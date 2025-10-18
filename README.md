@@ -1,12 +1,22 @@
 # ManhwaStudio
 Несложная мини-студия для перевода манхвы в одно рыло. Хорошо подходит для не особо популярных тайтлов без сложного клина, а сложные тайтлы лучше оставить командам с фотошопом.
+Читайте больше в Вики: https://github.com/Vasyanator/ManhwaStudio/wiki/
+**За предложениями, вопросами, поддержкой и компьюнити приглашаю на Discord-сервер**: discord.gg/invite/mZjZszwDbH
 
-<img width="1920" height="1008" alt="image" src="https://github.com/user-attachments/assets/266831b2-2057-4584-b99e-50d94d371b53" />
+## Основная идея - текстовые пузыри по бокам от непрерывной ленты с манхвой. Пузыри указывают, в каком месте располагается переведенный текст.
 
-<img width="1920" height="1001" alt="image" src="https://github.com/user-attachments/assets/da03c5c4-0950-4449-a6bd-e2ae5f016f49" />
+# Главное Меню
+<img width="1920" height="1034" alt="image" src="https://github.com/user-attachments/assets/7eaa27d4-65bf-4d34-be86-3f930dd2409c" />
 
-<img width="1920" height="1001" alt="image" src="https://github.com/user-attachments/assets/c781dbf8-29e8-4459-8e46-efe06d5f7e29" />
+# Окно нового проекта с выкачивателем
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/a22e6ad0-df0f-431f-8cbb-4e3eaa1ae5b8" />
 
-<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/4d7df81f-42c7-4357-a428-ef7fb8ee133e" />
+# Вкладка перевода
+<img width="1919" height="1035" alt="image" src="https://github.com/user-attachments/assets/5bdf8409-0801-4673-90a2-ad60665ddbd9" />
 
-<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/950a411c-c320-4d5d-9c59-703b428a8aa9" />
+# Вкладка Клина
+<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/4ce0edc5-88b1-4414-bdd2-21c7500da27f" />
+
+# Вкладка текста:
+<img width="1919" height="1033" alt="image" src="https://github.com/user-attachments/assets/23e05c3a-7f11-4cb4-b03f-b639da898158" />
+
