@@ -9,13 +9,13 @@
 ## Основная идея - текстовые пузыри по бокам от непрерывной ленты с манхвой. Пузыри указывают, в каком месте располагается переведенный текст.
 
 # Главное Меню
-<img width="1920" height="1034" alt="image" src="https://github.com/user-attachments/assets/7eaa27d4-65bf-4d34-be86-3f930dd2409c" />
+<img width="1918" height="1032" alt="image" src="https://github.com/user-attachments/assets/12fe42e3-68cb-4dd2-b369-36fdffddaf49" />
 
 # Окно нового проекта с выкачивателем
-<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/a22e6ad0-df0f-431f-8cbb-4e3eaa1ae5b8" />
+<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/ddefd7ac-4963-47ec-b0cc-dd25d218f41d" />
 
 # Вкладка перевода
-<img width="1919" height="1035" alt="image" src="https://github.com/user-attachments/assets/5bdf8409-0801-4673-90a2-ad60665ddbd9" />
+<img width="1920" height="1010" alt="image" src="https://github.com/user-attachments/assets/0312a69a-7d09-4d44-8cb8-1e38d1a24a0e" />
 
 # Вкладка Клина
 <img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/4ce0edc5-88b1-4414-bdd2-21c7500da27f" />
