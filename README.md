@@ -1,25 +1,27 @@
-Тут исходного кода нет, я недолюбливаю Git. Весь исходный код есть в релизах.
+Тут исходного кода нет, мне неудобно использовать Git. Весь исходный код есть в релизах, программа не компилируемая.
 # ManhwaStudio
 Несложная мини-студия для перевода манхвы самому. Хорошо подходит для не особо популярных тайтлов без сложного клина, а сложные тайтлы лучше оставить командам с фотошопом.
-Читайте больше в Вики: https://github.com/Vasyanator/ManhwaStudio/wiki/
+Читайте больше в Вики: https://github.com/Vasyanator/ManhwaStudio/wiki/, но актуальная версия есть в самой программе.
 
 
-**За предложениями, вопросами, поддержкой и компьюнити приглашаю на Discord-сервер**: https://discord.gg/invite/mZjZszwDbH
+**За предложениями, вопросами, поддержкой и компьюнити приглашаю на Discord-сервер или в Telegram**:
+- https://discord.gg/invite/mZjZszwDbH
+- https://t.me/SelfTranslators
 
 ## Основная идея - текстовые пузыри по бокам от непрерывной ленты с манхвой. Пузыри указывают, в каком месте располагается переведенный текст.
 
 # Главное Меню
-<img width="1918" height="1032" alt="image" src="https://github.com/user-attachments/assets/12fe42e3-68cb-4dd2-b369-36fdffddaf49" />
+<img width="1919" height="1034" alt="image" src="https://github.com/user-attachments/assets/fd3c57ad-f341-421c-9e2d-966c0cae620a" />
 
 # Окно нового проекта с выкачивателем
 <img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/ddefd7ac-4963-47ec-b0cc-dd25d218f41d" />
 
 # Вкладка перевода
-<img width="1920" height="1010" alt="image" src="https://github.com/user-attachments/assets/0312a69a-7d09-4d44-8cb8-1e38d1a24a0e" />
+<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/5f4450fe-b6ea-4159-990b-67546a3064d7" />
 
 # Вкладка Клина
-<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/4ce0edc5-88b1-4414-bdd2-21c7500da27f" />
+<img width="1920" height="1033" alt="image" src="https://github.com/user-attachments/assets/46c957b9-9542-4412-8147-0f43848ac4af" />
 
 # Вкладка текста:
-<img width="1919" height="1033" alt="image" src="https://github.com/user-attachments/assets/23e05c3a-7f11-4cb4-b03f-b639da898158" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/28ac1697-817b-45f4-b1d9-12bb2cd3a3c5" />
 
