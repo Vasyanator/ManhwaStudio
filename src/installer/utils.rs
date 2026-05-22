@@ -9,6 +9,7 @@ Main responsibilities:
 - create the managed Python environment and install Python dependencies;
 - install static base dependencies for every install and torch-dependent extras only for full installs;
 - install CPU or GPU PyTorch wheels selected by the UI;
+- sanitize ZIP entry path components that are invalid on Windows before writing files;
 - handle platform integration helpers such as elevation, shortcuts, registry entries, and uninstall cleanup.
 - on Windows Program Files installs, create the root install directory and grant inheritable Users
   modify rights before installer-managed files are created.
@@ -3780,7 +3781,7 @@ fn extract_zip(
             Some(path) => path.to_path_buf(),
             None => continue,
         };
-        let out_path = target_dir.join(rel);
+        let out_path = target_dir.join(archive_entry_relative_output_path(&rel));
 
         if entry.is_dir() {
             fs::create_dir_all(&out_path)
@@ -3825,6 +3826,69 @@ fn extract_zip(
     );
 
     Ok(())
+}
+
+fn archive_entry_relative_output_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let mut sanitized_path = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(name) => {
+                    sanitized_path.push(sanitize_windows_archive_path_component(
+                        &name.to_string_lossy(),
+                    ));
+                }
+                std::path::Component::CurDir
+                | std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_) => {}
+            }
+        }
+        sanitized_path
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn sanitize_windows_archive_path_component(component: &str) -> String {
+    let mut sanitized: String = component
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+
+    while sanitized.ends_with([' ', '.']) {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        sanitized.push('_');
+    }
+    let stem = sanitized
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let is_reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|n| (1..=9).contains(&n))
+        || stem
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|n| (1..=9).contains(&n));
+    if is_reserved {
+        sanitized.push('_');
+    }
+    sanitized
 }
 
 fn flatten_single_root_dir(target_dir: &Path) -> Result<(), String> {
@@ -3963,6 +4027,7 @@ mod tests {
     use super::{
         compare_version_strings, dependency_package_name, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages,
+        sanitize_windows_archive_path_component,
     };
     use std::cmp::Ordering;
 
@@ -4010,5 +4075,18 @@ mod tests {
             parse_executable_version_output("ManhwaStudio v3.5.1-beta").as_deref(),
             Some("v3.5.1-beta")
         );
+    }
+
+    #[test]
+    fn sanitize_windows_archive_path_component_replaces_invalid_names() {
+        assert_eq!(
+            sanitize_windows_archive_path_component("1: Лента картинок и её параметры"),
+            "1_ Лента картинок и её параметры"
+        );
+        assert_eq!(
+            sanitize_windows_archive_path_component("bad<name>|?."),
+            "bad_name___"
+        );
+        assert_eq!(sanitize_windows_archive_path_component("CON"), "CON_");
     }
 }
