@@ -10,41 +10,42 @@
 ## Основная идея - текстовые пузыри по бокам от непрерывной ленты с манхвой. Пузыри указывают, в каком месте располагается переведенный текст.
 
 # Главное Меню
-<img width="1919" height="1034" alt="image" src="https://github.com/user-attachments/assets/fd3c57ad-f341-421c-9e2d-966c0cae620a" />
+<img width="2559" height="1347" alt="image" src="https://github.com/user-attachments/assets/36b39f20-a2f4-4c9b-8ec6-a882f2ec6637" />
+
 
 # Окно нового проекта с выкачивателем
-<img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/ddefd7ac-4963-47ec-b0cc-dd25d218f41d" />
+<img width="2559" height="1329" alt="image" src="https://github.com/user-attachments/assets/62af87db-9995-4209-bb4d-31d75128851c" />
 
 Тут можно возможностей по выкачке и первичной обработке. Можно просто открыть папку, сказать главу из поддерживаемых сайтов, использовать браузер с шаблонами ссылок, или открыть офлайн-копию страницы.
 Затем, можно сшить и нарезать ленту (для вертикальных комиксов), убрать шум через Waifu2x
 
 # Вкладка перевода
-<img width="1920" height="1035" alt="image" src="https://github.com/user-attachments/assets/5f4450fe-b6ea-4159-990b-67546a3064d7" />
+<img width="2559" height="1345" alt="image" src="https://github.com/user-attachments/assets/d9fd8b7c-1eb0-4813-8dd5-b0e1108fa04e" />
 
 Тут выполняется перевод и редакт. Можно распознать текст на многих языках через EasyOCR, PaddleOCR, MangaOCR. Для каждой реплики можно указать роль, которая будет использована в компоновке текста перед отправкой в ИИ. Или же можно сделать детект текста и всё прогнать через машинный перевод, если хочется почитать.
 
 # Вкладка Клина
-<img width="1920" height="1033" alt="image" src="https://github.com/user-attachments/assets/46c957b9-9542-4412-8147-0f43848ac4af" />
+<img width="2559" height="1344" alt="image" src="https://github.com/user-attachments/assets/ab996bdf-3d23-483b-b60a-4c7585355fbd" />
 
 Тут замазывается исходный текст. В сравнении с фотошопом функционал достаточно скудный, но замазка с однородным фоном достаточно удобная. А ИИ модели для удаления объектов под маской, или инструмент восстановления градиента, дают вполне неплохое качество. Тем более, можно особо сложные фрагменты обработать в фотошопе отдельно.
 
 # Вкладка текста:
-<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/28ac1697-817b-45f4-b1d9-12bb2cd3a3c5" />
+<img width="2559" height="1344" alt="image" src="https://github.com/user-attachments/assets/a7dcf05c-3dbb-4ab1-9864-a66047d6e218" />
 
 Тут размещается переведенный текст. Можно на Shift+ЛКМ выделить область под него, и если блок текста сбоку указывает сюда, текст автоматически вставится. Или можно вписать вручную.
 На панели есть различные эффекты, от тени и обводки, до градиента. Сами картинки текста можно обрезать с помощью маски обрезки, или трансформировать в перспективе. Тайп значительно быстрее, чем в фотошопе.
 
 # Вкладка персонажей
-<img width="1920" height="983" alt="image" src="https://github.com/user-attachments/assets/6858a080-686d-44b4-b234-b717233b2351" />
+<img width="2559" height="1343" alt="image" src="https://github.com/user-attachments/assets/4f1ca23e-330c-4722-912d-f2c6a87d0e87" />
 
 Здесь можно просматривать и изменять персонажей тайтла. Их имена и описание попадут в инструкцию для ИИ перевода, чтобы улучшить понимание истории и стандартизировать имена.
 
 # Вкладка терминов
-<img width="1919" height="987" alt="image" src="https://github.com/user-attachments/assets/afebce97-80e8-4161-b501-abf9f49e84e3" />
+<img width="2559" height="1341" alt="image" src="https://github.com/user-attachments/assets/706f894e-b818-44a3-b961-e63f7f663770" />
 
 Так же как и персонажи, только без картинок
 
 # Вкладка заметок перевода
-<img width="1918" height="983" alt="image" src="https://github.com/user-attachments/assets/9acfdc27-57ce-409c-a75f-0e0d3839b67b" />
+<img width="2559" height="1341" alt="image" src="https://github.com/user-attachments/assets/43297a08-851b-4f95-bc51-7cf69b9801a1" />
 
 Здесь пишется основная инструкция для ИИ, и в неё автоматически вставляются персонажи и термины
