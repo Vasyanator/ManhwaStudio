@@ -1,0 +1,6 @@
+[alias]
+brel = "build --release"
+bwin = "build --release --target x86_64-pc-windows-gnu --bin manhwastudio_rs"
+bmac = "build --release --target x86_64-apple-darwin --bin manhwastudio_rs"
+blin = "build --release --target x86_64-unknown-linux-gnu --bin manhwastudio_rs"
+check-all = "check -q --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-gnu"

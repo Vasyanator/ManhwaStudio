@@ -1,0 +1,64 @@
+# Module: src/tabs/typing/render_next/effects
+
+## Purpose
+This directory owns the JSON-driven effect system for the production typing renderer.
+It keeps preprocess text mutations and post-raster image effects separate from base
+layout, wrapping, and glyph rasterization.
+
+## Architecture
+`mod.rs` is the only entry point used by `render_next::pipeline`. It parses
+`TextRenderParams.effects_json`, applies preprocess effects before inline-style
+parsing, and applies post-effects after a `RenderedTextImage` has been produced.
+
+The data flow is:
+
+1. `parse.rs` validates persisted JSON and converts aliases into typed effect params.
+2. `apply_text_preprocess_effects` mutates source text before inline tag parsing.
+3. The main renderer builds the base image.
+4. `apply_effects_pipeline` routes typed post-effects to concrete image modules.
+5. Image modules mutate the `RenderedTextImage` RGBA buffer in place, growing the
+   canvas only when the effect needs extra margin.
+
+`image_ops.rs` contains shared blur, distance-transform, dilation, sampling, blit, and
+compositing helpers. Concrete effects should use it instead of duplicating image math.
+
+## Files and submodules
+- `mod.rs`: effect pipeline entry points and routing from typed effect specs to modules.
+- `parse.rs`: external effects JSON contract, stage parsing, aliases, defaults, and
+  typed parameter structures.
+- `stroke_shadow.rs`: alpha-contour stroke and shadow layers with optional blur/source
+  color behavior.
+- `blur.rs`: Gaussian blur and motion blur post-effects.
+- `glow.rs`: contour glow, soft glow, falloff, dilation, and distance-transform usage.
+- `gradients.rs`: two-color and four-corner gradient fills over the text alpha bounds.
+- `reflect_shake.rs`: axis reflection and shake-trail composition.
+- `dry_media.rs`: deterministic pencil/chalk texture erosion and dust/grain effects.
+- `image_ops.rs`: shared low-level image helpers used by multiple effects.
+
+## Contracts and invariants
+- Missing `effect_type` in JSON means a post-effect for backward compatibility.
+- Preprocess effects run before inline-style parsing and may generate inline tags.
+  They must not inspect font layout, glyphs, or raster output.
+- Post-effects receive only a finished `RenderedTextImage`. They must not reach back
+  into wrapping, layout, inline span remapping, project state, or UI state.
+- Effect parsing must return clear `String` errors that name the stage, effect, or
+  field that failed.
+- RGBA buffers are unmultiplied and must remain `width * height * 4` bytes after every
+  effect, including effects that pad or resize the image.
+- Empty images and zero-sized intermediate dimensions must be handled without panics.
+- Long or multi-pass effects must honor the cancellation checks performed by
+  `apply_effects_pipeline` before each effect.
+- JSON aliases in `parse.rs` are part of the persisted renderer contract; update
+  parser tests when changing them.
+
+## Editing map
+- To add or rename an effect, start in `parse.rs`, then route it in `mod.rs`, implement
+  the image logic in a focused module, and add parser/image tests.
+- To change legacy JSON compatibility, edit `parse.rs` and update parent typing
+  serialization only if the persisted contract changes.
+- To change blur, dilation, distance transform, blitting, or shared sampling behavior,
+  edit `image_ops.rs` and audit all effect modules that call the helper.
+- To change text-mutating effects, update the preprocess path in `mod.rs` and keep the
+  output compatible with `inline_styles.rs`.
+- To change post-raster visual behavior, keep the work local to the concrete effect
+  module unless shared image math actually changes.
