@@ -1,0 +1,119 @@
+# GitHub publication allowlist.
+# Mercurial is the development repository; Git must publish only source,
+# documentation, and small runtime assets that are safe to share.
+*
+
+# Repository metadata for the Git mirror.
+!.gitignore
+
+# Rust package, lockfile, and target configuration.
+!.cargo/
+!.cargo/config.toml
+!Cargo.toml
+!Cargo.lock
+!build.rs
+
+# Project documentation and legal files.
+!AGENTS.md
+!LICENSE
+!MODULE_README.md
+!NOTICE
+!README.md
+!README_AGENT.md
+
+# Root runtime and helper scripts.
+!ai_backend.py
+!config.py
+
+# Application icons embedded by Rust code and the Windows resource build.
+!app_icon.ico
+!app_icon_512.png
+
+# Rust source tree. Keep generated blobs such as src/python_modules.zip out.
+!src/
+!src/**/
+!src/**/*.rs
+!src/**/MODULE_README.md
+
+# Python backend and helper modules. Keep bytecode and local browser profiles out.
+!modules/
+!modules/**/
+!modules/**/*.py
+!modules/**/MODULE_README.md
+modules/**/__pycache__/
+modules/**/*.py[cod]
+modules/browser_profiles/
+modules/browser_profiles/**
+modules/browser_profile_firefox/
+modules/browser_profile_firefox/**
+
+# Bundled fonts tracked by the project. Do not publish local font groups.
+!fonts/
+!fonts/ANTQUAB.ttf
+!fonts/ANTQUABI.ttf
+!fonts/ANTQUAI.ttf
+!fonts/HANZI.ttf
+!fonts/Narezka.ttf
+!fonts/St.Sign.ttf
+!fonts/v_CCCutthroatInt.ttf
+!fonts/v_CCWildWordsRoman_v3.25.ttf
+!fonts/Дёрганный.ttf
+!fonts/Пиксельный 1.ttf
+!fonts/Техно B.ttf
+!fonts/Техно.ttf
+!fonts/бормотание.otf
+!fonts/звук.otf
+!fonts/основной.ttf
+!fonts/простой V2.ttf
+!fonts/простой.ttf
+!fonts/ui/
+!fonts/ui/**
+fonts/MaybugMSRegular.ttf
+fonts/groups/
+fonts/groups/**
+
+# In-app wiki docs and screenshots.
+!wiki/
+!wiki/**
+
+# Explicit private/generated/runtime exclusions.
+.hg/
+.git/
+.claude/
+.codex/
+.vscode/
+.agents/
+AI_models/
+ManhwaStudio_AI_Models/
+Webtoon_Downloader/
+backup/
+c-libs/
+certs/
+downloaded/
+exmanga/
+installer_files/
+lama/
+lama_modernised/
+old_or_test/
+outputs/
+plans/
+projects/
+requirements/
+spell_check/
+target/
+test/
+venv/
+.venv/
+waifu2x/
+__pycache__/
+*.py[cod]
+*.bak
+*.log
+*.zip
+*.no_hg.*
+config.json
+user_config.json
+last.log
+previous.log
+backend.log
+manhwastudio_rs

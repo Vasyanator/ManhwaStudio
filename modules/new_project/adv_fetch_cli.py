@@ -1,0 +1,1357 @@
+"""
+FILE OVERVIEW: modules/new_project/adv_fetch_cli.py
+Python daemon for the advanced Selenium-based downloader used by the Rust launcher.
+
+Main items:
+- `AdvancedFetchDaemon`: owns the Selenium driver lifecycle and persistent browser profiles.
+- `open_url` command: opens a page in the selected browser/profile.
+- `fetch` command: collects image candidates from the active page, transfers cookies to
+  the active browser tab, downloads images, and stores them in a temporary folder for Rust.
+- `fetch_canvas` / `start_intercept` / `stop_intercept`: collect current canvas snapshots or
+  run a background canvas capture loop that tracks new unique canvas frames.
+
+Protocol:
+- Reads one JSON command per stdin line.
+- Writes one JSON event per stdout line; every event includes `downloader_version`
+  from root `config.VERSION` for Rust-side compatibility checks.
+- Intended to be launched by `src/launcher/new_project/advanced_download.rs`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import traceback
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import quote, urljoin, urlparse, urlunparse
+
+from PIL import Image
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as ec
+from selenium.webdriver.support.ui import WebDriverWait
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from modules.browser_f import (  # noqa: E402
+    build_browser,
+    cleanup_browser_runtime,
+)
+from modules.new_project.common import compile_wildcard_prefixes  # noqa: E402
+from config import VERSION  # noqa: E402
+
+import time
+import random
+
+LOG = logging.getLogger(__name__)
+CONTROL_TRANSLATION = {code: None for code in range(0x00, 0x20)} | {0x7F: None}
+VERBOSE_DOWNLOAD_LOG = True
+EMIT_LOCK = threading.Lock()
+@dataclass
+class FetchResult:
+    page_url: str
+    output_dir: Path
+    downloaded_images: int
+
+
+@dataclass
+class CanvasCaptureState:
+    stop_event: threading.Event
+    lock: threading.Lock
+    entries: list[dict[str, Any]]
+    hashes: set[str]
+    worker: threading.Thread
+    page_url: str
+    window_handle: str
+    error_message: Optional[str] = None
+    log_message: Optional[str] = None
+
+
+@dataclass
+class LinkCollectState:
+    stop_event: threading.Event
+    lock: threading.Lock
+    links: list[str]
+    seen_links: set[str]
+    worker: threading.Thread
+    page_url: str
+    window_handle: str
+    pattern: str
+    max_parallel: int
+    error_message: Optional[str] = None
+    log_message: Optional[str] = None
+
+
+class AdvancedFetchDaemon:
+    def __init__(self) -> None:
+        self._driver = None
+        self._browser_name: Optional[str] = None
+        self._current_window_handle: Optional[str] = None
+        self._tmp_profile_dir: Optional[str] = None
+        self._intercept_active = False
+        self._canvas_capture: Optional[CanvasCaptureState] = None
+        self._link_collect_active = False
+        self._link_collect: Optional[LinkCollectState] = None
+
+    def run(self) -> int:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                command = json.loads(line)
+                self._handle_command(command)
+            except SystemExit:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._emit_error(
+                    user_message=str(exc) or "Продвинутый выкачиватель завершился с ошибкой.",
+                    log_message=f"unexpected daemon error: {type(exc).__name__}: {exc}",
+                )
+                LOG.exception("Unexpected daemon error")
+        self.close()
+        return 0
+
+    def close(self) -> None:
+        self._stop_link_collect()
+        self._stop_canvas_capture()
+        if self._driver is not None:
+            try:
+                self._driver.quit()
+            except Exception:  # noqa: BLE001
+                LOG.exception("Failed to quit Selenium driver")
+            self._driver = None
+        if self._tmp_profile_dir:
+            try:
+                cleanup_browser_runtime(self._browser_name or "", self._tmp_profile_dir)
+            except Exception:  # noqa: BLE001
+                LOG.exception("Failed to remove temp profile dir")
+            self._tmp_profile_dir = None
+        self._browser_name = None
+        self._current_window_handle = None
+        self._intercept_active = False
+        self._link_collect_active = False
+
+    def _handle_command(self, command: dict) -> None:
+        command_name = str(command.get("command") or "").strip()
+        if command_name == "shutdown":
+            self.close()
+            raise SystemExit(0)
+        if command_name == "open_url":
+            browser = str(command.get("browser") or "").strip()
+            url = _normalize_http_url(str(command.get("url") or ""))
+            current_url = self.open_url(browser, url)
+            self._emit({"event": "opened", "current_url": current_url})
+            return
+        if command_name == "fetch":
+            browser = str(command.get("browser") or "").strip()
+            pattern = str(command.get("pattern") or "").strip()
+            max_parallel = int(command.get("max_parallel") or 1)
+            result = self.fetch(browser, pattern, max_parallel)
+            self._emit(
+                {
+                    "event": "result",
+                    "page_url": result.page_url,
+                    "output_dir": str(result.output_dir),
+                    "downloaded_images": result.downloaded_images,
+                }
+            )
+            return
+        if command_name == "start_link_collect":
+            browser = str(command.get("browser") or "").strip()
+            pattern = str(command.get("pattern") or "").strip()
+            max_parallel = int(command.get("max_parallel") or 1)
+            current_url = self.start_link_collect(browser, pattern, max_parallel)
+            self._emit({"event": "link_collect_started", "current_url": current_url})
+            return
+        if command_name == "stop_link_collect":
+            browser = str(command.get("browser") or "").strip()
+            result = self.stop_link_collect(browser)
+            self._emit(
+                {
+                    "event": "result",
+                    "page_url": result.page_url,
+                    "output_dir": str(result.output_dir),
+                    "downloaded_images": result.downloaded_images,
+                }
+            )
+            return
+        if command_name == "link_collect_status":
+            browser = str(command.get("browser") or "").strip()
+            found_links = self.link_collect_status(browser)
+            self._emit({"event": "link_collect_count", "found_links": found_links})
+            return
+        if command_name == "fetch_canvas":
+            browser = str(command.get("browser") or "").strip()
+            result = self.fetch_canvas(browser)
+            self._emit(
+                {
+                    "event": "result",
+                    "page_url": result.page_url,
+                    "output_dir": str(result.output_dir),
+                    "downloaded_images": result.downloaded_images,
+                }
+            )
+            return
+        if command_name == "start_intercept":
+            browser = str(command.get("browser") or "").strip()
+            current_url = self.start_intercept(browser)
+            self._emit({"event": "intercept_started", "current_url": current_url})
+            return
+        if command_name == "stop_intercept":
+            browser = str(command.get("browser") or "").strip()
+            result = self.stop_intercept(browser)
+            self._emit(
+                {
+                    "event": "result",
+                    "page_url": result.page_url,
+                    "output_dir": str(result.output_dir),
+                    "downloaded_images": result.downloaded_images,
+                }
+            )
+            return
+        if command_name == "intercept_status":
+            browser = str(command.get("browser") or "").strip()
+            found_pages = self.intercept_status(browser)
+            self._emit({"event": "intercept_count", "found_pages": found_pages})
+            return
+        if command_name == "scroll_page":
+            self.scroll_page()
+            self._emit({"event": "scrolled"})
+            return
+        raise RuntimeError(f"Unknown command: {command_name}")
+
+    def scroll_page(self) -> None:
+        """Scroll the current browser page down and back up to trigger lazy-load content."""
+        if self._driver is None:
+            raise RuntimeError("Сначала откройте страницу в браузере (open_url).")
+        driver = self._driver
+        # Read initial scroll height.
+        prev_height = driver.execute_script("return document.body.scrollHeight") or 0
+        # Scroll down in steps.
+        for pct in (0, 40, 80, 100):
+            driver.execute_script(
+                f"window.scrollTo(0, document.body.scrollHeight * {pct / 100});"
+            )
+            time.sleep(0.3)
+        # Check if page grew (lazy-load) and scroll up/down up to 40 times.
+        for _ in range(40):
+            new_height = driver.execute_script("return document.body.scrollHeight") or 0
+            if new_height <= prev_height:
+                break
+            prev_height = new_height
+            for pct in (100, 80, 40, 0):
+                driver.execute_script(
+                    f"window.scrollTo(0, document.body.scrollHeight * {pct / 100});"
+                )
+                time.sleep(0.2)
+            for pct in (0, 40, 80, 100):
+                driver.execute_script(
+                    f"window.scrollTo(0, document.body.scrollHeight * {pct / 100});"
+                )
+                time.sleep(0.2)
+
+    def open_url(self, browser: str, url: str) -> str:
+        self._ensure_browser(browser)
+        self._emit_progress("browser", 0, 0)
+        assert self._driver is not None
+        self._sync_active_browser_tab()
+        self._driver.get(url)
+        self._remember_current_window_handle()
+        self._wait_for_page_ready()
+        return str(self._driver.current_url or url)
+
+    def _wait_for_page_ready(self, timeout: float = 30.0) -> None:
+        assert self._driver is not None
+        try:
+            WebDriverWait(self._driver, timeout).until(
+                lambda driver: str(driver.current_url or "").strip()
+                not in {"", "about:blank", "data:,"}
+            )
+            WebDriverWait(self._driver, timeout).until(
+                lambda driver: str(
+                    driver.execute_script("return document.readyState || '';")
+                ).lower()
+                == "complete"
+            )
+            WebDriverWait(self._driver, timeout).until(
+                lambda driver: bool(
+                    driver.execute_script("return document.body !== null;")
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            current_url = str(self._driver.current_url or "").strip()
+            raise RuntimeError(
+                "Страница в браузере не успела загрузиться полностью."
+                f" Последний URL: {current_url or 'unknown'}"
+            ) from exc
+
+    def fetch(self, browser: str, pattern: str, max_parallel: int = 1) -> FetchResult:
+        self._ensure_browser(browser)
+        assert self._driver is not None
+        page_url, _window_handle = self._select_best_fetch_target(pattern)
+
+        try:
+            WebDriverWait(self._driver, 10).until(
+                ec.presence_of_all_elements_located((By.CSS_SELECTOR, "img, a"))
+            )
+        except Exception:  # noqa: BLE001
+            LOG.debug("Page did not report img/a presence within wait timeout", exc_info=True)
+
+        if not page_url or page_url in {"about:blank", "data:,"}:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+
+        self._emit_progress("collect", 0, 0)
+        candidates = self._collect_candidates(page_url)
+        _debug_log(
+            "fetch: collected %d raw candidates from %s",
+            len(candidates),
+            page_url,
+        )
+        filtered = self._filter_candidates(candidates, pattern)
+        _debug_log(
+            "fetch: %d candidates remained after prefilter (pattern=%r)",
+            len(filtered),
+            pattern,
+        )
+        return self._download_candidate_links(
+            filtered,
+            page_url,
+            temp_prefix="mangafucker_adv_fetch_",
+            max_parallel=max_parallel,
+        )
+
+    def start_link_collect(self, browser: str, pattern: str, max_parallel: int = 1) -> str:
+        self._ensure_browser(browser)
+        if self._link_collect is not None or self._link_collect_active:
+            raise RuntimeError("Сбор ссылок уже запущен.")
+        if self._canvas_capture is not None or self._intercept_active:
+            raise RuntimeError("Сначала завершите текущий перехват Canvas.")
+
+        page_url, window_handle = self._select_best_fetch_target(pattern)
+        collect_stop_event = threading.Event()
+        collect_lock = threading.Lock()
+        self._link_collect_active = True
+        worker = threading.Thread(
+            target=self._collect_links_loop,
+            args=(collect_stop_event, collect_lock),
+            daemon=True,
+            name="mangafucker-link-collect",
+        )
+        self._link_collect = LinkCollectState(
+            stop_event=collect_stop_event,
+            lock=collect_lock,
+            links=[],
+            seen_links=set(),
+            worker=worker,
+            page_url=page_url,
+            window_handle=window_handle,
+            pattern=pattern,
+            max_parallel=max_parallel,
+        )
+        self._emit_progress("collect", 0, 0)
+        worker.start()
+        return page_url
+
+    def stop_link_collect(self, browser: str) -> FetchResult:
+        self._ensure_browser(browser)
+        collect = self._link_collect
+        if not self._link_collect_active or collect is None:
+            raise RuntimeError("Сбор ссылок ещё не запущен.")
+
+        self._emit_progress("collect", 0, 0)
+        collect.stop_event.set()
+        collect.worker.join(timeout=2.5)
+        with collect.lock:
+            links = list(collect.links)
+            error_message = collect.error_message
+            log_message = collect.log_message
+        self._clear_link_collect_runtime()
+
+        if error_message:
+            if log_message:
+                LOG.error(log_message)
+            raise RuntimeError(error_message)
+        return self._download_candidate_links(
+            links,
+            self._page_url_for_handle(collect.window_handle) or collect.page_url,
+            temp_prefix="mangafucker_adv_fetch_collect_",
+            max_parallel=collect.max_parallel,
+        )
+
+    def link_collect_status(self, browser: str) -> int:
+        self._ensure_browser(browser)
+        collect = self._link_collect
+        if collect is None or not self._link_collect_active:
+            return 0
+        with collect.lock:
+            return len(collect.links)
+
+    def _download_candidate_links(
+        self,
+        filtered: list[str],
+        page_url: str,
+        temp_prefix: str,
+        max_parallel: int,
+    ) -> FetchResult:
+        if not filtered:
+            raise RuntimeError("Подходящих ссылок не найдено или ничего не скачалось.")
+
+        output_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
+        results = self._download_candidate_links_parallel(
+            filtered,
+            page_url,
+            max_parallel=max_parallel,
+        )
+        downloaded = 0
+        for index, (link, image) in enumerate(zip(filtered, results, strict=True), start=1):
+            if image is None:
+                continue
+            downloaded += 1
+            _debug_log(
+                "fetch: [%d/%d] success %s -> %dx%d",
+                index,
+                len(filtered),
+                link,
+                image.width,
+                image.height,
+            )
+            image.save(output_dir / f"{downloaded:04}.png", format="PNG")
+
+        if downloaded == 0:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise RuntimeError("Подходящих ссылок не найдено или ничего не скачалось.")
+
+        return FetchResult(
+            page_url=page_url,
+            output_dir=output_dir,
+            downloaded_images=downloaded,
+        )
+
+    def _download_candidate_links_parallel(
+        self,
+        filtered: list[str],
+        page_url: str,
+        max_parallel: int,
+    ) -> list[Optional[Image.Image]]:
+        if max_parallel > 1:
+            _debug_log(
+                "fetch: max_parallel=%d ignored because advanced downloads use the active browser tab session",
+                max_parallel,
+            )
+
+        results: list[Optional[Image.Image]] = []
+        for index, link in enumerate(filtered, start=1):
+            self._emit_progress("download", index, len(filtered))
+            time.sleep(random.uniform(0.5, 2.0))
+            _debug_log(
+                "fetch: [%d/%d] browser-tab downloading %s",
+                index,
+                len(filtered),
+                link,
+            )
+            try:
+                results.append(self._download_image_with_retry(link, page_url))
+            except Exception as exc:  # noqa: BLE001
+                _debug_log("fetch: [%d/%d] failed %s: %s", index, len(filtered), link, exc)
+                LOG.exception("Failed to download candidate %s", link)
+                results.append(None)
+        return results
+
+    def fetch_canvas(self, browser: str) -> FetchResult:
+        self._ensure_browser(browser)
+        if self._canvas_capture is not None:
+            raise RuntimeError("Сначала завершите текущий перехват Canvas.")
+        if self._intercept_active:
+            raise RuntimeError("Сначала завершите текущий перехват Canvas.")
+
+        page_url, _window_handle = self._select_best_canvas_target()
+        self._emit_progress("collect_canvas", 0, 0)
+        canvas_entries = self._collect_canvas_entries()
+        if not canvas_entries:
+            raise RuntimeError("Canvas на текущей странице не найдены.")
+
+        output_dir = Path(tempfile.mkdtemp(prefix="mangafucker_adv_canvas_fetch_"))
+        saved_count = self._save_canvas_entries(canvas_entries, output_dir)
+        if saved_count == 0:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise RuntimeError("Canvas на текущей странице не удалось сохранить.")
+
+        return FetchResult(
+            page_url=page_url,
+            output_dir=output_dir,
+            downloaded_images=saved_count,
+        )
+
+    def start_intercept(self, browser: str) -> str:
+        self._ensure_browser(browser)
+        if self._canvas_capture is not None or self._intercept_active:
+            raise RuntimeError("Перехват Canvas уже запущен.")
+
+        page_url, window_handle = self._select_best_canvas_target()
+        self._intercept_active = True
+        capture_stop_event = threading.Event()
+        capture_lock = threading.Lock()
+        worker = threading.Thread(
+            target=self._capture_canvas_loop,
+            args=(capture_stop_event, capture_lock),
+            daemon=True,
+            name="mangafucker-canvas-capture",
+        )
+        self._canvas_capture = CanvasCaptureState(
+            stop_event=capture_stop_event,
+            lock=capture_lock,
+            entries=[],
+            hashes=set(),
+            worker=worker,
+            page_url=page_url,
+            window_handle=window_handle,
+        )
+        self._emit_progress("collect_canvas", 0, 0)
+        worker.start()
+        return page_url
+
+    def stop_intercept(self, browser: str) -> FetchResult:
+        self._ensure_browser(browser)
+        capture = self._canvas_capture
+        if not self._intercept_active or capture is None:
+            raise RuntimeError("Перехват ещё не запущен.")
+
+        self._emit_progress("collect_canvas", 0, 0)
+        capture.stop_event.set()
+        capture.worker.join(timeout=2.5)
+        with capture.lock:
+            canvas_entries = list(capture.entries)
+            error_message = capture.error_message
+            log_message = capture.log_message
+        self._clear_intercept_runtime()
+
+        if error_message:
+            if log_message:
+                LOG.error(log_message)
+            raise RuntimeError(error_message)
+        if not canvas_entries:
+            raise RuntimeError("Во время перехвата не найдено новых Canvas.")
+
+        output_dir = Path(tempfile.mkdtemp(prefix="mangafucker_adv_canvas_intercept_"))
+        saved_count = self._save_canvas_entries(canvas_entries, output_dir)
+        if saved_count == 0:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            raise RuntimeError("Не удалось сохранить Canvas из перехвата.")
+
+        return FetchResult(
+            page_url=self._page_url_for_handle(capture.window_handle) or capture.page_url,
+            output_dir=output_dir,
+            downloaded_images=saved_count,
+        )
+
+    def intercept_status(self, browser: str) -> int:
+        self._ensure_browser(browser)
+        capture = self._canvas_capture
+        if capture is None or not self._intercept_active:
+            return 0
+        with capture.lock:
+            return len(capture.entries)
+
+    def _ensure_browser(self, browser: str) -> None:
+        if not browser:
+            raise RuntimeError("Не найден ни один поддерживаемый браузер.")
+
+        if self._driver is not None and self._browser_name == browser:
+            try:
+                self._sync_active_browser_tab()
+                _ = self._driver.current_url
+                self._remember_current_window_handle()
+                return
+            except WebDriverException:
+                LOG.warning("Existing Selenium driver became invalid, recreating it")
+                self.close()
+        elif self._driver is not None:
+            self.close()
+
+        self._emit_progress("browser", 0, 0)
+        self._driver, self._tmp_profile_dir = build_browser(True, browser)
+        self._browser_name = browser
+        self._remember_current_window_handle()
+        # Anti-bot stealth measures
+        self._driver.set_window_size(random.randint(1200, 1920), random.randint(800, 1080))
+        self._driver.execute_script("""
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined,
+});
+if (window.chrome) {
+    window.chrome.runtime = {};
+}
+""")
+        self._stop_link_collect()
+        self._stop_canvas_capture()
+        self._intercept_active = False
+        self._link_collect_active = False
+
+    def _require_page_url(self, default: Optional[str] = None, *, sync: bool = True) -> str:
+        if self._driver is None:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+        if sync:
+            self._sync_active_browser_tab()
+        page_url = str(self._driver.current_url or default or "").strip()
+        self._remember_current_window_handle()
+        if not page_url or page_url in {"about:blank", "data:,"}:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+        return page_url
+
+    def _list_window_handles(self) -> list[str]:
+        if self._driver is None:
+            return []
+        try:
+            return [str(handle) for handle in self._driver.window_handles]
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to list browser window handles", exc_info=True)
+            return []
+
+    def _switch_to_window_handle(self, handle: str) -> None:
+        if self._driver is None:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+        self._driver.switch_to.window(handle)
+        self._current_window_handle = handle
+
+    def _page_url_for_handle(self, handle: str) -> str:
+        self._switch_to_window_handle(handle)
+        assert self._driver is not None
+        return str(self._driver.current_url or "").strip()
+
+    def _count_canvas_entries(self) -> int:
+        if self._driver is None:
+            return 0
+        raw_count = self._driver.execute_script(
+            """
+            let total = 0;
+            const walk = (root) => {
+                if (!root || !root.querySelectorAll) {
+                    return;
+                }
+                total += root.querySelectorAll("canvas").length;
+                for (const element of root.querySelectorAll("*")) {
+                    if (element.shadowRoot) {
+                        walk(element.shadowRoot);
+                    }
+                }
+                for (const iframe of root.querySelectorAll("iframe")) {
+                    try {
+                        if (iframe.contentWindow && iframe.contentWindow.document) {
+                            walk(iframe.contentWindow.document);
+                        }
+                    } catch (_error) {
+                    }
+                }
+            };
+            walk(document);
+            return total;
+            """
+        )
+        try:
+            return max(0, int(raw_count))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _select_best_fetch_target(self, pattern: str) -> tuple[str, str]:
+        if self._driver is None:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+        handles = self._list_window_handles()
+        if not handles:
+            page_url = self._require_page_url()
+            if self._current_window_handle is None:
+                raise RuntimeError("Не удалось определить вкладку браузера.")
+            return page_url, self._current_window_handle
+
+        ranked: list[tuple[int, int, int, str, str]] = []
+        for index, handle in enumerate(handles):
+            try:
+                page_url = self._page_url_for_handle(handle)
+                if not page_url or page_url in {"about:blank", "data:,"}:
+                    continue
+                candidates = self._collect_candidates(page_url)
+                filtered = self._filter_candidates(candidates, pattern)
+                ranked.append((len(filtered), len(candidates), -index, handle, page_url))
+            except Exception:  # noqa: BLE001
+                LOG.debug("Failed to inspect tab %s for fetch target", handle, exc_info=True)
+
+        if not ranked:
+            page_url = self._require_page_url()
+            if self._current_window_handle is None:
+                raise RuntimeError("Не удалось определить вкладку браузера.")
+            return page_url, self._current_window_handle
+
+        best_filtered, best_total, _neg_index, best_handle, best_page_url = max(ranked)
+        self._switch_to_window_handle(best_handle)
+        _debug_log(
+            "window select fetch: handle=%s filtered=%d total=%d url=%s pattern=%r",
+            best_handle,
+            best_filtered,
+            best_total,
+            best_page_url,
+            pattern,
+        )
+        return best_page_url, best_handle
+
+    def _select_best_canvas_target(self) -> tuple[str, str]:
+        if self._driver is None:
+            raise RuntimeError("Сначала откройте страницу главы в браузере.")
+        handles = self._list_window_handles()
+        if not handles:
+            page_url = self._require_page_url()
+            if self._current_window_handle is None:
+                raise RuntimeError("Не удалось определить вкладку браузера.")
+            return page_url, self._current_window_handle
+
+        ranked: list[tuple[int, int, str, str]] = []
+        for index, handle in enumerate(handles):
+            try:
+                page_url = self._page_url_for_handle(handle)
+                if not page_url or page_url in {"about:blank", "data:,"}:
+                    continue
+                ranked.append((self._count_canvas_entries(), -index, handle, page_url))
+            except Exception:  # noqa: BLE001
+                LOG.debug("Failed to inspect tab %s for canvas target", handle, exc_info=True)
+
+        if not ranked:
+            page_url = self._require_page_url()
+            if self._current_window_handle is None:
+                raise RuntimeError("Не удалось определить вкладку браузера.")
+            return page_url, self._current_window_handle
+
+        canvas_count, _neg_index, best_handle, best_page_url = max(ranked)
+        self._switch_to_window_handle(best_handle)
+        _debug_log(
+            "window select canvas: handle=%s count=%d url=%s",
+            best_handle,
+            canvas_count,
+            best_page_url,
+        )
+        return best_page_url, best_handle
+
+    def _remember_current_window_handle(self) -> None:
+        if self._driver is None:
+            self._current_window_handle = None
+            return
+        try:
+            self._current_window_handle = str(self._driver.current_window_handle)
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to remember current browser window handle", exc_info=True)
+
+    def _inspect_window_handle(self, handle: str) -> Optional[dict[str, Any]]:
+        if self._driver is None:
+            return None
+        try:
+            self._driver.switch_to.window(handle)
+            details = self._driver.execute_script(
+                """
+                return {
+                    href: String(window.location.href || ""),
+                    visibility: String(document.visibilityState || ""),
+                    has_focus: Boolean(document.hasFocus && document.hasFocus()),
+                    title: String(document.title || ""),
+                    ready_state: String(document.readyState || ""),
+                };
+                """
+            )
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to inspect browser window handle %s", handle, exc_info=True)
+            return None
+        if not isinstance(details, dict):
+            return None
+        href = str(details.get("href") or "").strip()
+        visibility = str(details.get("visibility") or "").strip().lower()
+        has_focus = bool(details.get("has_focus"))
+        score = 0
+        if has_focus:
+            score += 100
+        if visibility == "visible":
+            score += 10
+        if href and href not in {"about:blank", "data:,"}:
+            score += 1
+        if handle == self._current_window_handle:
+            score += 2
+        return {
+            "handle": handle,
+            "href": href,
+            "visibility": visibility,
+            "has_focus": has_focus,
+            "score": score,
+        }
+
+    def _sync_active_browser_tab(self) -> None:
+        if self._driver is None:
+            return
+        try:
+            handles = list(self._driver.window_handles)
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to read browser window handles", exc_info=True)
+            return
+        if not handles:
+            return
+
+        inspected: list[dict[str, Any]] = []
+        for handle in handles:
+            details = self._inspect_window_handle(handle)
+            if details is not None:
+                inspected.append(details)
+        if not inspected:
+            return
+
+        best = max(inspected, key=lambda item: item["score"])
+        best_handle = str(best["handle"])
+        try:
+            self._driver.switch_to.window(best_handle)
+            self._current_window_handle = best_handle
+            _debug_log(
+                "window sync: selected handle=%s focus=%s visibility=%s url=%s",
+                best_handle,
+                best["has_focus"],
+                best["visibility"],
+                best["href"],
+            )
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to switch to active browser window handle %s", best_handle, exc_info=True)
+
+    def _collect_canvas_entries(self) -> list[dict[str, Any]]:
+        if self._driver is None:
+            return []
+        raw_entries = self._driver.execute_script(
+            """
+            const entries = [];
+            const walk = (root) => {
+                if (!root || !root.querySelectorAll) {
+                    return;
+                }
+                for (const canvas of root.querySelectorAll("canvas")) {
+                    try {
+                        entries.push({
+                            index: entries.length,
+                            width: Number(canvas.width || 0),
+                            height: Number(canvas.height || 0),
+                            data: canvas.toDataURL("image/png", 1.0),
+                        });
+                    } catch (_error) {
+                    }
+                }
+                for (const element of root.querySelectorAll("*")) {
+                    if (element.shadowRoot) {
+                        walk(element.shadowRoot);
+                    }
+                }
+                for (const iframe of root.querySelectorAll("iframe")) {
+                    try {
+                        if (iframe.contentWindow && iframe.contentWindow.document) {
+                            walk(iframe.contentWindow.document);
+                        }
+                    } catch (_error) {
+                    }
+                }
+            };
+            walk(document);
+            return entries;
+            """
+        )
+        if not isinstance(raw_entries, list):
+            return []
+        filtered_entries: list[dict[str, Any]] = []
+        for index, item in enumerate(raw_entries):
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data")
+            if not isinstance(data, str) or not data.startswith("data:image/png;base64,"):
+                continue
+            filtered_entries.append(
+                {
+                    "index": item.get("index", index),
+                    "width": item.get("width", 0),
+                    "height": item.get("height", 0),
+                    "data": data,
+                }
+            )
+        return filtered_entries
+
+    def _capture_canvas_loop(
+        self,
+        stop_event: threading.Event,
+        capture_lock: threading.Lock,
+    ) -> None:
+        while not stop_event.is_set():
+            try:
+                capture = self._canvas_capture
+                if capture is None:
+                    return
+                self._switch_to_window_handle(capture.window_handle)
+                canvas_entries = self._collect_canvas_entries()
+                added_count = 0
+                with capture_lock:
+                    for item in canvas_entries:
+                        canvas_hash = hashlib.sha256(
+                            item["data"].encode("utf-8")
+                        ).hexdigest()
+                        if canvas_hash in capture.hashes:
+                            continue
+                        capture.hashes.add(canvas_hash)
+                        capture.entries.append(item)
+                        added_count += 1
+                    total_count = len(capture.entries)
+                if added_count > 0:
+                    self._emit_progress("collect_canvas", total_count, 0)
+                if added_count > 0:
+                    _debug_log(
+                        "canvas capture: total=%d added=%d",
+                        total_count,
+                        added_count,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("Canvas capture loop failed")
+                capture = self._canvas_capture
+                if capture is not None:
+                    with capture_lock:
+                        capture.error_message = f"Ошибка перехвата Canvas: {exc}"
+                        capture.log_message = (
+                            f"canvas capture loop failed: {type(exc).__name__}: {exc}"
+                        )
+                stop_event.set()
+                break
+            stop_event.wait(1.0)
+
+    def _collect_links_loop(
+        self,
+        stop_event: threading.Event,
+        collect_lock: threading.Lock,
+    ) -> None:
+        while not stop_event.is_set():
+            try:
+                collect = self._link_collect
+                if collect is None:
+                    return
+                self._switch_to_window_handle(collect.window_handle)
+                page_url = self._require_page_url(default=collect.page_url, sync=False)
+                filtered = self._filter_candidates(
+                    self._collect_candidates(page_url),
+                    collect.pattern,
+                )
+                added_count = 0
+                with collect_lock:
+                    for link in filtered:
+                        if link in collect.seen_links:
+                            continue
+                        collect.seen_links.add(link)
+                        collect.links.append(link)
+                        added_count += 1
+                    total_count = len(collect.links)
+                if added_count > 0:
+                    self._emit_progress("collect", total_count, 0)
+                    _debug_log(
+                        "link collect: total=%d added=%d pattern=%r",
+                        total_count,
+                        added_count,
+                        collect.pattern,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("Link collection loop failed")
+                collect = self._link_collect
+                if collect is not None:
+                    with collect_lock:
+                        collect.error_message = f"Ошибка фонового сбора ссылок: {exc}"
+                        collect.log_message = (
+                            f"link collect loop failed: {type(exc).__name__}: {exc}"
+                        )
+                stop_event.set()
+                break
+            stop_event.wait(1.0)
+
+    def _save_canvas_entries(
+        self,
+        canvas_entries: list[dict[str, Any]],
+        output_dir: Path,
+    ) -> int:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+        total = len(canvas_entries)
+        for index, item in enumerate(canvas_entries, start=1):
+            self._emit_progress("save_canvas", index, total)
+            data_url = item.get("data")
+            if not isinstance(data_url, str):
+                continue
+            _, _, payload = data_url.partition(",")
+            if not payload:
+                continue
+            try:
+                image_bytes = base64.b64decode(payload)
+            except Exception:  # noqa: BLE001
+                LOG.exception("Failed to decode canvas payload")
+                continue
+            saved_count += 1
+            (output_dir / f"{saved_count:04}.png").write_bytes(image_bytes)
+        return saved_count
+
+    def _collect_candidates(self, page_url: str) -> list[str]:
+        assert self._driver is not None
+        self._sync_active_browser_tab()
+        raw_candidates = self._driver.execute_script(
+            """
+            const seen = new Set();
+            const out = [];
+
+            const add = (value) => {
+                if (typeof value !== "string") {
+                    return;
+                }
+                const normalized = value.trim();
+                if (!normalized || seen.has(normalized)) {
+                    return;
+                }
+                seen.add(normalized);
+                out.push(normalized);
+            };
+
+            const addSrcSet = (value) => {
+                if (typeof value !== "string") {
+                    return;
+                }
+                for (const part of value.split(",")) {
+                    const token = part.trim().split(/\\s+/)[0] || "";
+                    add(token);
+                }
+            };
+
+            const collectFromRoot = (root) => {
+                if (!root || !root.querySelectorAll) {
+                    return;
+                }
+                for (const img of root.querySelectorAll("img")) {
+                    add(img.currentSrc || "");
+                    add(img.src || "");
+                    add(img.getAttribute("src"));
+                    add(img.getAttribute("data-src"));
+                    add(img.getAttribute("data-lazy-src"));
+                    add(img.getAttribute("data-original"));
+                    add(img.getAttribute("data-url"));
+                    addSrcSet(img.getAttribute("srcset") || "");
+                    addSrcSet(img.getAttribute("data-srcset") || "");
+                }
+                for (const source of root.querySelectorAll("source")) {
+                    add(source.src || "");
+                    add(source.getAttribute("src"));
+                    addSrcSet(source.srcset || "");
+                    addSrcSet(source.getAttribute("srcset") || "");
+                    addSrcSet(source.getAttribute("data-srcset") || "");
+                }
+                for (const anchor of root.querySelectorAll("a[href]")) {
+                    add(anchor.href || "");
+                    add(anchor.getAttribute("href"));
+                }
+            };
+
+            collectFromRoot(document);
+            for (const element of document.querySelectorAll("*")) {
+                if (element.shadowRoot) {
+                    collectFromRoot(element.shadowRoot);
+                }
+            }
+            return out;
+            """
+        )
+        if not isinstance(raw_candidates, list):
+            return []
+        candidates: list[str] = []
+        for item in raw_candidates:
+            if not isinstance(item, str):
+                continue
+            value = item.strip()
+            if not value:
+                continue
+            try:
+                candidates.append(urljoin(page_url, value))
+            except Exception:  # noqa: BLE001
+                continue
+        return candidates
+
+    def _filter_candidates(self, candidates: list[str], pattern: str) -> list[str]:
+        matcher = compile_wildcard_prefixes(pattern) if pattern else None
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                _debug_log("prefilter: skip duplicate %s", candidate)
+                continue
+            if matcher is not None:
+                if matcher.search(candidate):
+                    seen.add(candidate)
+                    filtered.append(candidate)
+                    _debug_log("prefilter: matched pattern %s", candidate)
+                else:
+                    _debug_log("prefilter: skipped by pattern %s", candidate)
+                continue
+            seen.add(candidate)
+            filtered.append(candidate)
+            _debug_log("prefilter: accepted %s", candidate)
+        return filtered
+
+    def _clear_intercept_runtime(self) -> None:
+        self._intercept_active = False
+        self._canvas_capture = None
+
+    def _clear_link_collect_runtime(self) -> None:
+        self._link_collect_active = False
+        self._link_collect = None
+
+    def _stop_canvas_capture(self) -> None:
+        capture = self._canvas_capture
+        if capture is None:
+            return
+        capture.stop_event.set()
+        if capture.worker.is_alive():
+            capture.worker.join(timeout=2.0)
+        self._canvas_capture = None
+        self._intercept_active = False
+
+    def _stop_link_collect(self) -> None:
+        collect = self._link_collect
+        if collect is None:
+            return
+        collect.stop_event.set()
+        if collect.worker.is_alive():
+            collect.worker.join(timeout=2.0)
+        self._link_collect = None
+        self._link_collect_active = False
+
+    def _download_image_with_browser_session(self, link: str, referer: str) -> Image.Image:
+        if link.startswith("data:image/"):
+            _debug_log("download: decoding data URL %s", _short_link(link))
+            header, _, payload = link.partition(",")
+            if not payload:
+                raise RuntimeError("Empty data URL")
+            if ";base64" in header:
+                image_bytes = base64.b64decode(payload)
+            else:
+                image_bytes = payload.encode("utf-8")
+            return _decode_image_bytes(image_bytes, link)
+
+        browser_bytes = self._download_bytes_via_browser(link)
+        if browser_bytes is not None:
+            _debug_log(
+                "download: browser session returned %d bytes for %s",
+                len(browser_bytes),
+                link,
+            )
+            return _decode_image_bytes(browser_bytes, link)
+        raise RuntimeError(f"Browser tab could not download image URL: {link}")
+
+    def _download_image_with_retry(self, link: str, referer: str, max_retries: int = 3) -> Image.Image:
+        for attempt in range(max_retries):
+            try:
+                return self._download_image_with_browser_session(link, referer)
+            except Exception as exc:
+                if attempt == max_retries - 1:
+                    raise
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                LOG.warning(f"Download attempt {attempt+1}/{max_retries} failed for {_short_link(link)}: {exc}. Retrying in {wait:.1f}s")
+                time.sleep(wait)
+
+    def _download_bytes_via_browser(self, link: str) -> Optional[bytes]:
+        assert self._driver is not None
+        result = self._driver.execute_async_script(
+            """
+            const url = arguments[0];
+            const done = arguments[arguments.length - 1];
+            (async () => {
+                try {
+                    const response = await fetch(url, {
+                        credentials: "include",
+                        cache: "no-store",
+                    });
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                    const buffer = await response.arrayBuffer();
+                    const bytes = new Uint8Array(buffer);
+                    const chunkSize = 0x8000;
+                    const parts = [];
+                    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                        parts.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)));
+                    }
+                    done({ ok: true, data: btoa(parts.join("")) });
+                } catch (error) {
+                    done({ ok: false, error: String(error) });
+                }
+            })();
+            """,
+            link,
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            _debug_log("download: browser fetch failed for %s with result=%r", link, result)
+            return None
+        payload = result.get("data")
+        if not isinstance(payload, str) or not payload:
+            _debug_log("download: browser fetch returned empty payload for %s", link)
+            return None
+        return base64.b64decode(payload)
+
+    def _emit_progress(self, stage: str, current: int, total: int) -> None:
+        self._emit({"event": "progress", "stage": stage, "current": current, "total": total})
+
+    def _emit_error(self, user_message: str, log_message: str) -> None:
+        self._emit(
+            {
+                "event": "error",
+                "user_message": user_message,
+                "log_message": log_message,
+            }
+        )
+
+    def _emit(self, payload: dict) -> None:
+        payload.setdefault("downloader_version", VERSION)
+        with EMIT_LOCK:
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+
+def _normalize_http_url(raw: str) -> str:
+    value = (raw or "").translate(CONTROL_TRANSLATION).strip().replace("\\", "/")
+    if not value:
+        raise ValueError("Введите ссылку на страницу.")
+
+    has_scheme = re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", value) is not None
+    if not has_scheme:
+        if value.startswith("www.") or re.match(r"^[\w\-\.]+\.[a-zA-Z]{2,}(/|$)", value):
+            value = "https://" + value
+
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https", "file"):
+        raise ValueError("Поддерживаются ссылки http(s) и file://")
+    if parsed.scheme in ("http", "https") and not parsed.netloc:
+        raise ValueError("В адресе отсутствует домен (host).")
+
+    safe_path = quote(parsed.path or "/", safe="/%:@&=+$,;~*'()")
+    safe_query = parsed.query.replace(" ", "%20")
+    safe_fragment = parsed.fragment.replace(" ", "%20")
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            safe_path,
+            parsed.params,
+            safe_query,
+            safe_fragment,
+        )
+    )
+
+
+def _debug_log(message: str, *args: object) -> None:
+    if not VERBOSE_DOWNLOAD_LOG:
+        return
+    LOG.info(message, *args)
+    try:
+        formatted = message % args if args else message
+    except Exception:  # noqa: BLE001
+        formatted = f"{message} | args={args!r}"
+    _emit_daemon_log("info", formatted)
+
+
+def _emit_daemon_log(level: str, message: str) -> None:
+    with EMIT_LOCK:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "event": "log",
+                    "level": level,
+                    "message": message,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+
+
+def _decode_image_bytes(image_bytes: bytes, source: str) -> Image.Image:
+    if not _looks_like_supported_image(image_bytes):
+        _debug_log(
+            "decode: rejected non-image payload from %s, first-bytes=%s",
+            _short_link(source),
+            image_bytes[:16].hex(" "),
+        )
+        raise RuntimeError(f"Downloaded content does not look like an image: {source}")
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    if image.width <= 0 or image.height <= 0:
+        raise RuntimeError(f"Invalid downloaded image from {source}")
+    _debug_log(
+        "decode: accepted %s as image %dx%d",
+        _short_link(source),
+        image.width,
+        image.height,
+    )
+    return image
+
+
+def _looks_like_supported_image(image_bytes: bytes) -> bool:
+    if len(image_bytes) < 12:
+        return False
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return True
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if image_bytes.startswith(b"BM"):
+        return True
+    if image_bytes.startswith((b"II*\x00", b"MM\x00*")):
+        return True
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def _short_link(link: str, limit: int = 120) -> str:
+    if len(link) <= limit:
+        return link
+    return link[: limit - 3] + "..."
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--daemon", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    args = parse_args()
+    if not args.daemon:
+        print("This helper is intended to run with --daemon.", file=sys.stderr)
+        return 2
+
+    daemon = AdvancedFetchDaemon()
+    try:
+        return daemon.run()
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    except Exception as exc:  # noqa: BLE001
+        traceback.print_exc()
+        daemon._emit_error(
+            user_message="Продвинутый выкачиватель завершился с ошибкой.",
+            log_message=f"fatal helper error: {type(exc).__name__}: {exc}",
+        )
+        return 1
+    finally:
+        daemon.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

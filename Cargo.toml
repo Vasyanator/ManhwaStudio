@@ -1,0 +1,43 @@
+[package]
+name = "manhwastudio_rs"
+version = "3.4.0"
+edition = "2024"
+
+[workspace]
+members = ["."]
+
+[features]
+active-logs = []
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.33"
+egui = "0.33"
+cosmic-text = "0.14"
+hyphenation = { version = "0.8", features = ["embed_all"] }
+image = { version = "0.25", default-features = true }
+libloading = "0.8"
+minijinja = "2"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+tar = "0.4"
+ureq = { version = "2", features = ["json", "cookies"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+libc = "0.2"
+texture-synthesis = "0.8.2"
+translators = { version = "0.1.5", default-features = false, features = ["google"] }
+rayon = "1"
+psd = "0.3"
+zspell = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
+
+[build-dependencies]
+winresource = "0.1"
