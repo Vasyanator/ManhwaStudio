@@ -24,8 +24,8 @@ Inline rendering notes:
   falls back to stronger color emphasis when bold font is unavailable.
 - image destinations accept Markdown angle delimiters (`<path with spaces>`),
   which are stripped before local path resolution.
-- relative local image paths are normalized through `PathBuf` on Windows so
-  Markdown sources with `/` separators resolve as native filesystem paths.
+- relative local image paths are normalized through `PathBuf` on Windows and
+  use the same invalid-character replacement as installer ZIP extraction.
 */
 
 use eframe::egui;
@@ -772,6 +772,7 @@ fn relative_local_image_source_path(source: &str) -> PathBuf {
         source
             .split(['/', '\\'])
             .filter(|part| !part.is_empty())
+            .map(sanitize_windows_local_path_component)
             .collect()
     }
 
@@ -779,6 +780,43 @@ fn relative_local_image_source_path(source: &str) -> PathBuf {
     {
         PathBuf::from(source)
     }
+}
+
+#[cfg(windows)]
+fn sanitize_windows_local_path_component(component: &str) -> String {
+    let mut sanitized: String = component
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+
+    while sanitized.ends_with([' ', '.']) {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        sanitized.push('_');
+    }
+    let stem = sanitized
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let is_reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|n| (1..=9).contains(&n))
+        || stem
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|n| (1..=9).contains(&n));
+    if is_reserved {
+        sanitized.push('_');
+    }
+    sanitized
 }
 
 fn load_local_image_rgba(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
@@ -853,6 +891,18 @@ mod tests {
         assert_eq!(
             resolve_image_source(Path::new("wiki"), "images/Вкладка-Термины/1.png"),
             r"wiki\images\Вкладка-Термины\1.png"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_image_source_uses_installer_safe_names_on_windows() {
+        assert_eq!(
+            resolve_image_source(
+                Path::new("wiki"),
+                "images/1: Лента картинок и её параметры/1.png"
+            ),
+            r"wiki\images\1_ Лента картинок и её параметры\1.png"
         );
     }
 }
