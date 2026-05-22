@@ -24,6 +24,8 @@ Inline rendering notes:
   falls back to stronger color emphasis when bold font is unavailable.
 - image destinations accept Markdown angle delimiters (`<path with spaces>`),
   which are stripped before local path resolution.
+- relative local image paths are normalized through `PathBuf` on Windows so
+  Markdown sources with `/` separators resolve as native filesystem paths.
 */
 
 use eframe::egui;
@@ -758,7 +760,25 @@ fn resolve_image_source(base_dir: &Path, source: &str) -> String {
     if path.is_absolute() {
         return path.to_string_lossy().to_string();
     }
-    base_dir.join(path).to_string_lossy().to_string()
+    base_dir
+        .join(relative_local_image_source_path(source))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn relative_local_image_source_path(source: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        source
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(source)
+    }
 }
 
 fn load_local_image_rgba(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
@@ -824,6 +844,15 @@ mod tests {
         assert_eq!(
             resolve_image_source(Path::new("wiki"), &source),
             "wiki/images/with spaces/image.png"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_image_source_normalizes_markdown_slashes_on_windows() {
+        assert_eq!(
+            resolve_image_source(Path::new("wiki"), "images/Вкладка-Термины/1.png"),
+            r"wiki\images\Вкладка-Термины\1.png"
         );
     }
 }
