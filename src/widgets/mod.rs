@@ -20,9 +20,12 @@ FILE HEADER (widgets/mod.rs)
     виджетов, когда открыт popup combobox.
   - `ViewportColorSelector`: селектор цвета с кнопкой `Пипетка`, который
     умеет брать цвет из пикселя текущего viewport через screenshot-события egui.
+  - `MarkedScrollArea`: вертикальный скролл с разметкой бара (типизированные/
+    свободные пометки под ползунком) и жёлобом элементов слева от бара.
 */
 mod autocomplete_line;
 mod editable_combo_box;
+mod marked_scroll;
 mod seed_spin_box;
 mod spellchecked_line;
 mod text_edit_plus;
@@ -36,6 +39,11 @@ mod wheel_spin_box;
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
+#[allow(unused_imports)]
+pub use marked_scroll::{
+    ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,
+    MarkedScrollOutput, ScrollMark, ScrollSector, ScrollSpan, arrow, paint_marks_on_bar,
+};
 #[allow(unused_imports)]
 pub use seed_spin_box::{SeedSpinBox, random_seed};
 #[allow(unused_imports)]

@@ -118,6 +118,52 @@ fn register_selected_font(
     Ok(selected)
 }
 
+/// Загружает файл шрифта в свежую `fontdb::Database` и возвращает реальное
+/// PostScript-имя (OpenType name table id 6) выбранного face.
+///
+/// Зачем: Photoshop сопоставляет шрифт текстового слоя именно по PostScript-имени
+/// (например `MaybugMSRegular`), а не по имени файла или UI-метке. Функция читает
+/// это имя напрямую из данных шрифта, как бы файл ни назывался.
+///
+/// Robustness: при отсутствии/нечитаемости файла, непарсируемом шрифте или
+/// выходе `face_index` за границы возвращает `None` (без паники) — экспорт идёт
+/// в фоновом потоке и не должен падать.
+#[must_use]
+pub(crate) fn resolve_font_postscript_name(font_path: &str, face_index: usize) -> Option<String> {
+    if font_path.is_empty() {
+        return None;
+    }
+    let mut db = fontdb::Database::new();
+    // load_font_file сам читает файл; ошибка чтения/парсинга -> None.
+    db.load_font_file(font_path).ok()?;
+    // Face'ы перечисляем так же, как `register_selected_font`: выбираем по
+    // позиции среди загруженных, с откатом на первый при выходе за границы.
+    let faces: Vec<_> = db.faces().collect();
+    let face = faces.get(face_index).or_else(|| faces.first())?;
+    if face.post_script_name.is_empty() {
+        None
+    } else {
+        Some(face.post_script_name.clone())
+    }
+}
+
+/// Имя семейства (OpenType name table id 1) выбранного face — фолбэк для PSD,
+/// когда PostScript-имя недоступно. Та же robustness, что и у резолвера выше.
+#[must_use]
+pub(crate) fn resolve_font_family_name(font_path: &str, face_index: usize) -> Option<String> {
+    if font_path.is_empty() {
+        return None;
+    }
+    let mut db = fontdb::Database::new();
+    db.load_font_file(font_path).ok()?;
+    let faces: Vec<_> = db.faces().collect();
+    let face = faces.get(face_index).or_else(|| faces.first())?;
+    face.families
+        .first()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.is_empty())
+}
+
 #[must_use]
 pub(crate) fn normalize_inline_font_label(label: &str) -> String {
     label.trim().to_ascii_lowercase()

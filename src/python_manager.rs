@@ -173,6 +173,9 @@ pub fn build_python_script_command(root_dir: &Path, script_name: &str) -> Result
     Ok(command)
 }
 
+// Kept as a general helper alongside `build_python_script_command`; the advanced
+// browser downloaders that used it now run inside the unified AI backend over IPC.
+#[allow(dead_code)]
 pub fn build_python_script_path_command(
     root_dir: &Path,
     script_path: &Path,

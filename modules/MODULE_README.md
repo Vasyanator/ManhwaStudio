@@ -8,7 +8,7 @@ Python support layer for the Rust application. Runtime Python code here backs la
 
 Rust owns the main GUI and invokes Python modules only through explicit process or module boundaries. Long-running work must stay outside the GUI thread and report progress or errors through the Rust-facing bridge that started it.
 
-Python modules may use local browser profiles, Selenium, image libraries, and AI/runtime packages, but they must not silently fake missing dependencies or return placeholder outputs. Unsupported inputs should fail with clear user-facing errors and logged technical context.
+Python modules may use local browser profiles, Selenium, CloakBrowser/Playwright, image libraries, and AI/runtime packages, but they must not silently fake missing dependencies or return placeholder outputs. Unsupported inputs should fail with clear user-facing errors and logged technical context.
 
 ## Files and submodules
 
@@ -19,7 +19,7 @@ Python modules may use local browser profiles, Selenium, image libraries, and AI
 
 ## Contracts and invariants
 
-- Browser automation is stateful and tied to the Selenium driver that owns the active page.
+- Browser automation is stateful and tied to the selected daemon runtime that owns the active page.
 - Advanced browser downloads must resolve image links through the current tab session; this includes normal HTTP(S), data URLs, and browser-scoped URLs such as `blob:`.
 - Downloaded image bytes must be decoded and validated as real images before returning to Rust.
 - Do not add hidden network, model, or package dependencies without explicit errors when they are missing.

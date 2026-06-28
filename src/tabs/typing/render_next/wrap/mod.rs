@@ -8,12 +8,18 @@ Main responsibilities:
 - отделить word wrapping и hyphenation от layout и raster;
 - стать корневым модулем для horizontal/vertical/shape wrap логики.
 
+Разбивка текста на блоки и языковые правила переноса вынесены в
+`crate::tabs::typing::segmentation` (см. `Segmenter`); здесь wrap-ядро лишь
+подбирает переносы поверх готовых блоков.
+
 Public surface:
-- `HyphenationDictionaries` и `soft_hyphenate_overlong` обслуживают staged hyphenation path;
+- `HyphenationDictionaries` (реэкспорт из `segmentation`) обслуживает runtime
+  словарный/аварийный перенос;
 - `reshape_text_for_shape` собирает normal/free/shape horizontal wrap без участия raster-слоя;
 - `WordBreakPolicy` и helper-функции скрывают mapping от `TextWrapMode` к деталям wrap-ядра.
 */
 
+pub(crate) mod forms;
 mod horizontal;
 mod hyphenation;
 mod shape;
@@ -21,7 +27,7 @@ mod vertical;
 
 use super::types::TextWrapMode;
 
-pub(crate) use hyphenation::{HyphenationDictionaries, soft_hyphenate_overlong};
+pub(crate) use crate::tabs::typing::segmentation::HyphenationDictionaries;
 pub(crate) use shape::{LayoutTextResult, ShapeWrapRequest, reshape_text_for_shape};
 pub(crate) use vertical::{VerticalWrapRequest, build_vertical_layout_text};
 
@@ -63,50 +69,9 @@ pub(crate) fn should_prehyphenate_overlong(wrap_mode: TextWrapMode) -> bool {
     matches!(wrap_mode, TextWrapMode::Moderate | TextWrapMode::Aggressive)
 }
 
+/// Является ли символ висящей пунктуацией. Список общий для всего приложения и
+/// редактируется в настройках — см. [`crate::text_punctuation`].
 #[must_use]
 pub(crate) fn is_hanging_punctuation(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | ','
-            | '!'
-            | '?'
-            | ':'
-            | ';'
-            | '-'
-            | '–'
-            | '—'
-            | '~'
-            | '…'
-            | '·'
-            | '•'
-            | '。'
-            | '、'
-            | '，'
-            | '．'
-            | '！'
-            | '？'
-            | '：'
-            | '；'
-            | '・'
-            | '･'
-            | '('
-            | ')'
-            | '['
-            | ']'
-            | '{'
-            | '}'
-            | '"'
-            | '\''
-            | '«'
-            | '»'
-            | '\u{201C}'
-            | '\u{201D}'
-            | '\u{2018}'
-            | '\u{2019}'
-            | '\u{2039}'
-            | '\u{203A}'
-            | '\u{201E}'
-            | '\u{201F}'
-            | '\u{201A}'
-    )
+    crate::text_punctuation::is_hanging_punctuation(ch)
 }

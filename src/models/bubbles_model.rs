@@ -7,11 +7,14 @@ Main items:
   editable/readonly default display types for `default` bubbles.
 - `BubblesModel`: thread-safe mutable bubbles store with revisions and async saver.
 - `runtime_bubble_to_record`: adapter from canvas runtime fields to persisted `Bubble`,
-  including per-bubble `bubble_type`.
+  including per-bubble `bubble_class` and text display `bubble_type`.
 
 Threading/persistence:
 - Bubble writes are coalesced through `spawn_bubbles_saver_thread` so GUI thread only
-  publishes snapshots and does not block on filesystem I/O.
+  publishes snapshots and does not block on filesystem I/O. The saver channel carries
+  shared `Arc<Vec<Bubble>>` snapshots, so publishing a save never deep-clones the list.
+- `with_bubble`/`extra_of` let callers read a single bubble (or its `extra` map) by id
+  without cloning the whole list via `snapshot()`.
 - The saver always writes to the unsaved staging folder (`unsaved_bubbles_path`).
   The main chapter file is only updated by an explicit "save to project" merge.
 - `has_unsaved_changes()` returns true when the unsaved staging file exists on disk.
@@ -45,6 +48,7 @@ pub struct SharedCanvasSettings {
     pub bubble_max_width: f32,
     pub aside_compact_mode: String,
     pub aside_side_mode: String,
+    pub aside_second_column: bool,
     pub on_top_focus_mode: String,
     pub scale_bubbles: bool,
     pub aside_scale_pct: i32,
@@ -53,6 +57,7 @@ pub struct SharedCanvasSettings {
     pub spellcheck_translation: bool,
     pub tabs_autosync_enabled: bool,
     pub cache_pages: bool,
+    pub translation_status_display: String,
 }
 
 impl Default for SharedCanvasSettings {
@@ -73,6 +78,7 @@ impl Default for SharedCanvasSettings {
             bubble_max_width: 550.0,
             aside_compact_mode: "none".to_string(),
             aside_side_mode: "auto".to_string(),
+            aside_second_column: false,
             on_top_focus_mode: "around".to_string(),
             scale_bubbles: true,
             aside_scale_pct: 100,
@@ -81,6 +87,7 @@ impl Default for SharedCanvasSettings {
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
+            translation_status_display: "until_next".to_string(),
         }
     }
 }
@@ -95,13 +102,13 @@ pub struct BubblesModel {
     revision: u64,
     canvas_settings: SharedCanvasSettings,
     canvas_revision: u64,
-    saver_tx: Arc<Mutex<Sender<Vec<Bubble>>>>,
+    saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
 }
 
 #[derive(Clone)]
 pub struct BubblesSaveTask {
     snapshot: Arc<Vec<Bubble>>,
-    saver_tx: Arc<Mutex<Sender<Vec<Bubble>>>>,
+    saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
     unsaved_bubbles_path: PathBuf,
     bubbles_path: PathBuf,
 }
@@ -158,6 +165,27 @@ impl BubblesModel {
 
     pub fn snapshot_shared(&self) -> Arc<Vec<Bubble>> {
         Arc::clone(&self.bubbles)
+    }
+
+    /// Runs `f` against the bubble with id `bid` without cloning the whole list.
+    ///
+    /// Uses the maintained `bubble_index_by_id`, so it is O(1) lookup. Returns `None`
+    /// when no bubble has that id; otherwise returns `Some(f(&bubble))`. The borrow is
+    /// confined to `f`, so callers must copy out whatever they need from the bubble.
+    #[must_use]
+    pub fn with_bubble<R>(&self, bid: i64, f: impl FnOnce(&Bubble) -> R) -> Option<R> {
+        let index = self.bubble_index_by_id.get(&bid).copied()?;
+        self.bubbles.get(index).map(f)
+    }
+
+    /// Borrows the `extra` map of the bubble with id `bid` without cloning the list.
+    ///
+    /// Returns `None` when no bubble has that id. Intended for callers that previously
+    /// took a full `snapshot()` only to read one bubble's `extra`.
+    #[must_use]
+    pub fn extra_of(&self, bid: i64) -> Option<&Map<String, Value>> {
+        let index = self.bubble_index_by_id.get(&bid).copied()?;
+        self.bubbles.get(index).map(|bubble| &bubble.extra)
     }
 
     pub fn canvas_revision(&self) -> u64 {
@@ -270,6 +298,29 @@ impl BubblesModel {
         Ok(Some((self.revision, task)))
     }
 
+    pub fn update_translation_and_original_deferred_save(
+        &mut self,
+        bid: i64,
+        original_text: String,
+        translated_text: String,
+        translation_status: &str,
+    ) -> Result<Option<(u64, BubblesSaveTask)>> {
+        let Some(index) = self.bubble_index_by_id.get(&bid).copied() else {
+            return Ok(None);
+        };
+        let Some(existing) = Arc::make_mut(&mut self.bubbles).get_mut(index) else {
+            return Ok(None);
+        };
+        existing.original_text = original_text;
+        existing.text = translated_text;
+        existing.extra.insert(
+            "translation_status".to_string(),
+            Value::String(translation_status.to_string()),
+        );
+        let task = self.touch_and_prepare_save_task();
+        Ok(Some((self.revision, task)))
+    }
+
     pub fn delete(&mut self, bid: i64) -> Result<()> {
         let Some(index) = self.bubble_index_by_id.remove(&bid) else {
             return Ok(());
@@ -323,15 +374,18 @@ impl BubblesModel {
     }
 }
 
-fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Vec<Bubble>> {
-    let (tx, rx) = mpsc::channel::<Vec<Bubble>>();
+fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Arc<Vec<Bubble>>> {
+    let (tx, rx) = mpsc::channel::<Arc<Vec<Bubble>>>();
     thread::spawn(move || {
+        // Coalesce queued snapshots and persist only the latest one. The channel now carries
+        // shared `Arc<Vec<Bubble>>` snapshots, so superseded snapshots are dropped (refcount
+        // decrement) without an extra deep clone of the bubble list.
         while let Ok(first) = rx.recv() {
             let mut latest = first;
             while let Ok(next) = rx.try_recv() {
                 latest = next;
             }
-            if let Err(err) = write_bubbles_file(&bubbles_path, &latest) {
+            if let Err(err) = write_bubbles_file(&bubbles_path, latest.as_slice()) {
                 eprintln!(
                     "failed to persist bubbles {}: {err:#}",
                     bubbles_path.display()
@@ -360,6 +414,7 @@ pub fn runtime_bubble_to_record(
     img_u: f32,
     img_v: f32,
     side: Option<String>,
+    bubble_class: Option<String>,
     bubble_type: Option<String>,
     text: String,
     original_text: String,
@@ -371,6 +426,7 @@ pub fn runtime_bubble_to_record(
         img_u,
         img_v,
         side,
+        bubble_class,
         bubble_type,
         text,
         original_text,
@@ -390,8 +446,12 @@ fn rebuild_bubble_index(index_by_id: &mut HashMap<i64, usize>, bubbles: &[Bubble
     *index_by_id = build_bubble_index(bubbles);
 }
 
+/// Sends a shared bubble snapshot to the coalescing saver thread.
+///
+/// The snapshot is shared (`Arc<Vec<Bubble>>`); only the `Arc` is cloned, never the
+/// underlying bubble list. Respawns the saver thread once if it has gone away.
 fn send_snapshot_to_bubbles_saver(
-    saver_tx: &Arc<Mutex<Sender<Vec<Bubble>>>>,
+    saver_tx: &Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
     unsaved_bubbles_path: &Path,
     bubbles_path: &Path,
     snapshot: &Arc<Vec<Bubble>>,
@@ -400,7 +460,7 @@ fn send_snapshot_to_bubbles_saver(
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-    if sender.send(snapshot.as_ref().clone()).is_ok() {
+    if sender.send(Arc::clone(snapshot)).is_ok() {
         return;
     }
 
@@ -413,10 +473,100 @@ fn send_snapshot_to_bubbles_saver(
         Ok(mut guard) => *guard = new_sender.clone(),
         Err(poisoned) => *poisoned.into_inner() = new_sender.clone(),
     }
-    if new_sender.send(snapshot.as_ref().clone()).is_err() {
+    if new_sender.send(Arc::clone(snapshot)).is_err() {
         eprintln!(
             "ERROR failed to send to newly spawned bubbles saver thread: {}",
             bubbles_path.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Builds a unique temporary staging path so the background saver of each test model
+    /// writes to its own file and tests do not collide.
+    fn unique_unsaved_path() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("manhwastudio_bubbles_model_test_{n}.json"))
+    }
+
+    /// Creates a bubble whose `extra` map carries a single string entry under `key`.
+    fn bubble_with_extra(id: i64, key: &str, value: &str) -> Bubble {
+        let mut extra = Map::new();
+        extra.insert(key.to_string(), Value::String(value.to_string()));
+        runtime_bubble_to_record(
+            id,
+            0,
+            0.5,
+            0.5,
+            None,
+            None,
+            None,
+            String::new(),
+            String::new(),
+            Some(extra),
+        )
+    }
+
+    /// Builds a model from `bubbles` with isolated temporary save paths.
+    fn model_with(bubbles: Vec<Bubble>) -> BubblesModel {
+        let unsaved = unique_unsaved_path();
+        BubblesModel::new(
+            bubbles,
+            unsaved.with_extension("saved.json"),
+            unsaved,
+            SharedCanvasSettings::default(),
+        )
+    }
+
+    #[test]
+    fn extra_of_returns_only_matching_bubble_extra() {
+        let model = model_with(vec![
+            bubble_with_extra(1, "image_source_type", "external"),
+            bubble_with_extra(2, "image_source_type", "page_crop"),
+        ]);
+        let extra = model.extra_of(2).expect("bubble 2 should exist");
+        assert_eq!(
+            extra.get("image_source_type").and_then(Value::as_str),
+            Some("page_crop")
+        );
+        // Reading one bubble's extra must not require the other bubble's data.
+        assert!(model.extra_of(99).is_none());
+    }
+
+    #[test]
+    fn with_bubble_reads_fields_by_id_without_cloning_list() {
+        let model = model_with(vec![
+            bubble_with_extra(10, "k", "a"),
+            bubble_with_extra(20, "k", "b"),
+        ]);
+        let id = model
+            .with_bubble(20, |bubble| bubble.id)
+            .expect("bubble 20 should exist");
+        assert_eq!(id, 20);
+        assert!(model.with_bubble(7, |bubble| bubble.id).is_none());
+    }
+
+    #[test]
+    fn extra_of_tracks_index_after_delete() {
+        let mut model = model_with(vec![
+            bubble_with_extra(1, "k", "first"),
+            bubble_with_extra(2, "k", "second"),
+            bubble_with_extra(3, "k", "third"),
+        ]);
+        model.delete(1).expect("delete should succeed");
+        // After removing the first element the index must still resolve the remaining ids.
+        assert_eq!(
+            model
+                .extra_of(3)
+                .and_then(|e| e.get("k"))
+                .and_then(Value::as_str),
+            Some("third")
+        );
+        assert!(model.extra_of(1).is_none());
     }
 }

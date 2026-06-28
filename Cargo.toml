@@ -1,17 +1,22 @@
 [package]
 name = "manhwastudio_rs"
-version = "3.4.2"
+version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = ["."]
+members = [".", "crates/ag-psd"]
 
 [features]
 active-logs = []
+# Frame profiler instrumentation. Off by default for zero runtime overhead.
+# Enable with `cargo run --features profiling` to record per-frame puffin scopes
+# and show the puffin_egui profiler window inside the editor.
+profiling = ["dep:puffin", "dep:puffin_egui"]
 
 [dependencies]
 anyhow = "1"
 arboard = "3"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.33"
 egui = "0.33"
@@ -33,10 +38,17 @@ libc = "0.2"
 texture-synthesis = "0.8.2"
 translators = { version = "0.1.5", default-features = false, features = ["google"] }
 rayon = "1"
-psd = "0.3"
+ag-psd = { path = "crates/ag-psd" }
 zspell = "0.5"
+genai = "0.6"
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "crypto-rust", "vendored"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+puffin = { version = "0.20.0", optional = true }
+puffin_egui = { version = "0.30", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+uds_windows = "1"
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
 
 [build-dependencies]

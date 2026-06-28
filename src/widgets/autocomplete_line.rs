@@ -13,7 +13,7 @@ FILE HEADER (widgets/autocomplete_line.rs)
 
 use eframe::egui;
 use egui::text_edit::TextEditState;
-use egui::{Align, Id, Key};
+use egui::{Id, Key};
 
 const DEFAULT_MAX_SUGGESTIONS: usize = 8;
 
@@ -272,9 +272,7 @@ impl AutocompleteLine {
             out.submitted = true;
         }
 
-        if text_response.has_focus() {
-            ui.scroll_to_rect(text_response.rect, Some(Align::Center));
-        } else {
+        if !text_response.has_focus() {
             self.filter_query.clear();
         }
 

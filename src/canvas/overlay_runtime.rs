@@ -826,6 +826,9 @@ impl OverlayRuntimeState {
         if src_w <= 0.0 || src_h <= 0.0 {
             return;
         }
+        // Viewport cull: skip tiles whose on-screen rect does not intersect the
+        // visible clip rect. `intersects` keeps partially-visible edge tiles.
+        let viewport_rect = ui.clip_rect();
         for tile in &page_tex.tiles {
             let ox = tile.origin_px[0] as f32;
             let oy = tile.origin_px[1] as f32;
@@ -844,6 +847,9 @@ impl OverlayRuntimeState {
                     image_rect.height() * (th / src_h),
                 ),
             );
+            if !dst.intersects(viewport_rect) {
+                continue;
+            }
             ui.painter().image(
                 tile.texture.id(),
                 dst,

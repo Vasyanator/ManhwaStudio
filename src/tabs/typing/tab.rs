@@ -68,12 +68,13 @@ use super::auto_typing::{
 };
 use super::mask::{TypingMaskExportPage, TypingMaskLayer};
 use super::panel::{
-    TypingCreateImageRequest, TypingEditorFontSpec, TypingExportUiStatus, TypingOverlayEditRequest,
-    TypingOverlayKind, TypingPanelLayout, TypingSelectedOverlayForEdit,
+    TypingCreateImageRequest, TypingEditTarget, TypingEditorFontSpec, TypingExportUiStatus,
+    TypingOverlayEditRequest, TypingOverlayKind, TypingPanelLayout, TypingSelectedOverlayForEdit,
 };
-use super::render_next::render_text_to_image;
+use super::render_next::{apply_effects_to_image, render_text_to_image};
 use super::render_next::types::{
-    HorizontalAlign, KerningMode, TEXT_FORMULA_USER_VAR_COUNT, TextDrawnLinesLayoutParams,
+    HorizontalAlign, KerningMode, PxOrPercent, TEXT_FORMULA_USER_VAR_COUNT,
+    TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
     TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
     TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
@@ -82,7 +83,7 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
     CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords,
-    SourceTextureUploadBudget,
+    SourceTextureUploadBudget, parse_image_text_areas,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -121,6 +122,19 @@ const TEXT_OVERLAY_MIN_VISIBLE_FRACTION: f32 = 0.10;
 const TEXT_CREATE_SELECTION_MIN_SIDE_PX: f32 = 4.0;
 const TEXT_EDITOR_MIN_WIDTH_PX: f32 = 120.0;
 const TEXT_EDITOR_MIN_HEIGHT_PX: f32 = 72.0;
+
+// "Слои страницы" panel sizing.
+/// Minimum text-preview characters a text row shows (the narrowest panel). The panel cannot shrink below
+/// the width that fits exactly this many chars.
+const LAYERS_PANEL_MIN_PREVIEW_CHARS: usize = 5;
+/// Default panel width (px) — roughly the old fixed 260, enough for ~5+ preview chars.
+const LAYERS_PANEL_DEFAULT_WIDTH: f32 = 260.0;
+/// Default visible height of the layer list, in ROWS, before the inner scroll kicks in.
+const LAYERS_PANEL_DEFAULT_ROWS: usize = 8;
+/// Fixed horizontal overhead (px) of a text row that is NOT preview text: the ⬆/⬇ buttons + item
+/// spacing + the `Текст (` / `)` wrapper + frame padding + scrollbar. Used to derive both the min panel
+/// width and the per-width char budget so they stay consistent.
+const LAYERS_PANEL_ROW_OVERHEAD_PX: f32 = 116.0;
 const TEXT_EDITOR_STATUS_ERROR_SECONDS: f64 = 4.0;
 const TEXT_RENDER_DATA_FALLBACK_WIDTH_PX: u32 = 500;
 const TEXT_LAYOUT_IMAGE_SUFFIX: &str = "_layout";
@@ -139,6 +153,9 @@ const TEXT_LAYOUT_EDITOR_FRAME_MIN_SIDE_PX: f32 = 24.0;
 const TEXT_LAYOUT_EDITOR_POINT_RADIUS_PX: f32 = 6.0;
 const TEXT_OVERLAY_DEFORM_SURFACE_COLS: usize = 13;
 const TEXT_OVERLAY_DEFORM_SURFACE_ROWS: usize = 13;
+const TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX: f32 = 10.0;
+const TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX: f32 = 5.0;
+const TEXT_OVERLAY_WIDTH_GUIDE_LABEL_GAP_PX: f32 = 4.0;
 const TEXT_OVERLAY_BEND_HANDLE_COLS: usize = 5;
 const TEXT_OVERLAY_BEND_HANDLE_ROWS: usize = 5;
 const TEXT_OVERLAY_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
@@ -207,14 +224,14 @@ impl Default for TypingDeformToolSettings {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TypingOverlayDeformMesh {
-    cols: usize,
-    rows: usize,
+pub(super) struct TypingOverlayDeformMesh {
+    pub(super) cols: usize,
+    pub(super) rows: usize,
     points_px: Vec<[f32; 2]>,
 }
 
 impl TypingOverlayDeformMesh {
-    fn new(
+    pub(super) fn new(
         cols: usize,
         rows: usize,
         points_px: Vec<[f32; 2]>,
@@ -231,6 +248,17 @@ impl TypingOverlayDeformMesh {
                 .map(|point| clamp_page_point(point, page_size))
                 .collect(),
         })
+    }
+
+    /// Builds the runtime mesh from a canonical `DeformRec` (the shared codec's output), clamping its
+    /// page-pixel points to the page. The runtime struct adds rendering helpers (`point`, `translate`,
+    /// sampling); parsing/validation of `deform_mesh`/`transform_uv`/`points_uv` lives in the shared
+    /// `text_payload` codec, not here.
+    fn from_deform_rec(
+        rec: &crate::models::layer_model::manifest::DeformRec,
+        page_size: [usize; 2],
+    ) -> Option<Self> {
+        Self::new(rec.cols, rec.rows, rec.points_px.clone(), page_size)
     }
 
     fn point_idx(&self, col: usize, row: usize) -> usize {
@@ -257,6 +285,9 @@ pub struct TypingTabState {
     text_overlays: TypingTextOverlayLayer,
     top_panel: TypingTopPanelState,
     mask_layer: TypingMaskLayer,
+    /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
+    /// shared with the PS tab. `None` until `set_layer_doc` is called by app.rs.
+    layer_doc: Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
 }
 
 impl Default for TypingTabState {
@@ -269,6 +300,7 @@ impl Default for TypingTabState {
             text_overlays: TypingTextOverlayLayer::default(),
             top_panel: TypingTopPanelState::default(),
             mask_layer: TypingMaskLayer::default(),
+            layer_doc: None,
         }
     }
 }
@@ -285,8 +317,26 @@ impl TypingTabState {
         self.canvas.set_overlays_model(model);
     }
 
+    /// Wires the app-owned shared unified layer document (see `layer_doc`). Propagates to the inner
+    /// overlay layer, which owns the per-page load path that populates the doc.
+    pub fn set_layer_doc(
+        &mut self,
+        doc: std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>,
+    ) {
+        self.text_overlays.set_layer_doc(Arc::clone(&doc));
+        self.layer_doc = Some(doc);
+    }
+
     pub fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
         self.top_panel.set_panel_layout(layout);
+    }
+
+    /// Flushes the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
+    /// legacy chapter that was only viewed still migrates its text on save-to-project. Returns the set
+    /// of OWNED text pages (doc-resident this session) for the save-to-project merge to treat as
+    /// authoritative; pages NOT in it keep their committed text. Delegates to the overlay layer.
+    pub fn flush_text_layers(&mut self) -> std::collections::HashSet<usize> {
+        self.text_overlays.flush_text_layers()
     }
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
@@ -301,10 +351,12 @@ impl TypingTabState {
         self.canvas.apply_viewport_snapshot(snapshot);
     }
 
-    pub fn gpu_memory_snapshot(&self, pinned_pages: &BTreeSet<usize>) -> Vec<CacheResourceInfo> {
-        let mut snapshot = self.mask_layer.gpu_memory_snapshot(pinned_pages);
-        snapshot.extend(self.text_overlays.gpu_memory_snapshot(pinned_pages));
-        snapshot
+    pub fn current_page_local_view_center(&self) -> Option<(usize, Vec2)> {
+        self.canvas.current_page_local_view_center()
+    }
+
+    pub fn focus_page(&mut self, page_idx: usize, center_px: Option<Vec2>, zoom: f32) {
+        self.canvas.focus_page(page_idx, center_px, zoom);
     }
 
     pub fn evict_gpu_caches(&mut self, request: &CacheEvictionRequest) -> CacheEvictionReport {
@@ -315,13 +367,6 @@ impl TypingTabState {
             .saturating_add(overlay_report.estimated_freed_bytes);
         report.resources.extend(overlay_report.resources);
         report
-    }
-
-    pub fn clean_overlay_gpu_memory_snapshot(
-        &self,
-        pinned_pages: &BTreeSet<usize>,
-    ) -> Vec<CacheResourceInfo> {
-        self.canvas.clean_overlay_gpu_memory_snapshot(pinned_pages)
     }
 
     pub fn evict_clean_overlay_gpu_cache(
@@ -350,11 +395,18 @@ impl TypingTabState {
     ) {
         let canvas_rect = ui.max_rect();
         self.text_overlays.set_page_count(project.pages.len());
+        // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
+        // re-project the current page from it (in-memory; no disk reload).
+        self.text_overlays
+            .maybe_reproject_from_doc_version(self.canvas.current_page_idx());
         self.text_overlays.ensure_loader_started(project);
         self.mask_layer.ensure_loader_started(project);
         let mut needs_repaint = false;
         needs_repaint |= self.text_overlays.poll_loader();
+        needs_repaint |= self.text_overlays.poll_migration();
         needs_repaint |= self.text_overlays.poll_create_overlay_jobs(ctx);
+        needs_repaint |= self.text_overlays.poll_create_raster_jobs(ctx);
+        needs_repaint |= self.text_overlays.poll_raster_effects_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_edit_overlay_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_save_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_export_jobs(ctx);
@@ -656,8 +708,10 @@ impl CanvasHooks for TypingHooks<'_> {
             self.text_overlays.clear_selection();
             self.top_panel.sync_selected_overlay_for_edit(None);
         } else {
-            self.top_panel
-                .sync_selected_overlay_for_edit(self.text_overlays.selected_overlay_for_edit());
+            let selected = self
+                .text_overlays
+                .selected_item_for_edit(canvas.current_page_idx());
+            self.top_panel.sync_selected_overlay_for_edit(selected);
         }
         self.top_panel
             .sync_clean_overlays_visible_from_canvas(canvas.clean_overlays_visible());
@@ -688,7 +742,14 @@ impl CanvasHooks for TypingHooks<'_> {
                 self.top_panel,
             );
         }
-        self.top_panel.draw(ctx, canvas_rect);
+        // The combined Actions/Layers panel: the «Слои» tab body is rendered by `text_overlays` (which
+        // owns the layer/overlay state), routed through the Actions panel's tab UI on `top_panel`.
+        self.top_panel.draw(
+            ctx,
+            canvas_rect,
+            &mut self.text_overlays,
+            canvas.current_page_idx(),
+        );
         if self.text_overlays.layout_editor_preview_active() {
             self.text_overlays
                 .draw_layout_editor_mode_panel(ctx, canvas_rect);
@@ -705,10 +766,15 @@ impl CanvasHooks for TypingHooks<'_> {
                 request,
             );
         }
-        if let Some(export_dir) = self.top_panel.take_export_to_folder_request() {
+        if let Some((export_dir, export_format)) = self.top_panel.take_export_to_folder_request() {
             let mask_snapshot = self.mask_layer.export_masks_snapshot();
-            self.text_overlays
-                .request_export_to_folder(ctx, project, mask_snapshot, export_dir);
+            self.text_overlays.request_export_to_folder(
+                ctx,
+                project,
+                mask_snapshot,
+                export_dir,
+                export_format,
+            );
         }
         if self.top_panel.take_round_text_positions_request() {
             self.text_overlays.round_all_overlay_positions_to_pixels();
@@ -933,6 +999,62 @@ enum TypingCreateImageSource {
     File(PathBuf),
 }
 
+/// In-flight job creating a raster layer from an external image (the new image-add path).
+struct TypingCreateRasterState {
+    rx: Receiver<Result<TypingCreatedRaster, String>>,
+}
+
+/// Worker request to load an external image and persist it as a raster node in `layers.json`.
+struct TypingCreateRasterRequest {
+    layers_dir: PathBuf,
+    /// Committed `layers/` dir; the new staged page is seeded from it so a typeset page keeps its
+    /// committed TEXT (data-safety — see `persist::add_page_raster`).
+    fallback_dir: Option<PathBuf>,
+    page_idx: usize,
+    center_page_px: [f32; 2],
+    source: TypingCreateImageSource,
+}
+
+/// Worker result: the new raster layer was written to disk; the tab reloads the page's raster cache
+/// from disk (authoritative) and selects this uid.
+struct TypingCreatedRaster {
+    page_idx: usize,
+    uid: String,
+}
+
+/// Worker result for a non-destructive raster effects render: the display image to show (the
+/// rendered result, or the untouched base when the chain is empty) plus the chain to persist.
+struct TypingRasterEffectsResult {
+    page_idx: usize,
+    uid: String,
+    /// What to show: the post-effects render, or the original base when `effects` is empty.
+    display_image: ColorImage,
+    /// The effects chain that produced `display_image`.
+    effects: Vec<Value>,
+}
+
+/// Drag of a raster layer on the typing canvas (parity with overlay drag).
+#[derive(Clone)]
+struct TypingRasterDragState {
+    page_idx: usize,
+    raster_idx: usize,
+    mode: TypingRasterDragMode,
+    pointer_start_scene: Pos2,
+    start_transform: crate::models::layer_model::manifest::TransformRec,
+    /// Pointer angle (rad) about the raster center at drag start (rotate mode).
+    start_pointer_angle_rad: f32,
+    /// Deform mesh at drag start (perspective-handle mesh edit). Empty for move/rotate.
+    start_mesh: Option<TypingOverlayDeformMesh>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypingRasterDragMode {
+    Move,
+    Rotate,
+    /// Dragging one of the deform mesh's 4 corner handles (perspective transform mode).
+    PerspectiveHandle(usize),
+}
+
 struct TypingEditOverlayRequest {
     token: u64,
     latest_token: Arc<AtomicU64>,
@@ -949,6 +1071,10 @@ struct TypingEditOverlayResult {
     token: u64,
     overlay_idx: usize,
     file_name: String,
+    // Только для image-эффектов: новое имя исходной картинки (None — эффекты убраны, исходник = `file_name`).
+    image_original_file_name: Option<String>,
+    // Истина, когда результат пришёл из image-effects worker: применяется по своей ветке (allow rename).
+    is_image_effects: bool,
     user_scale: f32,
     rotation_deg: f32,
     render_data_json: Value,
@@ -1001,14 +1127,21 @@ impl Drop for TypingShapeVariantPreviewState {
 }
 
 struct TypingOverlayDecoded {
+    /// Stable cross-session id; mirrored as a node in `layers.json` and as the `uid` key in
+    /// `text_info.json`. Generated on creation or on first load of a pre-uid overlay.
+    uid: String,
     kind: TypingOverlayKind,
     page_idx: usize,
     center_page_px: [f32; 2],
     mask_clip_enabled: bool,
+    /// Индекс слоя текста, в который сгруппирован оверлей (по умолчанию 0).
+    layer_idx: usize,
     user_scale: f32,
     angle_deg: f32,
     deform_mesh: Option<TypingOverlayDeformMesh>,
     file_name: String,
+    // Для image-оверлеев — имя файла исходной (до эффектов) картинки, если эффекты применялись.
+    original_file_name: Option<String>,
     #[allow(dead_code)]
     render_data_json: Option<Value>,
     size_px: [usize; 2],
@@ -1016,15 +1149,50 @@ struct TypingOverlayDecoded {
     warnings: Vec<String>,
 }
 
+/// A read-only PS-editor raster layer cached for display under the text overlays in the typing tab.
+/// Loaded via `crate::models::layer_model::persist::load_page_rasters` for the current page.
+struct TypingRasterLayer {
+    uid: String,
+    name: String,
+    visible: bool,
+    opacity: f32,
+    /// Center cx/cy in page px, rotation in radians, uniform scale (see `TransformRec`).
+    transform: crate::models::layer_model::manifest::TransformRec,
+    /// The DISPLAY image (post-effects render when `effects` is non-empty, else the base).
+    image: ColorImage,
+    /// Base (pre-effects) PNG name, so the effects worker can re-render from the original.
+    base_file: String,
+    /// Non-destructive effects chain (`[{...}]`). Empty = no effects.
+    effects: Vec<Value>,
+    /// Optional mesh-deform grid (cols×rows control points, absolute page px, row-major). When
+    /// present the raster is rendered through this mesh (like a deformed overlay) instead of its
+    /// affine `transform`. `None` = plain affine raster.
+    deform: Option<crate::models::layer_model::manifest::DeformRec>,
+    /// Whether the raster is clipped to the page mask (typing tab). Rasters DEFAULT OFF (text differs).
+    /// Projected from the doc node's `NodeBody::Raster.mask_clip` (`Some(true)` ⇒ on).
+    mask_clip_enabled: bool,
+    /// Cached mask-clipped DISPLAY image, rebuilt when the doc node `generation` (which the mask-clip
+    /// toggle bumps) changes. `None` until first computed / when `mask_clip_enabled` is false.
+    clipped_image: Option<ColorImage>,
+    /// Lazily uploaded on first draw.
+    texture: Option<egui::TextureHandle>,
+}
+
 struct TypingOverlayRuntime {
+    /// Stable cross-session id (see `TypingOverlayDecoded::uid`).
+    uid: String,
     kind: TypingOverlayKind,
     page_idx: usize,
     center_page_px: [f32; 2],
     mask_clip_enabled: bool,
+    /// Индекс слоя текста, в который сгруппирован оверлей (по умолчанию 0).
+    layer_idx: usize,
     user_scale: f32,
     angle_deg: f32,
     deform_mesh: Option<TypingOverlayDeformMesh>,
     file_name: String,
+    // Для image-оверлеев — имя файла исходной (до эффектов) картинки, если эффекты применялись.
+    original_file_name: Option<String>,
     #[allow(dead_code)]
     render_data_json: Option<Value>,
     size_px: [usize; 2],
@@ -1035,25 +1203,71 @@ struct TypingOverlayRuntime {
 }
 
 #[derive(Clone)]
-struct TypingExportOverlaySnapshot {
-    page_idx: usize,
-    center_page_px: [f32; 2],
-    mask_clip_enabled: bool,
-    user_scale: f32,
-    angle_deg: f32,
-    deform_mesh: Option<TypingOverlayDeformMesh>,
-    size_px: [usize; 2],
-    source_rgba: Vec<u8>,
+pub(super) struct TypingExportOverlaySnapshot {
+    pub(super) page_idx: usize,
+    pub(super) center_page_px: [f32; 2],
+    pub(super) mask_clip_enabled: bool,
+    /// Индекс слоя текста, в который сгруппирован оверлей (по умолчанию 0).
+    pub(super) layer_idx: usize,
+    pub(super) user_scale: f32,
+    pub(super) angle_deg: f32,
+    pub(super) deform_mesh: Option<TypingOverlayDeformMesh>,
+    pub(super) size_px: [usize; 2],
+    pub(super) source_rgba: Vec<u8>,
+    pub(super) render_data_json: Option<serde_json::Value>,
+    pub(super) uid: String,
+    /// Unified band-Z captured from the SAME in-memory `bands_by_page`/doc-flattened order the raster
+    /// snapshot uses, so text and rasters interleave consistently in the export (no disk-vs-memory
+    /// divergence). The flatten falls back to a disk band lookup only when no snapshot is provided.
+    pub(super) band_z: u32,
 }
 
-struct TypingExportPageJob {
-    page_idx: usize,
-    page_path: PathBuf,
-    output_path: PathBuf,
-    clean_overlay_path: Option<PathBuf>,
-    clean_overlay_rgba: Option<Arc<image::RgbaImage>>,
-    overlays: Vec<TypingExportOverlaySnapshot>,
-    mask: Option<TypingMaskExportPage>,
+/// A snapshot of one on-screen PS raster layer for export, taken from the doc-projected
+/// `raster_layers_by_page` (the SAME source the live canvas draws) with its unified band-Z. Carrying
+/// this in the export job makes the composite use exactly what the user sees — including in-session
+/// transforms, deform, and effects renders — instead of re-reading `layers.json` from disk, which can
+/// diverge (unflushed edits, a missing `_fx.png` rendered file, or a stale staging manifest) and silently
+/// DROP the raster from the bake.
+#[derive(Clone)]
+pub(super) struct TypingExportRasterSnapshot {
+    pub(super) visible: bool,
+    pub(super) opacity: f32,
+    pub(super) transform: crate::models::layer_model::manifest::TransformRec,
+    pub(super) deform: Option<crate::models::layer_model::manifest::DeformRec>,
+    /// Straight (un-premultiplied) RGBA of the DISPLAY image (post-effects), row-major.
+    pub(super) rgba: Vec<u8>,
+    pub(super) size_px: [usize; 2],
+    /// Unified band-Z, bottom-to-top, for interleaving with text overlays exactly as on-screen.
+    pub(super) band_z: u32,
+    /// Whether the raster is clipped to the page mask (matches the on-screen `clipped_image` path). When
+    /// set, the export composite masks the raster via `export_clip_overlay_rgba_if_needed`, so a
+    /// mask-clipped raster exports clipped (not with pixels outside the mask).
+    pub(super) mask_clip_enabled: bool,
+}
+
+/// Output format chosen in the typing tab "export to folder" flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum TypingExportFormat {
+    #[default]
+    Png,
+    Psd,
+}
+
+pub(super) struct TypingExportPageJob {
+    pub(super) page_idx: usize,
+    pub(super) page_path: PathBuf,
+    pub(super) output_path: PathBuf,
+    pub(super) clean_overlay_path: Option<PathBuf>,
+    pub(super) clean_overlay_rgba: Option<Arc<image::RgbaImage>>,
+    pub(super) overlays: Vec<TypingExportOverlaySnapshot>,
+    /// On-screen PS raster layers snapshotted from the doc projection. When present, the composite uses
+    /// THESE (matching the canvas) instead of re-reading rasters from `layers_primary_dir`. An empty vec
+    /// falls back to the disk read (back-compat).
+    pub(super) rasters: Vec<TypingExportRasterSnapshot>,
+    pub(super) mask: Option<TypingMaskExportPage>,
+    pub(super) export_format: TypingExportFormat,
+    pub(super) layers_primary_dir: Option<PathBuf>,
+    pub(super) layers_fallback_dir: Option<PathBuf>,
 }
 
 struct TypingExportResult {
@@ -1147,11 +1361,13 @@ struct TypingOverlayDragState {
 
 type TypingOverlayLoadResponse = (PathBuf, Result<Vec<TypingOverlayDecoded>, String>);
 
-struct TypingTextOverlayLayer {
+pub(super) struct TypingTextOverlayLayer {
     loaded_project_dir: Option<PathBuf>,
     loaded_text_images_dir: Option<PathBuf>,
     /// Directory where new/edited overlays are written (always the unsaved staging dir).
     text_images_save_dir: Option<PathBuf>,
+    /// Saved (main) text_images dir, used as a read fallback for source PNGs not yet in staging.
+    text_images_fallback_dir: Option<PathBuf>,
     loading_project_dir: Option<PathBuf>,
     loading_text_images_dir: Option<PathBuf>,
     loading_rx: Option<Receiver<TypingOverlayLoadResponse>>,
@@ -1179,6 +1395,10 @@ struct TypingTextOverlayLayer {
     last_load_error: Option<String>,
     selected_overlay_idx: Option<usize>,
     transform_mode_overlay_idx: Option<usize>,
+    /// Raster analogue of `transform_mode_overlay_idx`: the selected raster (index into
+    /// `raster_layers_by_page[page]`) currently in deform/perspective transform mode, if any. Mutually
+    /// exclusive with overlay transform mode.
+    transform_mode_raster_idx: Option<usize>,
     layout_editor: Option<TypingLayoutEditorState>,
     deform_mode: TypingDeformMode,
     frame_handle_side_points: usize,
@@ -1188,10 +1408,68 @@ struct TypingTextOverlayLayer {
     drag_has_changes: bool,
     primary_pointer_targets_overlay_this_frame: bool,
     page_count: usize,
+    /// Page image path per page index (captured at project load), so the page's pixel size can be
+    /// resolved lazily for legacy-overlay uv→px decoding when handing a page to the shared doc.
+    page_image_paths: HashMap<usize, PathBuf>,
+    /// Lazily-cached page pixel sizes `[w, h]` keyed by page index (header-only `image_dimensions`).
+    page_sizes_px: HashMap<usize, [usize; 2]>,
     clean_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
     auto_typing_next_token: u64,
     auto_typing_job: Option<TypingAutoTypingJobState>,
     auto_typing_debug_visual: Option<TypingAutoTypingDebugVisual>,
+    /// Committed (`layers/`) and unsaved (`layers_unsaved/`) dirs for reading PS raster layers,
+    /// captured when a project loads. Used to (re)load `raster_layers` for the current page.
+    layers_primary_dir: Option<PathBuf>,
+    layers_fallback_dir: Option<PathBuf>,
+    /// Read-only PS raster layers per page (bottom-to-top), cached lazily so multi-page scenes do
+    /// not thrash the loader. Cleared on project (re)load and cross-tab reload.
+    raster_layers_by_page: HashMap<usize, Vec<TypingRasterLayer>>,
+    /// Unified per-page Z bands (bottom-to-top), cached lazily alongside `raster_layers_by_page` and
+    /// used to interleave rasters and text/image overlays in one ordered draw pass. Cleared in the
+    /// same places as `raster_layers_by_page`.
+    bands_by_page: HashMap<usize, Vec<crate::models::layer_model::ordering::Band>>,
+    /// Last `LayerDoc::version` this tab projected. Each frame, if the live doc version differs, the
+    /// tab re-projects its current page from the shared doc — the in-memory cross-tab sync. Initialized
+    /// to 0 (a fresh doc) and reconciled by every `sync_from_doc`.
+    last_doc_version: u64,
+    /// In-flight "create external image as a raster layer" job (replaces the old image-overlay path).
+    create_raster_state: Option<TypingCreateRasterState>,
+    /// In-flight "bake effects into the selected raster" job.
+    raster_effects_state: Option<Receiver<Result<TypingRasterEffectsResult, String>>>,
+    /// A raster effects edit that arrived while a render was already in flight. Only the latest is
+    /// kept (newer edits supersede); it is reapplied when the current render completes so the last
+    /// requested effects are never silently dropped (e.g. effecting a second raster right after a
+    /// first). `(page_idx, uid, render_data_json, user_scale, rotation_deg)`.
+    pending_raster_effects: Option<(usize, String, Value, f32, f32)>,
+    /// After a raster is created, select it once the page's raster cache reloads: (page, uid).
+    pending_select_raster_uid: Option<(usize, String)>,
+    /// The selected raster on the current page (index into `raster_layers_by_page[page]`), mutually
+    /// exclusive with `selected_overlay_idx`.
+    selected_raster_idx: Option<usize>,
+    /// Active raster move/rotate/mesh drag, if any.
+    raster_drag_state: Option<TypingRasterDragState>,
+    /// True while a raster drag has produced an unsaved transform change.
+    raster_drag_has_changes: bool,
+    /// Shared unified layer document (app-owned). The single source of truth for per-page layer
+    /// MODEL state; the per-page projections (`raster_layers_by_page`, `overlays`, `bands_by_page`)
+    /// are rebuilt from it by `sync_from_doc`. `None` until `set_layer_doc` is called.
+    layer_doc: Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
+    /// Per (page, raster uid) cache of the doc node `generation` the projected `TypingRasterLayer`'s
+    /// GPU texture was uploaded from. `sync_from_doc` preserves the texture across rebuilds when the
+    /// generation is unchanged, and forces a re-upload (texture = None) when it changed.
+    raster_texture_generations: HashMap<(usize, String), u64>,
+    /// In-flight EAGER chapter migration job (legacy `text_info.json` → inline v3 `layers.json`), run
+    /// once in the background on chapter open. Carries the migration report; on completion the migrated
+    /// doc pages are evicted so both tabs re-project the v3 data. `None` when no migration is running.
+    migration_rx: Option<Receiver<Result<crate::models::layer_model::migrate::MigrationReport, String>>>,
+    /// Pending eager-migration request captured at chapter open; the worker is only STARTED once the
+    /// initial overlay load completes, so it does not race the loader on the overlay PNGs it renames.
+    /// `(committed_layers_dir, legacy_text_images_dir, unsaved_layers_dir, page_paths)`.
+    pending_migration: Option<(PathBuf, PathBuf, PathBuf, Vec<(usize, PathBuf)>)>,
+    /// User-chosen WIDTH (px) of the floating "Слои страницы" panel, persisted across frames/pages.
+    /// Clamped to `>= LAYERS_PANEL_MIN_WIDTH` (the width at which a text preview shows exactly 5 chars).
+    /// Wider → text rows show more preview chars before the trailing dots (min 5).
+    layers_panel_width: f32,
 }
 
 impl Default for TypingTextOverlayLayer {
@@ -1199,6 +1477,7 @@ impl Default for TypingTextOverlayLayer {
         Self {
             loaded_project_dir: None,
             loaded_text_images_dir: None,
+            text_images_fallback_dir: None,
             text_images_save_dir: None,
             loading_project_dir: None,
             loading_text_images_dir: None,
@@ -1227,6 +1506,7 @@ impl Default for TypingTextOverlayLayer {
             last_load_error: None,
             selected_overlay_idx: None,
             transform_mode_overlay_idx: None,
+            transform_mode_raster_idx: None,
             layout_editor: None,
             deform_mode: TypingDeformMode::Perspective,
             frame_handle_side_points: TEXT_OVERLAY_FRAME_HANDLE_SIDE_POINTS_DEFAULT,
@@ -1236,15 +1516,748 @@ impl Default for TypingTextOverlayLayer {
             drag_has_changes: false,
             primary_pointer_targets_overlay_this_frame: false,
             page_count: 0,
+            page_image_paths: HashMap::new(),
+            page_sizes_px: HashMap::new(),
             clean_overlays_model: None,
             auto_typing_next_token: 0,
             auto_typing_job: None,
             auto_typing_debug_visual: None,
+            layers_primary_dir: None,
+            layers_fallback_dir: None,
+            raster_layers_by_page: HashMap::new(),
+            bands_by_page: HashMap::new(),
+            last_doc_version: 0,
+            create_raster_state: None,
+            raster_effects_state: None,
+            pending_raster_effects: None,
+            pending_select_raster_uid: None,
+            selected_raster_idx: None,
+            raster_drag_state: None,
+            raster_drag_has_changes: false,
+            layer_doc: None,
+            raster_texture_generations: HashMap::new(),
+            migration_rx: None,
+            pending_migration: None,
+            layers_panel_width: LAYERS_PANEL_DEFAULT_WIDTH,
         }
     }
 }
 
 impl TypingTextOverlayLayer {
+    /// Stores the app-owned shared unified layer document (see `layer_doc`).
+    fn set_layer_doc(
+        &mut self,
+        doc: std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>,
+    ) {
+        self.layer_doc = Some(doc);
+    }
+
+    /// Flattens the page's unified bands (from `self.bands_by_page`) into one `BandRef` per node,
+    /// bottom-to-top, expanding each `TextGroup` band into its member text overlays as `PinnedText`
+    /// refs sub-ordered by ascending page-Y (lower on the page = lower in the stack), mirroring
+    /// `draw_composite`'s tiebreak and the PS unified order. Used to move a SINGLE text within (or out
+    /// of) its text group: once flattened, every text owns its own pinned band so it can be reordered
+    /// independently. (This is the per-page on-demand pinning the guardrail allows; the `layer_idx`
+    /// grouping axis is untouched for other pages.)
+    fn flatten_page_bands_to_refs(
+        &self,
+        page_idx: usize,
+    ) -> Vec<crate::models::layer_model::persist::BandRef> {
+        use crate::models::layer_model::ordering::Band;
+        use crate::models::layer_model::persist;
+        let Some(bands) = self.bands_by_page.get(&page_idx) else {
+            return Vec::new();
+        };
+        let mut sorted: Vec<&Band> = bands.iter().collect();
+        sorted.sort_by_key(|b| b.z());
+        let mut order: Vec<persist::BandRef> = Vec::new();
+        for band in sorted {
+            match band {
+                Band::Raster { uid, .. } => order.push(persist::BandRef::Raster(uid.clone())),
+                Band::PinnedText { uid, .. } => {
+                    order.push(persist::BandRef::PinnedText(uid.clone()));
+                }
+                Band::TextGroup { member_uids, .. } => {
+                    let mut members = member_uids.clone();
+                    members.sort_by(|a, b| {
+                        let ya = self.overlay_page_y(a);
+                        let yb = self.overlay_page_y(b);
+                        ya.partial_cmp(&yb).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    for uid in members {
+                        order.push(persist::BandRef::PinnedText(uid));
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    /// Page-Y (vertical center) of an overlay by uid, for the page-Y sub-order of a text group.
+    fn overlay_page_y(&self, uid: &str) -> f32 {
+        self.overlays
+            .iter()
+            .find(|o| o.uid == uid)
+            .map_or(0.0, |o| o.center_page_px[1])
+    }
+
+    /// Moves an INDIVIDUAL text/image overlay one step in the page's UNIFIED band-Z order (text +
+    /// raster interleaved), shared with the PS editor. `up` raises it toward the top, `down` lowers it.
+    ///
+    /// Routed exactly like the PS editor's band move: the page's bands are flattened so the target owns
+    /// its own pinned band (a text inside a group is pinned OUT of the group's page-Y auto-order for
+    /// this page only), the target is swapped one step, the new order is persisted via
+    /// `persist::save_page_band_order` (the disk authority for pin + Z — which a later `flush_page_text`
+    /// then PRESERVES via `merge_preserved_text_fields`, so the reorder is never clobbered), and the
+    /// SAME order is mirrored into the shared doc via `set_z_order` so both tabs re-project in step.
+    fn move_overlay_in_unified_z(&mut self, page_idx: usize, overlay_idx: usize, up: bool) {
+        let Some(uid) = self.overlays.get(overlay_idx).map(|o| o.uid.clone()) else {
+            return;
+        };
+        self.move_node_in_unified_z(page_idx, &uid, up);
+    }
+
+    /// Moves a RASTER one step in the page's unified band-Z order (text + raster interleaved). Resolves
+    /// the raster's uid from `raster_layers_by_page[page][raster_idx]` and reuses the shared band-Z core.
+    fn move_raster_in_unified_z(&mut self, page_idx: usize, raster_idx: usize, up: bool) {
+        let Some(uid) = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .and_then(|v| v.get(raster_idx))
+            .map(|l| l.uid.clone())
+        else {
+            return;
+        };
+        self.move_node_in_unified_z(page_idx, &uid, up);
+    }
+
+    /// Uid-based core: moves the node `uid` (a raster or a text/image overlay) one step in the page's
+    /// unified band-Z order. Flattens the page's bands to per-node refs, swaps the target one step with
+    /// its neighbour, persists the new band order via `save_page_band_order` (the disk authority both
+    /// tabs read back), and mirrors the SAME order into the shared doc via `set_z_order`. Shared by the
+    /// overlay and raster reorder entry points.
+    fn move_node_in_unified_z(&mut self, page_idx: usize, uid: &str, up: bool) {
+        use crate::models::layer_model::persist;
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            return;
+        };
+
+        // Flatten to per-node bands, then swap the target one step with its neighbour.
+        let mut order = self.flatten_page_bands_to_refs(page_idx);
+        let Some(i) = order.iter().position(|b| matches!(
+            b,
+            persist::BandRef::PinnedText(u) | persist::BandRef::Raster(u) if u == uid
+        )) else {
+            return;
+        };
+        let j = if up { i + 1 } else { i.wrapping_sub(1) };
+        if (up && j >= order.len()) || (!up && i == 0) {
+            return; // already at the requested end
+        }
+        order.swap(i, j);
+
+        // Persist the new band order (pin + Z) to disk — the authority both tabs read back.
+        match persist::save_page_band_order(&primary, page_idx, &order) {
+            Ok(()) => {
+                // Drop the cached bands so the next projection reloads the new pinned-band order.
+                self.bands_by_page.remove(&page_idx);
+                // Mirror the SAME order into the shared doc so it (and, via its version bump, the PS
+                // tab) re-projects without a disk round-trip.
+                let node_order: Vec<String> = order
+                    .iter()
+                    .filter_map(|b| match b {
+                        persist::BandRef::Raster(u) | persist::BandRef::PinnedText(u) => {
+                            Some(u.clone())
+                        }
+                        persist::BandRef::TextGroup(_) => None,
+                    })
+                    .collect();
+                let routed = self.route_to_doc(page_idx, |doc| {
+                    doc.set_z_order(page_idx, &node_order);
+                });
+                if !routed {
+                    // No doc wired / page not resident: drop the raster cache too so it reloads.
+                    self.raster_layers_by_page.remove(&page_idx);
+                }
+            }
+            Err(e) => crate::runtime_log::log_warn(&format!(
+                "не удалось изменить порядок слоя в общем Z: {e}"
+            )),
+        }
+    }
+
+    /// Once-per-frame check: if the shared `LayerDoc` changed since we last projected (its `version`
+    /// advanced), and we are idle (not loading/saving), re-project the current page from the doc.
+    ///
+    /// The doc is the in-memory source of truth shared with the PS tab, so any edit there (or our own
+    /// that routed through the doc) bumps `version`; we just `sync_from_doc(current_page)` to rebuild
+    /// this tab's projections. This is the in-memory cross-tab sync (no disk reload, no revision Arc).
+    fn maybe_reproject_from_doc_version(&mut self, current_page: usize) {
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        // Don't fight in-flight work; we'll pick the change up on a later frame.
+        if self.loading_rx.is_some()
+            || self.save_rx.is_some()
+            || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
+            || self.edit_render_rx.is_some()
+        {
+            return;
+        }
+        let Ok(guard) = doc.lock() else {
+            return;
+        };
+        if guard.version() == self.last_doc_version {
+            return;
+        }
+        if guard.page(current_page).is_some() {
+            self.sync_from_doc(current_page, &guard);
+        } else {
+            // The current page is not resident (e.g. just evicted by a self-write that will reload it
+            // shortly). Adopt the version so we don't spin; the page-load path re-projects on arrival.
+            self.last_doc_version = guard.version();
+        }
+    }
+
+    /// Page pixel size `[w, h]` for `page_idx`, resolved lazily from the cached page image path
+    /// (header-only `image_dimensions`) and memoized. Used for legacy-overlay uv→px decoding when the
+    /// page is handed to the shared doc. Falls back to `[1, 1]` when unknown.
+    fn page_size_px(&mut self, page_idx: usize) -> [usize; 2] {
+        if let Some(size) = self.page_sizes_px.get(&page_idx) {
+            return *size;
+        }
+        let size = self
+            .page_image_paths
+            .get(&page_idx)
+            .and_then(|path| image::image_dimensions(path).ok())
+            .map(|(w, h)| [w as usize, h as usize])
+            .unwrap_or([1, 1]);
+        self.page_sizes_px.insert(page_idx, size);
+        size
+    }
+
+    /// Pixel sizes for EVERY page of the chapter (memoized via [`Self::page_size_px`]). The shared doc
+    /// needs the full map — not just the loaded page — because the legacy absolute-ribbon migration
+    /// recovers a chapter-wide ribbon scale from every page's aspect ratio.
+    fn page_sizes_map(&mut self) -> HashMap<usize, [usize; 2]> {
+        let pages: Vec<usize> = self.page_image_paths.keys().copied().collect();
+        let mut out = HashMap::with_capacity(pages.len());
+        for idx in pages {
+            out.insert(idx, self.page_size_px(idx));
+        }
+        out
+    }
+
+    /// (Re)loads the read-only PS raster layers for `page_idx` if not already cached for it.
+    fn ensure_raster_layers_for_page(&mut self, page_idx: usize) {
+        if self.raster_layers_by_page.contains_key(&page_idx) {
+            return;
+        }
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            self.raster_layers_by_page.insert(page_idx, Vec::new());
+            self.bands_by_page.insert(page_idx, Vec::new());
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        // Unified per-page Z bands, used to interleave rasters with overlays in one ordered pass.
+        let bands = crate::models::layer_model::persist::load_page_bands(
+            &primary,
+            fallback.as_deref(),
+            page_idx,
+        );
+        self.bands_by_page.insert(page_idx, bands);
+        let loaded = crate::models::layer_model::persist::load_page_rasters(
+            &primary,
+            fallback.as_deref(),
+            page_idx,
+        );
+        let layers = match loaded {
+            Ok(page) => page
+                .layers
+                .into_iter()
+                .map(|l| TypingRasterLayer {
+                    uid: l.uid,
+                    name: l.name,
+                    visible: l.visible,
+                    opacity: l.opacity,
+                    transform: l.transform,
+                    image: l.image,
+                    base_file: l.base_file,
+                    effects: l.effects,
+                    deform: l.deform,
+                    mask_clip_enabled: l.mask_clip.unwrap_or(false),
+                    clipped_image: None,
+                    texture: None,
+                })
+                .collect(),
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "[typing] load PS raster layers for page {page_idx} failed: {err}"
+                ));
+                Vec::new()
+            }
+        };
+        // A just-created raster asked to be selected once its page reloaded — resolve by uid now.
+        if let Some((pending_page, uid)) = self.pending_select_raster_uid.clone()
+            && pending_page == page_idx
+            && let Some(idx) = layers.iter().position(|l| l.uid == uid)
+        {
+            self.selected_raster_idx = Some(idx);
+            self.selected_overlay_idx = None;
+            self.pending_select_raster_uid = None;
+        }
+        self.raster_layers_by_page.insert(page_idx, layers);
+        // The shared unified layer document is the source of truth for layer MODEL state. Ensure the
+        // page is resident, then rebuild the per-page projections (rasters / overlays / bands) from
+        // it, overriding the disk-loaded caches above so both tabs read one model.
+        // Full chapter page sizes: the legacy ribbon migration in the doc needs every page's aspect.
+        let page_sizes = self.page_sizes_map();
+        if let Some(doc) = self.layer_doc.clone()
+            && let Ok(mut doc_guard) = doc.lock()
+        {
+            let _ = doc_guard.ensure_page_loaded(page_idx, &primary, fallback.as_deref(), &page_sizes);
+            self.sync_from_doc(page_idx, &doc_guard);
+        }
+    }
+
+    /// Rebuilds the per-page projections (`raster_layers_by_page`, `overlays`, `bands_by_page`) for
+    /// `page_idx` from the resident `LayerDoc` page, which is the source of truth for MODEL state
+    /// (transform, deform, effects, display pixels, render_data, z, visibility, opacity, group).
+    ///
+    /// Runtime/GPU/UI state is kept LOCAL and matched to nodes by `uid`:
+    /// - Rasters: a fresh `TypingRasterLayer` per doc Raster node; the GPU texture is preserved
+    ///   across rebuilds via `raster_texture_generations` and only dropped (forcing re-upload) when
+    ///   the node's `generation` changed.
+    /// - Overlays: each doc Text node is reconciled onto the existing `TypingOverlayRuntime` with the
+    ///   same uid — its MODEL fields are updated from the node while runtime fields (texture, upload
+    ///   state, payload tracking) are preserved; the GPU texture is re-uploaded only on a generation
+    ///   change. Runtime REMOVAL stays owned by `remove_overlay` / the disk loader, so the projected
+    ///   overlay indices are stable across a sync.
+    /// - Bands: one `Raster`/`PinnedText` band per node, with `z` taken directly from the node.
+    fn sync_from_doc(
+        &mut self,
+        page_idx: usize,
+        doc: &crate::models::layer_model::layer_doc::LayerDoc,
+    ) {
+        use crate::models::layer_model::layer_doc::NodeBody;
+        use crate::models::layer_model::ordering::Band;
+        let Some(page) = doc.page(page_idx) else {
+            return;
+        };
+
+        // --- Rasters: one projected layer per doc Raster node, texture preserved by generation. ---
+        // Capture the OLD positional → uid mapping before the rebuild. `selected_raster_idx`,
+        // `transform_mode_raster_idx`, and `raster_drag_state.raster_idx` are positions into THIS page's
+        // raster list, which `sync_from_doc` rebuilds in z-order every reproject. After a raster reorder
+        // (⬆/⬇, or a PS reorder that reprojects), a positional index would point at a DIFFERENT raster, so
+        // a transform/delete would hit the wrong layer. We resolve each tracked index to its uid here and
+        // remap to the uid's NEW position after the rebuild (clearing it if the raster is gone).
+        let prev_raster_uids: Vec<String> = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .map(|layers| layers.iter().map(|l| l.uid.clone()).collect())
+            .unwrap_or_default();
+        let selected_raster_uid = self
+            .selected_raster_idx
+            .and_then(|i| prev_raster_uids.get(i).cloned());
+        let transform_raster_uid = self
+            .transform_mode_raster_idx
+            .and_then(|i| prev_raster_uids.get(i).cloned());
+        let drag_raster_uid = self
+            .raster_drag_state
+            .as_ref()
+            .and_then(|d| prev_raster_uids.get(d.raster_idx).cloned());
+
+        let mut prev_rasters: HashMap<String, egui::TextureHandle> = self
+            .raster_layers_by_page
+            .remove(&page_idx)
+            .map(|layers| {
+                layers
+                    .into_iter()
+                    .filter_map(|l| l.texture.map(|t| (l.uid, t)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut rasters: Vec<TypingRasterLayer> = Vec::new();
+        for node in &page.nodes {
+            let NodeBody::Raster {
+                display_image,
+                effects,
+                base_file,
+                mask_clip,
+                ..
+            } = &node.body
+            else {
+                continue;
+            };
+            // Preserve the GPU texture when the generation the texture was built from is unchanged. The
+            // mask-clip toggle bumps the node generation, so this invalidates the texture (and the
+            // cached clipped image below) → re-clip + re-upload.
+            let cache_key = (page_idx, node.uid.clone());
+            let gen_unchanged = self.raster_texture_generations.get(&cache_key).copied()
+                == Some(node.generation);
+            let texture = if gen_unchanged {
+                prev_rasters.remove(&node.uid)
+            } else {
+                self.raster_texture_generations
+                    .insert(cache_key, node.generation);
+                None
+            };
+            rasters.push(TypingRasterLayer {
+                uid: node.uid.clone(),
+                name: node.name.clone(),
+                visible: node.visible,
+                opacity: node.opacity,
+                transform: node.transform,
+                image: display_image.clone(),
+                base_file: base_file.clone(),
+                effects: effects.clone(),
+                deform: node.deform.clone(),
+                mask_clip_enabled: mask_clip.unwrap_or(false),
+                // A generation change (e.g. a mask-clip toggle) invalidates the cached clipped image.
+                clipped_image: None,
+                texture,
+            });
+        }
+        // Any textures left in `prev_rasters` belonged to nodes whose generation changed (or which
+        // are gone); they are dropped here, freeing their GPU handles.
+        drop(prev_rasters);
+
+        // Remap the tracked raster indices to their uid's NEW position in the rebuilt z-ordered list, so
+        // a reorder doesn't silently retarget selection / transform / drag to a different raster. Only
+        // touch a field when we resolved a uid for THIS page above (so a selection on another page, or a
+        // freshly-set index, is left alone). A uid that's gone (deleted) clears the field.
+        if let Some(uid) = &selected_raster_uid {
+            self.selected_raster_idx = rasters.iter().position(|l| &l.uid == uid);
+        }
+        if let Some(uid) = &transform_raster_uid {
+            self.transform_mode_raster_idx = rasters.iter().position(|l| &l.uid == uid);
+        }
+        if let Some(uid) = &drag_raster_uid {
+            match rasters.iter().position(|l| &l.uid == uid) {
+                Some(new_idx) => {
+                    if let Some(drag) = self.raster_drag_state.as_mut() {
+                        drag.raster_idx = new_idx;
+                    }
+                }
+                None => self.raster_drag_state = None,
+            }
+        }
+
+        self.raster_layers_by_page.insert(page_idx, rasters);
+
+        // --- Overlays: reconcile-OR-CREATE doc Text nodes onto the local runtimes by uid (this page). ---
+        // The doc is the source of truth for text. For a runtime that already exists (in-session-created,
+        // already-projected, or loaded from legacy `text_info.json`) we reconcile its MODEL fields. For a
+        // doc Text node with NO local runtime we MATERIALIZE one from the node (mirrors PS's
+        // `sync_view_from_doc`). Without this, a MIGRATED chapter — whose `text_info.json` is retired to
+        // `.bak`, so the legacy disk loader populates no `self.overlays` — would show no text in the
+        // typing tab even though PS and the doc carry it. The runtime's deterministic rendered-PNG name
+        // (`text_image_file_name`) is the same the doc's text flush writes, so a later placement-save
+        // round-trips.
+        let mut to_requeue: Vec<usize> = Vec::new();
+        for node in &page.nodes {
+            let NodeBody::Text { render_data, image, mask_clip, .. } = &node.body else {
+                continue;
+            };
+            let center = [node.transform.cx, node.transform.cy];
+            let angle_deg = node.transform.rotation.to_degrees();
+            let user_scale = node.transform.scale;
+            let size_px = image.size;
+            let deform_mesh = node.deform.as_ref().and_then(|d| {
+                TypingOverlayDeformMesh::new(d.cols, d.rows, d.points_px.clone(), size_px)
+            });
+            let render_data_json = if render_data.is_null() {
+                None
+            } else {
+                Some(render_data.clone())
+            };
+
+            let cache_key = (page_idx, node.uid.clone());
+            let existing_idx = self
+                .overlays
+                .iter()
+                .position(|o| o.uid == node.uid && o.page_idx == page_idx);
+
+            match existing_idx {
+                Some(idx) => {
+                    // Reconcile MODEL fields; preserve runtime/payload-tracking fields.
+                    let pixels_changed = self.raster_texture_generations.get(&cache_key).copied()
+                        != Some(node.generation);
+                    let rt = &mut self.overlays[idx];
+                    rt.center_page_px = center;
+                    rt.angle_deg = angle_deg;
+                    rt.user_scale = user_scale;
+                    rt.deform_mesh = deform_mesh;
+                    rt.render_data_json = render_data_json;
+                    if pixels_changed {
+                        rt.size_px = size_px;
+                        rt.source_rgba = color_image_to_rgba(image);
+                        rt.display_texture_stale = true;
+                        self.raster_texture_generations
+                            .insert(cache_key, node.generation);
+                        to_requeue.push(idx);
+                    }
+                }
+                None => {
+                    // CREATE: materialize a runtime from the doc node (migrated-chapter case).
+                    let runtime = text_runtime_from_doc_node(
+                        &node.uid,
+                        page_idx,
+                        center,
+                        user_scale,
+                        angle_deg,
+                        deform_mesh,
+                        mask_clip.unwrap_or(false),
+                        node.text_layer_idx.unwrap_or(0) as usize,
+                        render_data_json,
+                        size_px,
+                        color_image_to_rgba(image),
+                    );
+                    self.overlays.push(runtime);
+                    let idx = self.overlays.len() - 1;
+                    // Mark the texture generation as projected so a subsequent sync doesn't needlessly
+                    // re-upload, and queue this frame's upload so it renders immediately.
+                    self.raster_texture_generations
+                        .insert(cache_key, node.generation);
+                    to_requeue.push(idx);
+                }
+            }
+        }
+        for idx in to_requeue {
+            self.queue_overlay_texture_upload(idx);
+        }
+        // Note: runtime REMOVAL is owned by `remove_overlay` (which also fixes the positional upload
+        // queue + selection indices) and by the disk loader on a full reload; `sync_from_doc` does
+        // not drop runtimes, so the projected overlay indices stay stable across a sync.
+
+        // --- Bands: derive unified Z directly from the doc node z. ---
+        let mut bands: Vec<Band> = Vec::with_capacity(page.nodes.len());
+        for node in &page.nodes {
+            match node.kind {
+                crate::models::layer_model::layer_doc::NodeKind::Raster => {
+                    bands.push(Band::Raster {
+                        uid: node.uid.clone(),
+                        z: node.z,
+                    });
+                }
+                crate::models::layer_model::layer_doc::NodeKind::Text => {
+                    bands.push(Band::PinnedText {
+                        uid: node.uid.clone(),
+                        z: node.z,
+                    });
+                }
+            }
+        }
+        self.bands_by_page.insert(page_idx, bands);
+
+        // A just-created raster asked to be selected once its page synced — resolve by uid now.
+        if let Some((pending_page, uid)) = self.pending_select_raster_uid.clone()
+            && pending_page == page_idx
+            && let Some(idx) = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|ls| ls.iter().position(|l| l.uid == uid))
+        {
+            self.selected_raster_idx = Some(idx);
+            self.selected_overlay_idx = None;
+            self.pending_select_raster_uid = None;
+        }
+
+        // Record the doc version we just projected so the per-frame `maybe_reproject_from_doc_version`
+        // check does not redundantly re-project until the doc changes again.
+        self.last_doc_version = doc.version();
+    }
+
+    /// Routes an edit to the shared `LayerDoc`: locks it, runs `edit` against the resident page (it
+    /// must already be loaded via `ensure_raster_layers_for_page`), then rebuilds the per-page
+    /// projections from the doc with `sync_from_doc`. No-op (returns false) if no doc is wired; the
+    /// caller then keeps its legacy local-cache + disk path. Returns true when the doc handled it.
+    fn route_to_doc<F>(&mut self, page_idx: usize, edit: F) -> bool
+    where
+        F: FnOnce(&mut crate::models::layer_model::layer_doc::LayerDoc),
+    {
+        let Some(doc) = self.layer_doc.clone() else {
+            return false;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return false;
+        };
+        if guard.page(page_idx).is_none() {
+            // The page is not resident in the doc; let the caller fall back to its legacy path.
+            return false;
+        }
+        edit(&mut guard);
+        // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
+        // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
+        guard.mark_changed();
+        self.sync_from_doc(page_idx, &guard);
+        true
+    }
+
+    /// Draws a single cached read-only PS raster layer (by page + index) into `painter`, lazily
+    /// uploading its texture via `ctx`. Uses the same page-px -> scene mapping (`scene_from_page_px`)
+    /// as the text overlays. Visibility/opacity handling matches `draw_page_raster_layers`.
+    fn draw_one_raster_layer(
+        &mut self,
+        ctx: &egui::Context,
+        painter: &egui::Painter,
+        page_idx: usize,
+        raster_idx: usize,
+        image_rect: Rect,
+        zoom: f32,
+    ) {
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|layers| layers.get_mut(raster_idx))
+        else {
+            return;
+        };
+        if !layer.visible || layer.opacity <= 0.0 {
+            return;
+        }
+        let [w, h] = layer.image.size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Use the mask-clipped image when mask-clip is on (precomputed in `prepare_raster_mask_clips`),
+        // else the plain display image.
+        let upload_image = layer
+            .clipped_image
+            .as_ref()
+            .filter(|_| layer.mask_clip_enabled)
+            .unwrap_or(&layer.image)
+            .clone();
+        let texture = layer.texture.get_or_insert_with(|| {
+            ctx.load_texture("typing_ps_raster_layer", upload_image, TextureOptions::LINEAR)
+        });
+        let texture_id = texture.id();
+        // Deformed raster: positioned by its cols×rows mesh (absolute page px), exactly like a
+        // deformed text overlay. The affine transform does not apply while deformed.
+        if let Some(grid) = &layer.deform {
+            if grid.cols >= 2 && grid.rows >= 2 && grid.points_px.len() == grid.cols * grid.rows {
+                let mesh_scene: Vec<Pos2> = grid
+                    .points_px
+                    .iter()
+                    .map(|p| scene_from_page_px(image_rect, zoom, *p))
+                    .collect();
+                draw_textured_deform_mesh(painter, texture_id, &mesh_scene, grid.cols, grid.rows);
+                return;
+            }
+        }
+        // Transform: center in page px, uniform scale, rotation (radians). Corners are the
+        // image quad centered on (cx, cy), scaled and rotated, then mapped page-px -> scene.
+        let cx = layer.transform.cx;
+        let cy = layer.transform.cy;
+        let scale = layer.transform.scale;
+        let (sin_a, cos_a) = layer.transform.rotation.sin_cos();
+        let hw = w as f32 * 0.5 * scale;
+        let hh = h as f32 * 0.5 * scale;
+        // Local corner offsets (top-left, top-right, bottom-right, bottom-left).
+        let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+        let mut quad = [Pos2::ZERO; 4];
+        for (i, (dx, dy)) in corners.iter().enumerate() {
+            let rx = dx * cos_a - dy * sin_a;
+            let ry = dx * sin_a + dy * cos_a;
+            quad[i] = scene_from_page_px(image_rect, zoom, [cx + rx, cy + ry]);
+        }
+        let tint = Color32::from_white_alpha((layer.opacity.clamp(0.0, 1.0) * 255.0) as u8);
+        let mut mesh = Mesh::with_texture(texture.id());
+        let uvs = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+        ];
+        for i in 0..4 {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: quad[i],
+                uv: uvs[i],
+                color: tint,
+            });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Unified band Z for a raster (by uid) on `page_idx`: the Z of the matching `Raster` band, or a
+    /// top-of-stack key (`bands.len()`) for an unsaved raster not yet in the manifest.
+    fn raster_band_z(&self, page_idx: usize, uid: &str) -> u32 {
+        let Some(bands) = self.bands_by_page.get(&page_idx) else {
+            return 0;
+        };
+        for band in bands {
+            if let crate::models::layer_model::ordering::Band::Raster { uid: u, z } = band
+                && u == uid
+            {
+                return *z;
+            }
+        }
+        bands.len() as u32
+    }
+
+    /// Unified band Z for an overlay on `page_idx`: if a `PinnedText` band with `uid` exists, its Z;
+    /// else the Z of the `TextGroup` band whose `layer_idx == layer_idx`; else a top-of-stack key
+    /// (`bands.len()`) for an item not yet in the manifest.
+    fn overlay_band_z(&self, page_idx: usize, uid: &str, layer_idx: usize) -> u32 {
+        use crate::models::layer_model::ordering::Band;
+        let Some(bands) = self.bands_by_page.get(&page_idx) else {
+            return 0;
+        };
+        for band in bands {
+            if let Band::PinnedText { uid: u, z } = band
+                && u == uid
+            {
+                return *z;
+            }
+        }
+        let layer_idx_u32 = u32::try_from(layer_idx).unwrap_or(u32::MAX);
+        for band in bands {
+            if let Band::TextGroup {
+                layer_idx: li, z, ..
+            } = band
+                && *li == layer_idx_u32
+            {
+                return *z;
+            }
+        }
+        bands.len() as u32
+    }
+
+    /// The TOPMOST text/image overlay whose scene quad contains `pointer` on `page_idx`, as
+    /// `(overlay_idx, unified band-Z)`, or `None` if no overlay is under the pointer. Used by the unified
+    /// click hit-test so a raster cannot steal a click that lands on a higher-Z overlay (and vice-versa
+    /// once text can sit below a raster). Mirrors `merged_fills`' overlay band-Z lookup.
+    fn topmost_overlay_at(
+        &self,
+        page_idx: usize,
+        pointer: Option<Pos2>,
+        image_rect: Rect,
+        zoom: f32,
+    ) -> Option<(usize, u32)> {
+        let p = pointer?;
+        let mut best: Option<(usize, u32)> = None;
+        for (idx, overlay) in self.overlays.iter().enumerate() {
+            if overlay.page_idx != page_idx || overlay.texture.is_none() {
+                continue;
+            }
+            let quad = overlay_quad_scene(overlay, image_rect, zoom);
+            if !point_in_quad(p, &quad) {
+                continue;
+            }
+            let z = self.overlay_band_z(page_idx, &overlay.uid, overlay.layer_idx);
+            if best.is_none_or(|(_, bz)| z >= bz) {
+                best = Some((idx, z));
+            }
+        }
+        best
+    }
+
     fn begin_canvas_frame(&mut self) {
         self.primary_pointer_targets_overlay_this_frame = false;
     }
@@ -1401,6 +2414,200 @@ impl TypingTextOverlayLayer {
                         }
                     });
             });
+    }
+
+    /// Task C: compact, collapsible layers list for the current page. Shows the read-only PS raster
+    /// rows (name + visibility) followed by this tab's text/image overlays, which can be reordered
+    /// (up/down) within the page. Reordering rewrites overlay array order, hence persisted z.
+    /// Renders the «Слои» tab BODY (the unified interleaved layer list with per-row ⬆/⬇ move,
+    /// text-preview names, the width-resize, and the 8-row scroll) into the supplied `ui`. The outer
+    /// Area/Frame and the tab header/collapse are provided by the combined Actions/Layers panel (drawn
+    /// from `TypingTopPanelState`). The WIDTH is still user-resizable here and persisted in
+    /// `layers_panel_width`, driving the per-width `max_chars` preview budget. No-op while the layout
+    /// editor is active.
+    /// The current persisted «Слои» list width — lets the combined panel size its Frame so the list's
+    /// inner width-resize can actually widen the panel.
+    pub(super) fn layers_panel_width(&self) -> f32 {
+        self.layers_panel_width
+    }
+
+    pub(super) fn draw_layers_tab_body(&mut self, ui: &mut egui::Ui, page_idx: usize) {
+        if self.layout_editor.is_some() {
+            return;
+        }
+        self.ensure_raster_layers_for_page(page_idx);
+
+        // Indices into `self.overlays` for this page, in array order (== persisted z order).
+        let page_overlay_indices: Vec<usize> = self
+            .overlays
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.page_idx == page_idx)
+            .map(|(i, _)| i)
+            .collect();
+
+        let raster_count = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .map_or(0, Vec::len);
+
+        // Build ONE unified, interleaved row list (text + image overlays + rasters) ordered by unified
+        // band-Z DESCENDING (top of the stack first). Overlay above raster at equal Z (the canvas/hit-test
+        // tie-break). This uses the SAME Z the canvas/hit-test use, so the panel matches what's drawn.
+        let mut row_inputs: Vec<(TypingLayerRow, u32, bool)> = Vec::new();
+        for &ov_idx in &page_overlay_indices {
+            if let Some(o) = self.overlays.get(ov_idx) {
+                let z = self.overlay_band_z(page_idx, &o.uid, o.layer_idx);
+                row_inputs.push((TypingLayerRow::Overlay(ov_idx), z, false));
+            }
+        }
+        for raster_idx in 0..raster_count {
+            if let Some(uid) = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|v| v.get(raster_idx))
+                .map(|l| l.uid.clone())
+            {
+                let z = self.raster_band_z(page_idx, &uid);
+                row_inputs.push((TypingLayerRow::Raster(raster_idx), z, true));
+            }
+        }
+        let ordered_rows = order_unified_layer_rows(row_inputs);
+
+        // A single move per frame across BOTH kinds; the row identity carries the kind.
+        let mut move_row: Option<(TypingLayerRow, bool)> = None;
+        let mut select_overlay: Option<usize> = None;
+        let mut select_raster: Option<usize> = None;
+
+        // Representative glyph width + row height from the current font/spacing (not magic numbers).
+        // egui 0.33's `Fonts*::glyph_width`/`row_height` need a &mut view (only `Painter`/`Ui` text
+        // measuring gives it), so measure a 10-glyph run via a galley and divide.
+        let font_id = egui::TextStyle::Body.resolve(&ui.ctx().style());
+        let probe = ui.ctx().fonts_mut(|f| {
+            f.layout_no_wrap("оооооооооо".to_string(), font_id.clone(), Color32::WHITE)
+        });
+        let char_px = (probe.rect.width() / 10.0).max(1.0);
+        let line_height = probe.rect.height().max(1.0);
+        // A row is a line plus the vertical item spacing between rows.
+        let row_height = (line_height + ui.ctx().style().spacing.item_spacing.y).max(1.0);
+        let list_height = row_height * LAYERS_PANEL_DEFAULT_ROWS as f32;
+
+        // MIN width = overhead + exactly `LAYERS_PANEL_MIN_PREVIEW_CHARS` chars of preview, so at the
+        // narrowest the preview shows 5 chars and the panel can't shrink further. Clamp the persisted
+        // width up to it.
+        let min_width =
+            LAYERS_PANEL_ROW_OVERHEAD_PX + LAYERS_PANEL_MIN_PREVIEW_CHARS as f32 * char_px;
+        if self.layers_panel_width < min_width {
+            self.layers_panel_width = min_width;
+        }
+        let panel_width = self.layers_panel_width;
+        // Preview char budget from the CURRENT width: how many chars fit after the fixed overhead.
+        let max_chars = preview_char_budget(panel_width - LAYERS_PANEL_ROW_OVERHEAD_PX, char_px);
+
+        let mut new_width = panel_width;
+        // Width-only resize for the list; HEIGHT follows content, capped at ~8 rows by the ScrollArea
+        // (`auto_shrink` lets a short list hug). The combined panel's Frame + the «Слои» tab supply the
+        // surrounding chrome.
+        egui::Resize::default()
+            .id_salt("typing_layers_panel_resize")
+            .resizable([true, false])
+            .default_size(egui::vec2(panel_width, 0.0))
+            .min_size(egui::vec2(min_width, 0.0))
+            .show(ui, |ui| {
+                new_width = ui.available_width().max(min_width);
+                egui::ScrollArea::vertical()
+                    .max_height(list_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if ordered_rows.is_empty() {
+                            ui.weak("Нет слоёв на этой странице.");
+                        }
+                        for row in &ordered_rows {
+                            match *row {
+                                TypingLayerRow::Overlay(ov_idx) => {
+                                    let Some(overlay) = self.overlays.get(ov_idx) else {
+                                        continue;
+                                    };
+                                    let label = match overlay.kind {
+                                        TypingOverlayKind::Text => {
+                                            let text = overlay
+                                                .render_data_json
+                                                .as_ref()
+                                                .and_then(|rd| rd.get("text_params"))
+                                                .and_then(|tp| tp.get("text"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            let preview = text_preview_label(text, max_chars);
+                                            if preview.is_empty() {
+                                                "Текст".to_string()
+                                            } else {
+                                                format!("Текст ({preview})")
+                                            }
+                                        }
+                                        TypingOverlayKind::Image => "Картинка".to_string(),
+                                    };
+                                    let selected = self.selected_overlay_idx == Some(ov_idx);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("⬆").clicked() {
+                                            move_row = Some((*row, true));
+                                        }
+                                        if ui.button("⬇").clicked() {
+                                            move_row = Some((*row, false));
+                                        }
+                                        if ui.selectable_label(selected, label).clicked() {
+                                            select_overlay = Some(ov_idx);
+                                        }
+                                    });
+                                }
+                                TypingLayerRow::Raster(raster_idx) => {
+                                    let Some(layer) = self
+                                        .raster_layers_by_page
+                                        .get(&page_idx)
+                                        .and_then(|v| v.get(raster_idx))
+                                    else {
+                                        continue;
+                                    };
+                                    let selected = self.selected_raster_idx == Some(raster_idx);
+                                    let label = format!("🖼 {}", layer.name);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("⬆").clicked() {
+                                            move_row = Some((*row, true));
+                                        }
+                                        if ui.button("⬇").clicked() {
+                                            move_row = Some((*row, false));
+                                        }
+                                        if ui.selectable_label(selected, label).clicked() {
+                                            select_raster = Some(raster_idx);
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    });
+            });
+        // Persist the (clamped) user-chosen width for next frame.
+        self.layers_panel_width = new_width.max(min_width);
+
+        if let Some(idx) = select_overlay {
+            self.selected_overlay_idx = Some(idx);
+            self.selected_raster_idx = None;
+            self.transform_mode_raster_idx = None;
+        }
+        if let Some(idx) = select_raster {
+            self.select_raster(idx);
+        }
+        // Apply at most one Z change per frame, routing by row kind. Both move helpers route through the
+        // shared doc band reorder, so text and rasters interleave correctly. ⬆ raises one step, ⬇ lowers.
+        if let Some((row, up)) = move_row {
+            match row {
+                TypingLayerRow::Overlay(idx) => {
+                    self.move_overlay_in_unified_z(page_idx, idx, up)
+                }
+                TypingLayerRow::Raster(idx) => {
+                    self.move_raster_in_unified_z(page_idx, idx, up)
+                }
+            }
+        }
     }
 
     fn draw_layout_editor_panels(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
@@ -1783,6 +2990,8 @@ impl TypingTextOverlayLayer {
         self.create_status_error = None;
         self.save_rx = None;
         self.save_requested_while_busy = false;
+        self.migration_rx = None;
+        self.pending_migration = None;
         self.export_rx = None;
         self.export_status = TypingExportUiStatus::Hidden;
         self.cancel_active_edit_overlay_render();
@@ -1798,33 +3007,74 @@ impl TypingTextOverlayLayer {
         self.loaded_project_dir = None;
         self.loaded_text_images_dir = None;
 
-        // Saves always go to the unsaved staging dir.
-        self.text_images_save_dir = Some(project.paths.unsaved_text_images_dir.clone());
+        // Text overlays now live in the chapter's `layers/` folder. Saves go to the unsaved
+        // staging `layers/` dir; reads prefer it, then the committed `layers/` dir. Chapters that
+        // predate this move still keep their overlays under the legacy `text_images/` folder, so
+        // that is used as the committed read source until the next save migrates them into
+        // `layers/`. Page masks are a separate store and stay under `text_images/`.
+        let unsaved_layers_dir = project.paths.unsaved_layers_dir.clone();
+        let main_layers_dir = project.paths.layers_dir.clone();
+        let legacy_text_images_dir = project.paths.text_images_dir.clone();
 
-        // For loading: prefer the unsaved dir when its text_info.json exists
-        // (crash-recovery mode), and fall back to individual PNGs from the main dir.
-        let unsaved_text_images_dir = project.paths.unsaved_text_images_dir.clone();
-        let main_text_images_dir = project.paths.text_images_dir.clone();
-        let load_from_unsaved = unsaved_text_images_dir.join(TEXT_INFO_FILE_NAME).is_file();
-        let (primary_load_dir, fallback_load_dir) = if load_from_unsaved {
-            (unsaved_text_images_dir, Some(main_text_images_dir))
+        // Capture the dirs used to read read-only PS raster layers (Task B) and force a reload of
+        // the raster cache for the current page on this project (re)load.
+        self.layers_primary_dir = Some(unsaved_layers_dir.clone());
+        self.layers_fallback_dir = Some(main_layers_dir.clone());
+        self.raster_layers_by_page.clear();
+        self.bands_by_page.clear();
+
+        // Committed (non-staging) read source: migrated chapters have `text_info.json` under
+        // `layers/`; older ones only under the legacy `text_images/` dir. Used as the save-time
+        // fallback for locating original image PNGs.
+        let committed_read_dir = if main_layers_dir.join(TEXT_INFO_FILE_NAME).is_file() {
+            main_layers_dir.clone()
+        } else if legacy_text_images_dir.join(TEXT_INFO_FILE_NAME).is_file() {
+            legacy_text_images_dir.clone()
         } else {
-            (main_text_images_dir, None)
+            main_layers_dir.clone()
         };
+
+        // Saves always go to the unsaved staging dir.
+        self.text_images_save_dir = Some(unsaved_layers_dir.clone());
+        // The committed dir is a read fallback: original image PNGs may still live only there
+        // (including a legacy `text_images/` for not-yet-migrated chapters).
+        self.text_images_fallback_dir = Some(committed_read_dir.clone());
+
+        // Loading reads `text_info.json` from the first candidate that has it, and resolves each
+        // overlay PNG from that dir then every later one. The order — unsaved staging, committed
+        // `layers/`, legacy `text_images/` — means an old chapter's PNGs are still found after its
+        // metadata has migrated into `layers/`.
+        let candidate_dirs = [unsaved_layers_dir, main_layers_dir, legacy_text_images_dir];
+        let primary_idx = candidate_dirs
+            .iter()
+            .position(|d| d.join(TEXT_INFO_FILE_NAME).is_file())
+            .unwrap_or(0);
+        let primary_load_dir = candidate_dirs[primary_idx].clone();
+        let fallback_load_dirs: Vec<PathBuf> = candidate_dirs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != primary_idx)
+            .map(|(_, d)| d.clone())
+            .collect();
 
         let page_paths = project
             .pages
             .iter()
             .map(|page| (page.idx, page.path.clone()))
             .collect::<Vec<_>>();
+        // Cache page image paths for lazy page-pixel-size resolution (legacy overlay uv→px), and drop
+        // any stale sizes from a previous project.
+        self.page_image_paths = page_paths.iter().cloned().collect();
+        self.page_sizes_px.clear();
         let (tx, rx) = mpsc::channel::<TypingOverlayLoadResponse>();
         let project_dir_for_thread = project_dir.clone();
         let primary_load_dir_for_thread = primary_load_dir.clone();
         thread::spawn(move || {
             let page_sizes = load_typing_page_sizes(&page_paths);
+            let fallback_refs: Vec<&Path> = fallback_load_dirs.iter().map(PathBuf::as_path).collect();
             let result = load_typing_overlays_from_dir(
                 &primary_load_dir_for_thread,
-                fallback_load_dir.as_deref(),
+                &fallback_refs,
                 &page_sizes,
             );
             let _ = tx.send((project_dir_for_thread, result));
@@ -1832,6 +3082,108 @@ impl TypingTextOverlayLayer {
         self.loading_project_dir = Some(project_dir);
         self.loading_text_images_dir = Some(primary_load_dir);
         self.loading_rx = Some(rx);
+
+        // EAGER one-shot migration: if this is a legacy chapter (a `text_info.json` not yet fully
+        // inlined into v3 `layers.json`), convert the WHOLE chapter to v3 on disk once, in the
+        // background. Pixels are preserved by renaming the overlay PNGs; `text_info.json` becomes
+        // `.bak` LAST. RECORD the request now (cheap detection); it is STARTED only after the initial
+        // overlay load completes (`poll_loader`), so the migration never races the loader on the
+        // overlay PNGs it renames.
+        use crate::models::layer_model::migrate;
+        self.pending_migration = None;
+        let committed_layers = project.paths.layers_dir.clone();
+        let legacy_text_images = project.paths.text_images_dir.clone();
+        if migrate::chapter_needs_migration(&committed_layers, &legacy_text_images).is_some() {
+            let page_paths = project
+                .pages
+                .iter()
+                .map(|page| (page.idx, page.path.clone()))
+                .collect::<Vec<_>>();
+            self.pending_migration = Some((
+                committed_layers,
+                legacy_text_images,
+                project.paths.unsaved_layers_dir.clone(),
+                page_paths,
+            ));
+        }
+    }
+
+    /// Spawns the eager chapter-migration worker for the `pending_migration` request captured at open.
+    /// Called once the initial overlay load has completed, so the migration (which renames overlay
+    /// PNGs) does not race the loader. The result is polled by `poll_migration`.
+    fn start_pending_migration(&mut self) {
+        use crate::models::layer_model::migrate;
+        if self.migration_rx.is_some() {
+            return;
+        }
+        let Some((committed_layers, legacy_text_images, unsaved_layers, page_paths)) =
+            self.pending_migration.take()
+        else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let page_sizes = load_typing_page_sizes(&page_paths);
+            let result = migrate::migrate_chapter_to_v3(
+                &committed_layers,
+                &legacy_text_images,
+                Some(&unsaved_layers),
+                &page_sizes,
+            );
+            let _ = tx.send(result);
+        });
+        self.migration_rx = Some(rx);
+    }
+
+    /// Polls the eager migration worker. On success, evicts the migrated doc pages so both tabs
+    /// re-project the v3 data; drops the page caches so they reload. Returns true when it completed.
+    fn poll_migration(&mut self) -> bool {
+        let Some(rx) = self.migration_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.migration_rx = None;
+                match result {
+                    Ok(report) => {
+                        if !report.migrated_pages.is_empty() {
+                            crate::runtime_log::log_info(format!(
+                                "[migrate] chapter migrated to v3: {} overlays, {} PNGs renamed, {} missing, {} pages; backup {:?}",
+                                report.migrated_overlays,
+                                report.renamed_pngs,
+                                report.missing_pngs,
+                                report.migrated_pages.len(),
+                                report.backup_path
+                            ));
+                            // Evict the migrated pages from the shared doc so both tabs re-project the
+                            // v3 inline data (the doc version bump drives their per-frame reproject).
+                            if let Some(doc) = self.layer_doc.clone()
+                                && let Ok(mut guard) = doc.lock()
+                            {
+                                for &page in &report.migrated_pages {
+                                    guard.evict_page(page);
+                                }
+                            }
+                            // Drop the local per-page caches so they reload the migrated bands/text.
+                            for &page in &report.migrated_pages {
+                                self.bands_by_page.remove(&page);
+                                self.raster_layers_by_page.remove(&page);
+                            }
+                        }
+                    }
+                    Err(err) => crate::runtime_log::log_warn(format!(
+                        "[migrate] chapter migration failed (will retry on next open, text_info.json intact): {err}"
+                    )),
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.migration_rx = None;
+                crate::runtime_log::log_warn("[migrate] migration worker disconnected".to_string());
+                true
+            }
+        }
     }
 
     fn poll_loader(&mut self) -> bool {
@@ -1846,28 +3198,13 @@ impl TypingTextOverlayLayer {
                 match result {
                     Ok(decoded) => {
                         self.loaded_text_images_dir = self.loading_text_images_dir.take();
-                        self.overlays = decoded
-                            .into_iter()
-                            .map(|entry| TypingOverlayRuntime {
-                                kind: entry.kind,
-                                page_idx: entry.page_idx,
-                                center_page_px: entry.center_page_px,
-                                mask_clip_enabled: entry.mask_clip_enabled,
-                                user_scale: entry.user_scale,
-                                angle_deg: entry.angle_deg,
-                                deform_mesh: entry.deform_mesh,
-                                file_name: entry.file_name,
-                                render_data_json: entry.render_data_json,
-                                size_px: entry.size_px,
-                                source_rgba: entry.rgba,
-                                texture: None,
-                                display_texture_stale: true,
-                                last_texture_used_frame: 0,
-                            })
-                            .collect();
-                        self.pending_upload_indices.clear();
-                        self.pending_upload_set.clear();
-                        for idx in 0..self.overlays.len() {
+                        // MERGE by (uid, page) instead of wholesale-replace, so doc-created runtimes
+                        // (materialized by an early `sync_from_doc` on a MIGRATED chapter, whose loader
+                        // returns an empty set) are NOT wiped on loader completion. See
+                        // `merge_loaded_overlays`. Only the merged-in entries are (re)queued for upload;
+                        // doc-created runtimes keep whatever upload state `sync_from_doc` gave them.
+                        let touched = merge_loaded_overlays(&mut self.overlays, decoded);
+                        for idx in touched {
                             self.queue_overlay_texture_upload(idx);
                         }
                         self.export_rx = None;
@@ -1884,25 +3221,25 @@ impl TypingTextOverlayLayer {
                         self.auto_typing_debug_visual = None;
                     }
                     Err(err) => {
+                        // Do NOT wholesale-clear `overlays` (same class as the merge fix): on a CORRUPT
+                        // / unreadable `text_info.json` the doc-created runtimes are authoritative and
+                        // must survive — clearing would wipe text the user is editing. Just record the
+                        // error and log it; keep the existing runtimes + their upload queue intact.
                         self.loading_text_images_dir = None;
                         self.loaded_text_images_dir = None;
-                        self.overlays.clear();
-                        self.pending_upload_indices.clear();
-                        self.pending_upload_set.clear();
+                        crate::runtime_log::log_warn(format!(
+                            "[typing] overlay load failed (keeping doc-created runtimes): {err}"
+                        ));
                         self.export_rx = None;
                         self.export_status = TypingExportUiStatus::Hidden;
                         self.last_load_error = Some(err);
                         self.cancel_active_edit_overlay_render();
                         self.edit_render_data_dirty = false;
-                        self.last_selected_overlay_idx = None;
-                        self.selected_overlay_idx = None;
-                        self.transform_mode_overlay_idx = None;
-                        self.drag_state = None;
-                        self.drag_has_changes = false;
-                        self.auto_typing_job = None;
-                        self.auto_typing_debug_visual = None;
                     }
                 }
+                // The initial overlay load is done reading `text_info.json` + the overlay PNGs, so it is
+                // now safe to start the eager migration (which renames those PNGs) without a race.
+                self.start_pending_migration();
                 true
             }
             Err(TryRecvError::Empty) => false,
@@ -1966,6 +3303,212 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// Drops the cached raster layers + bands for `page_idx` so they reload from disk (authoritative)
+    /// on the next `ensure_raster_layers_for_page`.
+    fn invalidate_raster_cache_for_page(&mut self, page_idx: usize) {
+        self.raster_layers_by_page.remove(&page_idx);
+        self.bands_by_page.remove(&page_idx);
+        // Evict the page from the shared doc too, so the next `ensure_raster_layers_for_page`
+        // reloads it from disk (where a worker just wrote a new raster) and re-projects.
+        if let Some(doc) = &self.layer_doc
+            && let Ok(mut guard) = doc.lock()
+        {
+            guard.evict_page(page_idx);
+        }
+        // Drop this page's raster texture-generation cache so re-projected nodes re-upload cleanly.
+        self.raster_texture_generations
+            .retain(|(p, _), _| *p != page_idx);
+    }
+
+    /// Polls the "create raster from external image" worker. On success the page's raster cache is
+    /// reloaded from disk and the new raster is selected; the cross-tab revision is bumped (PS picks
+    /// it up). Mirrors `poll_create_overlay_jobs`.
+    fn poll_create_raster_jobs(&mut self, ctx: &egui::Context) -> bool {
+        let recv_result = {
+            let Some(state) = self.create_raster_state.as_ref() else {
+                return false;
+            };
+            match state.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Создание растрового слоя прервано (ошибка канала).".to_string()))
+                }
+            }
+        };
+        let Some(recv_result) = recv_result else {
+            return false;
+        };
+        self.create_raster_state = None;
+        match recv_result {
+            Ok(created) => {
+                self.invalidate_raster_cache_for_page(created.page_idx);
+                self.pending_select_raster_uid = Some((created.page_idx, created.uid));
+                true
+            }
+            Err(err) => {
+                self.set_create_error(ctx, err);
+                true
+            }
+        }
+    }
+
+    /// Applies a scale/rotation edit from the image panel to a raster layer (by uid), persisting the
+    /// transform. Rotation arrives in degrees (panel space) and is converted to radians.
+    fn apply_raster_transform_edit(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        user_scale: f32,
+        rotation_deg: f32,
+    ) {
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|ls| ls.iter_mut().find(|l| l.uid == uid))
+        else {
+            return;
+        };
+        layer.transform.scale = user_scale.clamp(0.05, 20.0);
+        layer.transform.rotation = rotation_deg.to_radians();
+        let transform = layer.transform;
+        self.persist_raster_transform(page_idx, uid, transform);
+    }
+
+    /// Applies an effects edit (non-destructive) from the image panel to a raster: updates the
+    /// transform, then spawns a worker that renders the effects chain from the ORIGINAL base image.
+    /// `poll_raster_effects_jobs` writes the rendered PNG (or clears it) and persists the chain via
+    /// `update_raster_effects`, leaving the base untouched so the effects stay reversible.
+    fn apply_raster_effects_edit(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        render_data_json: &Value,
+        user_scale: f32,
+        rotation_deg: f32,
+    ) {
+        self.apply_raster_transform_edit(page_idx, uid, user_scale, rotation_deg);
+        if self.raster_effects_state.is_some() {
+            // A render is already in flight: stash the latest request (superseding any older
+            // pending one) so `poll_raster_effects_jobs` reapplies it once the current render
+            // finishes. Otherwise this edit would be silently lost — e.g. effecting a second
+            // raster right after a first, leaving the second without its effects on save.
+            self.pending_raster_effects = Some((
+                page_idx,
+                uid.to_string(),
+                render_data_json.clone(),
+                user_scale,
+                rotation_deg,
+            ));
+            return;
+        }
+        let effects: Vec<Value> = render_data_json
+            .get("effects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .and_then(|ls| ls.iter().find(|l| l.uid == uid))
+        else {
+            return;
+        };
+        let base_file = layer.base_file.clone();
+        let uid = uid.to_string();
+        let primary = self.layers_primary_dir.clone();
+        let fallback = self.layers_fallback_dir.clone();
+        let (tx, rx) = mpsc::channel::<Result<TypingRasterEffectsResult, String>>();
+        thread::spawn(move || {
+            let _ = tx.send(render_raster_effects(
+                page_idx, uid, base_file, primary, fallback, effects,
+            ));
+        });
+        self.raster_effects_state = Some(rx);
+    }
+
+    /// Polls the non-destructive raster-effects worker: swaps the cached display image, persists the
+    /// chain (`update_raster_effects` — base untouched), and bumps the cross-tab revision.
+    fn poll_raster_effects_jobs(&mut self, ctx: &egui::Context) -> bool {
+        let recv = {
+            let Some(rx) = self.raster_effects_state.as_ref() else {
+                return false;
+            };
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Эффекты растра прерваны (ошибка канала).".to_string()))
+                }
+            }
+        };
+        let Some(recv) = recv else {
+            return false;
+        };
+        self.raster_effects_state = None;
+        let result = match recv {
+            Ok(r) => r,
+            Err(err) => {
+                self.set_create_error(ctx, err);
+                return true;
+            }
+        };
+
+        // Route the rendered display image + effects chain to the shared doc (the source of truth),
+        // then re-project. `set_effects` bumps the node generation, so `sync_from_doc` re-uploads
+        // the raster texture. Falls back to mutating the local cache directly if no doc is wired.
+        let routed = {
+            let page = result.page_idx;
+            let uid = result.uid.clone();
+            let effects = result.effects.clone();
+            let display = result.display_image.clone();
+            self.route_to_doc(page, move |doc| doc.set_effects(page, &uid, effects, display))
+        };
+        if !routed
+            && let Some(layer) = self
+                .raster_layers_by_page
+                .get_mut(&result.page_idx)
+                .and_then(|ls| ls.iter_mut().find(|l| l.uid == result.uid))
+        {
+            layer.image = result.display_image.clone();
+            layer.effects = result.effects.clone();
+            layer.texture = None; // size may have changed → re-upload on next draw
+        }
+        if let Some(dir) = self.layers_primary_dir.clone() {
+            let rendered = if result.effects.is_empty() {
+                None
+            } else {
+                Some(&result.display_image)
+            };
+            let fallback = self.layers_fallback_dir.clone();
+            if let Err(err) = crate::models::layer_model::persist::update_raster_effects(
+                &dir,
+                result.page_idx,
+                &result.uid,
+                &result.effects,
+                rendered,
+                fallback.as_deref(),
+            ) {
+                crate::runtime_log::log_warn(format!("[typing] persist raster effects: {err}"));
+            }
+        }
+        // Reapply an edit that arrived while this render was in flight, so the last requested
+        // effects (e.g. on a second raster) are not lost. `raster_effects_state` is now `None`,
+        // so this spawns a fresh render instead of re-stashing.
+        if let Some((page_idx, uid, render_data_json, user_scale, rotation_deg)) =
+            self.pending_raster_effects.take()
+        {
+            self.apply_raster_effects_edit(
+                page_idx,
+                &uid,
+                &render_data_json,
+                user_scale,
+                rotation_deg,
+            );
+        }
+        true
+    }
+
     fn poll_edit_overlay_jobs(&mut self, ctx: &egui::Context) -> bool {
         let recv_result = {
             let Some(rx) = self.edit_render_rx.as_ref() else {
@@ -2021,15 +3564,42 @@ impl TypingTextOverlayLayer {
             let Some(overlay) = self.overlays.get_mut(result.overlay_idx) else {
                 return false;
             };
-            if overlay.file_name != result.file_name {
+            if result.is_image_effects {
+                // У image-эффектов имя показываемого файла может смениться (исходник <-> `_fx`),
+                // поэтому идентичность оверлея проверяем по виду, а не по имени файла.
+                if overlay.kind != TypingOverlayKind::Image {
+                    return false;
+                }
+                overlay.file_name = result.file_name;
+                overlay.original_file_name = result.image_original_file_name;
+            } else if overlay.file_name != result.file_name {
                 return false;
             }
 
             overlay.user_scale = result.user_scale.clamp(0.05, 20.0);
             overlay.angle_deg = normalize_angle_deg(result.rotation_deg);
-            overlay.render_data_json = Some(result.render_data_json);
+            overlay.render_data_json = Some(result.render_data_json.clone());
             overlay.size_px = result.size_px;
-            overlay.source_rgba = result.rgba;
+            overlay.source_rgba = result.rgba.clone();
+        }
+        // Route a TEXT overlay's re-render (render_data + rendered image) to the shared doc, the
+        // source of truth for text MODEL state, then re-project. Image-effect overlays are not doc
+        // nodes (they are local image overlays), so they keep only the local runtime mutation above.
+        if !result.is_image_effects
+            && let Some(overlay) = self.overlays.get(result.overlay_idx)
+            && overlay.kind == TypingOverlayKind::Text
+            && overlay.size_px[0] > 0
+            && overlay.size_px[1] > 0
+            && result.rgba.len() == result.size_px[0] * result.size_px[1] * 4
+        {
+            let page_idx = overlay.page_idx;
+            let uid = overlay.uid.clone();
+            let render_data = result.render_data_json.clone();
+            let image =
+                ColorImage::from_rgba_unmultiplied(result.size_px, result.rgba.as_slice());
+            self.route_to_doc(page_idx, move |doc| {
+                doc.set_text_render(page_idx, &uid, render_data, image);
+            });
         }
         self.mark_overlay_pixels_dirty(result.overlay_idx);
         self.edit_render_data_dirty = true;
@@ -2041,19 +3611,60 @@ impl TypingTextOverlayLayer {
         ctx: &egui::Context,
         request: TypingOverlayEditRequest,
     ) {
-        let Some(selected_idx) = self.selected_overlay_idx else {
-            return;
-        };
         match request {
             TypingOverlayEditRequest::ImageTransform {
-                overlay_idx,
+                target,
                 user_scale,
                 rotation_deg,
-            } => {
-                if selected_idx != overlay_idx {
-                    return;
+            } => match target {
+                TypingEditTarget::Raster { page_idx, uid } => {
+                    self.apply_raster_transform_edit(page_idx, &uid, user_scale, rotation_deg);
                 }
-                {
+                TypingEditTarget::Overlay(overlay_idx) => {
+                    if self.selected_overlay_idx != Some(overlay_idx) {
+                        return;
+                    }
+                    {
+                        let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
+                            return;
+                        };
+                        if overlay.kind != TypingOverlayKind::Image {
+                            return;
+                        }
+                        overlay.user_scale = user_scale.clamp(0.05, 20.0);
+                        overlay.angle_deg = normalize_angle_deg(rotation_deg);
+                    }
+                    self.mark_overlay_geometry_changed(overlay_idx, false);
+                    self.request_overlay_placement_save();
+                }
+            },
+            TypingOverlayEditRequest::ImageEffects {
+                target,
+                render_data_json,
+                user_scale,
+                rotation_deg,
+            } => match target {
+                TypingEditTarget::Raster { page_idx, uid } => {
+                    self.apply_raster_effects_edit(
+                        page_idx,
+                        &uid,
+                        &render_data_json,
+                        user_scale,
+                        rotation_deg,
+                    );
+                }
+                TypingEditTarget::Overlay(overlay_idx) => {
+                    // Re-render пишет в неподтверждённую staging-папку.
+                    let Some(text_images_dir) = self.text_images_save_dir.clone() else {
+                        self.set_create_error(
+                            ctx,
+                            "Не найдена папка text_images для редактирования картинки.",
+                        );
+                        return;
+                    };
+                    if self.selected_overlay_idx != Some(overlay_idx) {
+                        return;
+                    }
                     let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
                         return;
                     };
@@ -2062,10 +3673,23 @@ impl TypingTextOverlayLayer {
                     }
                     overlay.user_scale = user_scale.clamp(0.05, 20.0);
                     overlay.angle_deg = normalize_angle_deg(rotation_deg);
+
+                    let edit_request = TypingEditImageEffectsRequest {
+                        token: 0,
+                        latest_token: Arc::clone(&self.edit_render_latest_token),
+                        overlay_idx,
+                        file_name: overlay.file_name.clone(),
+                        original_file_name: overlay.original_file_name.clone(),
+                        text_images_dir,
+                        fallback_text_images_dir: self.text_images_fallback_dir.clone(),
+                        user_scale: overlay.user_scale,
+                        rotation_deg: overlay.angle_deg,
+                        render_data_json,
+                    };
+
+                    self.start_edit_image_effects_render_job(edit_request);
                 }
-                self.mark_overlay_geometry_changed(overlay_idx, false);
-                self.request_overlay_placement_save();
-            }
+            },
             TypingOverlayEditRequest::Text {
                 overlay_idx,
                 render_params,
@@ -2082,7 +3706,7 @@ impl TypingTextOverlayLayer {
                     );
                     return;
                 };
-                if selected_idx != overlay_idx {
+                if self.selected_overlay_idx != Some(overlay_idx) {
                     return;
                 }
                 let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
@@ -2116,6 +3740,16 @@ impl TypingTextOverlayLayer {
         let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
         thread::spawn(move || {
             let result = render_and_store_edited_overlay(request);
+            let _ = tx.send(result);
+        });
+        self.edit_render_rx = Some(rx);
+    }
+
+    fn start_edit_image_effects_render_job(&mut self, mut request: TypingEditImageEffectsRequest) {
+        request.token = self.next_edit_render_token();
+        let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
+        thread::spawn(move || {
+            let result = render_and_store_image_effects_overlay(request);
             let _ = tx.send(result);
         });
         self.edit_render_rx = Some(rx);
@@ -2388,7 +4022,11 @@ impl TypingTextOverlayLayer {
 
         self.save_rx = None;
         match recv_result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                // Our own overlay write to `layers.json` / PNGs completed. The MODEL change already
+                // routed through the shared doc (bumping its version, so the PS tab re-projects); this
+                // job only persisted it to disk, so there is nothing more to signal cross-tab.
+            }
             Ok(Err(err)) | Err(err) => self.set_create_error(ctx, err),
         }
 
@@ -2453,6 +4091,7 @@ impl TypingTextOverlayLayer {
         project: &ProjectData,
         masks_snapshot: HashMap<usize, TypingMaskExportPage>,
         output_dir: PathBuf,
+        export_format: TypingExportFormat,
     ) {
         if self.export_rx.is_some() {
             self.set_create_error(ctx, "Экспорт уже выполняется.");
@@ -2472,19 +4111,72 @@ impl TypingTextOverlayLayer {
             if overlay.source_rgba.len() != overlay.size_px[0] * overlay.size_px[1] * 4 {
                 continue;
             }
+            let band_z = self.overlay_band_z(overlay.page_idx, &overlay.uid, overlay.layer_idx);
             overlays_by_page.entry(overlay.page_idx).or_default().push(
                 TypingExportOverlaySnapshot {
                     page_idx: overlay.page_idx,
                     center_page_px: overlay.center_page_px,
                     mask_clip_enabled: overlay.mask_clip_enabled,
+                    layer_idx: overlay.layer_idx,
                     user_scale: overlay.user_scale,
                     angle_deg: overlay.angle_deg,
                     deform_mesh: overlay.deform_mesh.clone(),
                     size_px: overlay.size_px,
                     source_rgba: overlay.source_rgba.clone(),
+                    render_data_json: overlay.render_data_json.clone(),
+                    uid: overlay.uid.clone(),
+                    band_z,
                 },
             );
         }
+
+        // Bottom-to-top by the UNIFIED manual band-Z (same as the on-screen draw order), so the export
+        // stacks text exactly as shown. (Was the old layer_idx + page-Y auto-order.)
+        for (page, overlays) in overlays_by_page.iter_mut() {
+            overlays.sort_by_key(|o| self.overlay_band_z(*page, &o.uid, o.layer_idx));
+        }
+
+        // Snapshot the on-screen PS raster layers PER PAGE from the doc projection, so the export
+        // composites EXACTLY what the canvas shows (post-effects display image, in-session transform /
+        // deform, band-Z) rather than re-reading `layers.json` from disk — which silently dropped rasters
+        // for the user (missing `_fx.png`, unflushed staging, etc.). `ensure_raster_layers_for_page` is
+        // lazy (only visited pages are projected), so project every export page first.
+        // Projecting every page (`ensure_raster_layers_for_page`) resolves `pending_select_raster_uid`
+        // and would mutate the user's current selection. Triggering an export must NOT change selection,
+        // so snapshot and restore it around the projection loop.
+        let saved_selected_raster = self.selected_raster_idx;
+        let saved_selected_overlay = self.selected_overlay_idx;
+        let saved_pending_select = self.pending_select_raster_uid.clone();
+
+        let mut rasters_by_page = HashMap::<usize, Vec<TypingExportRasterSnapshot>>::new();
+        for page in &project.pages {
+            self.ensure_raster_layers_for_page(page.idx);
+            let Some(layers) = self.raster_layers_by_page.get(&page.idx) else {
+                continue;
+            };
+            if layers.is_empty() {
+                continue;
+            }
+            let snaps: Vec<TypingExportRasterSnapshot> = layers
+                .iter()
+                .map(|l| TypingExportRasterSnapshot {
+                    visible: l.visible,
+                    opacity: l.opacity,
+                    transform: l.transform,
+                    deform: l.deform.clone(),
+                    rgba: color_image_to_rgba(&l.image),
+                    size_px: l.image.size,
+                    band_z: self.raster_band_z(page.idx, &l.uid),
+                    mask_clip_enabled: l.mask_clip_enabled,
+                })
+                .collect();
+            rasters_by_page.insert(page.idx, snaps);
+        }
+
+        // Restore the selection the projection loop may have changed (export is side-effect-free).
+        self.selected_raster_idx = saved_selected_raster;
+        self.selected_overlay_idx = saved_selected_overlay;
+        self.pending_select_raster_uid = saved_pending_select;
 
         let jobs = project
             .pages
@@ -2496,7 +4188,11 @@ impl TypingTextOverlayLayer {
                     .and_then(|s| s.to_str())
                     .unwrap_or("page");
                 let clean_overlay_path = project.paths.clean_layers_dir.join(format!("{stem}.png"));
-                let out_name = format!("{stem}.png");
+                let out_ext = match export_format {
+                    TypingExportFormat::Png => "png",
+                    TypingExportFormat::Psd => "psd",
+                };
+                let out_name = format!("{stem}.{out_ext}");
                 TypingExportPageJob {
                     page_idx: page.idx,
                     page_path: page.path.clone(),
@@ -2504,7 +4200,11 @@ impl TypingTextOverlayLayer {
                     clean_overlay_path: clean_overlay_path.is_file().then_some(clean_overlay_path),
                     clean_overlay_rgba: None,
                     overlays: overlays_by_page.remove(&page.idx).unwrap_or_default(),
+                    rasters: rasters_by_page.remove(&page.idx).unwrap_or_default(),
                     mask: masks_snapshot.get(&page.idx).cloned(),
+                    export_format,
+                    layers_primary_dir: self.layers_primary_dir.clone(),
+                    layers_fallback_dir: self.layers_fallback_dir.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -2529,6 +4229,8 @@ impl TypingTextOverlayLayer {
     fn request_overlay_placement_save(&mut self) {
         if self.save_rx.is_some()
             || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
             || self.edit_render_rx.is_some()
         {
             self.save_requested_while_busy = true;
@@ -2537,43 +4239,169 @@ impl TypingTextOverlayLayer {
         self.spawn_overlay_placement_save();
     }
 
-    fn spawn_overlay_placement_save(&mut self) {
-        // Placement saves always go to the unsaved staging dir.
-        let Some(text_images_dir) = self.text_images_save_dir.clone() else {
+    /// Syncs every text overlay's full MODEL state (geometry + deform + grouping + mask_clip) from the
+    /// local runtimes into its shared-doc Text node, grouped per page so each resident page is synced
+    /// once. Returns the set of pages that carry text (callers flush exactly those). The render image +
+    /// `render_data` are pushed into the doc by `set_text_render` at render time, so this only needs to
+    /// reconcile the placement/grouping fields that drag/group edits change.
+    fn sync_overlay_state_into_doc(&mut self) -> std::collections::BTreeSet<usize> {
+        let mut pages_with_text: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        #[allow(clippy::type_complexity)]
+        let mut state_by_page: HashMap<
+            usize,
+            Vec<(
+                String,
+                crate::models::layer_model::manifest::TransformRec,
+                Option<crate::models::layer_model::manifest::DeformRec>,
+                Option<u32>,
+                Option<bool>,
+            )>,
+        > = HashMap::new();
+        for overlay in &self.overlays {
+            if overlay.kind != TypingOverlayKind::Text {
+                continue;
+            }
+            pages_with_text.insert(overlay.page_idx);
+            let transform = crate::models::layer_model::manifest::TransformRec {
+                cx: overlay.center_page_px[0],
+                cy: overlay.center_page_px[1],
+                rotation: overlay.angle_deg.to_radians(),
+                scale: overlay.user_scale,
+            };
+            let deform = overlay.deform_mesh.as_ref().map(|m| {
+                crate::models::layer_model::manifest::DeformRec {
+                    cols: m.cols,
+                    rows: m.rows,
+                    points_px: m.points_px.clone(),
+                }
+            });
+            state_by_page.entry(overlay.page_idx).or_default().push((
+                overlay.uid.clone(),
+                transform,
+                deform,
+                u32::try_from(overlay.layer_idx).ok(),
+                Some(overlay.mask_clip_enabled),
+            ));
+        }
+        for (page_idx, states) in state_by_page {
+            self.route_to_doc(page_idx, |doc| {
+                for (uid, transform, deform, layer_idx, mask_clip) in &states {
+                    doc.set_transform(page_idx, uid, *transform);
+                    if let Some(node) = doc.node_mut(page_idx, uid) {
+                        node.deform = deform.clone();
+                        node.text_layer_idx = *layer_idx;
+                        if let crate::models::layer_model::layer_doc::NodeBody::Text {
+                            mask_clip: mc,
+                            ..
+                        } = &mut node.body
+                        {
+                            *mc = *mask_clip;
+                        }
+                    }
+                }
+            });
+        }
+        pages_with_text
+    }
+
+    /// Synchronously flushes ONE page's CURRENT doc text to the staging `layers/` dir. Used right before
+    /// creating a raster on `page_idx` so the staged page reflects the doc (including a deleted-last-text
+    /// page → present-but-empty), preventing `add_page_raster`/`ensure_page_staged` from re-seeding stale
+    /// committed text. A no-op if no doc/dir is wired or the page is not resident. The page is flushed
+    /// even when it has zero text — `write_page_text_payload` keeps a previously-existing page
+    /// present-but-empty, making the deletion durable. (`flush_page_text` for an empty page does no PNG
+    /// IO, so this is cheap on the UI thread.)
+    fn flush_target_page_text_to_staging(&mut self, page_idx: usize) {
+        let Some(layers_dir) = self.layers_primary_dir.clone() else {
             return;
         };
+        let fallback_dir = self.layers_fallback_dir.clone();
+        // Reconcile the local overlay placement into the doc first (so the flush writes current state),
+        // then flush only the target page.
+        self.sync_overlay_state_into_doc();
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return;
+        };
+        if let Err(err) = guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref()) {
+            crate::runtime_log::log_warn(format!(
+                "[typing] flush target page {page_idx} text before raster create: {err}"
+            ));
+        }
+    }
 
-        let snapshot = self
-            .overlays
-            .iter()
-            .map(|overlay| {
-                let render_data = if overlay.kind == TypingOverlayKind::Text {
-                    Some(overlay.render_data_json.clone().unwrap_or_else(|| {
-                        default_render_data_for_text("", overlay.size_px[0].max(1) as u32)
-                    }))
-                } else {
-                    None
-                };
-                build_storage_overlay_entry(
-                    overlay.kind,
-                    overlay.page_idx,
-                    overlay.file_name.as_str(),
-                    overlay.center_page_px,
-                    overlay.mask_clip_enabled,
-                    overlay.angle_deg,
-                    overlay.user_scale,
-                    overlay.deform_mesh.clone(),
-                    render_data,
-                )
-            })
-            .collect::<Vec<_>>();
+    fn spawn_overlay_placement_save(&mut self) {
+        // Text persistence is now owned by the shared doc: route each text overlay's MODEL state into
+        // the doc, then flush the doc's INLINE v3 text payload to `layers.json` (staging `layers/`
+        // dir). Nothing writes `text_info.json` anymore — the doc is the sole text writer, mirroring
+        // how rasters persist.
+        let Some(layers_dir) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback_dir = self.layers_fallback_dir.clone();
+        let pages_with_text = self.sync_overlay_state_into_doc();
 
+        // Flush the doc's text payload on a worker thread (PNG re-encode is off the UI thread). The
+        // doc lock is shared via the Arc; `flush_page_text` writes only text nodes, leaving rasters
+        // untouched on disk.
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        let pages: Vec<usize> = pages_with_text.into_iter().collect();
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
-            let result = write_overlay_items_to_text_info(&text_images_dir, &snapshot);
+            let result = (|| {
+                let mut guard = doc.lock().map_err(|_| "doc lock poisoned".to_string())?;
+                for page_idx in pages {
+                    guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref())?;
+                }
+                Ok(())
+            })();
             let _ = tx.send(result);
         });
         self.save_rx = Some(rx);
+    }
+
+    /// Synchronously flushes text into the staging `layers/` dir for EVERY page the shared doc has
+    /// resident (not just pages with typing-tab overlays), so staging is text-complete for every page
+    /// the session loaded — including deletions and pages only PS visited (which load text into the doc
+    /// too). Returns the set of OWNED text pages (the doc-resident pages flushed): the save-to-project
+    /// merge replaces those pages wholesale (authoritative, incl. deletions) and PRESERVES committed
+    /// text for pages NOT in this set (never loaded this session → the session doesn't own their text,
+    /// so a raster-only PS edit must not drop their committed text). Mirrors the PS editor's
+    /// `flush_layers`; best-effort per page.
+    pub fn flush_text_layers(&mut self) -> std::collections::HashSet<usize> {
+        let mut owned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let Some(layers_dir) = self.layers_primary_dir.clone() else {
+            return owned;
+        };
+        let fallback_dir = self.layers_fallback_dir.clone();
+        // Push the live overlay MODEL state into the doc first (geometry/group/mask-clip edits), then
+        // flush EVERY resident doc page's text — not only pages with overlays loaded in this tab.
+        self.sync_overlay_state_into_doc();
+        let Some(doc) = self.layer_doc.clone() else {
+            return owned;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return owned;
+        };
+        for page_idx in guard.resident_pages() {
+            match guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref()) {
+                // Only a SUCCESSFUL flush marks the page owned: the merge then replaces its text
+                // wholesale (incl. deletions). A flush FAILURE leaves the page unowned (fail-safe), so
+                // the merge preserves the committed text rather than dropping it.
+                Ok(()) => {
+                    owned.insert(page_idx);
+                }
+                Err(err) => crate::runtime_log::log_warn(format!(
+                    "[typing] flush text page {page_idx} to layers.json failed: {err}"
+                )),
+            }
+        }
+        owned
     }
 
     fn round_all_overlay_positions_to_pixels(&mut self) {
@@ -2601,6 +4429,8 @@ impl TypingTextOverlayLayer {
         self.create_selection.is_some()
             || self.create_editor.is_some()
             || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
             || ctx.input(|i| i.modifiers.shift)
     }
 
@@ -2647,6 +4477,8 @@ impl TypingTextOverlayLayer {
         if self.loading_rx.is_some()
             || self.create_editor.is_some()
             || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
         {
             return;
         }
@@ -2743,8 +4575,9 @@ impl TypingTextOverlayLayer {
         }
 
         let center_page_px = selection_center_page_px(page_rect, scene_rect, canvas.zoom());
-        let seed_text = pick_bubble_text_for_selection(project, page_idx, scene_rect, page_rect)
-            .unwrap_or_default();
+        let seed_text =
+            pick_bubble_text_for_selection(&project.bubbles, page_idx, scene_rect, page_rect)
+                .unwrap_or_default();
 
         let mut font_family = None;
         let mut font_size_px = 24.0;
@@ -2902,7 +4735,7 @@ impl TypingTextOverlayLayer {
             };
 
         let request = TypingCreateOverlayRequest {
-            text_images_dir: project.paths.unsaved_text_images_dir.clone(),
+            text_images_dir: project.paths.unsaved_layers_dir.clone(),
             page_idx: editor.page_idx,
             center_page_px: editor.center_page_px,
             render_params,
@@ -2928,7 +4761,12 @@ impl TypingTextOverlayLayer {
         center_page_px: [f32; 2],
         request: TypingCreateImageRequest,
     ) {
-        if self.loading_rx.is_some() || self.create_render_state.is_some() {
+        if self.loading_rx.is_some()
+            || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
+            || self.create_raster_state.is_some()
+        {
             self.set_create_error(ctx, "Сначала дождитесь завершения текущей операции.");
             return;
         }
@@ -2941,21 +4779,30 @@ impl TypingTextOverlayLayer {
             TypingCreateImageRequest::FromClipboard => TypingCreateImageSource::Clipboard,
             TypingCreateImageRequest::FromFile(path) => TypingCreateImageSource::File(path),
         };
-        let create_request = TypingCreateImageOverlayRequest {
-            text_images_dir: project.paths.unsaved_text_images_dir.clone(),
+        // DATA-SAFETY (anti-resurrection): the worker's `add_page_raster` seeds an unstaged page from the
+        // COMMITTED manifest (so a typeset page keeps its text — the drop fix). But committed is STALE
+        // w.r.t. an in-session deletion: when the user deleted the page's LAST text, the placement-save
+        // skipped the now-empty page (`pages_with_text` no longer lists it), so the deletion lived only
+        // in the doc. Seeding committed would RESURRECT it. Fix: flush the target page's CURRENT doc text
+        // to staging NOW (main thread, has the doc) — for a deleted-last-text page this writes it
+        // PRESENT-but-EMPTY, so `ensure_page_staged` sees the page present and does NOT seed stale text;
+        // for a typeset page it writes the current text, which the new raster is then added on top of.
+        self.flush_target_page_text_to_staging(target_page_idx);
+
+        // External images now become RASTER layers (in layers.json), not text/image overlays, so
+        // they are first-class in both the typing and PS editor tabs.
+        let create_request = TypingCreateRasterRequest {
+            layers_dir: project.paths.unsaved_layers_dir.clone(),
+            fallback_dir: Some(project.paths.layers_dir.clone()),
             page_idx: target_page_idx,
             center_page_px,
             source,
         };
-        let (tx, rx) = mpsc::channel::<Result<TypingOverlayDecoded, String>>();
+        let (tx, rx) = mpsc::channel::<Result<TypingCreatedRaster, String>>();
         thread::spawn(move || {
-            let result = render_and_store_created_image_overlay(create_request);
-            let _ = tx.send(result);
+            let _ = tx.send(render_and_store_created_raster(create_request));
         });
-        self.create_render_state = Some(TypingCreateRenderState {
-            rx,
-            scene_rect: None,
-        });
+        self.create_raster_state = Some(TypingCreateRasterState { rx });
         self.create_status_error = None;
     }
 
@@ -3025,15 +4872,88 @@ impl TypingTextOverlayLayer {
 
     fn insert_runtime_overlay(&mut self, decoded: TypingOverlayDecoded) {
         let idx = self.overlays.len();
+        // Build the doc Text node for a TEXT overlay (the doc is the source of truth, so it joins the
+        // unified Z stack and re-projects like the rest). Image overlays remain local-only → no node.
+        //
+        // CRITICAL ordering: build the node here, but ADD it to the doc only AFTER the runtime is pushed
+        // into `self.overlays` (below). `route_to_doc` reprojects via `sync_from_doc`, whose CREATE/None
+        // branch MATERIALIZES a runtime for any doc Text node that has no matching local runtime yet. If
+        // we added the node before pushing the runtime, that branch would create a SECOND runtime for the
+        // same uid — a duplicate text layer (one doc-backed, one orphaned). The duplicate is invisible at
+        // create time (both render the same image, perfectly overlapping) but becomes visible on the
+        // first advanced-form apply: `sync_from_doc` reconciles only the FIRST uid match, leaving the
+        // other stuck on the pre-form render.
+        let pending_text_node = if decoded.kind == TypingOverlayKind::Text
+            && decoded.size_px[0] > 0
+            && decoded.size_px[1] > 0
+            && decoded.rgba.len() == decoded.size_px[0] * decoded.size_px[1] * 4
+        {
+            use crate::models::layer_model::layer_doc::{LayerNode, NodeBody, NodeKind};
+            let page_idx = decoded.page_idx;
+            let uid = decoded.uid.clone();
+            let name = decoded
+                .render_data_json
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str)
+                .map(|s| s.chars().take(40).collect::<String>())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Текст".to_string());
+            let transform = crate::models::layer_model::manifest::TransformRec {
+                cx: decoded.center_page_px[0],
+                cy: decoded.center_page_px[1],
+                rotation: decoded.angle_deg.to_radians(),
+                scale: decoded.user_scale,
+            };
+            let deform = decoded.deform_mesh.as_ref().map(|m| {
+                crate::models::layer_model::manifest::DeformRec {
+                    cols: m.cols,
+                    rows: m.rows,
+                    points_px: m.points_px.clone(),
+                }
+            });
+            let image =
+                ColorImage::from_rgba_unmultiplied(decoded.size_px, decoded.rgba.as_slice());
+            let render_data = decoded.render_data_json.clone().unwrap_or(Value::Null);
+            let node = LayerNode {
+                uid: uid.clone(),
+                name,
+                kind: NodeKind::Text,
+                z: 0, // set on top by add_node
+                visible: true,
+                opacity: 1.0,
+                group_uid: None,
+                // The typing tab's «Группа текста N» axis — carried so the doc flush persists it.
+                text_layer_idx: u32::try_from(decoded.layer_idx).ok(),
+                transform,
+                deform,
+                generation: 0,
+                // A freshly rendered overlay: mark dirty so the doc flush writes its rendered PNG.
+                pixels_dirty: true,
+                body: NodeBody::Text {
+                    render_data,
+                    image,
+                    payload_uid: uid,
+                    // Carry the overlay's mask-clip flag so the v3 inline payload persists it.
+                    mask_clip: Some(decoded.mask_clip_enabled),
+                },
+            };
+            Some((page_idx, node))
+        } else {
+            None
+        };
         self.overlays.push(TypingOverlayRuntime {
+            uid: decoded.uid,
             kind: decoded.kind,
             page_idx: decoded.page_idx,
             center_page_px: decoded.center_page_px,
             mask_clip_enabled: decoded.mask_clip_enabled,
+            layer_idx: decoded.layer_idx,
             user_scale: decoded.user_scale,
             angle_deg: decoded.angle_deg,
             deform_mesh: decoded.deform_mesh,
             file_name: decoded.file_name,
+            original_file_name: decoded.original_file_name,
             render_data_json: decoded.render_data_json,
             size_px: decoded.size_px,
             source_rgba: decoded.rgba,
@@ -3041,10 +4961,78 @@ impl TypingTextOverlayLayer {
             display_texture_stale: true,
             last_texture_used_frame: 0,
         });
+        // Now that the runtime is in `self.overlays`, add the doc node. `route_to_doc`'s reproject finds
+        // the runtime by uid and RECONCILES it (no duplicate materialized). See the ordering note above.
+        if let Some((page_idx, node)) = pending_text_node {
+            self.route_to_doc(page_idx, move |doc| {
+                doc.add_node(page_idx, node);
+            });
+        }
         self.queue_overlay_texture_upload(idx);
         self.selected_overlay_idx = Some(idx);
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
+    }
+
+    /// Computes the mask-clipped DISPLAY image for every mask-clip-enabled raster whose clipped image
+    /// is not yet cached, and drops its GPU texture so `draw_one_raster_layer` re-uploads the clipped
+    /// version. Runs before the overlay upload (which already has the mask layer). Mirrors the overlay
+    /// clip path (`clip_overlay_rgba_if_needed` with the layer's deform mesh as page-relative UV; an
+    /// affine raster uses an identity quad mesh derived from its transform).
+    fn prepare_raster_mask_clips(&mut self, mask_layer: &TypingMaskLayer) {
+        let pages: Vec<usize> = self.raster_layers_by_page.keys().copied().collect();
+        for page_idx in pages {
+            let Some(page_size) = mask_layer.page_mask_size(page_idx) else {
+                continue;
+            };
+            let Some(layers) = self.raster_layers_by_page.get_mut(&page_idx) else {
+                continue;
+            };
+            for layer in layers.iter_mut() {
+                if !layer.mask_clip_enabled {
+                    layer.clipped_image = None;
+                    continue;
+                }
+                if layer.clipped_image.is_some() {
+                    continue; // already computed for this generation
+                }
+                let [w, h] = layer.image.size;
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                // Deform mesh in page-relative UV (the raster's mesh, or an identity quad for affine).
+                let mesh = match &layer.deform {
+                    Some(rec) => TypingOverlayDeformMesh::from_deform_rec(rec, page_size),
+                    None => Some(default_deform_mesh_for_page(
+                        [layer.transform.cx, layer.transform.cy],
+                        layer.image.size,
+                        layer.transform.scale,
+                        layer.transform.rotation.to_degrees(),
+                        page_size,
+                    )),
+                };
+                let Some(mesh) = mesh else { continue };
+                let points_uv: Vec<[f32; 2]> = mesh
+                    .points_px
+                    .iter()
+                    .map(|&p| page_px_to_uv(p, page_size))
+                    .collect();
+                let src_rgba = color_image_to_rgba(&layer.image);
+                if let Some(clipped) = mask_layer.clip_overlay_rgba_if_needed(
+                    page_idx,
+                    [w, h],
+                    &src_rgba,
+                    mesh.cols,
+                    mesh.rows,
+                    &points_uv,
+                ) {
+                    layer.clipped_image =
+                        Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &clipped));
+                    // Force re-upload with the clipped pixels.
+                    layer.texture = None;
+                }
+            }
+        }
     }
 
     fn upload_pending_textures(
@@ -3052,6 +5040,7 @@ impl TypingTextOverlayLayer {
         ctx: &egui::Context,
         mask_layer: &TypingMaskLayer,
     ) -> bool {
+        self.prepare_raster_mask_clips(mask_layer);
         let mut uploaded_any = false;
         let mut uploaded_textures = 0usize;
         let mut uploaded_bytes = 0usize;
@@ -3211,6 +5200,24 @@ impl TypingTextOverlayLayer {
         self.drag_state = None;
         self.drag_has_changes = false;
         self.shape_variant_preview = None;
+        self.selected_raster_idx = None;
+        self.transform_mode_raster_idx = None;
+        self.raster_drag_state = None;
+        self.raster_drag_has_changes = false;
+    }
+
+    /// Selects a raster layer for the current page, clearing any overlay selection (one selection at
+    /// a time across the two layer kinds). Selecting a DIFFERENT raster exits raster transform mode.
+    fn select_raster(&mut self, raster_idx: usize) {
+        if self.transform_mode_raster_idx != Some(raster_idx) {
+            self.transform_mode_raster_idx = None;
+        }
+        self.selected_raster_idx = Some(raster_idx);
+        self.selected_overlay_idx = None;
+        self.transform_mode_overlay_idx = None;
+        self.drag_state = None;
+        self.drag_has_changes = false;
+        self.shape_variant_preview = None;
     }
 
     fn has_selected_overlay(&self) -> bool {
@@ -3235,6 +5242,29 @@ impl TypingTextOverlayLayer {
             width_px_hint,
             user_scale: overlay.user_scale,
             rotation_deg: overlay.angle_deg,
+            target: TypingEditTarget::Overlay(overlay_idx),
+        })
+    }
+
+    /// The edit-panel payload for the current selection: a text/image overlay, or — when a raster is
+    /// selected — the raster, shown with the same image UI (scale + rotation + effects, no text).
+    fn selected_item_for_edit(&self, page_idx: usize) -> Option<TypingSelectedOverlayForEdit> {
+        if self.selected_overlay_idx.is_some() {
+            return self.selected_overlay_for_edit();
+        }
+        let raster_idx = self.selected_raster_idx?;
+        let raster = self.raster_layers_by_page.get(&page_idx)?.get(raster_idx)?;
+        Some(TypingSelectedOverlayForEdit {
+            overlay_idx: 0, // unused for a raster target
+            overlay_kind: TypingOverlayKind::Image,
+            render_data_json: Some(serde_json::json!({ "effects": raster.effects.clone() })),
+            width_px_hint: raster.image.size[0] as u32,
+            user_scale: raster.transform.scale,
+            rotation_deg: raster.transform.rotation.to_degrees(),
+            target: TypingEditTarget::Raster {
+                page_idx,
+                uid: raster.uid.clone(),
+            },
         })
     }
 
@@ -3253,6 +5283,13 @@ impl TypingTextOverlayLayer {
         if overlay_idx >= self.overlays.len() {
             return;
         }
+        // Capture the doc-node identity (TEXT overlays only) before removing the runtime, so the
+        // matching node can be dropped from the shared doc afterward.
+        let doc_node = self
+            .overlays
+            .get(overlay_idx)
+            .filter(|o| o.kind == TypingOverlayKind::Text)
+            .map(|o| (o.page_idx, o.uid.clone()));
         self.overlays.remove(overlay_idx);
         self.shape_variant_preview = None;
 
@@ -3296,6 +5333,65 @@ impl TypingTextOverlayLayer {
         }
         self.drag_has_changes = false;
         self.edit_render_data_dirty = false;
+        // Drop the matching node from the shared doc (the source of truth), then re-project bands.
+        if let Some((page_idx, uid)) = doc_node {
+            self.route_to_doc(page_idx, move |doc| {
+                doc.remove_node(page_idx, &uid);
+            });
+        }
+        self.request_overlay_placement_save();
+    }
+
+    /// Removes a raster layer from the current page: drops the doc node (the source of truth), removes
+    /// the cached projection, fixes `selected_raster_idx` / `transform_mode_raster_idx` / drag state,
+    /// frees its texture, and persists. Mirrors `remove_overlay`.
+    fn remove_raster(&mut self, page_idx: usize, raster_idx: usize) {
+        let Some(uid) = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .and_then(|v| v.get(raster_idx))
+            .map(|l| l.uid.clone())
+        else {
+            return;
+        };
+        // Drop the node from the shared doc (its texture goes with the cached layer below).
+        self.route_to_doc(page_idx, |doc| {
+            doc.remove_node(page_idx, &uid);
+        });
+        // Remove the cached projection (its `texture` handle is freed on drop).
+        if let Some(layers) = self.raster_layers_by_page.get_mut(&page_idx) {
+            if raster_idx < layers.len() {
+                layers.remove(raster_idx);
+            }
+        }
+        self.raster_texture_generations
+            .retain(|(p, u), _| !(*p == page_idx && *u == uid));
+        // Fix the selection / transform-mode / drag indices (shift down past the removed one).
+        shift_index_after_remove(&mut self.selected_raster_idx, raster_idx);
+        shift_index_after_remove(&mut self.transform_mode_raster_idx, raster_idx);
+        if let Some(mut state) = self.raster_drag_state.take() {
+            if state.page_idx == page_idx && state.raster_idx == raster_idx {
+                self.raster_drag_state = None;
+                self.raster_drag_has_changes = false;
+            } else {
+                if state.page_idx == page_idx && state.raster_idx > raster_idx {
+                    state.raster_idx -= 1;
+                }
+                self.raster_drag_state = Some(state);
+            }
+        }
+        // Persist: flush the page, explicitly DROPPING the removed raster from the manifest (otherwise
+        // `save_page_rasters` would preserve it as another tab's, and it would resurrect on disk).
+        if let Some(primary) = self.layers_primary_dir.clone() {
+            let fallback = self.layers_fallback_dir.clone();
+            if let Some(doc) = self.layer_doc.clone()
+                && let Ok(mut guard) = doc.lock()
+                && let Err(err) =
+                    guard.flush_page_dropping_raster(page_idx, &primary, fallback.as_deref(), &uid)
+            {
+                crate::runtime_log::log_warn(format!("[typing] persist raster delete: {err}"));
+            }
+        }
         self.request_overlay_placement_save();
     }
 
@@ -3427,6 +5523,795 @@ impl TypingTextOverlayLayer {
             self.request_overlay_placement_save();
             ui.ctx().request_repaint();
         }
+    }
+
+    /// Scale the selected raster with the `-` / `=` / `0` keys (parity with the overlay shortcut).
+    fn try_scale_selected_raster_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
+        if ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let Some(idx) = self.selected_raster_idx else {
+            return;
+        };
+        let (increase, decrease, reset) = ui.ctx().input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Equals)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
+                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Equals),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Minus),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Num0),
+            )
+        });
+        if !increase && !decrease && !reset {
+            return;
+        }
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|v| v.get_mut(idx))
+        else {
+            return;
+        };
+        let prev = layer.transform.scale;
+        if reset {
+            layer.transform.scale = 1.0;
+        } else if increase {
+            layer.transform.scale = (layer.transform.scale * 1.1).clamp(0.05, 20.0);
+        } else if decrease {
+            layer.transform.scale = (layer.transform.scale / 1.1).clamp(0.05, 20.0);
+        }
+        if (layer.transform.scale - prev).abs() <= 1e-6 {
+            return;
+        }
+        let (uid, transform) = (layer.uid.clone(), layer.transform);
+        self.persist_raster_transform(page_idx, &uid, transform);
+        ui.ctx().request_repaint();
+    }
+
+    /// Routes one raster's transform to the shared doc (the cross-tab source of truth) and persists
+    /// it to the unsaved layers dir so it survives reloads / save-to-project.
+    /// Ensures the raster at `raster_idx` has a deform mesh (seeding an identity grid from its current
+    /// affine transform when it has none), so entering perspective transform mode has handles to drag.
+    /// Returns the resulting mesh (resolution-normalized), or `None` if the raster is absent. Mirrors
+    /// `ensure_overlay_deform_mesh`. Pure in-memory on the cached layer; persisted on drag-end.
+    fn ensure_raster_deform_mesh(
+        &mut self,
+        page_idx: usize,
+        raster_idx: usize,
+        image_rect: Rect,
+        zoom: f32,
+    ) -> Option<TypingOverlayDeformMesh> {
+        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let layer = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|v| v.get_mut(raster_idx))?;
+        let mesh = match &layer.deform {
+            Some(rec) => {
+                let m = TypingOverlayDeformMesh::from_deform_rec(rec, page_size)?;
+                normalize_deform_mesh_resolution(&m, page_size)
+            }
+            None => {
+                // Seed an identity grid covering the raster's current affine quad.
+                let m = default_deform_mesh_for_page(
+                    [layer.transform.cx, layer.transform.cy],
+                    layer.image.size,
+                    layer.transform.scale,
+                    layer.transform.rotation.to_degrees(),
+                    page_size,
+                );
+                layer.deform = Some(crate::models::layer_model::manifest::DeformRec {
+                    cols: m.cols,
+                    rows: m.rows,
+                    points_px: m.points_px.clone(),
+                });
+                m
+            }
+        };
+        Some(mesh)
+    }
+
+    fn persist_raster_transform(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        transform: crate::models::layer_model::manifest::TransformRec,
+    ) {
+        let Some(dir) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        // Route the MODEL change to the shared doc: it bumps the doc version (so the PS tab
+        // re-projects) and re-projects this tab's page.
+        let uid_owned = uid.to_string();
+        self.route_to_doc(page_idx, |doc| doc.set_transform(page_idx, &uid_owned, transform));
+        // Persist to disk so the transform survives a reload / save-to-project.
+        if let Err(err) = crate::models::layer_model::persist::update_raster_transform(
+            &dir,
+            page_idx,
+            uid,
+            transform,
+            fallback.as_deref(),
+        ) {
+            crate::runtime_log::log_warn(format!("[typing] persist raster transform: {err}"));
+        }
+    }
+
+    /// Flushes the doc page's RASTER nodes to disk (whole-page `save_page_rasters`), used after a
+    /// raster mask-clip toggle (routed through the doc) so the flag survives a reload / save-to-project.
+    /// `save_page_rasters` carries each raster's `mask_clip`. No-op if the doc/page is not resident.
+    fn persist_current_page_rasters(&mut self, page_idx: usize) {
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return;
+        };
+        if let Err(err) = guard.flush_page(page_idx, &primary, fallback.as_deref()) {
+            crate::runtime_log::log_warn(format!("[typing] persist raster mask-clip: {err}"));
+        }
+    }
+
+    /// Routes a raster's deform mesh (+ its affine transform) to the shared doc and persists both to
+    /// disk. Used by the raster perspective transform mode and by "Сбросить трансформацию" (deform =
+    /// None). The doc is the source of truth, so the PS tab re-projects via its version watch.
+    fn persist_raster_deform(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        transform: crate::models::layer_model::manifest::TransformRec,
+        deform: Option<crate::models::layer_model::manifest::DeformRec>,
+    ) {
+        let Some(dir) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        let uid_owned = uid.to_string();
+        let deform_for_doc = deform.clone();
+        self.route_to_doc(page_idx, |doc| {
+            doc.set_transform(page_idx, &uid_owned, transform);
+            doc.set_deform(page_idx, &uid_owned, deform_for_doc);
+        });
+        if let Err(err) = crate::models::layer_model::persist::update_raster_geometry(
+            &dir,
+            page_idx,
+            uid,
+            transform,
+            deform,
+            fallback.as_deref(),
+        ) {
+            crate::runtime_log::log_warn(format!("[typing] persist raster deform: {err}"));
+        }
+    }
+
+    /// Canvas select + move/rotate drag for raster layers (parity with overlays). Runs after the
+    /// overlay interaction so overlays win pointer ties; draws the selection decoration. The raster
+    /// pixels themselves are drawn in the unified merged-fill pass.
+    fn interact_page_rasters(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_idx: usize,
+        image_rect: Rect,
+        zoom: f32,
+        painter: &egui::Painter,
+    ) {
+        let count = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .map_or(0, |v| v.len());
+        if self.selected_raster_idx.is_some_and(|i| i >= count) {
+            self.selected_raster_idx = None;
+        }
+        if self.transform_mode_raster_idx.is_some_and(|i| i >= count) {
+            self.transform_mode_raster_idx = None;
+        }
+        if self
+            .raster_drag_state
+            .as_ref()
+            .is_some_and(|s| s.page_idx != page_idx || s.raster_idx >= count)
+        {
+            self.raster_drag_state = None;
+            self.raster_drag_has_changes = false;
+        }
+
+        // Drag-end: persist the final geometry (transform, and the mesh for a perspective edit).
+        let primary_down = ui.input(|i| i.pointer.primary_down());
+        if !primary_down
+            && let Some(state) = self.raster_drag_state.take()
+        {
+            if self.raster_drag_has_changes
+                && let Some(layer) = self
+                    .raster_layers_by_page
+                    .get(&state.page_idx)
+                    .and_then(|v| v.get(state.raster_idx))
+            {
+                let (uid, transform, deform) =
+                    (layer.uid.clone(), layer.transform, layer.deform.clone());
+                if matches!(state.mode, TypingRasterDragMode::PerspectiveHandle(_)) {
+                    self.persist_raster_deform(state.page_idx, &uid, transform, deform);
+                } else {
+                    self.persist_raster_transform(state.page_idx, &uid, transform);
+                }
+            }
+            self.raster_drag_has_changes = false;
+        }
+        if count == 0 {
+            return;
+        }
+
+        // Deferred menu actions (set inside the menu closure, applied after this method).
+        let mut menu_enter_transform: Option<usize> = None;
+        let mut menu_exit_transform = false;
+        let mut menu_reset_transform: Option<usize> = None;
+        let mut menu_toggle_mask_clip: Option<usize> = None;
+        let mut menu_move_z: Option<(usize, bool)> = None;
+        let mut menu_delete: Option<usize> = None;
+
+        // === Perspective transform mode: edit the selected raster's deform mesh corners. ===
+        if let Some(sel) = self.transform_mode_raster_idx {
+            let mesh = self.ensure_raster_deform_mesh(page_idx, sel, image_rect, zoom);
+            let deform = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|v| v.get(sel))
+                .and_then(|l| l.deform.clone());
+            if let (Some(_), Some(deform)) = (mesh, deform)
+                && let Some(corners) = deform_mesh_corners_scene(&deform, image_rect, zoom)
+            {
+                let pointer = ui.ctx().pointer_latest_pos();
+                let interact_rect = egui::Rect::from_points(&corners).expand(
+                    TEXT_OVERLAY_TRANSFORM_HANDLE_RADIUS_PX * 2.0 + 2.0,
+                );
+                let resp = ui.interact(
+                    interact_rect,
+                    egui::Id::new(("typing_raster_xform", page_idx, sel)),
+                    egui::Sense::click_and_drag(),
+                );
+                // Start a corner-handle drag.
+                if self.raster_drag_state.is_none()
+                    && resp.drag_started()
+                    && let Some(p) = pointer
+                    && let Some(handle_idx) = hit_test_transform_handle(p, &corners)
+                {
+                    let page_size = page_size_from_image_rect(image_rect, zoom);
+                    let start_mesh =
+                        TypingOverlayDeformMesh::from_deform_rec(&deform, page_size);
+                    let start_transform = self
+                        .raster_layers_by_page
+                        .get(&page_idx)
+                        .and_then(|v| v.get(sel))
+                        .map(|l| l.transform)
+                        .unwrap_or(crate::models::layer_model::manifest::TransformRec {
+                            cx: 0.0,
+                            cy: 0.0,
+                            rotation: 0.0,
+                            scale: 1.0,
+                        });
+                    self.raster_drag_state = Some(TypingRasterDragState {
+                        page_idx,
+                        raster_idx: sel,
+                        mode: TypingRasterDragMode::PerspectiveHandle(handle_idx),
+                        pointer_start_scene: p,
+                        start_transform,
+                        start_pointer_angle_rad: 0.0,
+                        start_mesh,
+                    });
+                    self.raster_drag_has_changes = false;
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                }
+                // Continue the corner drag.
+                if let Some(state) = self.raster_drag_state.clone()
+                    && state.raster_idx == sel
+                    && matches!(state.mode, TypingRasterDragMode::PerspectiveHandle(_))
+                    && (resp.dragged() || primary_down)
+                    && let Some(p) = pointer
+                {
+                    self.apply_raster_drag(&state, p, image_rect, zoom);
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                }
+                self.raster_context_menu(
+                    &resp,
+                    page_idx,
+                    sel,
+                    true,
+                    &mut menu_enter_transform,
+                    &mut menu_exit_transform,
+                    &mut menu_reset_transform,
+                    &mut menu_toggle_mask_clip,
+                    &mut menu_move_z,
+                    &mut menu_delete,
+                );
+
+                // Decoration: deformed mesh wireframe outline + corner handles.
+                let scene_pts = deform_mesh_scene_points(&deform, image_rect, zoom);
+                draw_textured_deform_mesh_wire(painter, &scene_pts, deform.cols, deform.rows);
+                draw_perspective_handles(painter, &corners);
+            }
+            self.apply_raster_menu_actions(
+                page_idx,
+                image_rect,
+                zoom,
+                menu_enter_transform,
+                menu_exit_transform,
+                menu_reset_transform,
+                menu_toggle_mask_clip,
+                menu_move_z,
+                menu_delete,
+            );
+            return;
+        }
+
+        // === Normal mode: move / rotate drag + selection + context menu. ===
+        // Scene quads + centers for this page's rasters.
+        let entries: Vec<(usize, [Pos2; 4], Pos2)> = (0..count)
+            .filter_map(|i| {
+                let l = self.raster_layers_by_page.get(&page_idx)?.get(i)?;
+                let quad = raster_quad_scene(&l.transform, l.image.size, image_rect, zoom);
+                let center = scene_from_page_px(image_rect, zoom, [l.transform.cx, l.transform.cy]);
+                Some((i, quad, center))
+            })
+            .collect();
+        let pointer = ui.ctx().pointer_latest_pos();
+
+        // === Unified topmost-at-pointer gate (text vs raster) ===
+        // The raster interaction runs AFTER the overlay pass, and egui gives the LATER-registered widget
+        // the click — so without this a raster would steal a click that lands on a higher-Z text overlay.
+        // Decide the winner by UNIFIED band-Z (same axis as the draw order): if a TEXT overlay is on top
+        // at the pointer, claim the click for overlays (`primary_pointer_targets_overlay_this_frame`) so
+        // the raster pass below gates out. If a RASTER is on top (text now allowed BELOW a raster), do
+        // NOT set the overlay gate, so the raster pass can take it. Skipped during an active drag (the
+        // drag owns the pointer) and when an overlay already claimed the click this frame.
+        if self.raster_drag_state.is_none() && !self.primary_pointer_targets_overlay_this_frame {
+            let topmost_raster_z = topmost_raster_target(&entries, pointer, image_rect, None)
+                .and_then(|(idx, _, _, _)| {
+                    self.raster_layers_by_page
+                        .get(&page_idx)
+                        .and_then(|v| v.get(idx))
+                        .map(|l| self.raster_band_z(page_idx, &l.uid))
+                });
+            let topmost_overlay = self.topmost_overlay_at(page_idx, pointer, image_rect, zoom);
+            if unified_topmost_pointer_target(topmost_overlay.map(|(_, z)| z), topmost_raster_z)
+                == TypingPointerTarget::Overlay
+            {
+                // A higher-or-equal-Z overlay is on top. Gate the raster pass so it can't steal the
+                // click. egui awarded the click to the later-registered raster widget (so the overlay
+                // pass's `.clicked()` did NOT fire) — so on a primary click here, SELECT the winning
+                // overlay directly, matching the visual top. (Click already routed to the raster by egui,
+                // so this is the only place the overlay can claim it.)
+                self.primary_pointer_targets_overlay_this_frame = true;
+                if let Some((overlay_idx, _)) = topmost_overlay {
+                    let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
+                    if primary_clicked && self.selected_overlay_idx != Some(overlay_idx) {
+                        self.selected_overlay_idx = Some(overlay_idx);
+                        self.selected_raster_idx = None;
+                        self.transform_mode_raster_idx = None;
+                    }
+                }
+            }
+        }
+
+        if let Some(state) = self.raster_drag_state.clone() {
+            // Continue an active drag (same Id keeps egui's drag association). This owns the selected
+            // raster's `("typing_raster", page_idx, raster_idx)` Id for the frame, so the branches below
+            // must NOT also create a resp for it.
+            if let Some((_, quad, _)) = entries.iter().find(|(i, _, _)| *i == state.raster_idx) {
+                let resp = ui.interact(
+                    egui::Rect::from_points(quad),
+                    egui::Id::new(("typing_raster", page_idx, state.raster_idx)),
+                    egui::Sense::click_and_drag(),
+                );
+                if (resp.dragged() || primary_down)
+                    && let Some(p) = pointer
+                {
+                    self.apply_raster_drag(&state, p, image_rect, zoom);
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                }
+                // Keep the menu attached to the selected raster's resp even mid-drag, so it persists.
+                self.raster_context_menu(
+                    &resp,
+                    page_idx,
+                    state.raster_idx,
+                    false,
+                    &mut menu_enter_transform,
+                    &mut menu_exit_transform,
+                    &mut menu_reset_transform,
+                    &mut menu_toggle_mask_clip,
+                    &mut menu_move_z,
+                    &mut menu_delete,
+                );
+            }
+        } else {
+            // No active drag. Two independent responses are created (distinct Ids):
+            //   (1) the SELECTED raster's resp UNCONDITIONALLY every frame — so its context menu stays
+            //       open regardless of pointer position (mirrors transform-mode and text overlays); and
+            //   (2) the topmost NON-selected raster under the pointer (a hit-test), so a first
+            //       right/left click selects it and opens its menu immediately.
+            // Tie gating with overlays is preserved: when an overlay claimed the pointer this frame
+            // (`primary_pointer_targets_overlay_this_frame`), we still CREATE the selected raster's resp
+            // and attach the menu (so it persists), but we DON'T run its click/drag handling.
+            let gated = self.primary_pointer_targets_overlay_this_frame;
+
+            // (1) Selected raster: unconditional resp + menu.
+            if let Some(sel) = self.selected_raster_idx
+                && let Some((_, sel_quad, sel_center)) =
+                    entries.iter().find(|(i, _, _)| *i == sel).copied()
+            {
+                let resp = ui.interact(
+                    egui::Rect::from_points(&sel_quad),
+                    egui::Id::new(("typing_raster", page_idx, sel)),
+                    egui::Sense::click_and_drag(),
+                );
+                if !gated {
+                    let on_rotate = pointer.is_some_and(|p| {
+                        let (_, handle) = rotation_handle_scene_with_corner(&sel_quad, image_rect);
+                        p.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0
+                    });
+                    let over = pointer
+                        .is_some_and(|p| point_in_quad(p, &sel_quad) || on_rotate);
+                    if over && (resp.clicked() || resp.secondary_clicked()) {
+                        // Already selected; just claim the click so the deselect-on-empty doesn't fire.
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                    if over
+                        && resp.drag_started()
+                        && let Some(p) = pointer
+                        && let Some(start_transform) = self
+                            .raster_layers_by_page
+                            .get(&page_idx)
+                            .and_then(|v| v.get(sel))
+                            .map(|l| l.transform)
+                    {
+                        self.raster_drag_state = Some(TypingRasterDragState {
+                            page_idx,
+                            raster_idx: sel,
+                            mode: if on_rotate {
+                                TypingRasterDragMode::Rotate
+                            } else {
+                                TypingRasterDragMode::Move
+                            },
+                            pointer_start_scene: p,
+                            start_transform,
+                            start_pointer_angle_rad: pointer_angle_rad(sel_center, p),
+                            start_mesh: None,
+                        });
+                        self.raster_drag_has_changes = false;
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                }
+                self.raster_context_menu(
+                    &resp,
+                    page_idx,
+                    sel,
+                    false,
+                    &mut menu_enter_transform,
+                    &mut menu_exit_transform,
+                    &mut menu_reset_transform,
+                    &mut menu_toggle_mask_clip,
+                    &mut menu_move_z,
+                    &mut menu_delete,
+                );
+            }
+
+            // (2) Non-selected rasters: topmost hit-test (skips the selected idx → no duplicate Id).
+            if !self.primary_pointer_targets_overlay_this_frame {
+                let target = topmost_raster_target(
+                    &entries,
+                    pointer,
+                    image_rect,
+                    self.selected_raster_idx,
+                );
+                if let Some((idx, quad, center, on_rotate)) = target {
+                    let resp = ui.interact(
+                        egui::Rect::from_points(&quad),
+                        egui::Id::new(("typing_raster", page_idx, idx)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if resp.clicked() {
+                        self.select_raster(idx);
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                    // Right-click selects the raster (mirror the overlay menu), then opens the menu.
+                    if resp.secondary_clicked() {
+                        self.select_raster(idx);
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                    if resp.drag_started()
+                        && let Some(p) = pointer
+                        && let Some(start_transform) = self
+                            .raster_layers_by_page
+                            .get(&page_idx)
+                            .and_then(|v| v.get(idx))
+                            .map(|l| l.transform)
+                    {
+                        self.select_raster(idx);
+                        self.raster_drag_state = Some(TypingRasterDragState {
+                            page_idx,
+                            raster_idx: idx,
+                            mode: if on_rotate {
+                                TypingRasterDragMode::Rotate
+                            } else {
+                                TypingRasterDragMode::Move
+                            },
+                            pointer_start_scene: p,
+                            start_transform,
+                            start_pointer_angle_rad: pointer_angle_rad(center, p),
+                            start_mesh: None,
+                        });
+                        self.raster_drag_has_changes = false;
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
+                    self.raster_context_menu(
+                        &resp,
+                        page_idx,
+                        idx,
+                        false,
+                        &mut menu_enter_transform,
+                        &mut menu_exit_transform,
+                        &mut menu_reset_transform,
+                        &mut menu_toggle_mask_clip,
+                        &mut menu_move_z,
+                        &mut menu_delete,
+                    );
+                }
+            }
+        }
+
+        // Deselect when clicking empty image area (no raster and no overlay targeted this frame).
+        if self.selected_raster_idx.is_some()
+            && self.raster_drag_state.is_none()
+            && !self.primary_pointer_targets_overlay_this_frame
+        {
+            let clicked_empty = ui.input(|i| {
+                i.pointer.primary_clicked()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| image_rect.contains(p))
+            }) && !ui.ctx().is_pointer_over_area();
+            if clicked_empty {
+                self.selected_raster_idx = None;
+                self.transform_mode_raster_idx = None;
+            }
+        }
+
+        // Selection decoration (dashed boundary + rotate handle).
+        if let Some(sel) = self.selected_raster_idx
+            && let Some((_, quad, _)) = entries.iter().find(|(i, _, _)| *i == sel)
+        {
+            let path = [quad[0], quad[1], quad[2], quad[3], quad[0]];
+            draw_dashed_selection_path(painter, &path);
+            draw_rotation_handle(painter, quad, image_rect);
+        }
+
+        self.apply_raster_menu_actions(
+            page_idx,
+            image_rect,
+            zoom,
+            menu_enter_transform,
+            menu_exit_transform,
+            menu_reset_transform,
+            menu_toggle_mask_clip,
+            menu_move_z,
+            menu_delete,
+        );
+    }
+
+    /// Attaches the raster context menu to `resp`, recording chosen actions into the deferred `out_*`
+    /// slots (applied after the closure by `apply_raster_menu_actions`, avoiding mid-closure mutation).
+    /// `is_transform_mode` toggles the enter/exit/reset items. Mirrors the text-overlay canvas menu.
+    #[allow(clippy::too_many_arguments)]
+    fn raster_context_menu(
+        &self,
+        resp: &egui::Response,
+        _page_idx: usize,
+        idx: usize,
+        is_transform_mode: bool,
+        out_enter_transform: &mut Option<usize>,
+        out_exit_transform: &mut bool,
+        out_reset_transform: &mut Option<usize>,
+        out_toggle_mask_clip: &mut Option<usize>,
+        out_move_z: &mut Option<(usize, bool)>,
+        out_delete: &mut Option<usize>,
+    ) {
+        let mask_clip_on = self
+            .raster_layers_by_page
+            .get(&_page_idx)
+            .and_then(|v| v.get(idx))
+            .map(|l| l.mask_clip_enabled)
+            .unwrap_or(false);
+        resp.context_menu(|menu_ui| {
+            if self.selected_raster_idx != Some(idx) {
+                menu_ui.label("Выделите слой ЛКМ.");
+                return;
+            }
+            if !is_transform_mode {
+                if menu_ui.button("Войти в режим трансформации").clicked() {
+                    *out_enter_transform = Some(idx);
+                    menu_ui.close();
+                }
+            } else {
+                if menu_ui.button("Выйти из режима трансформации").clicked() {
+                    *out_exit_transform = true;
+                    menu_ui.close();
+                }
+                if menu_ui.button("Сбросить трансформацию").clicked() {
+                    *out_reset_transform = Some(idx);
+                    menu_ui.close();
+                }
+            }
+            menu_ui.separator();
+            let toggle_label = if mask_clip_on {
+                "Выключить обрезание маской"
+            } else {
+                "Включить обрезание маской"
+            };
+            if menu_ui.button(toggle_label).clicked() {
+                *out_toggle_mask_clip = Some(idx);
+                menu_ui.close();
+            }
+            menu_ui.separator();
+            menu_ui.horizontal(|row| {
+                row.label("Порядок");
+                if row.button("▲").clicked() {
+                    *out_move_z = Some((idx, true));
+                }
+                if row.button("▼").clicked() {
+                    *out_move_z = Some((idx, false));
+                }
+            });
+            menu_ui.separator();
+            if menu_ui.button("Удалить слой").clicked() {
+                *out_delete = Some(idx);
+                menu_ui.close();
+            }
+        });
+    }
+
+    /// Applies the deferred raster context-menu actions captured by `raster_context_menu`.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_raster_menu_actions(
+        &mut self,
+        page_idx: usize,
+        image_rect: Rect,
+        zoom: f32,
+        enter_transform: Option<usize>,
+        exit_transform: bool,
+        reset_transform: Option<usize>,
+        toggle_mask_clip: Option<usize>,
+        move_z: Option<(usize, bool)>,
+        delete: Option<usize>,
+    ) {
+        if let Some(idx) = enter_transform {
+            // Seed the mesh (if absent) and enter perspective transform mode.
+            if self.ensure_raster_deform_mesh(page_idx, idx, image_rect, zoom).is_some() {
+                self.transform_mode_raster_idx = Some(idx);
+                self.deform_mode = TypingDeformMode::Perspective;
+                self.raster_drag_state = None;
+                self.raster_drag_has_changes = false;
+                // Persist the seeded mesh so it survives without a drag.
+                if let Some(layer) = self
+                    .raster_layers_by_page
+                    .get(&page_idx)
+                    .and_then(|v| v.get(idx))
+                {
+                    let (uid, transform, deform) =
+                        (layer.uid.clone(), layer.transform, layer.deform.clone());
+                    self.persist_raster_deform(page_idx, &uid, transform, deform);
+                }
+            }
+        }
+        if exit_transform {
+            self.transform_mode_raster_idx = None;
+            self.raster_drag_state = None;
+            self.raster_drag_has_changes = false;
+        }
+        if let Some(idx) = reset_transform {
+            // Clear the deform (back to plain affine), persist, exit transform mode.
+            if let Some(layer) = self
+                .raster_layers_by_page
+                .get_mut(&page_idx)
+                .and_then(|v| v.get_mut(idx))
+            {
+                layer.deform = None;
+            }
+            if let Some(layer) = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|v| v.get(idx))
+            {
+                let (uid, transform) = (layer.uid.clone(), layer.transform);
+                self.persist_raster_deform(page_idx, &uid, transform, None);
+            }
+            self.transform_mode_raster_idx = None;
+            self.raster_drag_state = None;
+            self.raster_drag_has_changes = false;
+        }
+        if let Some(idx) = toggle_mask_clip {
+            if let Some(layer) = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|v| v.get(idx))
+            {
+                let uid = layer.uid.clone();
+                let new_val = !layer.mask_clip_enabled;
+                // Route through the doc (source of truth): bumps generation → re-clip + re-upload, and
+                // bumps the doc version → the PS tab re-projects.
+                self.route_to_doc(page_idx, |doc| {
+                    doc.set_raster_mask_clip(page_idx, &uid, Some(new_val));
+                });
+                // Persist so it survives a reload / save-to-project (whole-page raster save preserves it).
+                self.persist_current_page_rasters(page_idx);
+            }
+        }
+        if let Some((idx, up)) = move_z {
+            self.move_raster_in_unified_z(page_idx, idx, up);
+        }
+        if let Some(idx) = delete {
+            self.remove_raster(page_idx, idx);
+        }
+    }
+
+    /// Applies an in-progress raster drag (move or rotate) to the cached transform.
+    fn apply_raster_drag(
+        &mut self,
+        state: &TypingRasterDragState,
+        pointer: Pos2,
+        image_rect: Rect,
+        zoom: f32,
+    ) {
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&state.page_idx)
+            .and_then(|v| v.get_mut(state.raster_idx))
+        else {
+            return;
+        };
+        match state.mode {
+            TypingRasterDragMode::Move => {
+                let z = zoom.max(f32::EPSILON);
+                layer.transform.cx =
+                    state.start_transform.cx + (pointer.x - state.pointer_start_scene.x) / z;
+                layer.transform.cy =
+                    state.start_transform.cy + (pointer.y - state.pointer_start_scene.y) / z;
+            }
+            TypingRasterDragMode::Rotate => {
+                let center = scene_from_page_px(
+                    image_rect,
+                    zoom,
+                    [state.start_transform.cx, state.start_transform.cy],
+                );
+                let cur = pointer_angle_rad(center, pointer);
+                layer.transform.rotation =
+                    state.start_transform.rotation + (cur - state.start_pointer_angle_rad);
+            }
+            TypingRasterDragMode::PerspectiveHandle(handle_idx) => {
+                let Some(start_mesh) = &state.start_mesh else {
+                    return;
+                };
+                let page_size = page_size_from_image_rect(image_rect, zoom);
+                let z = zoom.max(f32::EPSILON);
+                // Pointer delta in page px (scene → page).
+                let delta_page_px = [
+                    (pointer.x - state.pointer_start_scene.x) / z,
+                    (pointer.y - state.pointer_start_scene.y) / z,
+                ];
+                let mesh = apply_perspective_corner_drag(
+                    start_mesh,
+                    handle_idx,
+                    delta_page_px,
+                    page_size,
+                );
+                layer.deform = Some(crate::models::layer_model::manifest::DeformRec {
+                    cols: mesh.cols,
+                    rows: mesh.rows,
+                    points_px: mesh.points_px.clone(),
+                });
+            }
+        }
+        self.raster_drag_has_changes = true;
     }
 
     fn try_move_selected_overlay_by_arrow_shortcuts(
@@ -3817,6 +6702,12 @@ impl TypingTextOverlayLayer {
             self.drag_state = None;
             self.drag_has_changes = false;
         }
+        // One selection at a time across the two layer kinds: an overlay selection wins (overlay
+        // interaction runs before the raster pass below; `select_raster` clears overlays directly).
+        if self.selected_overlay_idx.is_some() {
+            self.selected_raster_idx = None;
+            self.transform_mode_raster_idx = None;
+        }
         if mask_panel_open {
             if let Some(selected_idx) = self.selected_overlay_idx {
                 let should_validate = self
@@ -3856,6 +6747,10 @@ impl TypingTextOverlayLayer {
         if !clip_rect.is_positive() {
             return Vec::new();
         }
+        // Ensure the read-only PS raster layers and unified Z bands for this page are loaded; the
+        // actual raster quads are now drawn interleaved with the text overlays (one ordered pass
+        // below) so a raster moved above a text group in the PS editor renders on top.
+        self.ensure_raster_layers_for_page(page_idx);
         let layout_editor_active = self.layout_editor.is_some();
         if !mask_panel_open && !layout_editor_active {
             self.try_trigger_selected_overlay_auto_typing_by_hotkey(
@@ -3868,6 +6763,7 @@ impl TypingTextOverlayLayer {
             );
             self.try_rotate_selected_overlay_by_ctrl_wheel(ui, page_idx, image_rect, zoom);
             self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
+            self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
             self.try_move_selected_overlay_by_arrow_shortcuts(
                 ui,
                 page_idx,
@@ -3927,6 +6823,7 @@ impl TypingTextOverlayLayer {
             mesh_rows: usize,
             occluder_quads: Vec<[Pos2; 4]>,
             texture: egui::TextureHandle,
+            render_width_px: Option<u32>,
         }
 
         let mut draw_entries: Vec<OverlayDrawEntry> = Vec::new();
@@ -3960,6 +6857,16 @@ impl TypingTextOverlayLayer {
             };
             let is_selected_text =
                 self.selected_overlay_idx == Some(idx) && overlay.kind == TypingOverlayKind::Text;
+            let render_width_px = if overlay.kind == TypingOverlayKind::Text {
+                overlay.render_data_json.as_ref().map(|render_data| {
+                    overlay_render_data_width_hint(
+                        Some(render_data),
+                        u32::try_from(overlay.size_px[0]).unwrap_or(u32::MAX),
+                    )
+                })
+            } else {
+                None
+            };
             let selection_mesh_scene = if is_selected_text {
                 expand_selection_mesh_to_min_screen_side(
                     &geometry.mesh_scene,
@@ -3989,14 +6896,49 @@ impl TypingTextOverlayLayer {
                 mesh_cols: geometry.mesh_cols,
                 mesh_rows: geometry.mesh_rows,
                 texture: overlay.texture.as_ref().expect("checked above").clone(),
+                render_width_px,
             });
         }
+
+        // Bottom-to-top by the UNIFIED manual band-Z (retire the old layer_idx + page-Y auto-order):
+        // the top overlay draws last (on top) AND registers its egui interaction last, so on an overlap
+        // the topmost-by-Z overlay wins the click — the same Z the raster/text unified hit-test and the
+        // `merged_fills` draw order use, so draw order == manual order == click order.
+        draw_entries.sort_by(|a, b| {
+            let z = |idx: usize| {
+                self.overlays
+                    .get(idx)
+                    .map(|o| self.overlay_band_z(page_idx, &o.uid, o.layer_idx))
+                    .unwrap_or(0)
+            };
+            z(a.idx).cmp(&z(b.idx))
+        });
 
         if !draw_entries.is_empty() && !mask_panel_open && !layout_editor_active {
             let mut clicked_overlay_idx: Option<usize> = None;
             let mut pending_delete_overlay_idx: Option<usize> = None;
             let mut pending_enter_layout_editor_idx: Option<usize> = None;
             let popup_open_before = ui.ctx().is_popup_open();
+            // Sticky-фокус: если клик пришёлся внутрь рамки уже выделенного оверлея,
+            // фокус остаётся на нём, даже если сверху лежит перекрывающий оверлей или
+            // растровый слой. Считаем это один раз по позиции клика и по grab-мешу
+            // выделенного оверлея (та же область, что и `pointer_inside_grab_area`).
+            let click_in_selected_frame = ui
+                .input(|i| i.pointer.primary_clicked())
+                .then(|| ui.input(|i| i.pointer.interact_pos()))
+                .flatten()
+                .zip(self.selected_overlay_idx)
+                .is_some_and(|(pos, selected_idx)| {
+                    draw_entries.iter().any(|entry| {
+                        entry.idx == selected_idx
+                            && deform_mesh_contains_point(
+                                &entry.selection_mesh_scene,
+                                entry.mesh_cols,
+                                entry.mesh_rows,
+                                pos,
+                            )
+                    })
+                });
             for entry in &draw_entries {
                 let is_transform_mode = self.transform_mode_overlay_idx == Some(entry.idx);
                 let show_rotate_handle =
@@ -4086,9 +7028,14 @@ impl TypingTextOverlayLayer {
                     || pointer_on_rotate_handle;
 
                 if response.clicked() && pointer_targets_overlay {
-                    clicked_overlay_idx = Some(entry.idx);
-                    self.selected_overlay_idx = Some(entry.idx);
-                    self.primary_pointer_targets_overlay_this_frame = true;
+                    // Не перехватываем фокус перекрывающим оверлеем, если клик попал
+                    // в рамку уже выделенного (нижнего) оверлея — фокус удержит
+                    // блок sticky-фокуса после цикла.
+                    if !(click_in_selected_frame && self.selected_overlay_idx != Some(entry.idx)) {
+                        clicked_overlay_idx = Some(entry.idx);
+                        self.selected_overlay_idx = Some(entry.idx);
+                        self.primary_pointer_targets_overlay_this_frame = true;
+                    }
                 }
                 if response.secondary_clicked() && pointer_inside_visual {
                     self.selected_overlay_idx = Some(entry.idx);
@@ -4170,6 +7117,25 @@ impl TypingTextOverlayLayer {
                             self.mark_overlay_pixels_dirty(entry.idx);
                             self.request_overlay_placement_save();
                             menu_ui.close();
+                        }
+                    }
+                    menu_ui.separator();
+                    {
+                        // ▲ / ▼ move the overlay one step in the unified Z order (text + raster
+                        // interleaved, shared with the PS editor). No more per-overlay text-group
+                        // number — order is the shared layer stack.
+                        let mut move_z_up: Option<bool> = None;
+                        menu_ui.horizontal(|row| {
+                            row.label("Порядок");
+                            if row.button("▲").clicked() {
+                                move_z_up = Some(true);
+                            }
+                            if row.button("▼").clicked() {
+                                move_z_up = Some(false);
+                            }
+                        });
+                        if let Some(up) = move_z_up {
+                            self.move_overlay_in_unified_z(page_idx, entry.idx, up);
                         }
                     }
                     menu_ui.separator();
@@ -4572,6 +7538,18 @@ impl TypingTextOverlayLayer {
                 }
             }
 
+            // Клик внутри рамки выделенного оверлея считаем нацеленным на него:
+            // помечаем кадр как «попал в оверлей» (чтобы растровый слой выше не
+            // перехватил фокус, см. `interact_page_rasters`) и подставляем
+            // выделенный индекс в `clicked_overlay_idx`, чтобы не сработал сброс
+            // выделения при клике по «пустому» месту.
+            if click_in_selected_frame {
+                self.primary_pointer_targets_overlay_this_frame = true;
+                if clicked_overlay_idx.is_none() {
+                    clicked_overlay_idx = self.selected_overlay_idx;
+                }
+            }
+
             self.poll_shape_variant_preview(ui.ctx());
             if let Some(variant) = self.draw_shape_variant_preview(ui.ctx()) {
                 self.apply_shape_variant_to_overlay(ctx, variant);
@@ -4656,14 +7634,69 @@ impl TypingTextOverlayLayer {
             }
         }
 
+        // Unified-Z fill pass: interleave the read-only PS raster quads with the text/image overlay
+        // textured meshes in one pass ordered bottom-to-top by band Z. (Selection decorations and
+        // editing handles are drawn afterwards so they always sit on top.)
+        enum MergedFillItem {
+            /// Index into the page's cached `raster_layers_by_page` vector.
+            Raster(usize),
+            /// Index into `draw_entries`.
+            Overlay(usize),
+        }
+        let mut merged_fills: Vec<(u32, u32, MergedFillItem)> = Vec::new();
+        // Rasters: band Z from the matching `Raster` band (else top). Tiebreak `0` keeps the cached
+        // bottom-to-top raster order via the raster index in the third tuple slot's stable sort.
+        if let Some(rasters) = self.raster_layers_by_page.get(&page_idx) {
+            for (raster_idx, raster) in rasters.iter().enumerate() {
+                let band_z = self.raster_band_z(page_idx, &raster.uid);
+                merged_fills.push((band_z, 0, MergedFillItem::Raster(raster_idx)));
+            }
+        }
+        // Overlays: band Z from the overlay's text group / pinned-text band (else top). Tiebreak `1`
+        // so that, within the same band Z, overlays draw above rasters; `draw_entries` is already in
+        // the desired within-group order, preserved by the stable sort.
+        for (entry_pos, entry) in draw_entries.iter().enumerate() {
+            let band_z = self
+                .overlays
+                .get(entry.idx)
+                .map(|overlay| self.overlay_band_z(page_idx, &overlay.uid, overlay.layer_idx))
+                .unwrap_or_else(|| {
+                    self.bands_by_page
+                        .get(&page_idx)
+                        .map(|b| b.len() as u32)
+                        .unwrap_or(0)
+                });
+            merged_fills.push((band_z, 1, MergedFillItem::Overlay(entry_pos)));
+        }
+        // Stable sort: primary band Z, then raster-below-overlay tiebreak; existing raster order and
+        // within-group overlay order are preserved as the stable tiebreak.
+        merged_fills.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, item) in &merged_fills {
+            match item {
+                MergedFillItem::Raster(raster_idx) => {
+                    self.draw_one_raster_layer(
+                        ui.ctx(),
+                        &painter,
+                        page_idx,
+                        *raster_idx,
+                        image_rect,
+                        zoom,
+                    );
+                }
+                MergedFillItem::Overlay(entry_pos) => {
+                    let entry = &draw_entries[*entry_pos];
+                    draw_textured_deform_mesh(
+                        &painter,
+                        entry.texture.id(),
+                        &entry.mesh_scene,
+                        entry.mesh_cols,
+                        entry.mesh_rows,
+                    );
+                }
+            }
+        }
+
         for entry in &draw_entries {
-            draw_textured_deform_mesh(
-                &painter,
-                entry.texture.id(),
-                &entry.mesh_scene,
-                entry.mesh_cols,
-                entry.mesh_rows,
-            );
             if !mask_panel_open && self.selected_overlay_idx == Some(entry.idx) {
                 let selection_path = mesh_boundary_path(
                     &entry.selection_mesh_scene,
@@ -4671,6 +7704,18 @@ impl TypingTextOverlayLayer {
                     entry.mesh_rows,
                 );
                 draw_dashed_selection_path(&painter, &selection_path);
+                if let Some(render_width_px) = entry.render_width_px {
+                    draw_text_overlay_width_guide(
+                        &painter,
+                        entry.selection_bounds_rect,
+                        render_width_px,
+                        entry.bounds_rect.width(),
+                        self.overlays
+                            .get(entry.idx)
+                            .map(|overlay| overlay.size_px[0])
+                            .unwrap_or_default(),
+                    );
+                }
                 if self.transform_mode_overlay_idx == Some(entry.idx) {
                     match self.deform_mode {
                         TypingDeformMode::Perspective => {
@@ -4726,6 +7771,9 @@ impl TypingTextOverlayLayer {
             );
         }
         self.draw_auto_typing_debug_visuals(&painter, page_idx, image_rect, auto_typing_settings);
+        if !mask_panel_open && !layout_editor_active {
+            self.interact_page_rasters(ui, page_idx, image_rect, zoom, &painter);
+        }
         draw_entries
             .into_iter()
             .flat_map(|entry| entry.occluder_quads.into_iter())
@@ -4737,6 +7785,8 @@ impl TypingTextOverlayLayer {
             || self.create_selection.is_some()
             || self.create_editor.is_some()
             || self.create_render_state.is_some()
+            || self.create_raster_state.is_some()
+            || self.raster_effects_state.is_some()
             || self.edit_render_rx.is_some()
             || self.auto_typing_job.is_some()
             || self.export_rx.is_some()
@@ -4892,6 +7942,59 @@ fn draw_dashed_selection_path(painter: &egui::Painter, path: &[Pos2]) {
         );
     }
     painter.extend(shapes);
+}
+
+fn draw_text_overlay_width_guide(
+    painter: &egui::Painter,
+    selection_bounds_rect: Rect,
+    render_width_px: u32,
+    overlay_screen_width_px: f32,
+    overlay_source_width_px: usize,
+) {
+    let source_width = overlay_source_width_px.max(1) as f32;
+    let guide_width =
+        (render_width_px.max(1) as f32 / source_width) * overlay_screen_width_px.max(1.0);
+    let half_width = guide_width.max(1.0) * 0.5;
+    let center_x = selection_bounds_rect.center().x;
+    let line_y = selection_bounds_rect.top() - TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX;
+    let left = Pos2::new(center_x - half_width, line_y);
+    let right = Pos2::new(center_x + half_width, line_y);
+    let tick_top_y = line_y - TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX;
+    let tick_bottom_y = line_y + TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX;
+
+    draw_dashed_selection_path(
+        painter,
+        &[
+            Pos2::new(left.x, tick_top_y),
+            Pos2::new(left.x, tick_bottom_y),
+        ],
+    );
+    draw_dashed_selection_path(painter, &[left, right]);
+    draw_dashed_selection_path(
+        painter,
+        &[
+            Pos2::new(right.x, tick_top_y),
+            Pos2::new(right.x, tick_bottom_y),
+        ],
+    );
+
+    let label = format!("{} px", render_width_px.max(1));
+    let label_pos = Pos2::new(center_x, tick_top_y - TEXT_OVERLAY_WIDTH_GUIDE_LABEL_GAP_PX);
+    let font_id = egui::FontId::proportional(13.0);
+    painter.text(
+        label_pos + Vec2::new(1.0, 1.0),
+        egui::Align2::CENTER_BOTTOM,
+        label.as_str(),
+        font_id.clone(),
+        Color32::BLACK,
+    );
+    painter.text(
+        label_pos,
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        font_id,
+        Color32::WHITE,
+    );
 }
 
 fn mesh_boundary_path(mesh_scene: &[Pos2], cols: usize, rows: usize) -> Vec<Pos2> {
@@ -5090,6 +8193,77 @@ fn draw_grid_handles(
             TEXT_OVERLAY_FRAME_HANDLE_RADIUS_PX,
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180)),
         );
+    }
+}
+
+/// The four scene-space corners of a raster layer's image quad (top-left, top-right, bottom-right,
+/// bottom-left), from its `TransformRec` (center page px, uniform scale, rotation radians). Mirrors
+/// the corner math in `draw_one_raster_layer`.
+fn raster_quad_scene(
+    transform: &crate::models::layer_model::manifest::TransformRec,
+    size: [usize; 2],
+    image_rect: Rect,
+    zoom: f32,
+) -> [Pos2; 4] {
+    let (sin_a, cos_a) = transform.rotation.sin_cos();
+    let hw = size[0] as f32 * 0.5 * transform.scale;
+    let hh = size[1] as f32 * 0.5 * transform.scale;
+    let corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
+    let mut quad = [Pos2::ZERO; 4];
+    for (i, (dx, dy)) in corners.iter().enumerate() {
+        let rx = dx * cos_a - dy * sin_a;
+        let ry = dx * sin_a + dy * cos_a;
+        quad[i] = scene_from_page_px(image_rect, zoom, [transform.cx + rx, transform.cy + ry]);
+    }
+    quad
+}
+
+/// The 4 corner scene points of a deform mesh grid (TL, TR, BR, BL), for perspective-handle drag.
+fn deform_mesh_corners_scene(
+    deform: &crate::models::layer_model::manifest::DeformRec,
+    image_rect: Rect,
+    zoom: f32,
+) -> Option<[Pos2; 4]> {
+    let (c, r) = (deform.cols, deform.rows);
+    if c < 2 || r < 2 || deform.points_px.len() != c * r {
+        return None;
+    }
+    let at = |col: usize, row: usize| {
+        scene_from_page_px(image_rect, zoom, deform.points_px[row * c + col])
+    };
+    Some([at(0, 0), at(c - 1, 0), at(c - 1, r - 1), at(0, r - 1)])
+}
+
+/// All scene points of a deform mesh grid (row-major), for drawing the wireframe.
+fn deform_mesh_scene_points(
+    deform: &crate::models::layer_model::manifest::DeformRec,
+    image_rect: Rect,
+    zoom: f32,
+) -> Vec<Pos2> {
+    deform
+        .points_px
+        .iter()
+        .map(|p| scene_from_page_px(image_rect, zoom, *p))
+        .collect()
+}
+
+/// Draws a deform mesh's grid lines (row + column segments) — the wireframe shown while a raster is in
+/// perspective transform mode.
+fn draw_textured_deform_mesh_wire(painter: &egui::Painter, mesh_scene: &[Pos2], cols: usize, rows: usize) {
+    if cols < 2 || rows < 2 || mesh_scene.len() != cols * rows {
+        return;
+    }
+    let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(90, 185, 255, 170));
+    let at = |c: usize, r: usize| mesh_scene[r * cols + c];
+    for r in 0..rows {
+        for c in 0..cols {
+            if c + 1 < cols {
+                painter.line_segment([at(c, r), at(c + 1, r)], stroke);
+            }
+            if r + 1 < rows {
+                painter.line_segment([at(c, r), at(c, r + 1)], stroke);
+            }
+        }
     }
 }
 
@@ -5572,6 +8746,129 @@ fn rotation_handle_scene_with_corner(quad: &[Pos2; 4], image_rect: Rect) -> (Pos
         corner,
         corner + dir / len_sq.sqrt() * TEXT_OVERLAY_ROTATE_HANDLE_OFFSET_PX,
     )
+}
+
+/// Finds the TOPMOST raster (last in `entries`, which are bottom-to-top) under `pointer`, SKIPPING the
+/// currently-selected idx so the normal-mode interaction never creates a second response for the
+/// selected raster (egui duplicate-Id). A raster is "under" the pointer if the point is inside its quad
+/// OR within the rotate-handle radius. Returns `(idx, quad, center, on_rotate)`. Pure (geometry only),
+/// so it is unit-testable. `excluded` (the selected idx) is skipped; pass `None` to consider every entry.
+fn topmost_raster_target(
+    entries: &[(usize, [Pos2; 4], Pos2)],
+    pointer: Option<Pos2>,
+    image_rect: Rect,
+    excluded: Option<usize>,
+) -> Option<(usize, [Pos2; 4], Pos2, bool)> {
+    let p = pointer?;
+    entries.iter().rev().find_map(|(idx, quad, center)| {
+        if excluded == Some(*idx) {
+            return None;
+        }
+        let (_, handle) = rotation_handle_scene_with_corner(quad, image_rect);
+        let on_rotate = p.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0;
+        if point_in_quad(p, quad) || on_rotate {
+            Some((*idx, *quad, *center, on_rotate))
+        } else {
+            None
+        }
+    })
+}
+
+/// Which kind of layer the pointer should interact with when a text overlay and a raster overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypingPointerTarget {
+    Overlay,
+    Raster,
+    None,
+}
+
+/// Picks the TOPMOST item (text overlay vs raster) under the pointer by UNIFIED band-Z, so the click
+/// goes to whatever is drawn on top — matching the canvas draw order exactly. `overlay_z` / `raster_z`
+/// are the topmost overlay's / raster's band-Z *if one is under the pointer* (else `None`). Ties go to
+/// the OVERLAY (text draws above a raster at the same band-Z, mirroring `merged_fills`' `(z, kind)`
+/// tiebreak where raster=0 < overlay=1). Pure, so it is unit-testable.
+fn unified_topmost_pointer_target(
+    overlay_z: Option<u32>,
+    raster_z: Option<u32>,
+) -> TypingPointerTarget {
+    match (overlay_z, raster_z) {
+        (Some(oz), Some(rz)) => {
+            // Equal band-Z → overlay wins (overlay draws above raster at the same band).
+            if oz >= rz {
+                TypingPointerTarget::Overlay
+            } else {
+                TypingPointerTarget::Raster
+            }
+        }
+        (Some(_), None) => TypingPointerTarget::Overlay,
+        (None, Some(_)) => TypingPointerTarget::Raster,
+        (None, None) => TypingPointerTarget::None,
+    }
+}
+
+/// How many text-preview characters fit in a text row's available label width, with a floor of
+/// `LAYERS_PANEL_MIN_PREVIEW_CHARS`. `available_px` is the row width left for the preview text (panel
+/// content width minus the fixed row overhead — buttons, `Текст (…)` wrapper, spacing); `char_px` is a
+/// representative glyph width. Wider panel → more chars before the dots; never below the min. Pure.
+fn preview_char_budget(available_px: f32, char_px: f32) -> usize {
+    if char_px <= 0.0 || !available_px.is_finite() {
+        return LAYERS_PANEL_MIN_PREVIEW_CHARS;
+    }
+    let fits = (available_px / char_px).floor();
+    let fits = if fits.is_finite() && fits > 0.0 { fits as usize } else { 0 };
+    fits.max(LAYERS_PANEL_MIN_PREVIEW_CHARS)
+}
+
+/// Builds the `{preview}` shown inside a text row's `Текст ({preview})` label.
+///
+/// - Takes the first `max_chars` CHARACTERS (Unicode `chars()`, NOT bytes — text is Cyrillic) of `text`
+///   after trimming leading whitespace. `max_chars` grows with the panel width (min 5).
+/// - Ensures the run of trailing "dot-equivalents" is AT LEAST 3, accounting for dots already present:
+///   a regular dot `.` counts 1, the single ellipsis char `…` (U+2026) counts 3. Trailing dots are
+///   counted from the end of the prefix until the first non-dot char; then `max(0, 3 - count)` regular
+///   dots are appended.
+/// - Empty (after trim) → `""` (the caller then shows just `Текст`, no parentheses).
+fn text_preview_label(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut prefix: String = trimmed.chars().take(max_chars).collect();
+    // Count trailing dot-equivalents (regular dot = 1, ellipsis = 3), stopping at the first non-dot.
+    let mut existing = 0u32;
+    for ch in prefix.chars().rev() {
+        match ch {
+            '.' => existing += 1,
+            '…' => existing += 3,
+            _ => break,
+        }
+    }
+    let needed = 3u32.saturating_sub(existing);
+    for _ in 0..needed {
+        prefix.push('.');
+    }
+    prefix
+}
+
+/// One row in the unified "Слои страницы" list: a text/image overlay (index into `self.overlays`) or a
+/// raster (index into `raster_layers_by_page[page]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypingLayerRow {
+    Overlay(usize),
+    Raster(usize),
+}
+
+/// Orders the page's layer rows for the panel: by unified band-Z DESCENDING (top of the stack first),
+/// interleaving overlays and rasters. Tie-break at equal Z: OVERLAY above RASTER (matches the canvas
+/// draw/hit-test tie-break where raster=0 < overlay=1). The input is `(row, band_z, raster_below_overlay)`
+/// where the bool is `true` for a raster (sorts below an overlay at the same Z). Pure → unit-testable.
+fn order_unified_layer_rows(mut rows: Vec<(TypingLayerRow, u32, bool)>) -> Vec<TypingLayerRow> {
+    // Sort TOP-first: higher Z first; at equal Z, overlay (raster_below=false) before raster (true).
+    rows.sort_by(|a, b| {
+        b.1.cmp(&a.1) // band-Z descending
+            .then_with(|| a.2.cmp(&b.2)) // false (overlay) before true (raster) at equal Z
+    });
+    rows.into_iter().map(|(row, _, _)| row).collect()
 }
 
 fn select_rotation_handle_corner(quad: &[Pos2; 4], image_rect: Rect) -> usize {
@@ -7384,8 +10681,15 @@ fn is_font_family_bound(ctx: &egui::Context, family: &egui::FontFamily) -> bool 
     ctx.fonts(|fonts| fonts.definitions().families.contains_key(family))
 }
 
+/// Picks the seed text for a freshly drawn typing selection from the bubble anchor closest to the
+/// selection center whose anchor falls inside the selection rectangle.
+///
+/// A multi-area `ImageBubble` is a single `Bubble` in the data model but splits into one read-only
+/// aside per text area, each with its own anchor. To match what the user sees, every image text
+/// area is treated as an independent anchor candidate here; a plain text bubble contributes its one
+/// `img_u`/`img_v` anchor. Returns `None` when no eligible anchor with non-empty text overlaps.
 fn pick_bubble_text_for_selection(
-    project: &ProjectData,
+    bubbles: &[Bubble],
     page_idx: usize,
     scene_rect: Rect,
     page_rect: Rect,
@@ -7393,38 +10697,179 @@ fn pick_bubble_text_for_selection(
     let selection_center = scene_rect.center();
     let mut best: Option<(f32, String)> = None;
 
-    for bubble in project
-        .bubbles
-        .iter()
-        .filter(|bubble| bubble.img_idx == page_idx)
-    {
-        let bubble_pos = scene_from_uv(page_rect, bubble.img_u, bubble.img_v);
-        if !scene_rect.contains(bubble_pos) {
-            continue;
-        }
-        let text = preferred_bubble_seed_text(bubble);
+    let mut consider = |anchor_uv: (f32, f32), text: String| {
         if text.is_empty() {
-            continue;
+            return;
         }
-        let dist_sq = selection_center.distance_sq(bubble_pos);
-        let should_replace = match best.as_ref() {
-            Some((best_dist, _)) => dist_sq < *best_dist,
-            None => true,
-        };
+        let anchor_pos = scene_from_uv(page_rect, anchor_uv.0, anchor_uv.1);
+        if !scene_rect.contains(anchor_pos) {
+            return;
+        }
+        let dist_sq = selection_center.distance_sq(anchor_pos);
+        let should_replace = best
+            .as_ref()
+            .is_none_or(|(best_dist, _)| dist_sq < *best_dist);
         if should_replace {
             best = Some((dist_sq, text));
+        }
+    };
+
+    for bubble in bubbles.iter().filter(|bubble| bubble.img_idx == page_idx) {
+        // Image bubbles expose one anchor per text area (matching the split read-only asides); text
+        // bubbles expose a single anchor at `img_u`/`img_v`.
+        let areas = parse_image_text_areas(bubble);
+        if areas.is_empty() {
+            consider(
+                (bubble.img_u, bubble.img_v),
+                preferred_bubble_seed_text(bubble),
+            );
+        } else {
+            for area in &areas {
+                consider(
+                    (area.anchor.x, area.anchor.y),
+                    preferred_area_seed_text(area),
+                );
+            }
         }
     }
 
     best.map(|(_, text)| text)
 }
 
+/// Seed text for a plain text bubble: the translation when present, otherwise the original.
 fn preferred_bubble_seed_text(bubble: &crate::project::Bubble) -> String {
     let translated = bubble.text.trim();
     if !translated.is_empty() {
         return translated.to_string();
     }
     bubble.original_text.trim().to_string()
+}
+
+/// Seed text for one image text area: the translation when present, otherwise the original. The
+/// description is intentionally excluded so a selection never seeds editor text with a note.
+fn preferred_area_seed_text(area: &crate::canvas::ImageTextArea) -> String {
+    let translated = area.translation.trim();
+    if !translated.is_empty() {
+        return translated.to_string();
+    }
+    area.original.trim().to_string()
+}
+
+/// Flattens a `ColorImage` into a row-major STRAIGHT (un-premultiplied) RGBA byte buffer (4 bytes/pixel),
+/// the `source_rgba` layout every consumer expects. egui `Color32` stores PREMULTIPLIED bytes, so we use
+/// `to_srgba_unmultiplied()` (NOT `to_array()`, which would return premultiplied). Every consumer of
+/// `source_rgba` treats it as straight alpha — the display upload and effects/mask-clip paths feed it
+/// back through `ColorImage::from_rgba_unmultiplied`, and the export composite blends it as straight — so
+/// emitting premultiplied here would premultiply the text TWICE, darkening semi-transparent (antialiased
+/// stroke) edges to gray.
+fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
+    let mut out = Vec::with_capacity(image.pixels.len() * 4);
+    for px in &image.pixels {
+        out.extend_from_slice(&px.to_srgba_unmultiplied());
+    }
+    out
+}
+
+/// Materializes a typing TEXT overlay runtime from a doc Text node's projected fields. Used by
+/// `sync_from_doc` when a doc Text node has no local runtime (the migrated-chapter case, where the
+/// legacy `text_info.json` loader populated nothing). The rendered-PNG `file_name` is reconstructed
+/// deterministically from `page_idx`+`uid` via [`persist::text_image_file_name`] — the SAME name the
+/// doc's text flush (`write_text_image`) writes — so a later placement-save/flush round-trips. Pure
+/// (no egui), so it is unit-testable. The new runtime starts with no GPU texture and is stale, so the
+/// caller queues it for upload.
+#[allow(clippy::too_many_arguments)]
+fn text_runtime_from_doc_node(
+    uid: &str,
+    page_idx: usize,
+    center_page_px: [f32; 2],
+    user_scale: f32,
+    angle_deg: f32,
+    deform_mesh: Option<TypingOverlayDeformMesh>,
+    mask_clip_enabled: bool,
+    layer_idx: usize,
+    render_data_json: Option<Value>,
+    size_px: [usize; 2],
+    source_rgba: Vec<u8>,
+) -> TypingOverlayRuntime {
+    TypingOverlayRuntime {
+        uid: uid.to_string(),
+        kind: TypingOverlayKind::Text,
+        page_idx,
+        center_page_px,
+        mask_clip_enabled,
+        layer_idx,
+        user_scale,
+        angle_deg,
+        deform_mesh,
+        file_name: crate::models::layer_model::persist::text_image_file_name(page_idx, uid),
+        original_file_name: None,
+        render_data_json,
+        size_px,
+        source_rgba,
+        texture: None,
+        display_texture_stale: true,
+        last_texture_used_frame: 0,
+    }
+}
+
+/// Builds an overlay runtime from a freshly-decoded legacy `text_info.json` entry. Fresh runtimes
+/// start with no GPU texture and are stale, so the caller queues them for upload.
+fn runtime_from_decoded(entry: TypingOverlayDecoded) -> TypingOverlayRuntime {
+    TypingOverlayRuntime {
+        uid: entry.uid,
+        kind: entry.kind,
+        page_idx: entry.page_idx,
+        center_page_px: entry.center_page_px,
+        mask_clip_enabled: entry.mask_clip_enabled,
+        layer_idx: entry.layer_idx,
+        user_scale: entry.user_scale,
+        angle_deg: entry.angle_deg,
+        deform_mesh: entry.deform_mesh,
+        file_name: entry.file_name,
+        original_file_name: entry.original_file_name,
+        render_data_json: entry.render_data_json,
+        size_px: entry.size_px,
+        source_rgba: entry.rgba,
+        texture: None,
+        display_texture_stale: true,
+        last_texture_used_frame: 0,
+    }
+}
+
+/// MERGES freshly-loaded legacy overlays (`decoded`) INTO `existing` by `(uid, page_idx)` instead of
+/// wholesale-replacing. CRITICAL for migrated chapters: their `text_info.json` is retired, so the loader
+/// returns an EMPTY set; `sync_from_doc` may have already MATERIALIZED text runtimes from the doc on an
+/// earlier frame (that path is not gated on `loading_rx`). A wholesale `self.overlays = decoded` would
+/// then WIPE those doc-created runtimes the instant the loader completes → the user's intermittent
+/// "text shows then vanishes" symptom. Merge semantics: a loaded entry whose (uid, page) already exists
+/// REPLACES that entry (legacy data is authoritative for a legacy chapter); a new one is APPENDED; an
+/// existing runtime whose uid is ABSENT from the loaded set is KEPT (doc-created on a migrated chapter).
+/// Cross-chapter reset is handled separately by `ensure_loader_started`, which clears `overlays` at the
+/// START of a chapter open — so a stale chapter's overlays never linger; this merge only governs the
+/// COMPLETION within one open. Returns the indices of entries that need a texture upload (replaced or
+/// appended), so the caller can queue exactly those.
+fn merge_loaded_overlays(
+    existing: &mut Vec<TypingOverlayRuntime>,
+    decoded: Vec<TypingOverlayDecoded>,
+) -> Vec<usize> {
+    let mut touched: Vec<usize> = Vec::with_capacity(decoded.len());
+    for entry in decoded {
+        let runtime = runtime_from_decoded(entry);
+        let idx = existing
+            .iter()
+            .position(|o| o.uid == runtime.uid && o.page_idx == runtime.page_idx);
+        match idx {
+            Some(i) => {
+                existing[i] = runtime;
+                touched.push(i);
+            }
+            None => {
+                existing.push(runtime);
+                touched.push(existing.len() - 1);
+            }
+        }
+    }
+    touched
 }
 
 fn render_and_store_created_overlay(
@@ -7478,32 +10923,25 @@ fn render_and_store_created_overlay(
 
     // Для нового оверлея не подгоняем PNG под выделение: показываем в исходном масштабе.
     let user_scale = 1.0_f32;
-    if let Err(err) = append_created_overlay_info(
-        &request.text_images_dir,
-        request.page_idx,
-        request.center_page_px,
-        true,
-        user_scale,
-        &file_name,
-        TypingOverlayKind::Text,
-        Some(request.render_data_json.clone()),
-    ) {
-        let _ = fs::remove_file(&image_path);
-        if let Some(path) = layout_image_path {
-            let _ = fs::remove_file(path);
-        }
-        return Err(err);
-    }
+    let overlay_uid = uuid::Uuid::new_v4().to_string();
+    // Persistence is owned by the shared doc: the caller adds this overlay as a doc Text node and the
+    // following placement save flushes the INLINE v3 payload to `layers.json`. The create path no
+    // longer writes `text_info.json` (the doc is the sole text writer). The rendered PNG above is kept
+    // on disk only as the create-job artifact; the doc flush writes its own uid-keyed `_text.png`.
+    let _ = &layout_image_path;
 
     Ok(TypingOverlayDecoded {
+        uid: overlay_uid,
         kind: TypingOverlayKind::Text,
         page_idx: request.page_idx,
         center_page_px: request.center_page_px,
         mask_clip_enabled: true,
+        layer_idx: 0,
         user_scale,
         angle_deg: 0.0,
         deform_mesh: None,
         file_name,
+        original_file_name: None,
         render_data_json: Some(request.render_data_json),
         size_px: [rendered.width as usize, rendered.height as usize],
         rgba: rendered.rgba,
@@ -7511,6 +10949,9 @@ fn render_and_store_created_overlay(
     })
 }
 
+// Superseded by `render_and_store_created_raster` (external images are now raster layers). Kept for
+// reference / potential "insert image as overlay" path.
+#[allow(dead_code)]
 fn render_and_store_created_image_overlay(
     request: TypingCreateImageOverlayRequest,
 ) -> Result<TypingOverlayDecoded, String> {
@@ -7542,34 +10983,144 @@ fn render_and_store_created_image_overlay(
     )
     .map_err(|err| format!("Не удалось сохранить {}: {err}", image_path.display()))?;
 
-    if let Err(err) = append_created_overlay_info(
-        &request.text_images_dir,
-        request.page_idx,
-        request.center_page_px,
-        true,
-        1.0,
-        &file_name,
-        TypingOverlayKind::Image,
-        None,
-    ) {
-        let _ = fs::remove_file(&image_path);
-        return Err(err);
-    }
+    let render_data_json = default_render_data_for_image();
+    let overlay_uid = uuid::Uuid::new_v4().to_string();
+    // (Superseded path.) Persistence is owned by the shared doc; no `text_info.json` write here.
+    let _ = &image_path;
 
     Ok(TypingOverlayDecoded {
+        uid: overlay_uid,
         kind: TypingOverlayKind::Image,
         page_idx: request.page_idx,
         center_page_px: request.center_page_px,
         mask_clip_enabled: true,
+        layer_idx: 0,
         user_scale: 1.0,
         angle_deg: 0.0,
         deform_mesh: None,
         file_name,
-        render_data_json: None,
+        original_file_name: None,
+        render_data_json: Some(render_data_json),
         size_px: [width, height],
         rgba,
         warnings: Vec::new(),
     })
+}
+
+/// Стартовые render-data для image-оверлея: только пустой список эффектов.
+/// Эффекты к сторонним картинкам применяются тем же pipeline, что и к растрированному тексту.
+#[allow(dead_code)]
+fn default_render_data_for_image() -> Value {
+    json!({ "effects": [] })
+}
+
+/// Worker: loads an external image (clipboard/file) and persists it as a NEW raster layer node in
+/// `layers.json` (via `persist::add_page_raster`), centered at `center_page_px`. Returns the page +
+/// uid so the tab reloads its raster cache from disk and selects it. No text/image overlay is made.
+fn render_and_store_created_raster(
+    request: TypingCreateRasterRequest,
+) -> Result<TypingCreatedRaster, String> {
+    let (rgba, width, height) = match &request.source {
+        TypingCreateImageSource::Clipboard => read_image_rgba_from_clipboard()?,
+        TypingCreateImageSource::File(path) => read_image_rgba_from_file(path.as_path())?,
+    };
+    if width == 0 || height == 0 {
+        return Err("Изображение нулевого размера.".to_string());
+    }
+    if rgba.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err("Некорректный буфер RGBA изображения.".to_string());
+    }
+    let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+    let name = match &request.source {
+        TypingCreateImageSource::File(path) => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Картинка".to_string()),
+        TypingCreateImageSource::Clipboard => "Картинка".to_string(),
+    };
+    let uid = uuid::Uuid::new_v4().to_string();
+    let transform = crate::models::layer_model::manifest::TransformRec {
+        cx: request.center_page_px[0],
+        cy: request.center_page_px[1],
+        rotation: 0.0,
+        scale: 1.0,
+    };
+    crate::models::layer_model::persist::add_page_raster(
+        &request.layers_dir,
+        request.fallback_dir.as_deref(),
+        request.page_idx,
+        &uid,
+        &name,
+        true,
+        1.0,
+        transform,
+        &image,
+    )?;
+    Ok(TypingCreatedRaster {
+        page_idx: request.page_idx,
+        uid,
+    })
+}
+
+/// Worker: renders a raster's effects chain from its ORIGINAL base PNG (non-destructive). Returns the
+/// display image to show (the rendered result, or the base unchanged when the chain is empty) plus
+/// the chain. The base is never modified, so effects stay reversible.
+fn render_raster_effects(
+    page_idx: usize,
+    uid: String,
+    base_file: String,
+    primary: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    effects: Vec<Value>,
+) -> Result<TypingRasterEffectsResult, String> {
+    let base = load_raster_base_png(&base_file, primary.as_deref(), fallback.as_deref())
+        .ok_or_else(|| format!("Не найден исходный PNG растра «{base_file}»."))?;
+    if effects.is_empty() {
+        return Ok(TypingRasterEffectsResult {
+            page_idx,
+            uid,
+            display_image: base,
+            effects,
+        });
+    }
+    let effects_json = serde_json::to_string(&Value::Array(effects.clone()))
+        .map_err(|e| format!("Эффекты растра: {e}"))?;
+    let (rendered, _origin) =
+        crate::models::layer_model::effects::apply_effects_to_color_image(&base, &effects_json)
+            .map_err(|e| format!("Эффекты растра: {e}"))?;
+    Ok(TypingRasterEffectsResult {
+        page_idx,
+        uid,
+        display_image: rendered,
+        effects,
+    })
+}
+
+/// Loads a raster's base PNG by name, trying the unsaved dir then the committed fallback.
+fn load_raster_base_png(file: &str, primary: Option<&Path>, fallback: Option<&Path>) -> Option<ColorImage> {
+    for dir in [primary, fallback].into_iter().flatten() {
+        let path = dir.join(file);
+        if path.is_file()
+            && let Ok(decoded) = image::open(&path)
+        {
+            let rgba = decoded.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            return Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
+        }
+    }
+    None
+}
+
+/// Извлекает `effects_json` (как массив) из render-data оверлея для подачи в `apply_effects_to_image`.
+fn effects_json_from_render_data(render_data: &Value) -> String {
+    render_data
+        .as_object()
+        .and_then(|obj| obj.get("effects"))
+        .and_then(Value::as_array)
+        .map(|effects| Value::Array(effects.clone()))
+        .and_then(|effects| serde_json::to_string(&effects).ok())
+        .unwrap_or_default()
 }
 
 fn render_and_store_edited_overlay(
@@ -7642,6 +11193,8 @@ fn render_and_store_edited_overlay(
         token: request.token,
         overlay_idx: request.overlay_idx,
         file_name: request.file_name,
+        image_original_file_name: None,
+        is_image_effects: false,
         user_scale: request.user_scale.max(0.05),
         rotation_deg: request.rotation_deg,
         render_data_json: request.render_data_json,
@@ -7649,6 +11202,146 @@ fn render_and_store_edited_overlay(
         rgba: rendered.rgba,
         warnings: rendered.warnings,
     }))
+}
+
+struct TypingEditImageEffectsRequest {
+    token: u64,
+    latest_token: Arc<AtomicU64>,
+    overlay_idx: usize,
+    // Текущий показываемый файл (исходник либо предыдущий `_fx`).
+    file_name: String,
+    // Исходник до эффектов, если он уже отделён от `file_name`.
+    original_file_name: Option<String>,
+    text_images_dir: PathBuf,
+    // Read-fallback (сохранённая main-папка), если исходник ещё не скопирован в staging.
+    fallback_text_images_dir: Option<PathBuf>,
+    user_scale: f32,
+    rotation_deg: f32,
+    // render-data вида `{ "effects": [...] }`.
+    render_data_json: Value,
+}
+
+/// Re-рендер image-оверлея: грузит исходник, применяет post-effects тем же pipeline, что и текст,
+/// и сохраняет результат отдельным `_fx`-файлом, сохраняя исходную картинку нетронутой.
+fn render_and_store_image_effects_overlay(
+    request: TypingEditImageEffectsRequest,
+) -> Result<Option<TypingEditOverlayResult>, String> {
+    if request.latest_token.load(Ordering::Acquire) != request.token {
+        return Ok(None);
+    }
+
+    // Исходник: отдельный original-файл, если он есть; иначе текущий показываемый файл является
+    // исходным (эффекты ещё не применялись).
+    let source_name = request
+        .original_file_name
+        .clone()
+        .unwrap_or_else(|| request.file_name.clone());
+    let primary_source_path = request.text_images_dir.join(&source_name);
+    // Исходник предпочтительно из staging; если его там ещё нет — из сохранённой main-папки.
+    let source_path = if primary_source_path.is_file() {
+        primary_source_path
+    } else if let Some(fallback) = request
+        .fallback_text_images_dir
+        .as_ref()
+        .map(|dir| dir.join(&source_name))
+        .filter(|path| path.is_file())
+    {
+        fallback
+    } else {
+        primary_source_path
+    };
+    let decoded = image::open(&source_path)
+        .map_err(|err| {
+            format!(
+                "Не удалось открыть исходную картинку {}: {err}",
+                source_path.display()
+            )
+        })?
+        .to_rgba8();
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 {
+        return Err("Исходная картинка нулевого размера.".to_string());
+    }
+
+    let effects_json = effects_json_from_render_data(&request.render_data_json);
+    let has_effects = !effects_json_array_is_empty(&effects_json);
+
+    let rendered = match apply_effects_to_image(
+        decoded.into_raw(),
+        width,
+        height,
+        effects_json.as_str(),
+        Some((&request.latest_token, request.token)),
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) if err == "render_next render cancelled" => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if rendered.width == 0 || rendered.height == 0 {
+        return Err("Рендер эффектов вернул изображение нулевого размера.".to_string());
+    }
+    if request.latest_token.load(Ordering::Acquire) != request.token {
+        return Ok(None);
+    }
+
+    // Когда эффекты есть — пишем отдельный `_fx`-файл, исходник остаётся как original-файл.
+    // Когда эффектов нет — показываем исходник напрямую и подчищаем устаревший `_fx`-файл.
+    let (display_file_name, new_original_file_name) = if has_effects {
+        let fx_name = image_effects_fx_file_name(&source_name);
+        let fx_path = request.text_images_dir.join(&fx_name);
+        image::save_buffer(
+            &fx_path,
+            rendered.rgba.as_slice(),
+            rendered.width,
+            rendered.height,
+            image::ColorType::Rgba8,
+        )
+        .map_err(|err| format!("Не удалось сохранить {}: {err}", fx_path.display()))?;
+        (fx_name, Some(source_name))
+    } else {
+        // Если раньше был отдельный `_fx`-файл — удаляем его, возвращаясь к исходнику.
+        if request.original_file_name.is_some() && request.file_name != source_name {
+            let _ = fs::remove_file(request.text_images_dir.join(&request.file_name));
+        }
+        (source_name, None)
+    };
+
+    Ok(Some(TypingEditOverlayResult {
+        token: request.token,
+        overlay_idx: request.overlay_idx,
+        file_name: display_file_name,
+        image_original_file_name: new_original_file_name,
+        is_image_effects: true,
+        user_scale: request.user_scale.max(0.05),
+        rotation_deg: request.rotation_deg,
+        render_data_json: request.render_data_json,
+        size_px: [rendered.width as usize, rendered.height as usize],
+        rgba: rendered.rgba,
+        warnings: rendered.warnings,
+    }))
+}
+
+/// Имя `_fx`-файла, производное от имени исходной картинки (`name.png` -> `name_fx.png`).
+fn image_effects_fx_file_name(source_name: &str) -> String {
+    let path = Path::new(source_name);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    format!("{stem}_fx.{ext}")
+}
+
+/// Истина, когда сериализованный массив эффектов пуст или отсутствует.
+fn effects_json_array_is_empty(effects_json: &str) -> bool {
+    let trimmed = effects_json.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| value.as_array().map(|arr| arr.is_empty()))
+        .unwrap_or(true)
 }
 
 fn shape_variant_slot_size(current_size_px: [usize; 2]) -> Vec2 {
@@ -7994,62 +11687,83 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
         .and_then(|effects| serde_json::to_string(&effects).ok())
         .unwrap_or_default();
 
+    // Сформированный текст (если задан) идёт в рендер вместо исходного, без
+    // повторного авто-переноса.
+    let formed_text = text_params
+        .get("formed_text")
+        .and_then(Value::as_str)
+        .filter(|formed| !formed.trim().is_empty());
+    let source_text = text_params
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let uses_formed = formed_text.is_some();
+    let render_text = formed_text.unwrap_or(source_text).to_string();
+
+    let font_size_px = text_params
+        .get("font_size_px")
+        .and_then(value_as_f32)
+        .unwrap_or(24.0)
+        .max(1.0);
+    // Единое представление `px-или-%`: новый строковый ключ либо устаревшая пара.
+    let line_spacing = read_render_param_px_or_percent(
+        text_params,
+        "line_spacing",
+        "line_spacing_px",
+        "line_spacing_percent",
+        PxOrPercent::percent(50.0),
+    );
+    let kerning = read_render_param_px_or_percent(
+        text_params,
+        "kerning",
+        "kerning_px",
+        "kerning_percent",
+        PxOrPercent::percent(0.0),
+    );
+    let glyph_height = read_render_param_px_or_percent(
+        text_params,
+        "glyph_height",
+        "",
+        "glyph_height_percent",
+        PxOrPercent::percent(100.0),
+    );
+    let glyph_width = read_render_param_px_or_percent(
+        text_params,
+        "glyph_width",
+        "",
+        "glyph_width_percent",
+        PxOrPercent::percent(100.0),
+    );
+
     Some(TextRenderParams {
-        text: text_params
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        text: render_text,
         text_color: text_params
             .get("text_color")
             .and_then(parse_rgba_value)
             .unwrap_or([0, 0, 0, 255]),
         font_path,
         available_inline_fonts: Vec::new(),
-        font_size_px: text_params
-            .get("font_size_px")
-            .and_then(value_as_f32)
-            .unwrap_or(24.0)
-            .max(1.0),
-        line_spacing_px: text_params
-            .get("line_spacing_px")
-            .and_then(value_as_f32)
-            .unwrap_or(4.0),
-        line_spacing_percent: text_params
-            .get("line_spacing_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(50.0),
+        font_size_px,
+        line_spacing_px: line_spacing.as_px_percent().0,
+        line_spacing_percent: line_spacing.as_px_percent().1,
         kerning_mode: text_params
             .get("kerning_mode")
             .and_then(Value::as_str)
             .and_then(parse_kerning_mode_config_str)
             .unwrap_or(KerningMode::Metric),
-        kerning_px: text_params
-            .get("kerning_px")
-            .and_then(value_as_f32)
-            .unwrap_or(0.0),
-        kerning_percent: text_params
-            .get("kerning_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(0.0),
-        glyph_height_percent: text_params
-            .get("glyph_height_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(100.0),
-        glyph_width_percent: text_params
-            .get("glyph_width_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(100.0),
+        kerning_px: kerning.as_px_percent().0,
+        kerning_percent: kerning.as_px_percent().1,
+        glyph_height_percent: glyph_height.as_percent_of(font_size_px),
+        glyph_width_percent: glyph_width.as_percent_of(font_size_px),
         width_px: text_params
             .get("width_px")
             .and_then(value_as_f32)
             .map(|value| value.round().max(1.0) as u32)
             .unwrap_or(TEXT_RENDER_DATA_FALLBACK_WIDTH_PX),
-        align: text_params
-            .get("align")
-            .and_then(Value::as_str)
-            .and_then(parse_align_config_str)
-            .unwrap_or(HorizontalAlign::Center),
+        align: HorizontalAlign::from_config(
+            text_params.get("align").and_then(Value::as_str),
+            text_params.get("align_bias").and_then(value_as_f32),
+        ),
         selected_face_index: text_params
             .get("selected_face_index")
             .and_then(Value::as_u64)
@@ -8083,11 +11797,15 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
             .get("enable_inline_style_tags")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        text_wrap_mode: text_params
-            .get("text_wrap_mode")
-            .and_then(Value::as_str)
-            .and_then(parse_text_wrap_mode_config_str)
-            .unwrap_or(TextWrapMode::Aggressive),
+        text_wrap_mode: if uses_formed {
+            TextWrapMode::None
+        } else {
+            text_params
+                .get("text_wrap_mode")
+                .and_then(Value::as_str)
+                .and_then(parse_text_wrap_mode_config_str)
+                .unwrap_or(TextWrapMode::Aggressive)
+        },
         text_shape: text_params
             .get("text_shape")
             .and_then(Value::as_str)
@@ -8346,15 +12064,6 @@ fn text_vector_point_params_from_value(value: &Value) -> Option<TextVectorPoint>
     })
 }
 
-fn parse_align_config_str(raw: &str) -> Option<HorizontalAlign> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "left" => Some(HorizontalAlign::Left),
-        "center" => Some(HorizontalAlign::Center),
-        "right" => Some(HorizontalAlign::Right),
-        "justify" => Some(HorizontalAlign::Justify),
-        _ => None,
-    }
-}
 
 fn parse_kerning_mode_config_str(raw: &str) -> Option<KerningMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -8362,6 +12071,37 @@ fn parse_kerning_mode_config_str(raw: &str) -> Option<KerningMode> {
         "optical" => Some(KerningMode::Optical),
         _ => None,
     }
+}
+
+/// Прочитать параметр `px-или-%`: сначала новый строковый ключ-токен, затем
+/// устаревшие отдельные ключи `*_px`/`*_percent` (с приоритетом пикселей).
+fn read_render_param_px_or_percent(
+    obj: &serde_json::Map<String, Value>,
+    token_key: &str,
+    legacy_px_key: &str,
+    legacy_percent_key: &str,
+    default: PxOrPercent,
+) -> PxOrPercent {
+    if let Some(value) = obj.get(token_key) {
+        if let Some(text) = value.as_str() {
+            if let Some(parsed) = PxOrPercent::parse(text) {
+                return parsed;
+            }
+        } else if let Some(number) = value_as_f32(value) {
+            // Голое число в ключе-токене встречается лишь в легаси `line_spacing`,
+            // где оно означало пиксели.
+            return PxOrPercent::px(number);
+        }
+    }
+    let legacy_px = obj.get(legacy_px_key).and_then(value_as_f32);
+    let legacy_percent = obj.get(legacy_percent_key).and_then(value_as_f32);
+    if legacy_px.is_some() || legacy_percent.is_some() {
+        return PxOrPercent::from_legacy_pair(
+            legacy_px.unwrap_or(0.0),
+            legacy_percent.unwrap_or(0.0),
+        );
+    }
+    default
 }
 
 fn parse_text_shape_config_str(raw: &str) -> Option<TextShape> {
@@ -8512,6 +12252,48 @@ fn export_typing_pages_to_folder(
 }
 
 fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), String> {
+    match job.export_format {
+        TypingExportFormat::Png => {
+            let (base_rgba, base_w, base_h) = flatten_typing_export_page_rgba(&job)?;
+            image::save_buffer(
+                &job.output_path,
+                &base_rgba,
+                base_w as u32,
+                base_h as u32,
+                image::ColorType::Rgba8,
+            )
+            .map_err(|err| {
+                format!(
+                    "Не удалось сохранить страницу {}: {err}",
+                    job.output_path.display()
+                )
+            })
+        }
+        TypingExportFormat::Psd => {
+            let bytes = super::psd_export::export_typing_single_page_psd(&job)?;
+            fs::write(&job.output_path, &bytes).map_err(|err| {
+                format!(
+                    "Не удалось сохранить страницу {}: {err}",
+                    job.output_path.display()
+                )
+            })
+        }
+    }
+}
+
+/// Загружает страницу-источник, накладывает клин и все оверлеи (так же, как делает
+/// PNG-экспорт) и возвращает финальный плоский RGBA8 буфер + размеры страницы.
+/// Используется и PNG-веткой, и PSD-веткой (для composite image_data).
+/// Сравнение оверлеев по порядку наложения (от низа стопки к верху).
+/// Приоритет: меньший `layer_idx` ниже; внутри одного слоя — чем ниже на
+/// картинке (больший `center_y`), тем выше в стопке. Используется и для отрисовки
+/// в редакторе, и для композиции при экспорте, чтобы UI и PNG/PSD совпадали.
+// `overlay_stack_cmp` (the old layer_idx + page-Y auto-order) was retired: text is now ordered by the
+// unified manual band-Z everywhere (draw, interaction, export), like rasters.
+
+pub(super) fn flatten_typing_export_page_rgba(
+    job: &TypingExportPageJob,
+) -> Result<(Vec<u8>, usize, usize), String> {
     let mut base = image::open(&job.page_path)
         .map_err(|err| {
             format!(
@@ -8533,58 +12315,247 @@ fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), String> {
         );
     }
 
-    for overlay in &job.overlays {
-        if overlay.page_idx != job.page_idx {
+    // PS raster layers to composite, normalized to a common shape (straight RGBA + band-Z). PREFER the
+    // on-screen snapshot taken from the doc projection (`job.rasters`, matching the canvas exactly);
+    // FALL BACK to a disk read of `layers.json` only when no snapshot was provided (back-compat). Then
+    // interleave rasters with text/image overlays in the SAME band-Z order the live canvas uses.
+    use crate::models::layer_model::ordering::Band;
+    use crate::models::layer_model::persist;
+    struct RasterDraw {
+        visible: bool,
+        opacity: f32,
+        transform: crate::models::layer_model::manifest::TransformRec,
+        deform: Option<crate::models::layer_model::manifest::DeformRec>,
+        rgba: Vec<u8>,
+        size_px: [usize; 2],
+        band_z: u32,
+        mask_clip_enabled: bool,
+    }
+
+    // On-disk page bands: needed for OVERLAY (text) band-Z in both paths, and for raster band-Z in the
+    // disk-fallback path (the snapshot carries raster band-Z directly).
+    let disk_bands = match job.layers_primary_dir.as_deref() {
+        Some(primary) => {
+            persist::load_page_bands(primary, job.layers_fallback_dir.as_deref(), job.page_idx)
+        }
+        None => Vec::new(),
+    };
+
+    let raster_draws: Vec<RasterDraw> = if !job.rasters.is_empty() {
+        job.rasters
+            .iter()
+            .map(|r| RasterDraw {
+                visible: r.visible,
+                opacity: r.opacity,
+                transform: r.transform,
+                deform: r.deform.clone(),
+                rgba: r.rgba.clone(),
+                size_px: r.size_px,
+                band_z: r.band_z,
+                mask_clip_enabled: r.mask_clip_enabled,
+            })
+            .collect()
+    } else if let Some(primary) = job.layers_primary_dir.as_deref() {
+        let fb = job.layers_fallback_dir.as_deref();
+        let loaded = persist::load_page_rasters(primary, fb, job.page_idx)
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "WARN typing::flatten_export_failed_to_load_rasters page={} err={err}",
+                    job.page_idx
+                );
+                persist::PageRasters {
+                    groups: Vec::new(),
+                    layers: Vec::new(),
+                }
+            })
+            .layers;
+        let raster_band_z = |uid: &str| -> u32 {
+            for band in &disk_bands {
+                if let Band::Raster { uid: u, z } = band
+                    && u == uid
+                {
+                    return *z;
+                }
+            }
+            disk_bands.len() as u32
+        };
+        loaded
+            .into_iter()
+            .map(|l| {
+                let rgba: Vec<u8> = l
+                    .image
+                    .pixels
+                    .iter()
+                    .flat_map(|p| p.to_srgba_unmultiplied())
+                    .collect();
+                let band_z = raster_band_z(&l.uid);
+                RasterDraw {
+                    visible: l.visible,
+                    opacity: l.opacity,
+                    transform: l.transform,
+                    deform: l.deform,
+                    size_px: l.image.size,
+                    rgba,
+                    band_z,
+                    mask_clip_enabled: l.mask_clip.unwrap_or(false),
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let overlay_z = |uid: &str, layer_idx: usize| -> u32 {
+        for band in &disk_bands {
+            if let Band::PinnedText { uid: u, z } = band
+                && u == uid
+            {
+                return *z;
+            }
+        }
+        let layer_idx_u32 = u32::try_from(layer_idx).unwrap_or(u32::MAX);
+        for band in &disk_bands {
+            if let Band::TextGroup {
+                layer_idx: li, z, ..
+            } = band
+                && *li == layer_idx_u32
+            {
+                return *z;
+            }
+        }
+        disk_bands.len() as u32
+    };
+
+    enum Item {
+        Raster(usize),
+        Overlay(usize),
+    }
+    // Source BOTH raster and overlay band-Z from the SAME place to avoid divergence: when the in-memory
+    // raster snapshot is present, the overlay snapshot's `band_z` (captured from the same `bands_by_page`)
+    // is authoritative; otherwise fall back to the disk band lookup. Tie-break keeps raster=0 below
+    // overlay=1 at the same Z (text on top of a same-Z raster).
+    let use_snapshot_z = !job.rasters.is_empty();
+    let mut items: Vec<(u32, u32, Item)> = Vec::new();
+    for (i, r) in raster_draws.iter().enumerate() {
+        items.push((r.band_z, 0, Item::Raster(i)));
+    }
+    for (i, ov) in job.overlays.iter().enumerate() {
+        if ov.page_idx != job.page_idx {
             continue;
         }
-        let deform_mesh = export_overlay_deform_mesh_for_page(overlay, [base_w, base_h]);
-        let clipped_rgba = if overlay.mask_clip_enabled {
-            job.mask
-                .as_ref()
-                .and_then(|mask| {
-                    export_clip_overlay_rgba_if_needed(
-                        mask,
+        let z = if use_snapshot_z { ov.band_z } else { overlay_z(&ov.uid, ov.layer_idx) };
+        items.push((z, 1, Item::Overlay(i)));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    for (_, _, item) in &items {
+        match item {
+            Item::Overlay(i) => {
+                let overlay = &job.overlays[*i];
+                let deform_mesh = export_overlay_deform_mesh_for_page(overlay, [base_w, base_h]);
+                let clipped_rgba = export_overlay_clipped_rgba(job, overlay, &deform_mesh);
+                if let Some(top_left_px) = direct_overlay_blit_top_left_px(overlay) {
+                    composite_overlay_at_page_position_over(
+                        base_rgba,
+                        [base_w, base_h],
+                        clipped_rgba.as_slice(),
                         overlay.size_px,
-                        overlay.source_rgba.as_slice(),
+                        top_left_px,
+                    );
+                } else {
+                    composite_overlay_mesh_over_page(
+                        base_rgba,
+                        [base_w, base_h],
+                        clipped_rgba.as_slice(),
+                        overlay.size_px,
                         &deform_mesh,
-                    )
-                })
-                .unwrap_or_else(|| overlay.source_rgba.clone())
-        } else {
-            overlay.source_rgba.clone()
-        };
-        if let Some(top_left_px) = direct_overlay_blit_top_left_px(overlay) {
-            composite_overlay_at_page_position_over(
-                base_rgba,
-                [base_w, base_h],
-                clipped_rgba.as_slice(),
-                overlay.size_px,
-                top_left_px,
-            );
-        } else {
-            composite_overlay_mesh_over_page(
-                base_rgba,
-                [base_w, base_h],
-                clipped_rgba.as_slice(),
-                overlay.size_px,
-                &deform_mesh,
-            );
+                    );
+                }
+            }
+            Item::Raster(i) => {
+                let r = &raster_draws[*i];
+                if !r.visible {
+                    continue;
+                }
+                let [w, h] = r.size_px;
+                if w == 0 || h == 0 || r.rgba.len() != w * h * 4 {
+                    continue;
+                }
+                // Honor the deform mesh when present (matching the canvas), else build the affine quad.
+                let mesh = if let Some(d) = &r.deform {
+                    TypingOverlayDeformMesh {
+                        cols: d.cols,
+                        rows: d.rows,
+                        points_px: d.points_px.clone(),
+                    }
+                } else {
+                    let (s, c) = r.transform.rotation.sin_cos();
+                    let hw = w as f32 * 0.5 * r.transform.scale;
+                    let hh = h as f32 * 0.5 * r.transform.scale;
+                    let rot = |dx: f32, dy: f32| {
+                        [
+                            r.transform.cx + dx * c - dy * s,
+                            r.transform.cy + dx * s + dy * c,
+                        ]
+                    };
+                    // Row-major TL, TR, BL, BR. Construct the mesh directly (not via
+                    // `TypingOverlayDeformMesh::new`) to skip its page clamping — a raster may extend
+                    // off-page.
+                    let points_px = vec![rot(-hw, -hh), rot(hw, -hh), rot(-hw, hh), rot(hw, hh)];
+                    TypingOverlayDeformMesh {
+                        cols: 2,
+                        rows: 2,
+                        points_px,
+                    }
+                };
+                // Mask-clip ON → clip the raster to the page mask through its mesh (same as on-screen
+                // `clipped_image` and the text-overlay export clip), so it exports WITHOUT pixels outside
+                // the mask. Falls back to unclipped only if there is no mask snapshot.
+                let mut rgba = if r.mask_clip_enabled {
+                    job.mask
+                        .as_ref()
+                        .and_then(|mask| {
+                            export_clip_overlay_rgba_if_needed(mask, [w, h], r.rgba.as_slice(), &mesh)
+                        })
+                        .unwrap_or_else(|| r.rgba.clone())
+                } else {
+                    r.rgba.clone()
+                };
+                if r.opacity < 1.0 {
+                    for px in rgba.chunks_exact_mut(4) {
+                        px[3] = (px[3] as f32 * r.opacity).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                composite_overlay_mesh_over_page(base_rgba, [base_w, base_h], &rgba, [w, h], &mesh);
+            }
         }
     }
 
-    image::save_buffer(
-        &job.output_path,
-        base_rgba,
-        base_w as u32,
-        base_h as u32,
-        image::ColorType::Rgba8,
-    )
-    .map_err(|err| {
-        format!(
-            "Не удалось сохранить страницу {}: {err}",
-            job.output_path.display()
-        )
-    })
+    Ok((base.into_raw(), base_w, base_h))
+}
+
+/// Применяет маску обрезки к оверлею, если она включена и доступна; иначе
+/// возвращает исходный RGBA. Общая логика для PNG- и PSD-экспорта.
+pub(super) fn export_overlay_clipped_rgba(
+    job: &TypingExportPageJob,
+    overlay: &TypingExportOverlaySnapshot,
+    deform_mesh: &TypingOverlayDeformMesh,
+) -> Vec<u8> {
+    if overlay.mask_clip_enabled {
+        job.mask
+            .as_ref()
+            .and_then(|mask| {
+                export_clip_overlay_rgba_if_needed(
+                    mask,
+                    overlay.size_px,
+                    overlay.source_rgba.as_slice(),
+                    deform_mesh,
+                )
+            })
+            .unwrap_or_else(|| overlay.source_rgba.clone())
+    } else {
+        overlay.source_rgba.clone()
+    }
 }
 
 fn prepare_export_clean_overlay_snapshots(
@@ -8647,7 +12618,7 @@ fn load_clean_overlay_rgba_from_disk(
     Ok(Some(clean))
 }
 
-fn composite_overlay_full_image_over(
+pub(super) fn composite_overlay_full_image_over(
     base_rgba: &mut [u8],
     base_size: [usize; 2],
     overlay_rgba: &[u8],
@@ -8676,7 +12647,7 @@ fn composite_overlay_full_image_over(
     }
 }
 
-fn composite_overlay_at_page_position_over(
+pub(super) fn composite_overlay_at_page_position_over(
     base_rgba: &mut [u8],
     base_size: [usize; 2],
     overlay_rgba: &[u8],
@@ -8719,7 +12690,7 @@ fn composite_overlay_at_page_position_over(
     }
 }
 
-fn composite_overlay_mesh_over_page(
+pub(super) fn composite_overlay_mesh_over_page(
     base_rgba: &mut [u8],
     base_size: [usize; 2],
     overlay_rgba: &[u8],
@@ -8745,10 +12716,14 @@ fn composite_overlay_mesh_over_page(
         for col in 0..(deform_mesh.cols - 1) {
             let s0 = col as f32 / (deform_mesh.cols - 1) as f32;
             let s1 = (col + 1) as f32 / (deform_mesh.cols - 1) as f32;
-            let p00 = export_scene_from_page_px(base_size, deform_mesh.point(col, row));
-            let p10 = export_scene_from_page_px(base_size, deform_mesh.point(col + 1, row));
-            let p01 = export_scene_from_page_px(base_size, deform_mesh.point(col, row + 1));
-            let p11 = export_scene_from_page_px(base_size, deform_mesh.point(col + 1, row + 1));
+            // Raw page-pixel corners (NO clamping to the page rect): the triangle rasterizer below
+            // already clips pixel iteration to the page bounds, so clamping the vertices would only
+            // distort geometry that extends off-page — e.g. a scaled-up raster, making its scale
+            // appear ignored. Off-page parts are correctly clipped by the rasterizer's bbox.
+            let p00 = deform_mesh.point(col, row);
+            let p10 = deform_mesh.point(col + 1, row);
+            let p01 = deform_mesh.point(col, row + 1);
+            let p11 = deform_mesh.point(col + 1, row + 1);
 
             rasterize_textured_triangle(
                 base_rgba,
@@ -8828,7 +12803,7 @@ fn rasterize_textured_triangle(
     }
 }
 
-fn direct_overlay_blit_top_left_px(overlay: &TypingExportOverlaySnapshot) -> Option<[i32; 2]> {
+pub(super) fn direct_overlay_blit_top_left_px(overlay: &TypingExportOverlaySnapshot) -> Option<[i32; 2]> {
     if overlay.deform_mesh.is_some()
         || overlay.angle_deg.abs() > 1e-4
         || (overlay.user_scale - 1.0).abs() > 1e-4
@@ -8934,7 +12909,7 @@ fn blend_source_over(dst: &mut [u8], src: &[u8]) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-fn export_overlay_deform_mesh_for_page(
+pub(super) fn export_overlay_deform_mesh_for_page(
     overlay: &TypingExportOverlaySnapshot,
     page_size: [usize; 2],
 ) -> TypingOverlayDeformMesh {
@@ -8980,10 +12955,6 @@ fn default_quad_uv_for_page(
 
     let quad_uv = quad_scene.map(|point| [point[0] / page_w, point[1] / page_h]);
     clamp_quad_uv(quad_uv)
-}
-
-fn export_scene_from_page_px(page_size: [usize; 2], page_px: [f32; 2]) -> [f32; 2] {
-    clamp_page_point(page_px, page_size)
 }
 
 fn export_bilinear_quad_uv(quad_uv: [[f32; 2]; 4], tu: f32, tv: f32) -> [f32; 2] {
@@ -9160,80 +13131,22 @@ fn parse_effects_json_array(raw: &str) -> Vec<Value> {
 
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
-fn append_created_overlay_info(
-    text_images_dir: &Path,
-    page_idx: usize,
-    center_page_px: [f32; 2],
-    mask_clip_enabled: bool,
-    user_scale: f32,
-    file_name: &str,
-    kind: TypingOverlayKind,
-    render_data_json: Option<Value>,
-) -> Result<(), String> {
-    let text_info_path = text_images_dir.join(TEXT_INFO_FILE_NAME);
-    let mut items = if text_info_path.is_file() {
-        let raw = fs::read_to_string(&text_info_path)
-            .map_err(|err| format!("Не удалось прочитать {}: {err}", text_info_path.display()))?;
-        let parsed: Value = serde_json::from_str(&raw)
-            .map_err(|err| format!("Не удалось распарсить {}: {err}", text_info_path.display()))?;
-        parsed.as_array().cloned().ok_or_else(|| {
-            format!(
-                "Файл {} должен содержать JSON-массив.",
-                text_info_path.display()
-            )
-        })?
-    } else {
-        Vec::new()
-    };
-
-    items.push(build_storage_overlay_entry(
-        kind,
-        page_idx,
-        file_name,
-        center_page_px,
-        mask_clip_enabled,
-        0.0,
-        user_scale,
-        None,
-        render_data_json,
-    ));
-
-    write_overlay_items_to_text_info(text_images_dir, &items)
-}
-
-fn write_overlay_items_to_text_info(text_images_dir: &Path, items: &[Value]) -> Result<(), String> {
-    fs::create_dir_all(text_images_dir).map_err(|err| {
-        format!(
-            "Не удалось создать папку {}: {err}",
-            text_images_dir.display()
-        )
-    })?;
-
-    let text_info_path = text_images_dir.join(TEXT_INFO_FILE_NAME);
-    let raw = serde_json::to_string_pretty(items).map_err(|err| {
-        format!(
-            "Не удалось сериализовать {}: {err}",
-            text_info_path.display()
-        )
-    })?;
-    fs::write(&text_info_path, raw)
-        .map_err(|err| format!("Не удалось записать {}: {err}", text_info_path.display()))
-}
-
-// Parameters represent distinct required inputs with no natural grouping.
-#[allow(clippy::too_many_arguments)]
 fn build_storage_overlay_entry(
+    uid: &str,
     kind: TypingOverlayKind,
     page_idx: usize,
     file_name: &str,
+    original_file_name: Option<&str>,
     center_page_px: [f32; 2],
     mask_clip_enabled: bool,
+    layer_idx: usize,
     rotation_deg: f32,
     scale: f32,
     deform_mesh: Option<TypingOverlayDeformMesh>,
     render_data: Option<Value>,
 ) -> Value {
     let mut out = serde_json::Map::<String, Value>::new();
+    out.insert("uid".to_string(), Value::String(uid.to_string()));
     out.insert(
         "overlay_type".to_string(),
         Value::String(
@@ -9246,27 +13159,44 @@ fn build_storage_overlay_entry(
     );
     out.insert("img_idx".to_string(), Value::from(page_idx as u64));
     out.insert("file".to_string(), Value::String(file_name.to_string()));
-    out.insert("img_x_px".to_string(), Value::from(center_page_px[0]));
-    out.insert("img_y_px".to_string(), Value::from(center_page_px[1]));
+    // Для image-оверлеев `file` хранит картинку ПОСЛЕ эффектов (она же идёт в показ/экспорт),
+    // а `image_original_file` — исходную импортированную картинку, чтобы эффекты можно было
+    // переприменять и отменять без потери качества.
+    if let Some(original) = original_file_name.filter(|name| !name.is_empty() && *name != file_name)
+    {
+        out.insert(
+            "image_original_file".to_string(),
+            Value::String(original.to_string()),
+        );
+    }
+    // Serialize position/rotation/scale through the shared encoder (single encode point: center →
+    // img_x/y, rad → rotation_deg, scale). The caller supplies rotation in DEGREES, so convert to the
+    // canonical radians `TransformRec` the encoder consumes.
+    crate::models::layer_model::text_payload::encode_transform_fields(
+        &crate::models::layer_model::manifest::TransformRec {
+            cx: center_page_px[0],
+            cy: center_page_px[1],
+            rotation: rotation_deg.to_radians(),
+            scale: scale.max(0.01),
+        },
+        &mut out,
+    );
     out.insert(
         "mask_clip_enabled".to_string(),
         Value::from(mask_clip_enabled),
     );
-    out.insert("rotation_deg".to_string(), Value::from(rotation_deg));
-    out.insert("scale".to_string(), Value::from(scale.max(0.01)));
+    out.insert("layer_idx".to_string(), Value::from(layer_idx as u64));
     if let Some(mesh) = deform_mesh {
-        let points = mesh
-            .points_px
-            .iter()
-            .map(|[x, y]| Value::Array(vec![Value::from(*x), Value::from(*y)]))
-            .collect::<Vec<_>>();
+        // Serialize the deform mesh through the shared encoder (single encode point), converting the
+        // runtime mesh to the canonical `DeformRec` first.
+        let rec = crate::models::layer_model::manifest::DeformRec {
+            cols: mesh.cols,
+            rows: mesh.rows,
+            points_px: mesh.points_px.clone(),
+        };
         out.insert(
             "deform_mesh".to_string(),
-            json!({
-                "cols": mesh.cols,
-                "rows": mesh.rows,
-                "points_px": points,
-            }),
+            crate::models::layer_model::text_payload::encode_deform_mesh(&rec),
         );
     }
     if let Some(render_data) = render_data {
@@ -9418,14 +13348,16 @@ fn normalize_text_params_object(
         .and_then(|v| usize::try_from(v).ok())
         .unwrap_or(0usize);
 
-    json!({
+    let mut params = json!({
         "text": text,
         "text_color": text_color,
         "font_path": font_path,
         "font_label": font_label,
         "font_size_px": obj.get("font_size_px").and_then(value_as_f32).or_else(|| obj.get("font_size").and_then(value_as_f32)).or_else(|| obj.get("size").and_then(value_as_f32)).unwrap_or(24.0).max(1.0),
-        "line_spacing_px": obj.get("line_spacing_px").and_then(value_as_f32).or_else(|| obj.get("line_spacing").and_then(value_as_f32)).unwrap_or(4.0),
-        "line_spacing_percent": obj.get("line_spacing_percent").and_then(value_as_f32).unwrap_or(50.0),
+        "line_spacing": read_render_param_px_or_percent(obj, "line_spacing", "line_spacing_px", "line_spacing_percent", PxOrPercent::percent(50.0)).to_token(),
+        "kerning": read_render_param_px_or_percent(obj, "kerning", "kerning_px", "kerning_percent", PxOrPercent::percent(0.0)).to_token(),
+        "glyph_height": read_render_param_px_or_percent(obj, "glyph_height", "", "glyph_height_percent", PxOrPercent::percent(100.0)).to_token(),
+        "glyph_width": read_render_param_px_or_percent(obj, "glyph_width", "", "glyph_width_percent", PxOrPercent::percent(100.0)).to_token(),
         "width_px": width_px,
         "align": align,
         "text_line_mode": text_line_mode,
@@ -9444,7 +13376,32 @@ fn normalize_text_params_object(
         "text_shape": text_shape,
         "shape_min_width_percent": obj.get("shape_min_width_percent").and_then(value_as_f32).unwrap_or(50.0),
         "shape_variant": obj.get("shape_variant").and_then(Value::as_u64).unwrap_or(5).clamp(1, 9),
-    })
+    });
+
+    // Современные поля панели, которых не было в легаси-схеме. Нормализатор строит
+    // `text_params` по белому списку, поэтому без явного проброса они терялись при
+    // загрузке проекта (напр. `formed_text` — сформированный текст «продвинутой
+    // формы»). Сохраняем как есть, если присутствуют; иначе панель подставит свои
+    // дефолты при чтении.
+    if let Some(map) = params.as_object_mut() {
+        for key in [
+            "formed_text",
+            "kerning_mode",
+            "hanging_punctuation",
+            "new_line_after_sentence",
+            "trim_extra_spaces",
+            "vertical_line_direction",
+            // Точное смещение выравнивания (слайдер лево↔право). Легаси-строка
+            // `align` сохраняется отдельно для совместимости/PSD-экспорта, но
+            // непрерывное значение живёт только здесь.
+            "align_bias",
+        ] {
+            if let Some(value) = obj.get(key) {
+                map.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    params
 }
 
 fn parse_effects_list_from_render_params_object(
@@ -9482,9 +13439,11 @@ fn parse_legacy_static_render_data(
     let text_color = overlay_param_rgba(style, obj, "font_color_rgba")
         .or_else(|| overlay_param_rgba(style, obj, "color"))
         .unwrap_or([0, 0, 0, 255]);
-    let line_spacing_px = overlay_param_f32(style, obj, "line_spacing").unwrap_or(4.0);
-    let line_spacing_percent =
-        overlay_param_f32(style, obj, "line_spacing_percent").unwrap_or(50.0);
+    // В легаси-схеме `line_spacing` — пиксели, `line_spacing_percent` — проценты.
+    let line_spacing = PxOrPercent::from_legacy_pair(
+        overlay_param_f32(style, obj, "line_spacing").unwrap_or(4.0),
+        overlay_param_f32(style, obj, "line_spacing_percent").unwrap_or(50.0),
+    );
     let align = normalize_align_legacy(
         overlay_param_str(style, obj, "align")
             .unwrap_or_else(|| "center".to_string())
@@ -9510,8 +13469,7 @@ fn parse_legacy_static_render_data(
             "font_path": Value::Null,
             "font_label": font_label,
             "font_size_px": font_size_px.max(1.0),
-            "line_spacing_px": line_spacing_px,
-            "line_spacing_percent": line_spacing_percent,
+            "line_spacing": line_spacing.to_token(),
             "width_px": width_px,
             "align": align,
             "text_line_mode": "horizontal",
@@ -10180,60 +14138,11 @@ fn normalized_to_static(value: &str) -> &'static str {
     }
 }
 
-fn parse_transform_uv(obj: &serde_json::Map<String, Value>) -> Option<[[f32; 2]; 4]> {
-    let raw_quad = obj.get("transform_uv")?.as_array()?;
-    if raw_quad.len() != 4 {
-        return None;
-    }
-
-    let mut out = [[0.0f32; 2]; 4];
-    for (idx, point) in raw_quad.iter().enumerate() {
-        let coords = point.as_array()?;
-        if coords.len() != 2 {
-            return None;
-        }
-        let u = coords[0].as_f64()? as f32;
-        let v = coords[1].as_f64()? as f32;
-        out[idx] = [clamp_overlay_uv_coord(u), clamp_overlay_uv_coord(v)];
-    }
-    Some(out)
-}
-
-fn parse_deform_mesh(
-    obj: &serde_json::Map<String, Value>,
-    page_size: [usize; 2],
-) -> Option<TypingOverlayDeformMesh> {
-    let mesh_obj = obj.get("deform_mesh")?.as_object()?;
-    let cols = mesh_obj
-        .get("cols")?
-        .as_u64()
-        .and_then(|v| usize::try_from(v).ok())?;
-    let rows = mesh_obj
-        .get("rows")?
-        .as_u64()
-        .and_then(|v| usize::try_from(v).ok())?;
-    let raw_points = mesh_obj
-        .get("points_px")
-        .or_else(|| mesh_obj.get("points_uv"))?
-        .as_array()?;
-    let use_page_px = mesh_obj.get("points_px").is_some();
-    let mut points_px = Vec::with_capacity(raw_points.len());
-    for point in raw_points {
-        let coords = point.as_array()?;
-        if coords.len() != 2 {
-            return None;
-        }
-        let x = coords[0].as_f64()? as f32;
-        let y = coords[1].as_f64()? as f32;
-        points_px.push(if use_page_px {
-            clamp_page_point([x, y], page_size)
-        } else {
-            uv_to_page_px(clamp_uv_point([x, y]), page_size)
-        });
-    }
-    TypingOverlayDeformMesh::new(cols, rows, points_px, page_size)
-        .map(|mesh| normalize_deform_mesh_resolution(&mesh, page_size))
-}
+// Legacy per-entry geometry decoding (`transform_uv` quad, `deform_mesh`, `img_u`/`img_v`/`u`/`v`
+// position, `angle`/`user_scale` aliases) now lives in the shared `text_payload` codec
+// (`decode_overlay_placement` / `decode_deform_mesh`) — the single source of truth so the typing tab
+// and the doc resolve old chapters identically. The former `parse_transform_uv` / `parse_deform_mesh`
+// / `overlay_center_page_px_from_storage` here were removed.
 
 fn legacy_fallback_width_px(obj: &serde_json::Map<String, Value>) -> u32 {
     obj.get("width_px")
@@ -10265,8 +14174,7 @@ fn default_render_data_for_text(text: &str, width_px: u32) -> Value {
             "font_path": Value::Null,
             "font_label": Value::Null,
             "font_size_px": 24.0,
-            "line_spacing_px": 4.0,
-            "line_spacing_percent": 50.0,
+            "line_spacing": "50%",
             "width_px": width_px.max(1),
             "align": "center",
             "text_line_mode": "horizontal",
@@ -10312,31 +14220,6 @@ fn parse_overlay_kind(obj: &serde_json::Map<String, Value>) -> TypingOverlayKind
     }
 }
 
-fn overlay_center_page_px_from_storage(
-    obj: &serde_json::Map<String, Value>,
-    page_size: [usize; 2],
-) -> [f32; 2] {
-    if let (Some(x_px), Some(y_px)) = (
-        obj.get("img_x_px").and_then(value_as_f32),
-        obj.get("img_y_px").and_then(value_as_f32),
-    ) {
-        return clamp_page_point([x_px, y_px], page_size);
-    }
-    let u = obj
-        .get("img_u")
-        .or_else(|| obj.get("u"))
-        .and_then(value_as_f32)
-        .unwrap_or(0.5)
-        .clamp(overlay_uv_min(), overlay_uv_max());
-    let v = obj
-        .get("img_v")
-        .or_else(|| obj.get("v"))
-        .and_then(value_as_f32)
-        .unwrap_or(0.5)
-        .clamp(overlay_uv_min(), overlay_uv_max());
-    uv_to_page_px([u, v], page_size)
-}
-
 fn normalize_overlay_storage_entry(
     obj: &serde_json::Map<String, Value>,
     page_size: [usize; 2],
@@ -10355,32 +14238,26 @@ fn normalize_overlay_storage_entry(
         .file_name()
         .and_then(|name| name.to_str())
         .map(|name| name.to_string())?;
-    let center_page_px = overlay_center_page_px_from_storage(obj, page_size);
-    let rotation_deg = obj
-        .get("rotation_deg")
-        .or_else(|| obj.get("angle"))
-        .and_then(value_as_f32)
-        .unwrap_or(0.0);
+    // Geometry decode through the SINGLE shared codec (center, rotation, scale, deform).
+    let placement =
+        crate::models::layer_model::text_payload::decode_overlay_placement(obj, page_size);
+    let center_page_px = [placement.transform.cx, placement.transform.cy];
+    let rotation_deg = placement.transform.rotation.to_degrees();
+    let scale = placement.transform.scale;
+    let deform_mesh = placement
+        .deform
+        .as_ref()
+        .and_then(|rec| TypingOverlayDeformMesh::from_deform_rec(rec, page_size))
+        .map(|mesh| normalize_deform_mesh_resolution(&mesh, page_size));
     let mask_clip_enabled = obj
         .get("mask_clip_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let scale = obj
-        .get("scale")
-        .or_else(|| obj.get("user_scale"))
-        .and_then(value_as_f32)
-        .unwrap_or(1.0)
-        .max(0.01);
-    let deform_mesh = parse_deform_mesh(obj, page_size).or_else(|| {
-        parse_transform_uv(obj).map(|quad| {
-            deform_mesh_from_quad(
-                quad,
-                TEXT_OVERLAY_DEFORM_SURFACE_COLS,
-                TEXT_OVERLAY_DEFORM_SURFACE_ROWS,
-                page_size,
-            )
-        })
-    });
+    let layer_idx = obj
+        .get("layer_idx")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0);
     let render_data = if kind == TypingOverlayKind::Text {
         let fallback_width_px = legacy_fallback_width_px(obj);
         Some(
@@ -10392,15 +14269,30 @@ fn normalize_overlay_storage_entry(
             }),
         )
     } else {
+        Some(parse_image_overlay_render_data(obj))
+    };
+    let original_file_name = if kind == TypingOverlayKind::Image {
+        parse_overlay_original_file_name(obj)
+    } else {
         None
     };
 
+    // Preserve an existing stable id, or mint one so pre-uid overlays acquire it on this rewrite.
+    let uid = obj
+        .get("uid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     Some(build_storage_overlay_entry(
+        &uid,
         kind,
         page_idx,
         file_name.as_str(),
+        original_file_name.as_deref(),
         center_page_px,
         mask_clip_enabled,
+        layer_idx,
         rotation_deg,
         scale,
         deform_mesh,
@@ -10434,53 +14326,84 @@ fn decode_overlay_from_storage_entry(
         return None;
     }
 
-    let center_page_px = overlay_center_page_px_from_storage(obj, page_size);
-    let user_scale = obj
-        .get("scale")
-        .or_else(|| obj.get("user_scale"))
-        .and_then(value_as_f32)
-        .unwrap_or(1.0)
-        .max(0.01);
+    // Geometry decode (center, rotation, scale, deform incl. transform_uv) goes through the SINGLE
+    // shared codec so the typing tab and the doc resolve legacy formats identically.
+    let placement =
+        crate::models::layer_model::text_payload::decode_overlay_placement(obj, page_size);
+    let center_page_px = [placement.transform.cx, placement.transform.cy];
+    let user_scale = placement.transform.scale;
+    let angle_deg = placement.transform.rotation.to_degrees();
+    let deform_mesh = placement
+        .deform
+        .as_ref()
+        .and_then(|rec| TypingOverlayDeformMesh::from_deform_rec(rec, page_size))
+        .map(|mesh| normalize_deform_mesh_resolution(&mesh, page_size));
     let mask_clip_enabled = obj
         .get("mask_clip_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let angle_deg = obj
-        .get("rotation_deg")
-        .or_else(|| obj.get("angle"))
-        .and_then(value_as_f32)
-        .unwrap_or(0.0);
-    let deform_mesh = parse_deform_mesh(obj, page_size).or_else(|| {
-        parse_transform_uv(obj).map(|quad| {
-            deform_mesh_from_quad(
-                quad,
-                TEXT_OVERLAY_DEFORM_SURFACE_COLS,
-                TEXT_OVERLAY_DEFORM_SURFACE_ROWS,
-                page_size,
-            )
-        })
-    });
+    let layer_idx = obj
+        .get("layer_idx")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0);
     let render_data_json = if kind == TypingOverlayKind::Text {
         let fallback_width_px = legacy_fallback_width_px(obj);
         parse_overlay_render_data_json(obj, fallback_width_px)
     } else {
+        Some(parse_image_overlay_render_data(obj))
+    };
+    let original_file_name = if kind == TypingOverlayKind::Image {
+        parse_overlay_original_file_name(obj)
+    } else {
         None
     };
 
+    let uid = obj
+        .get("uid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     Some(TypingOverlayDecoded {
+        uid,
         kind,
         page_idx,
         center_page_px,
         mask_clip_enabled,
+        layer_idx,
         user_scale,
         angle_deg,
         deform_mesh,
         file_name,
+        original_file_name,
         render_data_json,
         size_px: [w as usize, h as usize],
         rgba: decoded.into_raw(),
         warnings: Vec::new(),
     })
+}
+
+/// Парсит имя файла исходной картинки image-оверлея (`image_original_file`), очищая путь до имени.
+fn parse_overlay_original_file_name(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    obj.get("image_original_file")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|file| Path::new(file).file_name().and_then(|name| name.to_str()))
+        .map(|name| name.to_string())
+}
+
+/// Парсит render-data image-оверлея (только список эффектов). Отсутствие/мусор → пустые эффекты.
+fn parse_image_overlay_render_data(obj: &serde_json::Map<String, Value>) -> Value {
+    let effects = obj
+        .get("render_data")
+        .and_then(Value::as_object)
+        .and_then(|render_data| render_data.get("effects"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    json!({ "effects": effects })
 }
 
 fn load_typing_page_sizes(page_paths: &[(usize, PathBuf)]) -> HashMap<usize, [usize; 2]> {
@@ -10495,9 +14418,15 @@ fn load_typing_page_sizes(page_paths: &[(usize, PathBuf)]) -> HashMap<usize, [us
     out
 }
 
+// The cross-entry legacy migration (absolute ribbon `x`/`y`+`region_w`/`region_h`, top-left
+// `u`/`v`) and its helpers now live in the shared `text_payload::migrate_overlay_entries` codec,
+// so the typing loader and the doc loader normalize old chapters identically before per-entry
+// decode. The former `overlay_entry_is_modern` / `legacy_overlay_page_*` / `legacy_overlay_png_size`
+// / `migrate_legacy_text_overlays` here were removed.
+
 fn load_typing_overlays_from_dir(
     text_images_dir: &Path,
-    fallback_dir: Option<&Path>,
+    fallback_dirs: &[&Path],
     page_sizes: &HashMap<usize, [usize; 2]>,
 ) -> Result<Vec<TypingOverlayDecoded>, String> {
     let text_info_path = text_images_dir.join(TEXT_INFO_FILE_NAME);
@@ -10516,11 +14445,39 @@ fn load_typing_overlays_from_dir(
         ));
     };
 
-    let mut decoded_out = Vec::new();
-    let mut normalized_items = Vec::<Value>::with_capacity(items.len());
-    let mut needs_rewrite = false;
+    // Migrate the cross-entry legacy placement families (absolute ribbon x/y, top-left u/v) up front
+    // via the SHARED codec so the per-entry decode below — and the doc loader — see modern
+    // center-anchored `img_idx`/`img_u`/`img_v`. The PNG footprint (top-left case) is resolved from the
+    // text dirs (the model codec owns no image IO).
+    let fallback_png_dir = fallback_dirs.first().copied();
+    let migrated_items = crate::models::layer_model::text_payload::migrate_overlay_entries(
+        items,
+        page_sizes,
+        |obj| {
+            obj.get("file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|file| Path::new(file).file_name().and_then(|n| n.to_str()))
+                .map(|name| {
+                    let dims = image::image_dimensions(text_images_dir.join(name))
+                        .ok()
+                        .or_else(|| {
+                            fallback_png_dir
+                                .and_then(|d| image::image_dimensions(d.join(name)).ok())
+                        });
+                    match dims {
+                        Some((w, h)) => (w as f32, h as f32),
+                        None => (0.0, 0.0),
+                    }
+                })
+                .unwrap_or((0.0, 0.0))
+        },
+    );
 
-    for item in items {
+    let mut decoded_out = Vec::new();
+
+    for item in migrated_items.iter() {
         let page_idx = item
             .as_object()
             .and_then(|obj| obj.get("img_idx"))
@@ -10532,41 +14489,777 @@ fn load_typing_overlays_from_dir(
             .as_object()
             .and_then(|obj| normalize_overlay_storage_entry(obj, page_size))
             .unwrap_or_else(|| item.clone());
-        needs_rewrite |= normalized != *item;
 
         if let Some(decoded) = normalized.as_object().and_then(|obj| {
-            // Try the primary dir first; fall back to the fallback dir for PNGs that
-            // were not modified in the current unsaved session.
+            // Try the primary dir first, then each fallback in order — covering PNGs left in the
+            // committed `layers/` dir or the legacy `text_images/` dir after a metadata migration.
             decode_overlay_from_storage_entry(text_images_dir, obj, page_size).or_else(|| {
-                fallback_dir.and_then(|d| decode_overlay_from_storage_entry(d, obj, page_size))
+                fallback_dirs
+                    .iter()
+                    .find_map(|d| decode_overlay_from_storage_entry(d, obj, page_size))
             })
         }) {
             decoded_out.push(decoded);
         }
-        normalized_items.push(normalized);
     }
 
-    if needs_rewrite {
-        let normalized_raw = serde_json::to_string_pretty(&normalized_items).map_err(|err| {
-            format!(
-                "Не удалось сериализовать нормализованный {}: {err}",
-                text_info_path.display()
-            )
-        })?;
-        fs::write(&text_info_path, normalized_raw).map_err(|err| {
-            format!(
-                "Не удалось записать нормализованный {}: {err}",
-                text_info_path.display()
-            )
-        })?;
-    }
-
+    // NOTE: `text_info.json` is now READ-ONLY legacy. The in-memory normalization above feeds the
+    // session; it is NOT written back. The doc persists the overlays inline into `layers.json` on the
+    // next flush, after which this legacy file is no longer read (the doc loads from the inline payload).
     Ok(decoded_out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_composites_raster_from_disk_fallback() {
+        // Disk-fallback path (no snapshot in the job): rasters are read from `layers.json`, including the
+        // migrated layout (committed-only page reached via the per-page fallback).
+        use crate::models::layer_model::persist;
+        let dir = std::env::temp_dir().join(format!("typ_flat_disk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layers = dir.join("layers");
+        std::fs::create_dir_all(&layers).unwrap();
+        let base = dir.join("page.png");
+        image::save_buffer(&base, &vec![0u8; 20 * 20 * 4], 20, 20, image::ColorType::Rgba8).unwrap();
+        let red = ColorImage::filled([10, 10], Color32::from_rgba_unmultiplied(255, 0, 0, 255));
+        persist::add_page_raster(
+            &layers, None, 0, "r0", "R", true, 1.0,
+            crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
+            &red,
+        ).unwrap();
+        let job = TypingExportPageJob {
+            page_idx: 0,
+            page_path: base,
+            output_path: dir.join("out.png"),
+            clean_overlay_path: None,
+            clean_overlay_rgba: None,
+            overlays: Vec::new(),
+            rasters: Vec::new(), // force the disk-read path
+            mask: None,
+            export_format: TypingExportFormat::Png,
+            layers_primary_dir: Some(layers.clone()),
+            layers_fallback_dir: None,
+        };
+        let (rgba, w, h) = flatten_typing_export_page_rgba(&job).unwrap();
+        assert_eq!([w, h], [20, 20]);
+        let center = (10 * 20 + 10) * 4;
+        assert_eq!(&rgba[center..center + 4], &[255, 0, 0, 255], "disk raster composited at center");
+
+        // Migrated layout: primary=unsaved (manifest exists, lacks page 0), raster on committed page 0.
+        let committed = dir.join("committed");
+        let unsaved = dir.join("unsaved");
+        std::fs::create_dir_all(&committed).unwrap();
+        std::fs::create_dir_all(&unsaved).unwrap();
+        persist::add_page_raster(
+            &committed, None, 0, "rc", "R", true, 1.0,
+            crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
+            &red,
+        ).unwrap();
+        persist::add_page_raster(
+            &unsaved, None, 5, "rs", "R", true, 1.0,
+            crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
+            &red,
+        ).unwrap();
+        let base2 = dir.join("page2.png");
+        image::save_buffer(&base2, &vec![0u8; 20 * 20 * 4], 20, 20, image::ColorType::Rgba8).unwrap();
+        let job2 = TypingExportPageJob {
+            page_idx: 0,
+            page_path: base2,
+            output_path: dir.join("out2.png"),
+            clean_overlay_path: None,
+            clean_overlay_rgba: None,
+            overlays: Vec::new(),
+            rasters: Vec::new(),
+            mask: None,
+            export_format: TypingExportFormat::Png,
+            layers_primary_dir: Some(unsaved.clone()),
+            layers_fallback_dir: Some(committed.clone()),
+        };
+        let (rgba2, _, _) = flatten_typing_export_page_rgba(&job2).unwrap();
+        assert_eq!(&rgba2[center..center + 4], &[255, 0, 0, 255], "committed-only raster composited (migrated)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flatten_composites_raster_from_on_screen_snapshot() {
+        // PRIMARY Bug B fix: the export composites the ON-SCREEN raster snapshot (`job.rasters`) even when
+        // the disk dirs would yield NOTHING (no `layers.json` at all) — proving the bake no longer depends
+        // on a disk re-read that can silently drop the raster.
+        let dir = std::env::temp_dir().join(format!("typ_flat_snap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("page.png");
+        image::save_buffer(&base, &vec![0u8; 20 * 20 * 4], 20, 20, image::ColorType::Rgba8).unwrap();
+        // A 10x10 RED straight-alpha snapshot centered at (10,10), no disk dirs.
+        let snap = TypingExportRasterSnapshot {
+            visible: true,
+            opacity: 1.0,
+            transform: crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            rgba: vec![255, 0, 0, 255].repeat(10 * 10),
+            size_px: [10, 10],
+            band_z: 0,
+            mask_clip_enabled: false,
+        };
+        let job = TypingExportPageJob {
+            page_idx: 0,
+            page_path: base,
+            output_path: dir.join("out.png"),
+            clean_overlay_path: None,
+            clean_overlay_rgba: None,
+            overlays: Vec::new(),
+            rasters: vec![snap],
+            mask: None,
+            export_format: TypingExportFormat::Png,
+            layers_primary_dir: None, // no disk source at all
+            layers_fallback_dir: None,
+        };
+        let (rgba, w, h) = flatten_typing_export_page_rgba(&job).unwrap();
+        assert_eq!([w, h], [20, 20]);
+        let center = (10 * 20 + 10) * 4;
+        assert_eq!(&rgba[center..center + 4], &[255, 0, 0, 255], "on-screen snapshot raster composited");
+        // A hidden snapshot is skipped.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flatten_clips_mask_clip_enabled_raster_in_export() {
+        // ITEM B: a mask-clip-ENABLED raster must export CLIPPED — pixels over an inactive page mask are
+        // absent (transparent), matching the on-screen `clipped_image`. An unclipped raster is unchanged.
+        use crate::tabs::typing::mask::TypingMaskExportPage;
+        let dir = std::env::temp_dir().join(format!("typ_flat_maskclip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("page.png");
+        // 20x20 OPAQUE black base (alpha 255), so a clipped raster reveals the base, not transparency.
+        let base_px: Vec<u8> = (0..20 * 20).flat_map(|_| [0u8, 0, 0, 255]).collect();
+        image::save_buffer(&base, &base_px, 20, 20, image::ColorType::Rgba8).unwrap();
+
+        // A 10x10 RED raster centered at (10,10) → covers page px [5..15]x[5..15].
+        let make_snap = |mask_clip: bool| TypingExportRasterSnapshot {
+            visible: true,
+            opacity: 1.0,
+            transform: crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            rgba: vec![255, 0, 0, 255].repeat(10 * 10),
+            size_px: [10, 10],
+            band_z: 0,
+            mask_clip_enabled: mask_clip,
+        };
+        // Page mask ACTIVE only on the LEFT half (x < 10) of the 20x20 page.
+        let mask = TypingMaskExportPage {
+            width: 20,
+            height: 20,
+            data: (0..20 * 20).map(|i| if (i % 20) < 10 { 255 } else { 0 }).collect(),
+        };
+        let make_job = |snap: TypingExportRasterSnapshot, mask: Option<TypingMaskExportPage>| TypingExportPageJob {
+            page_idx: 0,
+            page_path: base.clone(),
+            output_path: dir.join("out.png"),
+            clean_overlay_path: None,
+            clean_overlay_rgba: None,
+            overlays: Vec::new(),
+            rasters: vec![snap],
+            mask,
+            export_format: TypingExportFormat::Png,
+            layers_primary_dir: None,
+            layers_fallback_dir: None,
+        };
+
+        // CLIPPED export: left-half page pixels keep the raster (red); right-half are clipped → base (black).
+        let (rgba, _, _) = flatten_typing_export_page_rgba(&make_job(make_snap(true), Some(mask.clone()))).unwrap();
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 20 + x) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        assert_eq!(px(7, 10), [255, 0, 0, 255], "raster kept where mask is active (left half)");
+        assert_eq!(px(13, 10), [0, 0, 0, 255], "raster CLIPPED where mask is inactive (right half)");
+
+        // UNCLIPPED (mask_clip OFF): the same right-half pixel keeps the raster.
+        let (rgba2, _, _) = flatten_typing_export_page_rgba(&make_job(make_snap(false), Some(mask))).unwrap();
+        let i = (10 * 20 + 13) * 4;
+        assert_eq!(&rgba2[i..i + 4], &[255, 0, 0, 255], "unclipped raster unchanged on the right half");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_char_budget_floors_at_min_and_grows_with_width() {
+        let cp = 8.0; // representative char width px
+        // At/below the min available width (5 chars fit) → exactly the min (5).
+        assert_eq!(preview_char_budget(5.0 * cp, cp), 5, "5 chars fit → 5");
+        assert_eq!(preview_char_budget(0.0, cp), 5, "no room → still min 5");
+        assert_eq!(preview_char_budget(-50.0, cp), 5, "negative (overhead > width) → min 5");
+        assert_eq!(preview_char_budget(3.0 * cp, cp), 5, "only 3 fit but floor is 5");
+        // Grows by 1 per ~char_px wider.
+        assert_eq!(preview_char_budget(6.0 * cp, cp), 6, "6 chars wide → 6");
+        assert_eq!(preview_char_budget(6.0 * cp + cp / 2.0, cp), 6, "partial char floors down");
+        assert_eq!(preview_char_budget(12.0 * cp, cp), 12, "12 chars wide → 12");
+        // Degenerate inputs → min (helper guards non-finite available + non-positive char_px).
+        assert_eq!(preview_char_budget(1000.0, 0.0), 5, "zero char width → min 5");
+        assert_eq!(preview_char_budget(f32::INFINITY, cp), 5, "non-finite available → min 5");
+        assert_eq!(preview_char_budget(f32::NAN, cp), 5, "NaN available → min 5");
+    }
+
+    #[test]
+    fn text_preview_label_appends_dots_to_three_accounting_for_existing() {
+        // First `max_chars` CHARACTERS (Unicode), trailing dot-equivalents brought to >= 3 (regular dot
+        // = 1, ellipsis '…' = 3), accounting for what's already there. These use max_chars = 5 (the min).
+        assert_eq!(text_preview_label("Привет мир", 5), "Приве...", "no trailing dots → append 3");
+        assert_eq!(text_preview_label("Да.", 5), "Да...", "1 existing dot → append 2");
+        assert_eq!(text_preview_label("Эй..", 5), "Эй...", "2 existing dots → append 1");
+        // "Стоп..." → first5 = "Стоп." (С,т,о,п,.), 1 trailing dot → append 2.
+        assert_eq!(text_preview_label("Стоп...", 5), "Стоп...", "first-5 truncation keeps one dot → append 2");
+        // Ellipsis char counts as 3 → append none.
+        assert_eq!(text_preview_label("Всё…", 5), "Всё…", "ellipsis = 3 → append none");
+        // "Хм….." → first5 = Х,м,…,.,. → trailing .,. then … = 1+1+3 = 5 → append none.
+        assert_eq!(text_preview_label("Хм…..", 5), "Хм…..", "ellipsis + 2 dots → already >= 3");
+        // Short text (< 5 chars), not truncated, still gets dots.
+        assert_eq!(text_preview_label("Да", 5), "Да...");
+        // Empty (after trim) → empty preview (caller shows just "Текст").
+        assert_eq!(text_preview_label("", 5), "");
+        assert_eq!(text_preview_label("   ", 5), "", "whitespace-only trims to empty");
+        // Leading whitespace is trimmed before taking the first 5 chars.
+        assert_eq!(text_preview_label("  Привет", 5), "Приве...");
+        // Cyrillic char-boundary safety: exactly 5 chars taken, no byte-panic on multibyte text.
+        let long = "Текстовая строка";
+        assert_eq!(long.chars().count() > 5, true);
+        assert_eq!(text_preview_label(long, 5), "Текст...");
+        // A 5-char prefix that is ALL dots stays as-is (>= 3).
+        assert_eq!(text_preview_label(".....", 5), ".....");
+
+        // Larger max_chars → more preview chars before the dots (wider panel). "Длинноеслово" has no
+        // space in the first 10, so the prefix is exactly its first 10 chars.
+        assert_eq!(text_preview_label("Длинноеслово", 10), "Длинноесло...", "first 10 chars + dots");
+        // A text SHORTER than max_chars still gets the dots.
+        assert_eq!(text_preview_label("Привет", 10), "Привет...", "short-than-max still gets dots");
+        // Dot accounting still applies with a larger budget.
+        assert_eq!(text_preview_label("Конец..", 10), "Конец...", "2 trailing dots → append 1");
+    }
+
+    #[test]
+    fn order_unified_layer_rows_interleaves_by_z_overlay_above_raster_on_ties() {
+        use TypingLayerRow::*;
+        // Rows with band-Z; bool = raster_below_overlay (true for rasters).
+        // overlay@5, raster@5 (tie → overlay above), raster@3, overlay@1.
+        let rows = vec![
+            (Overlay(0), 5, false),
+            (Raster(0), 5, true),
+            (Raster(1), 3, true),
+            (Overlay(1), 1, false),
+        ];
+        // TOP-first (Z desc): overlay@5, raster@5 (overlay wins the tie → listed first), raster@3, overlay@1.
+        assert_eq!(
+            order_unified_layer_rows(rows),
+            vec![Overlay(0), Raster(0), Raster(1), Overlay(1)]
+        );
+
+        // A raster strictly ABOVE a text (text can sit below a raster now): raster@7 first.
+        let rows2 = vec![(Overlay(2), 2, false), (Raster(2), 7, true)];
+        assert_eq!(order_unified_layer_rows(rows2), vec![Raster(2), Overlay(2)]);
+
+        // Empty input → empty output.
+        assert!(order_unified_layer_rows(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn unified_topmost_pointer_target_picks_by_z_overlay_wins_ties() {
+        let t = TypingPointerTarget::Overlay;
+        let r = TypingPointerTarget::Raster;
+        let n = TypingPointerTarget::None;
+        // Text above raster → text wins.
+        assert_eq!(unified_topmost_pointer_target(Some(5), Some(2)), t);
+        // Raster above text → raster wins (text can now sit BELOW a raster).
+        assert_eq!(unified_topmost_pointer_target(Some(2), Some(5)), r);
+        // Equal band-Z → overlay wins (text draws above a raster at the same band).
+        assert_eq!(unified_topmost_pointer_target(Some(3), Some(3)), t);
+        // Only one present → that one.
+        assert_eq!(unified_topmost_pointer_target(Some(0), None), t);
+        assert_eq!(unified_topmost_pointer_target(None, Some(0)), r);
+        // Neither under the pointer → None.
+        assert_eq!(unified_topmost_pointer_target(None, None), n);
+    }
+
+    #[test]
+    fn topmost_raster_target_skips_selected_and_picks_topmost() {
+        // The normal-mode raster interaction creates the SELECTED raster's response unconditionally, so
+        // the hit-test for the OTHER rasters must skip the selected idx (else egui gets a duplicate Id).
+        // It must also pick the TOPMOST (last in bottom-to-top `entries`) when quads overlap.
+        let image_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(1000.0, 1000.0));
+        let quad = |cx: f32, cy: f32| -> [Pos2; 4] {
+            [
+                Pos2::new(cx - 20.0, cy - 20.0),
+                Pos2::new(cx + 20.0, cy - 20.0),
+                Pos2::new(cx + 20.0, cy + 20.0),
+                Pos2::new(cx - 20.0, cy + 20.0),
+            ]
+        };
+        // Two overlapping rasters at the same center: idx 0 (bottom), idx 1 (top).
+        let entries = vec![
+            (0usize, quad(100.0, 100.0), Pos2::new(100.0, 100.0)),
+            (1usize, quad(100.0, 100.0), Pos2::new(100.0, 100.0)),
+        ];
+        let p = Some(Pos2::new(100.0, 100.0));
+
+        // No exclusion → topmost (idx 1) wins.
+        let t = topmost_raster_target(&entries, p, image_rect, None).expect("hit");
+        assert_eq!(t.0, 1, "topmost (last) raster wins on overlap");
+
+        // Exclude the selected top raster → the hit-test falls through to idx 0 (no duplicate Id).
+        let t = topmost_raster_target(&entries, p, image_rect, Some(1)).expect("hit");
+        assert_eq!(t.0, 0, "selected idx skipped, next raster targeted");
+
+        // Pointer far outside every quad → no target.
+        assert!(topmost_raster_target(&entries, Some(Pos2::new(900.0, 900.0)), image_rect, None).is_none());
+
+        // No pointer → no target.
+        assert!(topmost_raster_target(&entries, None, image_rect, None).is_none());
+
+        // Excluding the only raster under the pointer → no target.
+        let single = vec![(5usize, quad(100.0, 100.0), Pos2::new(100.0, 100.0))];
+        assert!(topmost_raster_target(&single, p, image_rect, Some(5)).is_none());
+    }
+
+    #[test]
+    fn color_image_to_rgba_round_trips_straight_alpha() {
+        // BUG A: `color_image_to_rgba` must return STRAIGHT (un-premultiplied) alpha so it round-trips
+        // through `ColorImage::from_rgba_unmultiplied`. With the old `to_array()` (premultiplied), white
+        // (255,255,255,128) came back as (128,128,128,128) — graying antialiased stroke edges.
+        let straight: Vec<u8> = vec![255, 255, 255, 128, 200, 100, 50, 64, 10, 20, 30, 255, 0, 0, 0, 0];
+        let image = ColorImage::from_rgba_unmultiplied([4, 1], &straight);
+        let out = color_image_to_rgba(&image);
+        assert_eq!(out.len(), straight.len());
+        // Alpha round-trips exactly; RGB is recovered within the unavoidable premultiply→u8→unpremultiply
+        // quantization (≈255/alpha), which the OLD `to_array()` (premultiplied) would blow past entirely.
+        for px in 0..4 {
+            let a = straight[px * 4 + 3] as i32;
+            assert_eq!(out[px * 4 + 3], straight[px * 4 + 3], "alpha exact at pixel {px}");
+            // Worst-case round-trip error ≈ ceil(255 / (2*alpha)).
+            let tol = if a == 0 { 0 } else { ((255 + 2 * a - 1) / (2 * a)).max(1) };
+            for ch in 0..3 {
+                let (g, o) = (out[px * 4 + ch] as i32, straight[px * 4 + ch] as i32);
+                // A fully-transparent pixel's RGB is undefined post-premult; skip it.
+                if a == 0 {
+                    continue;
+                }
+                assert!(
+                    (g - o).abs() <= tol,
+                    "pixel {px} ch {ch}: round-tripped {g} != original {o} (±{tol}, alpha {a})"
+                );
+            }
+        }
+        // The CRITICAL guard: un-premultiplied white (255,255,255,128) must NOT come back grayed to ~128
+        // (the old `to_array()` premultiplied bug). With the fix it stays white.
+        assert!(out[0] >= 254 && out[1] >= 254 && out[2] >= 254, "white stays white, not premultiplied gray");
+    }
+
+    #[test]
+    fn image_effects_fx_file_name_appends_fx_suffix() {
+        assert_eq!(image_effects_fx_file_name("image_p0_1.png"), "image_p0_1_fx.png");
+        assert_eq!(image_effects_fx_file_name("photo.jpeg"), "photo_fx.jpeg");
+        // Без расширения — по умолчанию png.
+        assert_eq!(image_effects_fx_file_name("noext"), "noext_fx.png");
+    }
+
+    #[test]
+    fn raster_identity_deform_seed_is_a_valid_grid_over_the_affine_quad() {
+        // Entering raster transform mode seeds an identity deform from the affine transform via
+        // `default_deform_mesh_for_page` (the same fn `ensure_raster_deform_mesh` uses for a raster
+        // with no deform). It must produce a valid cols×rows grid whose corners equal the affine quad.
+        let page_size = [200, 100];
+        let center = [100.0_f32, 50.0];
+        let size = [40usize, 20];
+        let mesh = default_deform_mesh_for_page(center, size, 1.0, 0.0, page_size);
+        assert_eq!(mesh.cols, TEXT_OVERLAY_DEFORM_SURFACE_COLS);
+        assert_eq!(mesh.rows, TEXT_OVERLAY_DEFORM_SURFACE_ROWS);
+        assert_eq!(mesh.points_px.len(), mesh.cols * mesh.rows);
+        // The 4 grid corners are the affine image quad corners (centered, unrotated, unit scale).
+        let tl = mesh.point(0, 0);
+        let br = mesh.point(mesh.cols - 1, mesh.rows - 1);
+        assert!((tl[0] - (center[0] - size[0] as f32 * 0.5)).abs() < 1e-2, "TL x = cx - w/2");
+        assert!((tl[1] - (center[1] - size[1] as f32 * 0.5)).abs() < 1e-2, "TL y = cy - h/2");
+        assert!((br[0] - (center[0] + size[0] as f32 * 0.5)).abs() < 1e-2, "BR x = cx + w/2");
+        assert!((br[1] - (center[1] + size[1] as f32 * 0.5)).abs() < 1e-2, "BR y = cy + h/2");
+    }
+
+    #[test]
+    fn perspective_corner_drag_moves_the_dragged_corner_fully() {
+        // The raster perspective transform mode drags a mesh corner via `apply_perspective_corner_drag`
+        // (shared with overlays): the dragged corner moves by the full delta; the opposite corner is
+        // untouched.
+        let page_size = [500, 500];
+        let mesh = default_deform_mesh_for_page([250.0, 250.0], [100, 100], 1.0, 0.0, page_size);
+        let tl_before = mesh.point(0, 0);
+        let br_before = mesh.point(mesh.cols - 1, mesh.rows - 1);
+        // Drag handle 0 (top-left) by (+10, +20) page px.
+        let dragged = apply_perspective_corner_drag(&mesh, 0, [10.0, 20.0], page_size);
+        let tl_after = dragged.point(0, 0);
+        let br_after = dragged.point(dragged.cols - 1, dragged.rows - 1);
+        assert!((tl_after[0] - (tl_before[0] + 10.0)).abs() < 1e-3, "TL fully follows the drag x");
+        assert!((tl_after[1] - (tl_before[1] + 20.0)).abs() < 1e-3, "TL fully follows the drag y");
+        assert!((br_after[0] - br_before[0]).abs() < 1e-3, "opposite corner unaffected x");
+        assert!((br_after[1] - br_before[1]).abs() < 1e-3, "opposite corner unaffected y");
+    }
+
+    #[test]
+    fn effects_json_array_emptiness_is_detected() {
+        assert!(effects_json_array_is_empty(""));
+        assert!(effects_json_array_is_empty("   "));
+        assert!(effects_json_array_is_empty("[]"));
+        assert!(!effects_json_array_is_empty(r#"[{"effect":"stroke"}]"#));
+        // Некорректный JSON трактуем как «пусто», чтобы не падать на мусоре.
+        assert!(effects_json_array_is_empty("not-json"));
+    }
+
+    #[test]
+    fn raster_selection_tracks_by_uid_across_a_reorder() {
+        // FIX 2 (wrong-layer): `selected_raster_idx` / `transform_mode_raster_idx` /
+        // `raster_drag_state.raster_idx` are POSITIONS into `raster_layers_by_page[page]`, which
+        // `sync_from_doc` rebuilds in z-order on every reproject. After a raster reorder the SAME position
+        // points at a DIFFERENT raster — so transform/delete would hit the wrong one. The remap at the end
+        // of `sync_from_doc` must keep these tracking the SAME raster by uid.
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_rsel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tf = crate::models::layer_model::manifest::TransformRec {
+            cx: 1.0,
+            cy: 1.0,
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        let pic = ColorImage::filled([2, 2], Color32::WHITE);
+        // Add order is bottom-to-top: r0 (bottom), r1 (top).
+        persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
+        persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+
+        let mut doc = LayerDoc::new();
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+
+        let mut layer = TypingTextOverlayLayer::default();
+        layer.sync_from_doc(0, &doc);
+        let rasters = &layer.raster_layers_by_page[&0];
+        assert_eq!(rasters.len(), 2);
+        // Projected bottom-to-top: index 0 == r0, index 1 == r1.
+        let r0_pos = rasters.iter().position(|l| l.uid == "r0").unwrap();
+        let r1_pos = rasters.iter().position(|l| l.uid == "r1").unwrap();
+        assert_eq!(r0_pos, 0);
+
+        // Select r0 (bottom), enter transform mode on it, and start a drag tracking it.
+        layer.selected_raster_idx = Some(r0_pos);
+        layer.transform_mode_raster_idx = Some(r0_pos);
+        layer.raster_drag_state = Some(TypingRasterDragState {
+            page_idx: 0,
+            raster_idx: r0_pos,
+            mode: TypingRasterDragMode::Move,
+            pointer_start_scene: Pos2::ZERO,
+            start_transform: tf,
+            start_pointer_angle_rad: 0.0,
+            start_mesh: None,
+        });
+
+        // Reorder r0 UP past r1 in the doc, then reproject.
+        assert!(doc.reorder_node_one(0, "r0", true));
+        layer.sync_from_doc(0, &doc);
+
+        let rasters = &layer.raster_layers_by_page[&0];
+        let r0_new = rasters.iter().position(|l| l.uid == "r0").unwrap();
+        assert_ne!(r0_new, r0_pos, "the reorder actually moved r0 to a new position");
+        // All three trackers now point at r0's NEW position (the SAME raster), not the stale index.
+        assert_eq!(layer.selected_raster_idx, Some(r0_new), "selection follows r0 by uid");
+        assert_eq!(layer.transform_mode_raster_idx, Some(r0_new), "transform mode follows r0 by uid");
+        assert_eq!(
+            layer.raster_drag_state.as_ref().map(|d| d.raster_idx),
+            Some(r0_new),
+            "drag state follows r0 by uid"
+        );
+        // The stale position now holds r1 — proof a positional tracker would have retargeted.
+        assert_eq!(rasters[r0_pos].uid, "r1");
+        let _ = r1_pos;
+
+        // A deleted raster clears the trackers instead of pointing at a neighbour.
+        layer.selected_raster_idx = Some(r0_new);
+        assert!(doc.remove_node(0, "r0"));
+        layer.sync_from_doc(0, &doc);
+        assert_eq!(layer.selected_raster_idx, None, "selection cleared when its raster is gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_from_doc_materializes_text_runtimes_for_a_migrated_chapter() {
+        // LIVE BUG: after the eager migration `text_info.json` is retired (.bak), so the legacy disk
+        // loader populates NO `self.overlays`. `sync_from_doc` must MATERIALIZE a text runtime from each
+        // doc Text node that has no local runtime (reconcile-OR-CREATE), else the typing tab shows no
+        // text while PS + the doc carry it. A second sync must NOT duplicate them (reconcile path).
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_migtext_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Seed two inline v3 text nodes on page 0 with real rendered PNGs (no text_info.json — migrated).
+        let seed_text = |uid: &str, cx: f32, cy: f32| -> persist::TextPayloadOut {
+            let img = ColorImage::filled([4, 3], Color32::GREEN);
+            let file = persist::write_text_image(&dir, 0, uid, &img).unwrap();
+            persist::TextPayloadOut {
+                uid: uid.into(),
+                name: uid.into(),
+                z: 1,
+                layer_idx: 2,
+                pinned: false,
+                visible: true,
+                opacity: 1.0,
+                group_uid: None,
+                pinned_by_group: false,
+                payload_uid: uid.into(),
+                render_data: json!({ "text": uid }),
+                transform: crate::models::layer_model::manifest::TransformRec {
+                    cx,
+                    cy,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
+                deform: None,
+                rendered_file: Some(file),
+                mask_clip: None,
+            }
+        };
+        persist::write_page_text_payload(&dir, None, 0, &[seed_text("ta", 10.0, 20.0), seed_text("tb", 30.0, 40.0)])
+            .unwrap();
+
+        let mut doc = LayerDoc::new();
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+        assert_eq!(
+            doc.page(0).unwrap().nodes.iter().filter(|n| n.is_text()).count(),
+            2,
+            "doc loaded both text nodes"
+        );
+
+        // Migrated-chapter state: NO local overlay runtimes.
+        let mut layer = TypingTextOverlayLayer::default();
+        assert!(layer.overlays.is_empty());
+
+        layer.sync_from_doc(0, &doc);
+
+        // Both text nodes materialized as runtimes with correct projected fields.
+        assert_eq!(layer.overlays.len(), 2, "sync_from_doc created a runtime per doc text node");
+        let ta = layer.overlays.iter().find(|o| o.uid == "ta").expect("ta runtime");
+        assert_eq!(ta.kind, TypingOverlayKind::Text);
+        assert_eq!(ta.page_idx, 0);
+        assert_eq!(ta.center_page_px, [10.0, 20.0]);
+        assert!((ta.angle_deg - 0.0).abs() < 1e-6);
+        assert!((ta.user_scale - 1.0).abs() < 1e-6);
+        assert_eq!(ta.layer_idx, 2, "text-group axis carried from the node");
+        assert_eq!(ta.size_px, [4, 3], "doc image projected");
+        assert_eq!(ta.source_rgba.len(), 4 * 3 * 4, "rgba populated from the doc image");
+        assert_eq!(
+            ta.file_name,
+            persist::text_image_file_name(0, "ta"),
+            "deterministic rendered-PNG name (round-trips with the doc flush)"
+        );
+        assert!(ta.texture.is_none() && ta.display_texture_stale, "queued for upload this frame");
+        // Newly-created runtimes are queued for texture upload.
+        assert_eq!(layer.pending_upload_indices.len(), 2, "both runtimes queued for upload");
+
+        // A second sync reconciles (no duplicates).
+        layer.sync_from_doc(0, &doc);
+        assert_eq!(layer.overlays.len(), 2, "second sync does NOT duplicate runtimes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_interleave_doc_text_survives_empty_loader_completion() {
+        // End-to-end interleave the unit test missed: a migrated chapter materializes text via
+        // `sync_from_doc`, THEN the loader completes with an empty set. The doc text must SURVIVE.
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_interleave_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img = ColorImage::filled([4, 3], Color32::GREEN);
+        let file = persist::write_text_image(&dir, 0, "ta", &img).unwrap();
+        let payload = persist::TextPayloadOut {
+            uid: "ta".into(),
+            name: "ta".into(),
+            z: 1,
+            layer_idx: 0,
+            pinned: false,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            pinned_by_group: false,
+            payload_uid: "ta".into(),
+            render_data: json!({ "text": "ta" }),
+            transform: crate::models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 20.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            deform: None,
+            rendered_file: Some(file),
+            mask_clip: None,
+        };
+        persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
+
+        let mut doc = LayerDoc::new();
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+
+        let mut layer = TypingTextOverlayLayer::default();
+        // 1) Early frame: doc materializes the text runtime (loader still in flight).
+        layer.sync_from_doc(0, &doc);
+        assert_eq!(layer.overlays.len(), 1, "doc-created the text runtime");
+
+        // 2) Loader completes with an EMPTY decoded set (migrated chapter) — drive the exact merge step
+        //    `poll_loader` runs. The doc-created runtime must NOT be wiped.
+        let touched = merge_loaded_overlays(&mut layer.overlays, Vec::new());
+        assert!(touched.is_empty());
+        assert_eq!(layer.overlays.len(), 1, "doc text SURVIVES the empty loader completion (race fixed)");
+        assert_eq!(layer.overlays[0].uid, "ta");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn decoded_text_overlay(uid: &str, page_idx: usize, center: [f32; 2]) -> TypingOverlayDecoded {
+        TypingOverlayDecoded {
+            uid: uid.into(),
+            kind: TypingOverlayKind::Text,
+            page_idx,
+            center_page_px: center,
+            mask_clip_enabled: false,
+            layer_idx: 0,
+            user_scale: 1.0,
+            angle_deg: 0.0,
+            deform_mesh: None,
+            file_name: crate::models::layer_model::persist::text_image_file_name(page_idx, uid),
+            original_file_name: None,
+            render_data_json: None,
+            size_px: [2, 2],
+            rgba: vec![0u8; 2 * 2 * 4],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn loader_completion_merge_does_not_wipe_doc_created_runtimes() {
+        // CRITICAL RACE (the intermittent "text shows then vanishes, sometimes half"): on a MIGRATED
+        // chapter `sync_from_doc` materializes text runtimes from the doc on an early frame, then the
+        // loader thread completes with an EMPTY decoded set (no `text_info.json`). The old wholesale
+        // `self.overlays = decoded` WIPED the doc-created runtimes. The merge must leave them intact.
+        let mut overlays: Vec<TypingOverlayRuntime> = vec![
+            text_runtime_from_doc_node("ta", 0, [10.0, 20.0], 1.0, 0.0, None, false, 1, None, [4, 3], vec![0u8; 4 * 3 * 4]),
+            text_runtime_from_doc_node("tb", 0, [30.0, 40.0], 1.0, 0.0, None, false, 1, None, [4, 3], vec![0u8; 4 * 3 * 4]),
+        ];
+
+        // Loader completes with an EMPTY set (migrated chapter).
+        let touched = merge_loaded_overlays(&mut overlays, Vec::new());
+        assert!(touched.is_empty(), "empty load touches nothing");
+        assert_eq!(overlays.len(), 2, "doc-created runtimes SURVIVE an empty loader completion");
+        assert!(overlays.iter().any(|o| o.uid == "ta"));
+        assert!(overlays.iter().any(|o| o.uid == "tb"));
+    }
+
+    #[test]
+    fn loader_completion_merge_replaces_same_uid_without_duplicating() {
+        // LEGACY/dup case: a doc-created runtime with uid "ta" exists (from the race), and the loader
+        // returns the SAME uid "ta" (plus a brand-new "tc"). The merge must REPLACE "ta" in place (no
+        // duplicate) and APPEND "tc".
+        let mut overlays: Vec<TypingOverlayRuntime> = vec![text_runtime_from_doc_node(
+            "ta", 0, [10.0, 20.0], 1.0, 0.0, None, false, 0, None, [4, 3], vec![0u8; 4 * 3 * 4],
+        )];
+
+        let touched = merge_loaded_overlays(
+            &mut overlays,
+            vec![decoded_text_overlay("ta", 0, [99.0, 88.0]), decoded_text_overlay("tc", 0, [1.0, 2.0])],
+        );
+
+        assert_eq!(overlays.len(), 2, "same-uid REPLACED in place (no dup), new uid APPENDED");
+        let ta = overlays.iter().find(|o| o.uid == "ta").unwrap();
+        assert_eq!(ta.center_page_px, [99.0, 88.0], "loaded entry replaced the doc-created one");
+        assert_eq!(overlays.iter().filter(|o| o.uid == "ta").count(), 1, "no duplicate ta");
+        assert!(overlays.iter().any(|o| o.uid == "tc"), "new loaded overlay appended");
+        // Both the replaced and the appended entry are flagged for upload.
+        assert_eq!(touched.len(), 2);
+        // Same uid on a DIFFERENT page is NOT treated as a match (page-scoped key).
+        let mut o2 = vec![text_runtime_from_doc_node(
+            "ta", 1, [5.0, 6.0], 1.0, 0.0, None, false, 0, None, [4, 3], vec![0u8; 4 * 3 * 4],
+        )];
+        merge_loaded_overlays(&mut o2, vec![decoded_text_overlay("ta", 0, [7.0, 8.0])]);
+        assert_eq!(o2.len(), 2, "same uid on a different page is a distinct runtime");
+    }
+
+    #[test]
+    fn image_overlay_render_data_round_trips_effects() {
+        let effects = json!([{ "effect": "stroke", "width_px": 4 }]);
+        let render_data = json!({ "effects": effects.clone() });
+        let entry = build_storage_overlay_entry(
+            "test-uid",
+            TypingOverlayKind::Image,
+            0,
+            "image_p0_1_fx.png",
+            Some("image_p0_1.png"),
+            [10.0, 20.0],
+            true,
+            0,
+            0.0,
+            1.0,
+            None,
+            Some(render_data),
+        );
+        let obj = entry.as_object().expect("entry must be an object");
+        assert_eq!(
+            obj.get("image_original_file").and_then(Value::as_str),
+            Some("image_p0_1.png")
+        );
+        let parsed = parse_image_overlay_render_data(obj);
+        assert_eq!(
+            effects_json_from_render_data(&parsed),
+            serde_json::to_string(&effects).unwrap()
+        );
+        assert_eq!(
+            parse_overlay_original_file_name(obj).as_deref(),
+            Some("image_p0_1.png")
+        );
+    }
+
+    #[test]
+    fn image_overlay_entry_omits_original_when_same_as_file() {
+        // Когда исходник совпадает с показываемым файлом, дублирующий ключ не пишем.
+        let entry = build_storage_overlay_entry(
+            "test-uid",
+            TypingOverlayKind::Image,
+            0,
+            "image_p0_1.png",
+            Some("image_p0_1.png"),
+            [0.0, 0.0],
+            true,
+            0,
+            0.0,
+            1.0,
+            None,
+            Some(default_render_data_for_image()),
+        );
+        let obj = entry.as_object().expect("entry must be an object");
+        assert!(!obj.contains_key("image_original_file"));
+    }
 
     fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         TextRenderParams {
@@ -10583,7 +15276,7 @@ mod tests {
             glyph_height_percent: 100.0,
             glyph_width_percent: 100.0,
             width_px: 120,
-            align: HorizontalAlign::Center,
+            align: HorizontalAlign::CENTER,
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,
@@ -10696,4 +15389,172 @@ mod tests {
             Some(9)
         );
     }
+
+    #[test]
+    fn storage_normalization_preserves_formed_text_and_modern_fields() {
+        let raw = json!({
+            "schema_version": 2,
+            "text_params": {
+                "text": "Ты станешь выше и сильнее",
+                "font_path": "/tmp/font.ttf",
+                "width_px": 120,
+                "formed_text": "Ты\nстанешь выше\nи сильнее",
+                "kerning_px": 3.0,
+                "hanging_punctuation": true,
+                "new_line_after_sentence": true
+            },
+            "effects": []
+        });
+
+        let Some(normalized) = normalize_render_data_value(&raw, 500) else {
+            panic!("render data should normalize");
+        };
+        let Some(text_params) = normalized.get("text_params").and_then(Value::as_object) else {
+            panic!("normalized render data should contain text params");
+        };
+
+        assert_eq!(
+            text_params.get("formed_text").and_then(Value::as_str),
+            Some("Ты\nстанешь выше\nи сильнее"),
+            "formed_text must survive normalization on project load"
+        );
+        // Устаревший `kerning_px` мигрирует в единый строковый ключ `kerning`.
+        assert_eq!(
+            text_params.get("kerning").and_then(Value::as_str),
+            Some("3.00")
+        );
+        assert_eq!(
+            text_params.get("hanging_punctuation").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            text_params
+                .get("new_line_after_sentence")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    fn text_bubble(id: i64, u: f32, v: f32, translation: &str) -> Bubble {
+        Bubble {
+            id,
+            img_idx: 0,
+            img_u: u,
+            img_v: v,
+            side: None,
+            bubble_class: None,
+            bubble_type: None,
+            text: translation.to_string(),
+            original_text: String::new(),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Builds an image bubble whose red rect spans the whole page and whose `text_areas` carry the
+    /// given anchors/translations. Area 0 mirrors its text into the legacy `text` field, matching
+    /// the persisted contract.
+    fn image_bubble_with_areas(id: i64, areas: &[((f32, f32), &str)]) -> Bubble {
+        let mut extra = serde_json::Map::new();
+        extra.insert("image_source_type".to_string(), Value::from("external"));
+        // Red image-area rect spanning the whole page, in the persisted {p1,p2} object form.
+        extra.insert(
+            "rect_coords".to_string(),
+            json!({
+                "p1": {"img_u": 0.0, "img_v": 0.0},
+                "p2": {"img_u": 1.0, "img_v": 1.0},
+            }),
+        );
+        let items: Vec<Value> = areas
+            .iter()
+            .map(|((au, av), text)| {
+                json!({
+                    "rect": [au - 0.02, av - 0.02, au + 0.02, av + 0.02],
+                    "anchor": [au, av],
+                    "original": "",
+                    "description": "",
+                    "translation": text,
+                })
+            })
+            .collect();
+        extra.insert("text_areas".to_string(), Value::Array(items));
+        let primary = areas.first().map(|(_, text)| *text).unwrap_or_default();
+        Bubble {
+            id,
+            img_idx: 0,
+            img_u: areas.first().map(|((u, _), _)| *u).unwrap_or(0.5),
+            img_v: areas.first().map(|((_, v), _)| *v).unwrap_or(0.5),
+            side: None,
+            bubble_class: Some("image".to_string()),
+            bubble_type: None,
+            text: primary.to_string(),
+            original_text: String::new(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn selection_seeds_text_from_each_image_area_anchor() {
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+        // One image bubble with three areas at distinct anchors.
+        let bubbles = vec![image_bubble_with_areas(
+            1,
+            &[
+                ((0.2, 0.2), "first"),
+                ((0.5, 0.5), "second"),
+                ((0.8, 0.8), "third"),
+            ],
+        )];
+
+        // A small selection around the second area's anchor (50,50) must seed the second area's
+        // text, not only area 0's. This is the regression: previously only `img_u/img_v` (area 0)
+        // was considered, so later areas never matched a selection.
+        let around = |u: f32, v: f32| {
+            Rect::from_center_size(scene_from_uv(page_rect, u, v), Vec2::splat(6.0))
+        };
+        assert_eq!(
+            pick_bubble_text_for_selection(&bubbles, 0, around(0.2, 0.2), page_rect),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            pick_bubble_text_for_selection(&bubbles, 0, around(0.5, 0.5), page_rect),
+            Some("second".to_string())
+        );
+        assert_eq!(
+            pick_bubble_text_for_selection(&bubbles, 0, around(0.8, 0.8), page_rect),
+            Some("third".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_picks_closest_anchor_and_skips_empty_text() {
+        let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+        let bubbles = vec![
+            text_bubble(1, 0.3, 0.3, "plain"),
+            image_bubble_with_areas(2, &[((0.31, 0.31), ""), ((0.6, 0.6), "img-area")]),
+        ];
+
+        // Selection covers the plain bubble and the empty image area 0; the empty area is skipped
+        // and the closest non-empty anchor (the plain bubble) wins.
+        let selection = Rect::from_min_max(
+            scene_from_uv(page_rect, 0.25, 0.25),
+            scene_from_uv(page_rect, 0.35, 0.35),
+        );
+        assert_eq!(
+            pick_bubble_text_for_selection(&bubbles, 0, selection, page_rect),
+            Some("plain".to_string())
+        );
+
+        // A selection that contains no anchor returns None.
+        let empty = Rect::from_min_max(
+            scene_from_uv(page_rect, 0.9, 0.05),
+            scene_from_uv(page_rect, 0.98, 0.12),
+        );
+        assert_eq!(
+            pick_bubble_text_for_selection(&bubbles, 0, empty, page_rect),
+            None
+        );
+    }
+
+    // Legacy ribbon/page-index migration tests moved to `models::layer_model::text_payload` together
+    // with the `migrate_overlay_entries` logic (the single shared codec).
 }

@@ -20,6 +20,43 @@ FILE HEADER (tabs/typing/panel.rs)
   В базовых параметрах есть сворачиваемый блок `Расширенные параметры`,
   включая направление строки (`Горизонтальная/Вертикальная`) и режим формулы
   раскладки символов (выражения `x/y/rotation`, параметры `t`, константы `a..h`).
+  Поле текста — конкурирующий аккордеон `draw_text_accordion`: «Изначальный текст»
+  (`text`, ▼ если развёрнут / ◀ если свёрнут) и «Сформированный текст»
+  (`formed_text`, ▲ / ◀); развёрнут ровно один. Если `formed_text` пуст —
+  развёрнут исходный, иначе сформированный. В рендер идёт `formed_text`, если он
+  не пуст (тогда авто-перенос принудительно `None`), иначе `text`
+  (`effective_render_text`/`uses_formed_text`; то же в `tab.rs`
+  `text_render_params_from_render_data`). Кнопки `Продвинутая форма текста`
+  (окно перебора форм по исходному `text`; клик по форме пишет результат в
+  `formed_text`, разворачивает сформированный пан и закрывает окно) и
+  `Вернуть исходный` (очищает `formed_text` и разворачивает исходный).
+  `formed_text` персонален для каждого оверлея: сериализуется в
+  `text_params.formed_text` (переживает перезапуск) и
+  загружается/сбрасывается в `load_from_selected_overlay`, чтобы не
+  «наследоваться» от ранее выбранного оверлея. В окне формы делятся на
+  динамические группы по числу переносов слов (кнопки только для встретившихся
+  значений + «Все») и дополнительно фильтруются: два диапазона
+  (`advanced_form_range_row`, спинбоксы `WheelSpinBox`) — число строк и ширина
+  самой длинной строки (в условных единицах метрики) — верхний порог пиковости
+  в % (`WheelSlider`, `peakiness_pct` = `(max−base)/base`, база минимум/медиана
+  через `PeakBase`) и верхний порог неравномерности в % (`WheelSlider`,
+  `unevenness_pct` = среднее |ширина−медиана| / медиана — общий разброс строк,
+  устойчивый к одиночным выбросам). Ширина строк
+  меряется попиксельно: панель строит `forms::GlyphWidths` выбранным шрифтом
+  (cosmic-text, кернинг пар) и передаёт как `LineWidthMetric` в `enumerate_forms`;
+  при недоступном шрифте — `CharWidthMetric` (счёт символов). Висящая пунктуация
+  оверлея учитывается (при включённой края не идут в ширину). Метрика
+  перестраивается при смене текста/шрифта/начертания/висячести
+  (`AdvancedFormMetricSignature`). Границы берутся из фактических данных
+  (`AdvancedFormCache`) и сбрасываются при пересборке кэша; смена базы пиковости
+  раскрывает порог на максимум для новой базы. Сортировка — по ширине
+  (узкие → широкие), в пределах допуска по ширине сначала по ровности (меньшая
+  неравномерность раньше), затем по цене разрывов, пиковости и числу переносов
+  (`sort_advanced_forms`). Само окно стартует
+  размером 80%×80% вьюпорта, поднято на `Order::Tooltip` (над панелями
+  параметров/действий) и при открытии центрируется по вьюпорту: первый кадр
+  скрыт (`set_opacity(0)`), пока не измерен итоговый размер, после чего
+  показывается по центру без дёрганья.
   - `TypingSelectedOverlayForEdit` / `TypingOverlayEditRequest`: payload синхронизации
     между `tab.rs` и edit-панелью, включая два типа оверлеев (`text` и `image`).
 - Ключевые методы:
@@ -46,12 +83,25 @@ FILE HEADER (tabs/typing/panel.rs)
     `fonts` автоматически включается и подмешивает системные шрифты в список.
   - `ComboBox` шрифтов (`Шрифт`) отображает каждый пункт с его собственной гарнитурой:
     UI-шрифт lazily регистрируется в `egui` по `(font_path, face_index)` и кэшируется.
+  - Дубликаты шрифтов (одно имя файла в корне/разных группах): `merge_duplicate_fonts`
+    объединяет байт-идентичные копии (совпадает имя и хэш содержимого) в один пункт
+    `FontEntry` с объединением групп (`groups`) и `alt_paths` для сопоставления по
+    сохранённому пути; различающиеся по содержимому остаются раздельными, а
+    `assign_font_disambiguators` добавляет к имени название группы в скобках. Скобки
+    показывает только `font_display_label` при выбранных «Все группы»; при конкретной
+    группе имя без скобок.
 */
 use crate::config;
 use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
+use crate::tabs::typing::tab::TypingExportFormat;
+use crate::tabs::typing::tab::TypingTextOverlayLayer;
+use crate::tabs::typing::render_next::forms::{self, PeakBase, TextForm, TextFormPreset};
+use crate::tabs::typing::segmentation::Conservatism;
+use crate::tabs::typing::render_next::load_selected_font_from_path;
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::types::{
-    HorizontalAlign, InlineFontEntry, KerningMode, RenderedTextImage, TEXT_FORMULA_USER_VAR_COUNT,
+    HorizontalAlign, InlineFontEntry, KerningMode, PxOrPercent, RenderedTextImage,
+    TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
     TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
@@ -61,7 +111,7 @@ use crate::widgets::{
     SeedSpinBox, TextEditPlus, TextEditPlusTextColor, ViewportColorSelector, WheelComboBox,
     WheelSlider, WheelSpinBox, random_seed,
 };
-use cosmic_text::fontdb;
+use cosmic_text::{Attrs, FontSystem, Metrics, fontdb};
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_selection::visuals::paint_text_selection;
@@ -71,7 +121,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -87,11 +137,13 @@ const TYPING_VERTICAL_ACTIONS_DEFAULT_WIDTH_PX: f32 = 320.0;
 const TYPING_VERTICAL_ACTIONS_MIN_WIDTH_PX: f32 = 260.0;
 const TYPING_VERTICAL_ACTIONS_MAX_WIDTH_PX: f32 = 420.0;
 const TYPING_VERTICAL_PANEL_GAP_PX: f32 = 12.0;
+const TYPING_VERTICAL_PANEL_SCROLLBAR_RESERVE_PX: f32 = 24.0;
 const TYPING_VERTICAL_PANEL_INITIAL_HEIGHT_RATIO: f32 = 0.8;
 const TYPING_VERTICAL_PANEL_DEFAULT_HEIGHT_PX: f32 = 290.0;
 const TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX: f32 = 120.0;
 const TYPING_PREVIEW_PANEL_AREA_ID: &str = "typing_canvas_preview_panel";
 const TYPING_PREVIEW_PANEL_CONTROLS_GAP_PX: f32 = 10.0;
+const TYPING_VERTICAL_ACTIONS_PANEL_PREVIEW_GAP_PX: f32 = 18.0;
 const TYPING_PREVIEW_PANEL_DEFAULT_WIDTH_PX: f32 = 300.0;
 const CREATE_PREVIEW_HEIGHT_PX: f32 = 200.0;
 const EDIT_TEXT_FIELD_HEIGHT_PX: f32 = 170.0;
@@ -100,6 +152,7 @@ const PREVIEW_TEXTURE_ID: &str = "typing-create-preview-texture";
 const DEFAULT_PREVIEW_TEXT: &str = "Текст будет выглядеть так";
 const DEFAULT_PREVIEW_WIDTH_PX: u32 = 300;
 const TEXT_TAB_USE_SYSTEM_FONTS_KEY: &str = "use_system_fonts";
+const TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY: &str = "use_legacy_inline_tags";
 const TEXT_TAB_CREATE_PRESETS_KEY: &str = "create_presets";
 const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
 const TEXT_PRESET_NONE_LABEL: &str = "Нет";
@@ -294,6 +347,8 @@ pub struct TypingTopPanelState {
     mode: TypingTopPanelMode,
     vertical_panel: TypingFloatingPanelState,
     vertical_actions_panel: TypingFloatingPanelState,
+    /// Active tab of the combined Actions/Layers panel (default «Действия»).
+    actions_panel_tab: TypingActionsPanelTab,
     vertical_panel_tab: TypingVerticalMainTab,
     vertical_panel_params_content_height_px: f32,
     vertical_panel_effects_content_height_px: f32,
@@ -305,6 +360,8 @@ pub struct TypingTopPanelState {
     create_panel: TypingCreatePanelState,
     edit_panel: TypingCreatePanelState,
     edit_overlay_idx: Option<usize>,
+    /// What the edit panel currently targets (overlay or raster). Drives request routing.
+    edit_target: Option<TypingEditTarget>,
     edit_overlay_kind: Option<TypingOverlayKind>,
     edit_render_data_snapshot: Option<Value>,
     mask_panel_open: bool,
@@ -312,6 +369,7 @@ pub struct TypingTopPanelState {
     clean_overlays_initialized: bool,
     pending_clean_overlays_visible: Option<bool>,
     pending_export_to_folder: Option<PathBuf>,
+    export_format: TypingExportFormat,
     pending_round_text_positions: bool,
     export_default_dir: Option<PathBuf>,
     export_status: TypingExportUiStatus,
@@ -355,6 +413,17 @@ pub(super) struct TypingSelectedOverlayForEdit {
     pub width_px_hint: u32,
     pub user_scale: f32,
     pub rotation_deg: f32,
+    /// What the edit panel is targeting — a typing overlay or a raster layer. Rasters use the same
+    /// `Image` UI (transform + effects, no text params).
+    pub target: TypingEditTarget,
+}
+
+/// The thing the edit panel currently edits: a typing overlay (by index) or a raster layer (by
+/// page + stable uid).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) enum TypingEditTarget {
+    Overlay(usize),
+    Raster { page_idx: usize, uid: String },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -372,7 +441,13 @@ pub(super) enum TypingOverlayEditRequest {
         rotation_deg: f32,
     },
     ImageTransform {
-        overlay_idx: usize,
+        target: TypingEditTarget,
+        user_scale: f32,
+        rotation_deg: f32,
+    },
+    ImageEffects {
+        target: TypingEditTarget,
+        render_data_json: Value,
         user_scale: f32,
         rotation_deg: f32,
     },
@@ -396,6 +471,7 @@ impl Default for TypingTopPanelState {
             mode: TypingTopPanelMode::CreateText,
             vertical_panel: TypingFloatingPanelState::default(),
             vertical_actions_panel: TypingFloatingPanelState::default(),
+            actions_panel_tab: TypingActionsPanelTab::Actions,
             vertical_panel_tab: TypingVerticalMainTab::Parameters,
             vertical_panel_params_content_height_px: 0.0,
             vertical_panel_effects_content_height_px: 0.0,
@@ -407,6 +483,7 @@ impl Default for TypingTopPanelState {
             create_panel,
             edit_panel,
             edit_overlay_idx: None,
+            edit_target: None,
             edit_overlay_kind: None,
             edit_render_data_snapshot: None,
             mask_panel_open: false,
@@ -414,6 +491,7 @@ impl Default for TypingTopPanelState {
             clean_overlays_initialized: false,
             pending_clean_overlays_visible: None,
             pending_export_to_folder: None,
+            export_format: TypingExportFormat::default(),
             pending_round_text_positions: false,
             export_default_dir: None,
             export_status: TypingExportUiStatus::Hidden,
@@ -428,7 +506,13 @@ impl Default for TypingTopPanelState {
 }
 
 impl TypingTopPanelState {
-    pub fn draw(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+    pub(super) fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        text_overlays: &mut TypingTextOverlayLayer,
+        page_idx: usize,
+    ) {
         self.create_panel.poll_font_reload_results();
         self.edit_panel.poll_font_reload_results();
         self.create_panel.reset_text_input_focus_tracking();
@@ -443,6 +527,16 @@ impl TypingTopPanelState {
         {
             self.apply_use_system_fonts(use_system_fonts, true);
         }
+        // Синхронизация выбранной группы шрифтов между панелями создания и
+        // редактирования: запрос с любой панели применяется к обеим.
+        if let Some(group) = self
+            .create_panel
+            .take_font_group_request()
+            .or_else(|| self.edit_panel.take_font_group_request())
+        {
+            self.create_panel.set_font_group(group.clone());
+            self.edit_panel.set_font_group(group);
+        }
         if self.mode == TypingTopPanelMode::CreateText {
             self.create_panel.poll_preview_render_results(ctx);
             self.create_panel.ensure_initial_preview_request();
@@ -451,7 +545,7 @@ impl TypingTopPanelState {
             }
         }
 
-        self.draw_vertical_panel(ctx, canvas_rect);
+        self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx);
     }
 
     fn apply_use_system_fonts(&mut self, use_system_fonts: bool, persist: bool) {
@@ -500,12 +594,17 @@ impl TypingTopPanelState {
         }
     }
 
-    fn draw_vertical_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+    fn draw_vertical_panel(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        text_overlays: &mut TypingTextOverlayLayer,
+        page_idx: usize,
+    ) {
+        // Для image-оверлея вкладка «Параметры» показывает только трансформацию, но вкладка
+        // «Эффекты» доступна так же, как для текста — эффекты применяются к сторонней картинке.
         let image_edit_only = self.mode == TypingTopPanelMode::EditText
             && self.edit_overlay_kind == Some(TypingOverlayKind::Image);
-        if image_edit_only {
-            self.vertical_panel_tab = TypingVerticalMainTab::Parameters;
-        }
         if self.vertical_panel_tab != self.vertical_panel_last_tab {
             self.vertical_panel_resize_revision =
                 self.vertical_panel_resize_revision.wrapping_add(1);
@@ -532,18 +631,23 @@ impl TypingTopPanelState {
                 TYPING_VERTICAL_ACTIONS_MAX_WIDTH_PX,
             )
             .min((canvas_rect.width() - TYPING_VERTICAL_PANEL_GAP_PX * 2.0).max(220.0));
-        let min_x = canvas_rect.left();
-        let max_x = (canvas_rect.right() - panel_w).max(min_x);
-        let actions_max_x = (canvas_rect.right() - actions_panel_w).max(min_x);
+        let viewport_rect = ctx.content_rect();
+        let min_x = viewport_rect.left();
+        let right_limit = viewport_rect.right() - TYPING_VERTICAL_PANEL_SCROLLBAR_RESERVE_PX;
+        let max_x = (right_limit - panel_w).max(min_x);
+        let actions_min_x = canvas_rect.left();
+        let actions_max_x = (canvas_rect.right() - actions_panel_w).max(actions_min_x);
         let min_y = canvas_rect.top();
         let max_y = (canvas_rect.bottom() - 48.0).max(min_y);
+        let default_panel_top = canvas_rect.top() + TYPING_VERTICAL_PANEL_GAP_PX;
         let default_pos = egui::pos2(
-            (canvas_rect.right() - panel_w - TYPING_VERTICAL_PANEL_GAP_PX).max(min_x),
-            canvas_rect.top() + TYPING_VERTICAL_PANEL_GAP_PX,
+            (right_limit - panel_w - TYPING_VERTICAL_PANEL_GAP_PX).max(min_x),
+            default_panel_top,
         );
         let panel_pos = self
             .vertical_panel
             .pos
+            .filter(|_| self.vertical_panel.user_positioned)
             .unwrap_or(default_pos)
             .clamp(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
         let viewport_target_height =
@@ -619,13 +723,11 @@ impl TypingTopPanelState {
                             TypingVerticalMainTab::Parameters,
                             TypingVerticalMainTab::Parameters.label(),
                         );
-                        if !image_edit_only {
-                            ui.selectable_value(
-                                &mut self.vertical_panel_tab,
-                                TypingVerticalMainTab::Effects,
-                                TypingVerticalMainTab::Effects.label(),
-                            );
-                        }
+                        ui.selectable_value(
+                            &mut self.vertical_panel_tab,
+                            TypingVerticalMainTab::Effects,
+                            TypingVerticalMainTab::Effects.label(),
+                        );
                     });
                     if self.collapsed {
                         return;
@@ -698,7 +800,15 @@ impl TypingTopPanelState {
                                                 self.create_panel.draw_effects_section(ui, true)
                                             }
                                             TypingTopPanelMode::EditText => {
-                                                self.edit_panel.draw_effects_section(ui, true)
+                                                // Эффекты тоже вызывают перерендер:
+                                                // при ненайденном шрифте блокируем их
+                                                // вместе с остальными параметрами.
+                                                let font_missing =
+                                                    self.edit_panel.missing_font.is_some();
+                                                ui.add_enabled_ui(!font_missing, |ui| {
+                                                    self.edit_panel.draw_effects_section(ui, true)
+                                                })
+                                                .inner
                                             }
                                         };
                                         content_height_px = ui.min_rect().height();
@@ -737,7 +847,12 @@ impl TypingTopPanelState {
                         });
                 });
             });
-        self.vertical_panel.pos = Some(params_area_response.response.rect.min);
+        if params_area_response.response.dragged() {
+            self.vertical_panel.user_positioned = true;
+        }
+        if self.vertical_panel.user_positioned {
+            self.vertical_panel.pos = Some(params_area_response.response.rect.min);
+        }
 
         let params_rect = params_area_response.response.rect;
         let preview_rect =
@@ -745,26 +860,41 @@ impl TypingTopPanelState {
         let actions_default_anchor = preview_rect.unwrap_or(params_rect);
         let actions_default_pos = egui::pos2(
             actions_default_anchor.min.x,
-            actions_default_anchor.max.y + TYPING_VERTICAL_PANEL_GAP_PX,
+            actions_default_anchor.max.y + TYPING_VERTICAL_ACTIONS_PANEL_PREVIEW_GAP_PX,
         );
         let actions_pos = self
             .vertical_actions_panel
             .pos
             .unwrap_or(actions_default_pos)
-            .clamp(egui::pos2(min_x, min_y), egui::pos2(actions_max_x, max_y));
+            .clamp(
+                egui::pos2(actions_min_x, min_y),
+                egui::pos2(actions_max_x, max_y),
+            );
+        // On the «Слои» tab the layer list's inner width-resize (persisted `layers_panel_width`) must be
+        // able to widen the panel, so let the Frame grow to at least that width; the «Действия» tab keeps
+        // the fixed actions width. (Both tabs share the resulting width.)
+        let panel_w_for_tab = if self.actions_panel_tab == TypingActionsPanelTab::Layers
+            && !self.vertical_actions_panel.collapsed
+        {
+            actions_panel_w.max(text_overlays.layers_panel_width())
+        } else {
+            actions_panel_w
+        };
         let actions_area_response = egui::Area::new(TYPING_VERTICAL_ACTIONS_PANEL_AREA_ID.into())
             .order(egui::Order::Foreground)
             .movable(true)
             .interactable(true)
             .current_pos(actions_pos)
             .show(ctx, |ui| {
-                ui.set_width(actions_panel_w);
-                ui.set_min_width(actions_panel_w);
-                ui.set_max_width(actions_panel_w);
+                ui.set_width(panel_w_for_tab);
+                ui.set_min_width(panel_w_for_tab);
+                ui.set_max_width(panel_w_for_tab);
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(actions_panel_w);
-                    ui.set_min_width(actions_panel_w);
-                    ui.set_max_width(actions_panel_w);
+                    ui.set_width(panel_w_for_tab);
+                    ui.set_min_width(panel_w_for_tab);
+                    ui.set_max_width(panel_w_for_tab);
+                    // 2-tab header (mirrors the Параметры/Эффекты panel): collapse toggle + «Действия» /
+                    // «Слои» tabs.
                     ui.horizontal(|ui| {
                         let toggle_icon = if self.vertical_actions_panel.collapsed {
                             "▶"
@@ -772,9 +902,9 @@ impl TypingTopPanelState {
                             "▼"
                         };
                         let toggle_hint = if self.vertical_actions_panel.collapsed {
-                            "Развернуть панель действий"
+                            "Развернуть панель"
                         } else {
-                            "Свернуть панель действий"
+                            "Свернуть панель"
                         };
                         if ui
                             .small_button(toggle_icon)
@@ -784,50 +914,75 @@ impl TypingTopPanelState {
                             self.vertical_actions_panel.collapsed =
                                 !self.vertical_actions_panel.collapsed;
                         }
-                        ui.label("Действия");
+                        ui.selectable_value(
+                            &mut self.actions_panel_tab,
+                            TypingActionsPanelTab::Actions,
+                            TypingActionsPanelTab::Actions.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.actions_panel_tab,
+                            TypingActionsPanelTab::Layers,
+                            TypingActionsPanelTab::Layers.label(),
+                        );
                     });
                     if self.vertical_actions_panel.collapsed {
                         return;
                     }
                     ui.add_space(4.0);
-                    let actions = match self.mode {
-                        TypingTopPanelMode::CreateText => self.create_panel.draw_right_section(
-                            ui,
-                            self.mask_panel_open,
-                            self.clean_overlays_visible,
-                            self.strict_pixel_movement,
-                            self.export_default_dir.as_deref(),
-                            &self.export_status,
-                        ),
-                        TypingTopPanelMode::EditText => self.edit_panel.draw_right_section(
-                            ui,
-                            self.mask_panel_open,
-                            self.clean_overlays_visible,
-                            self.strict_pixel_movement,
-                            self.export_default_dir.as_deref(),
-                            &self.export_status,
-                        ),
-                    };
-                    if actions.toggle_mask {
-                        self.mask_panel_open = !self.mask_panel_open;
+                    match self.actions_panel_tab {
+                        TypingActionsPanelTab::Actions => {
+                            let actions = match self.mode {
+                                TypingTopPanelMode::CreateText => {
+                                    self.create_panel.draw_right_section(
+                                        ui,
+                                        self.mask_panel_open,
+                                        self.clean_overlays_visible,
+                                        self.strict_pixel_movement,
+                                        self.export_default_dir.as_deref(),
+                                        &self.export_status,
+                                        self.export_format,
+                                    )
+                                }
+                                TypingTopPanelMode::EditText => self.edit_panel.draw_right_section(
+                                    ui,
+                                    self.mask_panel_open,
+                                    self.clean_overlays_visible,
+                                    self.strict_pixel_movement,
+                                    self.export_default_dir.as_deref(),
+                                    &self.export_status,
+                                    self.export_format,
+                                ),
+                            };
+                            if actions.toggle_mask {
+                                self.mask_panel_open = !self.mask_panel_open;
+                            }
+                            if let Some(visible) = actions.changed_clean_overlays {
+                                self.clean_overlays_visible = visible;
+                                self.pending_clean_overlays_visible = Some(visible);
+                            }
+                            if let Some(format) = actions.changed_export_format {
+                                self.export_format = format;
+                            }
+                            if let Some(path) = actions.export_to_folder {
+                                self.pending_export_to_folder = Some(path);
+                            }
+                            if actions.round_text_positions {
+                                self.pending_round_text_positions = true;
+                            }
+                            if actions.create_image_request.is_some() {
+                                self.pending_create_image_request = actions.create_image_request;
+                            }
+                            if let Some(strict_pixel_movement) =
+                                actions.changed_strict_pixel_movement
+                            {
+                                self.strict_pixel_movement = strict_pixel_movement;
+                            }
+                            self.draw_auto_typing_controls(ui);
+                        }
+                        TypingActionsPanelTab::Layers => {
+                            text_overlays.draw_layers_tab_body(ui, page_idx);
+                        }
                     }
-                    if let Some(visible) = actions.changed_clean_overlays {
-                        self.clean_overlays_visible = visible;
-                        self.pending_clean_overlays_visible = Some(visible);
-                    }
-                    if let Some(path) = actions.export_to_folder {
-                        self.pending_export_to_folder = Some(path);
-                    }
-                    if actions.round_text_positions {
-                        self.pending_round_text_positions = true;
-                    }
-                    if actions.create_image_request.is_some() {
-                        self.pending_create_image_request = actions.create_image_request;
-                    }
-                    if let Some(strict_pixel_movement) = actions.changed_strict_pixel_movement {
-                        self.strict_pixel_movement = strict_pixel_movement;
-                    }
-                    self.draw_auto_typing_controls(ui);
                 });
             });
         self.vertical_actions_panel.pos = Some(actions_area_response.response.rect.min);
@@ -897,9 +1052,10 @@ impl TypingTopPanelState {
     ) {
         match selected {
             Some(selected) => {
-                let render_data_changed = selected.overlay_kind == TypingOverlayKind::Text
-                    && self.edit_render_data_snapshot != selected.render_data_json;
-                if self.edit_overlay_idx != Some(selected.overlay_idx) || render_data_changed {
+                let render_data_changed =
+                    self.edit_render_data_snapshot != selected.render_data_json;
+                let target_changed = self.edit_target.as_ref() != Some(&selected.target);
+                if target_changed || render_data_changed {
                     match selected.overlay_kind {
                         TypingOverlayKind::Text => {
                             self.edit_panel.load_from_selected_overlay(&selected);
@@ -907,6 +1063,9 @@ impl TypingTopPanelState {
                         TypingOverlayKind::Image => {
                             self.edit_panel
                                 .sync_overlay_transform_from_selected_overlay(&selected);
+                            if let Some(render_data) = selected.render_data_json.as_ref() {
+                                self.edit_panel.load_effects_only_from_render_data(render_data);
+                            }
                         }
                     }
                     self.pending_edit_request = None;
@@ -915,12 +1074,14 @@ impl TypingTopPanelState {
                         .sync_overlay_transform_from_selected_overlay(&selected);
                 }
                 self.edit_overlay_idx = Some(selected.overlay_idx);
+                self.edit_target = Some(selected.target.clone());
                 self.edit_overlay_kind = Some(selected.overlay_kind);
                 self.edit_render_data_snapshot = selected.render_data_json.clone();
                 self.mode = TypingTopPanelMode::EditText;
             }
             None => {
                 self.edit_overlay_idx = None;
+                self.edit_target = None;
                 self.edit_overlay_kind = None;
                 self.edit_render_data_snapshot = None;
                 self.pending_edit_request = None;
@@ -953,8 +1114,10 @@ impl TypingTopPanelState {
         self.pending_clean_overlays_visible.take()
     }
 
-    pub(super) fn take_export_to_folder_request(&mut self) -> Option<PathBuf> {
-        self.pending_export_to_folder.take()
+    pub(super) fn take_export_to_folder_request(&mut self) -> Option<(PathBuf, TypingExportFormat)> {
+        self.pending_export_to_folder
+            .take()
+            .map(|path| (path, self.export_format))
     }
 
     pub(super) fn take_round_text_positions_request(&mut self) -> bool {
@@ -974,12 +1137,22 @@ impl TypingTopPanelState {
     }
 
     fn emit_edit_request(&mut self) {
-        let Some(overlay_idx) = self.edit_overlay_idx else {
+        let Some(target) = self.edit_target.clone() else {
             return;
         };
         let overlay_kind = self.edit_overlay_kind.unwrap_or(TypingOverlayKind::Text);
         self.pending_edit_request = match overlay_kind {
             TypingOverlayKind::Text => {
+                // Text editing only applies to overlays.
+                let TypingEditTarget::Overlay(overlay_idx) = target else {
+                    return;
+                };
+                // Шрифт оверлея не найден: рендер заблокирован, пока пользователь не
+                // выберет другой доступный шрифт. Иначе текст отрисовался бы чужим
+                // (подставленным) шрифтом.
+                if self.edit_panel.missing_font.is_some() {
+                    return;
+                }
                 let Some(render_params) = self.edit_panel.build_render_params() else {
                     return;
                 };
@@ -997,11 +1170,26 @@ impl TypingTopPanelState {
                     rotation_deg: normalize_angle_deg(self.edit_panel.overlay_rotation_deg),
                 })
             }
-            TypingOverlayKind::Image => Some(TypingOverlayEditRequest::ImageTransform {
-                overlay_idx,
-                user_scale: self.edit_panel.overlay_scale.clamp(0.05, 20.0),
-                rotation_deg: normalize_angle_deg(self.edit_panel.overlay_rotation_deg),
-            }),
+            TypingOverlayKind::Image => {
+                let user_scale = self.edit_panel.overlay_scale.clamp(0.05, 20.0);
+                let rotation_deg = normalize_angle_deg(self.edit_panel.overlay_rotation_deg);
+                // Изменения во вкладке «Эффекты» требуют перерендера картинки; чистая
+                // трансформация (масштаб/угол) применяется на показе без перерендера.
+                if self.vertical_panel_tab == TypingVerticalMainTab::Effects {
+                    Some(TypingOverlayEditRequest::ImageEffects {
+                        target,
+                        render_data_json: self.edit_panel.build_image_effects_render_data(),
+                        user_scale,
+                        rotation_deg,
+                    })
+                } else {
+                    Some(TypingOverlayEditRequest::ImageTransform {
+                        target,
+                        user_scale,
+                        rotation_deg,
+                    })
+                }
+            }
         };
     }
 
@@ -1128,6 +1316,7 @@ struct TypingFloatingPreviewPanelState {
 struct TypingFloatingPanelState {
     collapsed: bool,
     pos: Option<egui::Pos2>,
+    user_positioned: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -1146,11 +1335,38 @@ impl TypingVerticalMainTab {
     }
 }
 
+/// The two tabs of the combined Actions/Layers floating panel.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum TypingActionsPanelTab {
+    #[default]
+    Actions,
+    Layers,
+}
+
+impl TypingActionsPanelTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Actions => "Действия",
+            Self::Layers => "Слои",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FontEntry {
+    /// Базовое отображаемое имя (имя файла без расширения), без скобок-уточнения.
     label: String,
+    /// Представительный файл шрифта.
     path: PathBuf,
-    group_name: Option<String>,
+    /// Прочие байт-идентичные копии того же шрифта (объединены в один пункт);
+    /// нужны для сопоставления по сохранённому пути.
+    alt_paths: Vec<PathBuf>,
+    /// Группы, в которых встречается шрифт (`None` — корень папки шрифтов).
+    /// У объединённой копии — объединение групп всех копий.
+    groups: Vec<Option<String>>,
+    /// Скобочное уточнение (название группы) для отображения, когда выбрано «Все
+    /// группы» и базовое имя неоднозначно. `None` — уточнение не нужно.
+    disambig: Option<String>,
     faces: Vec<FontFaceEntry>,
 }
 
@@ -1158,6 +1374,14 @@ struct FontEntry {
 struct FontFaceEntry {
     label: String,
     face_index: usize,
+}
+
+/// Какой текстовый буфер сейчас активен для выделения и вставки инлайн-тегов:
+/// исходный `text` или сформированный `formed_text`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineTextTarget {
+    Source,
+    Formed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1480,6 +1704,7 @@ struct TypingRightSectionActions {
     toggle_mask: bool,
     changed_clean_overlays: Option<bool>,
     export_to_folder: Option<PathBuf>,
+    changed_export_format: Option<TypingExportFormat>,
     round_text_positions: bool,
     create_image_request: Option<TypingCreateImageRequest>,
     changed_strict_pixel_movement: Option<bool>,
@@ -1492,13 +1717,20 @@ struct TypingCreatePanelState {
     selected_font_group: Option<String>,
     use_system_fonts: bool,
     pending_use_system_fonts_toggle_request: Option<bool>,
+    /// Запрос смены группы шрифтов для синхронизации между панелями `create`/`edit`.
+    /// Внешний `Some` — есть запрос; внутреннее значение — новая `selected_font_group`
+    /// (`None` = «Все группы»).
+    pending_font_group_request: Option<Option<String>>,
     font_reload_rx: Option<Receiver<FontReloadResult>>,
     latest_font_reload_token: u64,
     fonts_reload_in_flight: bool,
     combo_font_family_cache: HashMap<(PathBuf, usize), String>,
-    combo_font_family_next_id: u64,
     font_profiles_by_key: HashMap<String, Value>,
     active_font_key: Option<String>,
+    /// Имя шрифта выбранного для редактирования оверлея, если этот шрифт не найден
+    /// среди доступных. Пока поле `Some`, рендер оверлея заблокирован, а все
+    /// параметры (кроме выбора шрифта) на панели редактирования недоступны.
+    missing_font: Option<String>,
     presets_by_name: HashMap<String, TypingCreatePreset>,
     selected_preset_name: Option<String>,
     preset_name_input: String,
@@ -1512,13 +1744,11 @@ struct TypingCreatePanelState {
     text_color: Color32,
     text_color_selector: ViewportColorSelector,
     font_size_px: f32,
-    line_spacing_px: f32,
-    line_spacing_percent: f32,
+    line_spacing: PxOrPercent,
     kerning_mode: KerningMode,
-    kerning_px: f32,
-    kerning_percent: f32,
-    glyph_height_percent: f32,
-    glyph_width_percent: f32,
+    kerning: PxOrPercent,
+    glyph_height: PxOrPercent,
+    glyph_width: PxOrPercent,
     width_px: u32,
     align: HorizontalAlign,
     text_line_mode: TextLineMode,
@@ -1547,6 +1777,9 @@ struct TypingCreatePanelState {
     hanging_punctuation: bool,
     new_line_after_sentence: bool,
     enable_inline_style_tags: bool,
+    // Писать обычные («человекочитаемые») inline-теги вместо компактного `<m ...>`.
+    // Пока не подключено к UI — будет переключаться в будущей вкладке настроек тайпа.
+    use_legacy_inline_tags: bool,
     overlay_scale: f32,
     overlay_rotation_deg: f32,
     effect_to_add: AvailableEffectKind,
@@ -1562,35 +1795,112 @@ struct TypingCreatePanelState {
     tracked_text_input_ids: Vec<Id>,
     text_selection_char_range: Option<Range<usize>>,
     pending_text_selection_restore: Option<Range<usize>>,
+    /// Буфер, к которому относятся выделение и инлайн-теги (исходный/сформированный).
+    inline_text_target: InlineTextTarget,
+    advanced_form_open: bool,
+    advanced_form_preset: TextFormPreset,
+    /// Выбранная группа по числу переносов слов; `None` — «Все».
+    advanced_form_group: Option<usize>,
+    advanced_form_cache: Option<AdvancedFormCache>,
+    /// Сформированный (разбитый на строки) текст. Если не пуст — в рендер идёт
+    /// именно он, а `text` остаётся исходным. Пуст — рендерится `text`.
+    formed_text: String,
+    /// Какой из двух текстов развёрнут в панели (конкурирующий аккордеон):
+    /// `true` — сформированный, `false` — исходный.
+    advanced_text_show_formed: bool,
+    /// Фильтр по числу строк `(min, max)`; задаётся границами кэша.
+    advanced_form_line_range: (usize, usize),
+    /// Фильтр по ширине самой длинной строки `(min, max)`, в единицах метрики.
+    advanced_form_width_range: (u32, u32),
+    /// Верхний порог пиковости в % (показываем формы не «пиковее» него).
+    advanced_form_peak_max: u32,
+    /// База отсчёта пиковости (минимум/медиана).
+    advanced_form_peak_base: PeakBase,
+    /// Верхний порог неравномерности в % (показываем формы не «разбросаннее» него).
+    advanced_form_uneven_max: u32,
+    /// Верхний порог консервативности: показываем формы, чья консервативность не
+    /// выше выбранной (`Safe` — только безопасные переносы, без отрыва предлогов).
+    advanced_form_conservatism_max: Conservatism,
+    /// Окно уже отцентрировано (узнало итоговый размер). До этого окно скрыто,
+    /// чтобы не было дёрганья при позиционировании.
+    advanced_form_centered: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Сколько карточек форм максимум отрисовываем в окне за раз. Это предел
+/// ОТРИСОВКИ, а не данных: кэш хранит все удачные формы и фильтрует их целиком,
+/// а в список попадают первые `ADVANCED_FORM_DISPLAY_LIMIT` (лучшие по сортировке)
+/// из прошедших фильтр.
+const ADVANCED_FORM_DISPLAY_LIMIT: usize = 600;
+
+/// Кэш перечисленных форм для окна «Продвинутая форма текста».
+struct AdvancedFormCache {
+    source_text: String,
+    preset: TextFormPreset,
+    /// Формы, отсортированные по ширине (узкие → широкие), а в пределах ±1
+    /// символа — по накопленной цене разрывов.
+    forms: Vec<TextForm>,
+    /// Встретившиеся значения числа переносов слов (для динамических кнопок).
+    group_counts: Vec<usize>,
+    /// Границы фильтров по фактическим данным: число строк, ширина, пиковость %.
+    line_bounds: (usize, usize),
+    width_bounds: (u32, u32),
+    /// Сигнатура шрифта/режима, при которой построена метрика ширины. Смена —
+    /// повод пересобрать кэш (ширины меняются).
+    metric_signature: AdvancedFormMetricSignature,
+    /// Максимальная пиковость в % для каждой базы (минимум/медиана).
+    peak_max_bound_min: u32,
+    peak_max_bound_median: u32,
+    /// Максимальная неравномерность в % среди форм (верхняя граница фильтра).
+    uneven_max_bound: u32,
+    /// Самая вольная консервативность среди форм (верхняя граница фильтра). Если
+    /// `Safe` — отрывов служебных слов нет, селектор консервативности не нужен.
+    conservatism_bound: Conservatism,
+    /// Перебор форм оказался неполным: выбит бюджет узлов рекурсии (не лимит
+    /// отрисовки). Означает, что в кэше лежат не все возможные формы.
+    truncated: bool,
+}
+
+/// От чего зависят пиксельные ширины глифов в окне форм. При смене любого поля
+/// метрику (и кэш форм) надо пересобрать.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AdvancedFormMetricSignature {
+    font_path: Option<String>,
+    face_index: usize,
+    force_bold: bool,
+    force_italic: bool,
+    hanging_punctuation: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 struct TypingInlineTagStyle {
     bold: bool,
     italic: bool,
     font_label: Option<String>,
     font_size_px: Option<f32>,
     text_color: Option<Color32>,
-    line_spacing: Option<[f32; 2]>,
-    kerning: Option<[f32; 2]>,
-    glyph_stretching: Option<[f32; 2]>,
+    line_spacing: Option<PxOrPercent>,
+    kerning: Option<PxOrPercent>,
+    glyph_stretching: Option<[PxOrPercent; 2]>,
     glyph_offset: Option<TypingInlineOffsetStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TypingInlineOffsetStyle {
-    global_px: [f32; 2],
-    line_px: f32,
+    global_x: PxOrPercent,
+    global_y: PxOrPercent,
+    line: PxOrPercent,
     shift_following: bool,
     group_rotation_deg: f32,
     glyph_rotation_deg: f32,
 }
 
 impl TypingInlineOffsetStyle {
-    fn global_only(global_px: [f32; 2]) -> Self {
+    // Свежее смещение по умолчанию задаётся в процентах (как и остальные параметры).
+    fn global_only(global: [f32; 2]) -> Self {
         Self {
-            global_px,
-            line_px: 0.0,
+            global_x: PxOrPercent::percent(global[0]),
+            global_y: PxOrPercent::percent(global[1]),
+            line: PxOrPercent::percent(0.0),
             shift_following: false,
             group_rotation_deg: 0.0,
             glyph_rotation_deg: 0.0,
@@ -1614,10 +1924,12 @@ enum TypingInlineTagKind {
     Font(String),
     Size(f32),
     Color(Color32),
-    LineSpacing([f32; 2]),
-    Kerning([f32; 2]),
-    Stretching([f32; 2]),
+    LineSpacing(PxOrPercent),
+    Kerning(PxOrPercent),
+    Stretching([PxOrPercent; 2]),
     Offset(TypingInlineOffsetStyle),
+    /// Машиночитаемый тег `<m ...>`, совмещающий все параметры в одном теге.
+    Machine(TypingInlineTagStyle),
 }
 
 #[derive(Debug, Clone)]
@@ -1664,13 +1976,14 @@ impl TypingCreatePanelState {
             selected_font_group: None,
             use_system_fonts: effective_use_system_fonts,
             pending_use_system_fonts_toggle_request: None,
+            pending_font_group_request: None,
             font_reload_rx: None,
             latest_font_reload_token: 0,
             fonts_reload_in_flight: false,
             combo_font_family_cache: HashMap::new(),
-            combo_font_family_next_id: 0,
             font_profiles_by_key: HashMap::new(),
             active_font_key: None,
+            missing_font: None,
             presets_by_name,
             selected_preset_name: None,
             preset_name_input: String::new(),
@@ -1684,15 +1997,13 @@ impl TypingCreatePanelState {
             text_color: Color32::BLACK,
             text_color_selector: ViewportColorSelector::default(),
             font_size_px: 24.0,
-            line_spacing_px: 0.0,
-            line_spacing_percent: 0.0,
+            line_spacing: PxOrPercent::percent(0.0),
             kerning_mode: KerningMode::Metric,
-            kerning_px: 0.0,
-            kerning_percent: 0.0,
-            glyph_height_percent: 100.0,
-            glyph_width_percent: 100.0,
+            kerning: PxOrPercent::percent(0.0),
+            glyph_height: PxOrPercent::percent(100.0),
+            glyph_width: PxOrPercent::percent(100.0),
             width_px: DEFAULT_PREVIEW_WIDTH_PX,
-            align: HorizontalAlign::Center,
+            align: HorizontalAlign::CENTER,
             text_line_mode: TextLineMode::Horizontal,
             vertical_line_direction: VerticalLineDirection::RightToLeft,
             text_layout_mode: TextLayoutMode::Normal,
@@ -1719,6 +2030,7 @@ impl TypingCreatePanelState {
             hanging_punctuation: true,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,
+            use_legacy_inline_tags: load_text_tab_use_legacy_inline_tags(),
             overlay_scale: 1.0,
             overlay_rotation_deg: 0.0,
             effect_to_add: AvailableEffectKind::Stroke,
@@ -1734,6 +2046,20 @@ impl TypingCreatePanelState {
             tracked_text_input_ids: Vec::new(),
             text_selection_char_range: None,
             pending_text_selection_restore: None,
+            inline_text_target: InlineTextTarget::Source,
+            advanced_form_open: false,
+            advanced_form_preset: TextFormPreset::FreeNoTree,
+            advanced_form_group: None,
+            advanced_form_cache: None,
+            formed_text: String::new(),
+            advanced_text_show_formed: false,
+            advanced_form_line_range: (0, 0),
+            advanced_form_width_range: (0, 0),
+            advanced_form_peak_max: 0,
+            advanced_form_peak_base: PeakBase::Min,
+            advanced_form_uneven_max: 0,
+            advanced_form_conservatism_max: Conservatism::Safe,
+            advanced_form_centered: false,
         };
         state.active_font_key = state.current_font_key();
         state.sync_current_font_profile_memory();
@@ -1789,6 +2115,25 @@ impl TypingCreatePanelState {
 
     fn take_use_system_fonts_toggle_request(&mut self) -> Option<bool> {
         self.pending_use_system_fonts_toggle_request.take()
+    }
+
+    fn take_font_group_request(&mut self) -> Option<Option<String>> {
+        self.pending_font_group_request.take()
+    }
+
+    /// Применяет выбранную группу шрифтов (для синхронизации между панелями).
+    /// Возвращает `true`, если группа изменилась.
+    fn set_font_group(&mut self, group: Option<String>) -> bool {
+        if self.selected_font_group == group {
+            return false;
+        }
+        self.selected_font_group = group;
+        self.sync_selected_font_group();
+        self.ensure_selected_font_in_group();
+        if self.preview_enabled {
+            self.queue_preview_render();
+        }
+        true
     }
 
     fn spawn_font_reload(&mut self) {
@@ -1888,10 +2233,19 @@ impl TypingCreatePanelState {
         self.fonts.get(idx).map(|font| font.label.clone())
     }
 
+    /// Имя шрифта для показа в списке: с уточнением в скобках, только когда
+    /// выбраны «Все группы» и имя неоднозначно; при конкретной группе — без скобок.
+    fn font_display_label(&self, font: &FontEntry) -> String {
+        match (self.selected_font_group.is_none(), font.disambig.as_deref()) {
+            (true, Some(suffix)) => format!("{} ({})", font.label, suffix),
+            _ => font.label.clone(),
+        }
+    }
+
     fn find_font_idx_by_key(&self, font_key: &str) -> Option<usize> {
         self.fonts
             .iter()
-            .position(|font| font.path.to_string_lossy() == font_key)
+            .position(|font| font_matches_path(font, font_key))
     }
 
     fn filtered_font_indices(&self) -> Vec<usize> {
@@ -1902,7 +2256,7 @@ impl TypingCreatePanelState {
                 if self
                     .selected_font_group
                     .as_deref()
-                    .is_none_or(|group_name| font.group_name.as_deref() == Some(group_name))
+                    .is_none_or(|group_name| font_in_group(font, group_name))
                 {
                     Some(idx)
                 } else {
@@ -1928,10 +2282,10 @@ impl TypingCreatePanelState {
         }
 
         let selected_group_matches = self
-            .fonts
-            .get(self.selected_font_idx)
-            .and_then(|font| font.group_name.as_deref())
-            == self.selected_font_group.as_deref();
+            .selected_font_group
+            .as_deref()
+            .zip(self.fonts.get(self.selected_font_idx))
+            .is_some_and(|(group, font)| font_in_group(font, group));
         if selected_group_matches {
             return;
         }
@@ -1949,10 +2303,10 @@ impl TypingCreatePanelState {
     ) -> Option<usize> {
         let mut selected_idx = None;
         if let Some(path_raw) = font_path {
-            selected_idx = self.fonts.iter().position(|font| {
-                font.path == std::path::Path::new(path_raw)
-                    || font.path.to_string_lossy() == path_raw
-            });
+            selected_idx = self
+                .fonts
+                .iter()
+                .position(|font| font_matches_path(font, path_raw));
         }
         if selected_idx.is_none()
             && let Some(label_raw) = font_label
@@ -1971,6 +2325,21 @@ impl TypingCreatePanelState {
             }
         }
         selected_idx
+    }
+
+    /// render-data для image-оверлея: только список эффектов (без text_params).
+    fn build_image_effects_render_data(&self) -> Value {
+        json!({ "effects": self.effects_value_array() })
+    }
+
+    /// Загружает только эффекты из render-data (для image-оверлеев без text_params).
+    fn load_effects_only_from_render_data(&mut self, render_data: &Value) {
+        self.effects = render_data
+            .as_object()
+            .and_then(|obj| obj.get("effects"))
+            .and_then(Value::as_array)
+            .map(|effects| parse_effect_cards(effects, self.text_color))
+            .unwrap_or_default();
     }
 
     fn effects_value_array(&self) -> Vec<Value> {
@@ -2160,23 +2529,19 @@ impl TypingCreatePanelState {
                 "text": text,
                 "text_color": [self.text_color.r(), self.text_color.g(), self.text_color.b(), self.text_color.a()],
                 "font_size_px": self.font_size_px,
-                "line_spacing_px": self.line_spacing_px,
-                "line_spacing_percent": self.line_spacing_percent,
+                "line_spacing": self.line_spacing.to_token(),
                 "kerning_mode": match self.kerning_mode {
                     KerningMode::Metric => "metric",
                     KerningMode::Optical => "optical",
                 },
-                "kerning_px": self.kerning_px,
-                "kerning_percent": self.kerning_percent,
-                "glyph_height_percent": self.glyph_height_percent,
-                "glyph_width_percent": self.glyph_width_percent,
+                "kerning": self.kerning.to_token(),
+                "glyph_height": self.glyph_height.to_token(),
+                "glyph_width": self.glyph_width.to_token(),
                 "width_px": width_px.max(1),
-                "align": match self.align {
-                    HorizontalAlign::Left => "left",
-                    HorizontalAlign::Center => "center",
-                    HorizontalAlign::Right => "right",
-                    HorizontalAlign::Justify => "justify",
-                },
+                // `align` — легаси-совместимая строка (PSD-экспорт, старые ридеры),
+                // `align_bias` — точное непрерывное смещение слайдера лево↔право.
+                "align": self.align.legacy_str(),
+                "align_bias": self.align.bias,
                 "text_line_mode": match self.text_line_mode {
                     TextLineMode::Horizontal => "horizontal",
                     TextLineMode::Vertical => "vertical",
@@ -2223,6 +2588,10 @@ impl TypingCreatePanelState {
                 "shape_variant": self.shape_variant,
                 "font_path": font_path,
                 "font_label": font_label,
+                // Сформированный (разбитый на строки) текст «продвинутой формы».
+                // Если не пуст — именно он идёт в рендер; `text` остаётся исходным.
+                // Переживает перезапуск.
+                "formed_text": self.formed_text,
             },
             "effects": self.effects_value_array(),
         })
@@ -2742,17 +3111,21 @@ impl TypingCreatePanelState {
         face_index: usize,
     ) -> Option<egui::FontFamily> {
         let cache_key = (font_path.to_path_buf(), face_index);
-        if let Some(name) = self.combo_font_family_cache.get(&cache_key) {
-            let family = egui::FontFamily::Name(name.clone().into());
-            if is_font_family_bound(ctx, &family) {
-                return Some(family);
-            }
-            return None;
+        // Имя egui-семейства детерминированно выводится из (путь, индекс начертания):
+        // один и тот же файл всегда даёт одно имя, разные файлы — разные имена. Это
+        // критично, потому что `create_panel` и `edit_panel` — две независимые панели
+        // с общим egui-`Context`. При последовательной нумерации обе генерировали
+        // совпадающие имена (`typing-panel-combo-font-1` …) для РАЗНЫХ файлов, а egui
+        // хранит данные шрифта по имени — поздняя регистрация затирала раннюю, и одна
+        // панель начинала рисовать чужой шрифт (в т.ч. в окне продвинутой формы).
+        let font_name = combo_font_family_name(font_path, face_index);
+        let family = egui::FontFamily::Name(font_name.clone().into());
+        if is_font_family_bound(ctx, &family) {
+            self.combo_font_family_cache.insert(cache_key, font_name);
+            return Some(family);
         }
 
         let font_bytes = fs::read(font_path).ok()?;
-        self.combo_font_family_next_id = self.combo_font_family_next_id.saturating_add(1);
-        let font_name = format!("typing-panel-combo-font-{}", self.combo_font_family_next_id);
         let mut font_data = egui::FontData::from_owned(font_bytes);
         font_data.index = face_index as u32;
         ctx.add_font(egui::epaint::text::FontInsert::new(
@@ -2763,9 +3136,7 @@ impl TypingCreatePanelState {
                 priority: egui::epaint::text::FontPriority::Highest,
             }],
         ));
-        let family = egui::FontFamily::Name(font_name.clone().into());
-        self.combo_font_family_cache
-            .insert(cache_key, font_name.clone());
+        self.combo_font_family_cache.insert(cache_key, font_name);
         if is_font_family_bound(ctx, &family) {
             Some(family)
         } else {
@@ -2864,6 +3235,8 @@ impl TypingCreatePanelState {
             stacked_columns,
             remap_wheel_to_horizontal,
             self.preview_enabled,
+            // Панель создания всегда работает с доступным шрифтом.
+            false,
         );
 
         if params_changed {
@@ -3094,9 +3467,9 @@ impl TypingCreatePanelState {
                 seed: random_seed(),
             }),
             AvailableEffectKind::Stroke => EffectCard::Stroke(StrokeEffectCard {
-                width_px: 2.0,
-                color: ColorField::new(Color32::BLACK),
-                opacity_mode: StrokeOpacityMode::FromContour,
+                width_px: 2.96,
+                color: ColorField::new(Color32::WHITE),
+                opacity_mode: StrokeOpacityMode::Static,
                 transparency_percent: 0.0,
                 smoothing: false,
                 smoothing_strength_percent: 100.0,
@@ -3209,11 +3582,13 @@ impl TypingCreatePanelState {
         strict_pixel_movement: bool,
         export_default_dir: Option<&Path>,
         export_status: &TypingExportUiStatus,
+        export_format: TypingExportFormat,
     ) -> TypingRightSectionActions {
         let mut out = TypingRightSectionActions {
             toggle_mask: false,
             changed_clean_overlays: None,
             export_to_folder: None,
+            changed_export_format: None,
             round_text_positions: false,
             create_image_request: None,
             changed_strict_pixel_movement: None,
@@ -3226,6 +3601,21 @@ impl TypingCreatePanelState {
             };
             if ui.button(mask_button_label).clicked() {
                 out.toggle_mask = true;
+            }
+            if self.preview_enabled {
+                let mut format = export_format;
+                ui.horizontal(|ui| {
+                    ui.label("Формат:");
+                    if ui
+                        .selectable_value(&mut format, TypingExportFormat::Png, "PNG")
+                        .clicked()
+                        || ui
+                            .selectable_value(&mut format, TypingExportFormat::Psd, "PSD")
+                            .clicked()
+                    {
+                        out.changed_export_format = Some(format);
+                    }
+                });
             }
             if self.preview_enabled && ui.button("Наложить и сохранить в папку").clicked()
             {
@@ -3291,12 +3681,14 @@ impl TypingCreatePanelState {
                     }
                 }
             }
+            // Чекбокс видимости клина доступен в обоих режимах (создание и
+            // редактирование); остальные действия ниже — только при создании.
+            ui.separator();
+            let mut show_clean = clean_overlays_visible;
+            if ui.checkbox(&mut show_clean, "Показывать клин").changed() {
+                out.changed_clean_overlays = Some(show_clean);
+            }
             if self.preview_enabled {
-                ui.separator();
-                let mut show_clean = clean_overlays_visible;
-                if ui.checkbox(&mut show_clean, "Показывать клин").changed() {
-                    out.changed_clean_overlays = Some(show_clean);
-                }
                 let mut strict_pixel_movement_value = strict_pixel_movement;
                 if ui
                     .checkbox(
@@ -3321,6 +3713,7 @@ impl TypingCreatePanelState {
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
         font_memory_enabled: bool,
+        font_missing: bool,
     ) -> bool {
         let mut changed = false;
         let mut block_hscroll_by_hovered_param = false;
@@ -3335,7 +3728,10 @@ impl TypingCreatePanelState {
             .map(|selection| self.effective_inline_tag_style(selection));
 
         ui.vertical(|ui| {
-            if self.preview_enabled {
+            // Комбобокс группы шрифтов показывается на обеих панелях (создание и
+            // редактирование); выбор синхронизируется между ними через
+            // `pending_font_group_request` (см. обработку во внешнем цикле).
+            {
                 let mut selected_group_idx = self
                     .selected_font_group
                     .as_ref()
@@ -3369,21 +3765,31 @@ impl TypingCreatePanelState {
                 };
                 if self.selected_font_group != previous_group {
                     self.ensure_selected_font_in_group();
+                    self.pending_font_group_request = Some(self.selected_font_group.clone());
                     changed = true;
                 }
             }
 
             let prev_font_idx = self.selected_font_idx;
             let filtered_font_indices = self.filtered_font_indices();
-            let selected_font_text = inline_style
-                .as_ref()
-                .and_then(|style| style.font_label.as_deref())
-                .or_else(|| {
-                    self.fonts
-                        .get(self.selected_font_idx)
-                        .map(|font| font.label.as_str())
-                })
-                .unwrap_or("<шрифт>");
+            let selected_font_text: String = if font_missing {
+                // Шрифт оверлея не найден: показываем его имя, чтобы было понятно,
+                // какой именно шрифт отсутствует и какой надо заменить.
+                self.missing_font
+                    .as_ref()
+                    .map(|name| format!("{name} (не найден)"))
+                    .unwrap_or_else(|| "<шрифт>".to_string())
+            } else {
+                inline_style
+                    .as_ref()
+                    .and_then(|style| style.font_label.clone())
+                    .or_else(|| {
+                        self.fonts
+                            .get(self.selected_font_idx)
+                            .map(|font| self.font_display_label(font))
+                    })
+                    .unwrap_or_else(|| "<шрифт>".to_string())
+            };
             let mut font_idx = inline_style
                 .as_ref()
                 .and_then(|style| {
@@ -3402,7 +3808,7 @@ impl TypingCreatePanelState {
                         let (label, path, face_index) = {
                             let font = &self.fonts[idx];
                             (
-                                font.label.clone(),
+                                self.font_display_label(font),
                                 font.path.clone(),
                                 font.faces.first().map(|face| face.face_index).unwrap_or(0),
                             )
@@ -3433,6 +3839,9 @@ impl TypingCreatePanelState {
             } else {
                 self.selected_font_idx = font_idx;
                 if self.selected_font_idx != prev_font_idx {
+                    // Любой выбор из списка — это доступный шрифт, поэтому снимаем
+                    // блокировку рендера по ненайденному шрифту.
+                    self.missing_font = None;
                     if font_memory_enabled {
                         changed |= self.handle_create_font_selection_change(prev_font_idx);
                     } else {
@@ -3440,6 +3849,13 @@ impl TypingCreatePanelState {
                         changed = true;
                     }
                 }
+            }
+
+            if font_missing {
+                ui.colored_label(
+                    Color32::from_rgb(240, 200, 60),
+                    "Выберите другой доступный шрифт, иначе рендер заблокирован",
+                );
             }
 
             ui.add_enabled_ui(!selection_mode, |ui| {
@@ -3512,36 +3928,12 @@ impl TypingCreatePanelState {
                 }
             }
 
-            if stacked_columns {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(columns_w, 0.0),
-                    egui::Layout::top_down(Align::Min),
-                    |ui| {
-                        self.draw_main_text_left_column(
-                            ui,
-                            &mut changed,
-                            &mut block_hscroll_by_hovered_param,
-                            inline_style.as_mut(),
-                        )
-                    },
-                );
-                ui.add_space(6.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(columns_w, 0.0),
-                    egui::Layout::top_down(Align::Min),
-                    |ui| {
-                        self.draw_main_text_right_column(
-                            ui,
-                            &mut changed,
-                            &mut block_hscroll_by_hovered_param,
-                            inline_style.as_mut(),
-                        )
-                    },
-                );
-            } else {
-                ui.horizontal_top(|ui| {
+            // Остальные параметры влияют на рендер: при ненайденном шрифте они
+            // блокируются, доступным остаётся только выбор шрифта выше.
+            ui.add_enabled_ui(!font_missing, |ui| {
+                if stacked_columns {
                     ui.allocate_ui_with_layout(
-                        Vec2::new(left_w, 0.0),
+                        Vec2::new(columns_w, 0.0),
                         egui::Layout::top_down(Align::Min),
                         |ui| {
                             self.draw_main_text_left_column(
@@ -3552,9 +3944,9 @@ impl TypingCreatePanelState {
                             )
                         },
                     );
-
+                    ui.add_space(6.0);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(right_w, 0.0),
+                        Vec2::new(columns_w, 0.0),
                         egui::Layout::top_down(Align::Min),
                         |ui| {
                             self.draw_main_text_right_column(
@@ -3565,8 +3957,36 @@ impl TypingCreatePanelState {
                             )
                         },
                     );
-                });
-            }
+                } else {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(left_w, 0.0),
+                            egui::Layout::top_down(Align::Min),
+                            |ui| {
+                                self.draw_main_text_left_column(
+                                    ui,
+                                    &mut changed,
+                                    &mut block_hscroll_by_hovered_param,
+                                    inline_style.as_mut(),
+                                )
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(right_w, 0.0),
+                            egui::Layout::top_down(Align::Min),
+                            |ui| {
+                                self.draw_main_text_right_column(
+                                    ui,
+                                    &mut changed,
+                                    &mut block_hscroll_by_hovered_param,
+                                    inline_style.as_mut(),
+                                )
+                            },
+                        );
+                    });
+                }
+            });
 
             // Extra bottom padding so the horizontal scrollbar doesn't overlap the last checkbox text.
             ui.add_space(ui.spacing().scroll.allocated_width() + 4.0);
@@ -3590,45 +4010,46 @@ impl TypingCreatePanelState {
         block_hscroll_by_hovered_param: &mut bool,
         inline_style: Option<&mut TypingInlineTagStyle>,
     ) {
+        let inline_font_size_px = inline_style
+            .as_ref()
+            .and_then(|style| style.font_size_px)
+            .unwrap_or(self.font_size_px)
+            .max(1.0);
         ui.add_enabled_ui(inline_style.is_some(), |ui| {
             let mut offset = inline_style
                 .as_ref()
                 .and_then(|style| style.glyph_offset)
                 .unwrap_or_else(|| TypingInlineOffsetStyle::global_only([0.0, 0.0]));
-            let offset_x_resp = ui.add(
-                WheelSlider::new(&mut offset.global_px[0], -100.0..=100.0)
-                    .text("Смещение X")
-                    .wheel_step(1.0),
+            px_or_percent_param_row(
+                ui,
+                "Смещение X",
+                &mut offset.global_x,
+                -100.0..=100.0,
+                1.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &offset_x_resp);
-            *changed |= offset_x_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &offset_x_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut offset.global_px[0], steps, 1.0, -100.0, 100.0);
-            }
-
-            let offset_y_resp = ui.add(
-                WheelSlider::new(&mut offset.global_px[1], -100.0..=100.0)
-                    .text("Смещение Y")
-                    .wheel_step(1.0),
+            px_or_percent_param_row(
+                ui,
+                "Смещение Y",
+                &mut offset.global_y,
+                -100.0..=100.0,
+                1.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &offset_y_resp);
-            *changed |= offset_y_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &offset_y_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut offset.global_px[1], steps, 1.0, -100.0, 100.0);
-            }
-
-            let line_resp = ui.add(
-                WheelSlider::new(&mut offset.line_px, -300.0..=300.0)
-                    .text("Смещение по линии")
-                    .wheel_step(1.0),
+            px_or_percent_param_row(
+                ui,
+                "Смещение по линии",
+                &mut offset.line,
+                -300.0..=300.0,
+                1.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &line_resp);
-            *changed |= line_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &line_resp) {
-                *changed |= apply_wheel_step_f32(&mut offset.line_px, steps, 1.0, -300.0, 300.0);
-            }
 
             *changed |= ui
                 .checkbox(&mut offset.shift_following, "Сдвигать следующие символы")
@@ -3718,28 +4139,20 @@ impl TypingCreatePanelState {
             *changed |= font_size_resp.changed();
         }
 
+        let base_font_size_px = self.font_size_px.max(1.0);
         if let Some(style) = inline_style.as_mut() {
-            let mut line_spacing = style
-                .line_spacing
-                .unwrap_or([self.line_spacing_px, self.line_spacing_percent]);
-            let line_spacing_px_resp = ui.add(
-                WheelSlider::new(&mut line_spacing[0], -300.0..=300.0)
-                    .text("Межстрочный отступ (px)"),
+            let inline_font_size_px = style.font_size_px.unwrap_or(base_font_size_px).max(1.0);
+            let mut line_spacing = style.line_spacing.unwrap_or(self.line_spacing);
+            px_or_percent_param_row(
+                ui,
+                "Межстрочный отступ",
+                &mut line_spacing,
+                -300.0..=300.0,
+                2.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &line_spacing_px_resp);
-            *changed |= line_spacing_px_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_px_resp) {
-                *changed |= apply_wheel_step_f32(&mut line_spacing[0], steps, 2.0, -300.0, 300.0);
-            }
-            let line_spacing_percent_resp = ui.add(
-                WheelSlider::new(&mut line_spacing[1], -300.0..=300.0)
-                    .text("Межстрочный отступ (%)"),
-            );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &line_spacing_percent_resp);
-            *changed |= line_spacing_percent_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_percent_resp) {
-                *changed |= apply_wheel_step_f32(&mut line_spacing[1], steps, 10.0, -300.0, 300.0);
-            }
             style.line_spacing = Some(line_spacing);
 
             ui.horizontal(|ui| {
@@ -3755,70 +4168,54 @@ impl TypingCreatePanelState {
                         .selected(self.kerning_mode == KerningMode::Optical),
                 );
             });
-            let mut kerning = style
-                .kerning
-                .unwrap_or([self.kerning_px, self.kerning_percent]);
-            let kerning_px_resp =
-                ui.add(WheelSlider::new(&mut kerning[0], -300.0..=300.0).text("Кернинг (px)"));
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &kerning_px_resp);
-            *changed |= kerning_px_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_px_resp) {
-                *changed |= apply_wheel_step_f32(&mut kerning[0], steps, 2.0, -300.0, 300.0);
-            }
-            let kerning_percent_resp =
-                ui.add(WheelSlider::new(&mut kerning[1], -300.0..=300.0).text("Кернинг (%)"));
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &kerning_percent_resp);
-            *changed |= kerning_percent_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_percent_resp) {
-                *changed |= apply_wheel_step_f32(&mut kerning[1], steps, 10.0, -300.0, 300.0);
-            }
+            let mut kerning = style.kerning.unwrap_or(self.kerning);
+            px_or_percent_param_row(
+                ui,
+                "Кернинг",
+                &mut kerning,
+                -300.0..=300.0,
+                2.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
+            );
             style.kerning = Some(kerning);
 
             let mut stretching = style
                 .glyph_stretching
-                .unwrap_or([self.glyph_width_percent, self.glyph_height_percent]);
-            let glyph_height_resp = ui
-                .add(WheelSlider::new(&mut stretching[1], 1.0..=300.0).text("Высота символа (%)"));
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &glyph_height_resp);
-            *changed |= glyph_height_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_height_resp) {
-                *changed |= apply_wheel_step_f32(&mut stretching[1], steps, 5.0, 1.0, 300.0);
-            }
-            let glyph_width_resp = ui
-                .add(WheelSlider::new(&mut stretching[0], 1.0..=300.0).text("Ширина символа (%)"));
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &glyph_width_resp);
-            *changed |= glyph_width_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_width_resp) {
-                *changed |= apply_wheel_step_f32(&mut stretching[0], steps, 5.0, 1.0, 300.0);
-            }
+                .unwrap_or([self.glyph_width, self.glyph_height]);
+            px_or_percent_param_row(
+                ui,
+                "Высота символа",
+                &mut stretching[1],
+                1.0..=300.0,
+                5.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
+            );
+            px_or_percent_param_row(
+                ui,
+                "Ширина символа",
+                &mut stretching[0],
+                1.0..=300.0,
+                5.0,
+                inline_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
+            );
             style.glyph_stretching = Some(stretching);
         } else {
-            let line_spacing_px_resp = ui.add(
-                WheelSlider::new(&mut self.line_spacing_px, -300.0..=300.0)
-                    .text("Межстрочный отступ (px)"),
+            px_or_percent_param_row(
+                ui,
+                "Межстрочный отступ",
+                &mut self.line_spacing,
+                -300.0..=300.0,
+                2.0,
+                base_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &line_spacing_px_resp);
-            *changed |= line_spacing_px_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_px_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut self.line_spacing_px, steps, 2.0, -300.0, 300.0);
-            }
-
-            let line_spacing_percent_resp = ui.add(
-                WheelSlider::new(&mut self.line_spacing_percent, -300.0..=300.0)
-                    .text("Межстрочный отступ (%)"),
-            );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &line_spacing_percent_resp);
-            *changed |= line_spacing_percent_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_percent_resp) {
-                *changed |= apply_wheel_step_f32(
-                    &mut self.line_spacing_percent,
-                    steps,
-                    10.0,
-                    -300.0,
-                    300.0,
-                );
-            }
 
             ui.horizontal(|ui| {
                 ui.label("Кернинг");
@@ -3830,45 +4227,38 @@ impl TypingCreatePanelState {
                     .changed();
             });
 
-            let kerning_px_resp =
-                ui.add(WheelSlider::new(&mut self.kerning_px, -300.0..=300.0).text("Кернинг (px)"));
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &kerning_px_resp);
-            *changed |= kerning_px_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_px_resp) {
-                *changed |= apply_wheel_step_f32(&mut self.kerning_px, steps, 2.0, -300.0, 300.0);
-            }
-
-            let kerning_percent_resp = ui.add(
-                WheelSlider::new(&mut self.kerning_percent, -300.0..=300.0).text("Кернинг (%)"),
+            px_or_percent_param_row(
+                ui,
+                "Кернинг",
+                &mut self.kerning,
+                -300.0..=300.0,
+                2.0,
+                base_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &kerning_percent_resp);
-            *changed |= kerning_percent_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_percent_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut self.kerning_percent, steps, 10.0, -300.0, 300.0);
-            }
 
-            let glyph_height_resp = ui.add(
-                WheelSlider::new(&mut self.glyph_height_percent, 1.0..=300.0)
-                    .text("Высота символа (%)"),
+            px_or_percent_param_row(
+                ui,
+                "Высота символа",
+                &mut self.glyph_height,
+                1.0..=300.0,
+                5.0,
+                base_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &glyph_height_resp);
-            *changed |= glyph_height_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_height_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut self.glyph_height_percent, steps, 5.0, 1.0, 300.0);
-            }
 
-            let glyph_width_resp = ui.add(
-                WheelSlider::new(&mut self.glyph_width_percent, 1.0..=300.0)
-                    .text("Ширина символа (%)"),
+            px_or_percent_param_row(
+                ui,
+                "Ширина символа",
+                &mut self.glyph_width,
+                1.0..=300.0,
+                5.0,
+                base_font_size_px,
+                changed,
+                block_hscroll_by_hovered_param,
             );
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &glyph_width_resp);
-            *changed |= glyph_width_resp.changed();
-            if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_width_resp) {
-                *changed |=
-                    apply_wheel_step_f32(&mut self.glyph_width_percent, steps, 5.0, 1.0, 300.0);
-            }
         }
 
         if selection_mode {
@@ -3881,6 +4271,59 @@ impl TypingCreatePanelState {
         }
     }
 
+    /// Управление выравниванием на ОДНОЙ строке: слайдер лево↔право (`-100..100`),
+    /// быстрые кнопки (⬅ влево / ⬇ по центру / ➡ вправо) и зажимаемая кнопка-тоггл
+    /// ⬌ (justify, «Растягивать по ширине блока»). Слайдер и стрелки отключаются при
+    /// включённом justify; кнопка ⬌ остаётся активной, чтобы его можно было выключить.
+    fn draw_alignment_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        changed: &mut bool,
+        block_hscroll_by_hovered_param: &mut bool,
+    ) {
+        let free_align = self.align.justify;
+        ui.horizontal(|ui| {
+            // Слайдер + стрелки отключаются при включённом justify.
+            ui.add_enabled_ui(!free_align, |ui| {
+                let mut bias_percent = (self.align.bias.clamp(-1.0, 1.0) * 100.0).round() as i32;
+                let slider_resp = ui.add(
+                    WheelSlider::new(&mut bias_percent, -100..=100)
+                        .text("Выравнивание")
+                        .wheel_step(5),
+                );
+                mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &slider_resp);
+                if slider_resp.changed() {
+                    self.align.bias = bias_percent as f32 / 100.0;
+                    *changed = true;
+                }
+
+                if ui.button("⬅").on_hover_text("По левому краю").clicked() {
+                    self.align.bias = -1.0;
+                    *changed = true;
+                }
+                if ui.button("⬇").on_hover_text("По центру").clicked() {
+                    self.align.bias = 0.0;
+                    *changed = true;
+                }
+                if ui.button("➡").on_hover_text("По правому краю").clicked() {
+                    self.align.bias = 1.0;
+                    *changed = true;
+                }
+            });
+
+            // Зажимаемая кнопка-тоггл justify — остаётся активной даже при включённом
+            // justify, чтобы его можно было снять.
+            if ui
+                .add(egui::Button::new("⬌").selected(self.align.justify))
+                .on_hover_text("Растягивать строки по ширине блока")
+                .clicked()
+            {
+                self.align.justify = !self.align.justify;
+                *changed = true;
+            }
+        });
+    }
+
     fn draw_main_text_right_column(
         &mut self,
         ui: &mut egui::Ui,
@@ -3890,30 +4333,7 @@ impl TypingCreatePanelState {
     ) {
         let selection_mode = inline_style.is_some();
         ui.add_enabled_ui(!selection_mode, |ui| {
-            let prev_align = self.align;
-            let align_combo = WheelComboBox::from_label("Выравнивание")
-                .selected_text(match self.align {
-                    HorizontalAlign::Left => "Слева",
-                    HorizontalAlign::Center => "По центру",
-                    HorizontalAlign::Right => "Справа",
-                    HorizontalAlign::Justify => "Свободно",
-                })
-                .show_ui_with_wheel(ui, |ui| {
-                    ui.selectable_value(&mut self.align, HorizontalAlign::Left, "Слева");
-                    ui.selectable_value(&mut self.align, HorizontalAlign::Center, "По центру");
-                    ui.selectable_value(&mut self.align, HorizontalAlign::Right, "Справа");
-                    ui.selectable_value(&mut self.align, HorizontalAlign::Justify, "Свободно");
-                });
-            mark_hscroll_block_on_hover(
-                block_hscroll_by_hovered_param,
-                &align_combo.inner.response,
-            );
-            if let Some(steps) = align_combo.wheel_steps {
-                *changed |= cycle_horizontal_align(&mut self.align, steps);
-            }
-            if self.align != prev_align {
-                *changed = true;
-            }
+            self.draw_alignment_controls(ui, changed, block_hscroll_by_hovered_param);
 
             let prev_shape = self.text_shape;
             let shape_combo = WheelComboBox::from_label("Форма")
@@ -4769,43 +5189,590 @@ impl TypingCreatePanelState {
         });
     }
 
+    /// Конкурирующий аккордеон «Изначальный текст» / «Сформированный текст»:
+    /// развёрнут ровно один. Без сформированного текста развёрнут исходный.
+    /// Возвращает `true`, если что-то изменилось.
+    fn draw_text_accordion(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_suffix: &str,
+        block_hscroll: &mut bool,
+    ) -> bool {
+        let mut changed = false;
+        // Без сформированного текста всегда развёрнут исходный.
+        if self.formed_text.trim().is_empty() {
+            self.advanced_text_show_formed = false;
+        }
+        let show_formed = self.advanced_text_show_formed;
+
+        // Заголовок «Изначальный текст»: ▼ если развёрнут, ◀ если свёрнут.
+        let source_arrow = if show_formed { "◀" } else { "▼" };
+        if ui
+            .selectable_label(!show_formed, format!("Изначальный текст {source_arrow}"))
+            .clicked()
+            && show_formed
+        {
+            // Переключение пана: старое выделение относилось к другому буферу.
+            self.clear_inline_text_selection();
+            self.advanced_text_show_formed = false;
+        }
+        if !show_formed {
+            self.inline_text_target = InlineTextTarget::Source;
+            let text_colors = build_inline_tag_editor_text_colors(&self.text);
+            let text_output = TextEditPlus::multiline(&mut self.text)
+                .id_salt(format!("typing_edit_text_source_{id_suffix}"))
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(ui.available_width(), EDIT_TEXT_FIELD_HEIGHT_PX))
+                .text_colors(text_colors)
+                .show(ui);
+            self.paint_persistent_text_selection_if_needed(ui, &text_output);
+            self.track_text_input(&text_output.response);
+            self.sync_text_selection_from_text_edit(
+                ui.ctx(),
+                text_output.response.id,
+                &text_output.response,
+                text_output.cursor_range,
+            );
+            mark_hscroll_block_on_hover(block_hscroll, &text_output.response);
+            changed |= text_output.response.changed();
+        }
+
+        // Сформированный текст раскрывается НАД своим заголовком (поэтому ▲).
+        if show_formed {
+            self.inline_text_target = InlineTextTarget::Formed;
+            let text_colors = build_inline_tag_editor_text_colors(&self.formed_text);
+            let formed_output = TextEditPlus::multiline(&mut self.formed_text)
+                .id_salt(format!("typing_edit_text_formed_{id_suffix}"))
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(ui.available_width(), EDIT_TEXT_FIELD_HEIGHT_PX))
+                .text_colors(text_colors)
+                .show(ui);
+            self.paint_persistent_text_selection_if_needed(ui, &formed_output);
+            self.track_text_input(&formed_output.response);
+            self.sync_text_selection_from_text_edit(
+                ui.ctx(),
+                formed_output.response.id,
+                &formed_output.response,
+                formed_output.cursor_range,
+            );
+            mark_hscroll_block_on_hover(block_hscroll, &formed_output.response);
+            changed |= formed_output.response.changed();
+        }
+
+        // Заголовок «Сформированный текст»: ▲ если развёрнут (поле над ним), ◀ если свёрнут.
+        let formed_arrow = if show_formed { "▲" } else { "◀" };
+        if ui
+            .selectable_label(show_formed, format!("Сформированный текст {formed_arrow}"))
+            .clicked()
+            && !show_formed
+            && !self.formed_text.trim().is_empty()
+        {
+            // Переключение пана: старое выделение относилось к другому буферу.
+            self.clear_inline_text_selection();
+            self.advanced_text_show_formed = true;
+        }
+
+        ui.add_space(6.0);
+        changed |= self.draw_advanced_form_buttons(ui);
+        changed
+    }
+
+    /// Кнопки «Продвинутая форма текста» и «Вернуть исходный» под полем текста.
+    fn draw_advanced_form_buttons(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Продвинутая форма текста").clicked() {
+                self.advanced_form_open = true;
+                self.advanced_form_cache = None;
+                self.advanced_form_centered = false;
+            }
+            // «Вернуть исходный» просто очищает сформированный текст и
+            // разворачивает исходный.
+            let has_formed = !self.formed_text.is_empty();
+            let revert = ui.add_enabled(has_formed, egui::Button::new("Вернуть исходный"));
+            if revert.clicked() {
+                self.formed_text.clear();
+                self.advanced_text_show_formed = false;
+                self.queue_preview_render();
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// Шрифт для отображения форм (тот же, что выбран в панели), или дефолтный.
+    fn advanced_form_preview_font(&mut self, ctx: &egui::Context) -> egui::FontId {
+        const PREVIEW_FONT_SIZE_PX: f32 = 22.0;
+        if let Some(font) = self.fonts.get(self.selected_font_idx) {
+            let face_index = font
+                .faces
+                .get(self.selected_face_idx)
+                .map_or(0, |face| face.face_index);
+            let path = font.path.clone();
+            if let Some(family) = self.ensure_combo_font_family(ctx, &path, face_index) {
+                return egui::FontId::new(PREVIEW_FONT_SIZE_PX, family);
+            }
+        }
+        egui::FontId::new(PREVIEW_FONT_SIZE_PX, egui::FontFamily::Proportional)
+    }
+
+    /// Текст, по которому перебираются формы — всегда исходный (`text`).
+    fn advanced_form_source_text(&self) -> String {
+        self.text.clone()
+    }
+
+    /// От чего зависят пиксельные ширины глифов в окне форм.
+    fn advanced_form_metric_signature(&self) -> AdvancedFormMetricSignature {
+        let font = self.fonts.get(self.selected_font_idx);
+        AdvancedFormMetricSignature {
+            font_path: font.map(|font| font.path.to_string_lossy().to_string()),
+            face_index: font
+                .and_then(|font| font.faces.get(self.selected_face_idx))
+                .map_or(0, |face| face.face_index),
+            force_bold: self.force_bold,
+            force_italic: self.force_italic,
+            hanging_punctuation: self.hanging_punctuation,
+        }
+    }
+
+    /// Строит попиксельную метрику ширины (`GlyphWidths`) выбранным шрифтом для
+    /// символов `source_text`. `None`, если шрифт не выбран/не читается — тогда
+    /// падаем на посимвольную метрику.
+    fn build_advanced_form_glyph_widths(&self, source_text: &str) -> Option<forms::GlyphWidths> {
+        // Единицы на em для замеров (должно совпадать с метрикой внутри forms).
+        const METRIC_EM: f32 = 1000.0;
+        let font = self.fonts.get(self.selected_font_idx)?;
+        let face_index = font
+            .faces
+            .get(self.selected_face_idx)
+            .map_or(0, |face| face.face_index);
+        let path = font.path.clone();
+        // Лёгкая система шрифтов: пустая БД + только нужный файл (без системных шрифтов).
+        let mut font_system =
+            FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new());
+        let selected_face = load_selected_font_from_path(&mut font_system, &path, face_index).ok()?;
+        let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
+        attrs = selected_face.apply_to_attrs(attrs);
+        if self.force_bold {
+            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        }
+        if self.force_italic {
+            attrs = attrs.style(cosmic_text::Style::Italic);
+        }
+        Some(forms::GlyphWidths::build(
+            &mut font_system,
+            &attrs,
+            source_text,
+            self.hanging_punctuation,
+            forms::DEFAULT_WIDTH_TOLERANCE,
+        ))
+    }
+
+    fn rebuild_advanced_form_cache_if_needed(&mut self) {
+        let source_text = self.advanced_form_source_text();
+        let signature = self.advanced_form_metric_signature();
+        let stale = match &self.advanced_form_cache {
+            Some(cache) => {
+                cache.source_text != source_text
+                    || cache.preset != self.advanced_form_preset
+                    || cache.metric_signature != signature
+            }
+            None => true,
+        };
+        if !stale {
+            return;
+        }
+        // Попиксельная метрика выбранным шрифтом; при отсутствии шрифта —
+        // посимвольная (с учётом висящей пунктуации).
+        let glyph_widths = self.build_advanced_form_glyph_widths(&source_text);
+        let char_metric = forms::CharWidthMetric::new(self.hanging_punctuation);
+        let metric: &dyn forms::LineWidthMetric = match &glyph_widths {
+            Some(glyph_widths) => glyph_widths,
+            None => &char_metric,
+        };
+        // Храним ВСЕ удачные формы (перебор ограничен лишь бюджетом узлов
+        // рекурсии). Фильтры применяются ко всему набору; ограничение на 600 —
+        // только в отрисовке (`ADVANCED_FORM_DISPLAY_LIMIT`).
+        let enumeration = forms::enumerate_forms(
+            &source_text,
+            self.advanced_form_preset,
+            usize::MAX,
+            metric,
+        );
+        let mut forms = enumeration.forms;
+        sort_advanced_forms(&mut forms);
+        let mut group_counts: Vec<usize> =
+            forms.iter().map(|form| form.word_break_count).collect();
+        group_counts.sort_unstable();
+        group_counts.dedup();
+        // Сбрасываем выбор группы, если такого числа переносов больше нет.
+        if let Some(selected) = self.advanced_form_group
+            && !group_counts.contains(&selected)
+        {
+            self.advanced_form_group = None;
+        }
+        let line_bounds = inclusive_bounds(forms.iter().map(|form| form.line_count()));
+        let width_bounds = inclusive_bounds(forms.iter().map(|form| form.max_width));
+        let peak_max_bound_min = forms
+            .iter()
+            .map(|form| form.peakiness_pct(PeakBase::Min))
+            .max()
+            .unwrap_or(0);
+        let peak_max_bound_median = forms
+            .iter()
+            .map(|form| form.peakiness_pct(PeakBase::Median))
+            .max()
+            .unwrap_or(0);
+        let uneven_max_bound = forms.iter().map(|form| form.unevenness_pct).max().unwrap_or(0);
+        let conservatism_bound = forms
+            .iter()
+            .map(|form| form.conservatism)
+            .max()
+            .unwrap_or(Conservatism::Safe);
+        // Диапазоны фильтров заново раскрываются на всю ширину данных; пороги
+        // пиковости и неравномерности — на максимум (показываем всё).
+        self.advanced_form_line_range = line_bounds;
+        self.advanced_form_width_range = width_bounds;
+        self.advanced_form_peak_max = match self.advanced_form_peak_base {
+            PeakBase::Min => peak_max_bound_min,
+            PeakBase::Median => peak_max_bound_median,
+        };
+        self.advanced_form_uneven_max = uneven_max_bound;
+        // Консервативность по умолчанию строгая (`Safe`): показываем только формы
+        // без отрыва служебных слов, как раньше. Пользователь ослабляет вручную.
+        self.advanced_form_conservatism_max = Conservatism::Safe;
+        self.advanced_form_cache = Some(AdvancedFormCache {
+            source_text,
+            preset: self.advanced_form_preset,
+            forms,
+            group_counts,
+            line_bounds,
+            width_bounds,
+            metric_signature: signature,
+            peak_max_bound_min,
+            peak_max_bound_median,
+            uneven_max_bound,
+            conservatism_bound,
+            truncated: enumeration.truncated,
+        });
+    }
+
+    /// Применяет выбранную форму: записывает её как сформированный текст (исходный
+    /// `text` не трогаем) и разворачивает сформированный пан.
+    fn apply_advanced_form(&mut self, form: &TextForm) {
+        self.formed_text = form.to_text();
+        self.advanced_text_show_formed = true;
+        self.queue_preview_render();
+    }
+
+    /// Плавающее окно перебора форм текста.
+    fn draw_advanced_form_window(&mut self, ctx: &egui::Context) -> bool {
+        if !self.advanced_form_open {
+            return false;
+        }
+        self.rebuild_advanced_form_cache_if_needed();
+        let font_id = self.advanced_form_preview_font(ctx);
+        let current_preset = self.advanced_form_preset;
+        let current_group = self.advanced_form_group;
+        let cache = self.advanced_form_cache.take();
+
+        // Окно центрируется по вьюпорту по итоговому размеру. На первых кадрах
+        // (пока размер ещё не измерен) окно скрыто, чтобы не дёргалось.
+        let centering = !self.advanced_form_centered;
+        let viewport = ctx.content_rect();
+        let screen_center = viewport.center();
+        let default_size = egui::vec2(viewport.width() * 0.8, viewport.height() * 0.8);
+
+        let mut line_range = self.advanced_form_line_range;
+        let mut width_range = self.advanced_form_width_range;
+        let mut peak_max = self.advanced_form_peak_max;
+        let mut peak_base = self.advanced_form_peak_base;
+        let mut uneven_max = self.advanced_form_uneven_max;
+        let mut conservatism_max = self.advanced_form_conservatism_max;
+
+        let mut open = true;
+        let mut new_preset = current_preset;
+        let mut new_group = current_group;
+        let mut clicked: Option<usize> = None;
+
+        let mut window = egui::Window::new("Продвинутая форма текста")
+            .open(&mut open)
+            .resizable(true)
+            // Над панелями параметров/действий (они на `Order::Foreground`).
+            .order(egui::Order::Tooltip)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_size(default_size);
+        if centering {
+            window = window.current_pos(screen_center);
+        }
+
+        let inner = window.show(ctx, |ui| {
+            if centering {
+                // Прячем содержимое, пока окно не встанет по центру.
+                ui.set_opacity(0.0);
+            }
+            ui.small(
+                "Перебор вариантов переноса. Это не финальный рендер — \
+                 просто чёрный текст на белом с висящей пунктуацией.",
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Форма:");
+                for preset in TextFormPreset::all() {
+                    if ui
+                        .selectable_label(preset == current_preset, preset.label())
+                        .clicked()
+                    {
+                        new_preset = preset;
+                    }
+                }
+            });
+            ui.separator();
+            match cache.as_ref() {
+                Some(cache) if !cache.forms.is_empty() => {
+                    if cache.group_counts.len() > 1 {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Переносов слов:");
+                            if ui
+                                .selectable_label(current_group.is_none(), "Все")
+                                .clicked()
+                            {
+                                new_group = None;
+                            }
+                            for &count in &cache.group_counts {
+                                if ui
+                                    .selectable_label(
+                                        current_group == Some(count),
+                                        count.to_string(),
+                                    )
+                                    .clicked()
+                                {
+                                    new_group = Some(count);
+                                }
+                            }
+                        });
+                    }
+                    // Диапазонные фильтры: число строк и ширина строки.
+                    let has_line = advanced_form_range_row(
+                        ui,
+                        "Строк:",
+                        "",
+                        &mut line_range,
+                        cache.line_bounds,
+                    );
+                    let has_width = advanced_form_range_row(
+                        ui,
+                        "Ширина (усл.):",
+                        "",
+                        &mut width_range,
+                        cache.width_bounds,
+                    );
+                    // Порог пиковости: насколько % самая длинная строка длиннее
+                    // базовой (минимальной/медианной). Один верхний предел.
+                    let peak_bound = match peak_base {
+                        PeakBase::Min => cache.peak_max_bound_min,
+                        PeakBase::Median => cache.peak_max_bound_median,
+                    };
+                    let has_peak = peak_bound > 0;
+                    if has_peak {
+                        ui.add(
+                            WheelSlider::new(&mut peak_max, 0..=peak_bound)
+                                .text("Длиннее базы не более чем на")
+                                .suffix("%"),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("База пиковости:");
+                            if ui
+                                .selectable_label(peak_base == PeakBase::Min, "минимум")
+                                .clicked()
+                            {
+                                peak_base = PeakBase::Min;
+                            }
+                            if ui
+                                .selectable_label(peak_base == PeakBase::Median, "медиана")
+                                .clicked()
+                            {
+                                peak_base = PeakBase::Median;
+                            }
+                        });
+                    }
+                    // Порог неравномерности: средний разброс ширин строк от
+                    // медианы. Меньше — ровнее форма.
+                    let uneven_bound = cache.uneven_max_bound;
+                    let has_uneven = uneven_bound > 0;
+                    if has_uneven {
+                        ui.add(
+                            WheelSlider::new(&mut uneven_max, 0..=uneven_bound)
+                                .text("Неравномерность не более")
+                                .suffix("%"),
+                        );
+                    }
+                    // Порог консервативности: какие отрывы служебных слов допускать.
+                    // `Safe` («нет») — только безопасные переносы; каждая следующая
+                    // категория добавляет более рискованные отрывы.
+                    let has_conservatism = cache.conservatism_bound > Conservatism::Safe;
+                    if has_conservatism {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Отрыв служебных слов:");
+                            for level in Conservatism::all() {
+                                if level > cache.conservatism_bound {
+                                    break;
+                                }
+                                let text = if level == Conservatism::Safe {
+                                    "нет".to_string()
+                                } else {
+                                    format!("+ {}", level.label())
+                                };
+                                if ui
+                                    .selectable_label(conservatism_max == level, text)
+                                    .clicked()
+                                {
+                                    conservatism_max = level;
+                                }
+                            }
+                        });
+                    }
+                    if (has_line || has_width || has_peak || has_uneven || has_conservatism)
+                        && ui.small_button("Сбросить фильтры").clicked()
+                    {
+                        line_range = cache.line_bounds;
+                        width_range = cache.width_bounds;
+                        peak_max = peak_bound;
+                        uneven_max = uneven_bound;
+                        conservatism_max = Conservatism::Safe;
+                        new_group = None;
+                    }
+
+                    let passes = |form: &TextForm| {
+                        new_group.is_none_or(|c| form.word_break_count == c)
+                            && (line_range.0..=line_range.1).contains(&form.line_count())
+                            && (width_range.0..=width_range.1).contains(&form.max_width)
+                            && form.peakiness_pct(peak_base) <= peak_max
+                            && form.unevenness_pct <= uneven_max
+                            && form.conservatism <= conservatism_max
+                    };
+
+                    let visible = cache.forms.iter().filter(|form| passes(form)).count();
+                    let shown = visible.min(ADVANCED_FORM_DISPLAY_LIMIT);
+                    let mut status = if shown < visible {
+                        format!("Вариантов: {visible}, показаны первые {shown}.")
+                    } else {
+                        format!("Вариантов: {visible}.")
+                    };
+                    if cache.truncated {
+                        status.push_str(" Перебор форм неполный (достигнут предел).");
+                    }
+                    ui.small(status);
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                let mut drawn = 0usize;
+                                for (idx, form) in cache.forms.iter().enumerate() {
+                                    if !passes(form) {
+                                        continue;
+                                    }
+                                    if drawn >= ADVANCED_FORM_DISPLAY_LIMIT {
+                                        break;
+                                    }
+                                    drawn += 1;
+                                    if draw_advanced_form_card(ui, &font_id, &form.lines)
+                                        .clicked()
+                                    {
+                                        clicked = Some(idx);
+                                    }
+                                }
+                            });
+                        });
+                }
+                Some(_) => {
+                    ui.label("Нет вариантов, удовлетворяющих этой форме.");
+                }
+                None => {
+                    ui.label("Введите текст, чтобы подобрать формы.");
+                }
+            }
+        });
+
+        // Как только окно отрисовалось и знает свой размер — на следующем кадре
+        // оно уже стоит по центру; делаем его видимым.
+        if centering {
+            if inner.is_some_and(|inner| {
+                inner.response.rect.width() > 1.0 && inner.response.rect.height() > 1.0
+            }) {
+                self.advanced_form_centered = true;
+            }
+            ctx.request_repaint();
+        }
+
+        self.advanced_form_line_range = line_range;
+        self.advanced_form_width_range = width_range;
+        // Смена базы делает старый порог несопоставимым — раскрываем его на
+        // максимум для новой базы.
+        if peak_base != self.advanced_form_peak_base {
+            self.advanced_form_peak_base = peak_base;
+            if let Some(cache) = cache.as_ref() {
+                peak_max = match peak_base {
+                    PeakBase::Min => cache.peak_max_bound_min,
+                    PeakBase::Median => cache.peak_max_bound_median,
+                };
+            }
+        }
+        self.advanced_form_peak_max = peak_max;
+        self.advanced_form_uneven_max = uneven_max;
+        self.advanced_form_conservatism_max = conservatism_max;
+
+        let mut changed = false;
+        if let Some(idx) = clicked
+            && let Some(cache) = cache.as_ref()
+            && let Some(form) = cache.forms.get(idx)
+        {
+            self.apply_advanced_form(form);
+            // После выбора формы окно закрывается.
+            open = false;
+            changed = true;
+        }
+        self.advanced_form_cache = cache;
+        if new_preset != self.advanced_form_preset {
+            self.advanced_form_preset = new_preset;
+            self.advanced_form_cache = None;
+        }
+        self.advanced_form_group = new_group;
+        self.advanced_form_open = open;
+        changed
+    }
+
     fn draw_edit_params_section(
         &mut self,
         ui: &mut egui::Ui,
         stacked_columns: bool,
         remap_wheel_to_horizontal: bool,
     ) -> bool {
-        let mut changed = false;
+        let mut changed = self.draw_advanced_form_window(ui.ctx());
         let mut block_hscroll_by_hovered_param = false;
 
         if stacked_columns {
+            let font_missing = self.missing_font.is_some();
             ui.vertical(|ui| {
-                ui.label("Текст");
-                let text_colors = build_inline_tag_editor_text_colors(&self.text);
-                let text_output = TextEditPlus::multiline(&mut self.text)
-                    .id_salt("typing_edit_text_multiline_stacked")
-                    .desired_width(f32::INFINITY)
-                    .min_size(egui::vec2(ui.available_width(), EDIT_TEXT_FIELD_HEIGHT_PX))
-                    .text_colors(text_colors)
-                    .show(ui);
-                self.paint_persistent_text_selection_if_needed(ui, &text_output);
-                self.track_text_input(&text_output.response);
-                self.sync_text_selection_from_text_edit(
-                    ui.ctx(),
-                    text_output.response.id,
-                    &text_output.response,
-                    text_output.cursor_range,
-                );
-                mark_hscroll_block_on_hover(
-                    &mut block_hscroll_by_hovered_param,
-                    &text_output.response,
-                );
-                changed |= text_output.response.changed();
-
+                if let Some(missing) = self.missing_font.clone() {
+                    ui.colored_label(
+                        Color32::from_rgb(240, 110, 110),
+                        format!("⚠ Шрифт «{missing}» не найден среди доступных."),
+                    );
+                    ui.add_space(4.0);
+                }
+                ui.add_enabled_ui(!font_missing, |ui| {
+                    changed |= self.draw_text_accordion(
+                        ui,
+                        "stacked",
+                        &mut block_hscroll_by_hovered_param,
+                    );
+                });
                 ui.add_space(6.0);
 
                 let selection_mode = self.inline_selection_context().is_some();
-                ui.add_enabled_ui(!selection_mode, |ui| {
+                ui.add_enabled_ui(!selection_mode && !font_missing, |ui| {
                     let width_resp = ui
                         .add(WheelSlider::new(&mut self.width_px, 16..=4096).text("Ширина (px)"));
                     mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &width_resp);
@@ -4847,7 +5814,13 @@ impl TypingCreatePanelState {
                 });
 
                 ui.separator();
-                changed |= self.draw_main_text_params(ui, true, remap_wheel_to_horizontal, false);
+                changed |= self.draw_main_text_params(
+                    ui,
+                    true,
+                    remap_wheel_to_horizontal,
+                    false,
+                    font_missing,
+                );
                 if selection_mode {
                     ui.add_space(4.0);
                     ui.small(
@@ -4897,27 +5870,11 @@ impl TypingCreatePanelState {
                     Vec2::new(left_w, 0.0),
                     egui::Layout::top_down(Align::Min),
                     |ui| {
-                        ui.label("Текст");
-                        let text_colors = build_inline_tag_editor_text_colors(&self.text);
-                        let text_output = TextEditPlus::multiline(&mut self.text)
-                            .id_salt("typing_edit_text_multiline_columns")
-                            .desired_width(f32::INFINITY)
-                            .min_size(egui::vec2(ui.available_width(), EDIT_TEXT_FIELD_HEIGHT_PX))
-                            .text_colors(text_colors)
-                            .show(ui);
-                        self.paint_persistent_text_selection_if_needed(ui, &text_output);
-                        self.track_text_input(&text_output.response);
-                        self.sync_text_selection_from_text_edit(
-                            ui.ctx(),
-                            text_output.response.id,
-                            &text_output.response,
-                            text_output.cursor_range,
-                        );
-                        mark_hscroll_block_on_hover(
+                        changed |= self.draw_text_accordion(
+                            ui,
+                            "columns",
                             &mut block_hscroll_by_hovered_param,
-                            &text_output.response,
                         );
-                        changed |= text_output.response.changed();
                     },
                 );
 
@@ -5204,34 +6161,25 @@ impl TypingCreatePanelState {
                                                     changed |= font_size_resp.changed();
                                                 }
 
+                                                let base_font_size_px = self.font_size_px.max(1.0);
                                                 if let Some(style) = inline_style.as_mut() {
+                                                    let inline_font_size_px = style
+                                                        .font_size_px
+                                                        .unwrap_or(base_font_size_px)
+                                                        .max(1.0);
                                                     let mut line_spacing = style
                                                         .line_spacing
-                                                        .unwrap_or([self.line_spacing_px, self.line_spacing_percent]);
-                                                    let line_spacing_px_resp = ui.add(
-                                                        WheelSlider::new(&mut line_spacing[0], -300.0..=300.0)
-                                                            .text("Межстрочный отступ (px)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                        .unwrap_or(self.line_spacing);
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Межстрочный отступ",
+                                                        &mut line_spacing,
+                                                        -300.0..=300.0,
+                                                        2.0,
+                                                        inline_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &line_spacing_px_resp,
                                                     );
-                                                    changed |= line_spacing_px_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_px_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut line_spacing[0], steps, 2.0, -300.0, 300.0);
-                                                    }
-                                                    let line_spacing_percent_resp = ui.add(
-                                                        WheelSlider::new(&mut line_spacing[1], -300.0..=300.0)
-                                                            .text("Межстрочный отступ (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
-                                                        &mut block_hscroll_by_hovered_param,
-                                                        &line_spacing_percent_resp,
-                                                    );
-                                                    changed |= line_spacing_percent_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_percent_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut line_spacing[1], steps, 10.0, -300.0, 300.0);
-                                                    }
                                                     style.line_spacing = Some(line_spacing);
 
                                                     ui.horizontal(|ui| {
@@ -5250,60 +6198,42 @@ impl TypingCreatePanelState {
 
                                                     let mut kerning = style
                                                         .kerning
-                                                        .unwrap_or([self.kerning_px, self.kerning_percent]);
-                                                    let kerning_px_resp = ui.add(
-                                                        WheelSlider::new(&mut kerning[0], -300.0..=300.0)
-                                                            .text("Кернинг (px)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                        .unwrap_or(self.kerning);
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Кернинг",
+                                                        &mut kerning,
+                                                        -300.0..=300.0,
+                                                        2.0,
+                                                        inline_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &kerning_px_resp,
                                                     );
-                                                    changed |= kerning_px_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_px_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut kerning[0], steps, 2.0, -300.0, 300.0);
-                                                    }
-                                                    let kerning_percent_resp = ui.add(
-                                                        WheelSlider::new(&mut kerning[1], -300.0..=300.0)
-                                                            .text("Кернинг (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
-                                                        &mut block_hscroll_by_hovered_param,
-                                                        &kerning_percent_resp,
-                                                    );
-                                                    changed |= kerning_percent_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_percent_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut kerning[1], steps, 10.0, -300.0, 300.0);
-                                                    }
                                                     style.kerning = Some(kerning);
 
                                                     let mut stretching = style
                                                         .glyph_stretching
-                                                        .unwrap_or([self.glyph_width_percent, self.glyph_height_percent]);
-                                                    let glyph_height_resp = ui.add(
-                                                        WheelSlider::new(&mut stretching[1], 1.0..=300.0)
-                                                            .text("Высота символа (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                        .unwrap_or([self.glyph_width, self.glyph_height]);
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Высота символа",
+                                                        &mut stretching[1],
+                                                        1.0..=300.0,
+                                                        5.0,
+                                                        inline_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &glyph_height_resp,
                                                     );
-                                                    changed |= glyph_height_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_height_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut stretching[1], steps, 5.0, 1.0, 300.0);
-                                                    }
-                                                    let glyph_width_resp = ui.add(
-                                                        WheelSlider::new(&mut stretching[0], 1.0..=300.0)
-                                                            .text("Ширина символа (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Ширина символа",
+                                                        &mut stretching[0],
+                                                        1.0..=300.0,
+                                                        5.0,
+                                                        inline_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &glyph_width_resp,
                                                     );
-                                                    changed |= glyph_width_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_width_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut stretching[0], steps, 5.0, 1.0, 300.0);
-                                                    }
                                                     style.glyph_stretching = Some(stretching);
                                                     self.draw_inline_offset_controls(
                                                         ui,
@@ -5312,83 +6242,51 @@ impl TypingCreatePanelState {
                                                         Some(style),
                                                     );
                                                 } else {
-                                                    let line_spacing_px_resp = ui.add(
-                                                        WheelSlider::new(&mut self.line_spacing_px, -300.0..=300.0)
-                                                            .text("Межстрочный отступ (px)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Межстрочный отступ",
+                                                        &mut self.line_spacing,
+                                                        -300.0..=300.0,
+                                                        2.0,
+                                                        base_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &line_spacing_px_resp,
                                                     );
-                                                    changed |= line_spacing_px_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_px_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.line_spacing_px, steps, 2.0, -300.0, 300.0);
-                                                    }
-                                                    let line_spacing_percent_resp = ui.add(
-                                                        WheelSlider::new(&mut self.line_spacing_percent, -300.0..=300.0)
-                                                            .text("Межстрочный отступ (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
-                                                        &mut block_hscroll_by_hovered_param,
-                                                        &line_spacing_percent_resp,
-                                                    );
-                                                    changed |= line_spacing_percent_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &line_spacing_percent_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.line_spacing_percent, steps, 10.0, -300.0, 300.0);
-                                                    }
                                                     ui.horizontal(|ui| {
                                                         ui.label("Кернинг");
                                                         changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Metric, "Метрический").changed();
                                                         changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Optical, "Оптический").changed();
                                                     });
-                                                    let kerning_px_resp = ui.add(
-                                                        WheelSlider::new(&mut self.kerning_px, -300.0..=300.0)
-                                                            .text("Кернинг (px)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Кернинг",
+                                                        &mut self.kerning,
+                                                        -300.0..=300.0,
+                                                        2.0,
+                                                        base_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &kerning_px_resp,
                                                     );
-                                                    changed |= kerning_px_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_px_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.kerning_px, steps, 2.0, -300.0, 300.0);
-                                                    }
-                                                    let kerning_percent_resp = ui.add(
-                                                        WheelSlider::new(&mut self.kerning_percent, -300.0..=300.0)
-                                                            .text("Кернинг (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Высота символа",
+                                                        &mut self.glyph_height,
+                                                        1.0..=300.0,
+                                                        5.0,
+                                                        base_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &kerning_percent_resp,
                                                     );
-                                                    changed |= kerning_percent_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &kerning_percent_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.kerning_percent, steps, 10.0, -300.0, 300.0);
-                                                    }
-                                                    let glyph_height_resp = ui.add(
-                                                        WheelSlider::new(&mut self.glyph_height_percent, 1.0..=300.0)
-                                                            .text("Высота символа (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
+                                                    px_or_percent_param_row(
+                                                        ui,
+                                                        "Ширина символа",
+                                                        &mut self.glyph_width,
+                                                        1.0..=300.0,
+                                                        5.0,
+                                                        base_font_size_px,
+                                                        &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
-                                                        &glyph_height_resp,
                                                     );
-                                                    changed |= glyph_height_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_height_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.glyph_height_percent, steps, 5.0, 1.0, 300.0);
-                                                    }
-                                                    let glyph_width_resp = ui.add(
-                                                        WheelSlider::new(&mut self.glyph_width_percent, 1.0..=300.0)
-                                                            .text("Ширина символа (%)"),
-                                                    );
-                                                    mark_hscroll_block_on_hover(
-                                                        &mut block_hscroll_by_hovered_param,
-                                                        &glyph_width_resp,
-                                                    );
-                                                    changed |= glyph_width_resp.changed();
-                                                    if let Some(steps) = wheel_steps_if_hovered(ui, &glyph_width_resp) {
-                                                        changed |= apply_wheel_step_f32(&mut self.glyph_width_percent, steps, 5.0, 1.0, 300.0);
-                                                    }
                                                 }
                                             },
                                         );
@@ -5400,47 +6298,11 @@ impl TypingCreatePanelState {
                                 Vec2::new(right_col_w, 0.0),
                                 egui::Layout::top_down(Align::Min),
                                 |ui| {
-                                        let prev_align = self.align;
-                                        let align_combo = WheelComboBox::from_label("Выравнивание")
-                                            .selected_text(match self.align {
-                                                HorizontalAlign::Left => "Слева",
-                                                HorizontalAlign::Center => "По центру",
-                                                HorizontalAlign::Right => "Справа",
-                                                HorizontalAlign::Justify => "Свободно",
-                                            })
-                                            .show_ui_with_wheel(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut self.align,
-                                                    HorizontalAlign::Left,
-                                                    "Слева",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.align,
-                                                    HorizontalAlign::Center,
-                                                    "По центру",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.align,
-                                                    HorizontalAlign::Right,
-                                                    "Справа",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.align,
-                                                    HorizontalAlign::Justify,
-                                                    "Свободно",
-                                                );
-                                            });
-                                        mark_hscroll_block_on_hover(
+                                        self.draw_alignment_controls(
+                                            ui,
+                                            &mut changed,
                                             &mut block_hscroll_by_hovered_param,
-                                            &align_combo.inner.response,
                                         );
-                                        if let Some(steps) = align_combo.wheel_steps {
-                                            changed |=
-                                                cycle_horizontal_align(&mut self.align, steps);
-                                        }
-                                        if self.align != prev_align {
-                                            changed = true;
-                                        }
 
                                         let prev_shape = self.text_shape;
                                         let shape_combo = WheelComboBox::from_label("Форма")
@@ -5718,7 +6580,7 @@ impl TypingCreatePanelState {
         cursor_range: Option<CCursorRange>,
     ) {
         if let Some(range) = self.pending_text_selection_restore.take() {
-            let clamped = clamp_char_range(&self.text, range);
+            let clamped = clamp_char_range(self.active_inline_text(), range);
             let mut state = egui::TextEdit::load_state(ctx, text_edit_id).unwrap_or_default();
             state.cursor.set_char_range(Some(CCursorRange::two(
                 CCursor::new(clamped.start),
@@ -5754,7 +6616,7 @@ impl TypingCreatePanelState {
             return;
         }
 
-        let clamped = clamp_char_range(&self.text, char_range.clone());
+        let clamped = clamp_char_range(self.active_inline_text(), char_range.clone());
         if clamped.start >= clamped.end {
             return;
         }
@@ -5772,18 +6634,40 @@ impl TypingCreatePanelState {
             .galley(text_output.galley_pos, galley, ui.visuals().text_color());
     }
 
+    /// Активный буфер для выделения и инлайн-тегов (исходный/сформированный).
+    fn active_inline_text(&self) -> &str {
+        match self.inline_text_target {
+            InlineTextTarget::Source => &self.text,
+            InlineTextTarget::Formed => &self.formed_text,
+        }
+    }
+
+    fn set_active_inline_text(&mut self, value: String) {
+        match self.inline_text_target {
+            InlineTextTarget::Source => self.text = value,
+            InlineTextTarget::Formed => self.formed_text = value,
+        }
+    }
+
+    /// Сбрасывает текущее выделение (например, при переключении панов аккордеона).
+    fn clear_inline_text_selection(&mut self) {
+        self.text_selection_char_range = None;
+        self.pending_text_selection_restore = None;
+    }
+
     fn inline_selection_context(&self) -> Option<TypingInlineSelectionContext> {
         let char_range = self.text_selection_char_range.as_ref()?.clone();
         if char_range.start >= char_range.end {
             return None;
         }
-        let text_byte_range = char_range_to_byte_range(&self.text, &char_range)?;
+        let text = self.active_inline_text();
+        let text_byte_range = char_range_to_byte_range(text, &char_range)?;
         if text_byte_range.start >= text_byte_range.end {
             return None;
         }
 
-        let opening_tags = collect_adjacent_opening_inline_tags(&self.text, text_byte_range.start);
-        let closing_tags = collect_adjacent_closing_inline_tags(&self.text, text_byte_range.end);
+        let opening_tags = collect_adjacent_opening_inline_tags(text, text_byte_range.start);
+        let closing_tags = collect_adjacent_closing_inline_tags(text, text_byte_range.end);
         let matched_count = opening_tags
             .iter()
             .zip(closing_tags.iter())
@@ -5823,6 +6707,35 @@ impl TypingCreatePanelState {
                 TypingInlineTagKind::Kerning(value) => style.kerning = Some(*value),
                 TypingInlineTagKind::Stretching(value) => style.glyph_stretching = Some(*value),
                 TypingInlineTagKind::Offset(offset) => style.glyph_offset = Some(*offset),
+                TypingInlineTagKind::Machine(machine) => {
+                    if machine.bold {
+                        style.bold = true;
+                    }
+                    if machine.italic {
+                        style.italic = true;
+                    }
+                    if machine.font_label.is_some() {
+                        style.font_label = machine.font_label.clone();
+                    }
+                    if machine.font_size_px.is_some() {
+                        style.font_size_px = machine.font_size_px;
+                    }
+                    if machine.text_color.is_some() {
+                        style.text_color = machine.text_color;
+                    }
+                    if machine.line_spacing.is_some() {
+                        style.line_spacing = machine.line_spacing;
+                    }
+                    if machine.kerning.is_some() {
+                        style.kerning = machine.kerning;
+                    }
+                    if machine.glyph_stretching.is_some() {
+                        style.glyph_stretching = machine.glyph_stretching;
+                    }
+                    if machine.glyph_offset.is_some() {
+                        style.glyph_offset = machine.glyph_offset;
+                    }
+                }
             }
         }
 
@@ -5854,23 +6767,13 @@ impl TypingCreatePanelState {
             ),
             font_size_px: Some(selection.style.font_size_px.unwrap_or(self.font_size_px)),
             text_color: Some(selection.style.text_color.unwrap_or(self.text_color)),
-            line_spacing: Some(
-                selection
-                    .style
-                    .line_spacing
-                    .unwrap_or([self.line_spacing_px, self.line_spacing_percent]),
-            ),
-            kerning: Some(
-                selection
-                    .style
-                    .kerning
-                    .unwrap_or([self.kerning_px, self.kerning_percent]),
-            ),
+            line_spacing: Some(selection.style.line_spacing.unwrap_or(self.line_spacing)),
+            kerning: Some(selection.style.kerning.unwrap_or(self.kerning)),
             glyph_stretching: Some(
                 selection
                     .style
                     .glyph_stretching
-                    .unwrap_or([self.glyph_width_percent, self.glyph_height_percent]),
+                    .unwrap_or([self.glyph_width, self.glyph_height]),
             ),
             glyph_offset: Some(
                 selection
@@ -5887,36 +6790,54 @@ impl TypingCreatePanelState {
         desired_effective_style: TypingInlineTagStyle,
     ) -> bool {
         let desired_tag_style = self.normalize_desired_inline_tag_style(desired_effective_style);
-        let opening_tags = build_inline_opening_tags(&desired_tag_style);
-        let closing_tags = build_inline_closing_tags(&desired_tag_style);
+        // По умолчанию панель пишет компактный машиночитаемый тег `<m ...>`.
+        // Настройка `use_legacy_inline_tags` (пока не подключена к UI) вернёт обычные теги.
+        let (opening_tags, closing_tags) = if self.use_legacy_inline_tags {
+            (
+                build_inline_opening_tags(&desired_tag_style),
+                build_inline_closing_tags(&desired_tag_style),
+            )
+        } else {
+            let opening = build_inline_machine_tag(&desired_tag_style);
+            let closing = if opening.is_empty() {
+                String::new()
+            } else {
+                "</m>".to_string()
+            };
+            (opening, closing)
+        };
 
-        let selected_text = self.text[selection.text_byte_range.clone()].to_string();
-        let mut new_text = String::with_capacity(
-            self.text.len()
-                + opening_tags.len()
-                + closing_tags.len()
-                + selection
-                    .opening_wrapper_range
-                    .len()
-                    .saturating_sub(selection.closing_wrapper_range.len()),
-        );
-        new_text.push_str(&self.text[..selection.opening_wrapper_range.start]);
-        new_text.push_str(&opening_tags);
-        new_text.push_str(selected_text.as_str());
-        new_text.push_str(&closing_tags);
-        new_text.push_str(&self.text[selection.closing_wrapper_range.end..]);
+        let (new_text, new_selection_start_byte, new_selection_end_byte) = {
+            let text = self.active_inline_text();
+            let selected_text = text[selection.text_byte_range.clone()].to_string();
+            let mut new_text = String::with_capacity(
+                text.len()
+                    + opening_tags.len()
+                    + closing_tags.len()
+                    + selection
+                        .opening_wrapper_range
+                        .len()
+                        .saturating_sub(selection.closing_wrapper_range.len()),
+            );
+            new_text.push_str(&text[..selection.opening_wrapper_range.start]);
+            new_text.push_str(&opening_tags);
+            new_text.push_str(selected_text.as_str());
+            new_text.push_str(&closing_tags);
+            new_text.push_str(&text[selection.closing_wrapper_range.end..]);
+            let start = selection.opening_wrapper_range.start + opening_tags.len();
+            let end = start + selected_text.len();
+            (new_text, start, end)
+        };
 
-        if new_text == self.text {
+        if new_text == self.active_inline_text() {
             return false;
         }
 
-        let new_selection_start_byte = selection.opening_wrapper_range.start + opening_tags.len();
-        let new_selection_end_byte = new_selection_start_byte + selected_text.len();
-        self.text = new_text;
+        self.set_active_inline_text(new_text);
         self.enable_inline_style_tags = true;
         self.pending_text_selection_restore = Some(
             byte_range_to_char_range(
-                &self.text,
+                self.active_inline_text(),
                 &(new_selection_start_byte..new_selection_end_byte),
             )
             .unwrap_or(selection.char_range),
@@ -5953,24 +6874,23 @@ impl TypingCreatePanelState {
             .filter(|value| *value != self.text_color);
         let line_spacing = desired_effective_style
             .line_spacing
-            .map(|value| [value[0].clamp(-300.0, 300.0), value[1].clamp(-300.0, 300.0)])
-            .filter(|value| {
-                (value[0] - self.line_spacing_px).abs() > 0.05
-                    || (value[1] - self.line_spacing_percent).abs() > 0.05
-            });
+            .map(|value| clamp_px_or_percent(value, 300.0))
+            .filter(|value| px_or_percent_differs(*value, self.line_spacing));
         let kerning = desired_effective_style
             .kerning
-            .map(|value| [value[0].clamp(-300.0, 300.0), value[1].clamp(-300.0, 300.0)])
-            .filter(|value| {
-                (value[0] - self.kerning_px).abs() > 0.05
-                    || (value[1] - self.kerning_percent).abs() > 0.05
-            });
+            .map(|value| clamp_px_or_percent(value, 300.0))
+            .filter(|value| px_or_percent_differs(*value, self.kerning));
         let glyph_stretching = desired_effective_style
             .glyph_stretching
-            .map(|value| [value[0].clamp(1.0, 300.0), value[1].clamp(1.0, 300.0)])
+            .map(|value| {
+                [
+                    clamp_stretch_px_or_percent(value[0]),
+                    clamp_stretch_px_or_percent(value[1]),
+                ]
+            })
             .filter(|value| {
-                (value[0] - self.glyph_width_percent).abs() > 0.05
-                    || (value[1] - self.glyph_height_percent).abs() > 0.05
+                px_or_percent_differs(value[0], self.glyph_width)
+                    || px_or_percent_differs(value[1], self.glyph_height)
             });
         let glyph_offset = desired_effective_style
             .glyph_offset
@@ -6029,6 +6949,18 @@ impl TypingCreatePanelState {
         self.overlay_rotation_deg = normalize_angle_deg(selected.rotation_deg);
         self.width_px = selected.width_px_hint.max(1);
 
+        // Сбрасываем флаг ненайденного шрифта: его заново выставит
+        // `apply_render_data_json_with_options`/`select_font_by_path_or_label`,
+        // если шрифт нового оверлея отсутствует среди доступных.
+        self.missing_font = None;
+
+        // Сформированный текст персонален для оверлея: сбрасываем перед загрузкой,
+        // чтобы он не «наследовался» от ранее выбранного оверлея.
+        // `apply_render_data_json_with_options` восстановит его из JSON, если есть.
+        self.formed_text.clear();
+        self.advanced_text_show_formed = false;
+        // Кэш окна форм относится к прошлому оверлею — инвалидируем.
+        self.advanced_form_cache = None;
         if let Some(render_data) = selected.render_data_json.as_ref() {
             self.apply_render_data_json_with_options(render_data, true);
         }
@@ -6072,53 +7004,56 @@ impl TypingCreatePanelState {
             .and_then(value_as_f32)
             .unwrap_or(self.font_size_px)
             .clamp(1.0, 256.0);
-        self.line_spacing_px = text_params_obj
-            .get("line_spacing_px")
-            .and_then(value_as_f32)
-            .unwrap_or(self.line_spacing_px)
-            .clamp(-300.0, 300.0);
-        self.line_spacing_percent = text_params_obj
-            .get("line_spacing_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(self.line_spacing_percent)
-            .clamp(-300.0, 300.0);
+        self.line_spacing = clamp_px_or_percent(
+            read_legacy_or_token_px_or_percent(
+                text_params_obj,
+                "line_spacing",
+                "line_spacing_px",
+                "line_spacing_percent",
+                self.line_spacing,
+            ),
+            300.0,
+        );
         self.kerning_mode = text_params_obj
             .get("kerning_mode")
             .and_then(Value::as_str)
             .and_then(parse_kerning_mode_str)
             .unwrap_or(KerningMode::Metric);
-        self.kerning_px = text_params_obj
-            .get("kerning_px")
-            .and_then(value_as_f32)
-            .unwrap_or(self.kerning_px)
-            .clamp(-300.0, 300.0);
-        self.kerning_percent = text_params_obj
-            .get("kerning_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(self.kerning_percent)
-            .clamp(-300.0, 300.0);
-        self.glyph_height_percent = text_params_obj
-            .get("glyph_height_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(self.glyph_height_percent)
-            .clamp(1.0, 300.0);
-        self.glyph_width_percent = text_params_obj
-            .get("glyph_width_percent")
-            .and_then(value_as_f32)
-            .unwrap_or(self.glyph_width_percent)
-            .clamp(1.0, 300.0);
+        self.kerning = clamp_px_or_percent(
+            read_legacy_or_token_px_or_percent(
+                text_params_obj,
+                "kerning",
+                "kerning_px",
+                "kerning_percent",
+                self.kerning,
+            ),
+            300.0,
+        );
+        self.glyph_height = clamp_stretch_px_or_percent(read_legacy_or_token_px_or_percent(
+            text_params_obj,
+            "glyph_height",
+            "",
+            "glyph_height_percent",
+            self.glyph_height,
+        ));
+        self.glyph_width = clamp_stretch_px_or_percent(read_legacy_or_token_px_or_percent(
+            text_params_obj,
+            "glyph_width",
+            "",
+            "glyph_width_percent",
+            self.glyph_width,
+        ));
         self.width_px = text_params_obj
             .get("width_px")
             .and_then(Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(self.width_px)
             .max(1);
-        if let Some(align) = text_params_obj
-            .get("align")
-            .and_then(Value::as_str)
-            .and_then(parse_align_str)
-        {
-            self.align = align;
+        if text_params_obj.get("align").is_some() || text_params_obj.get("align_bias").is_some() {
+            self.align = HorizontalAlign::from_config(
+                text_params_obj.get("align").and_then(Value::as_str),
+                text_params_obj.get("align_bias").and_then(value_as_f32),
+            );
         }
         if let Some(text_line_mode) = text_params_obj
             .get("text_line_mode")
@@ -6283,6 +7218,14 @@ impl TypingCreatePanelState {
         {
             self.text_wrap_mode = wrap_mode;
         }
+        // Сформированный текст (если был применён «продвинутый» перенос).
+        // Разворачиваем сформированный, если он есть, иначе исходный.
+        self.formed_text = text_params_obj
+            .get("formed_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.advanced_text_show_formed = !self.formed_text.trim().is_empty();
         self.allow_moderate_trees = text_params_obj
             .get("allow_moderate_trees")
             .and_then(Value::as_bool)
@@ -6326,6 +7269,23 @@ impl TypingCreatePanelState {
         if let Some(idx) = self.find_font_idx_by_path_or_label(font_path, font_label) {
             self.selected_font_idx = idx;
             self.active_font_key = self.current_font_key();
+            self.missing_font = None;
+        } else {
+            // Шрифт оверлея отсутствует среди доступных: запоминаем его имя, чтобы
+            // показать предупреждение и заблокировать рендер до выбора другого шрифта.
+            let name = font_label
+                .map(str::to_string)
+                .or_else(|| {
+                    font_path.map(|path| {
+                        Path::new(path)
+                            .file_name()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or(path)
+                            .to_string()
+                    })
+                })
+                .unwrap_or_else(|| "<неизвестный шрифт>".to_string());
+            self.missing_font = Some(name);
         }
     }
 
@@ -6399,8 +7359,21 @@ impl TypingCreatePanelState {
         }
     }
 
+    /// В рендер идёт сформированный текст, если он не пуст, иначе исходный.
+    fn uses_formed_text(&self) -> bool {
+        !self.formed_text.trim().is_empty()
+    }
+
+    fn effective_render_text(&self) -> String {
+        if self.uses_formed_text() {
+            self.formed_text.clone()
+        } else {
+            self.text.clone()
+        }
+    }
+
     fn build_render_params(&self) -> Option<TextRenderParams> {
-        self.build_render_params_for(self.text.clone(), self.width_px.max(1))
+        self.build_render_params_for(self.effective_render_text(), self.width_px.max(1))
     }
 
     fn adjust_font_size_by_wheel_steps(&mut self, steps: i32) -> bool {
@@ -6452,13 +7425,13 @@ impl TypingCreatePanelState {
             font_path: font.path.clone(),
             available_inline_fonts,
             font_size_px: self.font_size_px.max(1.0),
-            line_spacing_px: self.line_spacing_px,
-            line_spacing_percent: self.line_spacing_percent,
+            line_spacing_px: self.line_spacing.as_px_percent().0,
+            line_spacing_percent: self.line_spacing.as_px_percent().1,
             kerning_mode: self.kerning_mode,
-            kerning_px: self.kerning_px,
-            kerning_percent: self.kerning_percent,
-            glyph_height_percent: self.glyph_height_percent,
-            glyph_width_percent: self.glyph_width_percent,
+            kerning_px: self.kerning.as_px_percent().0,
+            kerning_percent: self.kerning.as_px_percent().1,
+            glyph_height_percent: self.glyph_height.as_percent_of(self.font_size_px.max(1.0)),
+            glyph_width_percent: self.glyph_width.as_percent_of(self.font_size_px.max(1.0)),
             width_px: width_px.max(1),
             align: self.align,
             text_line_mode: self.text_line_mode,
@@ -6475,7 +7448,12 @@ impl TypingCreatePanelState {
             hanging_punctuation: self.hanging_punctuation,
             new_line_after_sentence: self.new_line_after_sentence,
             enable_inline_style_tags: self.enable_inline_style_tags,
-            text_wrap_mode: self.text_wrap_mode,
+            // Сформированный текст уже разбит на строки — не переносим заново.
+            text_wrap_mode: if self.uses_formed_text() {
+                TextWrapMode::None
+            } else {
+                self.text_wrap_mode
+            },
             text_shape: self.text_shape,
             shape_min_width_percent: self.shape_min_width_percent,
             shape_variant: self.shape_variant,
@@ -6573,6 +7551,190 @@ fn byte_index_to_char_index(text: &str, byte_index: usize) -> Option<usize> {
         return None;
     }
     Some(text[..byte_index].chars().count())
+}
+
+/// `(min, max)` значений итератора; `(0, 0)` для пустого. `Default` даёт ноль
+/// для числовых типов.
+fn inclusive_bounds<T: Ord + Copy + Default>(values: impl Iterator<Item = T>) -> (T, T) {
+    let mut iter = values;
+    let Some(first) = iter.next() else {
+        return (T::default(), T::default());
+    };
+    let mut lo = first;
+    let mut hi = first;
+    for value in iter {
+        if value < lo {
+            lo = value;
+        }
+        if value > hi {
+            hi = value;
+        }
+    }
+    (lo, hi)
+}
+
+/// Строка фильтра-диапазона `(от, до)` для окна форм. Не рисуется, если границы
+/// схлопнуты (`bounds.0 >= bounds.1`) — фильтровать нечего. Возвращает `true`,
+/// если строка была показана.
+fn advanced_form_range_row<T>(
+    ui: &mut egui::Ui,
+    label: &str,
+    suffix: &str,
+    value: &mut (T, T),
+    bounds: (T, T),
+) -> bool
+where
+    T: egui::emath::Numeric + Ord + Copy,
+{
+    if bounds.0 >= bounds.1 {
+        // Все формы имеют одно значение — фильтр бессмыслен; держим диапазон полным.
+        *value = bounds;
+        return false;
+    }
+    value.0 = value.0.clamp(bounds.0, bounds.1);
+    value.1 = value.1.clamp(bounds.0, bounds.1);
+    if value.0 > value.1 {
+        value.0 = value.1;
+    }
+    // Шаг колеса/перетаскивания ~1/100 диапазона, чтобы крупные пиксельные
+    // ширины не приходилось крутить по единице, а мелкие счётчики шли точно.
+    let span = bounds.1.to_f64() - bounds.0.to_f64();
+    let step = (span / 100.0).max(1.0);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let hi_now = value.1;
+        ui.add(
+            WheelSpinBox::new(&mut value.0)
+                .range(bounds.0..=hi_now)
+                .wheel_step(step)
+                .speed(step)
+                .suffix(suffix),
+        );
+        ui.label("–");
+        let lo_now = value.0;
+        ui.add(
+            WheelSpinBox::new(&mut value.1)
+                .range(lo_now..=bounds.1)
+                .wheel_step(step)
+                .speed(step)
+                .suffix(suffix),
+        );
+    });
+    true
+}
+
+/// Сортировка форм для окна: узкие → широкие; в пределах допуска по ширине —
+/// по ровности (меньшая неравномерность раньше), затем по цене разрывов,
+/// пиковости и числу переносов.
+fn sort_advanced_forms(forms: &mut [TextForm]) {
+    forms.sort_by(|a, b| a.max_width.cmp(&b.max_width));
+    let mut i = 0;
+    while i < forms.len() {
+        let run_min = forms[i].max_width;
+        let mut j = i + 1;
+        while j < forms.len() && forms[j].max_width <= run_min + forms::DEFAULT_WIDTH_TOLERANCE {
+            j += 1;
+        }
+        forms[i..j].sort_by(|a, b| {
+            a.conservatism
+                .cmp(&b.conservatism)
+                .then(a.unevenness_pct.cmp(&b.unevenness_pct))
+                .then(a.break_cost.cmp(&b.break_cost))
+                .then(a.max_width.cmp(&b.max_width))
+                .then(a.peakiness_pct(PeakBase::Min).cmp(&b.peakiness_pct(PeakBase::Min)))
+                .then(a.word_break_count.cmp(&b.word_break_count))
+        });
+        i = j;
+    }
+}
+
+/// Рисует одну карточку формы: чёрный текст на белом, строки центрированы по
+/// «ядру», висящая пунктуация выходит за края. Возвращает отклик клика.
+fn draw_advanced_form_card(
+    ui: &mut egui::Ui,
+    font_id: &egui::FontId,
+    lines: &[String],
+) -> egui::Response {
+    const PAD_PX: f32 = 8.0;
+    let row_height = ui.fonts_mut(|fonts| fonts.row_height(font_id));
+
+    struct CardRow {
+        lead: Arc<egui::Galley>,
+        core: Arc<egui::Galley>,
+        trail: Arc<egui::Galley>,
+        core_w: f32,
+        lead_w: f32,
+    }
+
+    let mut rows: Vec<CardRow> = Vec::with_capacity(lines.len());
+    let mut half_extent = PAD_PX;
+    for line in lines {
+        let (lead_text, core_text, trail_text) = forms::split_hanging_edges(line);
+        let (lead, core, trail) = ui.fonts_mut(|fonts| {
+            (
+                fonts.layout_no_wrap(lead_text, font_id.clone(), Color32::BLACK),
+                fonts.layout_no_wrap(core_text, font_id.clone(), Color32::BLACK),
+                fonts.layout_no_wrap(trail_text, font_id.clone(), Color32::BLACK),
+            )
+        });
+        let core_w = core.size().x;
+        let lead_w = lead.size().x;
+        let trail_w = trail.size().x;
+        half_extent = half_extent
+            .max(core_w / 2.0 + lead_w)
+            .max(core_w / 2.0 + trail_w);
+        rows.push(CardRow {
+            lead,
+            core,
+            trail,
+            core_w,
+            lead_w,
+        });
+    }
+
+    let card_w = (half_extent * 2.0 + PAD_PX * 2.0).max(48.0);
+    let card_h = PAD_PX * 2.0 + row_height * lines.len().max(1) as f32;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::click());
+
+    let hovered = response.hovered();
+    let painter = ui.painter();
+    let bg = if hovered {
+        Color32::from_gray(244)
+    } else {
+        Color32::WHITE
+    };
+    painter.rect_filled(rect, 4.0, bg);
+    let border = if hovered {
+        Color32::from_rgb(90, 140, 220)
+    } else {
+        Color32::from_gray(170)
+    };
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+
+    let center_x = rect.center().x;
+    let mut y = rect.top() + PAD_PX;
+    for row in rows {
+        let core_x0 = center_x - row.core_w / 2.0;
+        painter.galley(
+            egui::pos2(core_x0 - row.lead_w, y),
+            row.lead,
+            Color32::BLACK,
+        );
+        painter.galley(egui::pos2(core_x0, y), row.core, Color32::BLACK);
+        painter.galley(
+            egui::pos2(core_x0 + row.core_w, y),
+            row.trail,
+            Color32::BLACK,
+        );
+        y += row_height;
+    }
+
+    response
 }
 
 fn build_inline_tag_editor_text_colors(text: &str) -> Vec<TextEditPlusTextColor> {
@@ -6718,6 +7880,10 @@ fn parse_opening_inline_tag(raw: &str) -> Option<TypingInlineTagKind> {
         _ => {}
     }
 
+    if let Some(style) = parse_machine_tag_style(raw) {
+        return Some(TypingInlineTagKind::Machine(style));
+    }
+
     if let Some((tag_name, value)) = raw.split_once('=')
         && tag_name.trim().eq_ignore_ascii_case("font")
     {
@@ -6755,15 +7921,15 @@ fn parse_opening_inline_tag(raw: &str) -> Option<TypingInlineTagKind> {
         return Some(TypingInlineTagKind::Color(color));
     }
 
-    if let Some(value) = parse_inline_pair_value(raw, "line-spacing", -300.0..=300.0) {
+    if let Some(value) = parse_inline_value_or_legacy_pair(raw, "line-spacing", 300.0) {
         return Some(TypingInlineTagKind::LineSpacing(value));
     }
 
-    if let Some(value) = parse_inline_pair_value(raw, "kerning", -300.0..=300.0) {
+    if let Some(value) = parse_inline_value_or_legacy_pair(raw, "kerning", 300.0) {
         return Some(TypingInlineTagKind::Kerning(value));
     }
 
-    if let Some(value) = parse_inline_pair_value(raw, "stretching", 1.0..=300.0) {
+    if let Some(value) = parse_inline_stretch_value(raw) {
         return Some(TypingInlineTagKind::Stretching(value));
     }
 
@@ -6786,12 +7952,16 @@ fn parse_closing_inline_tag(raw: &str) -> Option<TypingInlineTagKind> {
         "/font" => Some(TypingInlineTagKind::Font(String::new())),
         "/size" => Some(TypingInlineTagKind::Size(0.0)),
         "/color" => Some(TypingInlineTagKind::Color(Color32::TRANSPARENT)),
-        "/line-spacing" => Some(TypingInlineTagKind::LineSpacing([0.0, 0.0])),
-        "/kerning" => Some(TypingInlineTagKind::Kerning([0.0, 0.0])),
-        "/stretching" => Some(TypingInlineTagKind::Stretching([100.0, 100.0])),
+        "/line-spacing" => Some(TypingInlineTagKind::LineSpacing(PxOrPercent::percent(0.0))),
+        "/kerning" => Some(TypingInlineTagKind::Kerning(PxOrPercent::percent(0.0))),
+        "/stretching" => Some(TypingInlineTagKind::Stretching([
+            PxOrPercent::percent(100.0),
+            PxOrPercent::percent(100.0),
+        ])),
         "/offset" => Some(TypingInlineTagKind::Offset(
             TypingInlineOffsetStyle::global_only([0.0, 0.0]),
         )),
+        "/m" => Some(TypingInlineTagKind::Machine(TypingInlineTagStyle::default())),
         _ => None,
     }
 }
@@ -6820,7 +7990,73 @@ fn inline_tag_kinds_match(left: &TypingInlineTagKind, right: &TypingInlineTagKin
                 TypingInlineTagKind::Offset(_),
                 TypingInlineTagKind::Offset(_)
             )
+            | (
+                TypingInlineTagKind::Machine(_),
+                TypingInlineTagKind::Machine(_)
+            )
     )
+}
+
+/// Собрать машиночитаемый тег `<m ...>` (см. контракт ключей в `parse_machine_tag`).
+/// Возвращает пустую строку, если стиль ничего не задаёт.
+fn build_inline_machine_tag(style: &TypingInlineTagStyle) -> String {
+    let mut out = String::from("<m");
+    if style.bold {
+        out.push_str(" b");
+    }
+    if style.italic {
+        out.push_str(" i");
+    }
+    if let Some(font_label) = style.font_label.as_deref() {
+        let sanitized = font_label.replace(['"', '<', '>'], "");
+        out.push_str(format!(" f=\"{sanitized}\"").as_str());
+    }
+    if let Some(font_size_px) = style.font_size_px {
+        out.push_str(format!(" s={font_size_px:.2}").as_str());
+    }
+    if let Some(color) = style.text_color {
+        out.push_str(
+            format!(
+                " c={:02X}{:02X}{:02X}{:02X}",
+                color.r(),
+                color.g(),
+                color.b(),
+                color.a()
+            )
+            .as_str(),
+        );
+    }
+    if let Some(line_spacing) = style.line_spacing {
+        out.push_str(format!(" l={}", line_spacing.to_token()).as_str());
+    }
+    if let Some(kerning) = style.kerning {
+        out.push_str(format!(" k={}", kerning.to_token()).as_str());
+    }
+    if let Some([stretch_x, stretch_y]) = style.glyph_stretching {
+        out.push_str(format!(" w={} h={}", stretch_x.to_token(), stretch_y.to_token()).as_str());
+    }
+    if let Some(offset) = style.glyph_offset {
+        if offset.global_x.value != 0.0 {
+            out.push_str(format!(" x={}", offset.global_x.to_token()).as_str());
+        }
+        if offset.global_y.value != 0.0 {
+            out.push_str(format!(" y={}", offset.global_y.to_token()).as_str());
+        }
+        if offset.line.value != 0.0 {
+            out.push_str(format!(" n={}", offset.line.to_token()).as_str());
+        }
+        if offset.shift_following {
+            out.push_str(" q");
+        }
+        if offset.group_rotation_deg != 0.0 {
+            out.push_str(format!(" g={:.2}", offset.group_rotation_deg).as_str());
+        }
+        if offset.glyph_rotation_deg != 0.0 {
+            out.push_str(format!(" r={:.2}", offset.glyph_rotation_deg).as_str());
+        }
+    }
+    out.push('>');
+    if out == "<m>" { String::new() } else { out }
 }
 
 fn build_inline_opening_tags(style: &TypingInlineTagStyle) -> String {
@@ -6834,16 +8070,16 @@ fn build_inline_opening_tags(style: &TypingInlineTagStyle) -> String {
     if let Some(text_color) = style.text_color {
         out.push_str(format_inline_color_tag(text_color).as_str());
     }
-    if let Some([line_spacing_px, line_spacing_percent]) = style.line_spacing {
-        out.push_str(
-            format!("<line-spacing={line_spacing_px:.2},{line_spacing_percent:.2}>").as_str(),
-        );
+    if let Some(line_spacing) = style.line_spacing {
+        out.push_str(format!("<line-spacing={}>", line_spacing.to_token()).as_str());
     }
-    if let Some([kerning_px, kerning_percent]) = style.kerning {
-        out.push_str(format!("<kerning={kerning_px:.2},{kerning_percent:.2}>").as_str());
+    if let Some(kerning) = style.kerning {
+        out.push_str(format!("<kerning={}>", kerning.to_token()).as_str());
     }
     if let Some([stretch_x, stretch_y]) = style.glyph_stretching {
-        out.push_str(format!("<stretching={stretch_x:.2},{stretch_y:.2}>").as_str());
+        out.push_str(
+            format!("<stretching={},{}>", stretch_x.to_token(), stretch_y.to_token()).as_str(),
+        );
     }
     if let Some(offset) = style.glyph_offset {
         out.push_str(format_inline_offset_tag(offset).as_str());
@@ -6891,23 +8127,64 @@ fn build_inline_closing_tags(style: &TypingInlineTagStyle) -> String {
 
 fn format_inline_offset_tag(offset: TypingInlineOffsetStyle) -> String {
     format!(
-        "<offset={:.2},{:.2},{:.2},{},{:.2},{:.2}>",
-        offset.global_px[0],
-        offset.global_px[1],
-        offset.line_px,
+        "<offset={},{},{},{},{:.2},{:.2}>",
+        offset.global_x.to_token(),
+        offset.global_y.to_token(),
+        offset.line.to_token(),
         if offset.shift_following { 1 } else { 0 },
         offset.group_rotation_deg,
         offset.glyph_rotation_deg
     )
 }
 
+fn clamp_px_or_percent(value: PxOrPercent, limit: f32) -> PxOrPercent {
+    PxOrPercent {
+        value: value.value.clamp(-limit, limit),
+        is_percent: value.is_percent,
+    }
+}
+
+/// Считаются ли два значения различающимися (по единице или по величине).
+fn px_or_percent_differs(left: PxOrPercent, right: PxOrPercent) -> bool {
+    left.is_percent != right.is_percent || (left.value - right.value).abs() > 0.05
+}
+
+/// Прочитать параметр `px-или-%`: сначала новый строковый ключ-токен, затем
+/// устаревшие отдельные ключи `*_px`/`*_percent` (с приоритетом пикселей).
+fn read_legacy_or_token_px_or_percent(
+    obj: &serde_json::Map<String, Value>,
+    token_key: &str,
+    legacy_px_key: &str,
+    legacy_percent_key: &str,
+    default: PxOrPercent,
+) -> PxOrPercent {
+    if let Some(value) = obj.get(token_key) {
+        if let Some(text) = value.as_str() {
+            if let Some(parsed) = PxOrPercent::parse(text) {
+                return parsed;
+            }
+        } else if let Some(number) = value_as_f32(value) {
+            // Голое число в ключе-токене встречается лишь в легаси `line_spacing`,
+            // где оно означало пиксели.
+            return PxOrPercent::px(number);
+        }
+    }
+    let legacy_px = obj.get(legacy_px_key).and_then(value_as_f32);
+    let legacy_percent = obj.get(legacy_percent_key).and_then(value_as_f32);
+    if legacy_px.is_some() || legacy_percent.is_some() {
+        return PxOrPercent::from_legacy_pair(
+            legacy_px.unwrap_or(0.0),
+            legacy_percent.unwrap_or(0.0),
+        );
+    }
+    default
+}
+
 fn normalize_inline_offset_style(offset: TypingInlineOffsetStyle) -> TypingInlineOffsetStyle {
     TypingInlineOffsetStyle {
-        global_px: [
-            offset.global_px[0].clamp(-100.0, 100.0),
-            offset.global_px[1].clamp(-100.0, 100.0),
-        ],
-        line_px: offset.line_px.clamp(-300.0, 300.0),
+        global_x: clamp_px_or_percent(offset.global_x, 100.0),
+        global_y: clamp_px_or_percent(offset.global_y, 100.0),
+        line: clamp_px_or_percent(offset.line, 300.0),
         shift_following: offset.shift_following,
         group_rotation_deg: offset.group_rotation_deg.clamp(-180.0, 180.0),
         glyph_rotation_deg: offset.glyph_rotation_deg.clamp(-180.0, 180.0),
@@ -6915,9 +8192,9 @@ fn normalize_inline_offset_style(offset: TypingInlineOffsetStyle) -> TypingInlin
 }
 
 fn inline_offset_style_is_non_default(offset: &TypingInlineOffsetStyle) -> bool {
-    offset.global_px[0].abs() > 0.05
-        || offset.global_px[1].abs() > 0.05
-        || offset.line_px.abs() > 0.05
+    offset.global_x.value.abs() > 0.05
+        || offset.global_y.value.abs() > 0.05
+        || offset.line.value.abs() > 0.05
         || offset.shift_following
         || offset.group_rotation_deg.abs() > 0.05
         || offset.glyph_rotation_deg.abs() > 0.05
@@ -6964,6 +8241,105 @@ fn parse_inline_hex_color(value: &str) -> Option<Color32> {
     }
 }
 
+/// Разобрать машиночитаемый тег `<m ...>` в полный inline-стиль панели.
+fn parse_machine_tag_style(raw: &str) -> Option<TypingInlineTagStyle> {
+    let attrs = parse_machine_tag(raw)?;
+    let mut style = TypingInlineTagStyle::default();
+    let mut offset = TypingInlineOffsetStyle::global_only([0.0, 0.0]);
+    let mut has_offset = false;
+    let mut stretch_w: Option<PxOrPercent> = None;
+    let mut stretch_h: Option<PxOrPercent> = None;
+
+    for (key, value) in &attrs {
+        match key {
+            'b' => style.bold = true,
+            'i' => style.italic = true,
+            'f' => {
+                let label = value.trim();
+                if !label.is_empty() {
+                    style.font_label = Some(label.to_string());
+                }
+            }
+            's' => {
+                if let Ok(px) = value.trim().parse::<f32>()
+                    && px.is_finite()
+                    && px > 0.0
+                {
+                    style.font_size_px = Some(px);
+                }
+            }
+            'c' => {
+                if let Some(color) = parse_inline_hex_color(value) {
+                    style.text_color = Some(color);
+                }
+            }
+            'l' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    style.line_spacing = Some(clamp_px_or_percent(parsed, 300.0));
+                }
+            }
+            'k' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    style.kerning = Some(clamp_px_or_percent(parsed, 300.0));
+                }
+            }
+            'w' => stretch_w = PxOrPercent::parse(value).map(clamp_stretch_px_or_percent),
+            'h' => stretch_h = PxOrPercent::parse(value).map(clamp_stretch_px_or_percent),
+            'x' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.global_x = clamp_px_or_percent(parsed, 100.0);
+                    has_offset = true;
+                }
+            }
+            'y' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.global_y = clamp_px_or_percent(parsed, 100.0);
+                    has_offset = true;
+                }
+            }
+            'n' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.line = clamp_px_or_percent(parsed, 300.0);
+                    has_offset = true;
+                }
+            }
+            'g' => {
+                if let Ok(deg) = value.trim().parse::<f32>()
+                    && deg.is_finite()
+                {
+                    offset.group_rotation_deg = deg.clamp(-180.0, 180.0);
+                    has_offset = true;
+                }
+            }
+            'r' => {
+                if let Ok(deg) = value.trim().parse::<f32>()
+                    && deg.is_finite()
+                {
+                    offset.glyph_rotation_deg = deg.clamp(-180.0, 180.0);
+                    has_offset = true;
+                }
+            }
+            'q' => {
+                offset.shift_following = true;
+                has_offset = true;
+            }
+            _ => {}
+        }
+    }
+
+    if stretch_w.is_some() || stretch_h.is_some() {
+        style.glyph_stretching = Some([
+            stretch_w.unwrap_or(PxOrPercent::percent(100.0)),
+            stretch_h.unwrap_or(PxOrPercent::percent(100.0)),
+        ]);
+    }
+    if has_offset {
+        style.glyph_offset = Some(offset);
+    }
+
+    Some(style)
+}
+
 fn parse_inline_offset_value(raw: &str) -> Option<TypingInlineOffsetStyle> {
     let (tag_name, value) = raw.split_once('=')?;
     if !tag_name.trim().eq_ignore_ascii_case("offset") {
@@ -6975,17 +8351,18 @@ fn parse_inline_offset_value(raw: &str) -> Option<TypingInlineOffsetStyle> {
         .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
         .trim();
     let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
-    let x = parts.first()?.parse::<f32>().ok()?;
-    let y = parts.get(1)?.parse::<f32>().ok()?;
-    if !x.is_finite() || !y.is_finite() {
+    // X/Y/«по линии» поддерживают суффикс `%` (проценты от кегля), иначе пиксели.
+    let global_x = PxOrPercent::parse(parts.first()?)?;
+    let global_y = PxOrPercent::parse(parts.get(1)?)?;
+    if !global_x.value.is_finite() || !global_y.value.is_finite() {
         return None;
     }
 
-    let line_px = parts
+    let line = parts
         .get(2)
-        .and_then(|value| value.parse::<f32>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0);
+        .and_then(|value| PxOrPercent::parse(value))
+        .filter(|value| value.value.is_finite())
+        .unwrap_or(PxOrPercent::px(0.0));
     let shift_following = parts
         .get(3)
         .is_some_and(|value| parse_inline_bool(value).unwrap_or(false));
@@ -7001,8 +8378,9 @@ fn parse_inline_offset_value(raw: &str) -> Option<TypingInlineOffsetStyle> {
         .unwrap_or(0.0);
 
     Some(normalize_inline_offset_style(TypingInlineOffsetStyle {
-        global_px: [x, y],
-        line_px,
+        global_x,
+        global_y,
+        line,
         shift_following,
         group_rotation_deg,
         glyph_rotation_deg,
@@ -7017,28 +8395,66 @@ fn parse_inline_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_inline_pair_value(
-    raw: &str,
-    tag_name: &str,
-    range: RangeInclusive<f32>,
-) -> Option<[f32; 2]> {
+/// Извлечь значение тега `name=...`, обрезав кавычки/пробелы.
+fn inline_tag_value<'a>(raw: &'a str, tag_name: &str) -> Option<&'a str> {
     let (raw_name, value) = raw.split_once('=')?;
     if !raw_name.trim().eq_ignore_ascii_case(tag_name) {
         return None;
     }
-    let value = value
-        .trim()
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
-        .trim();
-    let (x_raw, y_raw) = value.split_once(',')?;
-    let x = x_raw.trim().parse::<f32>().ok()?;
-    let y = y_raw.trim().parse::<f32>().ok()?;
-    if !x.is_finite() || !y.is_finite() {
+    Some(
+        value
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+            .trim(),
+    )
+}
+
+/// Одиночное значение `px-или-%` (или устаревшая пара `px,percent`, которая
+/// сворачивается с приоритетом пикселей) для тегов line-spacing/kerning.
+fn parse_inline_value_or_legacy_pair(
+    raw: &str,
+    tag_name: &str,
+    clamp_abs: f32,
+) -> Option<PxOrPercent> {
+    let value = inline_tag_value(raw, tag_name)?;
+    if let Some((x_raw, y_raw)) = value.split_once(',') {
+        let px = x_raw.trim().parse::<f32>().ok()?;
+        let percent = y_raw.trim().parse::<f32>().ok()?;
+        if !px.is_finite() || !percent.is_finite() {
+            return None;
+        }
+        return Some(clamp_px_or_percent(
+            PxOrPercent::from_legacy_pair(px, percent),
+            clamp_abs,
+        ));
+    }
+    let parsed = PxOrPercent::parse(value)?;
+    if !parsed.value.is_finite() {
         return None;
     }
-    let start = *range.start();
-    let end = *range.end();
-    Some([x.clamp(start, end), y.clamp(start, end)])
+    Some(clamp_px_or_percent(parsed, clamp_abs))
+}
+
+/// `stretching=ширина,высота`, где каждая компонента — `px-или-%` (1..=300).
+fn parse_inline_stretch_value(raw: &str) -> Option<[PxOrPercent; 2]> {
+    let value = inline_tag_value(raw, "stretching")?;
+    let (x_raw, y_raw) = value.split_once(',')?;
+    let width = PxOrPercent::parse(x_raw)?;
+    let height = PxOrPercent::parse(y_raw)?;
+    if !width.value.is_finite() || !height.value.is_finite() {
+        return None;
+    }
+    Some([
+        clamp_stretch_px_or_percent(width),
+        clamp_stretch_px_or_percent(height),
+    ])
+}
+
+fn clamp_stretch_px_or_percent(value: PxOrPercent) -> PxOrPercent {
+    PxOrPercent {
+        value: value.value.clamp(1.0, 300.0),
+        is_percent: value.is_percent,
+    }
 }
 
 fn effect_card_title(effect: &EffectCard) -> &'static str {
@@ -7625,7 +9041,10 @@ fn load_fonts(fonts_dir: &Path, use_system_fonts: bool) -> Vec<FontEntry> {
         return entries;
     }
 
-    let mut known_paths: HashSet<PathBuf> = entries.iter().map(|font| font.path.clone()).collect();
+    let mut known_paths: HashSet<PathBuf> = entries
+        .iter()
+        .flat_map(|font| std::iter::once(font.path.clone()).chain(font.alt_paths.iter().cloned()))
+        .collect();
     for system_font in load_system_fonts() {
         if known_paths.insert(system_font.path.clone()) {
             entries.push(system_font);
@@ -7635,37 +9054,147 @@ fn load_fonts(fonts_dir: &Path, use_system_fonts: bool) -> Vec<FontEntry> {
     entries
 }
 
+/// Одна найденная копия файла шрифта до объединения дубликатов.
+struct RawFontFile {
+    path: PathBuf,
+    stem: String,
+    group: Option<String>,
+    content_hash: u64,
+    faces: Vec<FontFaceEntry>,
+}
+
 fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
     let mut files = Vec::<PathBuf>::new();
     collect_font_files_recursive(fonts_dir, fonts_dir, &mut files);
     files.sort_by_key(|path| path.to_string_lossy().to_lowercase());
 
-    let mut entries = Vec::<FontEntry>::with_capacity(files.len());
-    let mut used_labels = HashMap::<String, usize>::new();
-    for path in files {
-        let stem = path
-            .file_stem()
-            .and_then(|v| v.to_str())
-            .unwrap_or("font")
-            .to_string();
-        let count = used_labels.entry(stem.clone()).or_insert(0);
-        *count += 1;
-        let label = if *count > 1 {
-            format!("{stem} ({count})")
-        } else {
-            stem
-        };
-        let faces = load_font_faces(&path);
-        let group_name = font_group_name_for_path(fonts_dir, &path);
+    // Читаем каждый файл один раз: и для перечня faces, и для хэша содержимого.
+    let raws: Vec<RawFontFile> = files
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).ok();
+            let content_hash = bytes.as_deref().map_or(0, font_content_hash);
+            let faces = bytes
+                .as_deref()
+                .map_or_else(default_single_face, font_faces_from_bytes);
+            let stem = path
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .unwrap_or("font")
+                .to_string();
+            let group = font_group_name_for_path(fonts_dir, &path);
+            RawFontFile {
+                path,
+                stem,
+                group,
+                content_hash,
+                faces,
+            }
+        })
+        .collect();
+
+    let mut entries = merge_duplicate_fonts(raws);
+    assign_font_disambiguators(&mut entries);
+    entries
+}
+
+/// Объединяет копии одного шрифта (совпадает имя файла и содержимое — «тот же
+/// хэш») в один пункт со списком групп; разные по содержимому остаются раздельно.
+fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
+    // Кластеризация по (имя файла без регистра, хэш содержимого), с сохранением
+    // порядка первого появления.
+    let mut order: Vec<(String, u64)> = Vec::new();
+    let mut clusters: HashMap<(String, u64), Vec<RawFontFile>> = HashMap::new();
+    for raw in raws {
+        let key = (raw.stem.to_lowercase(), raw.content_hash);
+        if !clusters.contains_key(&key) {
+            order.push(key.clone());
+        }
+        clusters.entry(key).or_default().push(raw);
+    }
+
+    let mut entries = Vec::with_capacity(order.len());
+    for key in order {
+        let mut cluster = clusters.remove(&key).unwrap_or_default();
+        // Представитель — первый по пути (детерминированно).
+        cluster.sort_by(|a, b| a.path.cmp(&b.path));
+        let rep = &cluster[0];
+        let label = rep.stem.clone();
+        let faces = rep.faces.clone();
+        let path = rep.path.clone();
+        let alt_paths = cluster[1..].iter().map(|raw| raw.path.clone()).collect();
+        // Объединение групп копий (без повторов, в стабильном порядке).
+        let mut groups: Vec<Option<String>> = Vec::new();
+        for raw in &cluster {
+            if !groups.contains(&raw.group) {
+                groups.push(raw.group.clone());
+            }
+        }
         entries.push(FontEntry {
             label,
             path,
-            group_name,
+            alt_paths,
+            groups,
+            disambig: None,
             faces,
         });
     }
-
     entries
+}
+
+/// Проставляет скобочное уточнение (по группам) тем пунктам, у которых базовое
+/// имя совпадает с другим пунктом.
+fn assign_font_disambiguators(entries: &mut [FontEntry]) {
+    let mut label_counts: HashMap<String, usize> = HashMap::new();
+    for entry in entries.iter() {
+        *label_counts.entry(entry.label.to_lowercase()).or_insert(0) += 1;
+    }
+    // Уникальное имя — уточнение не нужно.
+    let mut used: HashMap<String, usize> = HashMap::new();
+    for entry in entries.iter_mut() {
+        if label_counts.get(&entry.label.to_lowercase()).copied().unwrap_or(0) <= 1 {
+            entry.disambig = None;
+            continue;
+        }
+        let mut suffix = font_groups_label(&entry.groups);
+        // Если уточнения совпали (например, два корневых) — добавим индекс.
+        let key = format!("{}\u{0}{}", entry.label.to_lowercase(), suffix.to_lowercase());
+        let n = used.entry(key).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            suffix = format!("{suffix} {n}");
+        }
+        entry.disambig = Some(suffix);
+    }
+}
+
+/// Отображаемое имя группы для уточнения: имя группы или «корень».
+fn font_groups_label(groups: &[Option<String>]) -> String {
+    let parts: Vec<&str> = groups
+        .iter()
+        .map(|group| group.as_deref().unwrap_or("корень"))
+        .collect();
+    if parts.is_empty() {
+        "корень".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+#[must_use]
+fn font_content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[must_use]
+fn default_single_face() -> Vec<FontFaceEntry> {
+    vec![FontFaceEntry {
+        label: "Face 0".to_string(),
+        face_index: 0,
+    }]
 }
 
 fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
@@ -7750,7 +9279,9 @@ fn load_system_fonts() -> Vec<FontEntry> {
         entries.push(FontEntry {
             label,
             path,
-            group_name: None,
+            alt_paths: Vec::new(),
+            groups: vec![None],
+            disambig: None,
             faces,
         });
     }
@@ -7758,21 +9289,11 @@ fn load_system_fonts() -> Vec<FontEntry> {
     entries
 }
 
-fn load_font_faces(path: &Path) -> Vec<FontFaceEntry> {
-    let Ok(bytes) = fs::read(path) else {
-        return vec![FontFaceEntry {
-            label: "Face 0".to_string(),
-            face_index: 0,
-        }];
-    };
-
+fn font_faces_from_bytes(bytes: &[u8]) -> Vec<FontFaceEntry> {
     let mut db = fontdb::Database::new();
-    let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(bytes)));
+    let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
     if ids.is_empty() {
-        return vec![FontFaceEntry {
-            label: "Face 0".to_string(),
-            face_index: 0,
-        }];
+        return default_single_face();
     }
 
     let mut faces = Vec::with_capacity(ids.len());
@@ -7871,6 +9392,24 @@ fn load_text_tab_use_system_fonts() -> bool {
         .get("TextTab")
         .and_then(Value::as_object)
         .and_then(|text_tab| text_tab.get(TEXT_TAB_USE_SYSTEM_FONTS_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Читает настройку «использовать обычные inline-теги вместо машиночитаемых».
+/// По умолчанию `false` — панель пишет компактный `<m ...>`. Пока не подключено к UI.
+fn load_text_tab_use_legacy_inline_tags() -> bool {
+    let user_settings_file = config::user_config_path();
+    let Ok(raw) = fs::read_to_string(user_settings_file) else {
+        return false;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    payload
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
@@ -8553,6 +10092,34 @@ fn is_font_family_bound(ctx: &egui::Context, family: &egui::FontFamily) -> bool 
     ctx.fonts(|fonts| fonts.definitions().families.contains_key(family))
 }
 
+/// Детерминированное имя egui-семейства для UI-превью шрифта в комбобоксе.
+/// Зависит только от (путь, индекс начертания), поэтому один и тот же файл всегда
+/// регистрируется под одним именем (безопасно разделяется между панелями `create`
+/// и `edit`, у которых общий egui-`Context`), а разные файлы получают разные имена.
+fn combo_font_family_name(font_path: &Path, face_index: usize) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    font_path.hash(&mut hasher);
+    face_index.hash(&mut hasher);
+    format!("typing-panel-combo-font-{:016x}", hasher.finish())
+}
+
+/// Принадлежит ли шрифт группе `group` (учитывает объединённые копии).
+fn font_in_group(font: &FontEntry, group: &str) -> bool {
+    font.groups.iter().any(|g| g.as_deref() == Some(group))
+}
+
+/// Совпадает ли `raw`-путь с представительным или альтернативным путём шрифта.
+fn font_matches_path(font: &FontEntry, raw: &str) -> bool {
+    let candidate = Path::new(raw);
+    font.path == candidate
+        || font.path.to_string_lossy() == raw
+        || font
+            .alt_paths
+            .iter()
+            .any(|alt| alt == candidate || alt.to_string_lossy() == raw)
+}
+
 fn fit_size_to_box(source_size: [usize; 2], box_size: Vec2) -> Vec2 {
     let src_w = source_size[0].max(1) as f32;
     let src_h = source_size[1].max(1) as f32;
@@ -8593,6 +10160,63 @@ fn consume_wheel_scroll_delta(ui: &egui::Ui) {
 fn wheel_steps_if_hovered(ui: &egui::Ui, response: &egui::Response) -> Option<i32> {
     let _ = (ui, response);
     None
+}
+
+/// Строка параметра «значение + переключатель X / X%» (пиксели или проценты от кегля).
+///
+/// При переключении единицы значение пересчитывается через `font_size_px`, чтобы
+/// итоговый результат остался максимально близким (px ↔ % от размера шрифта).
+fn px_or_percent_param_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut PxOrPercent,
+    range: std::ops::RangeInclusive<f32>,
+    wheel_step: f32,
+    font_size_px: f32,
+    changed: &mut bool,
+    block_hscroll_by_hovered_param: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        let min = *range.start();
+        let max = *range.end();
+        let slider_resp = ui.add(WheelSlider::new(&mut value.value, range).text(label));
+        mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &slider_resp);
+        *changed |= slider_resp.changed();
+        if let Some(steps) = wheel_steps_if_hovered(ui, &slider_resp) {
+            *changed |= apply_wheel_step_f32(&mut value.value, steps, wheel_step, min, max);
+        }
+        let mut want_percent = value.is_percent;
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(4, 1))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if ui
+                    .selectable_label(!want_percent, "X")
+                    .on_hover_text("Пиксели")
+                    .clicked()
+                {
+                    want_percent = false;
+                }
+                if ui
+                    .selectable_label(want_percent, "X%")
+                    .on_hover_text("Проценты от размера шрифта")
+                    .clicked()
+                {
+                    want_percent = true;
+                }
+            });
+        if want_percent != value.is_percent {
+            // Подбираем значение в новой единице с наиболее близким результатом.
+            let converted = if want_percent {
+                value.as_percent_of(font_size_px)
+            } else {
+                value.as_px_of(font_size_px)
+            };
+            value.value = converted.clamp(min, max);
+            value.is_percent = want_percent;
+            *changed = true;
+        }
+    });
 }
 
 fn apply_wheel_step_f32(value: &mut f32, steps: i32, step_size: f32, min: f32, max: f32) -> bool {
@@ -8645,26 +10269,6 @@ fn cycle_wrapped_index(index: &mut usize, len: usize, steps: i32) -> bool {
         (prev + len - shift) % len
     };
     *index != prev
-}
-
-fn cycle_horizontal_align(align: &mut HorizontalAlign, steps: i32) -> bool {
-    let mut idx = match *align {
-        HorizontalAlign::Left => 0,
-        HorizontalAlign::Center => 1,
-        HorizontalAlign::Right => 2,
-        HorizontalAlign::Justify => 3,
-    };
-    if !cycle_wrapped_index(&mut idx, 4, steps) {
-        return false;
-    }
-
-    *align = match idx {
-        0 => HorizontalAlign::Left,
-        1 => HorizontalAlign::Center,
-        2 => HorizontalAlign::Right,
-        _ => HorizontalAlign::Justify,
-    };
-    true
 }
 
 fn cycle_text_shape(shape: &mut TextShape, steps: i32) -> bool {
@@ -8778,16 +10382,6 @@ fn compute_typing_vertical_panel_auto_height(
     }
 }
 
-fn parse_align_str(raw: &str) -> Option<HorizontalAlign> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "left" => Some(HorizontalAlign::Left),
-        "center" => Some(HorizontalAlign::Center),
-        "right" => Some(HorizontalAlign::Right),
-        "justify" => Some(HorizontalAlign::Justify),
-        _ => None,
-    }
-}
-
 fn parse_text_shape_str(raw: &str) -> Option<TextShape> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "free" => Some(TextShape::Free),
@@ -8809,6 +10403,7 @@ fn parse_text_wrap_mode_str(raw: &str) -> Option<TextWrapMode> {
         _ => None,
     }
 }
+
 
 fn text_wrap_mode_label(mode: TextWrapMode) -> &'static str {
     match mode {
@@ -9459,6 +11054,40 @@ mod tests {
     }
 
     #[test]
+    fn machine_tag_round_trips_through_build_and_parse() {
+        let style = TypingInlineTagStyle {
+            bold: true,
+            italic: false,
+            font_label: Some("My Font".to_string()),
+            font_size_px: Some(36.0),
+            text_color: Some(Color32::from_rgb(0x11, 0x22, 0x33)),
+            line_spacing: Some(PxOrPercent::percent(50.0)),
+            kerning: Some(PxOrPercent::px(10.0)),
+            glyph_stretching: Some([PxOrPercent::percent(120.0), PxOrPercent::px(80.0)]),
+            glyph_offset: Some(TypingInlineOffsetStyle {
+                global_x: PxOrPercent::px(3.0),
+                global_y: PxOrPercent::percent(0.0),
+                line: PxOrPercent::px(12.0),
+                shift_following: true,
+                group_rotation_deg: 30.0,
+                glyph_rotation_deg: 0.0,
+            }),
+        };
+
+        let tag = build_inline_machine_tag(&style);
+        assert!(tag.starts_with("<m ") && tag.ends_with('>'));
+        let inner = &tag[1..tag.len() - 1];
+        let parsed = parse_machine_tag_style(inner).expect("machine tag should parse");
+
+        assert_eq!(parsed, style);
+    }
+
+    #[test]
+    fn empty_machine_tag_is_not_emitted() {
+        assert!(build_inline_machine_tag(&TypingInlineTagStyle::default()).is_empty());
+    }
+
+    #[test]
     fn inline_tag_editor_colors_dim_tags_and_whiten_content() {
         let colors = build_inline_tag_editor_text_colors("<b>Пример</b>");
 
@@ -9490,5 +11119,81 @@ mod tests {
                     })
                 })
         );
+    }
+
+    fn raw_font(path: &str, group: Option<&str>, hash: u64) -> RawFontFile {
+        RawFontFile {
+            path: PathBuf::from(path),
+            stem: PathBuf::from(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            group: group.map(ToOwned::to_owned),
+            content_hash: hash,
+            faces: default_single_face(),
+        }
+    }
+
+    #[test]
+    fn identical_fonts_merge_and_union_groups() {
+        // Одинаковое имя + одинаковый хэш в корне и в группе → один шрифт.
+        let entries = merge_duplicate_fonts(vec![
+            raw_font("/fonts/Разговор.ttf", None, 42),
+            raw_font("/fonts/groups/A/Разговор.ttf", Some("A"), 42),
+        ]);
+        assert_eq!(entries.len(), 1);
+        let font = &entries[0];
+        assert_eq!(font.label, "Разговор");
+        assert!(font.groups.contains(&None));
+        assert!(font.groups.contains(&Some("A".to_string())));
+        // Альтернативный путь сохранён для сопоставления.
+        assert!(font_matches_path(font, "/fonts/groups/A/Разговор.ttf"));
+        assert!(font_in_group(font, "A"));
+    }
+
+    #[test]
+    fn same_name_different_content_stays_separate_and_disambiguated() {
+        let mut entries = merge_duplicate_fonts(vec![
+            raw_font("/fonts/groups/A/Разговор.ttf", Some("A"), 1),
+            raw_font("/fonts/groups/B/Разговор.ttf", Some("B"), 2),
+        ]);
+        assert_eq!(entries.len(), 2);
+        assign_font_disambiguators(&mut entries);
+        let suffixes: Vec<Option<String>> =
+            entries.iter().map(|font| font.disambig.clone()).collect();
+        assert!(suffixes.contains(&Some("A".to_string())));
+        assert!(suffixes.contains(&Some("B".to_string())));
+    }
+
+    #[test]
+    fn unique_name_gets_no_disambiguator() {
+        let mut entries = merge_duplicate_fonts(vec![raw_font(
+            "/fonts/Уникальный.ttf",
+            None,
+            7,
+        )]);
+        assign_font_disambiguators(&mut entries);
+        assert_eq!(entries[0].disambig, None);
+    }
+
+    #[test]
+    fn selecting_missing_overlay_font_sets_warning_and_clears_on_found() {
+        let mut state = TypingCreatePanelState::new(false, false);
+        state.fonts = merge_duplicate_fonts(vec![raw_font("/fonts/Доступный.ttf", None, 11)]);
+        state.selected_font_idx = 0;
+
+        // Шрифт оверлея отсутствует среди доступных → запоминаем его имя.
+        state.select_font_by_path_or_label(Some("/fonts/Пропавший.ttf"), Some("Пропавший"));
+        assert_eq!(state.missing_font.as_deref(), Some("Пропавший"));
+
+        // Без метки берём имя файла из пути.
+        state.select_font_by_path_or_label(Some("/fonts/ДругойПропавший.otf"), None);
+        assert_eq!(state.missing_font.as_deref(), Some("ДругойПропавший.otf"));
+
+        // Найденный шрифт снимает блокировку рендера.
+        state.select_font_by_path_or_label(Some("/fonts/Доступный.ttf"), Some("Доступный"));
+        assert!(state.missing_font.is_none());
+        assert_eq!(state.selected_font_idx, 0);
     }
 }

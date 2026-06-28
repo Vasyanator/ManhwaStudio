@@ -68,26 +68,17 @@ struct VerticalRenderColumn {
 
 #[derive(Debug, Clone, Copy)]
 struct GlyphInkProfile {
-    left_px: f32,
-    right_px: f32,
     top_px: f32,
     bottom_px: f32,
 }
 
 impl GlyphInkProfile {
     #[must_use]
-    fn fallback(width_px: f32, height_px: f32) -> Self {
+    fn fallback(height_px: f32) -> Self {
         Self {
-            left_px: 0.0,
-            right_px: width_px.max(1.0),
             top_px: 0.0,
             bottom_px: height_px.max(1.0),
         }
-    }
-
-    #[must_use]
-    fn width_px(self) -> f32 {
-        (self.right_px - self.left_px).max(1.0)
     }
 
     #[must_use]
@@ -113,7 +104,6 @@ pub(crate) fn render_vertical_text(
     } = request;
     let width_px = layout_text.lines().count().max(1);
     let mut cache = SwashCache::new();
-    let kerning = KerningSettings::from_params(params);
     let columns = collect_vertical_render_columns(
         params,
         buffer,
@@ -143,16 +133,9 @@ pub(crate) fn render_vertical_text(
         let Some(column_x) = column_positions.get(column_idx).copied() else {
             continue;
         };
-        let cell_tops = compute_vertical_cell_tops(
-            column,
-            font_system,
-            &mut cache,
-            base_line_height_px,
-            font_size_px,
-            kerning,
-        );
+        let cell_baselines =
+            compute_vertical_cell_baselines(column, font_system, &mut cache, font_size_px);
         for (cell_idx, cell) in column.cells.iter().enumerate() {
-            let cell_top_y = cell_tops.get(cell_idx).copied().unwrap_or(0.0);
             let VerticalRenderCell::Glyph {
                 glyph,
                 glyph_scale,
@@ -162,7 +145,8 @@ pub(crate) fn render_vertical_text(
             else {
                 continue;
             };
-            let baseline_y = cell_top_y + font_size_px + glyph_offset_px[1];
+            let baseline_y = cell_baselines.get(cell_idx).copied().unwrap_or(font_size_px)
+                + glyph_offset_px[1];
             let origin_x = column_x + ((column.visual_width_px - glyph.w).max(0.0) * 0.5) - glyph.x
                 + glyph_offset_px[0];
             let physical = glyph.physical((origin_x, baseline_y), 1.0);
@@ -209,16 +193,9 @@ pub(crate) fn render_vertical_text(
         let Some(column_x) = column_positions.get(column_idx).copied() else {
             continue;
         };
-        let cell_tops = compute_vertical_cell_tops(
-            column,
-            font_system,
-            &mut cache,
-            base_line_height_px,
-            font_size_px,
-            kerning,
-        );
+        let cell_baselines =
+            compute_vertical_cell_baselines(column, font_system, &mut cache, font_size_px);
         for (cell_idx, cell) in column.cells.iter().enumerate() {
-            let cell_top_y = cell_tops.get(cell_idx).copied().unwrap_or(0.0);
             let VerticalRenderCell::Glyph {
                 glyph,
                 text_color,
@@ -229,7 +206,8 @@ pub(crate) fn render_vertical_text(
             else {
                 continue;
             };
-            let baseline_y = cell_top_y + font_size_px + glyph_offset_px[1];
+            let baseline_y = cell_baselines.get(cell_idx).copied().unwrap_or(font_size_px)
+                + glyph_offset_px[1];
             let origin_x = column_x + ((column.visual_width_px - glyph.w).max(0.0) * 0.5) - glyph.x
                 + glyph_offset_px[0];
             let physical = glyph.physical((origin_x, baseline_y), 1.0);
@@ -291,6 +269,8 @@ pub(crate) fn render_vertical_text(
         height: out_height,
         rgba,
         warnings: Vec::new(),
+        content_origin_x: 0,
+        content_origin_y: 0,
     })
 }
 
@@ -495,26 +475,23 @@ fn compute_vertical_column_positions(
     positions
 }
 
-fn compute_vertical_cell_tops(
+/// Доля кегля для базового зазора между «чернильными» (ink) боксами глифов столбца.
+const VERTICAL_INK_GAP_FRACTION: f32 = 0.1;
+
+/// Базовые линии глифов в столбце.
+///
+/// Каждый глиф ставится так, чтобы верх его ink-бокса встал на текущую позицию, а
+/// шаг до следующего глифа равнялся ink-высоте текущего глифа плюс равномерный зазор
+/// (базовый + кернинг). То есть вертикальный шаг определяется реальной высотой глифа,
+/// а не полным em, поэтому при нулевом кернинге символы стоят плотно. Кернинг (в % от
+/// кегля) и пробелы (em-доли) по-прежнему регулируют расстояние.
+fn compute_vertical_cell_baselines(
     column: &VerticalRenderColumn,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
-    base_line_height_px: f32,
     font_size_px: f32,
-    kerning: KerningSettings,
 ) -> Vec<f32> {
-    let default_step = base_line_height_px.max(1.0);
-    if column
-        .cells
-        .iter()
-        .all(|cell| !matches!(cell, VerticalRenderCell::Glyph { .. }))
-        || kerning.uses_default_metric_layout()
-    {
-        return default_vertical_cell_tops(column, default_step);
-    }
-
-    let mut tops = Vec::<f32>::with_capacity(column.cells.len());
-    let mut current_top = 0.0f32;
+    let base_gap = font_size_px * VERTICAL_INK_GAP_FRACTION;
     let profiles = column
         .cells
         .iter()
@@ -526,95 +503,30 @@ fn compute_vertical_cell_tops(
         })
         .collect::<Vec<_>>();
 
-    for (idx, cell) in column.cells.iter().enumerate() {
-        tops.push(current_top);
-        let cell_height_mul = match cell {
-            VerticalRenderCell::Glyph { .. } => 1.0,
-            VerticalRenderCell::Blank(height_mul) => *height_mul,
-        };
-        current_top += default_step * cell_height_mul;
-        if idx + 1 >= column.cells.len() {
-            continue;
-        }
-
-        let extra_step = match (&column.cells[idx], &column.cells[idx + 1]) {
-            (
-                VerticalRenderCell::Glyph {
-                    kerning: pair_kerning,
-                    ..
-                },
-                VerticalRenderCell::Glyph { .. },
-            ) => {
-                let pair_kerning = *pair_kerning;
-                let spacing_basis = match pair_kerning.mode {
-                    crate::tabs::typing::render_next::types::KerningMode::Metric => default_step,
-                    crate::tabs::typing::render_next::types::KerningMode::Optical => ((profiles
-                        [idx]
-                        .unwrap_or(GlyphInkProfile::fallback(default_step, default_step))
-                        .width_px()
-                        + profiles[idx + 1]
-                            .unwrap_or(GlyphInkProfile::fallback(default_step, default_step))
-                            .width_px())
-                        * 0.5)
-                        .max(default_step),
-                };
-                let optical_step = match (profiles[idx], profiles[idx + 1]) {
-                    (Some(prev), Some(next)) => {
-                        default_step
-                            + optical_vertical_pair_adjustment(
-                                prev,
-                                next,
-                                default_step,
-                                font_size_px,
-                            )
-                    }
-                    _ => default_step,
-                };
-                let base_step = match pair_kerning.mode {
-                    crate::tabs::typing::render_next::types::KerningMode::Metric => default_step,
-                    crate::tabs::typing::render_next::types::KerningMode::Optical => optical_step,
-                };
-                base_step - default_step + pair_kerning.extra_spacing_px(spacing_basis)
-            }
-            _ => kerning.extra_spacing_px(default_step),
-        };
-        current_top += extra_step;
-    }
-
-    tops
-}
-
-fn default_vertical_cell_tops(column: &VerticalRenderColumn, default_step: f32) -> Vec<f32> {
-    let mut tops = Vec::<f32>::with_capacity(column.cells.len());
+    let mut baselines = vec![font_size_px; column.cells.len()];
     let mut current_top = 0.0f32;
-    for cell in &column.cells {
-        tops.push(current_top);
-        let cell_height_mul = match cell {
-            VerticalRenderCell::Glyph { .. } => 1.0,
-            VerticalRenderCell::Blank(height_mul) => *height_mul,
-        };
-        current_top += default_step * cell_height_mul;
+    for (idx, cell) in column.cells.iter().enumerate() {
+        match cell {
+            VerticalRenderCell::Glyph { kerning, .. } => {
+                let profile =
+                    profiles[idx].unwrap_or_else(|| GlyphInkProfile::fallback(font_size_px));
+                // Базовая линия так, чтобы верх ink-бокса оказался на `current_top`.
+                baselines[idx] = current_top + font_size_px - profile.top_px;
+                current_top += profile.height_px();
+                // Зазор добавляется только между двумя глифами одной строки.
+                if matches!(
+                    column.cells.get(idx + 1),
+                    Some(VerticalRenderCell::Glyph { .. })
+                ) {
+                    current_top += base_gap + kerning.extra_spacing_px(font_size_px);
+                }
+            }
+            VerticalRenderCell::Blank(height_mul) => {
+                current_top += font_size_px * height_mul;
+            }
+        }
     }
-    tops
-}
-
-fn optical_vertical_pair_adjustment(
-    prev: GlyphInkProfile,
-    next: GlyphInkProfile,
-    metric_step: f32,
-    font_size_px: f32,
-) -> f32 {
-    if !metric_step.is_finite() || metric_step <= 0.0 {
-        return 0.0;
-    }
-
-    let avg_height = ((prev.height_px() + next.height_px()) * 0.5).max(font_size_px * 0.3);
-    let actual_gap = metric_step + next.top_px - prev.bottom_px;
-    let target_gap = (avg_height * 0.08).clamp(font_size_px * 0.02, font_size_px * 0.14);
-    let tighten_limit = metric_step.min(font_size_px * 0.14) * 0.45;
-    let loosen_limit = font_size_px * 0.14;
-    let delta = ((target_gap - actual_gap) * 0.45).clamp(-tighten_limit, loosen_limit);
-    if delta.abs() < 0.25 { 0.0 } else { delta }
+    baselines
 }
 
 fn glyph_ink_profile(
@@ -625,40 +537,33 @@ fn glyph_ink_profile(
 ) -> GlyphInkProfile {
     let physical = glyph.physical((-glyph.x, font_size_px), 1.0);
     let Some(image) = cache.get_image(font_system, physical.cache_key) else {
-        return GlyphInkProfile::fallback(glyph.w.max(font_size_px * 0.5), font_size_px);
+        return GlyphInkProfile::fallback(font_size_px);
     };
     glyph_ink_profile_from_image(
-        [
-            image.placement.left as f32,
-            (physical.y - image.placement.top) as f32,
-        ],
+        (physical.y - image.placement.top) as f32,
         &image.content,
         image.data.as_slice(),
         [
             image.placement.width as usize,
             image.placement.height as usize,
         ],
-        [glyph.w.max(font_size_px * 0.5), font_size_px],
+        font_size_px,
     )
 }
 
 fn glyph_ink_profile_from_image(
-    draw_origin_px: [f32; 2],
+    draw_top_px: f32,
     content: &cosmic_text::SwashContent,
     data: &[u8],
     glyph_size: [usize; 2],
-    fallback_size_px: [f32; 2],
+    fallback_height_px: f32,
 ) -> GlyphInkProfile {
-    let [draw_left_px, draw_top_px] = draw_origin_px;
     let [glyph_w, glyph_h] = glyph_size;
-    let [fallback_width_px, fallback_height_px] = fallback_size_px;
     if glyph_w == 0 || glyph_h == 0 {
-        return GlyphInkProfile::fallback(fallback_width_px, fallback_height_px);
+        return GlyphInkProfile::fallback(fallback_height_px);
     }
 
-    let mut min_x = glyph_w;
     let mut min_y = glyph_h;
-    let mut max_x = 0usize;
     let mut max_y = 0usize;
     let mut has_alpha = false;
 
@@ -667,21 +572,17 @@ fn glyph_ink_profile_from_image(
             if sample_swash_alpha(content, data, glyph_w, gx, gy) < OPTICAL_ALPHA_THRESHOLD {
                 continue;
             }
-            min_x = min_x.min(gx);
             min_y = min_y.min(gy);
-            max_x = max_x.max(gx);
             max_y = max_y.max(gy);
             has_alpha = true;
         }
     }
 
     if !has_alpha {
-        return GlyphInkProfile::fallback(fallback_width_px, fallback_height_px);
+        return GlyphInkProfile::fallback(fallback_height_px);
     }
 
     GlyphInkProfile {
-        left_px: draw_left_px + min_x as f32,
-        right_px: draw_left_px + max_x as f32 + 1.0,
         top_px: draw_top_px + min_y as f32,
         bottom_px: draw_top_px + max_y as f32 + 1.0,
     }
@@ -689,9 +590,7 @@ fn glyph_ink_profile_from_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GlyphInkProfile, compute_vertical_column_positions, optical_vertical_pair_adjustment,
-    };
+    use super::compute_vertical_column_positions;
     use crate::tabs::typing::render_next::types::VerticalLineDirection;
 
     #[test]
@@ -717,25 +616,4 @@ mod tests {
         assert_eq!(positions, vec![16.0, 0.0]);
     }
 
-    #[test]
-    fn optical_vertical_adjustment_stays_small_for_already_spaced_pair() {
-        let delta = optical_vertical_pair_adjustment(
-            GlyphInkProfile {
-                left_px: 0.0,
-                right_px: 10.0,
-                top_px: 0.0,
-                bottom_px: 10.0,
-            },
-            GlyphInkProfile {
-                left_px: 0.0,
-                right_px: 10.0,
-                top_px: 14.0,
-                bottom_px: 24.0,
-            },
-            14.0,
-            20.0,
-        );
-
-        assert!(delta.abs() < 4.0);
-    }
 }

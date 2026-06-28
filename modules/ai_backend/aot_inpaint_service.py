@@ -12,7 +12,6 @@ Main responsibilities:
 
 from __future__ import annotations
 
-import base64
 import gc
 import io
 import threading
@@ -49,7 +48,7 @@ from .model_manager import LoadedModelManager
 # Что в файле:
 # - `AotInpaintService`: lazy-load обёртка AOT-модели для endpoint `/inpaint/aot`.
 # - Порт инференса из legacy `ui_new/tools/aot_inpaint_tool.py` (без Qt-слоя).
-# - Декодирование/кодирование base64-изображений (RGB image + mask).
+# - Декодирование PNG-изображений (RGB image + mask) и кодирование raw PNG.
 # - Нормализация параметров AOT (`inpaint_size`).
 # - Синхронизация устройства с backend-настройкой `General.ai_device`
 #   через `AIDevice`.
@@ -464,7 +463,7 @@ class AotInpaintService:
                 lease.release()
 
         return {
-            "image_png_base64": _encode_png_base64_rgb(out_rgb),
+            "image_png": _encode_png_bytes_rgb(out_rgb),
             "source_size": [int(image_rgb.shape[1]), int(image_rgb.shape[0])],
             "device": self._active_device,
             "inpaint_size": int(normalized["inpaint_size"]),
@@ -682,7 +681,7 @@ def _decode_image_any(image_bytes: bytes) -> np.ndarray:
         return np.array(img.convert("RGBA"))
 
 
-def _encode_png_base64_rgb(image_rgb: np.ndarray) -> str:
+def _encode_png_bytes_rgb(image_rgb: np.ndarray) -> bytes:
     np = _np()
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("Ожидается RGB изображение (H, W, 3)")
@@ -694,13 +693,13 @@ def _encode_png_base64_rgb(image_rgb: np.ndarray) -> str:
         ok, encoded = cv2.imencode(".png", bgr)
         if not ok:
             raise RuntimeError("cv2.imencode('.png') вернул ошибку")
-        return base64.b64encode(encoded.tobytes()).decode("ascii")
+        return encoded.tobytes()
 
     from PIL import Image
 
     with io.BytesIO() as buffer:
         Image.fromarray(image_rgb, mode="RGB").save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("ascii")
+        return buffer.getvalue()
 
 
 def _to_int(value: Any, default: int) -> int:

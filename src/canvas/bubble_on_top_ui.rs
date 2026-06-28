@@ -459,7 +459,7 @@ pub(super) fn draw_on_top_for_page(
                 }
             });
 
-            hooks.build_bubble_footer(&mut footer_ui, hook_bubble, canvas.editable);
+            hooks.build_bubble_footer(&mut footer_ui, project, hook_bubble, canvas.editable);
             if footer_zone.intersect(scene_clip_rect).is_positive() {
                 hit_rect = hit_rect.union(footer_zone.intersect(scene_clip_rect));
             }
@@ -667,8 +667,15 @@ pub(super) fn focus_candidate_at_scene_pos(
     image_rect: Rect,
     scene_pos: Pos2,
 ) -> Option<i64> {
-    let mut ids = canvas.page_bubbles(page_idx, Side::Left, BubbleType::OnTop);
-    ids.extend(canvas.page_bubbles(page_idx, Side::Right, BubbleType::OnTop));
+    // On-top bubbles are always text bubbles, so each item is a plain bubble id. Bucket the page
+    // once and read the two on-top columns from it instead of scanning the runtime bubbles twice.
+    let buckets = canvas.page_bubbles_bucketed(page_idx);
+    let ids: Vec<i64> = buckets
+        .bucket(Side::Left, BubbleType::OnTop)
+        .iter()
+        .chain(buckets.bucket(Side::Right, BubbleType::OnTop))
+        .map(|item| item.bid)
+        .collect();
     for bid in ids.into_iter().rev() {
         let Some(bubble) = canvas.bubble_runtime.runtime_bubbles.get(&bid) else {
             continue;
@@ -716,10 +723,16 @@ pub(super) fn draw_rect_handles(
         if response.dragged() {
             canvas.bubble_runtime.active_rect_handle = Some((bid, idx));
             if let Some(pos) = response.interact_pointer_pos() {
+                // `resize_rect_by_handle` re-queues `bid` in `pending_upsert` every dragged frame
+                // (see its final line), so the last frame before release leaves it queued.
                 resize_rect_by_handle(canvas, bid, idx, image_rect, pos);
             }
         }
         if response.drag_stopped() {
+            // Clearing the active handle re-enables the debounced flush; the id is already in
+            // `pending_upsert` from the final `resize_rect_by_handle` call above, so the next flush
+            // commits the final rect. Unlike the area-handle `drag_stopped` path (which inserts
+            // `pending_upsert` here because its resize fn does not), no insert is needed here.
             canvas.bubble_runtime.active_rect_handle = None;
         }
     }
@@ -854,6 +867,13 @@ fn move_bubble_by_delta(canvas: &mut CanvasView, bid: i64, du: f32, dv: f32) {
     bubble.img_v = (bubble.img_v + shift_y).clamp(min_margin_v, 1.0 - min_margin_v);
 }
 
+/// Resizes the red image-area rect of bubble `bid` by dragging handle `idx` toward `scene_pos`,
+/// re-normalizes the rect, and keeps the anchor inside it.
+///
+/// Called every dragged frame from [`draw_rect_handles`]. It re-queues `bid` in `pending_upsert`
+/// on each call (final line), so the last frame before release leaves `bid` queued; the
+/// `drag_stopped` handler then clears `active_rect_handle`, and the next debounced flush commits the
+/// final rect. This is the commit guarantee for a normal on-screen release (no data loss).
 fn resize_rect_by_handle(
     canvas: &mut CanvasView,
     bid: i64,
@@ -911,5 +931,8 @@ fn resize_rect_by_handle(
     );
     bubble.img_u = anchor.x;
     bubble.img_v = anchor.y;
+    // Re-queue every dragged frame: the flush is debounced while `active_rect_handle` is set, so the
+    // queued id is only consumed once `draw_rect_handles`'s `drag_stopped` clears the handle. Keeping
+    // it queued each frame guarantees the final rect commits on a normal on-screen release.
     canvas.bubble_runtime.pending_upsert.insert(bid);
 }

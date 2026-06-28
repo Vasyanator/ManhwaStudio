@@ -26,7 +26,10 @@ output images, or apply effects.
 
 ## Files and submodules
 - `mod.rs`: internal public surface, wrap-mode policy mapping, shared constants, and
-  hanging-punctuation classification.
+  hanging-punctuation classification. The hanging set itself is not hardcoded here:
+  `is_hanging_punctuation` delegates to the app-wide editable list in
+  `crate::text_punctuation` (default in `TextTab.hanging_punctuation`, edited in
+  Settings → General).
 - `horizontal.rs`: DP/scored paragraph wrapping, line-width measurement, candidate
   break collection, keep-together heuristics, and target-width scoring.
 - `hyphenation.rs`: embedded Russian/English dictionaries, soft-hyphen insertion,
@@ -35,6 +38,23 @@ output images, or apply effects.
   iterative horizontal reshaping, and approximate-shape warnings.
 - `vertical.rs`: vertical column preparation, paragraph splitting, shape-aware vertical
   targets, and vertical emergency token splitting.
+- `forms.rs`: shared discrete line-break "form" logic (presets `FreeNoTree`/`Lens`/
+  `Widen`/`Narrow`, pluggable `LineWidthMetric` line widths — `GlyphWidths` measures
+  pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
+  kerning table, `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
+  edge rule — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
+  and `choose_form`). The
+  enumerator reuses the shared text segmenter (`segmentation::Segmenter::segment` after
+  `soft_hyphenate_overlong`) so it splits on the same orthographic boundaries as the
+  renderer — keep-together particles, dictionary hyphenation points, and existing hard
+  hyphens, with no emergency mid-word splits. Each block carries a `Joint` (how to join to
+  the next block on the same line vs. when wrapped) with its break cost/word-break flag. It
+  walks a break/no-break decision tree with shape pruning (a branch dies when a closed
+  line breaks the shape), and accumulates a per-break "cost" (space 0, hard hyphen 1,
+  dictionary hyphenation 2/3/4 by `classify_hyphen` quality) plus a word-break count for
+  the panel's grouping and width/cost sorting. Used by the typing panel's "Продвинутая
+  форма текста" window and re-exported as `render_next::forms` so the renderer subsystem
+  shares the same definitions.
 
 ## Contracts and invariants
 - Wrapping uses normalized text from `pipeline.rs`; inline style byte-offset remapping

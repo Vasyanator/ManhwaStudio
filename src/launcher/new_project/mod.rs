@@ -14,6 +14,8 @@ pub mod batch_processing;
 pub mod open_source;
 pub mod project_io;
 pub mod quick_download;
+pub mod reline;
+pub mod reline_models;
 pub mod ribbon;
 pub mod stitching;
 pub mod waifu2x;

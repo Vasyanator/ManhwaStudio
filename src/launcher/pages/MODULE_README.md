@@ -21,8 +21,8 @@ state arrives.
 - `base.rs`: shared slide/fade transition runtime, clipped page layer creation, common page shell,
   back button, and `PageNavAction`.
 - `open_page.rs`: projects-root title/chapter scanning, `_unsaved` chapter detection, project
-  validation through `ProjectValidationState`, open selection creation, and last-selection
-  persistence in `user_config.json`.
+  validation through `ProjectValidationState`, open selection creation, last opened title
+  persistence, and per-title last opened chapter persistence in `user_config.json`.
 - `import_page.rs`: `.mschapter` metadata read, editable target title/chapter form, archive
   extraction into the projects root, safe path validation, and optional open-after-import action.
 - `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and

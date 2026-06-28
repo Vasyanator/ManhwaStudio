@@ -12,8 +12,9 @@ FILE HEADER (cleaning/tools/zamazka.rs)
   - Для пипетки base-страница под курсором предварительно подгружается в фоне на каждом кадре,
     чтобы цвет можно было взять до первого рисования на странице.
   - Прямоугольный режим формирует scene-rect и вставляет chunk через `replace_overlay_region`.
-  - Для `Ctrl+ЛКМ` (временный прямоугольник) инструмент блокирует zoom CanvasView на эту
-    комбинацию, чтобы не конфликтовать с zoom-drag.
+  - Для `Ctrl+ЛКМ` (временный прямоугольник) и `Ctrl+Shift+ЛКМ` (временное прямоугольное
+    стирание) инструмент блокирует zoom CanvasView на эту комбинацию, чтобы не конфликтовать с
+    zoom-drag.
 - Потоки:
   - Отдельный worker загружает base-изображения страниц для пипетки, чтобы не блокировать GUI.
 */
@@ -54,6 +55,7 @@ pub struct ZamazkaTool {
     mode: ZamazkaMode,
     temporary_erase: bool,
     rect_erase: bool,
+    rect_stroke_erase: bool,
     rect_start: Option<StrokePoint>,
     rect_current: Option<StrokePoint>,
     touched_pages: HashSet<usize>,
@@ -85,6 +87,7 @@ impl Default for ZamazkaTool {
             mode: ZamazkaMode::Brush,
             temporary_erase: false,
             rect_erase: false,
+            rect_stroke_erase: false,
             rect_start: None,
             rect_current: None,
             touched_pages: HashSet::new(),
@@ -250,7 +253,7 @@ impl ZamazkaTool {
         if target.w == 0 || target.h == 0 {
             return;
         }
-        let fill = if self.rect_erase {
+        let fill = if self.rect_stroke_erase {
             Color32::TRANSPARENT
         } else {
             self.color
@@ -316,6 +319,7 @@ impl CleaningTool for ZamazkaTool {
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
         self.brush_base.set_space_pan_active(false);
         self.brush_base.cancel_scratch_stroke();
+        self.rect_stroke_erase = false;
         self.rect_start = None;
         self.rect_current = None;
     }
@@ -401,6 +405,7 @@ impl CleaningTool for ZamazkaTool {
         ui.label("ПКМ: взять цвет");
         ui.label("Shift + ЛКМ: временный ластик");
         ui.label("Ctrl + ЛКМ: прямоугольник");
+        ui.label("Ctrl + Shift + ЛКМ: стереть прямоугольник");
         ui.label("Shift + колесо: размер кисти");
         ui.label("- / =: размер кисти");
     }
@@ -499,6 +504,8 @@ impl CleaningTool for ZamazkaTool {
             return;
         }
         if point.modifiers.ctrl || self.mode == ZamazkaMode::Rect {
+            self.rect_stroke_erase = point.modifiers.ctrl && point.modifiers.shift
+                || self.mode == ZamazkaMode::Rect && self.rect_erase;
             self.rect_start = Some(point);
             self.rect_current = Some(point);
             return;
@@ -559,6 +566,7 @@ impl CleaningTool for ZamazkaTool {
     fn stroke_end(&mut self, canvas: &mut CanvasView) {
         if self.rect_start.is_some() {
             self.commit_rect(canvas);
+            self.rect_stroke_erase = false;
             self.rect_start = None;
             self.rect_current = None;
         }

@@ -17,36 +17,35 @@ Worker flow:
 - `worker_loop` receives `WorkerCommand::Detect` and runs `run_detect_batch`.
 - `run_detect_batch` processes pages sequentially in background and emits progress.
 
-Backend helpers:
+Backend helpers (v2 framed IPC):
 - `detect_page_classic` builds both rects and a real binary `mask_alpha` from accepted
   connected components, so classic mode uses the same editable mask pipeline as AI mode.
-- `detect_page_paddle_ocr` calls backend `POST /textdetector/paddle/detect`.
-- `detect_page_ai_ctd` calls backend `POST /textdetector/ctd/detect`.
-- `detect_page_surya` calls backend `POST /textdetector/surya/detect`.
+- `detect_page_paddle_ocr` calls backend `textdetector.paddle` over the v2 frame protocol.
+- `detect_page_ai_ctd` calls backend `textdetector.ctd` over the v2 frame protocol.
+- `detect_page_surya` calls backend `textdetector.surya` over the v2 frame protocol.
 - `detect_paddle_mask_for_image` / `detect_ai_ctd_mask_for_image` reuse the same backend
-  contracts for inline region-image detection in Cleaning tools.
-- `post_json` performs HTTP request and gates backend calls with `/health`.
+  contracts for inline region-image detection in Cleaning tools (image sent as blob).
+- `ensure_v2_backend_ready` gates backend calls the same way as ocr.rs.
+- The response mask PNG comes from the response BLOB (raw bytes), not a base64 field.
 */
 
-use crate::tabs::translation::backend_health::{ai_backend_addr_text, ensure_ai_backend_healthy};
+use crate::backend_ipc::{self, CallError};
+use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
 use crate::{ai_models, config};
 use eframe::egui;
 use image::imageops::FilterType;
 use image::{ColorType, ImageEncoder};
 use serde_json::{Value, json};
-use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const DETECTOR_EVENT_POLL_BUDGET: usize = 128;
 const MAX_DETECTOR_DIM: u32 = 1600;
-const DETECTOR_BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
-const DETECTOR_BACKEND_READ_TIMEOUT: Duration = Duration::from_secs(600);
-const DETECTOR_BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-call timeout for the v2 framed backend. Mirrors the previous HTTP read
+/// timeout: model warmup + large-page detection can take a while on first use.
+const DETECTOR_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_MASK_PIXELS: usize = 100_000_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -330,7 +329,7 @@ fn run_detect_batch(
         TextDetectorRunMode::AiCtd(_)
             | TextDetectorRunMode::PaddleOcr(_)
             | TextDetectorRunMode::Surya(_)
-    ) && let Err(error) = ensure_ai_backend_healthy()
+    ) && let Err(error) = ensure_v2_backend_ready()
     {
         let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
         return;
@@ -401,6 +400,49 @@ fn ensure_detector_models_for_mode(
     }
 }
 
+/// v2 readiness gate replacing the legacy HTTP `/health` precondition. A
+/// successful `shared_client()` performs the `hello` handshake, which fails fast
+/// when the backend is not running; that failure is mapped to the same unified
+/// "backend offline" message the HTTP path showed, preserving the UX.
+fn ensure_v2_backend_ready() -> Result<(), String> {
+    backend_ipc::shared_client()
+        .map(|_| ())
+        .map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())
+}
+
+/// Issues a blocking v2 framed call for a text-detector method.
+///
+/// If `page_path` is `Some`, that path is sent as the `page_path` header field
+/// and the request blob is empty (the backend reads the file on-disk).
+/// If `page_path` is `None`, the caller supplies `image_blob` (raw PNG bytes)
+/// which go directly into the request blob (no base64).
+///
+/// Maps `CallError` to a user-facing `String`:
+/// - `Error`       → the backend error message (same behaviour as old HTTP 4xx/5xx).
+/// - `Interrupted` → transient abort; treated as a transport failure (rare here).
+/// - `Transport`   → the existing connect/framing failure path.
+fn detector_call(
+    method: &str,
+    header_fields: Value,
+    image_blob: &[u8],
+) -> Result<(Value, Vec<u8>), String> {
+    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    client
+        .call(
+            method,
+            header_fields,
+            image_blob,
+            DETECTOR_BACKEND_CALL_TIMEOUT,
+        )
+        .map_err(|err| match err {
+            CallError::Error(msg) => msg,
+            CallError::Interrupted(msg) => {
+                format!("Запрос к backend детектора прерван: {msg}")
+            }
+            CallError::Transport(msg) => msg,
+        })
+}
+
 fn detect_page_classic(path: &PathBuf) -> Result<TextDetectorPageResult, String> {
     let img = image::open(path).map_err(|err| {
         format!(
@@ -463,11 +505,16 @@ fn detect_page_paddle_ocr(
     _options: &TextDetectorPaddleOcrOptions,
 ) -> Result<TextDetectorPageResult, String> {
     ai_models::ensure_paddle_ocr_detector(&config::models_dir())?;
-    let payload = json!({
-        "page_path": path.to_string_lossy().to_string(),
+    // Send the on-disk path as a header field; blob is empty.
+    let header_fields = json!({
+        "page_path": path.to_string_lossy().as_ref(),
     });
-    let response = post_json("/textdetector/paddle/detect", &payload.to_string())?;
-    parse_backend_text_detector_response(&response, path, "Paddle")
+    let (header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_PADDLE,
+        header_fields,
+        &[],
+    )?;
+    parse_v2_text_detector_response(&header, &blob, path, "Paddle")
 }
 
 fn detect_page_ai_ctd(
@@ -475,8 +522,9 @@ fn detect_page_ai_ctd(
     options: &TextDetectorAiCtdOptions,
 ) -> Result<TextDetectorPageResult, String> {
     ai_models::ensure_comic_text_detector_torch(&config::models_dir())?;
-    let payload = json!({
-        "page_path": path.to_string_lossy().to_string(),
+    // Send the on-disk path + ctd params in the header; blob is empty.
+    let header_fields = json!({
+        "page_path": path.to_string_lossy().as_ref(),
         "params": {
             "detect_size": options.detect_size.clamp(896, 2048),
             "det_rearrange_max_batches": options.det_rearrange_max_batches.clamp(1, 64),
@@ -485,20 +533,28 @@ fn detect_page_ai_ctd(
             "font size min": options.font_size_min.clamp(-1.0, 500.0)
         }
     });
-
-    let response = post_json("/textdetector/ctd/detect", &payload.to_string())?;
-    parse_backend_text_detector_response(&response, path, "CTD")
+    let (header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_CTD,
+        header_fields,
+        &[],
+    )?;
+    parse_v2_text_detector_response(&header, &blob, path, "CTD")
 }
 
 fn detect_page_surya(
     path: &Path,
     _options: &TextDetectorSuryaOptions,
 ) -> Result<TextDetectorPageResult, String> {
-    let payload = json!({
-        "page_path": path.to_string_lossy().to_string(),
+    // Send the on-disk path as a header field; blob is empty.
+    let header_fields = json!({
+        "page_path": path.to_string_lossy().as_ref(),
     });
-    let response = post_json("/textdetector/surya/detect", &payload.to_string())?;
-    parse_backend_text_detector_response(&response, path, "Surya")
+    let (header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_SURYA,
+        header_fields,
+        &[],
+    )?;
+    parse_v2_text_detector_response(&header, &blob, path, "Surya")
 }
 
 pub(crate) fn detect_ai_ctd_mask_for_image(
@@ -510,9 +566,9 @@ pub(crate) fn detect_ai_ctd_mask_for_image(
     }
 
     ai_models::ensure_comic_text_detector_torch(&config::models_dir())?;
+    // Send the raw image bytes in the request blob (v2 protocol: no base64).
     let image_png = encode_color_image_png_rgba(image)?;
-    let payload = json!({
-        "image_base64": base64_encode(&image_png),
+    let header_fields = json!({
         "params": {
             "detect_size": options.detect_size.clamp(896, 2048),
             "det_rearrange_max_batches": options.det_rearrange_max_batches.clamp(1, 64),
@@ -522,14 +578,12 @@ pub(crate) fn detect_ai_ctd_mask_for_image(
             "mask dilate size": options.mask_dilate_size.clamp(0, 30)
         }
     });
-    let response = match post_json("/textdetector/ctd/detect", &payload.to_string()) {
-        Ok(response) => response,
-        Err(err) if should_retry_ctd_via_temp_file(&err) => {
-            post_ai_ctd_mask_via_temp_file(&image_png, options)?
-        }
-        Err(err) => return Err(err),
-    };
-    parse_ai_mask_alpha(&response)
+    let (_header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_CTD,
+        header_fields,
+        &image_png,
+    )?;
+    parse_mask_alpha_from_blob(&blob)
 }
 
 pub(crate) fn detect_paddle_mask_for_image(
@@ -541,12 +595,14 @@ pub(crate) fn detect_paddle_mask_for_image(
     }
 
     ai_models::ensure_paddle_ocr_detector(&config::models_dir())?;
+    // Send the raw image bytes in the request blob (v2 protocol: no base64).
     let image_png = encode_color_image_png_rgba(image)?;
-    let payload = json!({
-        "image_base64": base64_encode(&image_png),
-    });
-    let response = post_json("/textdetector/paddle/detect", &payload.to_string())?;
-    let (mask_size, mut mask_alpha) = parse_ai_mask_alpha(&response)?;
+    let (_header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_PADDLE,
+        json!({}),
+        &image_png,
+    )?;
+    let (mask_size, mut mask_alpha) = parse_mask_alpha_from_blob(&blob)?;
     dilate_mask_alpha(&mut mask_alpha, mask_size, options.mask_dilate_size);
     Ok((mask_size, mask_alpha))
 }
@@ -559,30 +615,28 @@ pub(crate) fn detect_surya_mask_for_image(
         return Ok(([0, 0], Vec::new()));
     }
 
+    // Send the raw image bytes in the request blob (v2 protocol: no base64).
     let image_png = encode_color_image_png_rgba(image)?;
-    let payload = json!({
-        "image_base64": base64_encode(&image_png),
-    });
-    let response = post_json("/textdetector/surya/detect", &payload.to_string())?;
-    let (mask_size, mut mask_alpha) = parse_ai_mask_alpha(&response)?;
+    let (_header, blob) = detector_call(
+        crate::backend_ipc::protocol::METHOD_TEXTDETECTOR_SURYA,
+        json!({}),
+        &image_png,
+    )?;
+    let (mask_size, mut mask_alpha) = parse_mask_alpha_from_blob(&blob)?;
     dilate_mask_alpha(&mut mask_alpha, mask_size, dilate_size);
     Ok((mask_size, mask_alpha))
 }
 
-fn parse_backend_text_detector_response(
-    response: &Value,
+/// Parses a v2 `status:"ok"` text-detector response: reads `source_size` and
+/// `blocks` from the response header, and takes the mask PNG from the RESPONSE
+/// BLOB (raw bytes, no base64). The old `mask_png_base64` field is no longer used.
+fn parse_v2_text_detector_response(
+    header: &Value,
+    mask_blob: &[u8],
     path: &Path,
     engine_name: &str,
 ) -> Result<TextDetectorPageResult, String> {
-    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        let msg = response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Неизвестная ошибка backend детектора текста.");
-        return Err(msg.to_string());
-    }
-
-    let source_size = response
+    let source_size = header
         .get("source_size")
         .and_then(Value::as_array)
         .ok_or_else(|| {
@@ -622,8 +676,7 @@ fn parse_backend_text_detector_response(
         ));
     }
 
-    let mut blocks = parse_backend_blocks(response);
-
+    let mut blocks = parse_backend_blocks(header);
     blocks.sort_by(|a, b| {
         a.y1.total_cmp(&b.y1)
             .then_with(|| a.x1.total_cmp(&b.x1))
@@ -634,8 +687,9 @@ fn parse_backend_text_detector_response(
         blocks.truncate(2500);
     }
 
-    let (mask_size, mask_alpha) =
-        parse_ai_mask_alpha(response).map_err(|err| format!("{engine_name} backend: {err}"))?;
+    // The mask PNG is in the response BLOB (raw bytes), not a base64 field.
+    let (mask_size, mask_alpha) = parse_mask_alpha_from_blob(mask_blob)
+        .map_err(|err| format!("{engine_name} backend: {err}"))?;
 
     Ok(TextDetectorPageResult {
         source_size: [source_w, source_h],
@@ -716,16 +770,13 @@ fn parse_backend_line_rect(item: &Value) -> Option<TextDetectorRect> {
     TextDetectorRect::from_xyxy(min_x, min_y, max_x, max_y)
 }
 
-fn parse_ai_mask_alpha(response: &Value) -> Result<([u32; 2], Vec<u8>), String> {
-    let Some(raw_b64) = response.get("mask_png_base64").and_then(Value::as_str) else {
-        return Err("Backend детектора текста: не найдено поле mask_png_base64".to_string());
-    };
-    let trimmed = raw_b64.trim();
-    if trimmed.is_empty() {
+/// Decodes the mask PNG from the response BLOB bytes (raw PNG, not base64).
+/// Returns `([w, h], alpha_pixels)` where each pixel is 0 or 255.
+fn parse_mask_alpha_from_blob(blob: &[u8]) -> Result<([u32; 2], Vec<u8>), String> {
+    if blob.is_empty() {
         return Ok(([0, 0], Vec::new()));
     }
-    let bytes = decode_base64_ascii(trimmed)?;
-    let image = image::load_from_memory(&bytes)
+    let image = image::load_from_memory(blob)
         .map_err(|err| {
             format!("Backend детектора текста: не удалось декодировать PNG маски: {err}")
         })?
@@ -801,259 +852,6 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
         )
         .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
     Ok(out)
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut idx = 0usize;
-    while idx + 3 <= bytes.len() {
-        let a = bytes[idx];
-        let b = bytes[idx + 1];
-        let c = bytes[idx + 2];
-        out.push(TABLE[(a >> 2) as usize] as char);
-        out.push(TABLE[(((a & 0b0000_0011) << 4) | (b >> 4)) as usize] as char);
-        out.push(TABLE[(((b & 0b0000_1111) << 2) | (c >> 6)) as usize] as char);
-        out.push(TABLE[(c & 0b0011_1111) as usize] as char);
-        idx += 3;
-    }
-    match bytes.len().saturating_sub(idx) {
-        1 => {
-            let a = bytes[idx];
-            out.push(TABLE[(a >> 2) as usize] as char);
-            out.push(TABLE[((a & 0b0000_0011) << 4) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let a = bytes[idx];
-            let b = bytes[idx + 1];
-            out.push(TABLE[(a >> 2) as usize] as char);
-            out.push(TABLE[(((a & 0b0000_0011) << 4) | (b >> 4)) as usize] as char);
-            out.push(TABLE[((b & 0b0000_1111) << 2) as usize] as char);
-            out.push('=');
-        }
-        _ => {}
-    }
-    out
-}
-
-fn should_retry_ctd_via_temp_file(error: &str) -> bool {
-    error.contains("Field 'page_path' must be a non-empty string.")
-}
-
-fn post_ai_ctd_mask_via_temp_file(
-    image_png: &[u8],
-    options: &TextDetectorAiCtdOptions,
-) -> Result<Value, String> {
-    let temp_path = build_ctd_temp_image_path();
-    fs::write(&temp_path, image_png).map_err(|err| {
-        format!(
-            "Не удалось сохранить временное изображение для CTD fallback ({}): {err}",
-            temp_path.display()
-        )
-    })?;
-
-    let payload = json!({
-        "page_path": temp_path.to_string_lossy().to_string(),
-        "params": {
-            "detect_size": options.detect_size.clamp(896, 2048),
-            "det_rearrange_max_batches": options.det_rearrange_max_batches.clamp(1, 64),
-            "font size multiplier": options.font_size_multiplier.clamp(0.1, 8.0),
-            "font size max": options.font_size_max.clamp(-1.0, 500.0),
-            "font size min": options.font_size_min.clamp(-1.0, 500.0)
-        }
-    });
-    let result = post_json("/textdetector/ctd/detect", &payload.to_string());
-    if let Err(err) = fs::remove_file(&temp_path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "WARN translation::text_detector failed to remove temp CTD file {}: {}",
-            temp_path.display(),
-            err
-        );
-    }
-    result
-}
-
-fn build_ctd_temp_image_path() -> PathBuf {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("mangafucker_ctd_region_{pid}_{millis}.png"))
-}
-
-fn decode_base64_ascii(input: &str) -> Result<Vec<u8>, String> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut cleaned = Vec::<u8>::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        cleaned.push(b);
-    }
-    if !cleaned.len().is_multiple_of(4) {
-        return Err("Невалидная base64-строка (длина не кратна 4).".to_string());
-    }
-    let mut out = Vec::<u8>::with_capacity(cleaned.len() / 4 * 3);
-    let mut i = 0usize;
-    while i < cleaned.len() {
-        let c0 = cleaned[i];
-        let c1 = cleaned[i + 1];
-        let c2 = cleaned[i + 2];
-        let c3 = cleaned[i + 3];
-        let v0 = base64_val(c0).ok_or_else(|| "Невалидный символ base64.".to_string())?;
-        let v1 = base64_val(c1).ok_or_else(|| "Невалидный символ base64.".to_string())?;
-        let pad2 = c2 == b'=';
-        let pad3 = c3 == b'=';
-        let v2 = if pad2 {
-            0
-        } else {
-            base64_val(c2).ok_or_else(|| "Невалидный символ base64.".to_string())?
-        };
-        let v3 = if pad3 {
-            0
-        } else {
-            base64_val(c3).ok_or_else(|| "Невалидный символ base64.".to_string())?
-        };
-        let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
-        out.push(((n >> 16) & 0xff) as u8);
-        if !pad2 {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if !pad3 {
-            out.push((n & 0xff) as u8);
-        }
-        i += 4;
-    }
-    Ok(out)
-}
-
-fn base64_val(b: u8) -> Option<u8> {
-    match b {
-        b'A'..=b'Z' => Some(b - b'A'),
-        b'a'..=b'z' => Some(b - b'a' + 26),
-        b'0'..=b'9' => Some(b - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-fn post_json(path: &str, payload: &str) -> Result<Value, String> {
-    ensure_ai_backend_healthy()?;
-
-    let addr = ai_backend_addr_text();
-    let socket_addr = addr
-        .to_socket_addrs()
-        .map_err(|err| format!("Ошибка резолва AI backend {addr}: {err}"))?
-        .next()
-        .ok_or_else(|| format!("Не найден сокет AI backend: {addr}"))?;
-
-    let mut stream = TcpStream::connect_timeout(&socket_addr, DETECTOR_BACKEND_CONNECT_TIMEOUT)
-        .map_err(|err| format!("Не удалось подключиться к AI backend: {err}"))?;
-    stream
-        .set_read_timeout(Some(DETECTOR_BACKEND_READ_TIMEOUT))
-        .map_err(|err| format!("Не удалось выставить read timeout AI backend: {err}"))?;
-    stream
-        .set_write_timeout(Some(DETECTOR_BACKEND_WRITE_TIMEOUT))
-        .map_err(|err| format!("Не удалось выставить write timeout AI backend: {err}"))?;
-
-    let req_head = format!(
-        "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-        ai_backend_addr_text(),
-        payload.len()
-    );
-    stream
-        .write_all(req_head.as_bytes())
-        .map_err(|err| format!("Не удалось отправить HTTP-заголовки AI backend: {err}"))?;
-    stream
-        .write_all(payload.as_bytes())
-        .map_err(|err| format!("Не удалось отправить HTTP-body AI backend: {err}"))?;
-
-    let (status_code, body) = read_http_response(&mut stream)?;
-    let body_text = String::from_utf8_lossy(&body).to_string();
-    let json_value: Value = serde_json::from_str(&body_text)
-        .map_err(|err| format!("AI backend вернул не-JSON ({status_code}): {err}"))?;
-
-    if status_code >= 400 {
-        let msg = json_value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Ошибка AI backend.");
-        return Err(format!("AI backend HTTP {status_code}: {msg}"));
-    }
-
-    Ok(json_value)
-}
-
-fn read_http_response(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
-    let mut raw = Vec::with_capacity(8 * 1024);
-    let mut scratch = [0u8; 4096];
-    let mut header_end: Option<usize> = None;
-
-    while header_end.is_none() {
-        let n = stream
-            .read(&mut scratch)
-            .map_err(|err| format!("Не удалось прочитать ответ AI backend: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&scratch[..n]);
-        header_end = raw.windows(4).position(|chunk| chunk == b"\r\n\r\n");
-    }
-
-    if raw.is_empty() {
-        return Err("AI backend вернул пустой HTTP-ответ.".to_string());
-    }
-
-    let Some(header_end) = header_end else {
-        return Err("Некорректный HTTP-ответ AI backend (нет заголовков).".to_string());
-    };
-    let head = String::from_utf8_lossy(&raw[..header_end]);
-    let status_line = head.lines().next().unwrap_or("HTTP/1.1 500");
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|part| part.parse::<u16>().ok())
-        .ok_or_else(|| format!("Не удалось распарсить HTTP-статус AI backend: {status_line}"))?;
-
-    let content_length = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.trim().eq_ignore_ascii_case("content-length") {
-            return None;
-        }
-        value.trim().parse::<usize>().ok()
-    });
-    let Some(content_length) = content_length else {
-        return Err("AI backend не прислал Content-Length, ответ не может быть завершён без закрытия сокета.".to_string());
-    };
-
-    let body_start = header_end + 4;
-    let mut body = raw[body_start..].to_vec();
-    while body.len() < content_length {
-        let n = stream
-            .read(&mut scratch)
-            .map_err(|err| format!("Не удалось дочитать body AI backend: {err}"))?;
-        if n == 0 {
-            return Err(format!(
-                "AI backend закрыл соединение до полного body (получено {} из {} байт).",
-                body.len(),
-                content_length
-            ));
-        }
-        body.extend_from_slice(&scratch[..n]);
-    }
-    body.truncate(content_length);
-    Ok((status_code, body))
 }
 
 fn otsu_threshold(gray: &[u8]) -> u8 {
@@ -1262,4 +1060,301 @@ fn extract_components_as_rects_and_mask(
         rects.truncate(2500);
     }
     (rects, mask_alpha)
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -------------------------------------------------------------------------
+    // parse_mask_alpha_from_blob
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn empty_blob_returns_empty_mask() {
+        let (size, alpha) = parse_mask_alpha_from_blob(&[]).expect("empty blob");
+        assert_eq!(size, [0, 0]);
+        assert!(alpha.is_empty());
+    }
+
+    #[test]
+    fn invalid_blob_returns_error() {
+        let result = parse_mask_alpha_from_blob(b"not a png at all");
+        assert!(result.is_err(), "non-PNG blob must return Err");
+    }
+
+    /// Build a minimal 1×1 grayscale PNG in memory and check that
+    /// `parse_mask_alpha_from_blob` decodes it correctly.
+    #[test]
+    fn valid_png_blob_decoded_to_mask() {
+        // 1x1 white pixel (luma 255) => normalized to 255.
+        let png = make_gray_png(1, 1, 255);
+        let (size, alpha) = parse_mask_alpha_from_blob(&png).expect("1x1 white PNG");
+        assert_eq!(size, [1, 1]);
+        assert_eq!(alpha, vec![255u8]);
+    }
+
+    #[test]
+    fn mask_blob_normalizes_non_zero_to_255() {
+        // 1x1 pixel with value 42 (non-zero, non-255) => 255.
+        let png = make_gray_png(1, 1, 42);
+        let (size, alpha) = parse_mask_alpha_from_blob(&png).expect("1x1 gray42 PNG");
+        assert_eq!(size, [1, 1]);
+        assert_eq!(
+            alpha,
+            vec![255u8],
+            "any non-zero pixel must normalize to 255"
+        );
+    }
+
+    #[test]
+    fn mask_blob_zero_pixel_stays_zero() {
+        // 1x1 pixel with value 0 => stays 0.
+        let png = make_gray_png(1, 1, 0);
+        let (size, alpha) = parse_mask_alpha_from_blob(&png).expect("1x1 black PNG");
+        assert_eq!(size, [1, 1]);
+        assert_eq!(alpha, vec![0u8]);
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_v2_text_detector_response — header field shapes
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn v2_response_parses_source_size_and_blocks() {
+        let header = json!({
+            "source_size": [800, 1200],
+            "blocks": [
+                {"x1": 10.0, "y1": 20.0, "x2": 100.0, "y2": 80.0},
+                {"x1": 5.0,  "y1": 5.0,  "x2": 50.0,  "y2": 50.0}
+            ]
+        });
+        // Use a tiny valid 1x1 white PNG as the mask blob.
+        let mask_blob = make_gray_png(1, 1, 255);
+        let path = Path::new("/fake/page.png");
+        let result = parse_v2_text_detector_response(&header, &mask_blob, path, "Test")
+            .expect("v2 response parsing");
+        assert_eq!(result.source_size, [800, 1200]);
+        // Blocks sorted by y1 then x1: block2 (y=5) before block1 (y=20).
+        assert_eq!(result.blocks.len(), 2);
+        assert!((result.blocks[0].y1 - 5.0).abs() < f32::EPSILON);
+        assert!((result.blocks[1].y1 - 20.0).abs() < f32::EPSILON);
+        assert_eq!(result.mask_size, [1, 1]);
+        assert_eq!(result.mask_alpha, vec![255u8]);
+    }
+
+    #[test]
+    fn v2_response_falls_back_to_lines_when_blocks_empty() {
+        // `blocks` absent — should fall back to `lines` (Surya-style).
+        let header = json!({
+            "source_size": [640, 480],
+            "lines": [
+                {"bbox": [0.0, 0.0, 100.0, 50.0]},
+                {"bbox": [10.0, 60.0, 200.0, 110.0]}
+            ]
+        });
+        let mask_blob = make_gray_png(1, 1, 0);
+        let path = Path::new("/fake/page.png");
+        let result = parse_v2_text_detector_response(&header, &mask_blob, path, "Surya")
+            .expect("lines fallback");
+        assert_eq!(result.source_size, [640, 480]);
+        assert_eq!(result.blocks.len(), 2);
+    }
+
+    #[test]
+    fn v2_response_missing_source_size_returns_error() {
+        let header = json!({ "blocks": [] });
+        let mask_blob = make_gray_png(1, 1, 0);
+        let path = Path::new("/fake/page.png");
+        let err = parse_v2_text_detector_response(&header, &mask_blob, path, "Test")
+            .expect_err("missing source_size must error");
+        assert!(
+            err.contains("source_size"),
+            "error must mention source_size: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_response_zero_source_size_returns_error() {
+        let header = json!({ "source_size": [0, 0], "blocks": [] });
+        let mask_blob = make_gray_png(1, 1, 0);
+        let path = Path::new("/fake/page.png");
+        let err = parse_v2_text_detector_response(&header, &mask_blob, path, "Test")
+            .expect_err("zero source_size must error");
+        assert!(!err.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // header field shapes per method
+    // -------------------------------------------------------------------------
+
+    /// CTD page-path call must carry `page_path` and `params` in the header;
+    /// blob is empty. This test validates the *shape* of the header_fields Value
+    /// that `detect_page_ai_ctd` would build (extracted here so it can run
+    /// without a live backend connection).
+    #[test]
+    fn ctd_page_path_header_has_params_and_path() {
+        let options = TextDetectorAiCtdOptions::default();
+        let path = Path::new("/some/page.png");
+        // Mirror the header_fields built in detect_page_ai_ctd.
+        let header_fields = json!({
+            "page_path": path.to_string_lossy().as_ref(),
+            "params": {
+                "detect_size": options.detect_size.clamp(896, 2048),
+                "det_rearrange_max_batches": options.det_rearrange_max_batches.clamp(1, 64),
+                "font size multiplier": options.font_size_multiplier.clamp(0.1, 8.0),
+                "font size max": options.font_size_max.clamp(-1.0, 500.0),
+                "font size min": options.font_size_min.clamp(-1.0, 500.0)
+            }
+        });
+        assert_eq!(
+            header_fields["page_path"].as_str(),
+            Some("/some/page.png"),
+            "CTD page-path header must carry page_path"
+        );
+        assert!(
+            header_fields["params"].is_object(),
+            "CTD header must carry params object"
+        );
+        assert_eq!(
+            header_fields["params"]["detect_size"].as_i64(),
+            Some(1280),
+            "default detect_size must be 1280"
+        );
+    }
+
+    /// Paddle page-path call: header has `page_path`, no `params`.
+    #[test]
+    fn paddle_page_path_header_shape() {
+        let path = Path::new("/some/page.png");
+        let header_fields = json!({
+            "page_path": path.to_string_lossy().as_ref(),
+        });
+        assert_eq!(header_fields["page_path"].as_str(), Some("/some/page.png"));
+        assert!(
+            header_fields.get("params").is_none(),
+            "Paddle has no params"
+        );
+    }
+
+    /// Surya page-path call: header has `page_path`, no `params`.
+    #[test]
+    fn surya_page_path_header_shape() {
+        let path = Path::new("/surya/test.png");
+        let header_fields = json!({
+            "page_path": path.to_string_lossy().as_ref(),
+        });
+        assert_eq!(header_fields["page_path"].as_str(), Some("/surya/test.png"));
+    }
+
+    /// CTD inline-image call (for Cleaning tools): header has `params` but NO
+    /// `page_path`; the image bytes go in the blob.
+    #[test]
+    fn ctd_inline_image_header_has_no_page_path() {
+        let options = TextDetectorAiCtdOptions::default();
+        let header_fields = json!({
+            "params": {
+                "detect_size": options.detect_size.clamp(896, 2048),
+                "det_rearrange_max_batches": options.det_rearrange_max_batches.clamp(1, 64),
+                "font size multiplier": options.font_size_multiplier.clamp(0.1, 8.0),
+                "font size max": options.font_size_max.clamp(-1.0, 500.0),
+                "font size min": options.font_size_min.clamp(-1.0, 500.0),
+                "mask dilate size": options.mask_dilate_size.clamp(0, 30)
+            }
+        });
+        assert!(
+            header_fields.get("page_path").is_none(),
+            "CTD inline-image request must NOT have page_path"
+        );
+        assert!(
+            header_fields["params"]["mask dilate size"]
+                .as_i64()
+                .is_some()
+        );
+    }
+
+    /// Paddle inline-image call: empty header `{}` — image bytes go in the blob.
+    #[test]
+    fn paddle_inline_image_header_is_empty() {
+        let header_fields = json!({});
+        assert!(header_fields.get("page_path").is_none());
+        assert!(header_fields.get("params").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_backend_blocks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_blocks_xyxy() {
+        let response = json!({
+            "blocks": [
+                {"x1": 1.0, "y1": 2.0, "x2": 10.0, "y2": 20.0}
+            ]
+        });
+        let blocks = parse_backend_blocks(&response);
+        assert_eq!(blocks.len(), 1);
+        assert!((blocks[0].x1 - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_blocks_falls_back_to_lines_bbox() {
+        let response = json!({
+            "lines": [
+                {"bbox": [5.0, 10.0, 50.0, 100.0]}
+            ]
+        });
+        let blocks = parse_backend_blocks(&response);
+        assert_eq!(blocks.len(), 1);
+        assert!((blocks[0].x1 - 5.0).abs() < f32::EPSILON);
+        assert!((blocks[0].x2 - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_blocks_falls_back_to_lines_polygon() {
+        let response = json!({
+            "lines": [
+                {"polygon": [[0.0, 0.0], [100.0, 0.0], [100.0, 50.0], [0.0, 50.0]]}
+            ]
+        });
+        let blocks = parse_backend_blocks(&response);
+        assert_eq!(blocks.len(), 1);
+        assert!((blocks[0].x2 - 100.0).abs() < f32::EPSILON);
+        assert!((blocks[0].y2 - 50.0).abs() < f32::EPSILON);
+    }
+
+    // -------------------------------------------------------------------------
+    // ensure_v2_backend_ready error message
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn backend_ready_error_uses_offline_message() {
+        // shared_client() will fail (no backend running in tests).
+        let result = ensure_v2_backend_ready();
+        if let Err(msg) = result {
+            assert_eq!(
+                msg, AI_BACKEND_OFFLINE_ERROR,
+                "offline error must use the canonical constant"
+            );
+        }
+        // If shared_client() somehow succeeds (live backend in CI), that's fine too.
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper: build a minimal grayscale PNG in memory (no file I/O).
+    // -------------------------------------------------------------------------
+    fn make_gray_png(width: u32, height: u32, pixel_value: u8) -> Vec<u8> {
+        use image::{GrayImage, Luma};
+        let img = GrayImage::from_pixel(width, height, Luma([pixel_value]));
+        let mut buf = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode test PNG");
+        buf
+    }
 }

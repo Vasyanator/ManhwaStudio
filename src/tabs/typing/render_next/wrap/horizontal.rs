@@ -5,13 +5,14 @@ Purpose:
 DP-ядро horizontal wrap нового рендера typing.
 
 Main responsibilities:
-- разбивать paragraph на wrap segments/blocks с языковыми эвристиками;
 - подбирать line breaks через scoring + dictionary/emergency fallback;
 - отдавать стабильный horizontal wrap для free и shape профилей.
 
+Разбивка абзаца на блоки (`Block`/`Joint`) и языковые правила связывания/переноса
+живут в `crate::tabs::typing::segmentation` (см. `Segmenter::segment`); здесь
+остаётся только DP-подбор переносов поверх готовых блоков.
+
 Source:
-- `build_wrap_segments`
-- `build_wrap_blocks`
 - `collect_line_break_candidates`
 - `wrap_text_with_targets*`
 - `violates_tree_width_rule`
@@ -19,41 +20,24 @@ Source:
 */
 
 use super::hyphenation::{
-    HyphenationDictionaries, append_wrapped_hyphen, find_dictionary_split_index,
-    find_emergency_split_index,
+    append_wrapped_hyphen, find_dictionary_split_index, find_emergency_split_index,
 };
 use super::{
     CONSERVATIVE_DICTIONARY_BREAK_PENALTY, EMERGENCY_BREAK_PENALTY,
     MODERATE_TREE_CONTRACTING_RATIO, MODERATE_TREE_EXPANDING_RATIO, SHORT_HYPHEN_TAIL_PENALTY,
     SOFT_HYPHEN, SOFT_WRAP_WIDTH_TOLERANCE, WordBreakPolicy, is_hanging_punctuation,
 };
+use crate::tabs::typing::segmentation::{
+    BindingMode, Block, HyphenationDictionaries, SegmentOptions, build_line_text_and_units,
+    count_layout_units, with_default_segmenter,
+};
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
-use std::collections::{HashMap, VecDeque};
-
-#[derive(Debug, Clone)]
-struct WrapSegment {
-    text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum WrapBreakKind {
-    None,
-    Space(String),
-    Hyphen,
-    HardHyphen,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct WrapBlock {
-    text: String,
-    break_kind: WrapBreakKind,
-    unit_count: usize,
-}
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 struct LineBreakCandidate {
     consumed_blocks: usize,
-    split_remainder: Option<WrapBlock>,
+    split_remainder: Option<Block>,
     line_text: String,
     line_units: usize,
     break_penalty: f32,
@@ -157,7 +141,7 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WrapMemoKey {
-    remaining_blocks: Vec<WrapBlock>,
+    remaining_blocks: Vec<Block>,
     line_idx: usize,
     prev_line_units: Option<usize>,
     prev_line_width_px: Option<u32>,
@@ -206,7 +190,7 @@ impl WrapSettings<'_> {
 
 #[derive(Debug, Clone)]
 struct SolveState {
-    remaining_blocks: Vec<WrapBlock>,
+    remaining_blocks: Vec<Block>,
     line_idx: usize,
     prev_line_units: Option<usize>,
     prev_line_width_px: Option<u32>,
@@ -242,17 +226,6 @@ pub(super) fn wrap_text_with_targets_scored(
         lines: out,
         used_approximate_shape_fallback,
     }
-}
-
-pub(super) fn count_layout_units(text: &str, hanging_punctuation: bool) -> usize {
-    text.chars()
-        .filter(|&ch| {
-            ch != SOFT_HYPHEN
-                && ch != '\n'
-                && ch != '\r'
-                && (!hanging_punctuation || !is_hanging_punctuation(ch))
-        })
-        .count()
 }
 
 pub(super) fn estimate_line_capacity_units(
@@ -294,12 +267,18 @@ fn wrap_paragraph_with_targets_scored(
     global_line_idx: &mut usize,
     scoring: &mut WrapScoringContext<'_, '_>,
 ) -> WrapTextResult {
-    let blocks = build_wrap_blocks(
-        paragraph,
-        settings.hanging_punctuation,
-        settings.preserve_edge_spaces,
-        settings.word_break_policy.is_some(),
-    );
+    let blocks = with_default_segmenter(|seg| {
+        seg.segment(
+            paragraph,
+            SegmentOptions {
+                hanging_punctuation: settings.hanging_punctuation,
+                preserve_edge_spaces: settings.preserve_edge_spaces,
+                allow_hard_hyphen_breaks: settings.word_break_policy.is_some(),
+                // Врапер склеивает служебные слова: гарантия против сиротливых предлогов.
+                binding: BindingMode::Glue,
+            },
+        )
+    });
     let start_line_idx = *global_line_idx;
     let mut memo = HashMap::<WrapMemoKey, Option<WrapParagraphSolution>>::new();
     let best = solve_wrap_paragraph_dp(
@@ -514,7 +493,7 @@ fn solve_wrap_paragraph_dp(
 }
 
 fn approximate_wrap_paragraph_to_shape(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     start_line_idx: usize,
     settings: WrapSettings<'_>,
     scoring: &mut WrapScoringContext<'_, '_>,
@@ -560,7 +539,7 @@ fn approximate_wrap_paragraph_to_shape(
 }
 
 fn select_approximate_line_break_candidate(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     max_units: usize,
     line_idx: usize,
     prev_line_width_px: Option<u32>,
@@ -609,12 +588,11 @@ fn select_approximate_line_break_candidate(
 }
 
 fn build_overflow_block_candidate(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     hanging_punctuation: bool,
 ) -> Option<LineBreakCandidate> {
     let block = blocks.first()?;
-    let wraps_at_soft_hyphen =
-        blocks.len() > 1 && matches!(block.break_kind, WrapBreakKind::Hyphen);
+    let wraps_at_soft_hyphen = blocks.len() > 1 && block.joint.is_soft_hyphen();
     let line_text = build_line_text_and_units(&blocks[..1], wraps_at_soft_hyphen).0;
     Some(LineBreakCandidate {
         consumed_blocks: 1,
@@ -626,7 +604,7 @@ fn build_overflow_block_candidate(
 }
 
 fn collect_line_break_candidates(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     max_units: usize,
 ) -> Vec<LineBreakCandidate> {
     let mut out = Vec::<LineBreakCandidate>::new();
@@ -651,7 +629,7 @@ fn collect_line_break_candidates(
 }
 
 fn build_emergency_break_candidate(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     max_units: usize,
     hanging_punctuation: bool,
 ) -> Option<LineBreakCandidate> {
@@ -666,9 +644,9 @@ fn build_emergency_break_candidate(
     let line_units = count_layout_units(head.as_str(), hanging_punctuation);
     Some(LineBreakCandidate {
         consumed_blocks: 1,
-        split_remainder: Some(WrapBlock {
+        split_remainder: Some(Block {
             text: tail,
-            break_kind: block.break_kind.clone(),
+            joint: block.joint.clone(),
             unit_count: count_layout_units(&block.text[split_at..], hanging_punctuation),
         }),
         line_text: append_wrapped_hyphen(head.as_str()),
@@ -678,7 +656,7 @@ fn build_emergency_break_candidate(
 }
 
 fn build_dictionary_break_candidate(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     max_units: usize,
     target_width_px: f32,
     hanging_punctuation: bool,
@@ -703,9 +681,9 @@ fn build_dictionary_break_candidate(
     let line_units = count_layout_units(head.as_str(), hanging_punctuation);
     Some(LineBreakCandidate {
         consumed_blocks: 1,
-        split_remainder: Some(WrapBlock {
+        split_remainder: Some(Block {
             text: tail,
-            break_kind: block.break_kind.clone(),
+            joint: block.joint.clone(),
             unit_count: count_layout_units(&block.text[split_at..], hanging_punctuation),
         }),
         line_text,
@@ -744,14 +722,14 @@ fn hyphen_tail_penalty(tail: &str) -> f32 {
     }
 }
 
-fn is_hyphenatable_wrap_block(block: &WrapBlock) -> bool {
+fn is_hyphenatable_wrap_block(block: &Block) -> bool {
     !block.text.chars().any(char::is_whitespace)
 }
 
 fn apply_line_break_candidate(
-    blocks: &[WrapBlock],
+    blocks: &[Block],
     candidate: &LineBreakCandidate,
-) -> Vec<WrapBlock> {
+) -> Vec<Block> {
     let mut remaining = blocks[candidate.consumed_blocks..].to_vec();
     if let Some(remainder) = candidate.split_remainder.as_ref() {
         remaining.insert(0, remainder.clone());
@@ -868,356 +846,6 @@ fn shape_monotonic_phase(settings: WrapSettings<'_>, line_idx: usize) -> ShapeMo
     }
 }
 
-fn build_wrap_segments(paragraph: &str, preserve_edge_spaces: bool) -> VecDeque<WrapSegment> {
-    let tokens = tokenize_paragraph(paragraph);
-    let mut out = VecDeque::<WrapSegment>::new();
-    let mut idx = 0usize;
-
-    while idx < tokens.len() && tokens[idx].chars().all(char::is_whitespace) {
-        if preserve_edge_spaces {
-            out.push_back(WrapSegment {
-                text: tokens[idx].clone(),
-            });
-        }
-        idx += 1;
-    }
-
-    let mut current_text = String::new();
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if token.chars().all(char::is_whitespace) {
-            idx += 1;
-            continue;
-        }
-
-        current_text.push_str(token);
-
-        let Some(space) = tokens.get(idx + 1) else {
-            break;
-        };
-        if !space.chars().all(char::is_whitespace) {
-            idx += 1;
-            continue;
-        }
-
-        let Some(next_word) = tokens.get(idx + 2) else {
-            current_text.push_str(space.as_str());
-            break;
-        };
-
-        current_text.push_str(space.as_str());
-        if should_keep_words_together(token, next_word.as_str()) {
-            idx += 2;
-            continue;
-        }
-
-        out.push_back(WrapSegment {
-            text: std::mem::take(&mut current_text),
-        });
-        idx += 2;
-    }
-
-    if !current_text.is_empty() {
-        out.push_back(WrapSegment { text: current_text });
-    }
-
-    out
-}
-
-fn build_wrap_blocks(
-    paragraph: &str,
-    hanging_punctuation: bool,
-    preserve_edge_spaces: bool,
-    allow_hard_hyphen_breaks: bool,
-) -> Vec<WrapBlock> {
-    let segments = build_wrap_segments(paragraph, preserve_edge_spaces);
-    let mut out = Vec::<WrapBlock>::new();
-
-    let segment_count = segments.len();
-    for (segment_idx, segment) in segments.into_iter().enumerate() {
-        if preserve_edge_spaces && segment.text.chars().all(char::is_whitespace) {
-            out.push(WrapBlock {
-                text: segment.text.clone(),
-                break_kind: WrapBreakKind::None,
-                unit_count: count_layout_units(segment.text.as_str(), hanging_punctuation),
-            });
-            continue;
-        }
-
-        let trimmed_text = segment.text.trim_end_matches(char::is_whitespace);
-        if trimmed_text.is_empty() {
-            continue;
-        }
-
-        let trailing_ws = segment
-            .text
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_whitespace())
-            .count();
-        let separator = if trailing_ws == 0 {
-            None
-        } else {
-            Some(" ".repeat(trailing_ws))
-        };
-
-        let tail_break_kind = if preserve_edge_spaces && segment_idx + 1 == segment_count {
-            WrapBreakKind::None
-        } else if let Some(space) = separator.as_ref() {
-            WrapBreakKind::Space(space.clone())
-        } else {
-            WrapBreakKind::None
-        };
-        let parts =
-            split_segment_into_wrap_parts(trimmed_text, tail_break_kind, allow_hard_hyphen_breaks);
-        for (part, break_kind) in parts {
-            out.push(WrapBlock {
-                unit_count: count_layout_units(part.as_str(), hanging_punctuation),
-                text: part,
-                break_kind,
-            });
-        }
-
-        if preserve_edge_spaces
-            && segment_idx + 1 == segment_count
-            && let Some(space) = separator
-        {
-            out.push(WrapBlock {
-                text: space.clone(),
-                break_kind: WrapBreakKind::None,
-                unit_count: count_layout_units(space.as_str(), hanging_punctuation),
-            });
-        }
-    }
-
-    out
-}
-
-fn split_segment_into_wrap_parts(
-    text: &str,
-    tail_break_kind: WrapBreakKind,
-    allow_hard_hyphen_breaks: bool,
-) -> Vec<(String, WrapBreakKind)> {
-    let mut out = Vec::<(String, WrapBreakKind)>::new();
-    let mut part_start = 0usize;
-
-    for (idx, ch) in text.char_indices() {
-        if ch == SOFT_HYPHEN {
-            if part_start < idx {
-                out.push((text[part_start..idx].to_string(), WrapBreakKind::Hyphen));
-            }
-            part_start = idx + ch.len_utf8();
-            continue;
-        }
-
-        if allow_hard_hyphen_breaks && is_hard_hyphen_wrap_boundary(text, idx, ch) {
-            let next_idx = idx + ch.len_utf8();
-            out.push((
-                text[part_start..next_idx].to_string(),
-                WrapBreakKind::HardHyphen,
-            ));
-            part_start = next_idx;
-        }
-    }
-
-    if part_start < text.len() {
-        out.push((text[part_start..].to_string(), tail_break_kind));
-    } else if let Some((_, break_kind)) = out.last_mut() {
-        *break_kind = tail_break_kind;
-    }
-
-    out
-}
-
-fn is_hard_hyphen_wrap_boundary(text: &str, idx: usize, ch: char) -> bool {
-    if !is_inline_hard_hyphen_break_char(ch) || text.contains("://") || text.contains('@') {
-        return false;
-    }
-
-    let next_idx = idx + ch.len_utf8();
-    if idx == 0 || next_idx >= text.len() {
-        return false;
-    }
-
-    let left = text[..idx].chars().next_back();
-    let right = text[next_idx..].chars().next();
-    let (Some(left), Some(right)) = (left, right) else {
-        return false;
-    };
-
-    !left.is_whitespace()
-        && !right.is_whitespace()
-        && (left.is_alphabetic() || right.is_alphabetic())
-}
-
-fn is_inline_hard_hyphen_break_char(ch: char) -> bool {
-    matches!(ch, '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2212}')
-}
-
-fn build_line_text_and_units(blocks: &[WrapBlock], wraps_here: bool) -> (String, usize) {
-    let mut line = String::new();
-    let mut units = 0usize;
-
-    for (idx, block) in blocks.iter().enumerate() {
-        line.push_str(block.text.as_str());
-        units = units.saturating_add(block.unit_count);
-        let is_last = idx + 1 == blocks.len();
-        if !is_last {
-            if let WrapBreakKind::Space(space) = &block.break_kind {
-                line.push_str(space.as_str());
-                units = units.saturating_add(space.chars().count());
-            }
-        } else if wraps_here {
-            match block.break_kind {
-                WrapBreakKind::Hyphen => line.push('-'),
-                WrapBreakKind::None | WrapBreakKind::Space(_) | WrapBreakKind::HardHyphen => {}
-            }
-        }
-    }
-
-    (line, units)
-}
-
-fn should_keep_words_together(left_token: &str, right_token: &str) -> bool {
-    let left = normalize_binding_token(left_token);
-    let right = normalize_binding_token(right_token);
-    if left.is_empty() || right.is_empty() {
-        return false;
-    }
-
-    is_nonbreaking_prefix_word(left.as_str())
-        || is_nonbreaking_abbreviation(left_token)
-        || is_nonbreaking_suffix_particle(right.as_str())
-        || is_numeric_measure_pair(left_token, right_token)
-        || (left.chars().count() == 1 && left.chars().all(char::is_alphabetic))
-}
-
-fn normalize_binding_token(token: &str) -> String {
-    token
-        .trim_matches(|ch: char| !ch.is_alphabetic() && ch != SOFT_HYPHEN)
-        .to_lowercase()
-}
-
-fn is_nonbreaking_prefix_word(word: &str) -> bool {
-    matches!(
-        word,
-        "не" | "ни"
-            | "без"
-            | "безо"
-            | "для"
-            | "при"
-            | "про"
-            | "через"
-            | "перед"
-            | "пред"
-            | "но"
-            | "да"
-            | "или"
-            | "либо"
-            | "в"
-            | "во"
-            | "к"
-            | "ко"
-            | "с"
-            | "со"
-            | "у"
-            | "о"
-            | "об"
-            | "обо"
-            | "от"
-            | "до"
-            | "по"
-            | "за"
-            | "подо"
-            | "из"
-            | "изо"
-            | "на"
-            | "над"
-            | "под"
-    )
-}
-
-fn is_nonbreaking_suffix_particle(word: &str) -> bool {
-    matches!(word, "же" | "ли" | "ль" | "бы" | "б" | "ка" | "де" | "то")
-}
-
-fn is_nonbreaking_abbreviation(token: &str) -> bool {
-    let trimmed = token.trim();
-    if !trimmed.ends_with('.') {
-        return false;
-    }
-    let core = trimmed
-        .trim_end_matches('.')
-        .trim_matches(|ch: char| !ch.is_alphabetic())
-        .to_lowercase();
-    matches!(
-        core.as_str(),
-        "г" | "стр" | "рис" | "им" | "тов" | "ул" | "д" | "кв" | "см" | "т" | "п"
-    )
-}
-
-fn is_numeric_measure_pair(left_token: &str, right_token: &str) -> bool {
-    let left = left_token
-        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\''));
-    let right = right_token
-        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '№')
-        .to_lowercase();
-    (is_numeric_token(left) || left == "№") && is_measure_or_unit_token(right.as_str())
-}
-
-fn is_numeric_token(token: &str) -> bool {
-    let compact = token
-        .trim_matches(|ch: char| !ch.is_alphanumeric())
-        .replace(',', ".")
-        .replace(' ', "");
-    !compact.is_empty() && compact.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
-}
-
-fn is_measure_or_unit_token(token: &str) -> bool {
-    matches!(
-        token,
-        "кг" | "г"
-            | "мг"
-            | "л"
-            | "мл"
-            | "м"
-            | "см"
-            | "мм"
-            | "км"
-            | "стр"
-            | "с"
-            | "мин"
-            | "ч"
-            | "шт"
-            | "гл"
-    ) || token.starts_with("стр")
-}
-
-fn tokenize_paragraph(paragraph: &str) -> VecDeque<String> {
-    let mut tokens = VecDeque::<String>::new();
-    let mut start = 0usize;
-    let mut mode_ws: Option<bool> = None;
-
-    for (idx, ch) in paragraph.char_indices() {
-        let is_ws = ch.is_whitespace();
-        match mode_ws {
-            None => mode_ws = Some(is_ws),
-            Some(prev) if prev != is_ws => {
-                tokens.push_back(paragraph[start..idx].to_string());
-                start = idx;
-                mode_ws = Some(is_ws);
-            }
-            _ => {}
-        }
-    }
-
-    if start < paragraph.len() {
-        tokens.push_back(paragraph[start..].to_string());
-    }
-
-    tokens
-}
-
 fn measure_word_width_px(
     word: &str,
     font_system: &mut FontSystem,
@@ -1240,10 +868,19 @@ fn measure_word_width_px(
 #[cfg(test)]
 mod tests {
     use super::{
-        WrapScoringContext, WrapSettings, build_wrap_segments, count_layout_units,
-        violates_tree_width_rule, wrap_text_with_targets_scored,
+        WrapScoringContext, WrapSettings, violates_tree_width_rule, wrap_text_with_targets_scored,
     };
     use crate::tabs::typing::render_next::wrap::WordBreakPolicy;
+    use crate::tabs::typing::segmentation::{
+        BindingMode, count_layout_units, with_default_segmenter,
+    };
+
+    /// Тестовый шорткат: сегменты абзаца дефолтным (русским) сегментатором.
+    fn build_wrap_segments(text: &str, preserve_edge_spaces: bool) -> Vec<String> {
+        with_default_segmenter(|seg| {
+            seg.build_segments(text, preserve_edge_spaces, BindingMode::Glue)
+        })
+    }
 
     fn wrap_text_with_targets(
         text: &str,
@@ -1296,34 +933,19 @@ mod tests {
 
     #[test]
     fn wrap_segments_keep_negation_with_following_word() {
-        let segments = build_wrap_segments("не знаю что", false);
-        let texts = segments
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
-
+        let texts = build_wrap_segments("не знаю что", false);
         assert_eq!(texts, vec!["не знаю ".to_string(), "что".to_string()]);
     }
 
     #[test]
     fn wrap_segments_keep_particle_with_previous_word() {
-        let segments = build_wrap_segments("сделай же это", false);
-        let texts = segments
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
-
+        let texts = build_wrap_segments("сделай же это", false);
         assert_eq!(texts, vec!["сделай же ".to_string(), "это".to_string()]);
     }
 
     #[test]
     fn wrap_segments_keep_russian_abbreviation_with_following_word() {
-        let segments = build_wrap_segments("ул. Ленина рядом", false);
-        let texts = segments
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
-
+        let texts = build_wrap_segments("ул. Ленина рядом", false);
         assert_eq!(texts, vec!["ул. Ленина ".to_string(), "рядом".to_string()]);
     }
 
@@ -1400,25 +1022,14 @@ mod tests {
 
     #[test]
     fn wrap_segments_keep_number_with_measurement() {
-        let segments = build_wrap_segments("5 кг муки", false);
-        let texts = segments
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
-
+        let texts = build_wrap_segments("5 кг муки", false);
         assert_eq!(texts, vec!["5 кг ".to_string(), "муки".to_string()]);
     }
 
     #[test]
     fn wrap_segments_preserve_leading_spaces_only_when_requested() {
-        let preserved = build_wrap_segments("  текст", true)
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
-        let trimmed = build_wrap_segments("  текст", false)
-            .into_iter()
-            .map(|segment| segment.text)
-            .collect::<Vec<_>>();
+        let preserved = build_wrap_segments("  текст", true);
+        let trimmed = build_wrap_segments("  текст", false);
 
         assert_eq!(preserved, vec!["  ".to_string(), "текст".to_string()]);
         assert_eq!(trimmed, vec!["текст".to_string()]);

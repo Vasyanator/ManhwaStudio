@@ -13,7 +13,6 @@ Main responsibilities:
 
 from __future__ import annotations
 
-import base64
 import gc
 import io
 import logging
@@ -111,11 +110,11 @@ class SuryaTextDetectorService:
                 predictor = self._ensure_predictor_locked(selected_device)
             payload = self._detect_with_predictor(image_bytes, predictor)
             log.info(
-                "Surya detect_image_bytes done device=%s blocks=%s lines=%s mask_b64_len=%s",
+                "Surya detect_image_bytes done device=%s blocks=%s lines=%s mask_png_len=%s",
                 selected_device,
                 len(payload.get("blocks", [])),
                 len(payload.get("lines", [])),
-                len(str(payload.get("mask_png_base64", ""))),
+                len(payload.get("mask_png", b"")),
             )
             if lease.needs_load:
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
@@ -329,7 +328,7 @@ class SuryaTextDetectorService:
             "source_size": [image_w, image_h],
             "blocks": blocks,
             "lines": lines,
-            "mask_png_base64": _encode_mask_png_base64(cv2, source_mask),
+            "mask_png": _encode_mask_png_bytes(cv2, source_mask),
         }
 
     @staticmethod
@@ -482,11 +481,11 @@ def _extract_mask_and_boxes(
     }
 
 
-def _encode_mask_png_base64(cv2, mask: np.ndarray) -> str:
+def _encode_mask_png_bytes(cv2, mask: np.ndarray) -> bytes:
     ok, encoded = cv2.imencode(".png", mask)
     if not ok:
         raise RuntimeError("Не удалось закодировать mask PNG.")
-    return base64.b64encode(encoded.tobytes()).decode("ascii")
+    return encoded.tobytes()
 
 
 def _resolve_checkpoint_local_dir(checkpoint: str) -> str:

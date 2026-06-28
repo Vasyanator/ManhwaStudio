@@ -33,10 +33,13 @@ Main flow:
 )]
 
 mod ai_backend_capabilities;
+mod ai_backend_panel;
+mod ai_backend_supervisor;
 mod ai_install_probe;
 mod ai_models;
 mod app;
 mod args;
+mod backend_ipc;
 mod bubble_status;
 mod canvas;
 mod config;
@@ -52,6 +55,7 @@ mod python_manager;
 mod runtime_log;
 mod screen_capture;
 mod tabs;
+mod text_punctuation;
 mod tools;
 pub mod widgets;
 
@@ -150,17 +154,24 @@ fn run_main() -> anyhow::Result<()> {
 
     if cli.test_launcher {
         init_runtime_logging();
+        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start(!cli.no_ai);
         return launcher::run_test_launcher(
             &user_settings,
             Some(spawn_startup_update_check(cli.test_ver_check)),
+            &supervisor.handle(),
         );
     }
 
     let ai_enabled = !cli.no_ai;
+    // The single Python AI backend is owned here, above the launcher/studio loop, so it
+    // starts in the launcher (per the autostart toggle) and survives transitions between
+    // the launcher and the studio. Dropped (which stops the process + probe) on any return.
+    let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start(ai_enabled);
+    let ai_backend = ai_backend_supervisor.handle();
 
     // Main loop: re-enters the launcher when the user chooses "Выйти в лаунчер".
     loop {
-        let project_dir = resolve_startup_project_dir(&cli, &user_settings)?;
+        let project_dir = resolve_startup_project_dir(&cli, &user_settings, &ai_backend)?;
         let Some(project_dir) = project_dir else {
             return Ok(());
         };
@@ -174,7 +185,7 @@ fn run_main() -> anyhow::Result<()> {
         }
         .with_context(|| format!("failed to load project at {}", project_dir.display()))?;
 
-        match run_main_window(project, ai_enabled)? {
+        match run_main_window(project, ai_backend.clone())? {
             RunResult::Exit => return Ok(()),
             RunResult::ReturnToLauncher => {
                 // Clear the --project CLI flag so the launcher is shown next iteration.
@@ -300,6 +311,7 @@ fn auto_detect_missing_ai_install_type_for_startup() {
 fn resolve_startup_project_dir(
     cli: &Cli,
     user_settings: &serde_json::Value,
+    ai_backend: &ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<Option<PathBuf>> {
     if let Some(project_dir) = &cli.project {
         return resolve_cli_project_dir(project_dir);
@@ -309,6 +321,7 @@ fn resolve_startup_project_dir(
         cli.test_ver_check,
         cli.continue_install || cli.continue_install_target.is_some(),
         cli.continue_install_target.clone(),
+        ai_backend,
     )
 }
 
@@ -329,6 +342,7 @@ fn resolve_project_dir_without_cli_arg(
     force_update_available: bool,
     force_run_installer: bool,
     auto_install_target: Option<PathBuf>,
+    ai_backend: &ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<Option<PathBuf>> {
     if should_enter_installer_flow(force_run_installer, auto_install_target.as_ref()) {
         return run_startup_installer(config::program_dir(), auto_install_target);
@@ -382,6 +396,7 @@ fn resolve_project_dir_without_cli_arg(
     match launcher::run_launcher(
         user_settings,
         Some(spawn_startup_update_check(force_update_available)),
+        ai_backend,
     )? {
         Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(selection.project_dir)),
         Some(LauncherOutcome::StartUpdate) => {
@@ -1102,7 +1117,10 @@ enum VersionPart {
     Text(String),
 }
 
-fn run_main_window(project: project::ProjectData, ai_enabled: bool) -> anyhow::Result<RunResult> {
+fn run_main_window(
+    project: project::ProjectData,
+    ai_backend: ai_backend_supervisor::AiBackendHandle,
+) -> anyhow::Result<RunResult> {
     let title = format!(
         "ManhwaStudio v{} - {}",
         env!("CARGO_PKG_VERSION"),
@@ -1136,7 +1154,7 @@ fn run_main_window(project: project::ProjectData, ai_enabled: bool) -> anyhow::R
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             Ok(Box::new(app::MangaApp::new(
                 project,
-                ai_enabled,
+                ai_backend.clone(),
                 flag_for_app,
             )))
         }),

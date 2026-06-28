@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import json
 from typing import Any, Dict, Optional
-VERSION = "3.4.2"
+VERSION = "3.5.0"
 
 
 def _default_documents_dir() -> Optional[Path]:
@@ -75,6 +75,12 @@ PADDLEOCR_DIR = os.path.join(ONNX_MODELS_DIR, "PaddleOCR")
 PADDLEOCR_DET_DIR = os.path.join(PADDLEOCR_DIR, "detection")
 PADDLEOCR_REC_DIR = os.path.join(PADDLEOCR_DIR, "languages")
 MANGAOCR_DIR = os.path.join(ONNX_MODELS_DIR, "MangaOCR")
+# Сторонние крупные модели (качаются по требованию, не из основного репозитория).
+SIDE_MODELS_DIR = os.path.join(MODELS_DIR, "side_models")
+# FLUX.1-Fill-dev: GGUF-трансформер (квант выбирается) + diffusers-компоненты
+# (VAE/CLIP/T5/scheduler) в подпапке components/.
+FLUX_FILL_DIR = os.path.join(SIDE_MODELS_DIR, "FLUX.1-Fill-dev-GGUF")
+FLUX_FILL_COMPONENTS_DIR = os.path.join(FLUX_FILL_DIR, "components")
 folders = [
     LAMA_DIR,
     os.path.join(LAMA_DIR, "models"),
@@ -85,6 +91,9 @@ folders = [
     PADDLEOCR_DET_DIR,
     PADDLEOCR_REC_DIR,
     MANGAOCR_DIR,
+    SIDE_MODELS_DIR,
+    FLUX_FILL_DIR,
+    FLUX_FILL_COMPONENTS_DIR,
 ]
 for folder in folders:
     if not os.path.exists(folder):

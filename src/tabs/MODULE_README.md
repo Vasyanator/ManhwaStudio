@@ -25,6 +25,8 @@ model/backend calls, text rendering, export, or synchronous save-heavy workflows
   behavior.
 - `typing/`: text/image overlays, text rendering, typing masks, auto-typing, deformation, and
   export composition.
+- `ps_editor/`: standalone Photoshop-like single-page layered editor (own pan/zoom viewport, layer
+  stack with two locked base layers, selection/brush tools, tiled GPU cache). Not a `CanvasView`.
 - `settings/`: project/user settings panes for general options, shared ribbon/canvas settings,
   AI backend process/device controls, and hotkey overrides.
 - `characters.rs`: character database UI and image thumbnail/editor pipeline for project

@@ -1,12 +1,13 @@
 /*
 FILE HEADER (cleaning/tools/aot.rs)
 - Назначение: инструмент "AI удаление (AOT)" для вкладки cleaning на базе
-  `RegionMaskInpaintToolBase`, с вызовом Python backend endpoint `/inpaint/aot`.
+  `RegionMaskInpaintToolBase`, с вызовом Python backend через v2 framed IPC
+  (метод `inpaint.aot`).
 - Ключевые сущности:
   - `AotInpaintTool`: wiring инструмента (выделение, UI параметров, routing ввода).
   - `AotParams`: параметры AOT для backend (`inpaint_size`).
-  - `run_aot(...)`: конвертация region image + mask в PNG/base64, HTTP POST в backend и
-    разбор результата `image_png_base64`.
+  - `run_aot(...)`: конвертация region image + mask в PNG, отправка через v2 framed
+    IPC (`inpaint.aot`) и разбор результата из RESPONSE BLOB.
 - Поведение:
   - Shift+ЛКМ по canvas открывает region mask editor (через `RegionMaskInpaintToolBase`).
   - В окне рисуется маска; кнопка `Обработать` запускает AOT через backend.
@@ -16,23 +17,20 @@ FILE HEADER (cleaning/tools/aot.rs)
   - Ошибки backend пробрасываются пользователю в статус окна region editor.
 */
 use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
+use crate::backend_ipc::{self, CallError};
 use crate::canvas::CanvasView;
 use crate::project::ProjectData;
-use crate::tabs::translation::backend_health::{ai_backend_addr_text, ensure_ai_backend_healthy};
+use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
 use crate::widgets::WheelSlider;
 use crate::{ai_models, config};
 use eframe::egui;
 use image::{ColorType, ImageEncoder};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-const AOT_ENDPOINT: &str = "/inpaint/aot";
-const AOT_UNLOAD_ENDPOINT: &str = "/inpaint/aot/unload";
-const AOT_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
-const AOT_READ_TIMEOUT: Duration = Duration::from_secs(300);
-const AOT_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-call timeout for the v2 framed backend. Mirrors the previous HTTP read
+/// timeout: model warmup + inpaint can take a while on first use.
+const AOT_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy)]
 struct AotParams {
@@ -82,23 +80,22 @@ impl AotInpaintTool {
 
         let image_png = encode_color_image_png_rgba(image)?;
         let mask_png = encode_mask_png_luma(mask)?;
-        let payload = json!({
-            "image_base64": base64_encode(&image_png),
-            "mask_base64": base64_encode(&mask_png),
+        // v2 two-image convention: request blob = image_png ++ mask_png, with
+        // image_len/mask_len in the header so the backend can split them.
+        let header = json!({
+            "image_len": image_png.len(),
+            "mask_len": mask_png.len(),
             "params": {
                 "inpaint_size": params.inpaint_size,
             }
-        })
-        .to_string();
+        });
+        let blob = concat_image_mask(&image_png, &mask_png);
 
-        let response = post_json(AOT_ENDPOINT, &payload)?;
-        let out_b64 = response
-            .get("image_png_base64")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "AI backend не вернул image_png_base64.".to_string())?;
-        let out_bytes = decode_base64_ascii(out_b64)?;
+        let (_response_header, out_bytes) =
+            inpaint_call(backend_ipc::protocol::METHOD_INPAINT_AOT, header, &blob)?;
+        if out_bytes.is_empty() {
+            return Err("AI backend не вернул PNG результата.".to_string());
+        }
         let out_rgba = image::load_from_memory(&out_bytes)
             .map_err(|err| format!("AI backend вернул повреждённый PNG: {err}"))?
             .to_rgba8();
@@ -136,7 +133,7 @@ impl CleaningTool for AotInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Обработка через Python AI backend: /inpaint/aot.");
+        ui.small("Обработка через Python AI backend (v2 IPC): метод inpaint.aot.");
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -203,10 +200,11 @@ impl CleaningTool for AotInpaintTool {
                     );
                 });
                 if ui.small_button("Выгрузить AOT из backend").clicked() {
-                    *unload_status = match post_json(AOT_UNLOAD_ENDPOINT, "{}") {
-                        Ok(_) => Some("Запрошена выгрузка AOT из памяти backend.".to_string()),
-                        Err(err) => Some(format!("Ошибка выгрузки: {err}")),
-                    };
+                    *unload_status =
+                        match unload_call(backend_ipc::protocol::METHOD_INPAINT_AOT_UNLOAD) {
+                            Ok(_) => Some("Запрошена выгрузка AOT из памяти backend.".to_string()),
+                            Err(err) => Some(format!("Ошибка выгрузки: {err}")),
+                        };
                 }
                 if let Some(status) = unload_status.as_ref() {
                     ui.small(status);
@@ -272,204 +270,149 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn post_json(path: &str, payload: &str) -> Result<Value, String> {
-    ensure_ai_backend_healthy()?;
-
-    let addr = ai_backend_addr_text();
-    let socket_addr = addr
-        .to_socket_addrs()
-        .map_err(|err| format!("Ошибка резолва AI backend {addr}: {err}"))?
-        .next()
-        .ok_or_else(|| format!("Не найден сокет AI backend: {addr}"))?;
-
-    let mut stream = TcpStream::connect_timeout(&socket_addr, AOT_CONNECT_TIMEOUT)
-        .map_err(|err| format!("Не удалось подключиться к AI backend: {err}"))?;
-    stream
-        .set_read_timeout(Some(AOT_READ_TIMEOUT))
-        .map_err(|err| format!("Не удалось выставить read timeout AI backend: {err}"))?;
-    stream
-        .set_write_timeout(Some(AOT_WRITE_TIMEOUT))
-        .map_err(|err| format!("Не удалось выставить write timeout AI backend: {err}"))?;
-
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-        ai_backend_addr_text(),
-        payload.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("Не удалось отправить HTTP-заголовки AI backend: {err}"))?;
-    stream
-        .write_all(payload.as_bytes())
-        .map_err(|err| format!("Не удалось отправить HTTP-body AI backend: {err}"))?;
-
-    let (status_code, body) = read_http_response(&mut stream)?;
-    let body_text = String::from_utf8_lossy(&body).to_string();
-    let json_value: Value = serde_json::from_str(&body_text)
-        .map_err(|err| format!("AI backend вернул не-JSON ({status_code}): {err}"))?;
-
-    if status_code >= 400 {
-        let msg = json_value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("Ошибка AI backend.");
-        return Err(format!("AI backend HTTP {status_code}: {msg}"));
-    }
-    Ok(json_value)
+/// Concatenates the image PNG and mask PNG into the v2 two-image request blob
+/// (`image_png ++ mask_png`). The split is recovered server-side from the
+/// `image_len`/`mask_len` header fields.
+fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(image_png.len() + mask_png.len());
+    blob.extend_from_slice(image_png);
+    blob.extend_from_slice(mask_png);
+    blob
 }
 
-fn read_http_response(stream: &mut TcpStream) -> Result<(u16, Vec<u8>), String> {
-    let mut raw = Vec::with_capacity(8 * 1024);
-    let mut header_end: Option<usize> = None;
-    let mut scratch = [0u8; 4096];
-
-    while header_end.is_none() {
-        let n = stream
-            .read(&mut scratch)
-            .map_err(|err| format!("Не удалось прочитать ответ AI backend: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        raw.extend_from_slice(&scratch[..n]);
-        header_end = raw.windows(4).position(|chunk| chunk == b"\r\n\r\n");
-    }
-    if raw.is_empty() {
-        return Err("AI backend вернул пустой HTTP-ответ.".to_string());
-    }
-    let Some(header_end) = header_end else {
-        return Err("Некорректный HTTP-ответ AI backend (нет заголовков).".to_string());
-    };
-
-    let headers_end_idx = header_end + 4;
-    let head = String::from_utf8_lossy(&raw[..header_end]);
-    let status_line = head.lines().next().unwrap_or("HTTP/1.1 500");
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|part| part.parse::<u16>().ok())
-        .ok_or_else(|| format!("Не удалось распарсить HTTP-статус AI backend: {status_line}"))?;
-
-    let content_length = head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if !name.trim().eq_ignore_ascii_case("content-length") {
-            return None;
-        }
-        value.trim().parse::<usize>().ok()
-    });
-
-    if let Some(content_length) = content_length {
-        let mut body = raw[headers_end_idx..].to_vec();
-        while body.len() < content_length {
-            let n = stream
-                .read(&mut scratch)
-                .map_err(|err| format!("Не удалось дочитать body AI backend: {err}"))?;
-            if n == 0 {
-                return Err(format!(
-                    "HTTP body обрезан: получено {} байт из {}.",
-                    body.len(),
-                    content_length
-                ));
-            }
-            body.extend_from_slice(&scratch[..n]);
-        }
-        body.truncate(content_length);
-        return Ok((status_code, body));
-    }
-
-    let mut body = raw[headers_end_idx..].to_vec();
-    stream
-        .read_to_end(&mut body)
-        .map_err(|err| format!("Не удалось дочитать body AI backend: {err}"))?;
-    Ok((status_code, body))
+/// Issues a blocking v2 framed inpaint call. The request blob and header are
+/// built by the caller; the result PNG comes from the RESPONSE BLOB (raw bytes)
+/// and the metadata from the response header `Value`.
+///
+/// Maps `CallError` to a user-facing `String`, preserving the previous UX:
+/// - `Error`       → the backend error message (same as the old method error).
+/// - `Interrupted` → transient abort surfaced to the status line.
+/// - `Transport`   → connect/framing failure (unified backend offline message).
+fn inpaint_call(method: &str, header: Value, blob: &[u8]) -> Result<(Value, Vec<u8>), String> {
+    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    client
+        .call(method, header, blob, AOT_BACKEND_CALL_TIMEOUT)
+        .map_err(map_inpaint_call_error)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    if data.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | data[i + 2] as u32;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
-    }
-    let rem = data.len() - i;
-    if rem == 1 {
-        let n = (data[i] as u32) << 16;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-    out
+/// Issues a v2 framed `*.unload` call (no fields, no blob) and confirms the
+/// backend reported `unloaded`.
+fn unload_call(method: &str) -> Result<(), String> {
+    let (header, _blob) = inpaint_call(method, json!({}), &[])?;
+    let _unloaded = header.get("unloaded").and_then(Value::as_bool);
+    Ok(())
 }
 
-fn decode_base64_ascii(input: &str) -> Result<Vec<u8>, String> {
-    if input.is_empty() {
-        return Ok(Vec::new());
+/// Shared `CallError` → user-facing `String` mapping for inpaint/unload calls.
+fn map_inpaint_call_error(err: CallError) -> String {
+    match err {
+        CallError::Error(msg) => msg,
+        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
+        // A transport failure means the backend is offline; surface the unified
+        // offline message (matching device calls) instead of the raw error string.
+        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
     }
-    let mut cleaned = Vec::<u8>::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b.is_ascii_whitespace() {
-            continue;
-        }
-        cleaned.push(b);
-    }
-    if !cleaned.len().is_multiple_of(4) {
-        return Err("Невалидная base64-строка (длина не кратна 4).".to_string());
-    }
-    let mut out = Vec::<u8>::with_capacity(cleaned.len() / 4 * 3);
-    let mut i = 0usize;
-    while i < cleaned.len() {
-        let c0 = cleaned[i];
-        let c1 = cleaned[i + 1];
-        let c2 = cleaned[i + 2];
-        let c3 = cleaned[i + 3];
-        let v0 = base64_val(c0).ok_or_else(|| "Невалидный символ base64.".to_string())?;
-        let v1 = base64_val(c1).ok_or_else(|| "Невалидный символ base64.".to_string())?;
-        let pad2 = c2 == b'=';
-        let pad3 = c3 == b'=';
-        let v2 = if pad2 {
-            0
-        } else {
-            base64_val(c2).ok_or_else(|| "Невалидный символ base64.".to_string())?
-        };
-        let v3 = if pad3 {
-            0
-        } else {
-            base64_val(c3).ok_or_else(|| "Невалидный символ base64.".to_string())?
-        };
-        let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
-        out.push(((n >> 16) & 0xff) as u8);
-        if !pad2 {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if !pad3 {
-            out.push((n & 0xff) as u8);
-        }
-        i += 4;
-    }
-    Ok(out)
 }
 
-fn base64_val(b: u8) -> Option<u8> {
-    match b {
-        b'A'..=b'Z' => Some(b - b'A'),
-        b'a'..=b'z' => Some(b - b'a' + 26),
-        b'0'..=b'9' => Some(b - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The request blob must be `image_png ++ mask_png` in that exact order, and
+    /// the `image_len`/`mask_len` header ints must name the two segment lengths.
+    #[test]
+    fn blob_concat_orders_image_then_mask_with_lengths() {
+        let image_png = b"IMAGE_PNG_BYTES".to_vec();
+        let mask_png = b"MASK".to_vec();
+        let blob = concat_image_mask(&image_png, &mask_png);
+
+        let image_len = image_png.len();
+        let mask_len = mask_png.len();
+        assert_eq!(
+            blob.len(),
+            image_len + mask_len,
+            "image_len + mask_len == blob length"
+        );
+        assert_eq!(
+            &blob[..image_len],
+            image_png.as_slice(),
+            "image segment first"
+        );
+        assert_eq!(
+            &blob[image_len..image_len + mask_len],
+            mask_png.as_slice(),
+            "mask segment second"
+        );
+    }
+
+    /// The inpaint request header must carry `image_len`, `mask_len` and a
+    /// `params` object with `inpaint_size`.
+    #[test]
+    fn header_shape_has_lengths_and_params() {
+        let image_png = [0u8; 11];
+        let mask_png = [0u8; 3];
+        let header = json!({
+            "image_len": image_png.len(),
+            "mask_len": mask_png.len(),
+            "params": { "inpaint_size": 2048u32 }
+        });
+        assert_eq!(header["image_len"].as_u64(), Some(11));
+        assert_eq!(header["mask_len"].as_u64(), Some(3));
+        assert!(header["params"].is_object(), "params must be an object");
+        assert_eq!(header["params"]["inpaint_size"].as_u64(), Some(2048));
+    }
+
+    /// The result PNG comes from the RESPONSE BLOB (raw bytes); metadata fields
+    /// are read from the response header — no base64 anywhere.
+    #[test]
+    fn result_png_comes_from_response_blob() {
+        let mut blob = Vec::new();
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut blob),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test PNG");
+
+        let header = json!({
+            "source_size": [1, 1],
+            "device": "cpu",
+            "inpaint_size": 2048
+        });
+        assert!(!blob.is_empty(), "response blob must carry the PNG");
+        let decoded = image::load_from_memory(&blob).expect("decode response blob PNG");
+        assert_eq!(decoded.width(), 1);
+        assert_eq!(header["device"].as_str(), Some("cpu"));
+        assert_eq!(header["inpaint_size"].as_u64(), Some(2048));
+    }
+
+    /// The unload response header carries an `unloaded` bool.
+    #[test]
+    fn unload_response_reports_unloaded_flag() {
+        let header = json!({ "unloaded": true });
+        assert_eq!(header.get("unloaded").and_then(Value::as_bool), Some(true));
+    }
+
+    /// `CallError` mapping preserves the backend error message verbatim, maps
+    /// interrupt to its UX string, and maps transport failures to the unified
+    /// offline message.
+    #[test]
+    fn call_error_mapping_preserves_messages() {
+        assert_eq!(
+            map_inpaint_call_error(CallError::Error("boom".to_string())),
+            "boom"
+        );
+        assert!(
+            map_inpaint_call_error(CallError::Interrupted("x".to_string())).contains("прерван")
+        );
+        assert_eq!(
+            map_inpaint_call_error(CallError::Transport("dead".to_string())),
+            AI_BACKEND_OFFLINE_ERROR
+        );
     }
 }

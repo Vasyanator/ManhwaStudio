@@ -15,8 +15,8 @@ model, sockets, node registry, parameters, runtime values, and JSON compatibilit
 Execution starts when `window.rs` snapshots the live `GraphModel` into `executor::GraphSnapshot` and
 calls `spawn_executor`. The worker evaluates start nodes cycle-by-cycle, propagates data edges,
 queues exec edges, waits for required join inputs, and streams `ExecutorEvent` progress back to the
-UI. Browser nodes lazily start the Python Selenium helper through `python_manager` and talk JSON-RPC
-over stdio for the duration of the run.
+UI. Browser nodes lazily start the Python Selenium helper through `python_manager`, consume its
+startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
 
 ## Files and submodules
 - `mod.rs`: module declarations and public `BatchProcessingWindowState` re-export.
@@ -50,8 +50,8 @@ over stdio for the duration of the run.
 - Large image lists use shared ownership (`Arc`) to avoid hidden full-image clones during execution.
 - Cancellation is cooperative through the shared stop flag; long node handlers should check it at
   practical boundaries and return `ExecutorEvent::Cancelled` through the worker path.
-- Browser nodes must use `python_manager` and the existing Selenium helper protocol; do not start
-  ad hoc Python or browser commands from UI code.
+- Browser nodes must use `python_manager` and the existing Selenium helper protocol, including the
+  startup `ready` handshake; do not start ad hoc Python or browser commands from UI code.
 
 ## Editing map
 - To add a new node kind, update `NodeParams` in `types.rs`, the registry in `node_defs.rs`, JSON

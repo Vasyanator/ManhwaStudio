@@ -13,23 +13,27 @@ Main types:
 Main flow:
 - `draw_bubbles_panel` -> `BubblesPanelState::draw`: renders controls, applies filters, draws card list.
 - `flush_text_updates`: debounced write-through of text/original text into `CanvasView`.
-- `draw_card`: renders one bubble card, queues footer patches, and exposes card-level context menu actions.
+- `draw_card`: renders one bubble card, queues footer/ImageBubble patches, and exposes card-level context menu actions.
 - filter/cache helpers: `sync_editor_from_project`, `character_options`, `ensure_visible_cache`, `matches_filters`.
 
 Utilities:
 - footer parsing helpers: `footer_state_for_bubble`, `bubble_footer_state_from_record`,
   `bubble_extra_string` (без trim, сохраняет пользовательские пробелы),
-  `bubble_extra_bool`, `bubble_extra_i32`.
+  `bubble_extra_bool`, `bubble_extra_i32`, image-bubble file save helpers.
 - patch helper: `queue_footer_patch`.
 */
 
-use crate::canvas::{BubbleTextField, CanvasView};
+use crate::canvas::{BubbleClass, BubbleTextField, CanvasView};
+use crate::paste_image;
 use crate::project::{Bubble, ProjectData};
 use crate::widgets::{WheelComboBox, WheelSpinBox};
 use eframe::egui;
 use egui::{Color32, Stroke};
+use rfd::FileDialog;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const FOOTER_NO_CHARACTER: &str = "(не указан)";
 pub const FOOTER_NO_CHARACTERS: &str = "(нет персонажей)";
@@ -405,6 +409,11 @@ impl BubblesPanelState {
         panel_ctx: &mut BubblesPanelContext<'_>,
     ) {
         let bubble_id = bubble.id;
+        let mut bubble_class = bubble
+            .bubble_class
+            .as_deref()
+            .map(BubbleClass::from_str)
+            .unwrap_or(BubbleClass::Text);
         let footer = footer_state_for_bubble(panel_ctx.footer_overrides, bubble);
         let placed = bubble.side.is_some() && bubble.img_idx < project.pages.len();
         let mut translation_changed = false;
@@ -418,6 +427,8 @@ impl BubblesPanelState {
         let mut paste_translation_clicked = false;
         let mut translate_clicked = false;
         let mut delete_clicked = false;
+        let mut class_changed = false;
+        let mut image_error: Option<String> = None;
         let mut footer_state;
         let allow_paste = canvas.editable;
 
@@ -440,6 +451,23 @@ impl BubblesPanelState {
                             ui.colored_label(Color32::from_rgb(208, 84, 62), "Не привязан");
                         }
                         ui.label(format!("#{}", bubble_id));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Класс:");
+                        if ui
+                            .selectable_label(bubble_class == BubbleClass::Text, "TextBubble")
+                            .clicked()
+                        {
+                            bubble_class = BubbleClass::Text;
+                            class_changed = true;
+                        }
+                        if ui
+                            .selectable_label(bubble_class == BubbleClass::Image, "ImageBubble")
+                            .clicked()
+                        {
+                            bubble_class = BubbleClass::Image;
+                            class_changed = true;
+                        }
                     });
 
                     ui.add_space(4.0);
@@ -489,77 +517,153 @@ impl BubblesPanelState {
                             *panel_ctx.last_page_idx = bubble.img_idx as i64;
                             *panel_ctx.last_bubble_order = editor.bubble_order;
                         }
-
-                        let known_resp = ui
-                            .checkbox(&mut editor.is_known_character, "И.П.")
-                            .on_hover_text(
-                                "Использовать готовые имена персонажей, или ввести своё.",
-                            );
-                        if known_resp.changed() {
-                            queue_footer_patch(
-                                panel_ctx.pending_footer_patches,
-                                panel_ctx.pending_footer_patch_changed_at,
-                                bubble_id,
-                                "is_known_character",
-                                Value::Bool(editor.is_known_character),
-                                now_s,
-                            );
-                            let prev_character_name = editor.character_name.clone();
-                            if editor.is_known_character {
-                                if panel_ctx.character_names.is_empty() {
-                                    editor.character_name.clear();
-                                } else if editor.character_name == FOOTER_NO_CHARACTERS
-                                    || !panel_ctx
-                                        .character_names
-                                        .iter()
-                                        .any(|item| item == &editor.character_name)
-                                {
-                                    editor.character_name = panel_ctx.character_names[0].clone();
-                                }
-                                if editor.character_name == FOOTER_NO_CHARACTERS {
-                                    editor.character_name.clear();
-                                }
-                            }
-                            if editor.character_name != prev_character_name {
-                                editor.refresh_character_name_lc();
-                                character_dirty = true;
-                            }
-                            queue_footer_patch(
-                                panel_ctx.pending_footer_patches,
-                                panel_ctx.pending_footer_patch_changed_at,
-                                bubble_id,
-                                "character_name",
-                                Value::String(editor.character_name.clone()),
-                                now_s,
-                            );
-                            *panel_ctx.last_is_known_character = editor.is_known_character;
-                            *panel_ctx.last_character_name = editor.character_name.clone();
-                        }
                     });
 
-                    ui.horizontal_wrapped(|ui| {
-                        if editor.is_known_character {
-                            if panel_ctx.character_names.is_empty() {
-                                ui.label(FOOTER_NO_CHARACTERS);
-                            } else {
-                                let mut selected_name = editor.character_name.clone();
-                                WheelComboBox::from_id_salt((
-                                    "translation_bubbles_panel_character",
+                    if bubble_class == BubbleClass::Image {
+                        Self::draw_image_bubble_controls(
+                            ui,
+                            project,
+                            bubble,
+                            bubble_id,
+                            now_s,
+                            panel_ctx,
+                            &mut image_error,
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            let known_resp = ui
+                                .checkbox(&mut editor.is_known_character, "И.П.")
+                                .on_hover_text(
+                                    "Использовать готовые имена персонажей, или ввести своё.",
+                                );
+                            if known_resp.changed() {
+                                queue_footer_patch(
+                                    panel_ctx.pending_footer_patches,
+                                    panel_ctx.pending_footer_patch_changed_at,
                                     bubble_id,
-                                ))
-                                .selected_text(if selected_name.trim().is_empty() {
-                                    FOOTER_NO_CHARACTER.to_string()
-                                } else {
-                                    selected_name.clone()
-                                })
-                                .width(160.0)
-                                .show_ui(ui, |ui| {
-                                    for item in panel_ctx.character_names {
-                                        ui.selectable_value(&mut selected_name, item.clone(), item);
+                                    "is_known_character",
+                                    Value::Bool(editor.is_known_character),
+                                    now_s,
+                                );
+                                let prev_character_name = editor.character_name.clone();
+                                if editor.is_known_character {
+                                    if panel_ctx.character_names.is_empty() {
+                                        editor.character_name.clear();
+                                    } else if editor.character_name == FOOTER_NO_CHARACTERS
+                                        || !panel_ctx
+                                            .character_names
+                                            .iter()
+                                            .any(|item| item == &editor.character_name)
+                                    {
+                                        editor.character_name =
+                                            panel_ctx.character_names[0].clone();
                                     }
-                                });
-                                if selected_name != editor.character_name {
-                                    editor.character_name = selected_name;
+                                    if editor.character_name == FOOTER_NO_CHARACTERS {
+                                        editor.character_name.clear();
+                                    }
+                                }
+                                if editor.character_name != prev_character_name {
+                                    editor.refresh_character_name_lc();
+                                    character_dirty = true;
+                                }
+                                queue_footer_patch(
+                                    panel_ctx.pending_footer_patches,
+                                    panel_ctx.pending_footer_patch_changed_at,
+                                    bubble_id,
+                                    "character_name",
+                                    Value::String(editor.character_name.clone()),
+                                    now_s,
+                                );
+                                *panel_ctx.last_is_known_character = editor.is_known_character;
+                                *panel_ctx.last_character_name = editor.character_name.clone();
+                            }
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            if editor.is_known_character {
+                                if panel_ctx.character_names.is_empty() {
+                                    ui.label(FOOTER_NO_CHARACTERS);
+                                } else {
+                                    let mut selected_name = editor.character_name.clone();
+                                    WheelComboBox::from_id_salt((
+                                        "translation_bubbles_panel_character",
+                                        bubble_id,
+                                    ))
+                                    .selected_text(if selected_name.trim().is_empty() {
+                                        FOOTER_NO_CHARACTER.to_string()
+                                    } else {
+                                        selected_name.clone()
+                                    })
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for item in panel_ctx.character_names {
+                                            ui.selectable_value(
+                                                &mut selected_name,
+                                                item.clone(),
+                                                item,
+                                            );
+                                        }
+                                    });
+                                    if selected_name != editor.character_name {
+                                        editor.character_name = selected_name;
+                                        editor.refresh_character_name_lc();
+                                        character_dirty = true;
+                                        queue_footer_patch(
+                                            panel_ctx.pending_footer_patches,
+                                            panel_ctx.pending_footer_patch_changed_at,
+                                            bubble_id,
+                                            "character_name",
+                                            Value::String(editor.character_name.clone()),
+                                            now_s,
+                                        );
+                                        if !editor.clarification.is_empty() {
+                                            editor.clarification.clear();
+                                            queue_footer_patch(
+                                                panel_ctx.pending_footer_patches,
+                                                panel_ctx.pending_footer_patch_changed_at,
+                                                bubble_id,
+                                                "clarification",
+                                                Value::String(String::new()),
+                                                now_s,
+                                            );
+                                        }
+                                        *panel_ctx.last_character_name =
+                                            editor.character_name.clone();
+                                        panel_ctx.last_clarification.clear();
+                                    }
+                                }
+
+                                if ui
+                                    .small_button("↻")
+                                    .on_hover_text("Обновить список персонажей из characters.json")
+                                    .clicked()
+                                {
+                                    *panel_ctx.pending_characters_refresh = true;
+                                }
+
+                                let clarification_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut editor.clarification)
+                                        .hint_text("Уточнение...")
+                                        .desired_width(150.0),
+                                );
+                                if clarification_resp.changed() {
+                                    queue_footer_patch(
+                                        panel_ctx.pending_footer_patches,
+                                        panel_ctx.pending_footer_patch_changed_at,
+                                        bubble_id,
+                                        "clarification",
+                                        Value::String(editor.clarification.clone()),
+                                        now_s,
+                                    );
+                                    *panel_ctx.last_clarification = editor.clarification.clone();
+                                }
+                            } else {
+                                let character_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut editor.character_name)
+                                        .hint_text("Имя персонажа...")
+                                        .desired_width(180.0),
+                                );
+                                if character_resp.changed() {
                                     editor.refresh_character_name_lc();
                                     character_dirty = true;
                                     queue_footer_patch(
@@ -570,67 +674,11 @@ impl BubblesPanelState {
                                         Value::String(editor.character_name.clone()),
                                         now_s,
                                     );
-                                    if !editor.clarification.is_empty() {
-                                        editor.clarification.clear();
-                                        queue_footer_patch(
-                                            panel_ctx.pending_footer_patches,
-                                            panel_ctx.pending_footer_patch_changed_at,
-                                            bubble_id,
-                                            "clarification",
-                                            Value::String(String::new()),
-                                            now_s,
-                                        );
-                                    }
                                     *panel_ctx.last_character_name = editor.character_name.clone();
-                                    panel_ctx.last_clarification.clear();
                                 }
                             }
-
-                            if ui
-                                .small_button("↻")
-                                .on_hover_text("Обновить список персонажей из characters.json")
-                                .clicked()
-                            {
-                                *panel_ctx.pending_characters_refresh = true;
-                            }
-
-                            let clarification_resp = ui.add(
-                                egui::TextEdit::singleline(&mut editor.clarification)
-                                    .hint_text("Уточнение...")
-                                    .desired_width(150.0),
-                            );
-                            if clarification_resp.changed() {
-                                queue_footer_patch(
-                                    panel_ctx.pending_footer_patches,
-                                    panel_ctx.pending_footer_patch_changed_at,
-                                    bubble_id,
-                                    "clarification",
-                                    Value::String(editor.clarification.clone()),
-                                    now_s,
-                                );
-                                *panel_ctx.last_clarification = editor.clarification.clone();
-                            }
-                        } else {
-                            let character_resp = ui.add(
-                                egui::TextEdit::singleline(&mut editor.character_name)
-                                    .hint_text("Имя персонажа...")
-                                    .desired_width(180.0),
-                            );
-                            if character_resp.changed() {
-                                editor.refresh_character_name_lc();
-                                character_dirty = true;
-                                queue_footer_patch(
-                                    panel_ctx.pending_footer_patches,
-                                    panel_ctx.pending_footer_patch_changed_at,
-                                    bubble_id,
-                                    "character_name",
-                                    Value::String(editor.character_name.clone()),
-                                    now_s,
-                                );
-                                *panel_ctx.last_character_name = editor.character_name.clone();
-                            }
-                        }
-                    });
+                        });
+                    }
 
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
@@ -745,12 +793,186 @@ impl BubblesPanelState {
         if delete_clicked {
             let _ = canvas.request_delete_bubble(bubble_id);
         }
+        if class_changed {
+            let _ = canvas.set_bubble_class_for_bid(bubble_id, bubble_class);
+            let mut patch = Map::new();
+            if bubble_class == BubbleClass::Image {
+                patch.insert(
+                    "image_source_type".to_string(),
+                    Value::String("external".to_string()),
+                );
+                patch.insert("description".to_string(), Value::String(String::new()));
+            }
+            if !patch.is_empty() {
+                for (field, value) in patch {
+                    queue_footer_patch(
+                        panel_ctx.pending_footer_patches,
+                        panel_ctx.pending_footer_patch_changed_at,
+                        bubble_id,
+                        &field,
+                        value,
+                        now_s,
+                    );
+                }
+            }
+        }
+        if let Some(error) = image_error {
+            ui.colored_label(Color32::from_rgb(240, 102, 102), error);
+        }
         if character_dirty {
             self.visible_cache_dirty = true;
             self.character_options_dirty = true;
         }
 
         panel_ctx.footer_overrides.insert(bubble_id, footer_state);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_image_bubble_controls(
+        ui: &mut egui::Ui,
+        project: &ProjectData,
+        bubble: &Bubble,
+        bubble_id: i64,
+        now_s: f64,
+        panel_ctx: &mut BubblesPanelContext<'_>,
+        image_error: &mut Option<String>,
+    ) {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let mut source_type = bubble_extra_string(&bubble.extra, "image_source_type");
+            if source_type.is_empty() {
+                source_type = "external".to_string();
+            }
+            WheelComboBox::from_id_salt(("image_bubble_source_type", bubble_id))
+                .selected_text(if source_type == "page_crop" {
+                    "Вырезка из страницы"
+                } else {
+                    "Сторонняя картинка"
+                })
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut source_type,
+                        "external".to_string(),
+                        "Сторонняя картинка",
+                    );
+                    ui.selectable_value(
+                        &mut source_type,
+                        "page_crop".to_string(),
+                        "Вырезка из страницы",
+                    );
+                });
+            if bubble_extra_string(&bubble.extra, "image_source_type") != source_type {
+                queue_footer_patch(
+                    panel_ctx.pending_footer_patches,
+                    panel_ctx.pending_footer_patch_changed_at,
+                    bubble_id,
+                    "image_source_type",
+                    Value::String(source_type.clone()),
+                    now_s,
+                );
+                if source_type == "page_crop" && !bubble.extra.contains_key("crop_rect") {
+                    queue_footer_patch(
+                        panel_ctx.pending_footer_patches,
+                        panel_ctx.pending_footer_patch_changed_at,
+                        bubble_id,
+                        "crop_rect",
+                        Value::Array(default_image_crop_rect(project, bubble)),
+                        now_s,
+                    );
+                    queue_footer_patch(
+                        panel_ctx.pending_footer_patches,
+                        panel_ctx.pending_footer_patch_changed_at,
+                        bubble_id,
+                        "crop_page_idx",
+                        Value::Number(u64::try_from(bubble.img_idx).unwrap_or(u64::MAX).into()),
+                        now_s,
+                    );
+                }
+            }
+
+            if source_type == "external" {
+                if ui.small_button("Вставить картинку из буфера").clicked()
+                {
+                    match save_clipboard_image_for_bubble(project, bubble_id) {
+                        Ok(path) => queue_footer_patch(
+                            panel_ctx.pending_footer_patches,
+                            panel_ctx.pending_footer_patch_changed_at,
+                            bubble_id,
+                            "image_path",
+                            Value::String(project_relative_path(project, &path)),
+                            now_s,
+                        ),
+                        Err(err) => *image_error = Some(err),
+                    }
+                }
+                if ui.small_button("Выбрать файл").clicked()
+                    && let Some(path) = FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+                        .pick_file()
+                {
+                    match copy_external_image_for_bubble(project, bubble_id, &path) {
+                        Ok(saved) => queue_footer_patch(
+                            panel_ctx.pending_footer_patches,
+                            panel_ctx.pending_footer_patch_changed_at,
+                            bubble_id,
+                            "image_path",
+                            Value::String(project_relative_path(project, &saved)),
+                            now_s,
+                        ),
+                        Err(err) => *image_error = Some(err),
+                    }
+                }
+            } else {
+                ui.label("Страница:");
+                let mut page_number = bubble_extra_i32(
+                    &bubble.extra,
+                    "crop_page_idx",
+                    i32::try_from(bubble.img_idx).unwrap_or(0),
+                )
+                .saturating_add(1);
+                let max_page = i32::try_from(project.pages.len())
+                    .unwrap_or(i32::MAX)
+                    .max(1);
+                if ui
+                    .add(
+                        WheelSpinBox::new(&mut page_number)
+                            .range(1..=max_page)
+                            .speed(0.25),
+                    )
+                    .changed()
+                {
+                    let next_idx = page_number.saturating_sub(1).clamp(0, max_page - 1);
+                    queue_footer_patch(
+                        panel_ctx.pending_footer_patches,
+                        panel_ctx.pending_footer_patch_changed_at,
+                        bubble_id,
+                        "crop_page_idx",
+                        Value::Number(i64::from(next_idx).into()),
+                        now_s,
+                    );
+                }
+            }
+        });
+
+        let mut description = bubble_extra_string(&bubble.extra, "description");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut description)
+                    .desired_rows(2)
+                    .hint_text("Описание"),
+            )
+            .changed()
+        {
+            queue_footer_patch(
+                panel_ctx.pending_footer_patches,
+                panel_ctx.pending_footer_patch_changed_at,
+                bubble_id,
+                "description",
+                Value::String(description),
+                now_s,
+            );
+        }
     }
 
     fn sync_editor_from_project(
@@ -949,4 +1171,90 @@ pub fn bubble_extra_i32(extra: &Map<String, Value>, key: &str, default: i32) -> 
         Value::String(v) => v.trim().parse::<i32>().unwrap_or(default),
         _ => default,
     }
+}
+
+/// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
+///
+/// Page dimensions are read from the image header to convert 256 px into normalized half-extents,
+/// falling back to a small UV box when unavailable (mirrors `tab.rs::default_image_crop_rect_values`).
+fn default_image_crop_rect(project: &ProjectData, bubble: &Bubble) -> Vec<Value> {
+    const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f32 = 256.0;
+    let half = DEFAULT_IMAGE_CROP_SIDE_SRC_PX * 0.5;
+    let (u_half, v_half) = project
+        .pages
+        .iter()
+        .find(|page| page.idx == bubble.img_idx)
+        .and_then(|page| image::image_dimensions(&page.path).ok())
+        .map(|(w, h)| (half / (w.max(1) as f32), half / (h.max(1) as f32)))
+        .unwrap_or((0.05, 0.05));
+    [
+        bubble.img_u - u_half,
+        bubble.img_v - v_half,
+        bubble.img_u + u_half,
+        bubble.img_v + v_half,
+    ]
+    .into_iter()
+    .map(|value| Value::from(f64::from(value.clamp(0.0, 1.0))))
+    .collect()
+}
+
+fn save_clipboard_image_for_bubble(
+    project: &ProjectData,
+    bubble_id: i64,
+) -> Result<PathBuf, String> {
+    let clipboard_image = paste_image::read_image_from_clipboard()?;
+    let width = u32::try_from(clipboard_image.width)
+        .map_err(|_| "картинка из буфера слишком широкая".to_string())?;
+    let height = u32::try_from(clipboard_image.height)
+        .map_err(|_| "картинка из буфера слишком высокая".to_string())?;
+    let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
+        return Err("буфер картинки не соответствует ширине и высоте".to_string());
+    };
+    let dir = image_bubbles_dir(project);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+    let path = dir.join(format!("image_bubble_{bubble_id}.png"));
+    image
+        .save(&path)
+        .map_err(|err| format!("не удалось сохранить {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn copy_external_image_for_bubble(
+    project: &ProjectData,
+    bubble_id: i64,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err(format!("файл не найден: {}", source.display()));
+    }
+    let dir = image_bubbles_dir(project);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("png");
+    let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
+    fs::copy(source, &path).map_err(|err| {
+        format!(
+            "не удалось скопировать {} в {}: {err}",
+            source.display(),
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn project_relative_path(project: &ProjectData, path: &Path) -> String {
+    path.strip_prefix(&project.paths.unsaved_dir)
+        .or_else(|_| path.strip_prefix(&project.project_dir))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
+    project.paths.unsaved_image_bubbles_dir.clone()
 }

@@ -11,7 +11,6 @@ Main responsibilities:
 
 from __future__ import annotations
 
-import base64
 import threading
 from pathlib import Path
 from typing import Any
@@ -154,7 +153,7 @@ class PaddleTextDetectorService:
         return {
             "source_size": [img_w, img_h],
             "blocks": self._collect_blocks(boxes, img_w, img_h),
-            "mask_png_base64": self._encode_mask_png_base64(glyph_mask),
+            "mask_png": self._encode_mask_png_bytes(glyph_mask),
             "polys": [
                 {
                     "points": poly,
@@ -181,8 +180,8 @@ class PaddleTextDetectorService:
         return blocks
 
     @staticmethod
-    def _encode_mask_png_base64(mask: np.ndarray) -> str:
+    def _encode_mask_png_bytes(mask: np.ndarray) -> bytes:
         ok, encoded = cv2.imencode(".png", mask)
         if not ok:
             raise RuntimeError("Не удалось закодировать mask PNG.")
-        return base64.b64encode(encoded.tobytes()).decode("ascii")
+        return encoded.tobytes()

@@ -30,7 +30,8 @@ The algorithm is a direct port of Python BatchPipelineExecutor:
 Browser nodes (open_url, scroll_page, fetch_from_browser) communicate with the
 adv_fetch_cli.py Python daemon via JSON-RPC over stdio, reusing the pattern from
 advanced_download.rs.  The daemon is started lazily on first browser node use and
-kept alive for the duration of the pipeline run.
+kept alive for the duration of the pipeline run.  The startup `ready` event is
+consumed before browser node commands are sent.
 
 Image downloads (quick_downloader) use ureq with browser-like headers.
 Image saves (save_folder) write PNG files with sequential numbering.
@@ -40,15 +41,12 @@ Waifu2x calls the bundled waifu2x shared library via runtime FFI.
 
 use super::graph::{EdgeKind, GraphModel};
 use super::types::{DataValue, NodeParams};
-use crate::config;
+use crate::backend_ipc;
 use crate::launcher::new_project::stitching::{StitchInputImage, StitchOptions, StitchSplitMode};
 use crate::launcher::new_project::waifu2x::{Waifu2xInputImage, Waifu2xOptions};
-use crate::python_manager;
 use image::{ImageFormat, RgbaImage};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1111,47 +1109,47 @@ enum BrowserRpcError {
     Message(String),
 }
 
+/// Per-frame timeout for a batch browser IPC command (generous: some stages are
+/// silent for a while). The browser session lives inside the unified AI backend.
+const BATCH_BROWSER_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Drives the in-process Selenium browser session in the unified AI backend over
+/// framed IPC (method `browser.command`). The backend process is app-global, so
+/// this no longer owns a child process — only a cloneable client handle.
 struct BrowserDaemon {
-    child: Child,
-    stdin: BufWriter<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    client: backend_ipc::BackendClient,
     /// Last browser name used (reused for fetch command).
     pub browser_name: String,
 }
 
 impl BrowserDaemon {
     fn spawn() -> Result<Self, String> {
-        // Find the adv_fetch_cli.py script relative to the program root.
-        let app_root = resolve_app_root();
-        let script = app_root
-            .join("modules")
-            .join("new_project")
-            .join("adv_fetch_cli.py");
-        if !script.exists() {
-            return Err(format!(
-                "adv_fetch_cli.py not found at '{}'",
-                script.display()
-            ));
-        }
-
-        let mut command = python_manager::build_python_script_path_command(&app_root, &script)?;
-        let mut child = command
-            .arg("--daemon")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| format!("spawn python daemon: {err}"))?;
-
-        let stdin = BufWriter::new(child.stdin.take().ok_or("no stdin")?);
-        let stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
+        let client =
+            crate::launcher::new_project::advanced_download::connect_browser_backend()?;
+        let daemon = Self {
+            client,
             browser_name: String::new(),
-        })
+        };
+        // Batch automation always uses the Selenium backend; best-effort select.
+        let _ = daemon.send_simple(&serde_json::json!({
+            "command": "set_backend",
+            "backend": "selenium",
+        }));
+        Ok(daemon)
+    }
+
+    /// Fire-and-wait for a quick control command (no cancellation). Used for setup
+    /// (`set_backend`) and teardown (`close`).
+    fn send_simple(&self, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
+        match self.client.call(
+            backend_ipc::protocol::METHOD_BROWSER_COMMAND,
+            serde_json::json!({ "payload": cmd }),
+            &[],
+            BATCH_BROWSER_TIMEOUT,
+        ) {
+            Ok((header, _blob)) => Ok(header),
+            Err(err) => Err(format!("{err:?}")),
+        }
     }
 
     fn send_command_interruptible(
@@ -1160,94 +1158,81 @@ impl BrowserDaemon {
         expected_event: ExpectedDaemonEvent,
         stop_flag: &AtomicBool,
     ) -> Result<serde_json::Value, BrowserRpcError> {
-        let line =
-            serde_json::to_string(cmd).map_err(|err| BrowserRpcError::Message(err.to_string()))?;
-        let child = &mut self.child;
-        let stdin = &mut self.stdin;
-        let stdout = &mut self.stdout;
+        let client = self.client.clone();
+        let handle = client
+            .begin_call(
+                backend_ipc::protocol::METHOD_BROWSER_COMMAND,
+                serde_json::json!({ "payload": cmd }),
+                &[],
+            )
+            .map_err(BrowserRpcError::Message)?;
+        let id = handle.id();
         let (tx, rx) = mpsc::channel();
 
         thread::scope(|scope| {
             scope.spawn(move || {
-                let result = (|| {
-                    writeln!(stdin, "{line}").map_err(|err| err.to_string())?;
-                    stdin.flush().map_err(|err| err.to_string())?;
-
-                    loop {
-                        let mut response_line = String::new();
-                        stdout
-                            .read_line(&mut response_line)
-                            .map_err(|err| err.to_string())?;
-                        if response_line.trim().is_empty() {
-                            continue;
-                        }
-
-                        let response: serde_json::Value =
-                            serde_json::from_str(response_line.trim())
-                                .map_err(|err| err.to_string())?;
-                        match response
-                            .get("event")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                        {
-                            "progress" => continue,
-                            "error" => {
-                                let msg = response
-                                    .get("user_message")
-                                    .or_else(|| response.get("message"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown daemon error");
-                                return Err(msg.to_owned());
-                            }
-                            event_name if event_name == expected_event.as_str() => {
-                                return Ok(response);
-                            }
-                            _ => continue,
-                        }
-                    }
-                })();
+                // Ignore progress frames here; the batch flow only needs the result.
+                let result = handle.wait_streaming(|_header, _blob| {}, BATCH_BROWSER_TIMEOUT);
                 let _ = tx.send(result);
             });
 
+            let mut cancel_sent = false;
             loop {
                 match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(result) => return result.map_err(BrowserRpcError::Message),
+                    Ok(result) => return interpret_batch_terminal(result, expected_event),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if stop_flag.load(Ordering::Relaxed) {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(BrowserRpcError::Cancelled);
+                        // On cancel, ask the backend to stop; the worker then returns
+                        // an `interrupted` terminal which maps to `Cancelled`.
+                        if !cancel_sent && stop_flag.load(Ordering::Relaxed) {
+                            let _ = client.cancel(id);
+                            cancel_sent = true;
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         return Err(BrowserRpcError::Message(
-                            "browser daemon response channel disconnected".to_owned(),
+                            "browser ipc response channel disconnected".to_owned(),
                         ));
                     }
                 }
             }
         })
     }
-
-    fn try_send_shutdown(&mut self) {
-        let line = match serde_json::to_string(&serde_json::json!({ "command": "shutdown" })) {
-            Ok(line) => line,
-            Err(_) => return,
-        };
-        let _ = writeln!(self.stdin, "{line}");
-        let _ = self.stdin.flush();
-    }
-
-    fn terminate(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Drop for BrowserDaemon {
     fn drop(&mut self) {
-        self.try_send_shutdown();
-        self.terminate();
+        // Close the live browser session; the app-global backend process keeps running.
+        let _ = self.send_simple(&serde_json::json!({ "command": "close" }));
+    }
+}
+
+/// Maps a `browser.command` IPC outcome to the legacy `(Value | BrowserRpcError)`
+/// the batch executor expects. The single terminal event dict is the response
+/// header; `ExpectedDaemonEvent` is advisory (there is exactly one terminal).
+fn interpret_batch_terminal(
+    result: Result<(serde_json::Value, Vec<u8>), backend_ipc::CallError>,
+    expected_event: ExpectedDaemonEvent,
+) -> Result<serde_json::Value, BrowserRpcError> {
+    let _ = expected_event;
+    match result {
+        Ok((header, _blob)) => {
+            let event = header
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if event == "error" {
+                let msg = header
+                    .get("user_message")
+                    .or_else(|| header.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown daemon error");
+                return Err(BrowserRpcError::Message(msg.to_owned()));
+            }
+            Ok(header)
+        }
+        Err(backend_ipc::CallError::Interrupted(_)) => Err(BrowserRpcError::Cancelled),
+        Err(backend_ipc::CallError::Error(msg)) => Err(BrowserRpcError::Message(msg)),
+        Err(backend_ipc::CallError::Transport(msg)) => Err(BrowserRpcError::Message(msg)),
     }
 }
 
@@ -1276,32 +1261,11 @@ fn load_images_from_dir(dir: &Path) -> Result<Vec<RgbaImage>, String> {
     Ok(images)
 }
 
-fn resolve_app_root() -> PathBuf {
-    let start = config::program_dir();
-    for ancestor in start.ancestors() {
-        if ancestor.join("modules").join("browser_f.py").is_file() {
-            return ancestor.to_path_buf();
-        }
-        if ancestor.join("launcher.py").is_file() {
-            return ancestor.to_path_buf();
-        }
-    }
-    start
-}
-
+/// The terminal event a batch browser command expects. Advisory now (the IPC
+/// call delivers exactly one terminal event), kept for call-site readability.
 #[derive(Clone, Copy)]
 enum ExpectedDaemonEvent {
     Opened,
     Scrolled,
     Result,
-}
-
-impl ExpectedDaemonEvent {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Opened => "opened",
-            Self::Scrolled => "scrolled",
-            Self::Result => "result",
-        }
-    }
 }

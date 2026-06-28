@@ -21,6 +21,8 @@ Config edits stay synchronous because they are tiny, but the Python environment 
 background worker threads so the launcher UI never blocks on shell I/O.
 */
 
+use crate::ai_backend_panel::AiBackendPanelState;
+use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::ai_install_probe::{
     AiComputationsReport, AiPackageProbe, detect_ai_install_type_from_report,
     spawn_ai_computations_probe,
@@ -42,9 +44,10 @@ use crate::launcher::pages::base::{self, PageNavAction};
 use crate::launcher::theme;
 use crate::python_manager::{self, PythonShellKind};
 use crate::runtime_log;
+use chrono::Local;
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, Key, Layout, RichText, ScrollArea, Sense,
-    Stroke, TextEdit, TextStyle, Ui, Vec2,
+    Align, Align2, Area, Color32, CornerRadius, FontId, Frame, Key, Layout, Order, RichText,
+    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
 };
 use rfd::FileDialog;
 use serde_json::Value;
@@ -63,10 +66,8 @@ use std::thread;
 const STATUS_ERROR: Color32 = Color32::from_rgb(214, 104, 104);
 const TAB_ACTIVE_FILL: Color32 = Color32::from_rgba_premultiplied(72, 72, 78, 176);
 const TAB_IDLE_FILL: Color32 = theme::BUTTON_FILL;
-const TAB_HOVER_FILL: Color32 = theme::BUTTON_HOVERED;
 const TAB_STROKE: Color32 = theme::BUTTON_STROKE;
 const TAB_WARNING_FILL: Color32 = Color32::from_rgba_premultiplied(120, 88, 18, 188);
-const TAB_WARNING_HOVER_FILL: Color32 = Color32::from_rgba_premultiplied(150, 112, 24, 208);
 const TAB_WARNING_STROKE: Color32 = Color32::from_rgba_premultiplied(236, 197, 76, 170);
 const SETTINGS_CARD_EDGE_GAP: f32 = 18.0;
 const CONSOLE_MIN_HEIGHT: f32 = 320.0;
@@ -98,6 +99,7 @@ enum SettingsTab {
     General,
     SystemInfo,
     AiComputations,
+    AiBackend,
     TorchUpgrade,
     PythonEnvironment,
 }
@@ -112,6 +114,17 @@ pub struct SettingsPageState {
     system_info_probe: SystemInfoProbeState,
     ai_install_type: config::AiInstallType,
     torch_upgrade: TorchUpgradeState,
+    log_popup_open: bool,
+    /// Shared app-global backend handle + this page's panel scratch state, so the
+    /// launcher exposes the same backend controls as the studio settings tab.
+    ai_backend: AiBackendHandle,
+    ai_backend_panel: AiBackendPanelState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LogKind {
+    Current,
+    Previous,
 }
 
 enum SettingsStatus {
@@ -216,7 +229,11 @@ enum AiPackageStatusView<'a> {
 }
 
 impl SettingsPageState {
-    pub fn new(projects_root: PathBuf, ai_install_type: config::AiInstallType) -> Self {
+    pub fn new(
+        projects_root: PathBuf,
+        ai_install_type: config::AiInstallType,
+        ai_backend: AiBackendHandle,
+    ) -> Self {
         let projects_dir = normalize_projects_dir_value(&projects_root.to_string_lossy());
         Self {
             active_tab: SettingsTab::General,
@@ -228,6 +245,9 @@ impl SettingsPageState {
             system_info_probe: SystemInfoProbeState::default(),
             ai_install_type,
             torch_upgrade: TorchUpgradeState::default(),
+            log_popup_open: false,
+            ai_backend,
+            ai_backend_panel: AiBackendPanelState::default(),
         }
     }
 
@@ -258,6 +278,7 @@ impl SettingsPageState {
 
     pub fn show(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
         let mut action = None;
+        let mut save_log_button_rect = None;
         if let Some(back_action) = base::show_page_shell(ui, |ui| {
             ui.add_space(16.0);
             let available_width = ui.available_width();
@@ -269,7 +290,7 @@ impl SettingsPageState {
                     ui.label(RichText::new("Настройки").size(24.0).strong());
                     ui.add_space(18.0);
 
-                    self.show_tab_bar(ui);
+                    save_log_button_rect = Some(self.show_tab_bar(ui));
                     ui.add_space(18.0);
 
                     ScrollArea::vertical()
@@ -287,6 +308,13 @@ impl SettingsPageState {
                                     action = Some(tab_action);
                                 }
                             }
+                            SettingsTab::AiBackend => {
+                                crate::ai_backend_panel::draw_ai_backend_panel(
+                                    ui,
+                                    &self.ai_backend,
+                                    &mut self.ai_backend_panel,
+                                );
+                            }
                             SettingsTab::PythonEnvironment => {
                                 self.show_python_environment_tab(ui);
                             }
@@ -296,6 +324,8 @@ impl SettingsPageState {
         }) {
             action = Some(back_action);
         }
+
+        self.show_save_log_popup(ui, save_log_button_rect);
 
         action
     }
@@ -338,11 +368,13 @@ impl SettingsPageState {
         }
     }
 
-    fn show_tab_bar(&mut self, ui: &mut Ui) {
+    fn show_tab_bar(&mut self, ui: &mut Ui) -> egui::Rect {
+        let mut save_log_rect = egui::Rect::NOTHING;
         ui.horizontal_wrapped(|ui| {
             self.show_tab_button(ui, SettingsTab::General, "Общие настройки");
             self.show_tab_button(ui, SettingsTab::SystemInfo, "Информация о системе");
             self.show_tab_button(ui, SettingsTab::AiComputations, "ИИ вычисления");
+            self.show_tab_button(ui, SettingsTab::AiBackend, "ИИ бэкенд");
             match self.ai_install_type {
                 config::AiInstallType::Base => self.show_tab_button_highlighted(
                     ui,
@@ -357,7 +389,20 @@ impl SettingsPageState {
                 config::AiInstallType::None => {}
             }
             self.show_tab_button(ui, SettingsTab::PythonEnvironment, "Python окружение");
+
+            let response = show_two_line_button(
+                ui,
+                "Сохранить лог",
+                "Скиньте разработчику если столкнулись с багом",
+                egui::vec2(300.0, 40.0),
+                self.log_popup_open,
+            );
+            save_log_rect = response.rect;
+            if response.clicked() {
+                self.log_popup_open = !self.log_popup_open;
+            }
         });
+        save_log_rect
     }
 
     fn show_tab_button(&mut self, ui: &mut Ui, tab: SettingsTab, label: &str) {
@@ -390,17 +435,15 @@ impl SettingsPageState {
         let desired_size = egui::vec2(desired_width, 36.0);
         let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
         let hovered = response.hovered();
-        let actual_fill = if hovered && !selected && warning {
-            TAB_WARNING_HOVER_FILL
-        } else if hovered && !selected {
-            TAB_HOVER_FILL
+        let draw_rect = if hovered {
+            rect.expand(theme::BUTTON_HOVER_EXPANSION)
         } else {
-            fill
+            rect
         };
         ui.painter().rect(
-            rect,
+            draw_rect,
             CornerRadius::same(10),
-            actual_fill,
+            fill,
             Stroke::new(
                 1.0,
                 if warning {
@@ -420,6 +463,121 @@ impl SettingsPageState {
         );
         if response.clicked() {
             self.active_tab = tab;
+        }
+    }
+
+    fn show_save_log_popup(&mut self, ui: &mut Ui, button_rect: Option<egui::Rect>) {
+        if !self.log_popup_open {
+            return;
+        }
+        let Some(button_rect) = button_rect.filter(|rect| rect.is_finite()) else {
+            self.log_popup_open = false;
+            return;
+        };
+
+        const POPUP_WIDTH: f32 = 320.0;
+        const POPUP_BUTTON_HEIGHT: f32 = 50.0;
+        const POPUP_GAP: f32 = 8.0;
+
+        let popup_height = POPUP_BUTTON_HEIGHT * 2.0 + POPUP_GAP + 24.0;
+        let screen = ui.ctx().content_rect();
+        let popup_x = (button_rect.center().x - POPUP_WIDTH * 0.5)
+            .clamp(screen.left() + 8.0, (screen.right() - POPUP_WIDTH - 8.0).max(screen.left() + 8.0));
+        let popup_y = (button_rect.min.y - popup_height - POPUP_GAP).max(screen.top() + 8.0);
+        let popup_pos = egui::pos2(popup_x, popup_y);
+
+        let mut save_kind = None;
+        let popup_response = Area::new("settings_save_log_popup".into())
+            .order(Order::Foreground)
+            .fixed_pos(popup_pos)
+            .show(ui.ctx(), |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgb(24, 24, 28))
+                    .stroke(Stroke::new(1.0, theme::CARD_STROKE))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(POPUP_WIDTH);
+                        ui.vertical(|ui| {
+                            if show_two_line_button(
+                                ui,
+                                "Текущий лог",
+                                "Если программа не закрывалась после проблемы",
+                                egui::vec2(POPUP_WIDTH, POPUP_BUTTON_HEIGHT),
+                                false,
+                            )
+                            .clicked()
+                            {
+                                save_kind = Some(LogKind::Current);
+                            }
+                            ui.add_space(POPUP_GAP);
+                            if show_two_line_button(
+                                ui,
+                                "Предыдущий лог",
+                                "Если программа закрывалась после проблемы",
+                                egui::vec2(POPUP_WIDTH, POPUP_BUTTON_HEIGHT),
+                                false,
+                            )
+                            .clicked()
+                            {
+                                save_kind = Some(LogKind::Previous);
+                            }
+                        });
+                    });
+            });
+
+        if let Some(kind) = save_kind {
+            self.log_popup_open = false;
+            self.save_log_file(kind);
+            return;
+        }
+
+        let clicked_outside = ui.ctx().input(|input| {
+            input.pointer.any_pressed()
+                && !button_rect.contains(input.pointer.interact_pos().unwrap_or_default())
+                && !popup_response
+                    .response
+                    .rect
+                    .contains(input.pointer.interact_pos().unwrap_or_default())
+        });
+        if clicked_outside {
+            self.log_popup_open = false;
+        }
+    }
+
+    fn save_log_file(&mut self, kind: LogKind) {
+        let log_dir = config::data_dir();
+        let (source_name, label) = match kind {
+            LogKind::Current => ("last.log", "current"),
+            LogKind::Previous => ("previous.log", "previous"),
+        };
+        let source_path = log_dir.join(source_name);
+        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let default_name = format!("manhwastudio_{label}_log_{timestamp}.log");
+
+        let Some(save_path) = FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("Файлы логов", &["log"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match std::fs::copy(&source_path, &save_path) {
+            Ok(_) => {
+                runtime_log::log_info(format!(
+                    "[launcher-settings] saved '{}' log to '{}'",
+                    source_name,
+                    save_path.display()
+                ));
+            }
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[launcher-settings] failed to save '{}' log to '{}': {err}",
+                    source_name,
+                    save_path.display()
+                ));
+            }
         }
     }
 
@@ -1314,6 +1472,46 @@ impl Drop for SettingsPageState {
             runtime.terminate();
         }
     }
+}
+
+fn show_two_line_button(
+    ui: &mut Ui,
+    title: &str,
+    subtitle: &str,
+    size: Vec2,
+    active: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    let fill = if active { TAB_ACTIVE_FILL } else { TAB_IDLE_FILL };
+    let draw_rect = if hovered {
+        rect.expand(theme::BUTTON_HOVER_EXPANSION)
+    } else {
+        rect
+    };
+    ui.painter().rect(
+        draw_rect,
+        CornerRadius::same(10),
+        fill,
+        Stroke::new(1.0, TAB_STROKE),
+        egui::StrokeKind::Middle,
+    );
+    let center = rect.center();
+    ui.painter().text(
+        egui::pos2(center.x, center.y - 9.0),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(14.0),
+        theme::TEXT_MAIN,
+    );
+    ui.painter().text(
+        egui::pos2(center.x, center.y + 9.0),
+        Align2::CENTER_CENTER,
+        subtitle,
+        FontId::proportional(11.0),
+        theme::TEXT_MUTED,
+    );
+    response
 }
 
 fn console_output_layout_job(ui: &Ui, output: &str, wrap_width: f32) -> egui::text::LayoutJob {

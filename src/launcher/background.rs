@@ -35,6 +35,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Marker file placed inside a title folder to exclude it from the menu background pool.
+pub const NO_MENU_IMGS_MARKER: &str = "no_menu_imgs";
+
 const PROJECT_MENU_IMG_SAMPLE_COUNT: usize = 15;
 const PROJECT_MENU_IMG_MIN_TOTAL: usize = 21;
 const PROJECT_MENU_IMG_DEFAULT_SHARE: f32 = 0.30;
@@ -231,7 +234,7 @@ fn sample_project_menu_images(projects_root: &Path, rng: &mut SimpleRng) -> Vec<
     title_dirs.sort();
 
     for title_dir in title_dirs {
-        if title_dir.join("no_menu_imgs").exists() {
+        if title_dir.join(NO_MENU_IMGS_MARKER).exists() {
             continue;
         }
 

@@ -112,6 +112,10 @@ pub struct CompositionPanelOptions {
     pub limit: usize,
     pub limit_enabled: bool,
     pub use_character_names: bool,
+    /// Include image-bubble translations in the composition. When enabled, each text area of an
+    /// image bubble contributes one line `{translation}` (plus ` - {description}` when
+    /// `use_character_names` is on and the description is non-empty).
+    pub include_image_bubbles: bool,
     pub jinja2_enabled: bool,
     pub jinja2_template: String,
 }
@@ -133,6 +137,7 @@ impl Default for CompositionPanelOptions {
             limit: LIMIT_DEFAULT,
             limit_enabled: true,
             use_character_names: true,
+            include_image_bubbles: false,
             jinja2_enabled: false,
             jinja2_template: String::new(),
         }
@@ -429,6 +434,15 @@ fn draw_params_tab(
                 "Объединять реплики одного персонажа",
             )
             .changed();
+        changed |= ui
+            .checkbox(
+                &mut options.include_image_bubbles,
+                "Включать перевод из ImageBubble",
+            )
+            .on_hover_text(
+                "Для каждой области текста: «Перевод» (плюс « - Описание», если включены имена персонажей).",
+            )
+            .changed();
 
         ui.horizontal(|ui| {
             ui.label("Между репликами одного персонажа:");
@@ -486,6 +500,14 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
     let use_original = options.source_mode == CompositionSourceMode::Original;
     let mut filtered = Vec::new();
     for bubble in project.bubbles.iter() {
+        // Image bubbles are gated by their own option and always contribute their area translations
+        // (independent of the original/translation source mode used for text bubbles).
+        if is_image_bubble(bubble) {
+            if options.include_image_bubbles && !image_bubble_area_translations(bubble).is_empty() {
+                filtered.push(bubble);
+            }
+            continue;
+        }
         let translation_text = bubble.text.trim();
         let original_text = bubble.original_text.trim();
         if use_original {
@@ -544,6 +566,72 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
     let mut current_group = Vec::<String>::new();
 
     for bubble in filtered {
+        if is_image_bubble(bubble) {
+            // Flush any pending merged-character group first so image lines keep reading order.
+            if options.use_character_names
+                && options.merge_same_character
+                && !current_group.is_empty()
+                && let Some(prev) = prev_character.take()
+            {
+                let group_text = format!("{} - {prev}", current_group.join(&sep_same_character));
+                current_group.clear();
+                if !append_result_item(
+                    &mut result_lines,
+                    &mut current_length,
+                    &sep_between,
+                    &group_text,
+                    options.limit_enabled,
+                    options.limit,
+                    false,
+                ) {
+                    break;
+                }
+            }
+            prev_character = None;
+            let mut hit_limit = false;
+            for (translation, description) in image_bubble_area_translations(bubble) {
+                let mut normalized_text = translation.replace("\r\n", "\n").replace('\r', "\n");
+                if options.nl_replace_enabled {
+                    normalized_text = normalized_text.replace('\n', &newline_replacement);
+                }
+                normalized_text = collapse_inline_whitespace(&normalized_text)
+                    .trim()
+                    .to_string();
+                if normalized_text.is_empty() {
+                    continue;
+                }
+                let mut line_text = format!(
+                    "{}{}{}{}",
+                    options.replica_prefix, wrap_left, normalized_text, wrap_right
+                );
+                // "{translation} - {description}" only when character names are enabled and the
+                // description is non-empty; otherwise just the translation (no trailing dash).
+                if options.use_character_names {
+                    let description = description.trim();
+                    if !description.is_empty() {
+                        line_text.push_str(" - ");
+                        line_text.push_str(description);
+                    }
+                }
+                if !append_result_item(
+                    &mut result_lines,
+                    &mut current_length,
+                    &sep_between,
+                    &line_text,
+                    options.limit_enabled,
+                    options.limit,
+                    false,
+                ) {
+                    hit_limit = true;
+                    break;
+                }
+            }
+            if hit_limit {
+                break;
+            }
+            continue;
+        }
+
         let source_text = if use_original {
             bubble.original_text.trim()
         } else {
@@ -671,12 +759,60 @@ fn compose_minijinja(project: &ProjectData, options: &CompositionPanelOptions) -
     let bubbles = project
         .bubbles
         .iter()
+        .filter(|bubble| options.include_image_bubbles || !is_image_bubble(bubble))
         .map(|bubble| serde_json::to_value(bubble).unwrap_or(Value::Null))
         .collect::<Vec<_>>();
 
     template
         .render(context! { bubbles => bubbles })
         .unwrap_or_else(|err| format!("Ошибка MiniJinja: {err}"))
+}
+
+/// True when the bubble is an `ImageBubble` (`bubble_class == "image"`).
+fn is_image_bubble(bubble: &Bubble) -> bool {
+    bubble
+        .bubble_class
+        .as_deref()
+        .is_some_and(|class| class.eq_ignore_ascii_case("image"))
+}
+
+/// Returns `(translation, description)` for each image-bubble text area that has a non-empty
+/// translation, in area order. Area 0 reads the legacy `text` / `extra.description` fields; later
+/// areas read their entries in `extra["text_areas"]`.
+fn image_bubble_area_translations(bubble: &Bubble) -> Vec<(String, String)> {
+    let legacy_description = bubble_extra_string(&bubble.extra, "description");
+    let mut out = Vec::new();
+    match bubble.extra.get("text_areas").and_then(Value::as_array) {
+        Some(arr) if !arr.is_empty() => {
+            for (idx, entry) in arr.iter().enumerate() {
+                let (translation, description) = if idx == 0 {
+                    (bubble.text.clone(), legacy_description.clone())
+                } else {
+                    (
+                        entry
+                            .get("translation")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        entry
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                };
+                if !translation.trim().is_empty() {
+                    out.push((translation, description));
+                }
+            }
+        }
+        _ => {
+            if !bubble.text.trim().is_empty() {
+                out.push((bubble.text.clone(), legacy_description));
+            }
+        }
+    }
+    out
 }
 
 fn bubble_character_text(bubble: &Bubble) -> String {
@@ -1043,4 +1179,71 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{image_bubble_area_translations, is_image_bubble};
+    use crate::project::Bubble;
+    use serde_json::{Map, Value, json};
+
+    fn image_bubble(text: &str, extra: Map<String, Value>) -> Bubble {
+        Bubble {
+            id: 1,
+            img_idx: 0,
+            img_u: 0.5,
+            img_v: 0.5,
+            side: Some("right".to_string()),
+            bubble_class: Some("image".to_string()),
+            bubble_type: Some("aside".to_string()),
+            text: text.to_string(),
+            original_text: String::new(),
+            extra,
+        }
+    }
+
+    #[test]
+    fn is_image_bubble_detects_class() {
+        let mut text_bubble = image_bubble("t", Map::new());
+        assert!(is_image_bubble(&text_bubble));
+        text_bubble.bubble_class = Some("text".to_string());
+        assert!(!is_image_bubble(&text_bubble));
+        text_bubble.bubble_class = None;
+        assert!(!is_image_bubble(&text_bubble));
+    }
+
+    #[test]
+    fn area_translations_use_legacy_for_area0_and_array_for_rest() {
+        let mut extra = Map::new();
+        extra.insert(
+            "description".to_string(),
+            Value::String("desc0".to_string()),
+        );
+        extra.insert(
+            "text_areas".to_string(),
+            json!([
+                {"rect": [0.0, 0.0, 0.4, 0.4], "anchor": [0.2, 0.2]},
+                {"rect": [0.5, 0.5, 0.9, 0.9], "anchor": [0.7, 0.7],
+                 "translation": "tr1", "description": "desc1"},
+                {"rect": [0.5, 0.1, 0.9, 0.3], "anchor": [0.7, 0.2],
+                 "translation": "   ", "description": "empty-skipped"}
+            ]),
+        );
+        let areas = image_bubble_area_translations(&image_bubble("tr0", extra));
+        // Area 0 from legacy text + extra.description; area 1 from the array; the blank area skipped.
+        assert_eq!(areas.len(), 2);
+        assert_eq!(areas[0], ("tr0".to_string(), "desc0".to_string()));
+        assert_eq!(areas[1], ("tr1".to_string(), "desc1".to_string()));
+    }
+
+    #[test]
+    fn area_translations_fall_back_to_legacy_single_area() {
+        let mut extra = Map::new();
+        extra.insert("description".to_string(), Value::String("only".to_string()));
+        let areas = image_bubble_area_translations(&image_bubble("solo", extra));
+        assert_eq!(areas, vec![("solo".to_string(), "only".to_string())]);
+        // No translation at all -> no lines.
+        let empty = image_bubble_area_translations(&image_bubble("  ", Map::new()));
+        assert!(empty.is_empty());
+    }
 }

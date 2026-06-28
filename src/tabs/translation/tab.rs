@@ -7,6 +7,8 @@ Main types:
 - `TranslationPanel`: active floating panel (`None`, `Bubbles`, `Ocr`, `Composition`,
   `MachineTranslation`, `TextDetector`).
 - `OcrDragSelection`: transient OCR region selection on canvas (`start`, `current`).
+- `ImageCropDragSelection`: transient ImageBubble crop selection (`Shift+Q+drag`) that writes
+  crop metadata instead of dispatching OCR.
 - `AdvancedRecognitionWindow`: floating OCR preview/editor for manual region recognition.
 - `OcrToast`: short-lived foreground notification (`text`, `color`, `hide_at_s`).
 - `OcrPendingBubbleInsert`: deferred bubble-create payload after OCR response.
@@ -160,10 +162,12 @@ Key TranslationTabState field groups:
   `advanced_recognition`, `advanced_recognition_request`, `pending_bubble_inserts`,
   `pending_textdetector_ocr_tasks`,
   `textdetector_ocr_active_*`, `textdetector_ocr_retry_state`, `textdetector_ocr_* counters`.
-- MT runtime: `pending_translate_actions`, `pending_mt_start_all`, `pending_mt_start_page`.
+- MT runtime: `pending_translate_actions`, `pending_mt_start_all`, `pending_mt_start_page`,
+  `mt_progress`, `mt_stop_notice`, `mt_request_preview_rx`, `mt_request_preview`.
 - Footer/characters runtime: `character_names`, `characters_loaded_for`,
   `characters_file_mtime`, `character_names_watch_last_check_s`,
-  `pending_characters_refresh`, `footer_bootstrapped`, `footer_known_ids`,
+  `pending_characters_refresh`, `footer_bootstrapped`,
+  `footer_tracking_synced_revision`, `footer_known_ids`,
   `footer_overrides`, `pending_footer_patches`, `pending_footer_patch_changed_at`,
   `footer_character_autocomplete`,
   `last_*` defaults.
@@ -172,13 +176,17 @@ Key TranslationTabState field groups:
 */
 
 use crate::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
-use crate::canvas::{BubbleAction, CanvasHooks, CanvasUiStatus, CanvasView};
+use crate::canvas::{
+    BubbleAction, BubbleClass, CanvasHooks, CanvasScrollbarContext, CanvasUiStatus, CanvasView,
+    TranslationStatusDisplay,
+};
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
 };
 use crate::models::text_mask_model::{TextMaskModel, TextMaskPage};
+use crate::paste_image;
 use crate::project::{Bubble, Page, ProjectData};
 use crate::tabs::AppTab;
 use crate::tabs::characters::load_character_names;
@@ -187,15 +195,19 @@ use crate::tabs::translation::adv_rec::{
 };
 use crate::tabs::translation::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
 use crate::tabs::translation::machine_translation::{
-    MtControllerEvent, MtService, MtTranslateItem, MtTranslateRequest, TranslationMtController,
+    AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions, AiMtReasoning, AiMtSortMode,
+    MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,
+    MtRequestPreviewPart, MtService, MtTranslateItem, MtTranslateRequest, TranslationMtController,
+    bubble_order_for_sort, build_ai_mt_request_preview, character_for_bubble,
+    is_probable_quota_or_limit_error,
 };
 use crate::tabs::translation::ocr::{
-    OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
-    TranslationOcrController,
+    AiApiService, OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest,
+    OcrRuntimeOptions, TranslationOcrController, is_likely_multimodal_model,
 };
 use crate::tabs::translation::panels::bubbles::{
     BubbleFooterState, BubblesPanelContext, BubblesPanelState, FOOTER_NO_CHARACTER,
-    FOOTER_NO_CHARACTERS, bubble_footer_state_from_record, draw_bubbles_panel,
+    FOOTER_NO_CHARACTERS, bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel,
     footer_state_for_bubble,
 };
 use crate::tabs::translation::panels::composition::{
@@ -203,9 +215,11 @@ use crate::tabs::translation::panels::composition::{
     compose_translation_text, draw_composition_panel, normalize_wrap_with,
 };
 use crate::tabs::translation::panels::machine_translation::{
-    MtPanelOptions, draw_machine_translation_panel,
+    MtPanelOptions, MtPanelProgress, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
-use crate::tabs::translation::panels::ocr::{OcrPanelOptions, draw_ocr_panel};
+use crate::tabs::translation::panels::ocr::{
+    CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel,
+};
 use crate::tabs::translation::panels::text_detector::{
     TextDetectorAlgorithm, TextDetectorPanelOptions, draw_text_detector_panel,
 };
@@ -215,9 +229,12 @@ use crate::tabs::translation::text_detector::{
     TranslationTextDetectorController,
 };
 use crate::tools::MaskBrush;
-use crate::widgets::{AutocompleteLine, WheelSlider, WheelSpinBox};
+use crate::widgets::{
+    AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider, WheelSpinBox,
+};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke};
+use rfd::FileDialog;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -309,7 +326,7 @@ impl TranslationPanel {
             TranslationPanel::Bubbles => "Пузыри",
             TranslationPanel::Ocr => "Распознавание текста",
             TranslationPanel::Composition => "Компоновка",
-            TranslationPanel::MachineTranslation => "Машинный перевод",
+            TranslationPanel::MachineTranslation => "Машинный/ИИ перевод",
             TranslationPanel::TextDetector => "Массовый детектор текста",
         }
     }
@@ -320,7 +337,7 @@ impl TranslationPanel {
             TranslationPanel::Bubbles => "Пузыри",
             TranslationPanel::Ocr => "Распознавание текста",
             TranslationPanel::Composition => "Компоновка",
-            TranslationPanel::MachineTranslation => "Маш. перевод",
+            TranslationPanel::MachineTranslation => "Маш./ИИ перевод",
             TranslationPanel::TextDetector => "Массовый детектор текста",
         }
     }
@@ -340,6 +357,18 @@ struct OcrDragSelection {
     recent_character_rank: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ImageCropDragSelection {
+    start: Pos2,
+    current: Pos2,
+}
+
+impl ImageCropDragSelection {
+    fn rect(self) -> Rect {
+        Rect::from_two_pos(self.start, self.current)
+    }
+}
+
 impl OcrDragSelection {
     fn rect(&self) -> Rect {
         Rect::from_two_pos(self.start, self.current)
@@ -351,6 +380,17 @@ struct OcrToast {
     text: String,
     color: Color32,
     hide_at_s: f64,
+}
+
+/// Debug window state for "Отобразить полный запрос": holds the assembled first AI request and the
+/// GPU textures lazily created for its inline images. `scope_label` describes which action built it
+/// ("текущая страница" / "весь проект"). `open` is driven by the egui window close button.
+struct MtRequestPreviewWindow {
+    preview: MtRequestPreview,
+    scope_label: String,
+    open: bool,
+    /// One lazily-loaded texture per `MtRequestPreviewPart::Image`, indexed by image order.
+    image_textures: Vec<Option<egui::TextureHandle>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,7 +510,7 @@ pub struct TranslationTabState {
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
     ocr_controller: TranslationOcrController,
     ocr_panel_options: OcrPanelOptions,
-    ocr_engine_states: [OcrLoadState; 4],
+    ocr_engine_states: [OcrLoadState; 6],
     ocr_loading_engine: Option<OcrEngine>,
     ocr_last_panel_engine: Option<OcrEngine>,
     ocr_last_health_check_request_s: f64,
@@ -495,6 +535,11 @@ pub struct TranslationTabState {
     text_detection_storage_busy: bool,
     text_detection_storage_rx: Option<Receiver<TextDetectionStorageEvent>>,
     ocr_selection: Option<OcrDragSelection>,
+    image_crop_selection: Option<ImageCropDragSelection>,
+    /// Edge gate for the plain-`Q` image-bubble shortcut. Cleared while `Q` participates in a
+    /// `Shift+Q` crop session or after a creation, and re-armed only once `Q` is fully released, so
+    /// a lingering `Q` (e.g. `Shift` released a frame before `Q`) cannot spawn an extra bubble.
+    image_create_q_armed: bool,
     advanced_recognition: AdvancedRecognitionWindow,
     advanced_recognition_request: Option<BuiltOcrRequest>,
     ocr_toast: Option<OcrToast>,
@@ -512,6 +557,14 @@ pub struct TranslationTabState {
     pending_translate_actions: Vec<i64>,
     pending_mt_start_all: bool,
     pending_mt_start_page: bool,
+    mt_progress: Option<MtPanelProgress>,
+    /// Sticky notice shown when an AI run stopped due to a probable credit/quota/limit error.
+    mt_stop_notice: Option<MtStopNotice>,
+    /// Pending background build of the AI request preview (debug "Отобразить полный запрос").
+    /// Payload is `(preview, scope_label)` on success.
+    mt_request_preview_rx: Option<Receiver<Result<(MtRequestPreview, String), String>>>,
+    /// Open debug window showing the first AI request that a translate action would send.
+    mt_request_preview: Option<MtRequestPreviewWindow>,
     ocr_settings_dirty: bool,
     mt_settings_dirty: bool,
     composition_settings_dirty: bool,
@@ -528,6 +581,9 @@ pub struct TranslationTabState {
     character_names_watch_last_check_s: f64,
     pending_characters_refresh: bool,
     footer_bootstrapped: bool,
+    // Last `CanvasView::hook_bubbles_revision()` for which `sync_footer_tracking` ran a full
+    // recompute. Used to skip the per-frame snapshot/clone/sort when the bubble set is unchanged.
+    footer_tracking_synced_revision: Option<u64>,
     footer_known_ids: HashSet<i64>,
     footer_overrides: HashMap<i64, BubbleFooterState>,
     pending_footer_patches: HashMap<i64, Map<String, Value>>,
@@ -694,7 +750,7 @@ impl TranslationTabState {
             ai_backend_probe_tx,
             ocr_controller: TranslationOcrController::default(),
             ocr_panel_options: OcrPanelOptions::default(),
-            ocr_engine_states: [OcrLoadState::NotLoaded; 4],
+            ocr_engine_states: [OcrLoadState::NotLoaded; 6],
             ocr_loading_engine: None,
             ocr_last_panel_engine: None,
             ocr_last_health_check_request_s: -10_000.0,
@@ -719,6 +775,8 @@ impl TranslationTabState {
             text_detection_storage_busy: false,
             text_detection_storage_rx: None,
             ocr_selection: None,
+            image_crop_selection: None,
+            image_create_q_armed: true,
             advanced_recognition: AdvancedRecognitionWindow::default(),
             advanced_recognition_request: None,
             ocr_toast: None,
@@ -736,6 +794,10 @@ impl TranslationTabState {
             pending_translate_actions: Vec::new(),
             pending_mt_start_all: false,
             pending_mt_start_page: false,
+            mt_progress: None,
+            mt_stop_notice: None,
+            mt_request_preview_rx: None,
+            mt_request_preview: None,
             ocr_settings_dirty: false,
             mt_settings_dirty: false,
             composition_settings_dirty: false,
@@ -752,6 +814,7 @@ impl TranslationTabState {
             character_names_watch_last_check_s: -10_000.0,
             pending_characters_refresh: false,
             footer_bootstrapped: false,
+            footer_tracking_synced_revision: None,
             footer_known_ids: HashSet::new(),
             footer_overrides: HashMap::new(),
             pending_footer_patches: HashMap::new(),
@@ -838,6 +901,8 @@ impl TranslationTabState {
             OcrEngine::EasyOcr => 1,
             OcrEngine::PaddleOcr => 2,
             OcrEngine::Surya => 3,
+            OcrEngine::AiApi => 4,
+            OcrEngine::PaddleVl => 5,
         }
     }
 
@@ -867,6 +932,7 @@ impl TranslationTabState {
         let manga_ready = snapshot.ocr_manga_ready;
         let easy_ready = snapshot.ocr_easy_ready;
         let paddle_ready = snapshot.ocr_paddle_ready;
+        let paddle_vl_ready = snapshot.ocr_paddle_vl_ready;
         let surya_ready = snapshot.ocr_surya_ready;
         let sync_engine = |this: &mut Self, engine: OcrEngine, ready: Option<bool>| {
             let Some(ready) = ready else {
@@ -881,6 +947,7 @@ impl TranslationTabState {
         sync_engine(self, OcrEngine::MangaOcr, manga_ready);
         sync_engine(self, OcrEngine::EasyOcr, easy_ready);
         sync_engine(self, OcrEngine::PaddleOcr, paddle_ready);
+        sync_engine(self, OcrEngine::PaddleVl, paddle_vl_ready);
         sync_engine(self, OcrEngine::Surya, surya_ready);
     }
 
@@ -961,6 +1028,12 @@ impl TranslationTabState {
 
     fn ocr_advanced_selection_mode_active(&self) -> bool {
         self.hotkey_hints.ocr_advanced_selection_mode_modifier_down
+    }
+
+    fn image_crop_selection_mode_active(ctx: &egui::Context) -> bool {
+        ctx.input(|input| {
+            input.modifiers.shift && input.key_down(egui::Key::Q) && !input.any_touches()
+        }) && !ctx.wants_keyboard_input()
     }
 
     fn panel_title(&self, panel: TranslationPanel) -> String {
@@ -1076,13 +1149,13 @@ impl TranslationTabState {
 
     fn selected_ocr_mode_requires_torch(&self) -> bool {
         match self.ocr_panel_options.engine {
-            OcrEngine::EasyOcr | OcrEngine::Surya => true,
+            OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
             OcrEngine::MangaOcr => self
                 .ocr_panel_options
                 .manga_model
                 .trim()
                 .eq_ignore_ascii_case("base_torch"),
-            OcrEngine::PaddleOcr => false,
+            OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
         }
     }
 
@@ -1164,6 +1237,24 @@ impl TranslationTabState {
                             self.sync_ocr_states_from_backend_health_snapshot();
                         }
                     }
+                    if actions.save_ai_api_key {
+                        self.ocr_panel_options.ai_api_status = "Сохранение API key...".to_string();
+                        self.ocr_controller.store_ai_api_key(
+                            self.ocr_panel_options.ai_api_service,
+                            self.ocr_panel_options.ai_api_key_edit.clone(),
+                        );
+                    }
+                    if actions.clear_ai_api_key {
+                        self.ocr_panel_options.ai_api_status = "Удаление API key...".to_string();
+                        self.ocr_controller
+                            .clear_ai_api_key(self.ocr_panel_options.ai_api_service);
+                    }
+                    if actions.refresh_ai_api_metadata {
+                        self.ocr_panel_options.ai_api_status =
+                            "Обновление AI API данных...".to_string();
+                        self.ocr_controller
+                            .refresh_ai_api_metadata(self.ocr_panel_options.ai_api_service);
+                    }
                     if actions.request_load && !backend_unavailable {
                         if let Some(error) = self.current_ocr_torch_requirement_error() {
                             self.push_toast(ctx, error, Color32::RED, 2.8);
@@ -1194,6 +1285,8 @@ impl TranslationTabState {
                             ui,
                             mt_busy,
                             mt_can_cancel,
+                            self.mt_progress,
+                            &mut self.mt_stop_notice,
                             &mut self.mt_panel_options,
                         )
                     })
@@ -1202,15 +1295,41 @@ impl TranslationTabState {
                     if actions.options_changed {
                         self.mt_settings_dirty = true;
                     }
+                    if actions.save_ai_api_key {
+                        self.mt_panel_options.ai_api_status = "Сохранение API key...".to_string();
+                        self.mt_controller.store_ai_api_key(
+                            self.mt_panel_options.ai_api_service,
+                            self.mt_panel_options.ai_api_key_edit.clone(),
+                        );
+                    }
+                    if actions.clear_ai_api_key {
+                        self.mt_panel_options.ai_api_status = "Удаление API key...".to_string();
+                        self.mt_controller
+                            .clear_ai_api_key(self.mt_panel_options.ai_api_service);
+                    }
+                    if actions.refresh_ai_api_metadata {
+                        self.mt_panel_options.ai_api_status =
+                            "Обновление AI API данных...".to_string();
+                        self.mt_controller
+                            .refresh_ai_api_metadata(self.mt_panel_options.ai_api_service);
+                    }
                     if actions.start_all {
                         self.pending_mt_start_all = true;
                     }
                     if actions.start_page {
                         self.pending_mt_start_page = true;
                     }
+                    if actions.preview_request_page {
+                        self.start_ai_mt_request_preview(ctx, canvas, project, true);
+                    }
+                    if actions.preview_request_all {
+                        self.start_ai_mt_request_preview(ctx, canvas, project, false);
+                    }
                     if actions.cancel {
                         self.cancel_active_mt(ctx);
                     }
+                    self.poll_ai_mt_request_preview(ctx);
+                    self.draw_ai_mt_request_preview_window(ctx);
                 } else {
                     ui.separator();
                     ui.colored_label(
@@ -1386,7 +1505,26 @@ impl TranslationTabState {
         }
     }
 
+    /// Tracks bubble lifecycle and prunes footer caches, applying footer defaults to newly
+    /// detected bubbles.
+    ///
+    /// Runs every frame from `draw_canvas_overlay_top_left`, so the expensive recompute (full
+    /// bubble snapshot clone + id `HashSet` + recent-character history) is gated on
+    /// `CanvasView::hook_bubbles_revision()`: when the revision is unchanged and footer tracking
+    /// was already bootstrapped, the call returns early and reuses the cached footer state. A
+    /// newly-created bubble (even one living only in `runtime_bubbles`) bumps the revision, so the
+    /// "apply defaults for new bubble" path still fires. The first call always recomputes.
     fn sync_footer_tracking(&mut self, canvas: &CanvasView, project: &ProjectData) {
+        let current_revision = canvas.hook_bubbles_revision();
+        if !footer_tracking_should_recompute(
+            self.footer_tracking_synced_revision,
+            current_revision,
+            self.footer_bootstrapped,
+        ) {
+            return;
+        }
+        self.footer_tracking_synced_revision = Some(current_revision);
+
         let live_bubbles = canvas.hook_bubbles_snapshot(project);
         let known_now = live_bubbles
             .iter()
@@ -1569,6 +1707,55 @@ impl TranslationTabState {
             let _ = self.apply_recent_character_rank_to_latest_bubble(canvas, project, rank);
         }
         true
+    }
+
+    fn handle_image_bubble_hotkeys(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &mut CanvasView,
+        project: &ProjectData,
+    ) {
+        let (q_down, any_modifier) = ctx.input(|input| {
+            (
+                input.key_down(egui::Key::Q),
+                input.modifiers.shift
+                    || input.modifiers.ctrl
+                    || input.modifiers.command
+                    || input.modifiers.alt,
+            )
+        });
+        // Re-arm only once Q is fully released, so a Q still held after a Shift+Q crop (Shift may
+        // release a frame earlier) cannot spawn another bubble.
+        if !q_down {
+            self.image_create_q_armed = true;
+        }
+        let crop_context = Self::image_crop_selection_mode_active(ctx)
+            || self.image_crop_selection.is_some()
+            || any_modifier;
+        // Mark this Q-hold as belonging to a crop/modifier context; it must not create a plain
+        // bubble until released and pressed again.
+        if q_down && crop_context {
+            self.image_create_q_armed = false;
+        }
+
+        // Always consume the plain-Q press event so it does not leak elsewhere.
+        let q_pressed_event =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Q));
+        let create = q_pressed_event
+            && self.image_create_q_armed
+            && q_down
+            && !any_modifier
+            && !crop_context
+            && !ctx.wants_keyboard_input();
+        if create {
+            // One bubble per fresh press: block until Q is released and pressed again.
+            self.image_create_q_armed = false;
+            if let Some(pointer_pos) = ctx.pointer_latest_pos()
+                && canvas.create_image_bubble_at_pointer_shortcut(ctx, pointer_pos)
+            {
+                canvas.flush_pending_bubble_upserts_now(project);
+            }
+        }
     }
 
     fn draw_recent_character_cards(&self, ctx: &egui::Context, canvas_rect: Rect) {
@@ -1856,6 +2043,58 @@ impl TranslationTabState {
                             3.0,
                         );
                     }
+                }
+                OcrControllerEvent::AiApiKeyStored { service } => {
+                    if self.ocr_panel_options.ai_api_service == service {
+                        self.ocr_panel_options.ai_api_key_edit.clear();
+                        self.ocr_panel_options.ai_api_key_configured = Some(true);
+                        self.ocr_panel_options.ai_api_status =
+                            format!("API key {} сохранен.", service.label());
+                        self.ocr_controller.refresh_ai_api_metadata(service);
+                    }
+                    self.push_toast(
+                        ctx,
+                        format!("API key {} сохранен.", service.label()),
+                        Color32::from_rgb(42, 168, 88),
+                        2.2,
+                    );
+                }
+                OcrControllerEvent::AiApiKeyCleared { service } => {
+                    if self.ocr_panel_options.ai_api_service == service {
+                        self.ocr_panel_options.ai_api_key_edit.clear();
+                        self.ocr_panel_options.ai_api_key_configured = Some(false);
+                        self.ocr_panel_options.ai_api_models.clear();
+                        self.ocr_panel_options.ai_api_account_status =
+                            "API key не задан".to_string();
+                        self.ocr_panel_options.ai_api_status =
+                            format!("API key {} удален.", service.label());
+                    }
+                }
+                OcrControllerEvent::AiApiMetadataLoaded(metadata) => {
+                    if self.ocr_panel_options.ai_api_service == metadata.service {
+                        self.ocr_panel_options.ai_api_key_configured =
+                            Some(metadata.key_configured);
+                        self.ocr_panel_options.ai_api_models = metadata.models;
+                        self.ocr_panel_options.ai_api_account_status = metadata.account_status;
+                        if !self
+                            .ocr_panel_options
+                            .ai_api_models
+                            .iter()
+                            .any(|model| model == &self.ocr_panel_options.ai_api_model)
+                            && let Some(model) = self.ocr_panel_options.ai_api_models.first()
+                        {
+                            self.ocr_panel_options.ai_api_model = model.clone();
+                            self.ocr_settings_dirty = true;
+                        }
+                        self.ocr_panel_options.ai_api_status =
+                            "AI API данные обновлены.".to_string();
+                    }
+                }
+                OcrControllerEvent::AiApiMetadataFailed { service, error } => {
+                    if self.ocr_panel_options.ai_api_service == service {
+                        self.ocr_panel_options.ai_api_status = error.clone();
+                    }
+                    self.push_toast(ctx, format!("AI API: {error}"), Color32::RED, 3.0);
                 }
             }
         }
@@ -2715,6 +2954,7 @@ impl TranslationTabState {
                 image_override_png: None,
                 join_newlines: self.ocr_panel_options.join_newlines,
                 reflect_strings: self.ocr_panel_options.reflect_strings,
+                char_replacements: self.ocr_panel_options.runtime_char_replacements(),
             };
             if self.ocr_panel_options.create_bubble {
                 self.pending_bubble_inserts.insert(
@@ -3300,16 +3540,43 @@ impl TranslationTabState {
         for event in self.mt_controller.poll_events() {
             match event {
                 MtControllerEvent::RunStarted { total } => {
-                    let _ = total;
+                    // A fresh run clears any stale credit/limit notice from a previous run.
+                    self.mt_stop_notice = None;
+                    self.mt_progress = Some(MtPanelProgress {
+                        total,
+                        ..MtPanelProgress::default()
+                    });
                 }
                 MtControllerEvent::ItemTranslated {
                     bubble_id,
                     translated_text,
+                    original_text,
                 } => {
-                    if !canvas.apply_machine_translation_result(bubble_id, translated_text) {
+                    let applied = if let Some(original_text) = original_text {
+                        canvas.apply_machine_translation_result_with_original(
+                            bubble_id,
+                            original_text,
+                            translated_text,
+                        )
+                    } else {
+                        canvas.apply_machine_translation_result(bubble_id, translated_text)
+                    };
+                    if !applied {
                         self.push_toast(
                             ctx,
                             format!("Не удалось применить перевод для пузыря #{bubble_id}."),
+                            Color32::from_rgb(255, 172, 66),
+                            2.4,
+                        );
+                    }
+                }
+                MtControllerEvent::ItemAreasTranslated { bubble_id, areas } => {
+                    if !canvas.apply_machine_translation_areas(bubble_id, areas) {
+                        self.push_toast(
+                            ctx,
+                            format!(
+                                "Не удалось применить перевод областей для пузыря #{bubble_id}."
+                            ),
                             Color32::from_rgb(255, 172, 66),
                             2.4,
                         );
@@ -3322,6 +3589,7 @@ impl TranslationTabState {
                     );
                 }
                 MtControllerEvent::RunFinished { translated, errors } => {
+                    self.mt_progress = None;
                     let color = if errors == 0 {
                         Color32::from_rgb(42, 168, 88)
                     } else {
@@ -3338,6 +3606,7 @@ impl TranslationTabState {
                     );
                 }
                 MtControllerEvent::RunCancelled { translated, errors } => {
+                    self.mt_progress = None;
                     self.push_toast(
                         ctx,
                         format!("Маш. перевод отменён: готово {translated}, ошибок: {errors}"),
@@ -3346,13 +3615,101 @@ impl TranslationTabState {
                     );
                 }
                 MtControllerEvent::RunFailed { error } => {
+                    self.mt_progress = None;
                     eprintln!("[MT][RunFailed] {}", error.replace('\n', " "));
+                    if is_probable_quota_or_limit_error(&error) {
+                        // Stop quietly: replace the red error toast with a sticky yellow notice that
+                        // keeps the full provider error available behind a toggle.
+                        self.mt_stop_notice = Some(MtStopNotice {
+                            full_error: error,
+                            expanded: false,
+                        });
+                    } else {
+                        self.push_toast(
+                            ctx,
+                            format!("Маш. перевод ошибка: {error}"),
+                            Color32::RED,
+                            3.2,
+                        );
+                    }
+                }
+                MtControllerEvent::Progress {
+                    translated,
+                    errors,
+                    total,
+                    context_used_chars,
+                    context_budget_chars,
+                    pruned_replicas,
+                } => {
+                    self.mt_progress = Some(MtPanelProgress {
+                        translated,
+                        errors,
+                        total,
+                        context_used_chars,
+                        context_budget_chars,
+                        pruned_replicas,
+                    });
                     self.push_toast(
                         ctx,
-                        format!("Маш. перевод ошибка: {error}"),
-                        Color32::RED,
-                        3.2,
+                        format!(
+                            "ИИ перевод: {translated}/{total}, ошибок: {errors}. Контекст: {}/{}. Обрезано реплик: {pruned_replicas}",
+                            format_context_chars(context_used_chars),
+                            format_context_chars(context_budget_chars),
+                        ),
+                        Color32::from_rgb(255, 172, 66),
+                        2.4,
                     );
+                }
+                MtControllerEvent::AiApiKeyStored { service } => {
+                    if self.mt_panel_options.ai_api_service == service {
+                        self.mt_panel_options.ai_api_key_edit.clear();
+                        self.mt_panel_options.ai_api_key_configured = Some(true);
+                        self.mt_panel_options.ai_api_status =
+                            format!("API key {} сохранен.", service.label());
+                        self.mt_controller.refresh_ai_api_metadata(service);
+                    }
+                    self.push_toast(
+                        ctx,
+                        format!("API key {} сохранен.", service.label()),
+                        Color32::from_rgb(42, 168, 88),
+                        2.2,
+                    );
+                }
+                MtControllerEvent::AiApiKeyCleared { service } => {
+                    if self.mt_panel_options.ai_api_service == service {
+                        self.mt_panel_options.ai_api_key_edit.clear();
+                        self.mt_panel_options.ai_api_key_configured = Some(false);
+                        self.mt_panel_options.ai_api_models.clear();
+                        self.mt_panel_options.ai_api_account_status =
+                            "API key не задан".to_string();
+                        self.mt_panel_options.ai_api_status =
+                            format!("API key {} удален.", service.label());
+                    }
+                }
+                MtControllerEvent::AiApiMetadataLoaded(metadata) => {
+                    if self.mt_panel_options.ai_api_service == metadata.service {
+                        self.mt_panel_options.ai_api_key_configured = Some(metadata.key_configured);
+                        self.mt_panel_options.ai_api_models = metadata.models;
+                        self.mt_panel_options.ai_api_account_status = metadata.account_status;
+                        if !self
+                            .mt_panel_options
+                            .ai_api_models
+                            .iter()
+                            .any(|model| model == &self.mt_panel_options.ai_api_model)
+                            && let Some(model) = self.mt_panel_options.ai_api_models.first()
+                        {
+                            self.mt_panel_options.ai_api_model = model.clone();
+                            self.mt_settings_dirty = true;
+                        }
+                        self.mt_panel_options.ai_api_status =
+                            "AI API данные обновлены.".to_string();
+                    }
+                }
+                MtControllerEvent::AiApiMetadataFailed { service, error } => {
+                    if self.mt_panel_options.ai_api_service == service {
+                        self.mt_panel_options.ai_api_status = error.clone();
+                    }
+                    self.push_toast(ctx, format!("AI API: {error}"), Color32::RED, 3.0);
                 }
             }
         }
@@ -3418,21 +3775,8 @@ impl TranslationTabState {
         project: &ProjectData,
         current_page_only: bool,
     ) {
-        let current_page = canvas.current_page_idx();
-        let mut items = Vec::new();
-        for bubble in project.bubbles.iter() {
-            if current_page_only && bubble.img_idx != current_page {
-                continue;
-            }
-            if !bubble.text.trim().is_empty() || bubble.original_text.trim().is_empty() {
-                continue;
-            }
-            items.push(MtTranslateItem {
-                bubble_id: bubble.id,
-                text: bubble.original_text.clone(),
-            });
-        }
-        if items.is_empty() {
+        let items = self.collect_ai_mt_scope_items(canvas, project, current_page_only);
+        if !items.iter().any(|item| item.needs_translation) {
             self.push_toast(
                 ctx,
                 "Нет пузырей для машинного перевода.".to_string(),
@@ -3441,7 +3785,123 @@ impl TranslationTabState {
             );
             return;
         }
-        self.start_mt_with_items(ctx, items);
+        self.start_mt_with_items(ctx, project, items);
+    }
+
+    /// Collects the MT items for a scope translation (whole project or current page) using the same
+    /// rules as a real run: image-bubble inclusion, multimodal gating, and AI context mode that adds
+    /// already-translated replicas as ordered read-only context. Shared by the translate action and
+    /// the request preview so both see identical input.
+    fn collect_ai_mt_scope_items(
+        &self,
+        canvas: &CanvasView,
+        project: &ProjectData,
+        current_page_only: bool,
+    ) -> Vec<MtTranslateItem> {
+        if self.ai_mt_imagebubble_mode_active() {
+            return self.collect_ai_mt_imagebubble_items(canvas, project, current_page_only);
+        }
+        let current_page = canvas.current_page_idx();
+        let mut items = Vec::new();
+        let include_image_bubbles = self.ai_mt_can_include_image_bubbles();
+        // When AI context mode is on, already-translated replicas are kept as ordered read-only
+        // context so the model sees the correct reading order around the untranslated replicas.
+        let context_mode = self.ai_mt_context_includes_translated();
+        for bubble in project.bubbles.iter() {
+            if current_page_only && bubble.img_idx != current_page {
+                continue;
+            }
+            if is_image_bubble_record(bubble) && !include_image_bubbles {
+                continue;
+            }
+            let image_input = if include_image_bubbles {
+                mt_image_input_for_bubble(bubble)
+            } else {
+                None
+            };
+            let has_translation = !bubble.text.trim().is_empty();
+            // An image bubble is translatable whenever it has no translation yet (the model infers
+            // its source text); a text bubble also needs a non-empty source.
+            let needs_translation = if image_input.is_some() {
+                !has_translation
+            } else {
+                !has_translation && !bubble.original_text.trim().is_empty()
+            };
+            let is_context = !needs_translation && context_mode && has_translation;
+            if !needs_translation && !is_context {
+                continue;
+            }
+            items.push(MtTranslateItem {
+                bubble_id: bubble.id,
+                page_idx: bubble.img_idx,
+                img_v: bubble.img_v,
+                order: bubble_order_for_sort(bubble),
+                character: character_for_bubble(
+                    bubble,
+                    self.mt_panel_options.ai_use_character_names,
+                ),
+                text: bubble.original_text.clone(),
+                existing_translation: bubble.text.clone(),
+                // Context replicas never carry an image binary; they exist only for ordering.
+                image: if needs_translation { image_input } else { None },
+                needs_translation,
+            });
+        }
+        items
+    }
+
+    /// True when the AI per-ImageBubble mode is selected and usable (AI tab + multimodal model).
+    fn ai_mt_imagebubble_mode_active(&self) -> bool {
+        self.mt_panel_options.active_tab == MtPanelTab::AiApi
+            && self.mt_panel_options.ai_image_mode == AiMtImageMode::ImagesOnly
+            && is_likely_multimodal_model(&self.mt_panel_options.ai_api_model)
+    }
+
+    /// Collects items for the per-ImageBubble mode: every chapter bubble in reading order is included
+    /// as ordered context (text only, no binary), and `needs_translation` is set only on the in-scope
+    /// ImageBubbles that still lack a translation. The context spans the full chapter regardless of
+    /// the page scope, so each translated ImageBubble sees everything before it; the page scope only
+    /// restricts which ImageBubbles are actually translated.
+    fn collect_ai_mt_imagebubble_items(
+        &self,
+        canvas: &CanvasView,
+        project: &ProjectData,
+        current_page_only: bool,
+    ) -> Vec<MtTranslateItem> {
+        let current_page = canvas.current_page_idx();
+        let mut items = Vec::new();
+        for bubble in project.bubbles.iter() {
+            let is_image = is_image_bubble_record(bubble);
+            let has_translation = !bubble.text.trim().is_empty();
+            let in_target_scope = !current_page_only || bubble.img_idx == current_page;
+            // Only still-untranslated ImageBubbles in scope are translated; everything else (text
+            // bubbles, already-translated or out-of-scope images) is read-only ordered context.
+            let needs_translation = is_image && !has_translation && in_target_scope;
+            let image_input = if needs_translation {
+                mt_image_input_for_bubble(bubble)
+            } else {
+                None
+            };
+            if needs_translation && image_input.is_none() {
+                // An ImageBubble we cannot load a binary for falls back to plain context.
+                continue;
+            }
+            items.push(MtTranslateItem {
+                bubble_id: bubble.id,
+                page_idx: bubble.img_idx,
+                img_v: bubble.img_v,
+                order: bubble_order_for_sort(bubble),
+                character: character_for_bubble(
+                    bubble,
+                    self.mt_panel_options.ai_use_character_names,
+                ),
+                text: bubble.original_text.clone(),
+                existing_translation: bubble.text.clone(),
+                image: image_input,
+                needs_translation,
+            });
+        }
+        items
     }
 
     fn start_mt_for_ids(
@@ -3455,32 +3915,55 @@ impl TranslationTabState {
         ids.sort_unstable();
         ids.dedup();
         let mut items = Vec::new();
+        let include_image_bubbles = self.ai_mt_can_include_image_bubbles();
         for bubble_id in ids {
+            let project_bubble = project.bubbles.iter().find(|bubble| bubble.id == bubble_id);
             let source_text = canvas
                 .bubble_original_text(bubble_id)
-                .or_else(|| {
-                    project
-                        .bubbles
-                        .iter()
-                        .find(|bubble| bubble.id == bubble_id)
-                        .map(|bubble| bubble.original_text.clone())
-                })
+                .or_else(|| project_bubble.map(|bubble| bubble.original_text.clone()))
                 .unwrap_or_default();
-            if source_text.trim().is_empty() {
+            let Some(bubble) = project_bubble else {
+                continue;
+            };
+            if is_image_bubble_record(bubble) && !include_image_bubbles {
+                continue;
+            }
+            let image_input = if include_image_bubbles {
+                mt_image_input_for_bubble(bubble)
+            } else {
+                None
+            };
+            if source_text.trim().is_empty() && image_input.is_none() {
                 continue;
             }
             items.push(MtTranslateItem {
                 bubble_id,
+                page_idx: bubble.img_idx,
+                img_v: bubble.img_v,
+                order: bubble_order_for_sort(bubble),
+                character: character_for_bubble(
+                    bubble,
+                    self.mt_panel_options.ai_use_character_names,
+                ),
                 text: source_text,
+                existing_translation: bubble.text.clone(),
+                image: image_input,
+                // Explicit per-id requests always translate the selected replicas.
+                needs_translation: true,
             });
         }
         if items.is_empty() {
             return;
         }
-        self.start_mt_with_items(ctx, items);
+        self.start_mt_with_items(ctx, project, items);
     }
 
-    fn start_mt_with_items(&mut self, ctx: &egui::Context, items: Vec<MtTranslateItem>) {
+    fn start_mt_with_items(
+        &mut self,
+        ctx: &egui::Context,
+        project: &ProjectData,
+        items: Vec<MtTranslateItem>,
+    ) {
         if !self.ai_enabled {
             self.push_toast(
                 ctx,
@@ -3505,11 +3988,19 @@ impl TranslationTabState {
             source_lang: normalized_lang_input(&self.mt_panel_options.source_lang, "auto"),
             target_lang: normalized_lang_input(&self.mt_panel_options.target_lang, "ru"),
             items,
+            ai_api: self
+                .mt_panel_options
+                .active_tab
+                .eq(&MtPanelTab::AiApi)
+                .then(|| self.current_ai_mt_options(project)),
         };
 
         if let Err(err) = self.mt_controller.start_translation(request) {
             eprintln!("[MT][StartFailed] {}", err.replace('\n', " "));
             self.push_toast(ctx, format!("Ошибка запуска: {err}"), Color32::RED, 3.0);
+        } else {
+            // Drop any previous credit/limit notice as soon as a new run is accepted.
+            self.mt_stop_notice = None;
         }
     }
 
@@ -3520,6 +4011,242 @@ impl TranslationTabState {
             color,
             hide_at_s: now + duration_s.max(0.2),
         });
+    }
+
+    /// Builds the AI MT options from the current panel state. `project` is cloned into the options
+    /// because the worker thread needs an owned snapshot for image loading. Only meaningful when the
+    /// AI API tab is active.
+    fn current_ai_mt_options(&self, project: &ProjectData) -> AiMtOptions {
+        AiMtOptions {
+            service: self.mt_panel_options.ai_api_service,
+            model: self.mt_panel_options.ai_api_model.clone(),
+            system_instruction: self.mt_panel_options.ai_api_system_instruction.clone(),
+            sort_mode: self.mt_panel_options.ai_sort_mode,
+            use_character_names: self.mt_panel_options.ai_use_character_names,
+            use_notes_prompt: self.mt_panel_options.ai_use_notes_prompt,
+            include_characters: self.mt_panel_options.ai_include_characters,
+            include_terms: self.mt_panel_options.ai_include_terms,
+            batch_size: self.mt_panel_options.ai_batch_size,
+            reasoning: self.mt_panel_options.ai_reasoning,
+            context_limit_percent: self.mt_panel_options.ai_context_limit_percent,
+            include_existing_translation: self.mt_panel_options.ai_include_existing_translation,
+            image_detail: self.mt_panel_options.ai_image_detail,
+            image_mode: self.mt_panel_options.ai_image_mode,
+            image_context_source: self.mt_panel_options.ai_image_context_source,
+            project: project.clone(),
+        }
+    }
+
+    /// Debug entry point for "Отобразить полный запрос". Collects the same items a real scope
+    /// translation would use and builds the first AI request on a background thread (image loading
+    /// must not block the GUI). The result is consumed by `poll_ai_mt_request_preview`.
+    fn start_ai_mt_request_preview(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &CanvasView,
+        project: &ProjectData,
+        current_page_only: bool,
+    ) {
+        // Preview is meaningful only for the AI API path; plain translators have no request context.
+        if self.mt_panel_options.active_tab != MtPanelTab::AiApi {
+            return;
+        }
+        if !self.ai_enabled {
+            self.push_toast(
+                ctx,
+                "Машинный перевод отключён флагом --no-ai.".to_string(),
+                Color32::from_rgb(225, 180, 60),
+                2.6,
+            );
+            return;
+        }
+        let items = self.collect_ai_mt_scope_items(canvas, project, current_page_only);
+        if !items.iter().any(|item| item.needs_translation) {
+            self.push_toast(
+                ctx,
+                "Нет пузырей для предпросмотра запроса.".to_string(),
+                Color32::from_rgb(225, 180, 60),
+                2.3,
+            );
+            return;
+        }
+        let options = self.current_ai_mt_options(project);
+        let source_lang = normalized_lang_input(&self.mt_panel_options.source_lang, "auto");
+        let target_lang = normalized_lang_input(&self.mt_panel_options.target_lang, "ru");
+        let scope_label = if current_page_only {
+            "текущая страница"
+        } else {
+            "весь проект"
+        }
+        .to_string();
+
+        let (tx, rx) = mpsc::channel();
+        self.mt_request_preview_rx = Some(rx);
+        self.mt_request_preview = None;
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = build_ai_mt_request_preview(&source_lang, &target_lang, items, &options)
+                .map(|preview| (preview, scope_label));
+            let _ = tx.send(result);
+            // Wake the UI so the pending result is picked up even if the pointer is idle.
+            ctx_clone.request_repaint();
+        });
+        self.push_toast(
+            ctx,
+            "Подготовка полного запроса...".to_string(),
+            Color32::from_rgb(120, 180, 255),
+            1.6,
+        );
+    }
+
+    /// Consumes a finished background request-preview build, opening the debug window on success or
+    /// surfacing the failure as a toast.
+    fn poll_ai_mt_request_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.mt_request_preview_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((preview, scope_label))) => {
+                self.mt_request_preview_rx = None;
+                let image_count = preview
+                    .parts
+                    .iter()
+                    .filter(|part| matches!(part, MtRequestPreviewPart::Image(_)))
+                    .count();
+                self.mt_request_preview = Some(MtRequestPreviewWindow {
+                    preview,
+                    scope_label,
+                    open: true,
+                    image_textures: vec![None; image_count],
+                });
+            }
+            Ok(Err(error)) => {
+                self.mt_request_preview_rx = None;
+                self.push_toast(
+                    ctx,
+                    format!("Не удалось собрать запрос: {error}"),
+                    Color32::RED,
+                    3.5,
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.mt_request_preview_rx = None;
+            }
+        }
+    }
+
+    /// Draws the debug "Полный запрос ИИ перевода" window: system prompt, then the first batch user
+    /// message with image binaries rendered inline at their exact positions. Images are uploaded to
+    /// GPU textures lazily on first display.
+    fn draw_ai_mt_request_preview_window(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.mt_request_preview.as_mut() else {
+            return;
+        };
+        let mut open = window.open;
+        // Disjoint borrows of the window fields so the texture cache can be filled while reading the
+        // immutable preview content during the same frame.
+        let MtRequestPreviewWindow {
+            preview,
+            scope_label,
+            image_textures,
+            ..
+        } = window;
+        egui::Window::new("Полный запрос ИИ перевода")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([720.0, 640.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Область: {scope_label} • батч 1/{} • перевод: {} • контекст: {} • items всего: {} • картинок: {} ({} KiB)",
+                    preview.batch_total,
+                    preview.translate_count,
+                    preview.context_count,
+                    preview.total_item_count,
+                    preview.image_count,
+                    preview.image_bytes / 1024,
+                ));
+                if preview.batch_total > 1 {
+                    ui.colored_label(
+                        Color32::from_rgb(225, 180, 60),
+                        "Показан контекст только первого шага (батча). Остальные батчи уходят отдельными запросами.",
+                    );
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Системный промпт");
+                        selectable_monospace(ui, &preview.system_prompt);
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.heading("Сообщение пользователя (первый батч)");
+                        let mut image_idx = 0usize;
+                        for part in &preview.parts {
+                            match part {
+                                MtRequestPreviewPart::Text(text) => {
+                                    selectable_monospace(ui, text);
+                                    ui.add_space(6.0);
+                                }
+                                MtRequestPreviewPart::Image(image) => {
+                                    ui.label(format!(
+                                        "[картинка пузыря #{}: {}x{}, PNG {} KiB]",
+                                        image.bubble_id,
+                                        image.width,
+                                        image.height,
+                                        image.png_byte_len / 1024,
+                                    ));
+                                    if let Some(slot) = image_textures.get_mut(image_idx) {
+                                        let texture = slot.get_or_insert_with(|| {
+                                            let dims = [
+                                                usize::try_from(image.width).unwrap_or(0),
+                                                usize::try_from(image.height).unwrap_or(0),
+                                            ];
+                                            let color = egui::ColorImage::from_rgba_unmultiplied(
+                                                dims, &image.rgba,
+                                            );
+                                            ui.ctx().load_texture(
+                                                format!(
+                                                    "mt-request-preview-{}-{image_idx}",
+                                                    image.bubble_id
+                                                ),
+                                                color,
+                                                egui::TextureOptions::LINEAR,
+                                            )
+                                        });
+                                        // Fit the long edge to a readable width, never upscaling.
+                                        let max_w = ui.available_width().min(360.0);
+                                        let w = image.width.max(1) as f32;
+                                        let h = image.height.max(1) as f32;
+                                        let scale = (max_w / w).min(1.0);
+                                        let size = egui::vec2(w * scale, h * scale);
+                                        ui.add(egui::Image::new((texture.id(), size)));
+                                    }
+                                    ui.add_space(8.0);
+                                    image_idx += 1;
+                                }
+                            }
+                        }
+                    });
+            });
+        window.open = open;
+        if !window.open {
+            self.mt_request_preview = None;
+        }
+    }
+
+    fn ai_mt_can_include_image_bubbles(&self) -> bool {
+        self.mt_panel_options.active_tab == MtPanelTab::AiApi
+            && self.mt_panel_options.ai_include_image_bubbles
+            && is_likely_multimodal_model(&self.mt_panel_options.ai_api_model)
+    }
+
+    /// True when a scope translation should also send already-translated replicas as ordered
+    /// read-only context. Only meaningful for the AI API path with "existing translation in
+    /// context" enabled; the plain translators have no batch context.
+    fn ai_mt_context_includes_translated(&self) -> bool {
+        self.mt_panel_options.active_tab == MtPanelTab::AiApi
+            && self.mt_panel_options.ai_include_existing_translation
     }
 
     fn draw_toast(&mut self, ctx: &egui::Context, canvas_rect: Rect, top_offset: f32) {
@@ -3605,6 +4332,140 @@ impl TranslationTabState {
             });
     }
 
+    fn handle_image_crop_selection(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        canvas: &mut CanvasView,
+        project: &ProjectData,
+    ) {
+        let crop_mode_active = Self::image_crop_selection_mode_active(ctx);
+        let selection_active = self.image_crop_selection.is_some();
+        if !crop_mode_active && !selection_active {
+            return;
+        }
+
+        egui::Area::new("translation_image_crop_selection_capture".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(canvas_rect.min)
+            .show(ctx, |ui| {
+                ui.set_min_size(canvas_rect.size());
+                let local_rect = Rect::from_min_size(Pos2::ZERO, canvas_rect.size());
+                let sense = if crop_mode_active {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::hover()
+                };
+                let response = ui.interact(local_rect, ui.id().with("image_crop_drag"), sense);
+
+                if response.drag_started()
+                    && let Some(pos) = response.interact_pointer_pos()
+                    && contains_any_page(canvas, project, pos)
+                {
+                    self.image_crop_selection = Some(ImageCropDragSelection {
+                        start: pos,
+                        current: pos,
+                    });
+                }
+
+                if let Some(selection) = self.image_crop_selection.as_mut()
+                    && let Some(pos) = ctx.input(|input| input.pointer.latest_pos())
+                {
+                    selection.current = pos;
+                }
+
+                let should_finish = self.image_crop_selection.is_some()
+                    && (response.drag_stopped() || !crop_mode_active);
+                if should_finish && let Some(selection) = self.image_crop_selection.take() {
+                    let rect = selection.rect();
+                    if rect.width() >= 4.0 && rect.height() >= 4.0 {
+                        self.apply_image_crop_selection(ctx, canvas, project, rect);
+                    }
+                }
+            });
+
+        if let Some(selection) = self.image_crop_selection {
+            let rect = selection.rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("translation_image_crop_selection_painter"),
+            ));
+            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(220, 35, 35, 45));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(2.0, Color32::from_rgb(220, 35, 35)),
+                egui::StrokeKind::Outside,
+            );
+        }
+    }
+
+    fn apply_image_crop_selection(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &mut CanvasView,
+        project: &ProjectData,
+        selection_rect: Rect,
+    ) {
+        let Some((page_idx, crop_rect)) =
+            build_image_crop_selection(canvas, project, selection_rect)
+        else {
+            return;
+        };
+        let live_bubbles = canvas.hook_bubbles_snapshot(project);
+        let selected_image_id = canvas.selected_bubble_id().and_then(|selected_id| {
+            live_bubbles
+                .iter()
+                .find(|bubble| {
+                    bubble.id == selected_id
+                        && bubble.bubble_class.as_deref().map(BubbleClass::from_str)
+                            == Some(BubbleClass::Image)
+                })
+                .map(|bubble| bubble.id)
+        });
+        let bubble_id = if let Some(bubble_id) = selected_image_id {
+            bubble_id
+        } else {
+            let Some(page_rect) = canvas.page_scene_rect(page_idx) else {
+                return;
+            };
+            let center = egui::pos2(
+                page_rect.left() + page_rect.width() * ((crop_rect[0] + crop_rect[2]) * 0.5),
+                page_rect.top() + page_rect.height() * ((crop_rect[1] + crop_rect[3]) * 0.5),
+            );
+            let Some(new_id) = canvas.create_image_bubble_at_scene_pos(ctx, center) else {
+                return;
+            };
+            new_id
+        };
+
+        let _ = canvas.set_bubble_class_for_bid(bubble_id, BubbleClass::Image);
+        let mut patch = Map::new();
+        patch.insert(
+            "image_source_type".to_string(),
+            Value::String("page_crop".to_string()),
+        );
+        patch.insert(
+            "crop_page_idx".to_string(),
+            Value::Number(u64::try_from(page_idx).unwrap_or(u64::MAX).into()),
+        );
+        patch.insert(
+            "crop_rect".to_string(),
+            Value::Array(
+                crop_rect
+                    .iter()
+                    .map(|value| Value::from(f64::from(*value)))
+                    .collect(),
+            ),
+        );
+        // The image area rect (red) is owned by the canvas; keep `rect_coords` equal to the crop
+        // region so the canvas red rect matches the selected crop and clamps text areas to it.
+        patch.insert("rect_coords".to_string(), rect_coords_value(crop_rect));
+        if canvas.patch_bubble_extra_fields(project, bubble_id, &patch) {
+            canvas.flush_pending_bubble_upserts_now(project);
+        }
+    }
+
     fn handle_ocr_selection(
         &mut self,
         ctx: &egui::Context,
@@ -3617,6 +4478,10 @@ impl TranslationTabState {
             return;
         }
         if self.advanced_recognition.is_open() {
+            self.ocr_selection = None;
+            return;
+        }
+        if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
             self.ocr_selection = None;
             return;
         }
@@ -4019,9 +4884,98 @@ impl TranslationTabState {
     }
 }
 
+impl TranslationTabState {
+    fn build_image_bubble_footer_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &ProjectData,
+        bubble: &Bubble,
+        now_s: f64,
+    ) {
+        let bubble_id = bubble.id;
+        let mut source_type = bubble_extra_string(&bubble.extra, "image_source_type");
+        if source_type.is_empty() {
+            source_type = "external".to_string();
+        }
+        let before_source_type = source_type.clone();
+        WheelComboBox::from_id_salt(("translation_footer_image_source_type", bubble_id))
+            .selected_text(if source_type == "page_crop" {
+                "Вырезка из ленты"
+            } else {
+                "Сторонняя картинка"
+            })
+            .width(170.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut source_type,
+                    "page_crop".to_string(),
+                    "Вырезка из ленты",
+                );
+                ui.selectable_value(
+                    &mut source_type,
+                    "external".to_string(),
+                    "Сторонняя картинка",
+                );
+            });
+        if source_type != before_source_type {
+            self.queue_footer_patch(
+                bubble_id,
+                "image_source_type",
+                Value::String(source_type.clone()),
+                now_s,
+            );
+            if source_type == "page_crop" && !bubble.extra.contains_key("crop_rect") {
+                self.queue_footer_patch(
+                    bubble_id,
+                    "crop_rect",
+                    Value::Array(default_image_crop_rect_values(project, bubble)),
+                    now_s,
+                );
+                self.queue_footer_patch(
+                    bubble_id,
+                    "crop_page_idx",
+                    Value::Number(u64::try_from(bubble.img_idx).unwrap_or(u64::MAX).into()),
+                    now_s,
+                );
+            }
+        }
+
+        if source_type == "external" {
+            if ui.small_button("Вставить картинку из буфера").clicked() {
+                match save_clipboard_image_bubble(project, bubble_id) {
+                    Ok(path) => self.queue_footer_patch(
+                        bubble_id,
+                        "image_path",
+                        Value::String(project_relative_path(project, &path)),
+                        now_s,
+                    ),
+                    Err(err) => self.push_toast(ui.ctx(), err, Color32::RED, 3.0),
+                }
+            }
+            if ui.small_button("Выбрать файл").clicked()
+                && let Some(path) = FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+                    .pick_file()
+            {
+                match copy_external_image_bubble(project, bubble_id, &path) {
+                    Ok(saved) => self.queue_footer_patch(
+                        bubble_id,
+                        "image_path",
+                        Value::String(project_relative_path(project, &saved)),
+                        now_s,
+                    ),
+                    Err(err) => self.push_toast(ui.ctx(), err, Color32::RED, 3.0),
+                }
+            }
+        }
+    }
+}
+
 impl CanvasHooks for TranslationTabState {
     fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
-        let _ = ctx;
+        if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
+            return true;
+        }
         if !self.ai_enabled {
             return false;
         }
@@ -4031,6 +4985,82 @@ impl CanvasHooks for TranslationTabState {
         self.ocr_quick_selection_mode_active()
             || self.ocr_advanced_selection_mode_active()
             || self.ocr_selection.is_some()
+    }
+
+    fn canvas_scrollbar_marks(&mut self, ctx: &CanvasScrollbarContext<'_>) -> Vec<ScrollMark> {
+        // Per-bubble translation status painted on the canvas scrollbar:
+        // red while a bubble's translation is empty, blue once it is filled.
+        // The display mode is a user setting on the ribbon settings tab.
+        let mode = ctx.translation_status_display();
+        if mode == TranslationStatusDisplay::None {
+            return Vec::new();
+        }
+
+        let bubbles = ctx.bubbles();
+        let mut entries: Vec<(f32, bool)> = bubbles
+            .iter()
+            .filter_map(|bubble| {
+                ctx.content_y(bubble.img_idx, bubble.img_v)
+                    .map(|content_y| (content_y, !bubble.text.trim().is_empty()))
+            })
+            .collect();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mark_color = |translated: bool| {
+            if translated {
+                egui::Color32::from_rgb(40, 132, 255)
+            } else {
+                egui::Color32::from_rgb(220, 60, 60)
+            }
+        };
+
+        if mode == TranslationStatusDisplay::Marks {
+            // Thin fixed-height stripe at each bubble's own position; it does not
+            // stretch down to the next bubble.
+            const MARK_HALF_HEIGHT_PX: f32 = 1.0;
+            return entries
+                .into_iter()
+                .map(|(start, translated)| {
+                    let color = mark_color(translated);
+                    ScrollMark::custom(ScrollSpan::pixel_at(start), move |painter, _geom, cell| {
+                        let center_y = cell.center().y;
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(cell.left(), center_y - MARK_HALF_HEIGHT_PX),
+                            egui::pos2(cell.right(), center_y + MARK_HALF_HEIGHT_PX),
+                        );
+                        painter.rect_filled(rect, 0.0, color);
+                    })
+                })
+                .collect();
+        }
+
+        // TranslationStatusDisplay::UntilNext: each bubble paints a stripe from
+        // itself down to the next bubble vertically.
+        let content_end = ctx.content_size_y();
+        // The last bubble has no following bubble, so its mark would otherwise run
+        // to the very end of the content. Instead, let it extend just a couple
+        // percent of the scrollbar past the bubble, leaving the rest unpainted.
+        let tail_len = content_end * 0.02;
+        let mut marks = Vec::with_capacity(entries.len());
+        for index in 0..entries.len() {
+            let (start, translated) = entries[index];
+            // If another bubble follows, the mark runs down to it. The bottom-most
+            // bubble's mark gets only a short tail instead of reaching the end.
+            let end = entries
+                .get(index + 1)
+                .map_or_else(|| (start + tail_len).min(content_end), |next| next.0);
+            if end <= start {
+                continue;
+            }
+            marks.push(ScrollMark::fill(
+                ScrollSpan::ContentPixels { start, end },
+                MarkFill::Solid(mark_color(translated)),
+            ));
+        }
+        marks
     }
 
     fn draw_canvas_mask_overlay_on_page(
@@ -4087,6 +5117,8 @@ impl CanvasHooks for TranslationTabState {
         self.poll_text_detection_storage_events(project);
         self.poll_ocr_events(ctx, canvas, project);
         self.poll_mt_events(ctx, canvas);
+        self.handle_image_bubble_hotkeys(ctx, canvas, project);
+        self.handle_image_crop_selection(ctx, canvas_rect, canvas, project);
         self.handle_ocr_selection(ctx, canvas_rect, canvas, project);
         self.handle_advanced_recognition_window(ctx, canvas, project);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
@@ -4207,6 +5239,7 @@ impl CanvasHooks for TranslationTabState {
         if self.ocr_quick_selection_mode_active()
             || self.ocr_advanced_selection_mode_active()
             || self.ocr_selection.is_some()
+            || self.image_crop_selection.is_some()
             || self.advanced_recognition.is_open()
             || self.ocr_toast.is_some()
             || self.ocr_controller.state().is_busy()
@@ -4217,8 +5250,12 @@ impl CanvasHooks for TranslationTabState {
             || self.text_detector_controller.is_busy()
             || self.text_detection_storage_busy
             || self.textdetector_ocr_is_running()
-            || self.text_detector_edit_lines_mode
-            || self.text_detector_edit_mask_mode
+            // Detector edit modes are NOT a repaint trigger on their own: an idle
+            // edit mode with no active gesture has nothing to animate, and egui
+            // already repaints on pointer movement (brush cursor / hover). Only a
+            // live gesture needs forced frames — an in-progress mask brush stroke or
+            // an active line drag — so painted pixels keep up between pointer events.
+            || self.text_detector_mask_stroke_state.is_some()
             || self.text_detector_line_drag_state.is_some()
             || !self.pending_footer_patches.is_empty()
             || self.bubbles_panel.has_pending_text_updates()
@@ -4231,7 +5268,13 @@ impl CanvasHooks for TranslationTabState {
 
     fn build_bubble_header(&mut self, _ui: &mut egui::Ui, _bubble: &Bubble, _editable: bool) {}
 
-    fn build_bubble_footer(&mut self, ui: &mut egui::Ui, bubble: &Bubble, editable: bool) {
+    fn build_bubble_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &ProjectData,
+        bubble: &Bubble,
+        editable: bool,
+    ) {
         if !editable {
             return;
         }
@@ -4259,7 +5302,18 @@ impl CanvasHooks for TranslationTabState {
                 );
             }
 
-            let suggestions = self.character_names.clone();
+            if bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image)
+            {
+                self.build_image_bubble_footer_controls(ui, project, bubble, now_s);
+                return;
+            }
+
+            // Borrow `character_names` as a slice instead of cloning the whole Vec
+            // every frame for every edited bubble. `character_names` and
+            // `footer_character_autocomplete` are disjoint fields, so the immutable
+            // suggestions borrow coexists with the mutable autocomplete entry borrow;
+            // it ends at the `draw` call, before the later `queue_footer_patch` writes.
+            let suggestions: &[String] = &self.character_names;
             let autocomplete = self
                 .footer_character_autocomplete
                 .entry(bubble_id)
@@ -4269,7 +5323,7 @@ impl CanvasHooks for TranslationTabState {
             autocomplete.set_max_suggestions(FOOTER_CHARACTER_AUTOCOMPLETE_MAX);
             autocomplete.set_hint_text("Кто говорит?");
 
-            let field_resp = autocomplete.draw(ui, &mut state.character_name, &suggestions);
+            let field_resp = autocomplete.draw(ui, &mut state.character_name, suggestions);
             if field_resp.changed || field_resp.submitted {
                 if !state.is_known_character {
                     state.is_known_character = true;
@@ -4380,6 +5434,12 @@ impl TranslationTabState {
             if let Some(bubbles) = ocr_obj.get("bubbles").and_then(Value::as_bool) {
                 self.ocr_panel_options.create_bubble = bubbles;
             }
+            if let Some(replace_chars) = ocr_obj.get("replace_chars").and_then(Value::as_bool) {
+                self.ocr_panel_options.replace_chars_enabled = replace_chars;
+            }
+            if let Some(rules) = ocr_obj.get("char_replacements").and_then(Value::as_array) {
+                self.ocr_panel_options.char_replacements = parse_char_replacement_rules(rules);
+            }
 
             if let Some(params) = ocr_obj.get("params").and_then(Value::as_object) {
                 let manga_obj = params
@@ -4404,6 +5464,18 @@ impl TranslationTabState {
                     }
                     if let Some(show_full) = paddle.get("full_langs").and_then(Value::as_bool) {
                         self.ocr_panel_options.paddle_show_full_langs = show_full;
+                    }
+                }
+                let paddle_vl_obj = params
+                    .get("paddle_vl")
+                    .or_else(|| params.get("paddleocrvl"))
+                    .and_then(Value::as_object);
+                if let Some(paddle_vl) = paddle_vl_obj
+                    && let Some(script) = paddle_vl.get("script").and_then(Value::as_str)
+                {
+                    let trimmed = script.trim();
+                    if !trimmed.is_empty() {
+                        self.ocr_panel_options.paddle_vl_script = trimmed.to_ascii_lowercase();
                     }
                 }
                 let easy_obj = params
@@ -4454,6 +5526,27 @@ impl TranslationTabState {
                         self.ocr_panel_options.surya_max_tokens = value;
                     }
                 }
+                let ai_api_obj = params
+                    .get("ai_api")
+                    .or_else(|| params.get("aiapi"))
+                    .and_then(Value::as_object);
+                if let Some(ai_api) = ai_api_obj {
+                    if let Some(service) = ai_api.get("service").and_then(Value::as_str) {
+                        self.ocr_panel_options.ai_api_service = AiApiService::from_key(service);
+                    }
+                    if let Some(model) = ai_api.get("model").and_then(Value::as_str) {
+                        let trimmed = model.trim();
+                        if !trimmed.is_empty() {
+                            self.ocr_panel_options.ai_api_model = trimmed.to_string();
+                        }
+                    }
+                    if let Some(system_instruction) =
+                        ai_api.get("system_instruction").and_then(Value::as_str)
+                    {
+                        self.ocr_panel_options.ai_api_system_instruction =
+                            system_instruction.to_string();
+                    }
+                }
             }
         }
 
@@ -4486,6 +5579,80 @@ impl TranslationTabState {
             }
             if let Some(target_lang) = mt_obj.get("target_lang").and_then(Value::as_str) {
                 self.mt_panel_options.target_lang = target_lang.to_string();
+            }
+            if let Some(active_tab) = mt_obj.get("active_tab").and_then(Value::as_str) {
+                self.mt_panel_options.active_tab = if active_tab.eq_ignore_ascii_case("ai_api") {
+                    MtPanelTab::AiApi
+                } else {
+                    MtPanelTab::Machine
+                };
+            }
+            if let Some(ai_obj) = mt_obj.get("ai_api").and_then(Value::as_object) {
+                if let Some(service) = ai_obj.get("service").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_api_service = AiApiService::from_key(service);
+                }
+                if let Some(model) = ai_obj.get("model").and_then(Value::as_str)
+                    && !model.trim().is_empty()
+                {
+                    self.mt_panel_options.ai_api_model = model.trim().to_string();
+                }
+                if let Some(system_instruction) =
+                    ai_obj.get("system_instruction").and_then(Value::as_str)
+                {
+                    self.mt_panel_options.ai_api_system_instruction =
+                        system_instruction.to_string();
+                }
+                if let Some(sort_mode) = ai_obj.get("sort_mode").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_sort_mode = AiMtSortMode::from_key(sort_mode);
+                }
+                if let Some(value) = ai_obj.get("use_character_names").and_then(Value::as_bool) {
+                    self.mt_panel_options.ai_use_character_names = value;
+                }
+                if let Some(value) = ai_obj.get("use_notes_prompt").and_then(Value::as_bool) {
+                    self.mt_panel_options.ai_use_notes_prompt = value;
+                }
+                if let Some(value) = ai_obj.get("include_characters").and_then(Value::as_bool) {
+                    self.mt_panel_options.ai_include_characters = value;
+                }
+                if let Some(value) = ai_obj.get("include_terms").and_then(Value::as_bool) {
+                    self.mt_panel_options.ai_include_terms = value;
+                }
+                if let Some(value) = ai_obj
+                    .get("include_existing_translation")
+                    .and_then(Value::as_bool)
+                {
+                    self.mt_panel_options.ai_include_existing_translation = value;
+                }
+                if let Some(value) = ai_obj.get("include_image_bubbles").and_then(Value::as_bool) {
+                    self.mt_panel_options.ai_include_image_bubbles = value;
+                }
+                if let Some(value) = ai_obj.get("image_detail").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_image_detail = AiMtImageDetail::from_key(value);
+                } else if let Some(value) =
+                    ai_obj.get("image_encoding_quality").and_then(Value::as_str)
+                {
+                    self.mt_panel_options.ai_image_detail = AiMtImageDetail::from_key(value);
+                }
+                if let Some(value) = ai_obj.get("image_mode").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_image_mode = AiMtImageMode::from_key(value);
+                }
+                if let Some(value) = ai_obj.get("image_context_source").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_image_context_source =
+                        AiMtContextSource::from_key(value);
+                }
+                if let Some(value) = ai_obj.get("batch_size").and_then(Value::as_u64)
+                    && let Ok(value) = usize::try_from(value)
+                {
+                    self.mt_panel_options.ai_batch_size = value.clamp(1, 100);
+                }
+                if let Some(value) = ai_obj.get("reasoning").and_then(Value::as_str) {
+                    self.mt_panel_options.ai_reasoning = AiMtReasoning::from_key(value);
+                }
+                if let Some(value) = ai_obj.get("context_limit_percent").and_then(Value::as_u64)
+                    && let Ok(value) = u8::try_from(value)
+                {
+                    self.mt_panel_options.ai_context_limit_percent = value.clamp(10, 100);
+                }
             }
         }
 
@@ -4561,6 +5728,12 @@ impl TranslationTabState {
             }
             if let Some(value) = comp_obj.get("use_character_names").and_then(Value::as_bool) {
                 self.composition_panel_options.use_character_names = value;
+            }
+            if let Some(value) = comp_obj
+                .get("include_image_bubbles")
+                .and_then(Value::as_bool)
+            {
+                self.composition_panel_options.include_image_bubbles = value;
             }
             if let Some(value) = comp_obj.get("jinja2_enabled").and_then(Value::as_bool) {
                 self.composition_panel_options.jinja2_enabled = value;
@@ -4703,6 +5876,22 @@ fn recent_character_entry_from_state(state: &BubbleFooterState) -> Option<Recent
         character_name: trimmed.to_string(),
         clarification: state.clarification.clone(),
     })
+}
+
+/// Decides whether `sync_footer_tracking` must run a full recompute this frame.
+///
+/// `cached` is the revision the last recompute was performed for (`None` before the first
+/// recompute), `current` is the live `CanvasView::hook_bubbles_revision()` fingerprint, and
+/// `bootstrapped` is whether footer tracking has already been initialized. Returns `true` when not
+/// yet bootstrapped (the first frame must always recompute and bootstrap) or when the revision
+/// differs from the cached one (the bubble set changed); returns `false` only when bootstrapped and
+/// the revision is unchanged, so the cached footer state can be reused.
+#[must_use]
+fn footer_tracking_should_recompute(cached: Option<u64>, current: u64, bootstrapped: bool) -> bool {
+    if !bootstrapped {
+        return true;
+    }
+    cached != Some(current)
 }
 
 fn collect_recent_character_history(bubbles: &[Bubble]) -> VecDeque<RecentCharacterEntry> {
@@ -5383,6 +6572,288 @@ fn contains_any_page(canvas: &CanvasView, project: &ProjectData, pos: Pos2) -> b
     })
 }
 
+/// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
+///
+/// The crop page dimensions are read from the image header (cheap, header-only) to convert 256 px
+/// into normalized half-extents; if they are unavailable it falls back to a small UV box. This
+/// avoids the previous `±0.05` UV default, which on tall ribbon pages produced a near-full-height
+/// image area.
+fn default_image_crop_rect_values(project: &ProjectData, bubble: &Bubble) -> Vec<Value> {
+    const DEFAULT_IMAGE_CROP_SIDE_SRC_PX: f32 = 256.0;
+    let half = DEFAULT_IMAGE_CROP_SIDE_SRC_PX * 0.5;
+    let (u_half, v_half) = project
+        .pages
+        .iter()
+        .find(|page| page.idx == bubble.img_idx)
+        .and_then(|page| image::image_dimensions(&page.path).ok())
+        .map(|(w, h)| (half / (w.max(1) as f32), half / (h.max(1) as f32)))
+        .unwrap_or((0.05, 0.05));
+    [
+        bubble.img_u - u_half,
+        bubble.img_v - v_half,
+        bubble.img_u + u_half,
+        bubble.img_v + v_half,
+    ]
+    .into_iter()
+    .map(|value| Value::from(f64::from(value.clamp(0.0, 1.0))))
+    .collect()
+}
+
+fn mt_image_input_for_bubble(bubble: &Bubble) -> Option<MtImageInput> {
+    if !is_image_bubble_record(bubble) {
+        return None;
+    }
+    let source_type = bubble_extra_string(&bubble.extra, "image_source_type");
+    let description = bubble_extra_string(&bubble.extra, "description");
+    if source_type == "page_crop" {
+        let page_idx = bubble
+            .extra
+            .get("crop_page_idx")
+            .and_then(Value::as_u64)
+            .and_then(|raw| usize::try_from(raw).ok())
+            .unwrap_or(bubble.img_idx);
+        let crop_rect = bubble
+            .extra
+            .get("crop_rect")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                if items.len() != 4 {
+                    return None;
+                }
+                let mut rect = [0.0; 4];
+                for (idx, item) in items.iter().enumerate() {
+                    rect[idx] = item.as_f64()? as f32;
+                }
+                Some(normalize_uv_rect(rect))
+            })
+            .unwrap_or([
+                bubble.img_u - 0.05,
+                bubble.img_v - 0.05,
+                bubble.img_u + 0.05,
+                bubble.img_v + 0.05,
+            ]);
+        let crop_rect = normalize_uv_rect(crop_rect);
+        return Some(MtImageInput {
+            description,
+            source: MtImageSource::PageCrop {
+                page_idx,
+                crop_rect,
+            },
+            areas: mt_image_areas_for_bubble(bubble, Some(crop_rect)),
+        });
+    }
+
+    let image_path = bubble_extra_string(&bubble.extra, "image_path");
+    (!image_path.trim().is_empty()).then(|| MtImageInput {
+        description,
+        source: MtImageSource::ExternalPath(image_path),
+        areas: mt_image_areas_for_bubble(bubble, None),
+    })
+}
+
+/// Builds the ordered text areas of an image bubble for AI translation.
+///
+/// Area 0's text is read from the legacy fields (`original_text` + `extra.description`); later
+/// areas come from `extra["text_areas"]`. `crop` is the page-crop region (the sent image) used to
+/// express each area's bounding box relative to that image; `None` (external images) omits the
+/// positional hint.
+fn mt_image_areas_for_bubble(bubble: &Bubble, crop: Option<[f32; 4]>) -> Vec<MtImageArea> {
+    let description0 = bubble_extra_string(&bubble.extra, "description");
+    let rel = |area_rect: [f32; 4]| -> Option<[f32; 4]> {
+        let c = crop?;
+        let cw = (c[2] - c[0]).max(1e-6);
+        let ch = (c[3] - c[1]).max(1e-6);
+        Some([
+            ((area_rect[0] - c[0]) / cw).clamp(0.0, 1.0),
+            ((area_rect[1] - c[1]) / ch).clamp(0.0, 1.0),
+            ((area_rect[2] - c[0]) / cw).clamp(0.0, 1.0),
+            ((area_rect[3] - c[1]) / ch).clamp(0.0, 1.0),
+        ])
+    };
+    let read_rect = |entry: &Value| -> Option<[f32; 4]> {
+        let arr = entry.get("rect").and_then(Value::as_array)?;
+        if arr.len() != 4 {
+            return None;
+        }
+        let mut rect = [0.0f32; 4];
+        for (idx, item) in arr.iter().enumerate() {
+            rect[idx] = item.as_f64()? as f32;
+        }
+        Some(rect)
+    };
+    let fallback_rect = crop.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+    match bubble.extra.get("text_areas").and_then(Value::as_array) {
+        Some(arr) if !arr.is_empty() => arr
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let area_rect = read_rect(entry).unwrap_or(fallback_rect);
+                let (description, original) = if idx == 0 {
+                    (description0.clone(), bubble.original_text.clone())
+                } else {
+                    (
+                        entry
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        entry
+                            .get("original")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                };
+                MtImageArea {
+                    description,
+                    original,
+                    rel_bbox: rel(area_rect),
+                }
+            })
+            .collect(),
+        _ => vec![MtImageArea {
+            description: description0,
+            original: bubble.original_text.clone(),
+            rel_bbox: None,
+        }],
+    }
+}
+
+fn is_image_bubble_record(bubble: &Bubble) -> bool {
+    bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image)
+}
+
+fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
+    project.paths.unsaved_image_bubbles_dir.clone()
+}
+
+fn save_clipboard_image_bubble(project: &ProjectData, bubble_id: i64) -> Result<PathBuf, String> {
+    let clipboard_image = paste_image::read_image_from_clipboard()?;
+    let width = u32::try_from(clipboard_image.width)
+        .map_err(|_| "картинка из буфера слишком широкая".to_string())?;
+    let height = u32::try_from(clipboard_image.height)
+        .map_err(|_| "картинка из буфера слишком высокая".to_string())?;
+    let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
+        return Err("буфер картинки не соответствует ширине и высоте".to_string());
+    };
+    let dir = image_bubbles_dir(project);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+    let path = dir.join(format!("image_bubble_{bubble_id}.png"));
+    image
+        .save(&path)
+        .map_err(|err| format!("не удалось сохранить {}: {err}", path.display()))?;
+    Ok(path)
+}
+
+fn copy_external_image_bubble(
+    project: &ProjectData,
+    bubble_id: i64,
+    source: &Path,
+) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err(format!("файл не найден: {}", source.display()));
+    }
+    let dir = image_bubbles_dir(project);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("png");
+    let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
+    fs::copy(source, &path).map_err(|err| {
+        format!(
+            "не удалось скопировать {} в {}: {err}",
+            source.display(),
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn project_relative_path(project: &ProjectData, path: &Path) -> String {
+    path.strip_prefix(&project.paths.unsaved_dir)
+        .or_else(|_| path.strip_prefix(&project.project_dir))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn build_image_crop_selection(
+    canvas: &CanvasView,
+    project: &ProjectData,
+    selection_rect: Rect,
+) -> Option<(usize, [f32; 4])> {
+    let mut best_area = 0.0_f32;
+    let mut best_page: Option<(usize, Rect)> = None;
+    for page in &project.pages {
+        let Some(page_rect) = canvas.page_scene_rect(page.idx) else {
+            continue;
+        };
+        let intersection = page_rect.intersect(selection_rect);
+        if !intersection.is_positive() {
+            continue;
+        }
+        let area = intersection.width() * intersection.height();
+        if area > best_area {
+            best_area = area;
+            best_page = Some((page.idx, page_rect));
+        }
+    }
+
+    let (page_idx, page_rect) = best_page?;
+    let crop_scene = page_rect.intersect(selection_rect);
+    if !crop_scene.is_positive() {
+        return None;
+    }
+    let page_w = page_rect.width().max(1.0);
+    let page_h = page_rect.height().max(1.0);
+    Some((
+        page_idx,
+        normalize_uv_rect([
+            ((crop_scene.left() - page_rect.left()) / page_w).clamp(0.0, 1.0),
+            ((crop_scene.top() - page_rect.top()) / page_h).clamp(0.0, 1.0),
+            ((crop_scene.right() - page_rect.left()) / page_w).clamp(0.0, 1.0),
+            ((crop_scene.bottom() - page_rect.top()) / page_h).clamp(0.0, 1.0),
+        ]),
+    ))
+}
+
+fn normalize_uv_rect(rect: [f32; 4]) -> [f32; 4] {
+    [
+        rect[0].min(rect[2]).clamp(0.0, 1.0),
+        rect[1].min(rect[3]).clamp(0.0, 1.0),
+        rect[0].max(rect[2]).clamp(0.0, 1.0),
+        rect[1].max(rect[3]).clamp(0.0, 1.0),
+    ]
+}
+
+/// Builds the canvas `rect_coords` extra value (`{p1:{img_u,img_v}, p2:{img_u,img_v}}`) from a
+/// normalized `[x1,y1,x2,y2]` crop rect, so the canvas red image-area rect matches the crop region.
+fn rect_coords_value(rect: [f32; 4]) -> Value {
+    let rect = normalize_uv_rect(rect);
+    let point = |u: f32, v: f32| {
+        Value::Object(
+            [
+                ("img_u".to_string(), Value::from(f64::from(u))),
+                ("img_v".to_string(), Value::from(f64::from(v))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    Value::Object(
+        [
+            ("p1".to_string(), point(rect[0], rect[1])),
+            ("p2".to_string(), point(rect[2], rect[3])),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
 fn spawn_translation_settings_saver_thread()
 -> (Sender<TranslationSettingsSaveRequest>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<TranslationSettingsSaveRequest>();
@@ -5459,6 +6930,32 @@ fn save_translation_settings_to_project_file(
         "bubbles".to_string(),
         Value::Bool(ocr_options.create_bubble),
     );
+    ocr_obj.insert(
+        "replace_chars".to_string(),
+        Value::Bool(ocr_options.replace_chars_enabled),
+    );
+    ocr_obj.insert(
+        "char_replacements".to_string(),
+        Value::Array(
+            ocr_options
+                .char_replacements
+                .iter()
+                .map(|rule| {
+                    let mut rule_obj = Map::new();
+                    rule_obj.insert("enabled".to_string(), Value::Bool(rule.enabled));
+                    rule_obj.insert(
+                        "targets".to_string(),
+                        Value::String(rule.targets_raw.clone()),
+                    );
+                    rule_obj.insert(
+                        "replacement".to_string(),
+                        Value::String(rule.replacement.clone()),
+                    );
+                    Value::Object(rule_obj)
+                })
+                .collect(),
+        ),
+    );
 
     let mut params_obj = ocr_obj
         .get("params")
@@ -5510,6 +7007,16 @@ fn save_translation_settings_to_project_file(
         paddle_obj.insert("gpu".to_string(), Value::Bool(false));
     }
     params_obj.insert("paddle".to_string(), Value::Object(paddle_obj));
+    let mut paddle_vl_obj = params_obj
+        .get("paddle_vl")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    paddle_vl_obj.insert(
+        "script".to_string(),
+        Value::String(ocr_options.paddle_vl_script.clone()),
+    );
+    params_obj.insert("paddle_vl".to_string(), Value::Object(paddle_vl_obj));
     let mut surya_obj = params_obj
         .get("surya")
         .and_then(Value::as_object)
@@ -5544,6 +7051,24 @@ fn save_translation_settings_to_project_file(
         ))),
     );
     params_obj.insert("surya".to_string(), Value::Object(surya_obj));
+    let mut ai_api_obj = params_obj
+        .get("ai_api")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    ai_api_obj.insert(
+        "service".to_string(),
+        Value::String(ocr_options.ai_api_service.key().to_string()),
+    );
+    ai_api_obj.insert(
+        "model".to_string(),
+        Value::String(ocr_options.ai_api_model.clone()),
+    );
+    ai_api_obj.insert(
+        "system_instruction".to_string(),
+        Value::String(ocr_options.ai_api_system_instruction.clone()),
+    );
+    params_obj.insert("ai_api".to_string(), Value::Object(ai_api_obj));
     ocr_obj.insert("params".to_string(), Value::Object(params_obj));
     root_obj.insert("OCR".to_string(), Value::Object(ocr_obj));
 
@@ -5564,6 +7089,90 @@ fn save_translation_settings_to_project_file(
         "target_lang".to_string(),
         Value::String(normalized_lang_input(&mt_options.target_lang, "ru")),
     );
+    mt_obj.insert(
+        "active_tab".to_string(),
+        Value::String(
+            match mt_options.active_tab {
+                MtPanelTab::Machine => "machine_translation",
+                MtPanelTab::AiApi => "ai_api",
+            }
+            .to_string(),
+        ),
+    );
+    let mut mt_ai_obj = mt_obj
+        .get("ai_api")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    mt_ai_obj.insert(
+        "service".to_string(),
+        Value::String(mt_options.ai_api_service.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "model".to_string(),
+        Value::String(mt_options.ai_api_model.clone()),
+    );
+    mt_ai_obj.insert(
+        "system_instruction".to_string(),
+        Value::String(mt_options.ai_api_system_instruction.clone()),
+    );
+    mt_ai_obj.insert(
+        "sort_mode".to_string(),
+        Value::String(mt_options.ai_sort_mode.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "use_character_names".to_string(),
+        Value::Bool(mt_options.ai_use_character_names),
+    );
+    mt_ai_obj.insert(
+        "use_notes_prompt".to_string(),
+        Value::Bool(mt_options.ai_use_notes_prompt),
+    );
+    mt_ai_obj.insert(
+        "include_characters".to_string(),
+        Value::Bool(mt_options.ai_include_characters),
+    );
+    mt_ai_obj.insert(
+        "include_terms".to_string(),
+        Value::Bool(mt_options.ai_include_terms),
+    );
+    mt_ai_obj.insert(
+        "include_existing_translation".to_string(),
+        Value::Bool(mt_options.ai_include_existing_translation),
+    );
+    mt_ai_obj.insert(
+        "include_image_bubbles".to_string(),
+        Value::Bool(mt_options.ai_include_image_bubbles),
+    );
+    mt_ai_obj.insert(
+        "image_detail".to_string(),
+        Value::String(mt_options.ai_image_detail.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "image_mode".to_string(),
+        Value::String(mt_options.ai_image_mode.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "image_context_source".to_string(),
+        Value::String(mt_options.ai_image_context_source.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "batch_size".to_string(),
+        Value::Number(serde_json::Number::from(
+            mt_options.ai_batch_size.clamp(1, 100),
+        )),
+    );
+    mt_ai_obj.insert(
+        "reasoning".to_string(),
+        Value::String(mt_options.ai_reasoning.key().to_string()),
+    );
+    mt_ai_obj.insert(
+        "context_limit_percent".to_string(),
+        Value::Number(serde_json::Number::from(
+            mt_options.ai_context_limit_percent.clamp(10, 100),
+        )),
+    );
+    mt_obj.insert("ai_api".to_string(), Value::Object(mt_ai_obj));
     mt_obj.remove("threads");
     mt_obj.remove("params");
     root_obj.insert("machine_translation".to_string(), Value::Object(mt_obj));
@@ -5632,6 +7241,10 @@ fn save_translation_settings_to_project_file(
     composition_obj.insert(
         "use_character_names".to_string(),
         Value::Bool(composition_options.use_character_names),
+    );
+    composition_obj.insert(
+        "include_image_bubbles".to_string(),
+        Value::Bool(composition_options.include_image_bubbles),
     );
     composition_obj.insert(
         "jinja2_enabled".to_string(),
@@ -5744,6 +7357,20 @@ fn normalized_lang_input(raw: &str, fallback: &str) -> String {
     }
 }
 
+/// Renders read-only monospace text that wraps to the panel width. egui labels support text
+/// selection, so the exact prompt text stays copyable in the AI request-preview window.
+fn selectable_monospace(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(egui::RichText::new(text).monospace().small()).wrap());
+}
+
+fn format_context_chars(chars: usize) -> String {
+    if chars >= 1_000 {
+        format!("{}.{:01}k", chars / 1_000, (chars % 1_000) / 100)
+    } else {
+        chars.to_string()
+    }
+}
+
 fn parse_text_detector_algorithm_key(raw: &str) -> TextDetectorAlgorithm {
     match raw.trim().to_ascii_lowercase().as_str() {
         "paddleocr" | "paddle_ocr" | "paddle-ocr" | "paddle" | "onnx" => {
@@ -5762,7 +7389,11 @@ fn parse_ocr_engine_key(engine: &str) -> OcrEngine {
     match key.as_str() {
         "easyocr" | "easy" => OcrEngine::EasyOcr,
         "paddle" | "paddleocr" => OcrEngine::PaddleOcr,
+        "paddle_vl" | "paddlevl" | "paddleocr_vl" | "paddleocrvl" | "paddleocr-vl" => {
+            OcrEngine::PaddleVl
+        }
         "surya" | "suryaocr" | "surya_ocr" => OcrEngine::Surya,
+        "aiapi" | "ai_api" | "ai-api" | "genai" => OcrEngine::AiApi,
         "paddle_onnx" | "paddleonnx" | "paddle-onnx" | "onnx" => OcrEngine::PaddleOcr,
         "mangaocr" | "manga_ocr" | "manga" | "mocr" => OcrEngine::MangaOcr,
         _ => OcrEngine::MangaOcr,
@@ -5774,7 +7405,9 @@ fn ocr_engine_to_project_key(engine: OcrEngine) -> &'static str {
         OcrEngine::MangaOcr => "mangaocr",
         OcrEngine::EasyOcr => "easyocr",
         OcrEngine::PaddleOcr => "paddle",
+        OcrEngine::PaddleVl => "paddle_vl",
         OcrEngine::Surya => "surya",
+        OcrEngine::AiApi => "ai_api",
     }
 }
 
@@ -5825,6 +7458,7 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
     OcrRuntimeOptions {
         manga_model: ocr_options.manga_model.clone(),
         paddle_lang: ocr_options.paddle_lang.clone(),
+        paddle_vl_script: ocr_options.paddle_vl_script.clone(),
         easy_langs: ocr_options.easy_langs.clone(),
         surya_task_name: if surya_is_active {
             "ocr_without_boxes".to_string()
@@ -5856,6 +7490,9 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
         } else {
             ocr_options.surya_max_tokens
         },
+        ai_api_service: ocr_options.ai_api_service,
+        ai_api_model: ocr_options.ai_api_model.clone(),
+        ai_api_system_instruction: ocr_options.ai_api_system_instruction.clone(),
     }
 }
 
@@ -5907,9 +7544,35 @@ fn build_ocr_request(
             image_override_png: None,
             join_newlines: ocr_options.join_newlines,
             reflect_strings: ocr_options.reflect_strings,
+            char_replacements: ocr_options.runtime_char_replacements(),
         },
         page_idx: page.idx,
     })
+}
+
+/// Parses the persisted `char_replacements` array into editable UI rules.
+///
+/// Each element must be an object with `enabled` (bool, default `true`),
+/// `targets` (string), and `replacement` (string). Non-object entries are
+/// skipped so a malformed settings file cannot abort project loading.
+fn parse_char_replacement_rules(rules: &[Value]) -> Vec<CharReplacementRuleUi> {
+    rules
+        .iter()
+        .filter_map(Value::as_object)
+        .map(|rule| CharReplacementRuleUi {
+            enabled: rule.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            targets_raw: rule
+                .get("targets")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            replacement: rule
+                .get("replacement")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect()
 }
 
 fn build_bubble_original_text(
@@ -5927,4 +7590,29 @@ fn build_bubble_original_text(
     }
     let separator = if join_newlines { "\n" } else { " " };
     lines.join(separator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::footer_tracking_should_recompute;
+
+    #[test]
+    fn footer_tracking_not_bootstrapped_always_recomputes() {
+        // Before bootstrap the first frame must recompute regardless of the cached revision.
+        assert!(footer_tracking_should_recompute(None, 7, false));
+        assert!(footer_tracking_should_recompute(Some(7), 7, false));
+    }
+
+    #[test]
+    fn footer_tracking_changed_revision_recomputes() {
+        // A new bubble bumps `hook_bubbles_revision`, so a differing revision forces a recompute.
+        assert!(footer_tracking_should_recompute(Some(7), 8, true));
+        assert!(footer_tracking_should_recompute(None, 8, true));
+    }
+
+    #[test]
+    fn footer_tracking_equal_revision_when_bootstrapped_skips() {
+        // Unchanged bubble set on a bootstrapped tab: skip the per-frame recompute.
+        assert!(!footer_tracking_should_recompute(Some(8), 8, true));
+    }
 }

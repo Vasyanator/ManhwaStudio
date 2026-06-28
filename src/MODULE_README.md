@@ -27,13 +27,15 @@ entry, custom/existing install update entry, and hidden `--continue-update` cont
 update window, and constructs `MangaApp` for an opened chapter.
 
 `MangaApp` in `app.rs` is the editor root. It creates shared models, wires them into tabs and
-canvas instances, starts page/overlay loaders, throttles GPU uploads, routes the active tab, and
-dispatches global hotkeys. It should coordinate subsystems, not absorb feature-specific domain
-logic.
+canvas instances, starts page/overlay loaders, seeds the source-page CPU cache from the initial
+page decode when both canvas caching and the memory profile allow it, throttles GPU uploads, routes
+the active tab, and dispatches global hotkeys. It should coordinate subsystems, not absorb
+feature-specific domain logic.
 
 Project data enters through `project.rs`. `ProjectData` and `ProjectPaths` define the chapter
 filesystem contract, including source pages, bubbles, settings, clean overlays, text detection,
-text images, notes, terms, characters, wiki data, alternate versions, and unsaved staging paths.
+text images, ImageBubble media, notes, terms, characters, wiki data, alternate versions, and
+unsaved staging paths.
 
 The canvas layer is shared by translation, cleaning, and typing. Tab-specific behavior must be
 added through `CanvasHooks` instead of forking the canvas or duplicating page/bubble interaction
@@ -53,8 +55,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   polling, source-page geometry metadata, incremental texture upload and source GPU trimming,
   shared viewport sync, AI backend health wiring, and global hotkey dispatch.
 - `project.rs`: chapter data models, project path discovery, project/settings loading,
-  legacy `scr`/`src` and clean-layer filename normalization, unsaved staging paths, and filesystem
-  helpers.
+  legacy `scr`/`src` and `cleaned`/`clean_layers` folder normalization, magic-byte JPEG->PNG
+  conversion in `src`/`cleaned`/`clean_layers`, clean-layer filename normalization (including the
+  legacy `<group>_<page>` cleaned numbering, e.g. `1_1.png` -> `001.png`), legacy
+  absolute-coordinate bubble migration (`LegacyRibbonGeometry`), unsaved staging paths, and
+  filesystem helpers.
 - `config.rs`: runtime path roots, project/user config defaults, `JsonConfig`, application data
   directories, model root helpers, and `AiInstallType`.
 - `memory_manager.rs`: image-cache memory profile, pressure classification, budget policy, and
@@ -65,6 +70,14 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `gpu_utils.rs`: shared GPU/accelerator capability probes used by installer and launcher/runtime
   settings. Call it from workers, not from frame drawing.
 - `runtime_log.rs`: session log rotation and async log writer for `last.log` / `previous.log`.
+- `backend_ipc/`: directory module for the Rust<->Python AI-backend framed IPC. Submodules:
+  `transport` (socket path `backend_socket_path()`, `connect_path`, `BackendStream`), `protocol`
+  (Rust mirror of `ipc/protocol.py` constants), `frame` (`Frame`, `read_frame`, `write_frame`
+  implementing the `[u32 BE header_len][header_json][u32 BE blob_len][blob]` wire format), and
+  `client` (`BackendClient` with background reader thread, id demultiplexing, hello handshake,
+  reconnect, event subscriptions, and the process-wide `shared_client()` singleton).
+  `CallHandle::{id,cancel,wait,wait_streaming}` supports explicit cancellation and SDXL streaming.
+  The framed protocol is the single, sole IPC transport; the legacy HTTP helpers have been removed.
 - `ai_backend_capabilities.rs`: process-wide mirrored capability slot for cheap Torch availability
   checks after backend health probing.
 - `ai_install_probe.rs`: shared Python package probe that resolves and persists
@@ -110,11 +123,12 @@ tools; typing owns text/image overlay placement, text rendering, masks, and expo
 They interact with shared page/bubble/overlay behavior through `CanvasView` and `CanvasHooks`.
 
 Python AI calls are split between Rust and Python boundaries. Rust resolves app-managed model files
-through `ai_models.rs` before calling backend routes. Python process discovery and command setup go
-through `python_manager.rs`. Backend health and device state are polled once and shared into
-settings/translation and the editor root, with Torch availability mirrored through
-`ai_backend_capabilities.rs`. Unresolved backend device choices reported by `/device` are surfaced
-by the editor as startup prompts instead of blocking the GUI thread.
+through `ai_models.rs` before calling backend methods. Python process discovery and command setup go
+through `python_manager.rs`. Backend health is push-driven via `TOPIC_HEALTH` events (with a
+one-shot `health` pull as a startup/liveness fallback); Torch availability is mirrored through
+`ai_backend_capabilities.rs`. Device state is queried via `device.get`/`device.set` IPC methods.
+Unresolved backend device choices reported by `device.get` are surfaced by the editor as startup
+prompts instead of blocking the GUI thread.
 
 ## Contracts and invariants
 - Current application behavior belongs in Rust under `src/`; do not copy architecture from legacy
@@ -155,8 +169,8 @@ by the editor as startup prompts instead of blocking the GUI thread.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
 - AI install-type detection from installed Python packages: `ai_install_probe.rs`.
 - App-managed AI model coverage, Hugging Face paths, or lazy download behavior: `ai_models.rs`.
-- Chapter filesystem shape, project load/save contracts, page discovery, or staged unsaved paths:
-  `project.rs`.
+- Chapter filesystem shape, project load/save contracts, page discovery, staged unsaved paths, or
+  legacy bubble format migration: `project.rs`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,
   active tab routing, viewport sync, or global hotkeys: `app.rs`.
 - Canvas layout, zoom, scrolling, bubble interaction, overlay runtime, or canvas settings:

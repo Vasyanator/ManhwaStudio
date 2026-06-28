@@ -14,6 +14,10 @@ The public boundary is intentionally small:
 
 - `types.rs` defines the stable caller-facing data contract.
 - `render_next::render_text_to_image` is the normal entry point.
+- `render_next::apply_effects_to_image` applies the same post-effect pipeline to an arbitrary
+  RGBA image (no text layout), so callers can reuse stroke/glow/shadow/etc. on imported image
+  overlays. It validates `width * height * 4`, treats empty/`[]` effects JSON as a no-op, and
+  returns a `RenderedTextImage` that effects may grow for extra margin.
 - `pipeline::smoke_render_text_to_image` is only a smoke/contract helper.
 
 The main render flow is:

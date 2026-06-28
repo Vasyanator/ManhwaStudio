@@ -6,13 +6,15 @@ Detached egui window for importing simple PSD layers into launcher projects.
 
 Main responsibilities:
 - render a dark-themed PSD import UI with layer mapping and preview;
-- load PSD/ZIP/RAR sources on background threads using the Rust `psd` crate;
+- load PSD/ZIP/RAR sources on background threads using the in-tree `ag-psd` crate;
 - warn when unsupported complexity is detected (for example groups or PSB files);
 - save selected raster layers into project `src/` and `clean_layers/` without blocking the GUI.
 
 Notes:
-This implementation targets simple flat PSD files. The `psd` crate does not expose exact nested
-group hierarchy, so grouped/complex documents are flagged with a warning in the UI.
+This implementation targets simple flat PSD files. `ag-psd` decodes 8/16/32-bit documents
+(down-converting to 8-bit RGBA), so 16-bit "клин" exports load fine; it exposes the nested
+group hierarchy via `Layer::children`, which we flatten to leaf raster layers and flag with a
+warning when groups are present.
 */
 
 use crate::launcher::new_project::project_io::{
@@ -26,8 +28,9 @@ use egui::{
     Layout, RichText, ScrollArea, Sense, SidePanel, Stroke, TextureHandle, TextureOptions, Ui,
     ViewportClass,
 };
+use ag_psd::psd::{Layer, PixelData, ReadOptions};
+use ag_psd::read_psd;
 use image::RgbaImage;
-use psd::Psd;
 use rfd::FileDialog;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
@@ -105,14 +108,45 @@ struct PsdLayerRow {
     size: (u32, u32),
     import_type: LayerImportType,
     document_index: usize,
-    layer_index: usize,
+    source: LayerSource,
+}
+
+/// Where a row's pixel data comes from inside its PSD document.
+///
+/// Most rows map to a specific layer. Flattened PSDs (no layer section, only the
+/// merged composite) instead produce a single `Composite` fallback row that reads
+/// the whole-document image via `Psd::rgba()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerSource {
+    Layer(usize),
+    Composite,
+}
+
+/// A raster image already decoded to 8-bit RGBA, shared cheaply (via `Arc`) between
+/// the layer rows, the preview render and the final import.
+#[derive(Clone)]
+struct DecodedImage {
+    width: u32,
+    height: u32,
+    /// RGBA8 pixels, exactly `width * height * 4` bytes long.
+    data: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+struct DecodedLayer {
+    name: String,
+    image: DecodedImage,
 }
 
 #[derive(Clone)]
 struct LoadedPsdDocument {
     file_name: String,
     page: u32,
-    psd: Arc<Psd>,
+    /// Flattened leaf raster layers (groups expanded), ordered top-to-bottom.
+    layers: Vec<DecodedLayer>,
+    /// Merged composite image, only kept for flattened PSDs that have no usable
+    /// layers (see `LayerSource::Composite`). `None` whenever `layers` is non-empty.
+    composite: Option<DecodedImage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -194,7 +228,7 @@ struct ImportAssignment {
     page: u32,
     import_type: LayerImportType,
     document_index: usize,
-    layer_index: usize,
+    source: LayerSource,
 }
 
 impl PsdImportWindowState {
@@ -248,7 +282,17 @@ impl PsdImportWindowState {
 
         match viewport_class {
             ViewportClass::Embedded => self.show_embedded(ctx),
-            _ => self.show_native(ctx),
+            _ => {
+                // A native window is its own viewport but shares the launcher's single egui
+                // Context, so its style is global. Switch to this window's dark style while it
+                // renders and restore the previous (launcher) style afterwards, so it never
+                // leaks back and leaves the launcher's combo boxes / text fields unstyled.
+                let previous_style = ctx.style();
+                ctx.set_style(standard_dark_style());
+                let keep_open = self.show_native(ctx);
+                ctx.set_style(previous_style);
+                keep_open
+            }
         }
     }
 
@@ -271,7 +315,6 @@ impl PsdImportWindowState {
         if ctx.input(|input| input.viewport().close_requested()) {
             return false;
         }
-        ctx.set_style(standard_dark_style());
         CentralPanel::default()
             .frame(Frame::new().fill(Color32::from_rgb(24, 24, 27)))
             .show(ctx, |ui| self.show_contents(ui));
@@ -914,7 +957,7 @@ impl PsdImportWindowState {
         let spawn_result = thread::Builder::new()
             .name("launcher-psd-preview".to_string())
             .spawn(move || {
-                let result = render_preview_image(&documents, row.document_index, row.layer_index);
+                let result = render_preview_image(&documents, row.document_index, row.source);
                 if tx.send(PreviewWorkerResult { row_key, result }).is_err() {
                     runtime_log::log_warn("[launcher-psd] failed to deliver preview result");
                 }
@@ -1009,7 +1052,7 @@ impl PsdImportWindowState {
                 page: row.page,
                 import_type: row.import_type,
                 document_index: row.document_index,
-                layer_index: row.layer_index,
+                source: row.source,
             })
             .collect::<Vec<_>>();
 
@@ -1334,6 +1377,61 @@ impl LayerImportType {
     }
 }
 
+/// Build the import rows for a single PSD document.
+///
+/// Normal documents yield one row per leaf raster layer. Flattened documents that
+/// produce no usable layer rows (no layers at all) fall back to a single `Composite`
+/// row representing the whole-document merged image, typed as the source page.
+fn build_document_rows(
+    document: &LoadedPsdDocument,
+    document_index: usize,
+    warnings: &mut Vec<String>,
+) -> Vec<PsdLayerRow> {
+    // `document.layers` is already flattened (groups expanded) and ordered
+    // top-to-bottom, so no `reverse()` is needed before `auto_assign_types`.
+    let mut document_rows = Vec::new();
+    for (layer_index, layer) in document.layers.iter().enumerate() {
+        document_rows.push(PsdLayerRow {
+            row_key: format!("{document_index}:{layer_index}"),
+            file_name: document.file_name.clone(),
+            page: document.page,
+            layer_title: layer.name.clone(),
+            size: (layer.image.width, layer.image.height),
+            import_type: LayerImportType::Skip,
+            document_index,
+            source: LayerSource::Layer(layer_index),
+        });
+    }
+
+    if document_rows.is_empty() {
+        // Flattened PSD: no usable layers. Fall back to the merged composite image
+        // so the document still imports as a single source page.
+        let Some(composite) = document.composite.as_ref() else {
+            warnings.push(format!(
+                "{}: плоский PSD без слоёв и без растровых данных, пропущен.",
+                document.file_name
+            ));
+            return Vec::new();
+        };
+        return vec![PsdLayerRow {
+            row_key: format!("{document_index}:composite"),
+            file_name: document.file_name.clone(),
+            page: document.page,
+            layer_title: TYPE_SOURCE.to_string(),
+            size: (composite.width, composite.height),
+            // Explicitly typed as source; this is the only row for the document so
+            // `auto_assign_types` (which only acts on exactly one source/clean pair)
+            // would never touch it anyway.
+            import_type: LayerImportType::Source,
+            document_index,
+            source: LayerSource::Composite,
+        }];
+    }
+
+    auto_assign_types(&mut document_rows);
+    document_rows
+}
+
 fn run_scan_worker(request: ScanRequest) -> Result<ScanResponse, WorkerError> {
     let mut warnings = Vec::new();
     let documents = match request {
@@ -1363,33 +1461,7 @@ fn run_scan_worker(request: ScanRequest) -> Result<ScanResponse, WorkerError> {
     let shared_documents = Arc::new(documents);
     let mut rows = Vec::new();
     for (document_index, document) in shared_documents.iter().enumerate() {
-        let layers = document.psd.layers();
-        let mut document_rows = Vec::new();
-        for (layer_index, layer) in layers.iter().enumerate() {
-            let width = u32::from(layer.width());
-            let height = u32::from(layer.height());
-            if width == 0 || height == 0 {
-                warnings.push(format!(
-                    "{}: слой '{}' имеет нулевой размер и пропущен.",
-                    document.file_name,
-                    layer.name()
-                ));
-                continue;
-            }
-            document_rows.push(PsdLayerRow {
-                row_key: format!("{document_index}:{layer_index}"),
-                file_name: document.file_name.clone(),
-                page: document.page,
-                layer_title: layer.name().to_string(),
-                size: (width, height),
-                import_type: LayerImportType::Skip,
-                document_index,
-                layer_index,
-            });
-        }
-        document_rows.reverse();
-        auto_assign_types(&mut document_rows);
-        rows.extend(document_rows);
+        rows.extend(build_document_rows(document, document_index, &mut warnings));
     }
     sort_rows_for_table(&mut rows);
 
@@ -1767,22 +1839,101 @@ fn load_document_from_bytes(
     bytes: Vec<u8>,
     warnings: &mut Vec<String>,
 ) -> Result<LoadedPsdDocument, WorkerError> {
-    let psd = Psd::from_bytes(&bytes).map_err(|err| WorkerError {
+    // `use_image_data` keeps decoded pixels as raw 8-bit RGBA byte buffers (16/32-bit
+    // samples are down-converted to their top byte). `skip_composite_image_data`
+    // together with ag-psd's gating means the merged composite is only decoded for
+    // flattened PSDs (documents without a layer section), so layered documents never
+    // pay for a composite we would immediately drop.
+    let options = ReadOptions {
+        use_image_data: Some(true),
+        skip_composite_image_data: Some(true),
+        skip_thumbnail: Some(true),
+        skip_linked_files_data: Some(true),
+        ..Default::default()
+    };
+    let psd = read_psd(&bytes, &options).map_err(|err| WorkerError {
         user_message: format!("Не удалось прочитать PSD '{}'.", file_name),
         log_message: format!("failed to parse psd '{file_name}': {err}"),
     })?;
 
-    if !psd.groups().is_empty() {
+    let mut layers = Vec::new();
+    let mut has_groups = false;
+    if let Some(children) = psd.children.as_ref() {
+        collect_leaf_layers(children, &mut layers, &mut has_groups);
+    }
+    if has_groups {
         warnings.push(format!(
             "{}: обнаружены группы. Импорт работает только с простыми плоскими слоями; порядок и иерархия групп могут быть неточными.",
             file_name
         ));
     }
 
+    // Keep the composite only as a fallback for flattened PSDs; when real layers
+    // exist it is never used and ag-psd will not even have decoded it.
+    let composite = if layers.is_empty() {
+        psd.image_data
+            .as_ref()
+            .and_then(decoded_image_from_pixel_data)
+    } else {
+        None
+    };
+
     Ok(LoadedPsdDocument {
         file_name: file_name.to_string(),
         page,
-        psd: Arc::new(psd),
+        layers,
+        composite,
+    })
+}
+
+/// Recursively walk ag-psd's layer tree, collecting leaf raster layers (those with
+/// decoded pixel data) into `out` while flagging whether any groups were present.
+///
+/// `psd.children` is ordered top-to-bottom and groups are expanded in place, so the
+/// resulting list preserves visual top-to-bottom order.
+fn collect_leaf_layers(layers: &[Layer], out: &mut Vec<DecodedLayer>, has_groups: &mut bool) {
+    for layer in layers {
+        if let Some(children) = layer.children.as_ref() {
+            *has_groups = true;
+            collect_leaf_layers(children, out, has_groups);
+            continue;
+        }
+        // Empty/zero-size layers (text, adjustment, hidden empties) carry no usable
+        // pixels and are silently skipped.
+        let Some(image) = layer
+            .image_data
+            .as_ref()
+            .and_then(decoded_image_from_pixel_data)
+        else {
+            continue;
+        };
+        let name = layer
+            .additional_info
+            .name
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Без имени".to_string());
+        out.push(DecodedLayer { name, image });
+    }
+}
+
+/// Convert an ag-psd `PixelData` (8-bit RGBA after `use_image_data`) into a
+/// `DecodedImage`, rejecting empty buffers and trimming any trailing padding so the
+/// data is exactly `width * height * 4` bytes.
+fn decoded_image_from_pixel_data(pixel_data: &PixelData) -> Option<DecodedImage> {
+    if pixel_data.width == 0 || pixel_data.height == 0 {
+        return None;
+    }
+    let expected = (pixel_data.width as usize)
+        .checked_mul(pixel_data.height as usize)?
+        .checked_mul(4)?;
+    if pixel_data.data.len() < expected {
+        return None;
+    }
+    Some(DecodedImage {
+        width: pixel_data.width,
+        height: pixel_data.height,
+        data: Arc::new(pixel_data.data[..expected].to_vec()),
     })
 }
 
@@ -1903,9 +2054,9 @@ fn first_significant_digit(bytes: &[u8], start: usize, end: usize) -> usize {
 fn render_preview_image(
     documents: &Arc<Vec<LoadedPsdDocument>>,
     document_index: usize,
-    layer_index: usize,
+    source: LayerSource,
 ) -> Result<Arc<RgbaImage>, WorkerError> {
-    let rgba = render_layer_rgba(documents, document_index, layer_index)?;
+    let rgba = render_layer_rgba(documents, document_index, source)?;
     Ok(Arc::new(rgba))
 }
 
@@ -1946,7 +2097,7 @@ fn run_import_worker(
         };
         let filename = import_filename_for_page(page)?;
         if let Some(source) = entries.get(&LayerImportType::Source) {
-            let image = render_layer_rgba(&documents, source.document_index, source.layer_index)?;
+            let image = render_layer_rgba(&documents, source.document_index, source.source)?;
             image
                 .save(src_dir.join(&filename))
                 .map_err(|err| WorkerError {
@@ -1957,7 +2108,7 @@ fn run_import_worker(
                 })?;
         }
         if let Some(clean) = entries.get(&LayerImportType::Clean) {
-            let image = render_layer_rgba(&documents, clean.document_index, clean.layer_index)?;
+            let image = render_layer_rgba(&documents, clean.document_index, clean.source)?;
             image
                 .save(clean_dir.join(&filename))
                 .map_err(|err| WorkerError {
@@ -1989,32 +2140,45 @@ fn import_filename_for_page(page: u32) -> Result<String, WorkerError> {
 fn render_layer_rgba(
     documents: &Arc<Vec<LoadedPsdDocument>>,
     document_index: usize,
-    layer_index: usize,
+    source: LayerSource,
 ) -> Result<RgbaImage, WorkerError> {
     let document = documents.get(document_index).ok_or_else(|| WorkerError {
         user_message: "PSD документ больше не доступен.".to_string(),
         log_message: format!("missing document index {document_index}"),
     })?;
-    let layer = document
-        .psd
-        .layers()
-        .get(layer_index)
-        .ok_or_else(|| WorkerError {
-            user_message: "PSD слой больше не доступен.".to_string(),
-            log_message: format!(
-                "missing layer index {layer_index} in document '{}'",
-                document.file_name
-            ),
-        })?;
-    let width = u32::from(layer.width());
-    let height = u32::from(layer.height());
-    let pixels = layer.rgba();
+
+    let (image, label) = match source {
+        LayerSource::Layer(layer_index) => {
+            let layer = document.layers.get(layer_index).ok_or_else(|| WorkerError {
+                user_message: "PSD слой больше не доступен.".to_string(),
+                log_message: format!(
+                    "missing layer index {layer_index} in document '{}'",
+                    document.file_name
+                ),
+            })?;
+            (&layer.image, format!("layer '{}'", layer.name))
+        }
+        LayerSource::Composite => {
+            let composite = document.composite.as_ref().ok_or_else(|| WorkerError {
+                user_message: "Плоский PSD не содержит растровых данных.".to_string(),
+                log_message: format!(
+                    "empty composite rgba buffer for document '{}'",
+                    document.file_name
+                ),
+            })?;
+            (composite, "composite".to_string())
+        }
+    };
+
+    let (width, height) = (image.width, image.height);
+    // `Arc<Vec<u8>>` is shared with the row table / preview cache, so clone the bytes
+    // for `RgbaImage`, which needs to own its buffer.
+    let pixels = image.data.as_ref().clone();
     RgbaImage::from_raw(width, height, pixels).ok_or_else(|| WorkerError {
         user_message: "Не удалось собрать растровый слой PSD.".to_string(),
         log_message: format!(
-            "invalid rgba buffer for document '{}' layer '{}'",
-            document.file_name,
-            layer.name()
+            "invalid rgba buffer for document '{}' {label}",
+            document.file_name
         ),
     })
 }
@@ -2146,7 +2310,7 @@ fn standard_dark_style() -> egui::Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayerImportType, PsdLayerRow, import_filename_for_page};
+    use super::{LayerImportType, LayerSource, PsdLayerRow, import_filename_for_page};
 
     #[test]
     fn import_filename_preserves_page_gaps() {
@@ -2237,7 +2401,64 @@ mod tests {
             size: (1, 1),
             import_type,
             document_index,
-            layer_index: 0,
+            source: LayerSource::Layer(0),
         }
+    }
+
+    #[test]
+    fn flattened_psd_yields_single_source_composite_row() {
+        use ag_psd::psd::{ColorMode, PixelData, Psd as AgPsd, WriteOptions};
+        use ag_psd::write_psd;
+
+        let width = 3u32;
+        let height = 2u32;
+        // Opaque red composite, RGBA8.
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&[255, 0, 0, 255]);
+        }
+
+        let psd = AgPsd {
+            width: width as f64,
+            height: height as f64,
+            color_mode: Some(ColorMode::Rgb),
+            bits_per_channel: Some(8.0),
+            // Flattened: no layer section, only the merged composite.
+            children: None,
+            image_data: Some(PixelData {
+                width,
+                height,
+                data,
+            }),
+            ..Default::default()
+        };
+        let bytes = write_psd(&psd, &WriteOptions::default());
+
+        let mut warnings = Vec::new();
+        let document = super::load_document_from_bytes("001.psd", 1, bytes, &mut warnings)
+            .expect("flattened psd loads");
+        assert!(
+            document.layers.is_empty(),
+            "fixture is flattened (no layers)"
+        );
+        assert!(
+            document.composite.is_some(),
+            "flattened psd keeps its composite"
+        );
+
+        let rows = super::build_document_rows(&document, 0, &mut warnings);
+
+        assert_eq!(rows.len(), 1, "flattened psd yields exactly one row");
+        let row = &rows[0];
+        assert_eq!(row.import_type, LayerImportType::Source);
+        assert_eq!(row.source, super::LayerSource::Composite);
+        assert_eq!(row.size, (width, height));
+        assert!(warnings.is_empty(), "no warnings for a valid flattened psd");
+
+        // The composite pixels must flow through the shared render path.
+        let documents = std::sync::Arc::new(vec![document]);
+        let image = super::render_layer_rgba(&documents, 0, super::LayerSource::Composite)
+            .expect("composite renders");
+        assert_eq!(image.dimensions(), (width, height));
     }
 }

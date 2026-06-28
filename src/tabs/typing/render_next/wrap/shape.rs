@@ -18,10 +18,10 @@ Source:
 */
 
 use super::horizontal::{
-    ShapeMonotonicPhase, WrapScoringContext, WrapSettings, count_layout_units,
-    wrap_text_with_targets_scored,
+    ShapeMonotonicPhase, WrapScoringContext, WrapSettings, wrap_text_with_targets_scored,
 };
 use super::{HyphenationDictionaries, WordBreakPolicy};
+use crate::tabs::typing::segmentation::count_layout_units;
 use crate::tabs::typing::render_next::types::{TextShape, TextWrapMode};
 use cosmic_text::{Attrs, FontSystem};
 
@@ -262,10 +262,7 @@ fn rectangle_target_units(lines: &[String], base_units: usize, hanging_punctuati
         if sample.is_empty() {
             continue;
         }
-        total = total.saturating_add(super::horizontal::count_layout_units(
-            sample,
-            hanging_punctuation,
-        ));
+        total = total.saturating_add(count_layout_units(sample, hanging_punctuation));
         count += 1;
     }
 

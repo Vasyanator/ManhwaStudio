@@ -17,10 +17,11 @@ Notes:
 */
 
 use super::{
-    SettingsTabState, normalize_projects_dir_value, save_memory_profile, save_projects_dir,
-    save_typing_panel_layout,
+    SettingsTabState, normalize_projects_dir_value, save_hanging_punctuation, save_memory_profile,
+    save_projects_dir, save_typing_panel_layout,
 };
 use crate::config;
+use crate::text_punctuation;
 use crate::memory_manager::MemoryProfile;
 use crate::runtime_log;
 use crate::tabs::typing::TypingPanelLayout;
@@ -139,5 +140,72 @@ impl SettingsTabState {
             }
         }
         ui.small("Если поле пустое, автоматически используется путь по умолчанию.");
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label("Висящая пунктуация:");
+        ui.small(
+            "Символы, которые при включённой висящей пунктуации выносятся за края \
+             строки и не идут в счёт её ширины (в т.ч. дефис переноса). Список общий \
+             для рендера текста и перебора форм. Пробелы игнорируются.",
+        );
+
+        let mut should_save_punctuation = false;
+        ui.horizontal_wrapped(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.hanging_punctuation_input)
+                    .font(egui::FontId::new(16.0, egui::FontFamily::Monospace))
+                    .desired_width(520.0)
+                    .hint_text(text_punctuation::DEFAULT_HANGING_PUNCTUATION),
+            );
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                should_save_punctuation = true;
+            }
+            if ui
+                .add_enabled(
+                    self.hanging_punctuation_input != self.saved_hanging_punctuation,
+                    egui::Button::new("Сохранить"),
+                )
+                .clicked()
+            {
+                should_save_punctuation = true;
+            }
+            if ui
+                .add_enabled(
+                    self.hanging_punctuation_input
+                        != text_punctuation::DEFAULT_HANGING_PUNCTUATION,
+                    egui::Button::new("По умолчанию"),
+                )
+                .clicked()
+            {
+                self.hanging_punctuation_input =
+                    text_punctuation::DEFAULT_HANGING_PUNCTUATION.to_string();
+                should_save_punctuation = true;
+            }
+        });
+
+        if should_save_punctuation {
+            let punctuation = self.hanging_punctuation_input.clone();
+            self.saved_hanging_punctuation = punctuation.clone();
+            // Сразу применяем к живому набору, чтобы новые рендеры учли изменение.
+            text_punctuation::set_hanging_punctuation(&punctuation);
+            let path = self.user_settings_file.clone();
+            if let Err(err) = thread::Builder::new()
+                .name("settings-hanging-punctuation-save".to_string())
+                .spawn(move || {
+                    if let Err(err) = save_hanging_punctuation(&path, &punctuation) {
+                        runtime_log::log_error(format!(
+                            "[settings] failed to persist hanging punctuation to {}; error={err}",
+                            path.display()
+                        ));
+                    }
+                })
+            {
+                runtime_log::log_error(format!(
+                    "[settings] failed to start hanging punctuation save thread; error={err}"
+                ));
+            }
+        }
     }
 }

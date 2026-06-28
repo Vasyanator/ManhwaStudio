@@ -17,8 +17,9 @@ Source:
 */
 
 use super::WordBreakPolicy;
-use super::hyphenation::{HyphenationDictionaries, find_emergency_split_index};
+use super::hyphenation::find_emergency_split_index;
 use super::shape::compute_shape_line_widths;
+use crate::tabs::typing::segmentation::HyphenationDictionaries;
 use crate::tabs::typing::render_next::types::{TextShape, TextWrapMode};
 use std::collections::VecDeque;
 

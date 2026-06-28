@@ -6,26 +6,31 @@ launcher settings, global memory profile, shared canvas/ribbon behavior, AI back
 controls, and hotkey overrides.
 
 ## Architecture
-`SettingsTabState` in `mod.rs` owns pane selection, shared settings snapshots, AI backend process
-runtime state, the hot-applicable `MemoryManager` binding, and bindings to shared models. Pane files
-render focused UI sections through methods on `SettingsTabState`.
+`SettingsTabState` in `mod.rs` owns pane selection, shared settings snapshots, the hot-applicable
+`MemoryManager` binding, and bindings to shared models. The AI backend pane no longer owns the
+backend process: it holds a cloned `AiBackendHandle` and renders the shared widget from
+`crate::ai_backend_panel`. Pane files render focused UI sections through methods on
+`SettingsTabState`.
 
 Settings writes are offloaded to worker threads or a coalescing save worker. The GUI thread updates
 the in-memory `SharedCanvasSettings`, sends save requests, polls shared snapshots, and forwards
-commands to the AI backend process/probe workers.
+backend process/probe commands through the `AiBackendHandle`.
 
-AI backend health probing is shared with the Translation tab through
-`tabs::translation::backend_health`. Process management for `ai_backend.py` is local to this module
-and uses `python_manager`/`config` for runtime paths instead of constructing Python paths directly.
-Before launch, the process manager checks the default backend port and, if it is occupied, selects
-a free localhost port, publishes it through `backend_health`, and passes it to Python with `--port`.
+The `ai_backend.py` process and the health/device probe are owned **app-globally** by
+`crate::ai_backend_supervisor` (created in `run_main` before the launcher/studio loop), so the
+backend starts in the launcher (per the autostart toggle) and survives launcher↔studio transitions.
+Both the studio settings tab and the launcher settings page render the same
+`ai_backend_panel::draw_ai_backend_panel` against that shared handle. The backend speaks the framed
+IPC protocol over the AF_UNIX socket at `backend_ipc::backend_socket_path()`; the supervisor passes
+that path to Python with `--socket`. There is no free-port reservation and no HTTP server.
 
 ## Files and submodules
-- `mod.rs`: `SettingsTabState`, pane routing, canvas settings binding, AI backend process worker,
-  backend stdout/stderr readers, autostart/projects-dir/typing-layout persistence helpers, and
-  coalesced canvas settings save worker.
-- `general.rs`: general pane UI, including global memory profile, projects directory, and the
-  current typing panel layout persistence behavior.
+- `mod.rs`: `SettingsTabState`, pane routing, canvas settings binding, the shared `AiBackendHandle`,
+  projects-dir/typing-layout persistence helpers, and the coalesced canvas settings save worker.
+  (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
+- `general.rs`: general pane UI, including global memory profile, projects directory, the
+  current typing panel layout persistence behavior, and the app-wide hanging-punctuation
+  list editor (`TextTab.hanging_punctuation`, applied live via `crate::text_punctuation`).
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
 - `ai_backend.rs`: AI backend pane UI for health display, process start/stop/restart/autostart,

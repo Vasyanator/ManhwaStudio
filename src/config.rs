@@ -41,6 +41,7 @@ pub const CLEAN_LAYERS_DIR: &str = "clean_layers";
 pub const ALT_VERS_DIR: &str = "alt_vers";
 pub const SAVED_DIR: &str = "saved";
 pub const TEXT_IMAGES_DIR: &str = "text_images";
+pub const LAYERS_DIR: &str = "layers";
 pub const TEXT_DETECTION_DIR: &str = "text_detection";
 pub const CHARACTERS_DIR: &str = "characters";
 pub const TERMS_FILE: &str = "terms.json";
@@ -49,6 +50,7 @@ pub const USER_CONFIG_FILE: &str = "user_config.json";
 pub const GENERAL_PROJECTS_DIR_KEY: &str = "projects_dir";
 pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
 pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
+pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiInstallType {
@@ -98,6 +100,23 @@ pub fn data_dir() -> PathBuf {
 
 pub fn user_config_path() -> PathBuf {
     data_dir().join(USER_CONFIG_FILE)
+}
+
+/// Path to the dedicated SDXL inpainting settings file.
+///
+/// SDXL tool settings are kept in their own JSON file (not `user_config.json`)
+/// so the tool's frequent background saves cannot race the canvas-settings saver
+/// that owns `user_config.json`.
+#[must_use]
+pub fn sdxl_inpaint_settings_path() -> PathBuf {
+    data_dir().join("sdxl_inpaint_settings.json")
+}
+
+/// Dedicated settings file for the FLUX.1-Fill inpaint tool (kept separate from
+/// the `user_config.json` saver, like the SDXL one).
+#[must_use]
+pub fn flux_fill_inpaint_settings_path() -> PathBuf {
+    data_dir().join("flux_fill_inpaint_settings.json")
 }
 
 pub fn program_dir() -> PathBuf {
@@ -208,6 +227,21 @@ pub fn manga_ocr_onnx_dir() -> PathBuf {
     onnx_models_dir().join("MangaOCR")
 }
 
+/// Сторонние крупные модели, скачиваемые по требованию (не из основного репо).
+pub fn side_models_dir() -> PathBuf {
+    models_dir().join("side_models")
+}
+
+/// FLUX.1-Fill-dev: GGUF-трансформер (квант на выбор) лежит здесь, diffusers-компоненты
+/// (VAE/CLIP/T5/scheduler) — в подпапке `components/`.
+pub fn flux_fill_dir() -> PathBuf {
+    side_models_dir().join("FLUX.1-Fill-dev-GGUF")
+}
+
+pub fn flux_fill_components_dir() -> PathBuf {
+    flux_fill_dir().join("components")
+}
+
 pub fn model_folders() -> Vec<PathBuf> {
     vec![
         models_dir(),
@@ -221,6 +255,9 @@ pub fn model_folders() -> Vec<PathBuf> {
         onnx_text_detector_dir(),
         paddle_onnx_dir(),
         manga_ocr_onnx_dir(),
+        side_models_dir(),
+        flux_fill_dir(),
+        flux_fill_components_dir(),
     ]
 }
 
@@ -375,10 +412,12 @@ pub fn user_config_defaults() -> Value {
             "aside_max_width_px": 550,
             "aside_compact_mode": "none",
             "aside_side_mode": "auto",
+            "aside_second_column": false,
             "bubble_status_rules": default_bubble_status_rules_value(),
             "spellcheck_original": false,
             "spellcheck_translation": true,
             "cache_pages": true,
+            "translation_status_display": "until_next",
             "opengl_enabled": false,
             "opengl_device": "auto"
         },
@@ -419,6 +458,7 @@ pub fn user_config_defaults() -> Value {
         "CleaningTab": {},
         "TextTab": {
             "use_system_fonts": false,
+            "hanging_punctuation": crate::text_punctuation::DEFAULT_HANGING_PUNCTUATION,
             "formula_presets": {
                 "Дуга (мягкая)": {
                     "x_expr": "t * w",
@@ -523,11 +563,13 @@ pub fn project_config_defaults() -> Value {
             "side_margin_px": 20,
             "aside_compact_mode": "none",
             "aside_side_mode": "auto",
+            "aside_second_column": false,
             "aside_scale_pct": 100,
             "tabs_autosync_enabled": true,
             "auto_insert_last_character": true,
             "project_custom_spellcheck_words": "",
             "cache_pages": true,
+            "translation_status_display": "until_next",
             "opengl_enabled": false,
             "opengl_device": "auto"
         },

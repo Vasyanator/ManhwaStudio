@@ -39,6 +39,10 @@ to refresh local mask caches.
 
 ## Contracts and invariants
 - Do not hold model locks during long operations or disk I/O. Clone snapshots first.
+- To read a single bubble (or its `extra` map) by id, use `BubblesModel::with_bubble` /
+  `extra_of` instead of `snapshot()`; they look up via `bubble_index_by_id` and avoid cloning
+  the whole list. The saver channel carries `Arc<Vec<Bubble>>`, so publishing a save shares the
+  snapshot rather than deep-cloning it.
 - Model revisions and dirty sets are the synchronization contract with canvas/runtime
   subscribers; update them whenever visible shared state changes.
 - Bubble ids are the stable identity for updates. Maintain the id index whenever the stored bubble

@@ -3,7 +3,7 @@ File: src/canvas/helpers.rs
 
 Purpose:
 Чистые helper-функции для canvas-модуля: геометрия, сериализация rect coords,
-overlay tiling, текстовые оценки и хеширование bubble-снимков.
+per-tile overlay RGBA extraction, текстовые оценки и хеширование bubble-снимков.
 
 Main responsibilities:
 - инкапсулировать stateless helper-логику;
@@ -11,7 +11,7 @@ Main responsibilities:
 - сохранить переиспользуемые pure helpers вне основного runtime-фасада.
 
 Key functions:
-- build_overlay_prepared_tiles
+- rgba_from_overlay_tile
 - rect_coords_from_bubble
 - upsert_rect_coords_into_extra
 - bubbles_stamp
@@ -20,21 +20,34 @@ Key functions:
 Notes:
 - Функции не держат runtime state `CanvasView`.
 - GUI-зависимая helper-логика ограничена измерением текста через `egui::Ui`.
+- The text-measurement cache lives in egui temp data as a cheap-to-clone shared handle
+  (`Arc<Mutex<..>>`) so per-frame lookups/stores no longer clone the whole map; the map is
+  bounded in size and cleared on overflow (see `TEXT_MEASURE_CACHE_MAX_ENTRIES`).
 */
 
-use super::OVERLAY_TILE_SIDE;
-use super::types::{OverlayPreparedTile, OverlayRectPx, RectCoords};
+use super::types::{BubbleClass, ImageTextArea, OverlayRectPx, RectCoords};
 use crate::app::PageImageInfo;
 use crate::project::{Bubble, Side};
 use eframe::egui;
-use egui::{Color32, FontFamily, FontId, Rect, Stroke, Vec2};
+use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 pub(crate) const BUBBLE_TEXT_FONT_FAMILY_NAME: &str = "canvas-bubble-unicode";
 
 const TEXT_MEASURE_CACHE_ID: &str = "canvas_text_measure_cache";
+
+/// Maximum number of entries kept in the text-measurement cache.
+///
+/// The cache key includes the available text width in points, which scales with canvas zoom, so
+/// each zoom level produces fresh entries per (text, width, font). Without a bound the map would
+/// grow without limit across a zoom session. On overflow the whole map is cleared (clear-on-overflow
+/// rather than LRU): measurements are cheap to recompute and clearing keeps the store O(1) and
+/// simple. 8192 entries is well above the live bubble count for a single page yet small enough to
+/// keep the map cheap.
+const TEXT_MEASURE_CACHE_MAX_ENTRIES: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum TextMeasureKind {
@@ -50,10 +63,11 @@ struct TextMeasureKey {
     font_size_bits: u32,
 }
 
-#[derive(Clone, Debug, Default)]
-struct TextMeasureCache {
-    values: HashMap<TextMeasureKey, f32>,
-}
+/// Cheap-to-clone shared handle to the bounded text-measurement map stored in egui temp data.
+///
+/// Cloning the handle is O(1) (an `Arc` bump), unlike cloning the owned `HashMap`. The `Mutex`
+/// keeps it `Send + Sync` as required by `egui::Memory::insert_temp`.
+type TextMeasureCache = Arc<Mutex<HashMap<TextMeasureKey, f32>>>;
 
 pub(crate) fn bubble_text_font_family() -> FontFamily {
     FontFamily::Name(BUBBLE_TEXT_FONT_FAMILY_NAME.into())
@@ -75,23 +89,61 @@ pub(crate) fn bubble_text_font_id(ui: &egui::Ui) -> FontId {
     }
 }
 
-fn text_measure_cache_lookup(ui: &egui::Ui, key: &TextMeasureKey) -> Option<f32> {
+/// Returns the cheap-to-clone shared cache handle from egui temp data, creating an empty one on
+/// first use.
+///
+/// Only the `Arc` is cloned out of the temp store (O(1)); the underlying map is never cloned.
+fn text_measure_cache_handle(ui: &egui::Ui) -> TextMeasureCache {
     let cache_id = egui::Id::new(TEXT_MEASURE_CACHE_ID);
     ui.ctx().data_mut(|data| {
-        data.get_temp::<TextMeasureCache>(cache_id)
-            .and_then(|cache| cache.values.get(key).copied())
+        if let Some(handle) = data.get_temp::<TextMeasureCache>(cache_id) {
+            return handle;
+        }
+        let handle: TextMeasureCache = Arc::new(Mutex::new(HashMap::new()));
+        data.insert_temp(cache_id, handle.clone());
+        handle
     })
 }
 
+/// Reads a cached measurement for `key`, or `None` on a miss.
+///
+/// Clones only the shared handle (O(1)) and briefly locks the map for the read. A poisoned lock is
+/// treated as a miss rather than panicking.
+fn text_measure_cache_lookup(ui: &egui::Ui, key: &TextMeasureKey) -> Option<f32> {
+    let handle = text_measure_cache_handle(ui);
+    let guard = handle.lock().ok()?;
+    guard.get(key).copied()
+}
+
+/// Stores `value` for `key` in the bounded shared cache.
+///
+/// Clones only the shared handle (O(1)) and briefly locks the map for the insert. Size is bounded
+/// to `TEXT_MEASURE_CACHE_MAX_ENTRIES`; on overflow the map is cleared before inserting
+/// (clear-on-overflow, not LRU). A poisoned lock is treated as a no-op rather than panicking.
 fn text_measure_cache_store(ui: &egui::Ui, key: TextMeasureKey, value: f32) {
-    let cache_id = egui::Id::new(TEXT_MEASURE_CACHE_ID);
-    ui.ctx().data_mut(|data| {
-        let mut cache = data
-            .get_temp::<TextMeasureCache>(cache_id)
-            .unwrap_or_default();
-        cache.values.insert(key, value);
-        data.insert_temp(cache_id, cache);
-    });
+    let handle = text_measure_cache_handle(ui);
+    if let Ok(mut guard) = handle.lock() {
+        insert_bounded(&mut guard, key, value, TEXT_MEASURE_CACHE_MAX_ENTRIES);
+    }
+}
+
+/// Inserts `key`/`value` into `map`, clearing it first when it is already at `cap` and `key` is new.
+///
+/// `cap` of 0 means the map is kept empty. Clear-on-overflow keeps the operation O(1) amortized and
+/// avoids unbounded growth; updating an existing key never triggers a clear.
+fn insert_bounded(
+    map: &mut HashMap<TextMeasureKey, f32>,
+    key: TextMeasureKey,
+    value: f32,
+    cap: usize,
+) {
+    if map.len() >= cap && !map.contains_key(&key) {
+        map.clear();
+    }
+    if cap == 0 {
+        return;
+    }
+    map.insert(key, value);
 }
 
 pub(crate) fn with_bubble_text_font<R>(
@@ -163,34 +215,6 @@ pub(crate) fn blit_scaled_chunk(
             }
         }
     }
-}
-
-pub(crate) fn build_overlay_prepared_tiles(image: &egui::ColorImage) -> Vec<OverlayPreparedTile> {
-    let w = image.size[0];
-    let h = image.size[1];
-    if w == 0 || h == 0 {
-        return Vec::new();
-    }
-    let mut tiles = Vec::new();
-    let mut tile_idx = 0usize;
-    let mut y = 0usize;
-    while y < h {
-        let mut x = 0usize;
-        while x < w {
-            let tw = (w - x).min(OVERLAY_TILE_SIDE);
-            let th = (h - y).min(OVERLAY_TILE_SIDE);
-            tiles.push(OverlayPreparedTile {
-                tile_idx,
-                origin_px: [x, y],
-                size_px: [tw, th],
-                rgba: rgba_from_overlay_tile(image, x, y, tw, th),
-            });
-            tile_idx += 1;
-            x += OVERLAY_TILE_SIDE;
-        }
-        y += OVERLAY_TILE_SIDE;
-    }
-    tiles
 }
 
 pub(crate) fn rgba_from_overlay_tile(
@@ -283,18 +307,14 @@ pub(crate) fn bubble_fingerprint_with_hasher(
         coords.p2.x.to_bits().hash(hasher);
         coords.p2.y.to_bits().hash(hasher);
     }
-}
-
-pub(crate) fn bubbles_history_hash(bubbles: &[Bubble]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    if let Ok(raw) = serde_json::to_vec(bubbles) {
-        raw.hash(&mut hasher);
-        return hasher.finish();
+    // Multi-area image bubbles store geometry/text of extra areas here; hash it so remote edits
+    // (e.g. cross-tab autosync) re-sync into the runtime even though the legacy fields are equal.
+    if let Some(areas) = bubble.extra.get("text_areas") {
+        areas.to_string().hash(hasher);
     }
-    for bubble in bubbles {
-        bubble_fingerprint_with_hasher(bubble, &mut hasher);
+    if let Some(description) = bubble.extra.get("description").and_then(Value::as_str) {
+        description.hash(hasher);
     }
-    hasher.finish()
 }
 
 pub(crate) fn default_rect_coords(u: f32, v: f32, delta_u: f32, delta_v: f32) -> RectCoords {
@@ -321,6 +341,39 @@ pub(crate) fn default_rect_coords_from_source_px(
 pub(crate) fn rect_coords_from_bubble(bubble: &Bubble) -> Option<RectCoords> {
     let raw = bubble.extra.get("rect_coords")?;
     rect_coords_from_value(raw)
+}
+
+/// Returns the image-area rect (the single red rectangle) for an image bubble.
+///
+/// For a page-crop image bubble the image area is the crop region (`extra["crop_rect"]`), which is
+/// the authoritative rect that sizes the image on the ribbon; `rect_coords` is kept in sync with
+/// it. For external images and as a fallback it returns `rect_coords`. Returns `None` when neither
+/// is present.
+pub(crate) fn image_area_rect_from_bubble(bubble: &Bubble) -> Option<RectCoords> {
+    let is_image =
+        bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image);
+    if is_image
+        && bubble
+            .extra
+            .get("image_source_type")
+            .and_then(Value::as_str)
+            .unwrap_or("external")
+            == "page_crop"
+        && let Some(arr) = bubble.extra.get("crop_rect").and_then(Value::as_array)
+        && arr.len() == 4
+    {
+        let coord = |idx: usize| arr[idx].as_f64().map(|n| (n as f32).clamp(0.0, 1.0));
+        if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (coord(0), coord(1), coord(2), coord(3)) {
+            return Some(
+                RectCoords {
+                    p1: egui::pos2(x1, y1),
+                    p2: egui::pos2(x2, y2),
+                }
+                .normalized(),
+            );
+        }
+    }
+    rect_coords_from_bubble(bubble)
 }
 
 pub(crate) fn rect_coords_from_value(raw: &Value) -> Option<RectCoords> {
@@ -398,6 +451,247 @@ pub(crate) fn upsert_rect_coords_into_extra(extra: &mut Map<String, Value>, coor
             .collect(),
         ),
     );
+}
+
+/// Parses the text areas of a multi-area `ImageBubble` from its record.
+///
+/// Returns an empty vector for non-image bubbles. For image bubbles it always returns at least one
+/// area: when `extra["text_areas"]` is missing or empty a single area is synthesized from the
+/// legacy fields (`rect_coords` as the area rect, `img_u/img_v` as the anchor). Area 0's text is
+/// always taken from the legacy `text` / `original_text` / `extra.description` fields, which remain
+/// the source of truth for the primary area; later areas carry their own text. Every area is
+/// normalized so its rect sits inside the red `rect_coords` and its anchor sits inside its rect.
+#[must_use]
+pub(crate) fn parse_image_text_areas(bubble: &Bubble) -> Vec<ImageTextArea> {
+    let is_image = bubble
+        .bubble_class
+        .as_deref()
+        .map(BubbleClass::from_str)
+        .unwrap_or(BubbleClass::Text)
+        == BubbleClass::Image;
+    if !is_image {
+        return Vec::new();
+    }
+
+    let red_rect = image_area_rect_from_bubble(bubble)
+        .unwrap_or_else(|| default_rect_coords(bubble.img_u, bubble.img_v, 0.05, 0.05));
+    let legacy_description = bubble
+        .extra
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let mut areas: Vec<ImageTextArea> = bubble
+        .extra
+        .get("text_areas")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(image_text_area_from_value)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if areas.is_empty() {
+        // Legacy single-area image bubble: synthesize one small box around the stored anchor (not
+        // covering the whole image area, so it does not look like a duplicate of the red rect).
+        let anchor = egui::pos2(bubble.img_u.clamp(0.0, 1.0), bubble.img_v.clamp(0.0, 1.0));
+        areas.push(ImageTextArea {
+            area_rect: default_text_area_box(red_rect, anchor),
+            anchor,
+            original: String::new(),
+            description: String::new(),
+            translation: String::new(),
+        });
+    }
+
+    // Migrate areas that cover (nearly) the entire image area back to a small box around their
+    // anchor; older builds stored area 0 as the full red rect, which duplicated the image area.
+    for area in &mut areas {
+        if covers_full_red_rect(area.area_rect, red_rect) {
+            area.area_rect = default_text_area_box(red_rect, area.anchor);
+        }
+    }
+
+    // Area 0 text is mirrored from the legacy fields so OCR/MT/status keep one canonical primary.
+    if let Some(first) = areas.first_mut() {
+        first.original = bubble.original_text.clone();
+        first.translation = bubble.text.clone();
+        first.description = legacy_description;
+    }
+
+    normalize_image_text_areas(&mut areas, red_rect);
+    areas
+}
+
+/// Reads one `ImageTextArea` from a JSON object `{rect:[x1,y1,x2,y2], anchor:[u,v], original,
+/// description, translation}`. Returns `None` when the rect/anchor arrays are malformed.
+fn image_text_area_from_value(raw: &Value) -> Option<ImageTextArea> {
+    let obj = raw.as_object()?;
+    let rect = obj.get("rect")?.as_array()?;
+    if rect.len() != 4 {
+        return None;
+    }
+    let coord = |idx: usize| -> f32 {
+        rect.get(idx)
+            .and_then(Value::as_f64)
+            .map(|n| (n as f32).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    };
+    let area_rect = RectCoords {
+        p1: egui::pos2(coord(0), coord(1)),
+        p2: egui::pos2(coord(2), coord(3)),
+    }
+    .normalized();
+    let anchor_arr = obj.get("anchor").and_then(Value::as_array);
+    let anchor = match anchor_arr {
+        Some(values) if values.len() == 2 => egui::pos2(
+            values[0]
+                .as_f64()
+                .map(|n| (n as f32).clamp(0.0, 1.0))
+                .unwrap_or_else(|| area_rect.center_uv().x),
+            values[1]
+                .as_f64()
+                .map(|n| (n as f32).clamp(0.0, 1.0))
+                .unwrap_or_else(|| area_rect.center_uv().y),
+        ),
+        _ => area_rect.center_uv(),
+    };
+    let text = |key: &str| {
+        obj.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(ImageTextArea {
+        area_rect,
+        anchor,
+        original: text("original"),
+        description: text("description"),
+        translation: text("translation"),
+    })
+}
+
+/// Serializes image text areas into the JSON array stored under `extra["text_areas"]`.
+///
+/// Geometry is written for every area; area 0's text is intentionally omitted because the legacy
+/// fields remain its source of truth, so it is never persisted in two places that could drift.
+#[must_use]
+pub(crate) fn serialize_image_text_areas(areas: &[ImageTextArea]) -> Value {
+    let items: Vec<Value> = areas
+        .iter()
+        .enumerate()
+        .map(|(idx, area)| {
+            let rect = area.area_rect.normalized();
+            let mut obj = Map::new();
+            obj.insert(
+                "rect".to_string(),
+                Value::Array(vec![
+                    Value::from(f64::from(rect.p1.x)),
+                    Value::from(f64::from(rect.p1.y)),
+                    Value::from(f64::from(rect.p2.x)),
+                    Value::from(f64::from(rect.p2.y)),
+                ]),
+            );
+            obj.insert(
+                "anchor".to_string(),
+                Value::Array(vec![
+                    Value::from(f64::from(area.anchor.x)),
+                    Value::from(f64::from(area.anchor.y)),
+                ]),
+            );
+            if idx != 0 {
+                obj.insert("original".to_string(), Value::String(area.original.clone()));
+                obj.insert(
+                    "description".to_string(),
+                    Value::String(area.description.clone()),
+                );
+                obj.insert(
+                    "translation".to_string(),
+                    Value::String(area.translation.clone()),
+                );
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    Value::Array(items)
+}
+
+/// Clamps every text area (including area 0) so its rect lies fully inside the red image area and
+/// its anchor lies inside its own rect.
+///
+/// All areas are independent sub-rects of the red `rect_coords`. Areas wider/taller than the red
+/// rect are shrunk to fit; rects are translated (not just clipped) to stay fully inside so dragging
+/// never silently resizes them.
+pub(crate) fn normalize_image_text_areas(areas: &mut [ImageTextArea], red_rect: RectCoords) {
+    let red = red_rect.normalized();
+    for area in areas.iter_mut() {
+        area.area_rect = clamp_rect_inside(area.area_rect.normalized(), red);
+        area.anchor = clamp_pos_inside(area.anchor, area.area_rect);
+    }
+}
+
+/// Builds a default text-area box centered on `anchor`, sized to a fraction of the red rect and
+/// clamped to stay inside it. Used so area 0 (and freshly added areas) start as a small sub-box
+/// rather than covering the whole image area.
+pub(crate) fn default_text_area_box(red: RectCoords, anchor: Pos2) -> RectCoords {
+    let red = red.normalized();
+    let w = (red.p2.x - red.p1.x).max(0.001);
+    let h = (red.p2.y - red.p1.y).max(0.001);
+    let half_w = (w * 0.25).max(0.0);
+    let half_h = (h * 0.2).max(0.0);
+    let cx = anchor.x.clamp(red.p1.x + half_w, red.p2.x - half_w);
+    let cy = anchor.y.clamp(red.p1.y + half_h, red.p2.y - half_h);
+    RectCoords {
+        p1: egui::pos2(cx - half_w, cy - half_h),
+        p2: egui::pos2(cx + half_w, cy + half_h),
+    }
+    .normalized()
+}
+
+/// Clamps `inner` to lie fully inside `outer`, shrinking it only when it is larger than `outer`.
+fn clamp_rect_inside(inner: RectCoords, outer: RectCoords) -> RectCoords {
+    let clamp_axis = |mut lo: f32, mut hi: f32, omin: f32, omax: f32| -> (f32, f32) {
+        let span = (hi - lo).min(omax - omin).max(0.0);
+        if lo < omin {
+            lo = omin;
+            hi = omin + span;
+        }
+        if hi > omax {
+            hi = omax;
+            lo = omax - span;
+        }
+        (lo.max(omin), hi.min(omax))
+    };
+    let (x1, x2) = clamp_axis(inner.p1.x, inner.p2.x, outer.p1.x, outer.p2.x);
+    let (y1, y2) = clamp_axis(inner.p1.y, inner.p2.y, outer.p1.y, outer.p2.y);
+    RectCoords {
+        p1: egui::pos2(x1, y1),
+        p2: egui::pos2(x2, y2),
+    }
+}
+
+/// True when `area` covers essentially the entire `red` rect (within a small tolerance), i.e. it is
+/// a leftover full-image-area box that should be shrunk to a normal sub-box.
+fn covers_full_red_rect(area: RectCoords, red: RectCoords) -> bool {
+    let area = area.normalized();
+    let red = red.normalized();
+    const EPS: f32 = 0.01;
+    area.p1.x <= red.p1.x + EPS
+        && area.p1.y <= red.p1.y + EPS
+        && area.p2.x >= red.p2.x - EPS
+        && area.p2.y >= red.p2.y - EPS
+}
+
+/// Clamps a normalized point to lie inside `rect`.
+fn clamp_pos_inside(pos: Pos2, rect: RectCoords) -> Pos2 {
+    let rect = rect.normalized();
+    egui::pos2(
+        pos.x.clamp(rect.p1.x, rect.p2.x),
+        pos.y.clamp(rect.p1.y, rect.p2.y),
+    )
 }
 
 pub(crate) fn measure_text_widget_content_height(ui: &egui::Ui, text: &str, width_px: f32) -> f32 {
@@ -505,4 +799,227 @@ pub(crate) fn page_info_content_size(page_info: &PageImageInfo) -> Option<Vec2> 
         page_info.width_px as f32,
         page_info.height_px as f32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::types::{ImageTextArea, image_bubble_side_from_areas};
+    use serde_json::json;
+
+    fn image_bubble(extra: Map<String, Value>) -> Bubble {
+        Bubble {
+            id: 1,
+            img_idx: 0,
+            img_u: 0.5,
+            img_v: 0.5,
+            side: Some("right".to_string()),
+            bubble_class: Some("image".to_string()),
+            bubble_type: Some("aside".to_string()),
+            text: "tr0".to_string(),
+            original_text: "orig0".to_string(),
+            extra,
+        }
+    }
+
+    fn measure_key(text: &str) -> TextMeasureKey {
+        TextMeasureKey {
+            kind: TextMeasureKind::Height,
+            text: text.to_owned(),
+            width_bits: 0,
+            font_size_bits: 0,
+        }
+    }
+
+    #[test]
+    fn insert_bounded_normal_insert_and_update() {
+        let mut map: HashMap<TextMeasureKey, f32> = HashMap::new();
+        insert_bounded(&mut map, measure_key("a"), 1.0, 8);
+        insert_bounded(&mut map, measure_key("b"), 2.0, 8);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&measure_key("a")).copied(), Some(1.0));
+        // Updating an existing key does not grow the map and does not clear it.
+        insert_bounded(&mut map, measure_key("a"), 9.0, 8);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&measure_key("a")).copied(), Some(9.0));
+    }
+
+    #[test]
+    fn insert_bounded_clears_on_overflow_then_inserts() {
+        const CAP: usize = 4;
+        let mut map: HashMap<TextMeasureKey, f32> = HashMap::new();
+        for i in 0..CAP {
+            insert_bounded(&mut map, measure_key(&i.to_string()), i as f32, CAP);
+        }
+        assert_eq!(map.len(), CAP);
+        // A new key at capacity clears the whole map first, then inserts the single new entry.
+        insert_bounded(&mut map, measure_key("overflow"), 42.0, CAP);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&measure_key("overflow")).copied(), Some(42.0));
+    }
+
+    #[test]
+    fn insert_bounded_updating_existing_key_at_capacity_does_not_clear() {
+        const CAP: usize = 3;
+        let mut map: HashMap<TextMeasureKey, f32> = HashMap::new();
+        for i in 0..CAP {
+            insert_bounded(&mut map, measure_key(&i.to_string()), i as f32, CAP);
+        }
+        // Re-inserting an existing key while full must not wipe the cache.
+        insert_bounded(&mut map, measure_key("0"), 100.0, CAP);
+        assert_eq!(map.len(), CAP);
+        assert_eq!(map.get(&measure_key("0")).copied(), Some(100.0));
+    }
+
+    #[test]
+    fn insert_bounded_zero_cap_keeps_map_empty() {
+        let mut map: HashMap<TextMeasureKey, f32> = HashMap::new();
+        insert_bounded(&mut map, measure_key("a"), 1.0, 0);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_synthesizes_single_area_for_legacy_image_bubble() {
+        let mut extra = Map::new();
+        extra.insert(
+            "description".to_string(),
+            Value::String("desc0".to_string()),
+        );
+        let areas = parse_image_text_areas(&image_bubble(extra));
+        assert_eq!(areas.len(), 1);
+        // Area 0 text is always mirrored from the legacy fields.
+        assert_eq!(areas[0].original, "orig0");
+        assert_eq!(areas[0].translation, "tr0");
+        assert_eq!(areas[0].description, "desc0");
+    }
+
+    #[test]
+    fn image_area_rect_prefers_crop_rect_for_page_crop() {
+        let mut extra = Map::new();
+        extra.insert(
+            "image_source_type".to_string(),
+            Value::String("page_crop".to_string()),
+        );
+        extra.insert(
+            "rect_coords".to_string(),
+            json!({"p1": {"img_u": 0.4, "img_v": 0.4}, "p2": {"img_u": 0.5, "img_v": 0.5}}),
+        );
+        extra.insert("crop_rect".to_string(), json!([0.1, 0.1, 0.9, 0.9]));
+        let rect = image_area_rect_from_bubble(&image_bubble(extra)).unwrap();
+        // The crop region wins over the (smaller) rect_coords for page-crop image bubbles.
+        assert!((rect.p1.x - 0.1).abs() < 1e-4 && (rect.p2.x - 0.9).abs() < 1e-4);
+
+        // External image bubble falls back to rect_coords.
+        let mut ext = Map::new();
+        ext.insert(
+            "image_source_type".to_string(),
+            Value::String("external".to_string()),
+        );
+        ext.insert(
+            "rect_coords".to_string(),
+            json!({"p1": {"img_u": 0.4, "img_v": 0.4}, "p2": {"img_u": 0.5, "img_v": 0.5}}),
+        );
+        ext.insert("crop_rect".to_string(), json!([0.1, 0.1, 0.9, 0.9]));
+        let rect = image_area_rect_from_bubble(&image_bubble(ext)).unwrap();
+        assert!((rect.p1.x - 0.4).abs() < 1e-4 && (rect.p2.x - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn parse_returns_empty_for_text_bubble() {
+        let mut bubble = image_bubble(Map::new());
+        bubble.bubble_class = Some("text".to_string());
+        assert!(parse_image_text_areas(&bubble).is_empty());
+    }
+
+    #[test]
+    fn serialize_then_parse_round_trips_extra_areas() {
+        let mut extra = Map::new();
+        extra.insert(
+            "rect_coords".to_string(),
+            json!({"p1": {"img_u": 0.0, "img_v": 0.0}, "p2": {"img_u": 1.0, "img_v": 1.0}}),
+        );
+        extra.insert(
+            "description".to_string(),
+            Value::String("desc0".to_string()),
+        );
+        extra.insert(
+            "text_areas".to_string(),
+            json!([
+                {"rect": [0.0, 0.0, 0.4, 0.4], "anchor": [0.2, 0.2]},
+                {"rect": [0.5, 0.5, 0.9, 0.9], "anchor": [0.7, 0.7],
+                 "original": "o1", "description": "d1", "translation": "t1"}
+            ]),
+        );
+        let areas = parse_image_text_areas(&image_bubble(extra));
+        assert_eq!(areas.len(), 2);
+        assert_eq!(areas[1].original, "o1");
+        assert_eq!(areas[1].translation, "t1");
+
+        // Re-serialize and parse again; geometry of area 1 must survive (red rect spans the page).
+        let serialized = serialize_image_text_areas(&areas);
+        let mut extra2 = Map::new();
+        extra2.insert(
+            "rect_coords".to_string(),
+            json!({"p1": {"img_u": 0.0, "img_v": 0.0}, "p2": {"img_u": 1.0, "img_v": 1.0}}),
+        );
+        extra2.insert("text_areas".to_string(), serialized);
+        let reparsed = parse_image_text_areas(&image_bubble(extra2));
+        assert_eq!(reparsed.len(), 2);
+        assert!((reparsed[1].anchor.x - 0.7).abs() < 1e-4);
+        assert_eq!(reparsed[1].translation, "t1");
+    }
+
+    #[test]
+    fn side_weight_lets_one_far_left_anchor_outweigh_two_slightly_right() {
+        let area = |u: f32| ImageTextArea {
+            area_rect: RectCoords {
+                p1: egui::pos2(0.0, 0.0),
+                p2: egui::pos2(1.0, 1.0),
+            },
+            anchor: egui::pos2(u, 0.5),
+            original: String::new(),
+            description: String::new(),
+            translation: String::new(),
+        };
+        // One strongly-left anchor plus two slightly-right anchors → Left overall.
+        let areas = vec![area(0.05), area(0.55), area(0.55)];
+        assert_eq!(image_bubble_side_from_areas(&areas), Side::Left);
+        // All right → Right.
+        let right = vec![area(0.8), area(0.6)];
+        assert_eq!(image_bubble_side_from_areas(&right), Side::Right);
+    }
+
+    #[test]
+    fn normalize_keeps_area_inside_red_rect_and_anchor_inside_area() {
+        let red = RectCoords {
+            p1: egui::pos2(0.2, 0.2),
+            p2: egui::pos2(0.8, 0.8),
+        };
+        let area = |x1: f32, y1: f32, x2: f32, y2: f32, ax: f32, ay: f32| ImageTextArea {
+            area_rect: RectCoords {
+                p1: egui::pos2(x1, y1),
+                p2: egui::pos2(x2, y2),
+            },
+            anchor: egui::pos2(ax, ay),
+            original: String::new(),
+            description: String::new(),
+            translation: String::new(),
+        };
+        let mut areas = vec![
+            // Already inside red: stays put (area 0 is a normal sub-box, not pinned to red).
+            area(0.4, 0.4, 0.5, 0.5, 0.45, 0.45),
+            // Partly outside red with anchor outside the sub-area: clamped fully inside red.
+            area(0.7, 0.7, 1.2, 1.2, 0.95, 0.95),
+        ];
+        normalize_image_text_areas(&mut areas, red);
+        for area in &areas {
+            let rect = area.area_rect;
+            assert!(rect.p1.x >= 0.2 - 1e-4 && rect.p2.x <= 0.8 + 1e-4);
+            assert!(rect.p1.y >= 0.2 - 1e-4 && rect.p2.y <= 0.8 + 1e-4);
+            assert!(area.anchor.x >= rect.p1.x - 1e-4 && area.anchor.x <= rect.p2.x + 1e-4);
+            assert!(area.anchor.y >= rect.p1.y - 1e-4 && area.anchor.y <= rect.p2.y + 1e-4);
+        }
+        // Area 0 stayed where it was (not resized to fill the red rect).
+        assert!((areas[0].area_rect.p1.x - 0.4).abs() < 1e-4);
+    }
 }

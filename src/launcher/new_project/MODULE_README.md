@@ -20,8 +20,11 @@ not yet available.
 The ribbon model is the in-memory handoff between acquisition and save/export. Import/download
 modules produce decoded images, `ribbon.rs` builds tiled previews while preserving source pixels and
 crop metadata, and `project_io.rs` writes selected images to `src`, `alt_vers`, or an arbitrary
-folder. Browser automation uses the shared Python runtime path and a JSON-RPC helper daemon instead
-of embedding Selenium in Rust.
+folder. Browser automation no longer spawns its own Python helper: the Selenium/CloakBrowser session
+runs inside the app-global AI backend and is driven over framed IPC (`backend_ipc`, method
+`browser.command`). `advanced_download.rs` translates each legacy command into one streaming IPC call
+(progress frames + a terminal event); if the backend is not running it asks the supervisor
+(`ai_backend_supervisor::global_handle`) to start it before issuing commands.
 
 ## Files and submodules
 - `mod.rs`: public module map for the detached new-project window.
@@ -33,15 +36,24 @@ of embedding Selenium in Rust.
   save result mapping back to `OpenProjectSelection` where applicable.
 - `quick_download.rs`: direct chapter downloader for supported sites, URL extraction, parallel
   image download/decode, and ribbon conversion.
-- `advanced_download.rs`: Selenium/browser-profile JSON-RPC bridge through `adv_fetch_cli.py`,
-  persistent daemon lifecycle, helper version checks, link collection, direct fetch, canvas
-  snapshot, and canvas intercept workflows.
+- `advanced_download.rs`: advanced browser bridge over the unified backend's `browser.command` IPC
+  (Selenium or CloakBrowser, selected via `set_backend`), backend start-gate, helper version checks,
+  backend selection, pattern link collection, cancellable auto link candidate grouping/review,
+  responsive candidate-card layout, direct fetch, canvas snapshot, canvas intercept workflows, and
+  Cloak-only deep capture that returns byte-classified candidates through the same auto-review path.
 - `stitching.rs`: vertical stitch/split heuristics, heterogeneous-bottom adjacent-page merge,
   cut-like-reference, manual cut apply, progress events, and synchronous helpers reused by batch
   execution.
 - `waifu2x.rs`: platform runtime discovery/download/extraction, dynamic shared-library loading,
   cached model/context lifetime, cancellation, worker processing, and synchronous helpers reused by
   batch execution.
+- `reline.rs`: worker bridge to the already running Python AI backend `/reline/process` and
+  `/reline/models` endpoints; it writes temporary PNG inputs/outputs, converts processed images
+  back into ribbon pages, and loads the available Reline model catalog for UI selection.
+- `reline_models.rs`: pure, offline classification of catalog model names into gallery categories
+  with friendly titles, capability descriptions, and recommendations (curated table plus a
+  name-derived heuristic fallback). No UI, no network; consumed by the simplified Reline gallery in
+  `window.rs`.
 - `ribbon.rs`: `RibbonState`, `RibbonPage`, `RibbonTile`, `RibbonCrop`, `ImportedImage`, tiled
   preview generation, adjacent page merge, non-destructive crop state, and original-page
   restoration.
@@ -58,13 +70,21 @@ of embedding Selenium in Rust.
 - Source images are decoded from real bytes, not from filename labels.
 - Ribbon pages retain original pixels and crop metadata so crop/restore operations are
   non-destructive.
-- Browser automation must go through `python_manager` and the project helper daemon; profile and
-  Python-process lifecycle are owned by the downloader controller. The helper daemon is spawned
-  through the managed Python child path so Windows kills it if the Rust parent dies.
-- The advanced downloader helper must include `downloader_version` in daemon events; Rust compares
-  it with `CARGO_PKG_VERSION` and shows a session-only warning on mismatch.
+- Browser automation must go through the unified AI backend over `backend_ipc` (method
+  `browser.command`); the live browser session lifecycle is owned by the backend's `BrowserService`,
+  not by spawning a Python child here. The backend process itself is owned app-globally by
+  `ai_backend_supervisor`; `new_project` only requests a start (start-gate) if it is not running.
+- Cloak deep capture is a review-mode acquisition path: Rust only starts/stops/status-polls the
+  session and must keep decoded results behind the existing auto-review window before adding them to
+  the ribbon.
+- The advanced downloader version is read via the `version` command (`downloader_version`); Rust
+  compares it with `CARGO_PKG_VERSION` and shows a session-only warning on mismatch.
 - Waifu2x must keep the application usable when the shared library is absent; the worker either
   downloads/extracts the real runtime or returns a clear error.
+- Reline processing depends on an externally running AI backend reached through `crate::backend_ipc`
+  (HTTP/1.1 over the AF_UNIX socket); `reline.rs` uses `get_request`/`post_json` and no longer uses
+  `ureq`. The launcher must not start that backend from `new_project`; it should report connectivity
+  or backend errors clearly.
 
 ## Editing map
 - To change source picking or image import, edit `open_source.rs`.
@@ -77,5 +97,12 @@ of embedding Selenium in Rust.
 - To change stitch/split, heterogeneous-bottom merge, or cut behavior, edit `stitching.rs`.
 - To change waifu2x runtime discovery, package download, cancellation, or processing, edit
   `waifu2x.rs`.
+- To change Reline backend request shape, temporary file handoff, model-catalog loading, or
+  response parsing, edit `reline.rs`.
+- The Reline section in `window.rs` has two modes behind a persisted toggle (simplified by
+  default, full/expert behind it). To change model categories, descriptions, or recommendations
+  shown in the simplified gallery, edit `reline_models.rs`; to change the simplified controls or
+  preset-to-pipeline mapping, edit `show_reline_simple`/`build_reline_simple_options` in
+  `window.rs`.
 - To change detached window UI flow or controller wiring, edit `window.rs`.
 - To change batch graph editing or execution, edit `batch_processing/`.

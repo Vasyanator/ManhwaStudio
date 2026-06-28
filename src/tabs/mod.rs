@@ -1,6 +1,7 @@
 pub mod characters;
 pub mod cleaning;
 pub mod notes;
+pub mod ps_editor;
 pub mod settings;
 pub mod terms;
 pub mod translation;
@@ -12,6 +13,7 @@ pub enum AppTab {
     Translation,
     Cleaning,
     Typing,
+    PsEditor,
     Characters,
     Terms,
     Notes,
@@ -20,10 +22,11 @@ pub enum AppTab {
 }
 
 impl AppTab {
-    pub const ALL: [AppTab; 8] = [
+    pub const ALL: [AppTab; 9] = [
         AppTab::Translation,
         AppTab::Cleaning,
         AppTab::Typing,
+        AppTab::PsEditor,
         AppTab::Characters,
         AppTab::Terms,
         AppTab::Notes,
@@ -36,6 +39,7 @@ impl AppTab {
             AppTab::Translation => "Перевод",
             AppTab::Cleaning => "Клининг",
             AppTab::Typing => "Текст",
+            AppTab::PsEditor => "PS-подобный редактор",
             AppTab::Characters => "Персонажи",
             AppTab::Terms => "Термины",
             AppTab::Notes => "Заметки перевода",

@@ -33,6 +33,178 @@ use std::path::PathBuf;
 
 pub const TEXT_FORMULA_USER_VAR_COUNT: usize = 8;
 
+/// Машиночитаемый inline-тег `<m k=v k=v ...>…</m>` — компактная форма, совмещающая
+/// все возможности обычных inline-тегов в одном теге. Каждый регулируемый параметр
+/// кодируется одним ключом; отсутствующий параметр — отсутствующий ключ.
+///
+/// Ключи (общий контракт панели и рендера):
+/// - `b` — bold (флаг), `i` — italic (флаг)
+/// - `f` — шрифт (строка, при необходимости в кавычках)
+/// - `s` — размер шрифта в px
+/// - `c` — цвет (hex `RRGGBBAA`)
+/// - `l` — межстрочный отступ (px-или-%), `k` — кернинг (px-или-%)
+/// - `w` — ширина символа (px-или-%), `h` — высота символа (px-или-%)
+/// - `x` — смещение X (px-или-%), `y` — смещение Y (px-или-%), `n` — смещение по линии (px-или-%)
+/// - `g` — поворот группы (град.), `r` — поворот символа (град.)
+/// - `q` — сдвигать следующие символы (флаг)
+///
+/// Разбирает содержимое тега (без угловых скобок) в список `(ключ, значение)`.
+/// Значения могут быть в двойных кавычках (для строк с пробелами); бесфлаговые
+/// ключи дают пустое значение. Возвращает `None`, если это не тег `m`.
+#[must_use]
+pub fn parse_machine_tag(raw: &str) -> Option<Vec<(char, String)>> {
+    let mut chars = raw.trim().chars().peekable();
+    match chars.next() {
+        Some('m' | 'M') => {}
+        _ => return None,
+    }
+    // После имени тега `m` обязателен пробел или конец (чтобы не путать с `main` и т.п.).
+    match chars.peek() {
+        None => return Some(Vec::new()),
+        Some(next) if next.is_whitespace() => {}
+        _ => return None,
+    }
+
+    let mut out = Vec::new();
+    while let Some(&next) = chars.peek() {
+        if next.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let key = chars.next()?;
+        if chars.peek() == Some(&'=') {
+            chars.next();
+            let value = if chars.peek() == Some(&'"') {
+                chars.next();
+                let mut value = String::new();
+                for ch in chars.by_ref() {
+                    if ch == '"' {
+                        break;
+                    }
+                    value.push(ch);
+                }
+                value
+            } else {
+                let mut value = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_whitespace() {
+                        break;
+                    }
+                    value.push(ch);
+                    chars.next();
+                }
+                value
+            };
+            out.push((key, value));
+        } else {
+            out.push((key, String::new()));
+        }
+    }
+    Some(out)
+}
+
+/// Значение параметра, заданное либо в пикселях, либо в процентах от размера шрифта.
+///
+/// Единое представление для параметров, которые раньше хранились двумя отдельными
+/// полями (`*_px` + `*_percent`). В сериализации и inline-тегах кодируется строкой:
+/// число без суффикса — пиксели, число с суффиксом `%` — проценты от кегля.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PxOrPercent {
+    pub value: f32,
+    pub is_percent: bool,
+}
+
+impl PxOrPercent {
+    #[must_use]
+    pub fn px(value: f32) -> Self {
+        Self {
+            value,
+            is_percent: false,
+        }
+    }
+
+    #[must_use]
+    pub fn percent(value: f32) -> Self {
+        Self {
+            value,
+            is_percent: true,
+        }
+    }
+
+    /// Разобрать строку вида `"12"`, `"12px"` или `"50%"`.
+    /// Возвращает `None`, если число нечитаемо/не конечно.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+            .trim();
+        let (number, is_percent) = match trimmed.strip_suffix('%') {
+            Some(rest) => (rest.trim(), true),
+            None => (trimmed.strip_suffix("px").unwrap_or(trimmed).trim(), false),
+        };
+        let value = number.parse::<f32>().ok()?;
+        if value.is_finite() {
+            Some(Self { value, is_percent })
+        } else {
+            None
+        }
+    }
+
+    /// Свернуть устаревшую пару (px, percent) в одно значение.
+    /// Берём пиксели, если они ненулевые, иначе проценты.
+    #[must_use]
+    pub fn from_legacy_pair(px: f32, percent: f32) -> Self {
+        if px != 0.0 {
+            Self::px(px)
+        } else {
+            Self::percent(percent)
+        }
+    }
+
+    /// Строковое представление для сериализации/inline-тегов.
+    #[must_use]
+    pub fn to_token(self) -> String {
+        if self.is_percent {
+            format!("{:.2}%", self.value)
+        } else {
+            format!("{:.2}", self.value)
+        }
+    }
+
+    /// Разложить на устаревшую пару (px, percent): активна ровно одна компонента.
+    #[must_use]
+    pub fn as_px_percent(self) -> (f32, f32) {
+        if self.is_percent {
+            (0.0, self.value)
+        } else {
+            (self.value, 0.0)
+        }
+    }
+
+    /// Привести к процентам от кегля (px-режим: `value / font_size * 100`).
+    #[must_use]
+    pub fn as_percent_of(self, font_size_px: f32) -> f32 {
+        if self.is_percent {
+            self.value
+        } else if font_size_px > 0.0 {
+            self.value / font_size_px * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Привести к пикселям (percent-режим: `value / 100 * font_size`).
+    #[must_use]
+    pub fn as_px_of(self, font_size_px: f32) -> f32 {
+        if self.is_percent {
+            self.value / 100.0 * font_size_px
+        } else {
+            self.value
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TextRenderParams {
     pub text: String,
@@ -94,6 +266,14 @@ pub struct RenderedTextImage {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub warnings: Vec<String>,
+    /// X-позиция (в пикселях итогового изображения) левого верхнего угла
+    /// ИСХОДНОГО контента — накопленный левый паддинг всех увеличивающих холст
+    /// post-эффектов (тень/свечение/блюр и т.п.). По умолчанию 0.
+    pub content_origin_x: u32,
+    /// Y-позиция (в пикселях итогового изображения) левого верхнего угла
+    /// ИСХОДНОГО контента — накопленный верхний паддинг всех увеличивающих
+    /// холст post-эффектов. По умолчанию 0.
+    pub content_origin_y: u32,
 }
 
 impl RenderedTextImage {
@@ -112,16 +292,91 @@ impl RenderedTextImage {
             height,
             rgba: vec![0; pixel_count.saturating_mul(4)],
             warnings: Vec::new(),
+            content_origin_x: 0,
+            content_origin_y: 0,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HorizontalAlign {
-    Left,
-    Center,
-    Right,
-    Justify,
+/// Горизонтальное выравнивание строк.
+///
+/// Раньше было четырьмя дискретными вариантами (`Left`/`Center`/`Right`/`Justify`).
+/// Теперь это непрерывное смещение `bias` от -1.0 (по левому краю) до 1.0 (по
+/// правому краю) плюс флаг `justify` (свободное выравнивание, растягивающее
+/// строки по ширине блока). Старые варианты восстанавливаются через
+/// [`HorizontalAlign::from_config`] и сводятся обратно к строке через
+/// [`HorizontalAlign::legacy_str`] (PSD-экспорт, легаси-JSON).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HorizontalAlign {
+    /// -1.0 = по левому краю, 0.0 = по центру, 1.0 = по правому краю.
+    pub bias: f32,
+    /// Свободное (justify) выравнивание — растягивает строки по ширине блока.
+    pub justify: bool,
+}
+
+impl HorizontalAlign {
+    pub const LEFT: Self = Self {
+        bias: -1.0,
+        justify: false,
+    };
+    pub const CENTER: Self = Self {
+        bias: 0.0,
+        justify: false,
+    };
+    pub const RIGHT: Self = Self {
+        bias: 1.0,
+        justify: false,
+    };
+    pub const JUSTIFY: Self = Self {
+        bias: 0.0,
+        justify: true,
+    };
+
+    /// Доля свободного пространства слева от строки: 0.0 — влево, 0.5 — центр,
+    /// 1.0 — вправо.
+    #[must_use]
+    pub fn offset_fraction(self) -> f32 {
+        (self.bias.clamp(-1.0, 1.0) + 1.0) * 0.5
+    }
+
+    /// Ближайший дискретный вариант для совместимости (PSD-экспорт, легаси-JSON).
+    #[must_use]
+    pub fn legacy_str(self) -> &'static str {
+        if self.justify {
+            "justify"
+        } else if self.bias <= -0.5 {
+            "left"
+        } else if self.bias >= 0.5 {
+            "right"
+        } else {
+            "center"
+        }
+    }
+
+    fn legacy_bias_from_str(raw: &str) -> Option<f32> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(-1.0),
+            "right" => Some(1.0),
+            "center" | "justify" => Some(0.0),
+            _ => None,
+        }
+    }
+
+    /// Восстановление из конфигурации с обратной совместимостью: точный `bias`
+    /// (новое поле `align_bias`), если задан, иначе он выводится из легаси-строки
+    /// `align` (`left`/`center`/`right`/`justify`). Флаг `justify` берётся из
+    /// строки `align == "justify"`.
+    #[must_use]
+    pub fn from_config(align_str: Option<&str>, bias: Option<f32>) -> Self {
+        let justify = align_str
+            .map(str::trim)
+            .is_some_and(|s| s.eq_ignore_ascii_case("justify"));
+        let bias = bias
+            .or_else(|| align_str.and_then(Self::legacy_bias_from_str))
+            .unwrap_or(0.0)
+            .clamp(-1.0, 1.0);
+        Self { bias, justify }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

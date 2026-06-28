@@ -36,7 +36,8 @@ use super::inline_styles::{
 };
 use super::layout::{VerticalRasterRequest, render_vertical_text};
 use super::raster::{
-    GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer, draw_scaled_glyph_rgba,
+    GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
+    draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba, include_rotated_rect_bounds,
     include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
     trim_rendered_image_to_alpha_bounds,
 };
@@ -47,8 +48,9 @@ use super::types::{
 use super::wrap::{
     HyphenationDictionaries, LayoutTextResult, ShapeWrapRequest, VerticalWrapRequest,
     build_vertical_layout_text, needs_hyphenation_dicts, reshape_text_for_shape,
-    should_prehyphenate_overlong, soft_hyphenate_overlong, word_break_policy,
+    should_prehyphenate_overlong, word_break_policy,
 };
+use crate::tabs::typing::segmentation::with_default_segmenter;
 use cosmic_text::{
     Align, Attrs, AttrsOwned, Buffer, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping,
     SwashCache, Wrap,
@@ -196,10 +198,7 @@ fn build_layout_text_for_shape_params(
     let hyphen_dicts =
         needs_hyphenation_dicts(shape_params.text_wrap_mode).then(HyphenationDictionaries::new);
     let shaped_text = if should_prehyphenate_overlong(shape_params.text_wrap_mode) {
-        hyphen_dicts
-            .as_ref()
-            .map(|dicts| soft_hyphenate_overlong(source_text, dicts))
-            .unwrap_or_else(|| source_text.to_string())
+        with_default_segmenter(|seg| seg.soft_hyphenate_overlong(source_text))
     } else {
         source_text.to_string()
     };
@@ -241,6 +240,54 @@ fn build_layout_text_for_shape_params(
     }
 }
 
+/// Применяет post-effects pipeline (обводка, свечение, тени, градиенты и т.д.) к произвольному
+/// RGBA-изображению, минуя layout/raster текста.
+///
+/// Используется вкладкой typing, чтобы переиспользовать те же эффекты, что уже применяются к
+/// растрированному тексту, на сторонних (импортированных) картинках-оверлеях. На вход подаётся
+/// исходный (неизменённый) RGBA-буфер `width * height * 4`, на выход возвращается новый
+/// `RenderedTextImage` с применёнными эффектами (эффекты могут увеличивать холст под запас).
+///
+/// `effects_json` имеет тот же контракт, что и `TextRenderParams::effects_json`. Пустой/пробельный
+/// JSON означает «без эффектов» и возвращает изображение без изменений.
+pub fn apply_effects_to_image(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    effects_json: &str,
+    cancel: Option<(&Arc<AtomicU64>, u64)>,
+) -> Result<RenderedTextImage, String> {
+    if is_cancelled(cancel) {
+        return Err("render_next render cancelled".to_string());
+    }
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|w| usize::try_from(height).ok().map(|h| w.saturating_mul(h)))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "apply_effects_to_image: размеры изображения переполняют usize".to_string())?;
+    if rgba.len() != expected_len {
+        return Err(format!(
+            "apply_effects_to_image: длина RGBA-буфера {} не соответствует {width}x{height}x4 = {expected_len}",
+            rgba.len()
+        ));
+    }
+
+    let mut image = RenderedTextImage {
+        width,
+        height,
+        rgba,
+        warnings: Vec::new(),
+        content_origin_x: 0,
+        content_origin_y: 0,
+    };
+
+    if !effects_json.trim().is_empty() {
+        apply_effects_pipeline(&mut image, effects_json, cancel)?;
+    }
+
+    Ok(image)
+}
+
 pub fn render_text_to_image(
     params: &TextRenderParams,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
@@ -263,7 +310,10 @@ pub fn render_text_to_image(
         apply_text_preprocess_effects(prepared_text.as_str(), params.effects_json.as_str())?;
     let parsed_inline_styles =
         if params.enable_inline_style_tags || preprocess_generated_inline_tags {
-            Some(parse_inline_style_tags(prepared_text.as_str()))
+            Some(parse_inline_style_tags(
+                prepared_text.as_str(),
+                params.font_size_px,
+            ))
         } else {
             None
         };
@@ -349,6 +399,8 @@ pub fn render_text_to_image(
                     height: 0,
                     rgba: Vec::new(),
                     warnings,
+                    content_origin_x: 0,
+                    content_origin_y: 0,
                 });
             }
         }
@@ -534,6 +586,32 @@ pub fn render_text_to_image(
         line_extra_spacing_table.as_slice(),
         has_inline_size_overrides,
     );
+
+    // Inline-смещения с поворотом (группы/символа) обычный «прямой» blit не умеет —
+    // для таких overlay используем отдельный путь с обратной выборкой и поворотом.
+    if mapped_inline_style_spans
+        .as_deref()
+        .is_some_and(spans_have_inline_rotation)
+    {
+        let mut rendered = render_horizontal_rotated(
+            params,
+            &mut font_system,
+            &buffer,
+            &attrs,
+            &inline_font_registry_build.registry,
+            mapped_inline_style_spans.as_deref(),
+            layout_line_offsets.as_slice(),
+            line_baselines.as_slice(),
+            width_px,
+            font_size_px,
+            line_height_px,
+            cancel,
+        )?;
+        rendered.warnings.extend(warnings);
+        apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
+        rendered = trim_rendered_image_to_alpha_bounds(rendered, 1);
+        return Ok(rendered);
+    }
 
     let mut cache = SwashCache::new();
     let mut bounds = PixelBounds::empty();
@@ -905,10 +983,332 @@ pub fn render_text_to_image(
         height: out_height,
         rgba,
         warnings,
+        content_origin_x: 0,
+        content_origin_y: 0,
     };
     apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
     rendered = trim_rendered_image_to_alpha_bounds(rendered, 1);
     Ok(rendered)
+}
+
+/// Одно размещение глифа для пути с поворотами: исходный bitmap, масштаб, центр в
+/// координатах контента, итоговый поворот и принадлежность к группе.
+struct RotatedGlyphPlacement {
+    glyph_rgba: Vec<u8>,
+    glyph_w: usize,
+    glyph_h: usize,
+    src_left: f32,
+    src_top: f32,
+    scale: GlyphScaleSettings,
+    center_x: f32,
+    center_y: f32,
+    rotation_rad: f32,
+    group_key: Option<(usize, usize)>,
+    group_rotation_rad: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_rotated_placement(
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    glyph: &LayoutGlyph,
+    pos_x: f32,
+    pos_y: f32,
+    scale: GlyphScaleSettings,
+    text_color: [u8; 4],
+    glyph_rotation_rad: f32,
+    group_key: Option<(usize, usize)>,
+    group_rotation_rad: f32,
+) -> Option<RotatedGlyphPlacement> {
+    let physical = glyph.physical((pos_x, pos_y), 1.0);
+    let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+        return None;
+    };
+    let glyph_w = image.placement.width as usize;
+    let glyph_h = image.placement.height as usize;
+    if glyph_w == 0 || glyph_h == 0 {
+        return None;
+    }
+    let src_left = (physical.x + image.placement.left) as f32;
+    let src_top = (physical.y - image.placement.top) as f32;
+    let glyph_rgba =
+        build_glyph_rgba_buffer(&image.content, image.data.as_slice(), glyph_w, glyph_h, text_color);
+    let (scaled_left, scaled_top, scaled_width, scaled_height) =
+        scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
+    Some(RotatedGlyphPlacement {
+        glyph_rgba,
+        glyph_w,
+        glyph_h,
+        src_left,
+        src_top,
+        scale,
+        center_x: scaled_left + scaled_width * 0.5,
+        center_y: scaled_top + scaled_height * 0.5,
+        rotation_rad: glyph_rotation_rad,
+        group_key,
+        group_rotation_rad,
+    })
+}
+
+/// Повернуть глифы одной группы как жёсткое тело: вокруг центроида группы, добавляя
+/// поворот группы к собственному повороту каждого глифа.
+fn apply_rotated_group_rotations(placements: &mut [RotatedGlyphPlacement]) {
+    let mut i = 0;
+    while i < placements.len() {
+        let Some(key) = placements[i].group_key else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < placements.len() && placements[j].group_key == Some(key) {
+            j += 1;
+        }
+        let group_rotation = placements[i].group_rotation_rad;
+        let count = (j - i) as f32;
+        let center_x = placements[i..j].iter().map(|p| p.center_x).sum::<f32>() / count;
+        let center_y = placements[i..j].iter().map(|p| p.center_y).sum::<f32>() / count;
+        let (sin_a, cos_a) = group_rotation.sin_cos();
+        for placement in &mut placements[i..j] {
+            let rel_x = placement.center_x - center_x;
+            let rel_y = placement.center_y - center_y;
+            placement.center_x = center_x + rel_x * cos_a - rel_y * sin_a;
+            placement.center_y = center_y + rel_x * sin_a + rel_y * cos_a;
+            placement.rotation_rad += group_rotation;
+        }
+        i = j;
+    }
+}
+
+/// Горизонтальный рендер обычного текста с inline-поворотами смещений.
+/// Собирает размещения всех глифов, применяет повороты групп, считает повёрнутый
+/// bbox и выводит каждый глиф обратной выборкой с поворотом.
+#[allow(clippy::too_many_arguments)]
+fn render_horizontal_rotated(
+    params: &TextRenderParams,
+    font_system: &mut FontSystem,
+    buffer: &Buffer,
+    attrs: &Attrs<'_>,
+    inline_font_registry: &super::font_registry::InlineFontRegistry,
+    inline_style_spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    line_baselines: &[f32],
+    width_px: u32,
+    font_size_px: f32,
+    line_height_px: f32,
+    cancel: Option<(&Arc<AtomicU64>, u64)>,
+) -> Result<RenderedTextImage, String> {
+    let mut cache = SwashCache::new();
+    let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
+    let mut line_idx = 0usize;
+    let mut runs = buffer.layout_runs().peekable();
+
+    while let Some(run) = runs.next() {
+        if is_cancelled(cancel) {
+            return Err("render_next render cancelled".to_string());
+        }
+        let run_layout = horizontal_run_layout(
+            params,
+            &run,
+            font_system,
+            &mut cache,
+            layout_line_offsets,
+            inline_style_spans,
+            font_size_px,
+        );
+        let line_offset_x = horizontal_line_offset(
+            width_px,
+            if params.hanging_punctuation {
+                run_layout.visual_width_px
+            } else {
+                run_layout.line_width_px
+            },
+            params.align,
+        ) as f32
+            - if params.hanging_punctuation {
+                run_layout.leading_hang_px
+            } else {
+                0.0
+            };
+        let baseline_y = line_baselines.get(line_idx).copied().unwrap_or(run.line_y);
+
+        for (glyph, glyph_x) in run.glyphs.iter().zip(run_layout.glyph_xs.iter().copied()) {
+            let glyph_text_color = inline_text_color_for_glyph(
+                params.text_color,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
+            let glyph_scale = inline_glyph_scale_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
+            let offset = inline_glyph_offset_style_for_glyph(
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
+            let group_key = if offset.group_rotation_rad.abs() > f32::EPSILON {
+                inline_glyph_offset_span_for_glyph(
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                )
+            } else {
+                None
+            };
+            if let Some(placement) = build_rotated_placement(
+                font_system,
+                &mut cache,
+                glyph,
+                line_offset_x + (glyph_x - glyph.x) + offset.global_px[0],
+                baseline_y + offset.global_px[1],
+                glyph_scale,
+                glyph_text_color,
+                offset.glyph_rotation_rad,
+                group_key,
+                offset.group_rotation_rad,
+            ) {
+                placements.push(placement);
+            }
+        }
+
+        if run_wraps_at_soft_hyphen(&run, runs.peek())
+            && let Some(hyphen_glyph) = build_wrapped_hyphen_glyph(
+                font_system,
+                attrs,
+                inline_style_spans,
+                inline_font_registry,
+                layout_line_offsets,
+                &run,
+                runs.peek(),
+                font_size_px,
+                font_size_px,
+            )
+        {
+            let style_offset = soft_hyphen_style_offset(&run, runs.peek(), layout_line_offsets);
+            let hyphen_text_color = style_offset
+                .map(|offset| {
+                    inline_text_color_at_offset(params.text_color, inline_style_spans, offset)
+                })
+                .unwrap_or(params.text_color);
+            let hyphen_scale = style_offset
+                .map(|offset| inline_glyph_scale_at_offset(params, inline_style_spans, offset))
+                .unwrap_or_else(|| GlyphScaleSettings::from_params(params));
+            let hyphen_offset = style_offset
+                .map(|offset| inline_glyph_offset_style_at_offset(inline_style_spans, offset))
+                .unwrap_or_else(|| InlineGlyphOffset::global_only([0.0, 0.0]));
+            let group_key = if hyphen_offset.group_rotation_rad.abs() > f32::EPSILON {
+                style_offset
+                    .and_then(|offset| inline_glyph_offset_span_at_offset(inline_style_spans, offset))
+            } else {
+                None
+            };
+            let hyphen_offset_x = line_offset_x
+                + trailing_hyphen_x(&run)
+                + run_layout
+                    .glyph_xs
+                    .last()
+                    .zip(run.glyphs.last())
+                    .map(|(glyph_x, last_glyph)| glyph_x - last_glyph.x)
+                    .unwrap_or(0.0);
+            if let Some(placement) = build_rotated_placement(
+                font_system,
+                &mut cache,
+                &hyphen_glyph,
+                hyphen_offset_x + hyphen_offset.global_px[0],
+                baseline_y + hyphen_offset.global_px[1],
+                hyphen_scale,
+                hyphen_text_color,
+                hyphen_offset.glyph_rotation_rad,
+                group_key,
+                hyphen_offset.group_rotation_rad,
+            ) {
+                placements.push(placement);
+            }
+        }
+        line_idx += 1;
+    }
+
+    apply_rotated_group_rotations(&mut placements);
+
+    let mut bounds = PixelBounds::empty();
+    for placement in &placements {
+        let (scaled_left, scaled_top, scaled_width, scaled_height) = placement.scale.scaled_rect(
+            placement.src_left,
+            placement.src_top,
+            placement.glyph_w as f32,
+            placement.glyph_h as f32,
+        );
+        include_rotated_rect_bounds(
+            &mut bounds,
+            scaled_left,
+            scaled_top,
+            scaled_width,
+            scaled_height,
+            placement.center_x,
+            placement.center_y,
+            placement.rotation_rad,
+        );
+    }
+    if !bounds.initialized {
+        return Ok(RenderedTextImage::transparent(
+            width_px,
+            line_height_px.ceil().max(1.0) as u32,
+        ));
+    }
+
+    let pad = (font_size_px * 0.5).ceil().max(2.0) as i32;
+    let out_width = u32::try_from((bounds.max_x - bounds.min_x).max(1))
+        .unwrap_or(1)
+        .saturating_add(pad as u32 * 2);
+    let out_height = u32::try_from((bounds.max_y - bounds.min_y).max(1))
+        .unwrap_or(1)
+        .saturating_add(pad as u32 * 2);
+    let x_offset = -bounds.min_x + pad;
+    let y_offset = -bounds.min_y + pad;
+
+    let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
+    for placement in &placements {
+        if is_cancelled(cancel) {
+            return Err("render_next render cancelled".to_string());
+        }
+        let mut canvas = RgbaCanvasView {
+            rgba: rgba.as_mut_slice(),
+            width: out_width as usize,
+            height: out_height as usize,
+        };
+        draw_rotated_scaled_glyph_rgba(
+            &mut canvas,
+            GlyphRgbaView {
+                rgba: placement.glyph_rgba.as_slice(),
+                width: placement.glyph_w,
+                height: placement.glyph_h,
+            },
+            placement.src_left,
+            placement.src_top,
+            placement.scale,
+            placement.center_x,
+            placement.center_y,
+            placement.rotation_rad,
+            x_offset,
+            y_offset,
+        );
+    }
+
+    Ok(RenderedTextImage {
+        width: out_width,
+        height: out_height,
+        rgba,
+        warnings: Vec::new(),
+        content_origin_x: 0,
+        content_origin_y: 0,
+    })
 }
 
 pub fn smoke_render_text_to_image(params: &TextRenderParams) -> Result<RenderedTextImage, String> {
@@ -1051,9 +1451,10 @@ fn trim_extra_spaces(text: &str) -> String {
 }
 
 fn justify_alignment_option(align: HorizontalAlign) -> Option<Align> {
-    match align {
-        HorizontalAlign::Justify => Some(Align::Justified),
-        HorizontalAlign::Left | HorizontalAlign::Center | HorizontalAlign::Right => None,
+    if align.justify {
+        Some(Align::Justified)
+    } else {
+        None
     }
 }
 
@@ -1062,12 +1463,13 @@ pub(crate) fn horizontal_line_offset(
     line_width: f32,
     align: HorizontalAlign,
 ) -> i32 {
-    let free = width_px as f32 - line_width;
-    match align {
-        HorizontalAlign::Left | HorizontalAlign::Justify => 0,
-        HorizontalAlign::Center => (free * 0.5).round() as i32,
-        HorizontalAlign::Right => free.round() as i32,
+    // Свободное выравнивание растягивает строки до полной ширины, поэтому начинаем
+    // от левого края (смещение 0); прочие случаи позиционируются по `bias`.
+    if align.justify {
+        return 0;
     }
+    let free = width_px as f32 - line_width;
+    (free * align.offset_fraction()).round() as i32
 }
 
 fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
@@ -1138,6 +1540,48 @@ pub(crate) fn inline_glyph_offset_for_glyph(
 ) -> [f32; 2] {
     let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
     inline_glyph_offset_at_offset(spans, line_offset + glyph.start.min(glyph.end))
+}
+
+fn inline_glyph_offset_style_for_glyph(
+    spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    line_idx: usize,
+    glyph: &LayoutGlyph,
+) -> InlineGlyphOffset {
+    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
+    inline_glyph_offset_style_at_offset(spans, line_offset + glyph.start.min(glyph.end))
+}
+
+/// Диапазон inline-спана, задающего смещение для глифа, — ключ для группировки
+/// глифов, поворачиваемых как единая группа.
+fn inline_glyph_offset_span_at_offset(
+    spans: Option<&[InlineStyleSpan]>,
+    offset: usize,
+) -> Option<(usize, usize)> {
+    spans
+        .and_then(|style_spans| inline_style_at_offset(style_spans, offset))
+        .filter(|style| style.glyph_offset.is_some())
+        .map(|style| (style.start, style.end))
+}
+
+fn inline_glyph_offset_span_for_glyph(
+    spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    line_idx: usize,
+    glyph: &LayoutGlyph,
+) -> Option<(usize, usize)> {
+    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
+    inline_glyph_offset_span_at_offset(spans, line_offset + glyph.start.min(glyph.end))
+}
+
+/// Есть ли среди inline-спанов смещения с ненулевым поворотом (группы или символа).
+fn spans_have_inline_rotation(spans: &[InlineStyleSpan]) -> bool {
+    spans.iter().any(|span| {
+        span.glyph_offset.is_some_and(|offset| {
+            offset.group_rotation_rad.abs() > f32::EPSILON
+                || offset.glyph_rotation_rad.abs() > f32::EPSILON
+        })
+    })
 }
 
 fn inline_glyph_scale_at_offset(
@@ -1566,7 +2010,7 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::render_text_to_image;
+    use super::{apply_effects_to_image, render_text_to_image};
     use crate::tabs::typing::render_next::types::{
         HorizontalAlign, KerningMode, TextDrawnLinesLayoutParams, TextFormulaLayoutParams,
         TextLayoutMode, TextLineMode, TextRenderParams, TextRenderShapeCompareParams, TextShape,
@@ -1597,7 +2041,7 @@ mod tests {
             glyph_height_percent: 100.0,
             glyph_width_percent: 100.0,
             width_px: 256,
-            align: HorizontalAlign::Left,
+            align: HorizontalAlign::LEFT,
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,
@@ -1674,6 +2118,83 @@ mod tests {
         assert!(rendered.width > 0);
         assert!(rendered.height > 0);
         assert!(rendered.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
+    fn vertical_step_follows_glyph_ink_height() {
+        let mut params = base_params();
+        params.text_line_mode = TextLineMode::Vertical;
+
+        // Низкие глифы (точки у базовой линии) укладываются плотно по своей ink-высоте.
+        params.text = "...".to_string();
+        let dots = render_text_to_image(&params, None).expect("vertical dots render");
+        let (_, dots_h) =
+            alpha_bounds_from_rgba(dots.width, dots.height, &dots.rgba).expect("dots bounds");
+
+        // Высокие глифы занимают по вертикали заметно больше.
+        params.text = "III".to_string();
+        let bars = render_text_to_image(&params, None).expect("vertical bars render");
+        let (_, bars_h) =
+            alpha_bounds_from_rgba(bars.width, bars.height, &bars.rgba).expect("bars bounds");
+
+        // При старом «em на символ» обе высоты были бы почти равны; при шаге по
+        // ink-высоте высокие глифы тянутся значительно дальше низких.
+        assert!(
+            bars_h > dots_h * 2,
+            "vertical step should track ink height: III={bars_h} vs ...={dots_h}"
+        );
+    }
+
+    #[test]
+    fn inline_group_rotation_rotates_text_block() {
+        let mut params = base_params();
+        params.enable_inline_style_tags = true;
+
+        params.text = "Hello world".to_string();
+        let plain = render_text_to_image(&params, None).expect("plain render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain.width, plain.height, &plain.rgba).expect("plain bounds");
+
+        // Поворот всей строки на 90° через машиночитаемый тег делает блок высоким и узким.
+        params.text = "<m g=90>Hello world</m>".to_string();
+        let rotated = render_text_to_image(&params, None).expect("rotated render");
+        assert!(
+            rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "rotated block must render visible pixels"
+        );
+        let (rotated_w, rotated_h) = alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
+            .expect("rotated bounds");
+        assert!(
+            rotated_h > plain_h,
+            "90°-rotated block should be taller: {rotated_h} vs {plain_h}"
+        );
+        assert!(
+            rotated_w < plain_w,
+            "90°-rotated block should be narrower: {rotated_w} vs {plain_w}"
+        );
+    }
+
+    #[test]
+    fn inline_glyph_rotation_flips_tall_glyph_bounds() {
+        let mut params = base_params();
+        params.enable_inline_style_tags = true;
+
+        // Заглавная «I» — высокая и узкая.
+        params.text = "I".to_string();
+        let plain = render_text_to_image(&params, None).expect("plain render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain.width, plain.height, &plain.rgba).expect("plain bounds");
+        assert!(plain_h > plain_w, "capital I should be tall and narrow");
+
+        // Повёрнутая на 90° «I» становится низкой и широкой.
+        params.text = "<m r=90>I</m>".to_string();
+        let rotated = render_text_to_image(&params, None).expect("glyph-rotated render");
+        let (rotated_w, rotated_h) = alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
+            .expect("rotated bounds");
+        assert!(
+            rotated_w > rotated_h,
+            "90°-rotated I should be wide and short: {rotated_w}x{rotated_h}"
+        );
     }
 
     #[test]
@@ -1768,7 +2289,7 @@ mod tests {
     fn base_pipeline_renders_hanging_punctuation() {
         let mut params = base_params();
         params.text = "«Hello!»".to_string();
-        params.align = HorizontalAlign::Center;
+        params.align = HorizontalAlign::CENTER;
         params.hanging_punctuation = true;
 
         let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
@@ -1780,7 +2301,7 @@ mod tests {
     #[test]
     fn horizontal_center_alignment_keeps_overlong_line_centered() {
         assert_eq!(
-            super::horizontal_line_offset(100, 140.0, HorizontalAlign::Center),
+            super::horizontal_line_offset(100, 140.0, HorizontalAlign::CENTER),
             -20
         );
     }
@@ -1995,6 +2516,52 @@ mod tests {
         assert!(
             offset_y > baseline_y + 12.0,
             "inline Y offset should move vector-line glyph down: baseline={baseline_y}, offset={offset_y}"
+        );
+    }
+
+    #[test]
+    fn apply_effects_to_image_without_effects_returns_unchanged() {
+        let rgba = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let result = apply_effects_to_image(rgba.clone(), 2, 1, "", None)
+            .unwrap_or_else(|error| panic!("empty effects should pass image through: {error}"));
+        assert_eq!(result.width, 2);
+        assert_eq!(result.height, 1);
+        assert_eq!(result.rgba, rgba);
+
+        // Пустой JSON-массив эффектов тоже означает «без эффектов».
+        let result_empty_array = apply_effects_to_image(rgba.clone(), 2, 1, "[]", None)
+            .unwrap_or_else(|error| panic!("empty effects array should pass through: {error}"));
+        assert_eq!(result_empty_array.rgba, rgba);
+    }
+
+    #[test]
+    fn apply_effects_to_image_rejects_mismatched_buffer() {
+        let result = apply_effects_to_image(vec![0u8; 7], 2, 1, "", None);
+        assert!(
+            result.is_err(),
+            "buffer length not matching width*height*4 must be an error"
+        );
+    }
+
+    #[test]
+    fn apply_effects_to_image_stroke_grows_canvas() {
+        // Сплошной непрозрачный квадрат + обводка должны увеличить холст под запас контура.
+        let width = 8u32;
+        let height = 8u32;
+        let rgba = vec![255u8; (width * height * 4) as usize];
+        let effects_json = r#"[{"effect":"stroke","width_px":4,"color":[0,0,0,255]}]"#;
+        let result = apply_effects_to_image(rgba, width, height, effects_json, None)
+            .unwrap_or_else(|error| panic!("stroke effect should apply to image: {error}"));
+        assert!(
+            result.width >= width && result.height >= height,
+            "stroke should not shrink the canvas: got {}x{}",
+            result.width,
+            result.height
+        );
+        assert_eq!(
+            result.rgba.len(),
+            (result.width * result.height * 4) as usize,
+            "RGBA buffer must stay width*height*4 after effects"
         );
     }
 }

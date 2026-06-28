@@ -253,6 +253,148 @@ pub(crate) fn draw_scaled_glyph_rgba(
     }
 }
 
+/// Включить в bounds повёрнутый (и масштабированный) прямоугольник глифа.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn include_rotated_rect_bounds(
+    bounds: &mut PixelBounds,
+    src_left: f32,
+    src_top: f32,
+    src_width: f32,
+    src_height: f32,
+    dst_center_x: f32,
+    dst_center_y: f32,
+    rotation_rad: f32,
+) {
+    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
+        src_left,
+        src_top,
+        src_width,
+        src_height,
+        dst_center_x,
+        dst_center_y,
+        rotation_rad,
+    );
+    let min_x_i = min_x.floor() as i32;
+    let min_y_i = min_y.floor() as i32;
+    let max_x_i = max_x.ceil() as i32;
+    let max_y_i = max_y.ceil() as i32;
+    bounds.include_rect(
+        min_x_i,
+        min_y_i,
+        (max_x_i - min_x_i).max(1),
+        (max_y_i - min_y_i).max(1),
+    );
+}
+
+/// Мировой bbox прямоугольника, повёрнутого вокруг своего центра и помещённого в `dst_center`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rotated_rect_world_bounds(
+    src_left: f32,
+    src_top: f32,
+    src_width: f32,
+    src_height: f32,
+    dst_center_x: f32,
+    dst_center_y: f32,
+    rotation_rad: f32,
+) -> (f32, f32, f32, f32) {
+    let src_center_x = src_left + src_width * 0.5;
+    let src_center_y = src_top + src_height * 0.5;
+    let corners = [
+        (src_left, src_top),
+        (src_left + src_width, src_top),
+        (src_left + src_width, src_top + src_height),
+        (src_left, src_top + src_height),
+    ];
+    let cos_a = rotation_rad.cos();
+    let sin_a = rotation_rad.sin();
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let rel_x = x - src_center_x;
+        let rel_y = y - src_center_y;
+        let tx = dst_center_x + rel_x * cos_a - rel_y * sin_a;
+        let ty = dst_center_y + rel_x * sin_a + rel_y * cos_a;
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+    (min_x, min_y, max_x, max_y)
+}
+
+/// Нарисовать глиф с масштабом и поворотом вокруг точки `dst_center` (обратная выборка).
+/// `src_left`/`src_top` — левый верх немасштабированного глифа в координатах контента;
+/// `x_offset`/`y_offset` переводят координаты контента в пиксели холста.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_rotated_scaled_glyph_rgba(
+    canvas: &mut RgbaCanvasView<'_>,
+    glyph: GlyphRgbaView<'_>,
+    src_left: f32,
+    src_top: f32,
+    glyph_scale: GlyphScaleSettings,
+    dst_center_x: f32,
+    dst_center_y: f32,
+    rotation_rad: f32,
+    x_offset: i32,
+    y_offset: i32,
+) {
+    if glyph.width == 0 || glyph.height == 0 {
+        return;
+    }
+    let glyph_w = glyph.width;
+    let glyph_h = glyph.height;
+    let src_center_x = src_left + glyph_w as f32 * 0.5;
+    let src_center_y = src_top + glyph_h as f32 * 0.5;
+    let cos_a = rotation_rad.cos();
+    let sin_a = rotation_rad.sin();
+    let (scaled_left, scaled_top, scaled_width, scaled_height) =
+        glyph_scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
+    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
+        scaled_left,
+        scaled_top,
+        scaled_width,
+        scaled_height,
+        dst_center_x,
+        dst_center_y,
+        rotation_rad,
+    );
+    let out_width = canvas.width as i32;
+    let out_height = canvas.height as i32;
+    let dst_min_x = ((min_x + x_offset as f32).floor() as i32 - 1).max(0);
+    let dst_max_x = ((max_x + x_offset as f32).ceil() as i32 + 1).min(out_width);
+    let dst_min_y = ((min_y + y_offset as f32).floor() as i32 - 1).max(0);
+    let dst_max_y = ((max_y + y_offset as f32).ceil() as i32 + 1).min(out_height);
+    for dst_y in dst_min_y..dst_max_y {
+        for dst_x in dst_min_x..dst_max_x {
+            let world_x = dst_x as f32 + 0.5 - x_offset as f32;
+            let world_y = dst_y as f32 + 0.5 - y_offset as f32;
+            let rel_x = world_x - dst_center_x;
+            let rel_y = world_y - dst_center_y;
+            let rotated_x = rel_x * cos_a + rel_y * sin_a;
+            let rotated_y = -rel_x * sin_a + rel_y * cos_a;
+            let src_x = src_center_x + rotated_x / glyph_scale.width_mul;
+            let src_y = src_center_y + rotated_y / glyph_scale.height_mul;
+            let local_x = src_x - src_left - 0.5;
+            let local_y = src_y - src_top - 0.5;
+            let (src_r, src_g, src_b, src_a) =
+                bilinear_sample_rgba(glyph.rgba, glyph_w, glyph_h, local_x, local_y);
+            if src_a == 0 {
+                continue;
+            }
+            let dst_idx = ((dst_y as usize * canvas.width) + dst_x as usize) * 4;
+            blend_pixel_over(
+                &mut canvas.rgba[dst_idx..dst_idx + 4],
+                src_r,
+                src_g,
+                src_b,
+                src_a,
+            );
+        }
+    }
+}
+
 // The glyph blit call site naturally carries raster target, glyph bitmap and draw position.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_unscaled_glyph(
@@ -348,6 +490,8 @@ pub(crate) fn trim_rendered_image_to_alpha_bounds(
         height: crop_height as u32,
         rgba,
         warnings: image.warnings,
+        content_origin_x: 0,
+        content_origin_y: 0,
     }
 }
 
@@ -422,6 +566,8 @@ mod tests {
     #[test]
     fn trim_rendered_image_crops_transparent_edges() {
         let image = RenderedTextImage {
+            content_origin_x: 0,
+            content_origin_y: 0,
             width: 4,
             height: 3,
             rgba: vec![

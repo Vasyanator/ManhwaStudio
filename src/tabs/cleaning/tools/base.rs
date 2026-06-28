@@ -161,6 +161,16 @@ pub trait CleaningTool {
         false
     }
 
+    fn on_wheel_event_with_keys(
+        &mut self,
+        delta_y: f32,
+        modifiers: egui::Modifiers,
+        r_down: bool,
+    ) -> bool {
+        let _ = r_down;
+        self.on_wheel_event(delta_y, modifiers)
+    }
+
     fn on_key_event(&mut self, _ctx: &egui::Context) -> bool {
         false
     }
@@ -1893,115 +1903,138 @@ impl RegionMaskInpaintToolBase {
             ui.ctx().request_repaint();
         }
 
-        ui.horizontal(|ui| {
-            ui.label("ЛКМ: рисовать | ПКМ/Shift+ЛКМ: стирать");
-            let mut radius = brush_base.radius_px();
-            if ui
-                .add(WheelSlider::new(&mut radius, 1..=200).text("Кисть"))
-                .changed()
-            {
-                brush_base.set_radius_px(radius);
-            }
-            ui.separator();
-            if RegionEditToolBase::draw_region_editor_zoom_controls(ui, editor) {
-                ui.ctx().request_repaint();
-            }
-        });
-        if sample_mask_enabled {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Режим:");
-                ui.selectable_value(
-                    &mut editor_state.active_mask_target,
-                    RegionInpaintMaskTarget::Inpaint,
-                    "Удаление",
-                );
-                ui.selectable_value(
-                    &mut editor_state.active_mask_target,
-                    RegionInpaintMaskTarget::Sample,
-                    "Пример",
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(Color32::from_rgb(255, 220, 0), "Жёлтая: удаление");
-                ui.colored_label(Color32::from_rgb(90, 255, 130), "Зелёная: пример");
-            });
-        }
-
-        ui.separator();
-        let mask_section_id =
-            ui.make_persistent_id(("cleaning_region_mask_generation_section", editor.scroll_id));
-        egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            mask_section_id,
-            false,
-        )
-        .show_header(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Параметры генерации маски");
-                ui.add_space(8.0);
-                egui::ComboBox::from_id_salt(("mask_generation_method", editor.scroll_id))
-                    .selected_text(mask_generation_params.method.label())
-                    .show_ui(ui, |ui| {
+        // Scroll the editor body (brush controls, params, preview, status) so a
+        // long parameter list never pushes the action buttons off-screen. The
+        // buttons below stay fixed. Mouse-drag scrolling is disabled so dragging
+        // on the preview only paints the mask.
+        let scroll_id = editor.scroll_id;
+        let scroll_max_h = (ui.ctx().content_rect().height() - 200.0).max(240.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("cleaning_region_editor_body_scroll", scroll_id))
+            .max_height(scroll_max_h)
+            .auto_shrink([false, true])
+            // Keep scrollbar + wheel, but not mouse-drag, so dragging on the
+            // preview only paints the mask instead of scrolling the panel.
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("ЛКМ: рисовать | ПКМ/Shift+ЛКМ: стирать");
+                    let mut radius = brush_base.radius_px();
+                    if ui
+                        .add(WheelSlider::new(&mut radius, 1..=200).text("Кисть"))
+                        .changed()
+                    {
+                        brush_base.set_radius_px(radius);
+                    }
+                    ui.separator();
+                    if RegionEditToolBase::draw_region_editor_zoom_controls(ui, editor) {
+                        ui.ctx().request_repaint();
+                    }
+                });
+                if sample_mask_enabled {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Режим:");
                         ui.selectable_value(
-                            &mut mask_generation_params.method,
-                            RegionMaskGenerationMethod::PaddleOcr,
-                            RegionMaskGenerationMethod::PaddleOcr.label(),
+                            &mut editor_state.active_mask_target,
+                            RegionInpaintMaskTarget::Inpaint,
+                            "Удаление",
                         );
-                        let response = ui.add_enabled(
-                            ai_backend_torch_available,
-                            egui::Button::new(RegionMaskGenerationMethod::Surya.label()).selected(
-                                mask_generation_params.method == RegionMaskGenerationMethod::Surya,
-                            ),
+                        ui.selectable_value(
+                            &mut editor_state.active_mask_target,
+                            RegionInpaintMaskTarget::Sample,
+                            "Пример",
                         );
-                        let response = if ai_backend_torch_available {
-                            response
-                        } else {
-                            response.on_disabled_hover_text(
-                                egui::RichText::new("PyTorch не установлен")
-                                    .color(Color32::from_rgb(240, 102, 102)),
-                            )
-                        };
-                        if response.clicked() {
-                            mask_generation_params.method = RegionMaskGenerationMethod::Surya;
-                        }
-                        let response = ui.add_enabled(
-                            ai_backend_torch_available,
-                            egui::Button::new(
-                                RegionMaskGenerationMethod::ComicTextDetector.label(),
-                            )
-                            .selected(
-                                mask_generation_params.method
-                                    == RegionMaskGenerationMethod::ComicTextDetector,
-                            ),
-                        );
-                        let response = if ai_backend_torch_available {
-                            response
-                        } else {
-                            response.on_disabled_hover_text(
-                                egui::RichText::new("PyTorch не установлен")
-                                    .color(Color32::from_rgb(240, 102, 102)),
-                            )
-                        };
-                        if response.clicked() {
-                            mask_generation_params.method =
-                                RegionMaskGenerationMethod::ComicTextDetector;
-                        }
                     });
-            });
-        })
-        .body(|ui| {
-            ui.add(
-                WheelSlider::new(&mut mask_generation_params.dilate_size, 0..=30)
-                    .text("Расширение маски"),
-            );
-        });
-        draw_custom_ui(ui);
-        Self::draw_mask_editor_image(ui, editor, brush_base, editor_state);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(Color32::from_rgb(255, 220, 0), "Жёлтая: удаление");
+                        ui.colored_label(Color32::from_rgb(90, 255, 130), "Зелёная: пример");
+                    });
+                }
 
-        if let Some(status) = editor.status.as_ref() {
-            ui.separator();
-            ui.small(status);
-        }
+                ui.separator();
+                let mask_section_id = ui.make_persistent_id((
+                    "cleaning_region_mask_generation_section",
+                    editor.scroll_id,
+                ));
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    mask_section_id,
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Параметры генерации маски");
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_id_salt(("mask_generation_method", editor.scroll_id))
+                            .selected_text(mask_generation_params.method.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut mask_generation_params.method,
+                                    RegionMaskGenerationMethod::PaddleOcr,
+                                    RegionMaskGenerationMethod::PaddleOcr.label(),
+                                );
+                                let response = ui.add_enabled(
+                                    ai_backend_torch_available,
+                                    egui::Button::new(RegionMaskGenerationMethod::Surya.label())
+                                        .selected(
+                                            mask_generation_params.method
+                                                == RegionMaskGenerationMethod::Surya,
+                                        ),
+                                );
+                                let response = if ai_backend_torch_available {
+                                    response
+                                } else {
+                                    response.on_disabled_hover_text(
+                                        egui::RichText::new("PyTorch не установлен")
+                                            .color(Color32::from_rgb(240, 102, 102)),
+                                    )
+                                };
+                                if response.clicked() {
+                                    mask_generation_params.method =
+                                        RegionMaskGenerationMethod::Surya;
+                                }
+                                let response = ui.add_enabled(
+                                    ai_backend_torch_available,
+                                    egui::Button::new(
+                                        RegionMaskGenerationMethod::ComicTextDetector.label(),
+                                    )
+                                    .selected(
+                                        mask_generation_params.method
+                                            == RegionMaskGenerationMethod::ComicTextDetector,
+                                    ),
+                                );
+                                let response = if ai_backend_torch_available {
+                                    response
+                                } else {
+                                    response.on_disabled_hover_text(
+                                        egui::RichText::new("PyTorch не установлен")
+                                            .color(Color32::from_rgb(240, 102, 102)),
+                                    )
+                                };
+                                if response.clicked() {
+                                    mask_generation_params.method =
+                                        RegionMaskGenerationMethod::ComicTextDetector;
+                                }
+                            });
+                    });
+                })
+                .body(|ui| {
+                    ui.add(
+                        WheelSlider::new(&mut mask_generation_params.dilate_size, 0..=30)
+                            .text("Расширение маски"),
+                    );
+                });
+                draw_custom_ui(ui);
+                Self::draw_mask_editor_image(ui, editor, brush_base, editor_state);
+
+                if let Some(status) = editor.status.as_ref() {
+                    ui.separator();
+                    ui.small(status);
+                }
+            });
 
         ui.separator();
         let background_busy =

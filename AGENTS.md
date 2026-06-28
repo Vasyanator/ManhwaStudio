@@ -27,12 +27,14 @@
 
 ## 2. Hierarchical Documentation for Agents
 
-Documentation for quick codebase onboarding has three levels:
+Documentation for quick codebase onboarding has four levels:
 
 ```text
 README_AGENT.md      -> whole-project architecture and cross-layer contracts
 MODULE_README.md     -> architecture of a specific directory/module
 file header          -> local responsibility of a specific file
+declaration comment  -> contract of a specific function, struct, enum, trait, etc.
+inline comment       -> intent of a specific non-obvious block inside a function
 ```
 
 The goal of this system is to quickly understand where to change code without rereading the entire module. Documentation must be an architectural cheat sheet, not a changelog, roadmap, or line-by-line implementation summary.
@@ -141,6 +143,72 @@ Used by the UI when opening a project.
 */
 ```
 
+### Declaration Comments
+
+Every maintained function, method, struct, enum, trait, and other public or non-trivial declaration must have a **declaration comment** describing its contract. If one is missing, **create it** when editing the declaration.
+
+A declaration comment describes only that specific item, not the surrounding module or file:
+
+* what it does and the contract it guarantees, not a restatement of its name;
+* parameters that are not self-explanatory, including units, ranges, and ownership;
+* return value and its meaning;
+* error conditions and what each error variant means;
+* important invariants, side effects, panics (if any and why they are safe), threading, or performance assumptions.
+
+Rules:
+
+* Use the language-native doc comment form (`///` and `//!` in Rust, docstrings in Python) so tooling can pick it up.
+* Document the contract, not the implementation. Do not narrate line by line; do not duplicate the body in prose.
+* Keep it compact: usually 1-5 lines. A simple, self-evident private helper may use a single-line comment; do not pad trivial getters with boilerplate.
+* Trivial, fully self-describing items do not need a comment if the name already states the full contract. When in doubt, document the contract.
+* Update the declaration comment whenever the signature, returned value, errors, or guarantees change.
+
+Example (Rust):
+
+```rust
+/// Loads a project from disk and validates its structure.
+///
+/// `path` must point to a project root directory. Returns the parsed
+/// `Project` on success.
+///
+/// # Errors
+/// Returns `AppError::NotFound` if the path does not exist and
+/// `AppError::InvalidProject` if the structure fails validation.
+#[must_use]
+fn load_project(path: &Path) -> Result<Project, AppError> { ... }
+```
+
+Example (Python):
+
+```python
+def load_project(path: Path) -> Project:
+    """Load and validate a project from `path`.
+
+    Raises FileNotFoundError if the path is missing and ValueError if
+    the project structure is invalid.
+    """
+```
+
+### Inline Comments
+
+Inside function bodies, add **inline comments** that explain intent where the code is not self-evident. The goal is to make non-obvious decisions understandable without reverse-engineering the code.
+
+Comment when there is a reason a reader would otherwise miss:
+
+* why a non-obvious approach, ordering, or workaround was chosen;
+* the meaning of a tricky calculation, index math, shape/stride handling, or bit operation;
+* assumptions, invariants, and preconditions that hold at that point;
+* the reason behind an edge-case branch, retry, fallback, or guard;
+* references to an external spec, protocol, ticket, or formula when relevant.
+
+Rules:
+
+* Explain **why**, not **what**. Do not narrate code that already reads clearly (`// increment i` is noise).
+* Keep comments truthful and in sync with the code; update or remove them when the code changes. A stale comment is worse than none.
+* Prefer clearer code over a comment that exists to excuse confusing code.
+* Do not leave commented-out code; see section 13.
+* Inline comments, like all agent-facing documentation, are written in English.
+
 ### Reading Order Before Changes
 
 Before changing source code, use this order:
@@ -148,7 +216,8 @@ Before changing source code, use this order:
 1. `README_AGENT.md` - overall architecture and global constraints.
 2. The target directory's `MODULE_README.md` and parent module readmes if they define boundaries.
 3. Headers of the specific files.
-4. The code itself and existing tests.
+4. Declaration comments of the functions, structs, and other items you touch.
+5. The code itself, its inline comments, and existing tests.
 
 ---
 
@@ -324,11 +393,12 @@ Always:
 
 1. Read the nearest `MODULE_README.md` and parent module readmes if they define boundaries.
 2. Read the file header.
-3. Understand the file responsibility and its role in the module.
-4. Check whether a similar function already exists.
-5. Check the change against architectural layers.
-6. Ensure the change does not break project contracts from `README_AGENT.md`.
-7. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed.
+3. Read the declaration comments and inline comments of the items you will touch.
+4. Understand the file responsibility and its role in the module.
+5. Check whether a similar function already exists.
+6. Check the change against architectural layers.
+7. Ensure the change does not break project contracts from `README_AGENT.md`.
+8. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed, and update or add declaration and inline comments for the code you changed.
 
 ---
 

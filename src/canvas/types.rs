@@ -12,7 +12,7 @@ Main responsibilities:
 Key structures:
 - CanvasUiStatus
 - SourceTextureUploadBudget
-- BubbleAction / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
+- BubbleAction / BubbleClass / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
 - RectCoords
 - RuntimeBubble
 - OverlayPreparedTile / OverlayPreparedPage
@@ -108,6 +108,29 @@ pub(crate) struct OverlayUploadBudget {
 pub enum BubbleAction {
     Translate,
     Delete,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BubbleClass {
+    Text,
+    Image,
+}
+
+impl BubbleClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("image") {
+            Self::Image
+        } else {
+            Self::Text
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -251,6 +274,38 @@ impl OnTopFocusMode {
     }
 }
 
+/// How per-bubble translation status is shown on the canvas vertical scrollbar.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TranslationStatusDisplay {
+    /// Nothing is drawn on the scrollbar.
+    None,
+    /// Each bubble paints a stripe from itself down to the next bubble (the last
+    /// bubble gets only a short tail).
+    UntilNext,
+    /// Each bubble paints a thin fixed-height mark at its own position only.
+    Marks,
+}
+
+impl TranslationStatusDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::UntilNext => "until_next",
+            Self::Marks => "marks",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Self {
+        if raw.eq_ignore_ascii_case("none") {
+            Self::None
+        } else if raw.eq_ignore_ascii_case("marks") {
+            Self::Marks
+        } else {
+            Self::UntilNext
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RectCoords {
     pub p1: Pos2,
@@ -270,6 +325,70 @@ impl RectCoords {
     }
 }
 
+/// One independently-placed text region of a multi-area `ImageBubble`.
+///
+/// Geometry is normalized to the page image (0..1). `area_rect` is constrained to live inside the
+/// bubble's red `rect_coords`; `anchor` is constrained to live inside `area_rect`. `original` /
+/// `description` / `translation` hold this area's text. Area 0's text mirrors the legacy
+/// `Bubble.text` / `Bubble.original_text` / `extra.description` fields; areas >= 1 are stored only
+/// inside `extra["text_areas"]`.
+#[derive(Debug, Clone)]
+pub(crate) struct ImageTextArea {
+    pub(crate) area_rect: RectCoords,
+    pub(crate) anchor: Pos2,
+    pub(crate) original: String,
+    pub(crate) description: String,
+    pub(crate) translation: String,
+}
+
+impl ImageTextArea {
+    /// Read-only display text for this area: translation, then original, then description.
+    pub(crate) fn readonly_text(&self) -> &str {
+        let translation = self.translation.trim();
+        if !translation.is_empty() {
+            return translation;
+        }
+        let original = self.original.trim();
+        if !original.is_empty() {
+            return original;
+        }
+        self.description.trim()
+    }
+}
+
+/// Returns the distinct outline/link color for image-bubble text area `index`.
+///
+/// Colors follow the rainbow in reverse starting at blue (blue → green → yellow → orange → red →
+/// violet) so area 0 is the canvas-selection blue and later areas cycle through visually distinct
+/// hues; each area's rect, anchor point, and link line share one recognizable color.
+#[must_use]
+pub(crate) fn image_area_palette(index: usize) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 6] = [
+        egui::Color32::from_rgb(0, 120, 215),
+        egui::Color32::from_rgb(46, 204, 113),
+        egui::Color32::from_rgb(241, 196, 15),
+        egui::Color32::from_rgb(230, 126, 34),
+        egui::Color32::from_rgb(231, 76, 60),
+        egui::Color32::from_rgb(155, 89, 182),
+    ];
+    PALETTE[index % PALETTE.len()]
+}
+
+/// Picks the aside side for a multi-area image bubble from the signed-distance weight of its
+/// anchors: `Side::Left` when the sum of `(anchor_u - 0.5)` over all areas is negative.
+///
+/// A single far-left anchor outweighs several anchors slightly right of center, matching the
+/// requested behavior. Falls back to `Side::Right` when there are no areas.
+#[must_use]
+pub(crate) fn image_bubble_side_from_areas(areas: &[ImageTextArea]) -> Side {
+    let weight: f32 = areas.iter().map(|area| area.anchor.x - 0.5).sum();
+    if weight < 0.0 {
+        Side::Left
+    } else {
+        Side::Right
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeBubble {
     pub(crate) id: i64,
@@ -277,6 +396,7 @@ pub(crate) struct RuntimeBubble {
     pub(crate) img_u: f32,
     pub(crate) img_v: f32,
     pub(crate) side: Side,
+    pub(crate) bubble_class: BubbleClass,
     pub(crate) bubble_type: BubbleType,
     pub(crate) text: String,
     pub(crate) original_text: String,
@@ -286,6 +406,15 @@ pub(crate) struct RuntimeBubble {
     pub(crate) height_px: f32,
     pub(crate) line_x: f32,
     pub(crate) mounted: bool,
+    /// Text areas for a multi-area `ImageBubble`. Empty for text bubbles and for image bubbles
+    /// that have never been expanded; otherwise area 0 mirrors the legacy text fields and later
+    /// areas carry their own text. Always normalized so each `area_rect` sits inside `rect_coords`
+    /// and each `anchor` sits inside its `area_rect`.
+    pub(crate) text_areas: Vec<ImageTextArea>,
+    /// Transient per-area card "row block" rectangles in scene coordinates, recorded during the
+    /// last editable layout. Used to route card-body drags and to target each area's link line at
+    /// its block center. Index matches `text_areas`; empty until laid out.
+    pub(crate) image_block_rects: Vec<Rect>,
 }
 
 impl RuntimeBubble {
@@ -301,8 +430,16 @@ impl RuntimeBubble {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AsideDragTarget {
+    /// Text bubble: move the bubble anchor (and red rect when it would leave the anchor behind).
     BubbleBody,
+    /// Text bubble: move the red rect, keeping the anchor inside it.
     RectArea,
+    /// Image bubble: move the red `rect_coords` and shift every text area + anchor with it.
+    ImageRedRect,
+    /// Image bubble: move text area `idx`'s rect (and its anchor) inside the red rect.
+    ImageAreaRect(usize),
+    /// Image bubble: move text area `idx`'s anchor point inside its own `area_rect`.
+    ImageAreaAnchor(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -345,6 +482,7 @@ impl BubbleCopyPasteTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CopiedBubbleData {
+    pub(crate) bubble_class: BubbleClass,
     pub(crate) bubble_type: BubbleType,
     pub(crate) text: String,
     pub(crate) original_text: String,
@@ -370,10 +508,19 @@ pub(crate) struct CanvasContextMenuTarget {
     pub(crate) page_uv: Pos2,
 }
 
+/// One undo/redo entry: a shared snapshot of the whole bubble list plus the model
+/// revision it was taken at.
+///
+/// `bubbles` is an `Arc` so capturing a snapshot is an O(1) refcount bump (the model already
+/// owns the list behind an `Arc`), not a deep clone of every bubble. `revision` is the
+/// `BubblesModel` revision at capture time; it is the cheap identity used to dedup consecutive
+/// snapshots of an unchanged model (the revision is monotonic and bumped on every mutation), so
+/// a gesture that changed nothing does not push a no-op entry. It replaces the old per-frame
+/// `serde_json` content hash.
 #[derive(Clone)]
 pub(crate) struct BubbleHistoryEntry {
-    pub(crate) bubbles: Vec<Bubble>,
-    pub(crate) hash: u64,
+    pub(crate) bubbles: Arc<Vec<Bubble>>,
+    pub(crate) revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +529,49 @@ pub(crate) struct BubbleLink {
     pub(crate) img_v: f32,
     pub(crate) target_x: f32,
     pub(crate) target_y: f32,
+    /// Link line color. Lets a single image bubble draw one differently-colored line per text area.
+    pub(crate) color: egui::Color32,
+}
+
+/// All four per-`(side, type)` aside/on-top bubble columns for one page.
+///
+/// `CanvasView::page_bubbles_bucketed` fills this in a single runtime-bubble scan per page (per
+/// pass), replacing four separate per-column scans of every runtime bubble. Each field is a
+/// top-to-bottom ordered `Vec<AsideItem>` for one `(side, type)` consumer. Only Aside/OnTop appear
+/// because displayed bubble types resolve to one of those two (never Default).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PageBubbleBuckets {
+    pub(crate) aside_left: Vec<AsideItem>,
+    pub(crate) aside_right: Vec<AsideItem>,
+    pub(crate) on_top_left: Vec<AsideItem>,
+    pub(crate) on_top_right: Vec<AsideItem>,
+}
+
+impl PageBubbleBuckets {
+    /// Returns the bucket matching one `(side, bubble_type)` consumer.
+    ///
+    /// `bubble_type` is the displayed type; `Default` never occurs as a displayed type, so it maps
+    /// to the (empty) aside bucket for that side rather than panicking.
+    #[must_use]
+    pub(crate) fn bucket(&self, side: Side, bubble_type: BubbleType) -> &[AsideItem] {
+        match (bubble_type, side) {
+            (BubbleType::Aside | BubbleType::Default, Side::Left) => &self.aside_left,
+            (BubbleType::Aside | BubbleType::Default, Side::Right) => &self.aside_right,
+            (BubbleType::OnTop, Side::Left) => &self.on_top_left,
+            (BubbleType::OnTop, Side::Right) => &self.on_top_right,
+        }
+    }
+}
+
+/// One renderable entry in an aside column.
+///
+/// `area_idx` is `None` for text bubbles and for editable image bubbles (which render all their
+/// areas inside one card). For a read-only image bubble it is `Some(i)`, so the bubble splits into
+/// one ordinary aside card per text area, each placed by its own anchor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsideItem {
+    pub(crate) bid: i64,
+    pub(crate) area_idx: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -461,6 +651,9 @@ pub struct CanvasState {
     pub bubble_max_width: f32,
     pub aside_compact_mode: AsideBubbleCompactMode,
     pub aside_side_mode: AsideBubbleSideMode,
+    /// When true, a side may split its aside bubbles into two side-by-side columns
+    /// (near/far) where horizontal viewport room allows; see `bubble_aside_ui`.
+    pub aside_second_column: bool,
     pub on_top_focus_mode: OnTopFocusMode,
     pub scale_bubbles: bool,
     pub aside_scale_pct: i32,
@@ -469,6 +662,7 @@ pub struct CanvasState {
     pub spellcheck_translation: bool,
     pub tabs_autosync_enabled: bool,
     pub cache_pages: bool,
+    pub translation_status_display: TranslationStatusDisplay,
 }
 
 impl Default for CanvasState {
@@ -491,6 +685,7 @@ impl Default for CanvasState {
             bubble_max_width: 550.0,
             aside_compact_mode: AsideBubbleCompactMode::None,
             aside_side_mode: AsideBubbleSideMode::Auto,
+            aside_second_column: false,
             on_top_focus_mode: OnTopFocusMode::Around,
             scale_bubbles: true,
             aside_scale_pct: 100,
@@ -499,6 +694,7 @@ impl Default for CanvasState {
             spellcheck_translation: true,
             tabs_autosync_enabled: true,
             cache_pages: true,
+            translation_status_display: TranslationStatusDisplay::UntilNext,
         }
     }
 }

@@ -6,7 +6,7 @@ HTTP-friendly LaMa V2 inpaint service for the Python AI backend.
 
 Main responsibilities:
 - lazy-load `InpainterV2` and keep one active checkpoint/device pair in memory;
-- decode input image + mask from base64/PNG and return PNG/base64 result;
+- decode input image + mask from PNG bytes and return raw PNG bytes result;
 - normalize refine parameters and requested checkpoint name from the HTTP payload;
 - expose health information about available and currently active LaMa checkpoints.
 
@@ -26,7 +26,6 @@ Notes:
 
 from __future__ import annotations
 
-import base64
 import importlib.util
 import io
 import sys
@@ -69,7 +68,7 @@ from .model_manager import LoadedModelManager
 # Что в файле:
 # - `LamaInpaintService`: lazy-load обёртка для `InpainterV2` (модель как в
 #   `ui_new/tools/region_edit_ai.py`) с HTTP-friendly API.
-# - Декодирование/кодирование base64-изображений (RGB image + mask).
+# - Декодирование PNG-изображений (RGB image + mask) и кодирование raw PNG.
 # - Нормализация параметров `refine` (`n_iters`, `max_scales`, `px_budget`).
 # - Синхронизация устройства с backend-настройкой `General.ai_device`
 #   через `AIDevice`.
@@ -176,7 +175,7 @@ class LamaInpaintService:
                 lease.release()
 
         return {
-            "image_png_base64": _encode_png_base64_rgb(out_rgb),
+            "image_png": _encode_png_bytes_rgb(out_rgb),
             "source_size": [int(image_rgb.shape[1]), int(image_rgb.shape[0])],
             "device": self._active_device,
             "refine": bool(normalized["refine"]),
@@ -454,7 +453,7 @@ def _decode_image_any(image_bytes: bytes) -> np.ndarray:
         return np.array(img.convert("RGBA"))
 
 
-def _encode_png_base64_rgb(image_rgb: np.ndarray) -> str:
+def _encode_png_bytes_rgb(image_rgb: np.ndarray) -> bytes:
     np = _np()
     if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
         raise ValueError("Ожидается RGB изображение (H, W, 3)")
@@ -466,13 +465,13 @@ def _encode_png_base64_rgb(image_rgb: np.ndarray) -> str:
         ok, encoded = cv2.imencode(".png", bgr)
         if not ok:
             raise RuntimeError("cv2.imencode('.png') вернул ошибку")
-        return base64.b64encode(encoded.tobytes()).decode("ascii")
+        return encoded.tobytes()
 
     from PIL import Image
 
     with io.BytesIO() as buffer:
         Image.fromarray(image_rgb, mode="RGB").save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("ascii")
+        return buffer.getvalue()
 
 
 def _resolve_selected_backend_device(fallback: str) -> str:

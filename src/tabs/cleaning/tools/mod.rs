@@ -5,7 +5,7 @@ FILE HEADER (tabs/cleaning/tools/mod.rs)
   - `CleaningTool`, `StrokePoint`, `StrokeModifiers` из `base.rs`.
   - Конкретные инструменты вкладки cleaning:
     `ZamazkaTool`, `StampTool`, `GradientFillTool`, `TextureSynthesisInpaintTool`,
-    `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`.
+    `LamaInpaintTool`, `LamaMpeInpaintTool`, `AotInpaintTool`, `SdxlInpaintTool`.
 */
 mod base;
 
@@ -20,6 +20,12 @@ pub use texture_synthesis::TextureSynthesisInpaintTool;
 
 mod lama;
 pub use lama::LamaInpaintTool;
+
+mod sdxl;
+pub use sdxl::SdxlInpaintTool;
+
+mod flux_fill;
+pub use flux_fill::FluxFillInpaintTool;
 
 mod lama_mpe;
 pub use lama_mpe::LamaMpeInpaintTool;

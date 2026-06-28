@@ -22,7 +22,10 @@ use crate::bubble_status::{
     BubbleBorderKind, BubbleBorderStyle, BubbleStatusCondition, BubbleStatusField,
     BubbleStatusRule, default_bubble_status_rules, normalize_bubble_status_rules,
 };
-use crate::canvas::{AsideBubbleCompactMode, AsideBubbleSideMode, BubbleType, OnTopFocusMode};
+use crate::canvas::{
+    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleType, OnTopFocusMode,
+    TranslationStatusDisplay,
+};
 use crate::project::ComicType;
 use crate::widgets::{WheelComboBox as ComboBox, WheelSlider};
 use egui::{
@@ -262,6 +265,26 @@ impl SettingsTabState {
                         .changed();
                 });
 
+                changed |= ui
+                    .checkbox(
+                        &mut self.canvas_settings.aside_second_column,
+                        "Вторая колонка боковых пузырей",
+                    )
+                    .on_hover_text(concat!(
+                        "Когда сбоку от ленты хватает места, чтобы обе колонки целиком поместились ",
+                        "в экране, боковые пузыри этой стороны раскладываются в две колонки: ближнюю ",
+                        "к ленте и дальнюю. Режим выключается раньше, чем дальние пузыри выйдут за ",
+                        "край экрана.\n",
+                        "Левая и правая стороны включаются независимо, в зависимости от свободного ",
+                        "места при горизонтальной прокрутке.\n",
+                        "Ближние пузыри в приоритете: дальняя колонка используется только там, где ",
+                        "пузыри начинают слипаться. Дальние держат линию ровной, а ближние немного ",
+                        "расступаются, чтобы линия проходила между ними.\n",
+                        "Если «Растягивать боковые пузыри» выключено, обе колонки минимальной ширины ",
+                        "и жмутся ближе к ленте."
+                    ))
+                    .changed();
+
                 ui.label("Раскрытие пузырей типа \"Поверх\":");
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
@@ -339,6 +362,40 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(&mut self.canvas_settings.cache_pages, "Кэшировать страницы")
                     .changed();
+
+                ui.separator();
+
+                ui.label("Отображение статуса перевода на скроллбаре:");
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.canvas_settings.translation_status_display,
+                            TranslationStatusDisplay::None.as_str().to_string(),
+                            "Нет",
+                        )
+                        .on_hover_text("Скроллбар не показывает статус перевода пузырей")
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.canvas_settings.translation_status_display,
+                            TranslationStatusDisplay::UntilNext.as_str().to_string(),
+                            "До следующего пузыря",
+                        )
+                        .on_hover_text(
+                            "Каждый пузырь красит полосу от себя до следующего пузыря: красную, пока перевод пустой, синюю — когда заполнен",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.canvas_settings.translation_status_display,
+                            TranslationStatusDisplay::Marks.as_str().to_string(),
+                            "Метками",
+                        )
+                        .on_hover_text(
+                            "Каждый пузырь отмечается тонкой полоской на своей позиции: красной, пока перевод пустой, синей — когда заполнен",
+                        )
+                        .changed();
+                });
 
                 ui.separator();
                 changed |= self.draw_bubble_status_rules_block(ui);

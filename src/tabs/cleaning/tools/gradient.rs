@@ -13,12 +13,20 @@ FILE HEADER (cleaning/tools/gradient.rs)
 - Важно:
   - Обработка запускается по кнопке "Обработать" в `RegionMaskInpaintToolBase`.
   - По `Применить` результат вставляется обратно в clean-overlay выбранного региона.
+- Параллелизм (rayon, глобальный пул):
+  - `red_black_sor_sweeps`: красно-чёрный SOR. Полусвип одного цвета параллелится по строкам;
+    обновляемые ячейки одного цвета не читают друг друга (5-точечный stencil читает только соседей
+    противоположного цвета), поэтому row-параллель численно идентична последовательному варианту.
+    Два полусвипа (red/black) остаются последовательными между собой.
+  - `dilate`: ping-pong буфер вместо клонирования на итерацию; каждая итерация параллелится по
+    строкам (каждая выходная строка читает 3×3 окно из предыдущего буфера).
 */
 use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
 use crate::canvas::CanvasView;
 use crate::project::ProjectData;
 use eframe::egui;
 use egui::Color32;
+use rayon::prelude::*;
 
 const ANGLE_STEP_DEG: usize = 3;
 const DELTA_E_THRESHOLD: f32 = 2.5;
@@ -790,23 +798,7 @@ fn screened_poisson_refine(
     }
 
     if rw >= 3 && rh >= 3 {
-        for _ in 0..iters {
-            for parity in 0..=1usize {
-                for y in 1..(rh - 1) {
-                    let xstart = 1 + ((parity ^ (y & 1)) & 1);
-                    for x in (xstart..(rw - 1)).step_by(2) {
-                        let i = idx2d(x, y, rw);
-                        let nbr = u[idx2d(x - 1, y, rw)]
-                            + u[idx2d(x + 1, y, rw)]
-                            + u[idx2d(x, y - 1, rw)]
-                            + u[idx2d(x, y + 1, rw)];
-                        let rhs = nbr + lam[i] * u0[i];
-                        let next = rhs / denom[i];
-                        u[i] = u[i] + omega * (next - u[i]);
-                    }
-                }
-            }
-        }
+        red_black_sor_sweeps(&mut u, &u0, &lam, &denom, rw, rh, iters, omega);
     }
 
     let mut out = channel_pred.to_vec();
@@ -820,6 +812,78 @@ fn screened_poisson_refine(
         }
     }
     out
+}
+
+/// Runs `iters` red-black SOR iterations over the interior of an `rw`×`rh` ROI in place.
+///
+/// Each iteration performs two half-sweeps (red then black). A half-sweep updates only the
+/// cells of one color, where a cell's color is `(x + y) & 1`. The 5-point Laplacian stencil
+/// reads only the 4 axis neighbors, which all have the opposite color, so within one half-sweep
+/// no updated cell is read by another updated cell. The updates within a half-sweep are therefore
+/// mutually independent and order-invariant, which makes a row-parallel sweep numerically
+/// identical to the sequential one.
+///
+/// `u` is the working buffer (interior updated in place), `u0` the data-fidelity reference,
+/// `lam` the per-cell fidelity weight, `denom` the precomputed `4 + lam[i]`. The two half-sweeps
+/// stay sequential w.r.t. each other; parallelism is only within a half-sweep, across rows.
+// All parameters are distinct solver buffers or ROI dimensions; grouping would obscure the kernel.
+#[allow(clippy::too_many_arguments)]
+fn red_black_sor_sweeps(
+    u: &mut [f32],
+    u0: &[f32],
+    lam: &[f32],
+    denom: &[f32],
+    rw: usize,
+    rh: usize,
+    iters: usize,
+    omega: f32,
+) {
+    // Scratch holds the newly computed value for each updated cell of the current half-sweep.
+    // Because updated cells are never read within the same half-sweep, computing into scratch
+    // from the immutable snapshot `u` and copying back yields the exact in-place result while
+    // letting rows be processed in parallel without aliasing the writes.
+    //
+    // The buffer is allocated once and deliberately NOT re-zeroed between half-sweeps or
+    // iterations: cells of the parity NOT being updated this half-sweep retain stale values from
+    // a previous half-sweep, but the copyback below reads only current-parity cells (it recomputes
+    // the exact same parity-selection predicate as the compute loop), so those stale cells are
+    // never read. Do not add a stale read of `scratch` outside that predicate.
+    let mut scratch = vec![0.0f32; u.len()];
+    for _ in 0..iters {
+        for parity in 0..=1usize {
+            // Compute updates for every interior cell of this color in parallel by row. Each row's
+            // updated cells write only into `scratch[row]`; reads of `u` touch opposite-color
+            // cells (neighbors) that are not updated this half-sweep, so the shared `&u` borrow is
+            // race-free. The stride between consecutive rows in the flat buffer is `rw`.
+            scratch
+                .par_chunks_mut(rw)
+                .enumerate()
+                .skip(1)
+                .take(rh.saturating_sub(2))
+                .for_each(|(y, scratch_row)| {
+                    let xstart = 1 + ((parity ^ (y & 1)) & 1);
+                    let row_base = y * rw;
+                    for x in (xstart..(rw - 1)).step_by(2) {
+                        let i = row_base + x;
+                        let nbr = u[i - 1] + u[i + 1] + u[i - rw] + u[i + rw];
+                        let rhs = nbr + lam[i] * u0[i];
+                        let next = rhs / denom[i];
+                        scratch_row[x] = u[i] + omega * (next - u[i]);
+                    }
+                });
+
+            // Apply the half-sweep results back into `u`. Only the cells of `parity` were written
+            // in `scratch`; recompute the same membership to copy exactly those cells.
+            for y in 1..(rh - 1) {
+                let xstart = 1 + ((parity ^ (y & 1)) & 1);
+                let row_base = y * rw;
+                for x in (xstart..(rw - 1)).step_by(2) {
+                    let i = row_base + x;
+                    u[i] = scratch[i];
+                }
+            }
+        }
+    }
 }
 
 fn ring_mask(mask: &[bool], w: usize, h: usize, inner: usize, outer: usize) -> Vec<bool> {
@@ -838,30 +902,46 @@ fn ring_mask(mask: &[bool], w: usize, h: usize, inner: usize, outer: usize) -> V
     ring
 }
 
+/// Binary dilation by a 3×3 full structuring element (8-connectivity), applied `iters` times.
+///
+/// Border pixels use replicate behavior (neighbor indices clamped into range), matching the
+/// original implementation. Uses a ping-pong double buffer instead of cloning per iteration and
+/// parallelizes each iteration across output rows: every output cell reads only the previous
+/// buffer's 3×3 neighborhood and writes a single row, so rows are independent. The flat-buffer
+/// row stride is `w`. The result is bit-for-bit identical to the sequential clone-per-iter form.
 fn dilate(mask: &[bool], w: usize, h: usize, iters: usize) -> Vec<bool> {
-    let mut cur = mask.to_vec();
+    if iters == 0 || w == 0 || h == 0 {
+        return mask.to_vec();
+    }
+
+    let mut src = mask.to_vec();
+    let mut dst = vec![false; mask.len()];
     for _ in 0..iters {
-        let prev = cur.clone();
-        for y in 0..h {
+        // Compute each output row in parallel from the immutable `src` buffer.
+        dst.par_chunks_mut(w).enumerate().for_each(|(y, dst_row)| {
             let y0 = y.saturating_sub(1);
-            let y1 = (y + 1).min(h.saturating_sub(1));
-            for x in 0..w {
+            let y1 = (y + 1).min(h - 1);
+            for (x, cell) in dst_row.iter_mut().enumerate() {
                 let x0 = x.saturating_sub(1);
-                let x1 = (x + 1).min(w.saturating_sub(1));
+                let x1 = (x + 1).min(w - 1);
                 let mut on = false;
                 'outer: for ny in y0..=y1 {
+                    let row_base = ny * w;
                     for nx in x0..=x1 {
-                        if prev[idx2d(nx, ny, w)] {
+                        if src[row_base + nx] {
                             on = true;
                             break 'outer;
                         }
                     }
                 }
-                cur[idx2d(x, y, w)] = on;
+                *cell = on;
             }
-        }
+        });
+        // Swap buffers: the freshly written `dst` becomes the source for the next iteration.
+        std::mem::swap(&mut src, &mut dst);
     }
-    cur
+    // After the final swap, `src` holds the latest result.
+    src
 }
 
 fn rgb_to_lab(rgb: &[[u8; 3]]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -1085,4 +1165,197 @@ fn median_f32(values: &mut [f32]) -> f32 {
 #[inline]
 fn idx2d(x: usize, y: usize, w: usize) -> usize {
     y.saturating_mul(w).saturating_add(x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference sequential red-black SOR, copied verbatim from the pre-parallel implementation.
+    /// Used as the golden baseline that the parallel `red_black_sor_sweeps` must reproduce.
+    // Mirrors the production kernel signature so the comparison is one-to-one.
+    #[allow(clippy::too_many_arguments)]
+    fn sequential_sor_reference(
+        u: &mut [f32],
+        u0: &[f32],
+        lam: &[f32],
+        denom: &[f32],
+        rw: usize,
+        rh: usize,
+        iters: usize,
+        omega: f32,
+    ) {
+        if rw < 3 || rh < 3 {
+            return;
+        }
+        for _ in 0..iters {
+            for parity in 0..=1usize {
+                for y in 1..(rh - 1) {
+                    let xstart = 1 + ((parity ^ (y & 1)) & 1);
+                    for x in (xstart..(rw - 1)).step_by(2) {
+                        let i = idx2d(x, y, rw);
+                        let nbr = u[idx2d(x - 1, y, rw)]
+                            + u[idx2d(x + 1, y, rw)]
+                            + u[idx2d(x, y - 1, rw)]
+                            + u[idx2d(x, y + 1, rw)];
+                        let rhs = nbr + lam[i] * u0[i];
+                        let next = rhs / denom[i];
+                        u[i] = u[i] + omega * (next - u[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reference sequential dilation, copied verbatim from the pre-parallel implementation
+    /// (clone-per-iteration, 3×3 full structuring element, replicate border).
+    fn sequential_dilate_reference(mask: &[bool], w: usize, h: usize, iters: usize) -> Vec<bool> {
+        let mut cur = mask.to_vec();
+        for _ in 0..iters {
+            let prev = cur.clone();
+            for y in 0..h {
+                let y0 = y.saturating_sub(1);
+                let y1 = (y + 1).min(h.saturating_sub(1));
+                for x in 0..w {
+                    let x0 = x.saturating_sub(1);
+                    let x1 = (x + 1).min(w.saturating_sub(1));
+                    let mut on = false;
+                    'outer: for ny in y0..=y1 {
+                        for nx in x0..=x1 {
+                            if prev[idx2d(nx, ny, w)] {
+                                on = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                    cur[idx2d(x, y, w)] = on;
+                }
+            }
+        }
+        cur
+    }
+
+    /// Builds a deterministic, mildly varied SOR fixture (interior masked, fidelity weights).
+    fn build_sor_fixture(rw: usize, rh: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = rw * rh;
+        let mut u0 = vec![0.0f32; n];
+        let mut lam = vec![0.0f32; n];
+        for y in 0..rh {
+            for x in 0..rw {
+                let i = idx2d(x, y, rw);
+                // Smooth-ish initial field plus a deterministic ripple.
+                u0[i] =
+                    (x as f32) * 0.37 - (y as f32) * 0.21 + ((x * 7 + y * 13) % 11) as f32 * 0.05;
+                // Mark an interior block as "inside the mask" with weak fidelity, rest strong.
+                let inside = x >= rw / 4 && x < 3 * rw / 4 && y >= rh / 4 && y < 3 * rh / 4;
+                lam[i] = if inside { 1.0 } else { 120.0 };
+            }
+        }
+        let mut denom = vec![0.0f32; n];
+        for i in 0..n {
+            denom[i] = 4.0 + lam[i];
+        }
+        (u0, lam, denom)
+    }
+
+    /// Golden test: parallel red-black SOR must equal the sequential baseline bit-for-bit.
+    ///
+    /// The arithmetic per cell is identical and order-independent within a half-sweep, so the
+    /// results should match exactly. The tolerance is kept explicit and tight to catch any
+    /// stencil/index regression rather than to paper over reordering error.
+    #[test]
+    fn parallel_sor_matches_sequential() {
+        // Bit-exact equality is expected: the parallel and sequential paths apply the exact same
+        // per-cell arithmetic in the same operation order (one thread owns each cell, no float
+        // reordering across the parallel split), so identical f32 results are guaranteed. Any
+        // nonzero diff would signal a real stencil/index regression, not reordering noise.
+        const TOL: f32 = 0.0;
+        // (3, 3) exercises the minimum interior: a single interior cell at (1, 1), so the parallel
+        // `take(rh - 2)` row range and the sequential reference must agree at the smallest ROI.
+        for &(rw, rh) in &[(3usize, 3usize), (5, 4), (17, 23), (40, 9), (33, 33)] {
+            let (u0, lam, denom) = build_sor_fixture(rw, rh);
+            let iters = 64usize;
+            let omega = 1.95f32;
+
+            let mut u_seq = u0.clone();
+            sequential_sor_reference(&mut u_seq, &u0, &lam, &denom, rw, rh, iters, omega);
+
+            let mut u_par = u0.clone();
+            red_black_sor_sweeps(&mut u_par, &u0, &lam, &denom, rw, rh, iters, omega);
+
+            assert_eq!(u_seq.len(), u_par.len());
+            for (i, (a, b)) in u_seq.iter().zip(u_par.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= TOL,
+                    "SOR mismatch at {i} ({rw}x{rh}): seq={a} par={b}",
+                );
+            }
+        }
+    }
+
+    /// Dilation test: ping-pong/parallel dilation must equal the old clone-per-iter result exactly.
+    #[test]
+    fn parallel_dilate_matches_sequential() {
+        let w = 13usize;
+        let h = 11usize;
+        let mut mask = vec![false; w * h];
+        // A couple of seed points and an edge point to exercise replicate-border behavior.
+        mask[idx2d(6, 5, w)] = true;
+        mask[idx2d(1, 1, w)] = true;
+        mask[idx2d(0, 0, w)] = true;
+        mask[idx2d(w - 1, h - 1, w)] = true;
+
+        for iters in 0..=4usize {
+            let expected = sequential_dilate_reference(&mask, w, h, iters);
+            let got = dilate(&mask, w, h, iters);
+            assert_eq!(
+                expected, got,
+                "dilation mismatch for iters={iters} (structuring element / border drift)",
+            );
+        }
+    }
+
+    /// Single-row and single-column masks exercise the `h - 1` / `w - 1` saturating-clamp border
+    /// path of `dilate`; the parallel result must equal the verbatim sequential reference.
+    #[test]
+    fn parallel_dilate_matches_sequential_thin() {
+        // Single row: 5×1.
+        {
+            let (w, h) = (5usize, 1usize);
+            let mut mask = vec![false; w * h];
+            mask[idx2d(2, 0, w)] = true;
+            mask[idx2d(0, 0, w)] = true;
+            for iters in 0..=3usize {
+                let expected = sequential_dilate_reference(&mask, w, h, iters);
+                let got = dilate(&mask, w, h, iters);
+                assert_eq!(
+                    expected, got,
+                    "single-row dilation mismatch for iters={iters}",
+                );
+            }
+        }
+        // Single column: 1×5.
+        {
+            let (w, h) = (1usize, 5usize);
+            let mut mask = vec![false; w * h];
+            mask[idx2d(0, 2, w)] = true;
+            mask[idx2d(0, 0, w)] = true;
+            for iters in 0..=3usize {
+                let expected = sequential_dilate_reference(&mask, w, h, iters);
+                let got = dilate(&mask, w, h, iters);
+                assert_eq!(
+                    expected, got,
+                    "single-column dilation mismatch for iters={iters}",
+                );
+            }
+        }
+    }
+
+    /// Empty/degenerate inputs must not panic and must round-trip the input.
+    #[test]
+    fn dilate_handles_degenerate_inputs() {
+        assert_eq!(dilate(&[], 0, 0, 3), Vec::<bool>::new());
+        let mask = vec![true, false, true, false];
+        assert_eq!(dilate(&mask, 2, 2, 0), mask);
+    }
 }

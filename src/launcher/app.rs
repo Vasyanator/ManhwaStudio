@@ -14,6 +14,7 @@ Notes:
   on Linux and Windows, including detached child windows.
 */
 
+use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::config;
 use crate::launcher::background::{
     self, BackgroundImageLoadRequest, BackgroundImagePlan, LoadedBackgroundImage,
@@ -101,6 +102,7 @@ impl LauncherApp {
         user_settings: &serde_json::Value,
         output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
         update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+        ai_backend: AiBackendHandle,
     ) -> Self {
         let ai_install_type = config::AiInstallType::from_user_settings(user_settings);
         let mut app = Self {
@@ -113,7 +115,7 @@ impl LauncherApp {
             open_page: OpenPageState::new(projects_root.clone(), user_settings),
             import_page: ImportPageState::new(projects_root.clone()),
             export_page: ExportPageState::new(projects_root.clone()),
-            settings_page: SettingsPageState::new(projects_root.clone(), ai_install_type),
+            settings_page: SettingsPageState::new(projects_root.clone(), ai_install_type, ai_backend),
             output_outcome,
             update_notification: None,
             ai_install_type,
@@ -499,9 +501,12 @@ impl LauncherApp {
             PageNavAction::OpenProject(selection) => {
                 self.close_settings_resources_if_leaving(LauncherPage::Main);
                 if let Ok(mut output) = self.output_outcome.lock() {
-                    *output = Some(LauncherOutcome::OpenProject(selection));
+                    *output = Some(LauncherOutcome::OpenProject(selection.clone()));
                 }
-                if let Err(err) = self.open_page.persist_last_selection() {
+                if let Err(err) = crate::launcher::pages::open_page::persist_last_selection_values(
+                    &selection.title,
+                    &selection.chapter,
+                ) {
                     crate::runtime_log::log_warn(format!(
                         "[launcher-open] failed to persist last selection: {err:#}"
                     ));

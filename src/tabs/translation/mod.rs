@@ -4,7 +4,7 @@ Translation tab module wiring.
 
 Submodules:
 - `adv_rec`: floating advanced-recognition window for manual OCR region selection.
-- `backend_health`: shared `/health` checks + background probe helpers for AI backend.
+- `backend_health`: push-driven AI-backend health (`TOPIC_HEALTH` v2 events) + device-control helpers.
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.

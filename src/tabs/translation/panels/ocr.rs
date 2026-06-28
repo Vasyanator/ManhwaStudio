@@ -12,11 +12,16 @@ Main function:
 UI specifics:
 - EasyOCR selected languages are shown as removable rows with full names.
 - EasyOCR/PaddleOCR model dropdown options are alphabetically sorted by title.
+- AI API controls keep API key text transient and emit controller actions for
+  credential-store writes; model/status text is constrained to avoid widening
+  the side panel.
 - Legacy local PaddleOCR engine keys are normalized back to `PaddleOCR`
   by the Translation tab loader.
 */
 
-use crate::tabs::translation::ocr::{OcrEngine, OcrLoadState, OcrRecognizeResult};
+use crate::tabs::translation::ocr::{
+    AiApiService, CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult,
+};
 use crate::tabs::translation::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
     PADDLEOCR_MAIN_LANGUAGES,
@@ -24,6 +29,7 @@ use crate::tabs::translation::panels::ocr_langs::{
 use crate::widgets::WheelComboBox;
 
 const PYTORCH_UNAVAILABLE_HINT: &str = "PyTorch не установлен";
+const OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE: f32 = 300.0;
 
 #[derive(Debug, Clone)]
 pub struct OcrPanelOptions {
@@ -31,6 +37,7 @@ pub struct OcrPanelOptions {
     pub manga_model: String,
     pub paddle_lang: String,
     pub paddle_show_full_langs: bool,
+    pub paddle_vl_script: String,
     pub easy_langs: String,
     pub easy_lang_to_add: String,
     pub easy_show_full_langs: bool,
@@ -40,10 +47,54 @@ pub struct OcrPanelOptions {
     pub surya_drop_repeated_text: bool,
     pub surya_max_sliding_window: u32,
     pub surya_max_tokens: u32,
+    pub ai_api_service: AiApiService,
+    pub ai_api_model: String,
+    pub ai_api_key_edit: String,
+    pub ai_api_key_configured: Option<bool>,
+    pub ai_api_models: Vec<String>,
+    pub ai_api_account_status: String,
+    pub ai_api_status: String,
+    pub ai_api_system_instruction: String,
     pub join_newlines: bool,
     pub reflect_strings: bool,
     pub copy_to_clipboard: bool,
     pub create_bubble: bool,
+    pub replace_chars_enabled: bool,
+    pub replace_chars_expanded: bool,
+    pub char_replacements: Vec<CharReplacementRuleUi>,
+}
+
+/// Editable form of one character-substitution rule shown in the OCR panel.
+///
+/// `targets_raw` holds the user-facing quoted, comma-separated list of strings
+/// to replace (e.g. `'·', '…'`); it is parsed into concrete targets only when a
+/// runtime request is built. `enabled` toggles this single rule independently of
+/// the master "Заменять символы" checkbox.
+#[derive(Debug, Clone)]
+pub struct CharReplacementRuleUi {
+    pub enabled: bool,
+    pub targets_raw: String,
+    pub replacement: String,
+}
+
+impl CharReplacementRuleUi {
+    /// Builds a rule with the given raw target list and replacement, enabled.
+    fn new(targets_raw: &str, replacement: &str) -> Self {
+        Self {
+            enabled: true,
+            targets_raw: targets_raw.to_string(),
+            replacement: replacement.to_string(),
+        }
+    }
+}
+
+/// Default character substitutions: middle dots (`·`, `・`) become a period and
+/// the ellipsis character (`…`) becomes three periods.
+fn default_char_replacements() -> Vec<CharReplacementRuleUi> {
+    vec![
+        CharReplacementRuleUi::new("'·', '・'", "."),
+        CharReplacementRuleUi::new("'…'", "..."),
+    ]
 }
 
 impl Default for OcrPanelOptions {
@@ -53,6 +104,7 @@ impl Default for OcrPanelOptions {
             manga_model: "base_onnx".to_string(),
             paddle_lang: "korean_v5".to_string(),
             paddle_show_full_langs: false,
+            paddle_vl_script: "auto".to_string(),
             easy_langs: "ko".to_string(),
             easy_lang_to_add: "ko".to_string(),
             easy_show_full_langs: false,
@@ -62,11 +114,82 @@ impl Default for OcrPanelOptions {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
+            ai_api_service: AiApiService::OpenAi,
+            ai_api_model: AiApiService::OpenAi.default_model().to_string(),
+            ai_api_key_edit: String::new(),
+            ai_api_key_configured: None,
+            ai_api_models: Vec::new(),
+            ai_api_account_status: "Нажмите обновить.".to_string(),
+            ai_api_status: String::new(),
+            ai_api_system_instruction: "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /".to_string(),
             join_newlines: true,
             reflect_strings: false,
             copy_to_clipboard: true,
             create_bubble: true,
+            replace_chars_enabled: true,
+            replace_chars_expanded: false,
+            char_replacements: default_char_replacements(),
         }
+    }
+}
+
+impl OcrPanelOptions {
+    /// Builds the runtime substitution rules from the current panel state.
+    ///
+    /// Returns an empty vector when the master toggle is off. Each enabled UI
+    /// rule with a non-empty parsed target list contributes one runtime rule.
+    #[must_use]
+    pub fn runtime_char_replacements(&self) -> Vec<CharReplacementRule> {
+        if !self.replace_chars_enabled {
+            return Vec::new();
+        }
+        self.char_replacements
+            .iter()
+            .filter(|rule| rule.enabled)
+            .filter_map(|rule| {
+                let targets = parse_replacement_targets(&rule.targets_raw);
+                if targets.is_empty() {
+                    return None;
+                }
+                Some(CharReplacementRule {
+                    targets,
+                    replacement: rule.replacement.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Parses a quoted, comma-separated target list into concrete substrings.
+///
+/// Each comma-separated item may be wrapped in matching single or double quotes
+/// (`'·'` / `"·"`); the quotes are stripped. Unquoted items are taken verbatim
+/// after trimming. Empty items are skipped, so an empty or quotes-only entry
+/// yields no target.
+fn parse_replacement_targets(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|item| {
+            let trimmed = item.trim();
+            let unquoted = strip_matching_quotes(trimmed);
+            if unquoted.is_empty() {
+                None
+            } else {
+                Some(unquoted.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Strips a single pair of matching surrounding quotes (`'` or `"`) if present.
+fn strip_matching_quotes(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &text[1..text.len() - 1]
+    } else {
+        text
     }
 }
 
@@ -74,6 +197,9 @@ impl Default for OcrPanelOptions {
 pub struct OcrPanelActions {
     pub request_load: bool,
     pub options_changed: bool,
+    pub save_ai_api_key: bool,
+    pub clear_ai_api_key: bool,
+    pub refresh_ai_api_metadata: bool,
 }
 
 // Parameters represent distinct required inputs with no natural grouping.
@@ -128,6 +254,23 @@ pub fn draw_ocr_panel(
             "Самый жирный и продвинутый OCR, соответственно самый медленный.\nНе требует выбора языка, поддерживает 90 языков из коробки.",
         );
 
+        actions.options_changed |= ui
+            .selectable_value(&mut options.engine, OcrEngine::AiApi, "AI API")
+            .on_hover_text("Мультимодальные облачные модели через genai. API key хранится в системном хранилище секретов.")
+            .changed();
+
+    });
+    // Second engine row keeps wider engines off the first line so the side panel
+    // does not grow horizontally when a new engine is added.
+    ui.horizontal_wrapped(|ui| {
+        actions.options_changed |= disabled_ocr_engine_choice(
+            ui,
+            &mut options.engine,
+            OcrEngine::PaddleVl,
+            "PaddleOCR-VL",
+            torch_available,
+            "Vision-language OCR (Transformers).\nНе требует детекта текста и выбора языка, распознаёт текст сразу из изображения.",
+        );
     });
     match options.engine {
         OcrEngine::MangaOcr => {
@@ -218,7 +361,35 @@ pub fn draw_ocr_panel(
             });
             actions.options_changed |= draw_easy_selected_langs(ui, options);
         }
+        OcrEngine::PaddleVl => {
+            // PaddleOCR-VL auto-detects script; an optional hard-restriction mode
+            // constrains decoding to one writing system to curb hallucination on
+            // messy/handwritten text (no separate language model is selected).
+            normalize_paddle_vl_script(options);
+            WheelComboBox::from_label("Ограничение письменности")
+                .selected_text(paddle_vl_script_label(&options.paddle_vl_script))
+                .show_ui(ui, |ui| {
+                    for (key, label) in PADDLE_VL_SCRIPTS {
+                        actions.options_changed |= ui
+                            .selectable_value(
+                                &mut options.paddle_vl_script,
+                                (*key).to_string(),
+                                *label,
+                            )
+                            .changed();
+                    }
+                });
+            if options.paddle_vl_script != "auto" {
+                ui.small(
+                    "Жёсткий режим: модель выдаёт только выбранную письменность, цифры и знаки.",
+                );
+            }
+        }
+        // Surya auto-detects language and needs no selection UI here.
         OcrEngine::Surya => {}
+        OcrEngine::AiApi => {
+            draw_ai_api_options(ui, options, &mut actions);
+        }
     }
     if torch_mode_unavailable {
         ui.colored_label(
@@ -268,6 +439,7 @@ pub fn draw_ocr_panel(
     actions.options_changed |= ui
         .checkbox(&mut options.create_bubble, "Создавать пузырь")
         .changed();
+    draw_char_replacements(ui, options, &mut actions);
     let quick_label = match quick_selection_shortcut {
         Some(shortcut) if !shortcut.is_empty() => {
             format!("Быстрое распознавание: {shortcut}+ЛКМ")
@@ -339,6 +511,198 @@ pub fn draw_ocr_panel(
     actions
 }
 
+/// Renders the "Заменять символы" toggle plus its expandable rule editor.
+///
+/// The master checkbox enables substitution; clicking the label expands an
+/// indented list where each row edits one rule (per-row enable, quoted target
+/// list, replacement text, delete) and a button appends a new empty rule.
+fn draw_char_replacements(
+    ui: &mut egui::Ui,
+    options: &mut OcrPanelOptions,
+    actions: &mut OcrPanelActions,
+) {
+    ui.horizontal(|ui| {
+        actions.options_changed |= ui
+            .checkbox(&mut options.replace_chars_enabled, "")
+            .on_hover_text("Заменять отдельные символы в распознанном тексте.")
+            .changed();
+        let arrow = if options.replace_chars_expanded {
+            "⏷"
+        } else {
+            "⏵"
+        };
+        let header = ui
+            .add(egui::Label::new(format!("{arrow} Заменять символы")).sense(egui::Sense::click()));
+        if header.clicked() {
+            options.replace_chars_expanded = !options.replace_chars_expanded;
+        }
+    });
+
+    if !options.replace_chars_expanded {
+        return;
+    }
+
+    ui.indent("ocr_char_replacements", |ui| {
+        let mut to_remove: Option<usize> = None;
+        for (idx, rule) in options.char_replacements.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                actions.options_changed |= ui
+                    .checkbox(&mut rule.enabled, "")
+                    .on_hover_text("Включить эту строку замены")
+                    .changed();
+                actions.options_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut rule.targets_raw)
+                            .desired_width(96.0)
+                            .hint_text("'·', '…'"),
+                    )
+                    .on_hover_text("Что заменять: значения в кавычках через запятую.")
+                    .changed();
+                ui.label("→");
+                actions.options_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut rule.replacement)
+                            .desired_width(64.0)
+                            .hint_text("."),
+                    )
+                    .on_hover_text("На что заменять.")
+                    .changed();
+                if ui
+                    .small_button("🗑")
+                    .on_hover_text("Удалить строку")
+                    .clicked()
+                {
+                    to_remove = Some(idx);
+                }
+            });
+        }
+        if let Some(idx) = to_remove {
+            options.char_replacements.remove(idx);
+            actions.options_changed = true;
+        }
+        if ui.button("Добавить замену").clicked() {
+            options.char_replacements.push(CharReplacementRuleUi {
+                enabled: true,
+                targets_raw: String::new(),
+                replacement: String::new(),
+            });
+            actions.options_changed = true;
+        }
+    });
+}
+
+fn draw_ai_api_options(
+    ui: &mut egui::Ui,
+    options: &mut OcrPanelOptions,
+    actions: &mut OcrPanelActions,
+) {
+    let max_width = ui.available_width().min(300.0);
+    let max_height = ai_api_options_max_height(ui);
+    let old_service = options.ai_api_service;
+    egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width(max_width);
+                ui.label("Сервис");
+                WheelComboBox::from_id_salt("translation_ocr_ai_api_service")
+                    .selected_text(options.ai_api_service.label())
+                    .show_ui(ui, |ui| {
+                        for service in AiApiService::ALL {
+                            actions.options_changed |= ui
+                                .selectable_value(
+                                    &mut options.ai_api_service,
+                                    service,
+                                    service.label(),
+                                )
+                                .changed();
+                        }
+                    });
+                if old_service != options.ai_api_service {
+                    options.ai_api_model = options.ai_api_service.default_model().to_string();
+                    options.ai_api_key_edit.clear();
+                    options.ai_api_key_configured = None;
+                    options.ai_api_models.clear();
+                    options.ai_api_account_status = "Нажмите обновить.".to_string();
+                    options.ai_api_status.clear();
+                    actions.options_changed = true;
+                    actions.refresh_ai_api_metadata = true;
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    let key_state = match options.ai_api_key_configured {
+                        Some(true) => "key сохранен",
+                        Some(false) => "key не задан",
+                        None => "key не проверен",
+                    };
+                    ui.small(key_state);
+                    if ui.small_button("Обновить").clicked() {
+                        actions.refresh_ai_api_metadata = true;
+                    }
+                });
+
+                ui.label("API key");
+                ui.add(
+                    egui::TextEdit::singleline(&mut options.ai_api_key_edit)
+                        .password(true)
+                        .desired_width(max_width),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("Сохранить").clicked() {
+                        actions.save_ai_api_key = true;
+                    }
+                    if ui.small_button("Удалить").clicked() {
+                        actions.clear_ai_api_key = true;
+                    }
+                });
+                if !options.ai_api_status.trim().is_empty() {
+                    ui.small(options.ai_api_status.clone());
+                }
+
+                ui.label("Модель");
+                let selected_model = compact_middle(&options.ai_api_model, 42);
+                WheelComboBox::from_id_salt("translation_ocr_ai_api_model")
+                    .selected_text(selected_model)
+                    .show_ui(ui, |ui| {
+                        let models = if options.ai_api_models.is_empty() {
+                            vec![options.ai_api_service.default_model().to_string()]
+                        } else {
+                            options.ai_api_models.clone()
+                        };
+                        for model in models {
+                            actions.options_changed |= ui
+                                .selectable_value(&mut options.ai_api_model, model.clone(), model)
+                                .changed();
+                        }
+                    });
+                actions.options_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut options.ai_api_model)
+                            .desired_width(max_width)
+                            .hint_text("model id"),
+                    )
+                    .changed();
+
+                ui.label("Баланс и лимиты");
+                ui.small(options.ai_api_account_status.clone());
+
+                ui.label("Системная инструкция");
+                actions.options_changed |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut options.ai_api_system_instruction)
+                            .desired_width(max_width)
+                            .desired_rows(4),
+                    )
+                    .changed();
+            });
+        });
+}
+
+fn ai_api_options_max_height(ui: &egui::Ui) -> f32 {
+    (ui.ctx().content_rect().height() * 0.7 - OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE).max(140.0)
+}
+
 fn disabled_ocr_engine_choice(
     ui: &mut egui::Ui,
     selected_engine: &mut OcrEngine,
@@ -364,6 +728,20 @@ fn disabled_ocr_engine_choice(
         return true;
     }
     false
+}
+
+fn compact_middle(text: &str, max_chars: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars || max_chars < 8 {
+        return text.to_string();
+    }
+    let keep = (max_chars - 1) / 2;
+    let start = chars.iter().take(keep).collect::<String>();
+    let end = chars
+        .iter()
+        .skip(chars.len().saturating_sub(keep))
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 fn disabled_manga_model_choice(
@@ -392,13 +770,40 @@ fn disabled_manga_model_choice(
 
 fn selected_ocr_mode_requires_torch(options: &OcrPanelOptions) -> bool {
     match options.engine {
-        OcrEngine::EasyOcr | OcrEngine::Surya => true,
+        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
         OcrEngine::MangaOcr => options
             .manga_model
             .trim()
             .eq_ignore_ascii_case("base_torch"),
-        OcrEngine::PaddleOcr => false,
+        OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
     }
+}
+
+// PaddleOCR-VL writing-system restriction modes: (wire key, UI label). `auto`
+// keeps the model's native multilingual detection; the others hard-restrict
+// decoding to that script. Keys must match `script_constraint.normalize_script`.
+const PADDLE_VL_SCRIPTS: &[(&str, &str)] = &[
+    ("auto", "Авто (без ограничения)"),
+    ("korean", "Только корейский"),
+    ("chinese", "Только китайский"),
+    ("japanese", "Только японский"),
+];
+
+fn normalize_paddle_vl_script(options: &mut OcrPanelOptions) {
+    let normalized = options.paddle_vl_script.trim().to_ascii_lowercase();
+    if !PADDLE_VL_SCRIPTS.iter().any(|(key, _)| *key == normalized) {
+        options.paddle_vl_script = "auto".to_string();
+    } else {
+        options.paddle_vl_script = normalized;
+    }
+}
+
+fn paddle_vl_script_label(script: &str) -> &'static str {
+    PADDLE_VL_SCRIPTS
+        .iter()
+        .find(|(key, _)| *key == script)
+        .map(|(_, label)| *label)
+        .unwrap_or("Авто (без ограничения)")
 }
 
 fn paddle_language_options(show_full: bool) -> &'static [(&'static str, &'static str)] {
@@ -600,4 +1005,52 @@ fn parse_lang_codes(raw: &str) -> Vec<String> {
         out.push(normalized);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OcrPanelOptions, parse_replacement_targets};
+
+    #[test]
+    fn parses_quoted_comma_separated_targets() {
+        assert_eq!(parse_replacement_targets("'·', '・'"), vec!["·", "・"]);
+        assert_eq!(parse_replacement_targets("\"…\""), vec!["…"]);
+        assert_eq!(parse_replacement_targets("·, ・"), vec!["·", "・"]);
+    }
+
+    #[test]
+    fn skips_empty_and_quotes_only_targets() {
+        assert!(parse_replacement_targets("").is_empty());
+        assert!(parse_replacement_targets("'', \"\"").is_empty());
+        assert_eq!(parse_replacement_targets("'·', ''").to_vec(), vec!["·"]);
+    }
+
+    #[test]
+    fn default_options_yield_dot_substitutions() {
+        let options = OcrPanelOptions::default();
+        let runtime = options.runtime_char_replacements();
+        assert_eq!(runtime.len(), 2);
+        assert_eq!(runtime[0].targets, vec!["·", "・"]);
+        assert_eq!(runtime[0].replacement, ".");
+        assert_eq!(runtime[1].targets, vec!["…"]);
+        assert_eq!(runtime[1].replacement, "...");
+    }
+
+    #[test]
+    fn master_toggle_off_disables_all_rules() {
+        let options = OcrPanelOptions {
+            replace_chars_enabled: false,
+            ..Default::default()
+        };
+        assert!(options.runtime_char_replacements().is_empty());
+    }
+
+    #[test]
+    fn disabled_rule_is_skipped() {
+        let mut options = OcrPanelOptions::default();
+        options.char_replacements[0].enabled = false;
+        let runtime = options.runtime_char_replacements();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(runtime[0].targets, vec!["…"]);
+    }
 }

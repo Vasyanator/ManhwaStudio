@@ -9,11 +9,15 @@ FILE HEADER (tabs/typing/mod.rs)
     и реализацией в `pipeline.rs`.
   - `panel`: верхняя фиксированная панель вкладки `Текст` (layout + режимы).
   - `mask`: бинарная маска обрезки страниц (загрузка/редактирование/сохранение/клип).
+  - `segmentation`: сегментатор текста (разбивка на блоки + правила соединения при
+    переносе) с языко-нейтральным `base` и реализациями языков (`ru`).
 */
 mod auto_typing;
 mod mask;
 mod panel;
+mod psd_export;
 pub mod render_next;
+mod segmentation;
 mod tab;
 
 pub use panel::{TypingPanelLayout, TypingTopPanelState};

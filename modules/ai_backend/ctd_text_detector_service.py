@@ -12,7 +12,6 @@ Main responsibilities:
 
 from __future__ import annotations
 
-import base64
 import gc
 import threading
 from pathlib import Path
@@ -369,7 +368,7 @@ class CtdTextDetectorService:
         return {
             "source_size": [int(w), int(h)],
             "blocks": self._collect_blocks(blocks, int(w), int(h)),
-            "mask_png_base64": self._encode_mask_png_base64(mask_refined),
+            "mask_png": self._encode_mask_png_bytes(mask_refined),
         }
 
     def _apply_mask_dilate(self, mask, params: dict[str, Any]):
@@ -392,19 +391,19 @@ class CtdTextDetectorService:
         )
         return cv2.dilate(mask, element)
 
-    def _encode_mask_png_base64(self, mask) -> str:
+    def _encode_mask_png_bytes(self, mask) -> bytes:
         if mask is None:
-            return ""
+            return b""
         cv2 = self._ensure_cv2_locked()
         try:
             binary = cv2.convertScaleAbs(mask)
             _, binary = cv2.threshold(binary, 30, 255, cv2.THRESH_BINARY)
             ok, encoded = cv2.imencode(".png", binary)
             if not ok:
-                return ""
-            return base64.b64encode(encoded.tobytes()).decode("ascii")
+                return b""
+            return encoded.tobytes()
         except Exception:
-            return ""
+            return b""
 
 
 def _resolve_selected_backend_device(fallback: str) -> str:

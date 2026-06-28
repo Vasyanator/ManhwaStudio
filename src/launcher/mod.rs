@@ -33,6 +33,7 @@ pub mod psd_import_window;
 pub mod state;
 pub mod theme;
 
+use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::config;
 use crate::launcher::state::{LauncherOutcome, UpdateNotification};
 use std::sync::mpsc::Receiver;
@@ -46,15 +47,17 @@ const LAUNCHER_TEST_APP_ID: &str = "manhwastudio_rs.launcher_test";
 pub fn run_launcher(
     user_settings: &serde_json::Value,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+    ai_backend: &AiBackendHandle,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
-    run_launcher_internal(user_settings, false, update_check_rx)
+    run_launcher_internal(user_settings, false, update_check_rx, ai_backend)
 }
 
 pub fn run_test_launcher(
     user_settings: &serde_json::Value,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+    ai_backend: &AiBackendHandle,
 ) -> anyhow::Result<()> {
-    let _ = run_launcher_internal(user_settings, true, update_check_rx)?;
+    let _ = run_launcher_internal(user_settings, true, update_check_rx, ai_backend)?;
     Ok(())
 }
 
@@ -62,9 +65,11 @@ fn run_launcher_internal(
     user_settings: &serde_json::Value,
     test_mode: bool,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+    ai_backend: &AiBackendHandle,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
     let projects_root = config::projects_root_from_user_settings(user_settings);
     let user_settings = user_settings.clone();
+    let ai_backend = ai_backend.clone();
     let output_outcome = Arc::new(Mutex::new(None::<LauncherOutcome>));
     let output_outcome_for_app = Arc::clone(&output_outcome);
     crate::runtime_log::log_info(format!(
@@ -102,6 +107,7 @@ fn run_launcher_internal(
                 &user_settings,
                 Arc::clone(&output_outcome_for_app),
                 update_check_rx,
+                ai_backend.clone(),
             )))
         }),
     )

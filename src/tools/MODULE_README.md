@@ -6,8 +6,7 @@ do not belong to a single tab. The current module provides reusable mask-brush b
 editing `egui::ColorImage` and binary alpha buffers.
 
 ## Architecture
-`mod.rs` is the public boundary. It exports `MaskBrush` and `paint_line_with_brush` from
-`mask_brush.rs`.
+`mod.rs` is the public boundary. It exports `MaskBrush` from `mask_brush.rs`.
 
 `MaskBrush` stores only brush configuration and short-lived wheel gesture state. It handles brush
 radius changes from Shift+wheel and size hotkeys, draws a circle cursor in an egui image viewport,
@@ -19,8 +18,8 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 
 ## Files and submodules
 - `mod.rs`: shared-tool module exports.
-- `mask_brush.rs`: `MaskBrush`, `paint_line_with_brush`, ColorImage painting helpers, binary-mask
-  painting helpers, radius input handling, and cursor drawing.
+- `mask_brush.rs`: `MaskBrush`, internal ColorImage painting helpers, binary-mask painting helpers,
+  radius input handling, and cursor drawing.
 
 ## Contracts and invariants
 - `MaskBrush` is UI/tool state, not durable project state. Do not serialize it into project files.

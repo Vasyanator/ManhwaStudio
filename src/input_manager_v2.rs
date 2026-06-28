@@ -106,6 +106,10 @@ pub struct HotkeyCommandV2 {
     pub scope: HotkeyScopeV2,
     pub active_when_input: bool,
     pub binding: HotkeyBindingV2,
+    /// Whether this command's keyboard shortcut was held on the previous `collect_triggered` call.
+    /// Used to fire only on the rising edge of a press, so holding a key does not repeat the command
+    /// (a new activation requires releasing and pressing the key again).
+    last_shortcut_held: bool,
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +142,7 @@ impl InputManagerV2 {
             scope: spec.scope,
             active_when_input: spec.active_when_input,
             binding,
+            last_shortcut_held: false,
         });
         self.bindings_revision = self.bindings_revision.saturating_add(1);
     }
@@ -266,14 +271,12 @@ impl InputManagerV2 {
         let wants_keyboard_input = ctx.wants_keyboard_input();
         let mut triggered = Vec::new();
 
-        for command in &self.commands {
-            if !command.binding.enabled {
-                continue;
-            }
-            if !matches_scope(command.scope, active_tab) {
-                continue;
-            }
-            if wants_keyboard_input && !command.active_when_input {
+        for command in &mut self.commands {
+            if !command.binding.enabled
+                || !matches_scope(command.scope, active_tab)
+                || (wants_keyboard_input && !command.active_when_input)
+            {
+                command.last_shortcut_held = false;
                 continue;
             }
 
@@ -282,12 +285,23 @@ impl InputManagerV2 {
             }
 
             let Some(shortcut) = command.binding.shortcut else {
+                command.last_shortcut_held = false;
                 continue;
             };
 
-            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+            // Consume the press event (including auto-repeats) so it does not propagate, but fire
+            // only on the rising edge: when the shortcut is freshly pressed and was not already held
+            // on the previous frame. Holding the key therefore activates the command exactly once;
+            // a new activation requires releasing and pressing the key again.
+            let pressed_event = ctx.input_mut(|i| i.consume_shortcut(&shortcut));
+            let held = ctx.input(|i| {
+                i.key_down(shortcut.logical_key)
+                    && i.modifiers.matches_logically(shortcut.modifiers)
+            });
+            if pressed_event && !command.last_shortcut_held {
                 triggered.push(command.id.clone());
             }
+            command.last_shortcut_held = held;
         }
 
         triggered

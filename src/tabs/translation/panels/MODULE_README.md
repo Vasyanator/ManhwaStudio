@@ -24,17 +24,32 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 
 ## Files and submodules
 - `mod.rs`: panel module declarations.
-- `ocr.rs`: OCR engine/language/model controls, behavior toggles, load action, selection-mode
-  hints, and last result/error preview.
+- `ocr.rs`: OCR engine/language/model controls, AI API provider/key/model controls, behavior
+  toggles, load action, selection-mode hints, and last result/error preview. The "Заменять
+  символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
+  quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
+  enabled rows into `CharReplacementRule`s carried by `OcrRecognizeRequest`, and the OCR worker
+  applies them to the recognized result. Wider engines
+  (PaddleOCR-VL) live on a second engine row to keep the side panel from widening; PaddleOCR-VL
+  shows no language/model controls (only an optional writing-system restriction: auto / korean /
+  chinese / japanese) and is disabled when PyTorch is unavailable.
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
   actions, and line/mask edit mode toggles.
-- `machine_translation.rs`: MT provider and source/target language controls plus start/cancel
-  actions.
+- `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
+  provider/key/model/prompt/batching/context controls, multimodal ImageBubble inclusion and image
+  visual-detail controls, plus start/cancel actions. On the AI API tab the start buttons also expose
+  a right-click "Отобразить полный запрос" debug action (`MtPanelActions::preview_request_page` /
+  `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
+  sending it.
 - `bubbles.rs`: searchable bubble cards, debounced original/translation text syncing, footer field
   editing, character filters, and card context actions.
 - `composition.rs`: composed text generation from project bubbles, plain/MiniJinja formatting
-  options, and TXT/DOCX export helpers.
+  options, and TXT/DOCX export helpers. ImageBubbles are gated by the `include_image_bubbles`
+  option: when enabled, each text area contributes one line `{translation}` (plus ` - {description}`
+  when `use_character_names` is on and the description is non-empty); area 0 reads the legacy
+  fields, later areas read `extra["text_areas"]`. The MiniJinja path simply includes/excludes image
+  bubbles by the same option (their serialized `extra` already exposes `text_areas`).
 
 ## Contracts and invariants
 - Panels must not start long-running work directly. They return typed actions for `tab.rs` to
@@ -43,7 +58,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   state machines.
 - Option structs are the settings boundary between panel UI, project settings persistence, and
   controller request construction. Keep parser/writer mappings in `tab.rs` synchronized when
-  adding fields.
+  adding fields. API keys edited in the OCR panel are transient UI input and must be saved only via
+  controller actions to the OS credential store, not serialized into project settings.
 - `bubbles.rs` must write bubble text through `CanvasView` APIs and footer fields through the
   parent tab patch queue; it must not mutate `ProjectData` directly.
 - Composition export may perform file writes from panel helpers because it is an explicit user

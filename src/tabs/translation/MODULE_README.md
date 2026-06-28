@@ -11,11 +11,12 @@ state, and debounced settings persistence.
 
 Long work is delegated to focused controllers:
 
-- `ocr.rs` owns the OCR worker, backend HTTP transport, page crop/cache handling, and per-engine
-  load state.
+- `ocr.rs` owns the OCR worker, backend IPC transport (framed `shared_client()`), AI API OCR
+  transport, page crop/cache handling, OS credential-store API key access, and per-engine load state.
 - `text_detector.rs` owns the text detector worker and returns page boxes plus editable binary
   masks.
-- `machine_translation.rs` owns MT run threads, cancellation, and stale-event filtering.
+- `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
+  cancellation, and stale-event filtering.
 - `backend_health.rs` owns the shared Python backend probe snapshot used by Translation and
   Settings.
 
@@ -27,12 +28,40 @@ Text-detector mask GPU textures are a reconstructable display cache. The tab exp
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
 text-mask data remain intact for redraw, editing, and disk persistence.
 
-Python-backed OCR/detector routes call the backend service on `127.0.0.1` using the runtime port
-published by `backend_health.rs`. The default port is `8765`, but the Settings backend process
-manager may switch to a free port when the default is occupied and launch `ai_backend.py --port`.
-App-managed model files must be resolved through `src/ai_models.rs` before backend initialization;
-EasyOCR and Surya library caches remain backend/library-managed. PaddleOCR detector-only downloads
-only detection files, while full PaddleOCR also downloads the selected recognition language.
+Python-backed OCR/detector routes call the backend service over the framed IPC protocol on the
+AF_UNIX socket from `backend_ipc::backend_socket_path()`. All backend transport goes through
+`crate::backend_ipc::shared_client()`; `backend_health.rs` owns no TCP/port state. OCR requests use
+`begin_call`/`CallHandle` for explicit cancellation (replacing legacy "latest-wins" behavior). App-managed
+model files must be resolved through `src/ai_models.rs` before backend initialization; EasyOCR,
+Surya, and PaddleOCR-VL library/Hugging Face caches remain backend/library-managed. PaddleOCR
+detector-only downloads only detection files, while full PaddleOCR also downloads the selected
+recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
+engine that needs no text detection and no language selection; it is shown on a second engine row in
+the OCR panel so the side panel stays narrow.
+AI API OCR bypasses the Python backend and uses Rust `genai` from the OCR worker thread; provider
+API keys must be read/written through the OS credential store and never persisted to project or
+user JSON settings.
+AI API MT also bypasses the Python backend. Plain untranslated text batches are sent grouped by
+character and require flat JSON responses containing every bubble ID. When the "existing translation
+in context" option is on, a scope translation also includes already-translated replicas as ordered
+read-only context (`MtTranslateItem.needs_translation == false`, flagged `"context": true` with
+their existing translation); such batches switch to the ordered per-item representation so the model
+sees the exact reading-order interleaving. `split_ai_mt_batches` keeps context around the
+translatable replicas but cuts each batch right after its `batch_size`-th translatable replica, so a
+context replica beyond a reached per-batch limit is deferred until translation reaches its window;
+context replicas are never returned, counted, or reported as failures. When ImageBubble inclusion is enabled for a
+multimodal model, the MT worker attaches each image in ordered message parts using the selected
+visual detail level and requires `original_text` plus `translation` for those IDs. A multi-area
+ImageBubble is sent as one item whose `MtImageInput.areas` lists every text area (description,
+current original, image-relative bbox); the model must return
+`{id, areas:[{original_text, translation}, ...]}` and the per-area result is applied through
+`CanvasView::apply_machine_translation_areas`. Binary image
+parts are sent only in the active API request; retained chat history stores a text-only batch
+record so image payload bytes do not consume the normal context budget. It keeps chat history
+between batches and prunes old user/assistant turns when the configured context-fill budget is
+exceeded. Progress events expose translated/error counts, approximate context usage, and the number
+of replicas removed during context pruning; batches may include existing bubble translations when
+the user enables that context option.
 
 ## Files and submodules
 - `mod.rs`: module wiring and public re-exports for `TranslationTabState`, hotkey IDs, and hotkey
@@ -40,22 +69,25 @@ only detection files, while full PaddleOCR also downloads the selected recogniti
 - `tab.rs`: main tab state, canvas hooks, panel routing, OCR region selection, advanced-recognition
   integration, footer metadata sync, text-detection mask/line editing, detector result storage,
   MT dispatch, and coalesced translation settings persistence.
-- `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, persistent backend HTTP client,
-  crop encoding, page image LRU cache, and model-download/load-state events.
+- `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
+  `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR via `genai`,
+  credential-store API key commands, crop encoding, page image LRU cache, and
+  model-download/load-state events.
 - `text_detector.rs`: `TranslationTextDetectorController`, local classic detector, backend
   PaddleOCR/CTD/Surya detector calls, mask decoding/building, detector batch progress, and helper
   routes reused by cleaning tools for region masks.
-- `machine_translation.rs`: `TranslationMtController`, `MtService`, batch item/request types,
-  per-run worker thread lifecycle, cancellation, and backend dispatch.
+- `machine_translation.rs`: `TranslationMtController`, `MtService`, AI API MT options, batch
+  item/request types including optional ImageBubble image payloads, per-run worker thread
+  lifecycle, cancellation, chat context pruning, JSON response parsing, and backend dispatch.
 - `machine_translators/`: UI-agnostic Google, Yandex, and DeepL MT provider implementations behind
   `MachineTranslatorBackend`.
 - `panels/`: side-panel UI modules for OCR, bubble cards/footer fields, machine translation,
   text detector controls, composed text, and OCR language catalogs.
 - `adv_rec.rs`: floating advanced-recognition crop preview/editor with async crop preparation,
   brush overlay, rotation, zoom, and local quick-selection OCR actions.
-- `backend_health.rs`: backend `/health`, backend version snapshot, `/device`, ONNX provider,
-  max-loaded-models, and
-  diagnostics probe helpers.
+- `backend_health.rs`: push-driven backend health via `TOPIC_HEALTH` v2 events (with a one-shot
+  `health` pull as the startup/liveness fallback), backend version snapshot, plus `device`
+  get/set, ONNX provider, max-loaded-models, and CUDA diagnostics helpers.
 
 ## Contracts and invariants
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
@@ -68,21 +100,44 @@ only detection files, while full PaddleOCR also downloads the selected recogniti
   result data, text-mask model data, and pending storage jobs.
 - Persisted detector results live under `ProjectPaths::text_detection_dir`; storage jobs must load
   and save real block/mask data rather than synthesizing success.
-- Footer metadata lives in `Bubble.extra` fields and is synchronized through debounced
-  `CanvasView::patch_bubble_extra_fields` calls.
+- Footer metadata and ImageBubble metadata live in `Bubble.extra` fields and are synchronized
+  through debounced `CanvasView::patch_bubble_extra_fields` calls. Image bubbles do not expose the
+  translation character autocomplete; their panel controls edit source type, image path/crop page,
+  description, original text, and translation. Translation owns ImageBubble shortcuts: `Q` creates
+  an empty external-image bubble under the pointer, and `Shift+Q` captures a drag rectangle as the
+  page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
+  files are written to the chapter unsaved staging `image_bubbles/` directory and stored as
+  chapter-relative paths so the saved chapter can resolve them after commit.
 - App-managed OCR/detector model downloads must go through `src/ai_models.rs`. Missing models,
-  backend failures, and unsupported engines must surface clear errors.
+  backend failures, unavailable credential stores, AI API request failures, and unsupported engines
+  must surface clear errors.
 - MT worker events are accepted only for the active run id; cancelled/detached run output must not
-  mutate canvas state.
+  mutate canvas state. AI API MT responses must be matched by bubble ID before applying text; for
+  ImageBubble results, original text and translation are applied together.
+- A failed AI run whose error matches `is_probable_quota_or_limit_error` (keyword/HTTP-code scan)
+  stops quietly: instead of a red error toast the panel shows the sticky `MtStopNotice` with the
+  full provider error available behind a toggle. Other run failures keep the red toast.
+- `build_ai_mt_request_preview` assembles the first AI request (system prompt + first batch user
+  message with decoded inline images) without contacting the provider, reusing the exact item sort,
+  batch split, and `build_ai_mt_user_parts` ordering as a real run. `tab.rs` runs it on a worker
+  thread (it loads/decodes images) and shows the result in the debug "Полный запрос" window; the
+  per-button right-click action only applies to the AI API tab.
+- The AI MT worker emits diagnostic lines to `runtime_log` (session `last.log`) tagged
+  `[MT][run <id>]`: a run-start summary (service, model, batch counts, translate/context/total item
+  counts, image-bubble count, image detail, context budget), one line per batch before the request
+  (replica/translate/context counts, attached image count and KiB, history depth, pruned total) and
+  one after the response (response length, parsed entry count or parse error), plus the per-batch
+  and final translated/errors totals. Raw provider request errors are logged before being wrapped
+  into `RunFailed`. Logging must never include API keys or image binary contents.
 - Shared model locks must be short-lived and released before image decoding, HTTP calls,
   composition/export, storage I/O, or callbacks.
 
 ## Editing map
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
   detector storage, footer sync, or settings persistence, edit `tab.rs`.
-- To change OCR engine options, loading, recognition requests, backend endpoints, crop handling, or
+- To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
-- To change text detector algorithms, masks, backend detector endpoints, or cleaning-tool detector
+- To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector
   helpers, edit `text_detector.rs` and `panels/text_detector.rs`.
 - To change MT run lifecycle, provider selection, cancellation, or batch dispatch, edit
   `machine_translation.rs`, `machine_translators/`, and `panels/machine_translation.rs`.

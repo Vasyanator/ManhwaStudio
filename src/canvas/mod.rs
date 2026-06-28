@@ -10,7 +10,8 @@ Main types:
 - `CanvasScenePageFrame`: geometry snapshot for one page row within the scene pass.
 - `OverlayUploadBudget`: per-frame clean-overlay upload budget used to keep GUI responsive.
 - `BubbleAction`: user actions emitted from bubble UI (`Translate`, `Delete`).
-- `BubbleType`: per-bubble stored type (`Default`, `Aside`, `OnTop`); `Default` resolves
+- `BubbleClass`: per-bubble domain class (`Text`, `Image`).
+- `BubbleType`: per-text-bubble stored display type (`Default`, `Aside`, `OnTop`); `Default` resolves
   through canvas editable/readonly settings before rendering.
 - `BubbleMode`: legacy persisted canvas mode retained for settings migration/compatibility.
 - `BubbleCopyPasteTarget`: bubble context-menu paste targets (`Original`, `Translation`, `WholeBubble`).
@@ -135,7 +136,9 @@ CanvasView method map:
   `apply_canvas_snapshot`, `publish_canvas_settings`, `canvas_snapshot`,
   `queue_canvas_settings_save`.
 - Bubble layout/edit helpers:
-  `calc_bubble_width`, `aside_scale_factor`, `page_bubbles`, `apply_pending_actions`,
+  `calc_bubble_width`, `aside_scale_factor`, `page_bubbles`, `page_bubbles_bucketed`,
+  `hook_bubbles_snapshot`, `hook_bubbles_revision`,
+  `commit_lingering_drag_gestures_on_pointer_up`, `apply_pending_actions`,
   `schedule_text_upsert`, `commit_text_upsert_now`, `promote_debounced_text_upserts`,
   `flush_bubble_upserts_to_model`, `create_bubble_at`, `place_or_move_bubble`,
   `create_bubble_from_canvas_context_menu`, `move_bubble_anchor`, `move_bubble_anchor_impl`,
@@ -153,11 +156,11 @@ CanvasState lifecycle:
 
 Module-level utility functions:
 - Overlay/image processing:
-  `sanitize_clipboard_text`, `blit_scaled_chunk`, `build_overlay_prepared_tiles`,
+  `sanitize_clipboard_text`, `blit_scaled_chunk`,
   `rgba_from_overlay_tile`, `build_overlay_tile_image`, `paint_line_with_brush`, `paint_circle`.
 - Bubble metadata and hashing:
   `bubble_side`, `side_to_string`, `bubbles_stamp`, `bubble_fingerprint`,
-  `bubble_fingerprint_with_hasher`, `bubbles_history_hash`.
+  `bubble_fingerprint_with_hasher`.
 - Rect coords serialization defaults:
   `default_rect_coords`, `default_rect_coords_from_source_px`,
   `rect_coords_from_bubble`, `rect_coords_from_value`, `read_rect_coord_value`,
@@ -181,7 +184,10 @@ Key CanvasView state groups (important fields):
 - Async settings persistence: `last_published_canvas_snapshot`,
   `canvas_settings_save_tx`, `canvas_settings_save_thread`.
 - Pixel inspection: `pixel_sampling_nearest` and `pixel_grid_visible` are transient canvas render
-  switches for tab-owned inspection modes; they are not persisted in `CanvasState`.
+  switches for tab-owned inspection modes; they are not persisted in `CanvasState`. Both are driven
+  from one DPI-correct magnification notion (`device_pixels_per_source` / `pixel_inspection_recommended`,
+  threshold `PIXEL_INSPECTION_MIN_DEVICE_PX`), so NEAREST sampling and the grid switch together. The
+  grid is painted in a single late overlay pass (`draw_pixel_grid_overlay`), never in base layers.
 */
 
 use self::bubble_runtime::BubbleRuntimeState;
@@ -192,21 +198,25 @@ use self::settings::CanvasSettingsRuntime;
 use self::types::{OverlayUploadBudget, RuntimeBubble};
 use crate::app::{PageImageInfo, PageTexture};
 use crate::bubble_status::BubbleBorderStyle;
-use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest, CacheResourceInfo};
+use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest};
 use crate::models::bubbles_model::runtime_bubble_to_record;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{Bubble, ProjectData};
 use crate::runtime_log;
-use crate::widgets::{queue_word_to_global_exceptions, queue_word_to_project_exceptions};
+use crate::widgets::{
+    BarGeometry, ScrollMark, paint_marks_on_bar, queue_word_to_global_exceptions,
+    queue_word_to_project_exceptions,
+};
 use arboard::Clipboard;
 use eframe::egui;
-use egui::{Pos2, Rect, Vec2};
+use egui::{Pos2, Rect, TextureHandle, Vec2};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasViewportSnapshot {
@@ -226,7 +236,12 @@ mod overlay_runtime;
 mod scene;
 mod settings;
 mod types;
+mod view_transform;
 mod workers;
+
+// Shadow-only world<->screen transform. Computed from the current ScrollArea
+// layout each frame but not yet consumed; future increments make it authoritative.
+pub(crate) use self::view_transform::ViewTransform;
 
 pub(crate) use self::settings::{
     save_canvas_settings_to_project_file, save_canvas_settings_to_user_file,
@@ -234,10 +249,15 @@ pub(crate) use self::settings::{
 
 pub use self::workers::spawn_overlay_autosave_thread;
 
+// Image-bubble text-area parsing is shared with the typing tab, which seeds created text overlays
+// from the per-area text of read-only image bubbles.
+pub(crate) use self::helpers::parse_image_text_areas;
+pub(crate) use self::types::ImageTextArea;
+
 pub use self::types::{
-    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleAction, BubbleCopyPasteTarget, BubbleMode,
-    BubbleTextField, BubbleType, CanvasState, CanvasUiStatus, OnTopFocusMode, OverlayRectPx,
-    RectCoords, SourceTextureUploadBudget,
+    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleAction, BubbleClass, BubbleCopyPasteTarget,
+    BubbleMode, BubbleTextField, BubbleType, CanvasState, CanvasUiStatus, OnTopFocusMode,
+    OverlayRectPx, RectCoords, SourceTextureUploadBudget, TranslationStatusDisplay,
 };
 
 const TEXT_UPSERT_DEBOUNCE_SECS: f64 = 1.0;
@@ -255,10 +275,150 @@ const BUBBLE_MIN_ANCHOR_MARGIN_PX: f32 = 10.0;
 const BUBBLE_ANCHOR_OUTSIDE_RECT_SPAN_MULT: f32 = 0.0;
 const DUPLICATE_BUBBLE_OFFSET_PX: f32 = 40.0;
 const ON_TOP_FOOTER_RESERVED_HEIGHT_PX: f32 = 220.0;
+/// Floor for the image-bubble preview zoom factor: when zoomed out, the preview
+/// image never shrinks below 20% of its fit-to-bubble size.
+const IMAGE_BUBBLE_PREVIEW_MIN_ZOOM_SCALE: f32 = 0.2;
+
+/// How long a cached external image-bubble file fingerprint (`len:mtime`) stays valid
+/// before the next preview-key check re-stats the file. Bounds external-file `fs::metadata`
+/// calls to once per bubble per interval instead of once per frame; an external file edit is
+/// still picked up within this window.
+const IMAGE_BUBBLE_META_THROTTLE: Duration = Duration::from_secs(1);
+
+/// Minimum device pixels per source pixel at which pixel inspection (NEAREST
+/// sampling plus the pixel grid) becomes useful.
+///
+/// This is resolution-correct: the trigger depends on the physical
+/// magnification (`zoom * pixels_per_point`), not raw `zoom`, so the same
+/// on-screen pixel size enables inspection on any DPI. ~4 device pixels per
+/// source pixel is where a 1-device-pixel grid line stays legible and NEAREST
+/// sampling is wanted to read individual source pixels.
+pub(crate) const PIXEL_INSPECTION_MIN_DEVICE_PX: f32 = 4.0;
+
+/// Device pixels rendered per source pixel for a given canvas zoom and DPI.
+///
+/// `zoom` is screen points per source pixel; `pixels_per_point` is device
+/// pixels per screen point. The product is device pixels per source pixel,
+/// clamped to be non-negative. This is the single magnification notion used to
+/// gate pixel inspection and the pixel grid.
+#[must_use]
+pub(crate) fn device_pixels_per_source_for(zoom: f32, pixels_per_point: f32) -> f32 {
+    (zoom * pixels_per_point).max(0.0)
+}
+
+/// Whether pixel inspection (NEAREST sampling + pixel grid) is recommended at
+/// the given magnification. Pure helper so the threshold contract is testable
+/// without a live GUI context.
+#[must_use]
+pub(crate) fn pixel_inspection_recommended_for(zoom: f32, pixels_per_point: f32) -> bool {
+    device_pixels_per_source_for(zoom, pixels_per_point) >= PIXEL_INSPECTION_MIN_DEVICE_PX
+}
+
+/// Additional preview-size multiplier applied to the already fit-to-bubble image
+/// size of an `ImageBubble` so the preview shrinks together with the canvas when
+/// zoomed out.
+///
+/// Contract: at `zoom >= 1.0` the factor is `1.0` (the image is never enlarged);
+/// at `zoom < 1.0` the factor shrinks proportionally with `zoom`, floored at
+/// `IMAGE_BUBBLE_PREVIEW_MIN_ZOOM_SCALE` (0.2) so the preview never drops below
+/// 20% of its fit-to-bubble size, including at zero or negative `zoom`.
+#[must_use]
+fn image_bubble_zoom_preview_scale(zoom: f32) -> f32 {
+    zoom.clamp(IMAGE_BUBBLE_PREVIEW_MIN_ZOOM_SCALE, 1.0)
+}
+
+/// Computes the on-screen size of an `ImageBubble` preview from its source pixel size.
+///
+/// Single source of truth shared by aside layout (slot-height reservation) and the draw pass
+/// so a card never packs against a size different from the one drawn in the same frame.
+///
+/// `source_px` is the decoded preview size `[w, h]` (each treated as at least 1 px).
+/// `available_width` is the preview content width inside the card frame, `max_h` caps the
+/// preview height (bubble max/min width), and `zoom` is the current canvas zoom.
+/// The size is `fit_to_bubble * image_bubble_zoom_preview_scale(zoom)`, where `fit_to_bubble`
+/// scales the source to fit `available_width` x `max_h` without upscaling (clamped to `[0.01, 1.0]`).
+#[must_use]
+fn image_bubble_preview_size(
+    source_px: [usize; 2],
+    available_width: f32,
+    max_h: f32,
+    zoom: f32,
+) -> egui::Vec2 {
+    // Image pixel dimensions: real decoded previews fit well within f32's exact-integer
+    // range, so the precision loss is harmless for these domain-bounded values.
+    #[allow(clippy::cast_precision_loss)]
+    let source_w = source_px[0].max(1) as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let source_h = source_px[1].max(1) as f32;
+    let max_h = max_h.max(1.0);
+    let scale = (available_width.max(1.0) / source_w)
+        .min(max_h / source_h)
+        .clamp(0.01, 1.0);
+    let zoom_factor = image_bubble_zoom_preview_scale(zoom);
+    egui::vec2(
+        source_w * scale * zoom_factor,
+        source_h * scale * zoom_factor,
+    )
+}
+
+/// Geometry context passed to `CanvasHooks::canvas_scrollbar_marks` so a tab can
+/// place marks on the canvas vertical scrollbar.
+///
+/// `content_y` maps a page-relative vertical position to the scroll content
+/// space (`0.0` at the content top, `content_size_y` at the bottom) — the same
+/// space `ScrollSpan::ContentPixels` expects. The mapping is `world_y * zoom`,
+/// where `world_y` comes from this frame's per-page world layout.
+pub struct CanvasScrollbarContext<'a> {
+    canvas: &'a CanvasView,
+    project: &'a ProjectData,
+    content_size_y: f32,
+}
+
+impl CanvasScrollbarContext<'_> {
+    /// The canvas bubble set (model + runtime), sorted by id.
+    ///
+    /// Built on demand so tabs that draw no marks pay nothing: the snapshot is a
+    /// per-call allocation, so callers should bind it once.
+    #[must_use]
+    pub fn bubbles(&self) -> Vec<Bubble> {
+        self.canvas.hook_bubbles_snapshot(self.project)
+    }
+
+    /// Total scrollable content length along the vertical axis, in content points.
+    #[must_use]
+    pub fn content_size_y(&self) -> f32 {
+        self.content_size_y
+    }
+
+    /// The user's chosen mode for showing translation status on the scrollbar.
+    #[must_use]
+    pub fn translation_status_display(&self) -> TranslationStatusDisplay {
+        self.canvas.state.translation_status_display
+    }
+
+    /// Content-space Y for vertical fraction `v` (`0.0..=1.0`) of page `img_idx`,
+    /// or `None` if that page was not laid out this frame.
+    #[must_use]
+    pub fn content_y(&self, img_idx: usize, v: f32) -> Option<f32> {
+        let world_rect = self.canvas.scene.page_world_rects.get(img_idx)?;
+        if world_rect.height() <= 0.0 {
+            return None;
+        }
+        Some((world_rect.top() + v.clamp(0.0, 1.0) * world_rect.height()) * self.canvas.state.zoom)
+    }
+}
 
 pub trait CanvasHooks {
     fn wants_canvas_shift_drag_selection(&self, _ctx: &egui::Context) -> bool {
         false
+    }
+
+    /// Returns marks to paint on the canvas vertical scrollbar this frame.
+    ///
+    /// The tab fully owns mark content and geometry; positions are expressed in
+    /// content space via [`CanvasScrollbarContext::content_y`]. Default: none.
+    fn canvas_scrollbar_marks(&mut self, _ctx: &CanvasScrollbarContext<'_>) -> Vec<ScrollMark> {
+        Vec::new()
     }
 
     fn draw_canvas_mask_overlay_on_page(
@@ -306,7 +466,14 @@ pub trait CanvasHooks {
         None
     }
 
-    fn build_bubble_footer(&mut self, _ui: &mut egui::Ui, _bubble: &Bubble, _editable: bool) {}
+    fn build_bubble_footer(
+        &mut self,
+        _ui: &mut egui::Ui,
+        _project: &ProjectData,
+        _bubble: &Bubble,
+        _editable: bool,
+    ) {
+    }
 
     fn bubble_status_style(
         &mut self,
@@ -373,6 +540,10 @@ pub struct CanvasView {
     overlay_runtime: OverlayRuntimeState,
     scene: CanvasSceneState,
     settings_runtime: CanvasSettingsRuntime,
+    image_bubble_preview_cache: HashMap<i64, ImageBubblePreviewCacheEntry>,
+    // Throttled per-bubble external file fingerprint (`len:mtime`) plus the instant it was
+    // last refreshed, so the preview key is not stat-ing the filesystem every frame.
+    image_bubble_meta_cache: HashMap<i64, (Instant, String)>,
     bubble_unicode_fonts_initialized: bool,
     pixel_sampling_nearest: bool,
     pixel_grid_visible: bool,
@@ -389,11 +560,20 @@ impl Default for CanvasView {
             overlay_runtime: OverlayRuntimeState::default(),
             scene: CanvasSceneState::default(),
             settings_runtime: CanvasSettingsRuntime::default(),
+            image_bubble_preview_cache: HashMap::new(),
+            image_bubble_meta_cache: HashMap::new(),
             bubble_unicode_fonts_initialized: false,
             pixel_sampling_nearest: false,
             pixel_grid_visible: false,
         }
     }
+}
+
+struct ImageBubblePreviewCacheEntry {
+    key: String,
+    texture: Option<TextureHandle>,
+    size_px: [usize; 2],
+    error: Option<String>,
 }
 
 impl Drop for CanvasView {
@@ -537,6 +717,166 @@ impl CanvasView {
         bubbles
     }
 
+    /// Paints tab-provided marks on the canvas vertical scrollbar, then re-draws
+    /// the handle on top so it stays visible above the marks.
+    ///
+    /// `output` is the `ScrollArea::both` result from `draw_canvas_scene`. No-op
+    /// when there is no vertical overflow (no vertical bar drawn) or the active
+    /// tab returns no marks. The bar geometry mirrors egui's solid (non-floating)
+    /// vertical bar so the re-drawn handle and marks align with the native bar.
+    /// Cache the scrollbar rects for the current frame from the scroll output, so
+    /// tabs can occlude tool cursors/input over the bars. `None` on an axis with
+    /// no overflow (egui draws no bar there).
+    ///
+    /// Placement depends on the bar style: **solid** bars sit just *outside*
+    /// `inner_rect` (content is shrunk), **floating** (egui's default) bars
+    /// overlay the *inside* edge (`auto_shrink(false)` keeps `inner_rect` full).
+    /// The strip is widened by both margins so hovering anywhere near the bar
+    /// counts. Mirrors egui's bar geometry (see `render_scrollbar_marks` and the
+    /// `marked_scroll` widget).
+    fn cache_scrollbar_rects(&mut self, ctx: &egui::Context, inner: Rect, content: Vec2) {
+        let scroll = ctx.style().spacing.scroll;
+        let thickness = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
+        // Match egui's own "is the bar drawn" test (see `render_scrollbar_marks`).
+        let v_overflow = content.y > inner.height() + 0.5;
+        let h_overflow = content.x > inner.width() + 0.5;
+        let (v_rect, h_rect) = if scroll.floating {
+            (
+                Rect::from_min_max(
+                    egui::pos2(inner.right() - thickness, inner.top()),
+                    egui::pos2(inner.right(), inner.bottom()),
+                ),
+                Rect::from_min_max(
+                    egui::pos2(inner.left(), inner.bottom() - thickness),
+                    egui::pos2(inner.right(), inner.bottom()),
+                ),
+            )
+        } else {
+            (
+                Rect::from_min_max(
+                    egui::pos2(inner.right(), inner.top()),
+                    egui::pos2(inner.right() + thickness, inner.bottom()),
+                ),
+                Rect::from_min_max(
+                    egui::pos2(inner.left(), inner.bottom()),
+                    egui::pos2(inner.right(), inner.bottom() + thickness),
+                ),
+            )
+        };
+        self.scene.scroll_vertical_bar_rect = v_overflow.then_some(v_rect);
+        self.scene.scroll_horizontal_bar_rect = h_overflow.then_some(h_rect);
+    }
+
+    /// True if `pos` is over a canvas scrollbar drawn this frame. Tabs use this to
+    /// hide a brush cursor (and gate tool input) over the bars, the same way they
+    /// hide it over floating panels.
+    #[must_use]
+    pub fn pointer_over_scrollbar(&self, pos: Pos2) -> bool {
+        self.scene
+            .scroll_vertical_bar_rect
+            .is_some_and(|rect| rect.contains(pos))
+            || self
+                .scene
+                .scroll_horizontal_bar_rect
+                .is_some_and(|rect| rect.contains(pos))
+    }
+
+    pub(super) fn render_scrollbar_marks(
+        &self,
+        ui: &egui::Ui,
+        output: &egui::scroll_area::ScrollAreaOutput<()>,
+        project: &ProjectData,
+        hooks: &mut dyn CanvasHooks,
+    ) {
+        let inner = output.inner_rect;
+        let content_size_y = output.content_size.y;
+        // No vertical overflow -> egui draws no vertical bar, nothing to mark.
+        if content_size_y <= inner.height() + 0.5 {
+            return;
+        }
+        let ctx = CanvasScrollbarContext {
+            canvas: self,
+            project,
+            content_size_y,
+        };
+        let marks = hooks.canvas_scrollbar_marks(&ctx);
+        if marks.is_empty() {
+            return;
+        }
+
+        // Solid (non-floating) vertical bar: a `bar_width` column just right of the
+        // content, travelling over the viewport height. Matches egui's cross-axis
+        // placement (`inner_rect.right() + bar_inner_margin`).
+        let scroll = ui.spacing().scroll;
+        let track_rect = Rect::from_min_max(
+            egui::pos2(inner.right() + scroll.bar_inner_margin, inner.top()),
+            egui::pos2(
+                inner.right() + scroll.bar_inner_margin + scroll.bar_width,
+                inner.bottom(),
+            ),
+        );
+        let geometry = BarGeometry {
+            track_rect,
+            content_size: content_size_y,
+            viewport: inner.height(),
+            offset: output.state.offset.y,
+        };
+
+        let painter = ui.painter();
+        paint_marks_on_bar(painter, &geometry, marks, 1.0);
+
+        // Re-draw the handle above the marks so it stays visible; use the hovered
+        // visual when the pointer is over it, for parity with the native handle.
+        let handle_rect = geometry.handle_rect(scroll.handle_min_length);
+        let hovered = ui.rect_contains_pointer(handle_rect);
+        let (handle_color, corner_radius) = {
+            let widgets = &ui.visuals().widgets;
+            let visuals = if hovered {
+                &widgets.hovered
+            } else {
+                &widgets.inactive
+            };
+            let color = if scroll.foreground_color {
+                visuals.fg_stroke.color
+            } else {
+                visuals.bg_fill
+            };
+            (color, visuals.corner_radius)
+        };
+        painter.rect_filled(handle_rect, corner_radius, handle_color);
+    }
+
+    /// Returns a cheap fingerprint of the bubble set that `hook_bubbles_snapshot(project)` would
+    /// produce, for gating expensive per-frame work without rebuilding the snapshot.
+    ///
+    /// The value combines the persisted [`BubblesModel::revision`] (bumped on every model mutation)
+    /// with the canvas runtime-only bubble set: the count of `runtime_bubbles` and `next_bubble_id`.
+    /// A bubble that has just been created but lives only in `runtime_bubbles` (not yet flushed to
+    /// the model) bumps either the runtime count or `next_bubble_id`, so the returned value changes
+    /// even though the model revision has not moved yet. The value is monotonic-ish, not strictly
+    /// monotonic: it is a fingerprint meant for equality comparison between frames (changed vs.
+    /// unchanged), not for ordering. When no model is bound the model component is treated as 0.
+    #[must_use]
+    pub fn hook_bubbles_revision(&self) -> u64 {
+        let model_revision = self
+            .bubble_runtime
+            .bubbles_model
+            .as_ref()
+            .and_then(|model| model.lock().ok().map(|locked| locked.revision()))
+            .unwrap_or(0);
+        // Fold the two runtime-only signals into the model revision with mixing constants so a
+        // change in any single component reliably changes the result (rather than canceling out).
+        let runtime_count =
+            u64::try_from(self.bubble_runtime.runtime_bubbles.len()).unwrap_or(u64::MAX);
+        // `next_bubble_id` is a positive, monotonically increasing counter; reinterpret its bits so
+        // any change to it perturbs the fingerprint without a fallible or lossy conversion.
+        let next_id_bits = u64::from_ne_bytes(self.bubble_runtime.next_bubble_id.to_ne_bytes());
+        model_revision
+            .wrapping_mul(0x0000_0100_0000_01b3)
+            .wrapping_add(runtime_count.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add(next_id_bits)
+    }
+
     pub fn set_drag_scroll_blocked(&mut self, blocked: bool) {
         self.scene.drag_scroll_blocked = blocked;
     }
@@ -573,6 +913,20 @@ impl CanvasView {
         self.pixel_sampling_nearest
     }
 
+    /// Device pixels rendered per source pixel at the current zoom and the
+    /// given context DPI. Single source of truth for inspection magnification.
+    #[must_use]
+    pub fn device_pixels_per_source(&self, ctx: &egui::Context) -> f32 {
+        device_pixels_per_source_for(self.state.zoom, ctx.pixels_per_point())
+    }
+
+    /// Whether pixel inspection (NEAREST sampling + pixel grid) is recommended
+    /// at the current zoom and DPI. Drives both NEAREST sampling and the grid.
+    #[must_use]
+    pub fn pixel_inspection_recommended(&self, ctx: &egui::Context) -> bool {
+        self.device_pixels_per_source(ctx) >= PIXEL_INSPECTION_MIN_DEVICE_PX
+    }
+
     pub fn draw_pixel_grid_overlay(&self, ui: &mut egui::Ui) {
         self.draw_visible_pixel_grid_overlay(ui);
     }
@@ -606,13 +960,6 @@ impl CanvasView {
         self.overlay_runtime.clean_overlays_visible()
     }
 
-    pub fn clean_overlay_gpu_memory_snapshot(
-        &self,
-        pinned_pages: &std::collections::BTreeSet<usize>,
-    ) -> Vec<CacheResourceInfo> {
-        self.overlay_runtime.memory_usage_snapshot(pinned_pages)
-    }
-
     pub fn evict_clean_overlay_gpu_cache(
         &mut self,
         request: &CacheEvictionRequest,
@@ -643,6 +990,49 @@ impl CanvasView {
         );
         self.scene.scroll_offset = scroll_offset;
         self.scene.pending_scroll_offset = Some(scroll_offset);
+        self.scene.pending_zoom_anchor = None;
+        self.scene.initial_horizontal_scroll_centered = true;
+    }
+
+    /// Current page index plus the page-local source-pixel point shown at the center of the
+    /// viewport, for handing the view off to tabs that do not share the canvas scroll model
+    /// (e.g. the standalone PS editor). `None` until the scene has been laid out at least once.
+    ///
+    /// The center may fall outside `[0, page_size]` when the viewport straddles a page gap; the
+    /// receiver is expected to clamp it to its own page bounds.
+    pub fn current_page_local_view_center(&self) -> Option<(usize, Vec2)> {
+        let page_idx = self.current_page_idx();
+        let visible = self.scene.visible_scene_rect?;
+        let page_rect = self.page_scene_rect(page_idx)?;
+        let zoom = self.state.zoom;
+        if zoom <= f32::EPSILON {
+            return None;
+        }
+        let local_px = (visible.center() - page_rect.min) / zoom;
+        Some((page_idx, local_px))
+    }
+
+    /// Scrolls/zooms so that `center_px` (page-local source pixels) of `page_idx` is centered in
+    /// the viewport at `zoom`. Inverse of [`Self::current_page_local_view_center`].
+    ///
+    /// Requires the target page to have been laid out (its world rect is known from a prior
+    /// frame); when it has not, only the zoom is applied. The page layout is zoom-independent, so
+    /// a stale-but-present world rect from the last draw still positions the page correctly.
+    pub fn focus_page(&mut self, page_idx: usize, center_px: Option<Vec2>, zoom: f32) {
+        self.state.zoom = zoom.clamp(0.2, 5.0);
+        let zoom = self.state.zoom;
+        let (Some(center), Some(world_rect)) = (center_px, self.page_world_rect(page_idx)) else {
+            return;
+        };
+        let viewport = self
+            .scene
+            .scroll_inner_rect
+            .map_or(Vec2::ZERO, |rect| rect.size());
+        let content_center = (world_rect.min.to_vec2() + center) * zoom;
+        let offset = content_center - viewport * 0.5;
+        let offset = egui::vec2(offset.x.max(0.0), offset.y.max(0.0));
+        self.scene.scroll_offset = offset;
+        self.scene.pending_scroll_offset = Some(offset);
         self.scene.pending_zoom_anchor = None;
         self.scene.initial_horizontal_scroll_centered = true;
     }
@@ -868,12 +1258,16 @@ impl CanvasView {
         );
         self.scene.scroll_inner_rect = Some(scroll_output.inner_rect);
         self.scene.scroll_content_size = scroll_output.content_size;
+        self.cache_scrollbar_rects(ctx, scroll_output.inner_rect, scroll_output.content_size);
         self.scene.pending_zoom_anchor = None;
-        if self.bubble_runtime.aside_drag_state.is_some()
-            && !ctx.input(|i| i.pointer.primary_down())
-            && let Some(bid) = self.bubble_runtime.aside_drag_state.map(|state| state.bid)
-        {
-            bubble_aside_ui::finish_aside_drag(self, bid);
+        // Pointer-up fallback for positional drags whose widget never delivered `drag_stopped()`
+        // (e.g. the dragged page scrolled fully off-screen mid-drag, so its widget stopped being
+        // rendered). This runs AFTER the scene draw pass, so a normally-finishing gesture has
+        // already run its `finish_*` / `drag_stopped` path and cleared its state; only a lingering
+        // gesture is committed here. See `commit_lingering_drag_gestures_on_pointer_up`.
+        let pointer_up = !ctx.input(|i| i.pointer.primary_down());
+        if pointer_up {
+            self.commit_lingering_drag_gestures_on_pointer_up();
         }
 
         self.capture_clipboard_events(project, ctx);
@@ -886,6 +1280,47 @@ impl CanvasView {
         self.publish_canvas_settings(project);
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
+        }
+    }
+
+    /// Commits and clears any positional drag/resize gesture whose state is still set after the
+    /// scene draw pass while the primary pointer button is up.
+    ///
+    /// DATA-LOSS GUARD: positional drags debounce their model write until release; the runtime
+    /// bubble follows the pointer each frame but the model is committed only when the widget's
+    /// gesture-end path runs (`finish_aside_drag` / `finish_on_top_drag`, or the rect/area handle
+    /// `drag_stopped` paths). If the dragged widget stops being rendered mid-drag (its page scrolls
+    /// fully off-screen), egui never delivers `drag_stopped()`, so that path never runs: the dragged
+    /// id is never re-queued into `pending_upsert`, the final position is lost on reload, and the
+    /// drag-state lingers forever. This is the single source of truth for that commit run, called
+    /// from the per-frame `draw` only when the pointer is up.
+    ///
+    /// DOUBLE-COMMIT GUARD: each `finish_*` handler clears its own drag-state, and the rect/area
+    /// handle paths clear `active_*_handle` on `drag_stopped`. Because this fallback runs after the
+    /// draw pass, a normally-finishing gesture has already cleared its state, so the matching branch
+    /// here is skipped and the gesture commits exactly once. Only a *lingering* gesture (state still
+    /// set) is committed here.
+    pub(super) fn commit_lingering_drag_gestures_on_pointer_up(&mut self) {
+        // Aside drag: reuse the widget's gesture-end handler so the commit logic stays identical.
+        if let Some(bid) = self.bubble_runtime.aside_drag_state.map(|state| state.bid) {
+            bubble_aside_ui::finish_aside_drag(self, bid);
+        }
+        // On-top drag: same single-source-of-truth handler as the widget path.
+        if let Some(bid) = self.bubble_runtime.on_top_drag_state.map(|state| state.bid) {
+            bubble_on_top_ui::finish_on_top_drag(self, bid);
+        }
+        // Rect resize handle: mirror the `drag_stopped` path (queue the upsert, clear the handle).
+        // The resize itself already wrote the final geometry into the runtime bubble and queued the
+        // id during the drag, but the handle state would otherwise linger and the release-time
+        // commit could be skipped while the gesture is still considered active.
+        if let Some((bid, _)) = self.bubble_runtime.active_rect_handle {
+            self.bubble_runtime.pending_upsert.insert(bid);
+            self.bubble_runtime.active_rect_handle = None;
+        }
+        // Image text-area resize handle: same mirror of its `drag_stopped` path.
+        if let Some((bid, _, _)) = self.bubble_runtime.active_area_handle {
+            self.bubble_runtime.pending_upsert.insert(bid);
+            self.bubble_runtime.active_area_handle = None;
         }
     }
 
@@ -1231,13 +1666,11 @@ impl CanvasView {
         project: &ProjectData,
         bid: i64,
     ) -> Map<String, Value> {
+        // Read only the requested bubble's `extra` from the model (O(1) by id, no full
+        // snapshot clone); fall back to the loaded project when the model lacks this id.
         if let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone)
             && let Ok(locked) = model.lock()
-            && let Some(extra) = locked
-                .snapshot()
-                .into_iter()
-                .find(|bubble| bubble.id == bid)
-                .map(|bubble| bubble.extra)
+            && let Some(extra) = locked.extra_of(bid).cloned()
         {
             return extra;
         }
@@ -1302,6 +1735,7 @@ impl CanvasView {
             runtime.img_u,
             runtime.img_v,
             Some(side_to_string(runtime.side)),
+            Some(runtime.bubble_class.as_str().to_string()),
             Some(runtime.bubble_type.as_str().to_string()),
             runtime.text,
             runtime.original_text,
@@ -1351,6 +1785,9 @@ impl CanvasView {
     }
 
     fn displayed_bubble_type_for_runtime(&self, bubble: &RuntimeBubble) -> BubbleType {
+        if bubble.bubble_class == BubbleClass::Image {
+            return BubbleType::Aside;
+        }
         let display_type = if self.editable {
             bubble
                 .bubble_type
@@ -1379,6 +1816,14 @@ impl CanvasView {
             .unwrap_or(BubbleType::Default)
     }
 
+    fn effective_bubble_class_for_record(&self, bubble: &Bubble) -> BubbleClass {
+        bubble
+            .bubble_class
+            .as_deref()
+            .map(BubbleClass::from_str)
+            .unwrap_or(BubbleClass::Text)
+    }
+
     fn set_bubble_type_for_bid(&mut self, bid: i64, bubble_type: BubbleType) -> bool {
         let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) else {
             return false;
@@ -1392,6 +1837,180 @@ impl CanvasView {
         true
     }
 
+    pub fn set_bubble_class_for_bid(&mut self, bid: i64, bubble_class: BubbleClass) -> bool {
+        let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) else {
+            return false;
+        };
+        if rt.bubble_class == bubble_class {
+            return false;
+        }
+        rt.bubble_class = bubble_class;
+        if bubble_class == BubbleClass::Image {
+            rt.bubble_type = BubbleType::Aside;
+        }
+        rt.mounted = false;
+        self.bubble_runtime.pending_upsert.insert(bid);
+        true
+    }
+
+    pub fn selected_bubble_id(&self) -> Option<i64> {
+        self.bubble_runtime.selected_bubble
+    }
+
+    /// Ensures the cached preview texture for `bubble` matches its current crop/source key.
+    ///
+    /// Idempotent: a no-op when the cached entry already matches the key, and skipped entirely
+    /// while the image-area rect/area/anchor is being dragged so the crop refreshes once on
+    /// release instead of re-decoding every frame. Must be called before reading
+    /// `image_bubble_preview_height` so layout packing and the draw pass see the same `size_px`
+    /// within one frame. The only heavy work (decode + GPU upload) runs solely on a key change.
+    /// Returns the throttled `len:mtime` fingerprint of an external image-bubble file.
+    ///
+    /// Page-crop bubbles do not read an external file, so this returns an empty string for
+    /// them without touching the filesystem. For external bubbles the file is stat-ed at most
+    /// once per `IMAGE_BUBBLE_META_THROTTLE`; in between, the last fingerprint is reused so the
+    /// per-frame preview-key check does no I/O. A file edit is still detected on the next
+    /// refresh after the throttle window elapses.
+    fn image_bubble_external_fingerprint(
+        &mut self,
+        project: &ProjectData,
+        bubble: &Bubble,
+    ) -> String {
+        let source_type = bubble
+            .extra
+            .get("image_source_type")
+            .and_then(Value::as_str)
+            .unwrap_or("external");
+        if source_type == "page_crop" {
+            return String::new();
+        }
+        let now = Instant::now();
+        if let Some((checked_at, fingerprint)) = self.image_bubble_meta_cache.get(&bubble.id)
+            && now.duration_since(*checked_at) < IMAGE_BUBBLE_META_THROTTLE
+        {
+            return fingerprint.clone();
+        }
+        let path = bubble
+            .extra
+            .get("image_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let resolved_path = resolve_image_bubble_path(project, path);
+        let fingerprint = image_bubble_file_fingerprint(&resolved_path);
+        self.image_bubble_meta_cache
+            .insert(bubble.id, (now, fingerprint.clone()));
+        fingerprint
+    }
+
+    pub(crate) fn ensure_image_bubble_preview_loaded(
+        &mut self,
+        ctx: &egui::Context,
+        project: &ProjectData,
+        bubble: &Bubble,
+    ) {
+        // Use the live runtime image-area rect as the crop so the preview tracks rect edits. The
+        // reload is gated while the rect is being dragged/resized, so the crop refreshes once on
+        // release (cheap) rather than re-decoding every frame during the drag.
+        let crop_override = self.image_bubble_runtime_crop(bubble);
+        let external_fingerprint = self.image_bubble_external_fingerprint(project, bubble);
+        let key = image_bubble_preview_key(project, bubble, crop_override, &external_fingerprint);
+        let manipulating = self.is_image_rect_manipulated(bubble.id);
+        let needs_load = !manipulating
+            && self
+                .image_bubble_preview_cache
+                .get(&bubble.id)
+                .is_none_or(|entry| entry.key != key);
+        if needs_load {
+            let entry = load_image_bubble_preview(ctx, project, bubble, &key, crop_override);
+            self.image_bubble_preview_cache.insert(bubble.id, entry);
+        }
+    }
+
+    pub(crate) fn draw_image_bubble_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &ProjectData,
+        bubble: &Bubble,
+        available_width: f32,
+        side: crate::project::Side,
+    ) {
+        // The preview is pre-loaded at the start of the aside layout pass so layout and draw agree
+        // on `size_px`; ensure here too in case this path is reached without that pre-load.
+        self.ensure_image_bubble_preview_loaded(ui.ctx(), project, bubble);
+        let Some(entry) = self.image_bubble_preview_cache.get(&bubble.id) else {
+            return;
+        };
+        if let Some(texture) = entry.texture.as_ref() {
+            let max_h = self.state.bubble_max_width.max(self.state.bubble_min_width);
+            // Shared size helper keeps the drawn size identical to the reserved layout height.
+            let size =
+                image_bubble_preview_size(entry.size_px, available_width, max_h, self.state.zoom);
+            // Keep the preview closest to the page strip: left-side bubbles sit to the left of the
+            // page, so right-align their preview; right-side bubbles keep the default left-align.
+            match side {
+                crate::project::Side::Left => {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        ui.add(egui::Image::new((texture.id(), size)));
+                    });
+                }
+                crate::project::Side::Right => {
+                    ui.add(egui::Image::new((texture.id(), size)));
+                }
+            }
+        } else if let Some(error) = entry.error.as_ref() {
+            ui.colored_label(egui::Color32::from_rgb(240, 102, 102), error);
+        }
+    }
+
+    /// Returns the live page-crop rect (`[x1,y1,x2,y2]`) from the runtime image-area rect, or
+    /// `None` for non-page-crop bubbles. Lets the preview crop track edits before they are flushed.
+    fn image_bubble_runtime_crop(&self, bubble: &Bubble) -> Option<[f32; 4]> {
+        let source_type = bubble
+            .extra
+            .get("image_source_type")
+            .and_then(Value::as_str)
+            .unwrap_or("external");
+        if source_type != "page_crop" {
+            return None;
+        }
+        let rect = self
+            .bubble_runtime
+            .runtime_bubbles
+            .get(&bubble.id)?
+            .rect_coords
+            .normalized();
+        Some([rect.p1.x, rect.p1.y, rect.p2.x, rect.p2.y])
+    }
+
+    /// True while the bubble's image-area rect, a text area, or an anchor is being dragged/resized.
+    /// Used to defer the page-crop preview reload until the interaction settles.
+    fn is_image_rect_manipulated(&self, bid: i64) -> bool {
+        self.bubble_runtime
+            .aside_drag_state
+            .is_some_and(|state| state.bid == bid)
+            || self
+                .bubble_runtime
+                .active_area_handle
+                .is_some_and(|(active_bid, _, _)| active_bid == bid)
+            || self
+                .bubble_runtime
+                .active_rect_handle
+                .is_some_and(|(active_bid, _)| active_bid == bid)
+    }
+
+    // Predict the on-screen height of an editable image bubble preview for aside layout.
+    // Uses `image_bubble_preview_size` (the same helper as `draw_image_bubble_preview`) so the
+    // reserved slot height matches the rendered preview exactly. Returns `None` until the preview
+    // texture is available; call `ensure_image_bubble_preview_loaded` earlier in the same frame so
+    // the cache is populated before packing.
+    fn image_bubble_preview_height(&self, bid: i64, available_width: f32) -> Option<f32> {
+        let entry = self.image_bubble_preview_cache.get(&bid)?;
+        entry.texture.as_ref()?;
+        let max_h = self.state.bubble_max_width.max(self.state.bubble_min_width);
+        // Same helper as the draw pass, so the reserved slot height equals the drawn preview height.
+        Some(image_bubble_preview_size(entry.size_px, available_width, max_h, self.state.zoom).y)
+    }
+
     fn hook_bubble_for_runtime(&self, project: &ProjectData, runtime: &RuntimeBubble) -> Bubble {
         let mut extra = self.bubble_extra_from_model_or_project(project, runtime.id);
         upsert_rect_coords_into_extra(&mut extra, runtime.rect_coords);
@@ -1401,6 +2020,7 @@ impl CanvasView {
             img_u: runtime.img_u,
             img_v: runtime.img_v,
             side: Some(side_to_string(runtime.side)),
+            bubble_class: Some(runtime.bubble_class.as_str().to_string()),
             bubble_type: Some(runtime.bubble_type.as_str().to_string()),
             text: runtime.text.clone(),
             original_text: runtime.original_text.clone(),
@@ -1850,9 +2470,279 @@ fn read_system_clipboard_text() -> Option<String> {
     Some(sanitize_clipboard_text(&raw))
 }
 
+/// Builds the cache key identifying a rendered image-bubble preview.
+///
+/// For `page_crop` bubbles the key is derived purely from the crop page index and rect.
+/// For `external` bubbles it embeds the resolved path plus `external_fingerprint`, a
+/// throttled `len:mtime` of the source file produced by `image_bubble_external_fingerprint`
+/// (the caller stats the file at most once per `IMAGE_BUBBLE_META_THROTTLE` so the key is
+/// not stat-ing the filesystem every frame). A changed file still eventually invalidates the
+/// preview once the throttle window elapses.
+fn image_bubble_preview_key(
+    project: &ProjectData,
+    bubble: &Bubble,
+    crop_override: Option<[f32; 4]>,
+    external_fingerprint: &str,
+) -> String {
+    let source_type = bubble
+        .extra
+        .get("image_source_type")
+        .and_then(Value::as_str)
+        .unwrap_or("external");
+    if source_type == "page_crop" {
+        let page_idx = bubble
+            .extra
+            .get("crop_page_idx")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::try_from(bubble.img_idx).unwrap_or(u64::MAX));
+        // Prefer the live runtime crop rect so the preview key changes as the image-area rect is
+        // edited; fall back to the persisted crop rect.
+        let rect = crop_override.map_or_else(
+            || {
+                bubble
+                    .extra
+                    .get("crop_rect")
+                    .map_or_else(String::new, Value::to_string)
+            },
+            |rect| format!("{rect:?}"),
+        );
+        return format!("crop:{page_idx}:{rect}");
+    }
+    let path = bubble
+        .extra
+        .get("image_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let resolved_path = resolve_image_bubble_path(project, path);
+    format!(
+        "external:{}:{external_fingerprint}",
+        resolved_path.display()
+    )
+}
+
+/// Stats `path` and returns a `len:mtime_nanos` fingerprint, or an empty string when the
+/// file is missing or has no readable mtime. Used to detect external image-bubble changes.
+fn image_bubble_file_fingerprint(path: &Path) -> String {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            format!("{}:{modified}", metadata.len())
+        })
+        .unwrap_or_default()
+}
+
+fn load_image_bubble_preview(
+    ctx: &egui::Context,
+    project: &ProjectData,
+    bubble: &Bubble,
+    key: &str,
+    crop_override: Option<[f32; 4]>,
+) -> ImageBubblePreviewCacheEntry {
+    match load_image_bubble_color_image(project, bubble, crop_override) {
+        Ok(image) => {
+            let size_px = image.size;
+            let texture = ctx.load_texture(
+                format!("image-bubble-preview-{}-{key}", bubble.id),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            ImageBubblePreviewCacheEntry {
+                key: key.to_string(),
+                texture: Some(texture),
+                size_px,
+                error: None,
+            }
+        }
+        Err(error) => ImageBubblePreviewCacheEntry {
+            key: key.to_string(),
+            texture: None,
+            size_px: [1, 1],
+            error: Some(error),
+        },
+    }
+}
+
+fn load_image_bubble_color_image(
+    project: &ProjectData,
+    bubble: &Bubble,
+    crop_override: Option<[f32; 4]>,
+) -> Result<egui::ColorImage, String> {
+    let source_type = bubble
+        .extra
+        .get("image_source_type")
+        .and_then(Value::as_str)
+        .unwrap_or("external");
+    if source_type == "page_crop" {
+        return load_image_bubble_crop(project, bubble, crop_override);
+    }
+    let raw_path = bubble
+        .extra
+        .get("image_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "Картинка не выбрана".to_string())?;
+    let path = resolve_image_bubble_path(project, raw_path);
+    let image = image::open(&path)
+        .map_err(|err| format!("Не удалось открыть картинку {}: {err}", path.display()))?
+        .to_rgba8();
+    color_image_from_rgba(image)
+}
+
+fn load_image_bubble_crop(
+    project: &ProjectData,
+    bubble: &Bubble,
+    crop_override: Option<[f32; 4]>,
+) -> Result<egui::ColorImage, String> {
+    let page_idx = bubble
+        .extra
+        .get("crop_page_idx")
+        .and_then(Value::as_u64)
+        .and_then(|raw| usize::try_from(raw).ok())
+        .unwrap_or(bubble.img_idx);
+    let page = project
+        .pages
+        .iter()
+        .find(|page| page.idx == page_idx)
+        .ok_or_else(|| format!("Страница вырезки не найдена: #{}", page_idx + 1))?;
+    let source = image::open(&page.path)
+        .map_err(|err| format!("Не удалось открыть страницу {}: {err}", page.path.display()))?
+        .to_rgba8();
+    let rect = crop_override.unwrap_or_else(|| image_bubble_crop_rect(bubble));
+    let width = source.width().max(1);
+    let height = source.height().max(1);
+    let max_x = width as f32;
+    let max_y = height as f32;
+    let x1 = (rect[0] * max_x).floor().clamp(0.0, (max_x - 1.0).max(0.0)) as u32;
+    let y1 = (rect[1] * max_y).floor().clamp(0.0, (max_y - 1.0).max(0.0)) as u32;
+    let x2 = (rect[2] * max_x).ceil().clamp(x1 as f32 + 1.0, max_x) as u32;
+    let y2 = (rect[3] * max_y).ceil().clamp(y1 as f32 + 1.0, max_y) as u32;
+    let cropped = image::imageops::crop_imm(&source, x1, y1, x2 - x1, y2 - y1).to_image();
+    color_image_from_rgba(cropped)
+}
+
+fn color_image_from_rgba(image: image::RgbaImage) -> Result<egui::ColorImage, String> {
+    let w = usize::try_from(image.width()).map_err(|_| "Картинка слишком широкая".to_string())?;
+    let h = usize::try_from(image.height()).map_err(|_| "Картинка слишком высокая".to_string())?;
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [w, h],
+        image.as_raw(),
+    ))
+}
+
+fn resolve_image_bubble_path(project: &ProjectData, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        path
+    } else {
+        let unsaved_path = project.paths.unsaved_dir.join(&path);
+        if unsaved_path.exists() {
+            return unsaved_path;
+        }
+        let saved_path = project.project_dir.join(&path);
+        if saved_path.exists() {
+            return saved_path;
+        }
+        unsaved_path
+    }
+}
+
+fn image_bubble_crop_rect(bubble: &Bubble) -> [f32; 4] {
+    let mut rect = [
+        bubble.img_u - 0.05,
+        bubble.img_v - 0.05,
+        bubble.img_u + 0.05,
+        bubble.img_v + 0.05,
+    ];
+    if let Some(items) = bubble.extra.get("crop_rect").and_then(Value::as_array)
+        && items.len() == 4
+    {
+        for (idx, item) in items.iter().enumerate() {
+            if let Some(value) = item.as_f64() {
+                rect[idx] = value as f32;
+            }
+        }
+    }
+    [
+        rect[0].min(rect[2]).clamp(0.0, 1.0),
+        rect[1].min(rect[3]).clamp(0.0, 1.0),
+        rect[0].max(rect[2]).clamp(0.0, 1.0),
+        rect[1].max(rect[3]).clamp(0.0, 1.0),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_inspection_threshold_is_dpi_correct() {
+        // 4 device px per source px is the boundary.
+        assert!((device_pixels_per_source_for(4.0, 1.0) - 4.0).abs() <= f32::EPSILON);
+        // At 1x DPI, zoom must reach the device-px threshold directly.
+        assert!(!pixel_inspection_recommended_for(3.9, 1.0));
+        assert!(pixel_inspection_recommended_for(4.0, 1.0));
+        // At 2x DPI, half the zoom reaches the same physical magnification.
+        assert!(!pixel_inspection_recommended_for(1.9, 2.0));
+        assert!(pixel_inspection_recommended_for(2.0, 2.0));
+        // Negative/zero inputs never recommend inspection and never go below 0.
+        assert!((device_pixels_per_source_for(-5.0, 1.0)).abs() <= f32::EPSILON);
+        assert!(!pixel_inspection_recommended_for(0.0, 1.0));
+    }
+
+    #[test]
+    fn image_bubble_zoom_preview_scale_clamps_to_contract() {
+        // zoom >= 1.0 never enlarges the preview.
+        assert!((image_bubble_zoom_preview_scale(1.0) - 1.0).abs() <= f32::EPSILON);
+        assert!((image_bubble_zoom_preview_scale(2.0) - 1.0).abs() <= f32::EPSILON);
+        // zoom < 1.0 shrinks proportionally.
+        assert!((image_bubble_zoom_preview_scale(0.5) - 0.5).abs() <= f32::EPSILON);
+        assert!((image_bubble_zoom_preview_scale(0.3) - 0.3).abs() <= f32::EPSILON);
+        // Floor at 0.2 for very low, zero, and negative zoom.
+        assert!((image_bubble_zoom_preview_scale(0.1) - 0.2).abs() <= f32::EPSILON);
+        assert!((image_bubble_zoom_preview_scale(0.0) - 0.2).abs() <= f32::EPSILON);
+        assert!((image_bubble_zoom_preview_scale(-1.0) - 0.2).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn image_bubble_preview_size_is_deterministic_and_height_matches_draw() {
+        // Same inputs must always yield the same size (layout height == drawn height).
+        let cases: &[([usize; 2], f32, f32, f32)] = &[
+            ([400, 300], 200.0, 500.0, 1.0),  // width-limited, no zoom shrink
+            ([300, 600], 200.0, 250.0, 1.0),  // height-limited by max_h
+            ([100, 80], 400.0, 500.0, 1.0),   // smaller than fit -> no upscale (scale clamp 1.0)
+            ([800, 1200], 180.0, 220.0, 0.5), // zoom shrink applied
+            ([640, 480], 150.0, 300.0, 0.05), // extreme zoom floored at 0.2
+            ([1, 1], 0.0, 0.0, 1.0),          // degenerate inputs are clamped, never NaN
+        ];
+        for &(source_px, width, max_h, zoom) in cases {
+            let a = image_bubble_preview_size(source_px, width, max_h, zoom);
+            let b = image_bubble_preview_size(source_px, width, max_h, zoom);
+            assert_eq!(a, b, "helper must be deterministic for {source_px:?}");
+            assert!(a.x.is_finite() && a.y.is_finite());
+            assert!(a.x >= 0.0 && a.y >= 0.0);
+        }
+    }
+
+    #[test]
+    fn image_bubble_preview_size_preserves_source_aspect_ratio() {
+        // fit_to_bubble + uniform zoom factor must keep the source aspect ratio.
+        let size = image_bubble_preview_size([400, 300], 200.0, 500.0, 1.0);
+        let expected_ratio = 400.0_f32 / 300.0;
+        assert!((size.x / size.y - expected_ratio).abs() <= 1e-4);
+    }
+
+    #[test]
+    fn image_bubble_preview_size_never_upscales() {
+        // Source smaller than the available box must not be enlarged (scale clamped to 1.0).
+        let size = image_bubble_preview_size([100, 80], 400.0, 500.0, 1.0);
+        assert!((size.x - 100.0).abs() <= 1e-4);
+        assert!((size.y - 80.0).abs() <= 1e-4);
+    }
 
     #[test]
     fn apply_viewport_snapshot_sets_zoom_and_pending_scroll() {

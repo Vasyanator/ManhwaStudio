@@ -15,6 +15,7 @@ use super::image_ops::{
     blend_full_image_over, draw_image_with_opacity, gaussian_blur_rgba_in_place,
 };
 use super::parse::{ReflectAxis, ShakeEffectParams};
+use rayon::prelude::*;
 
 pub(crate) fn apply_reflect_effect(image: &mut RenderedTextImage, axis: ReflectAxis) {
     let width = image.width as usize;
@@ -25,22 +26,27 @@ pub(crate) fn apply_reflect_effect(image: &mut RenderedTextImage, axis: ReflectA
 
     let source = image.rgba.clone();
     let mut out = vec![0u8; source.len()];
+    let row_stride = width * 4;
 
-    for y in 0..height {
-        for x in 0..width {
-            let src_x = match axis {
-                ReflectAxis::X => x,
-                ReflectAxis::Y => width - 1 - x,
-            };
+    // Pure gather: each output pixel copies exactly one read-only source pixel, so the
+    // mirror is parallelized over output rows with no overlapping writes.
+    out.par_chunks_mut(row_stride)
+        .enumerate()
+        .for_each(|(y, out_row)| {
             let src_y = match axis {
                 ReflectAxis::X => height - 1 - y,
                 ReflectAxis::Y => y,
             };
-            let src_idx = (src_y * width + src_x) * 4;
-            let dst_idx = (y * width + x) * 4;
-            out[dst_idx..dst_idx + 4].copy_from_slice(&source[src_idx..src_idx + 4]);
-        }
-    }
+            for x in 0..width {
+                let src_x = match axis {
+                    ReflectAxis::X => x,
+                    ReflectAxis::Y => width - 1 - x,
+                };
+                let src_idx = (src_y * width + src_x) * 4;
+                let dst_idx = x * 4;
+                out_row[dst_idx..dst_idx + 4].copy_from_slice(&source[src_idx..src_idx + 4]);
+            }
+        });
 
     image.rgba = out;
 }
@@ -140,6 +146,10 @@ pub(crate) fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEff
         image.width = out_width;
         image.height = out_height;
         image.rgba = base;
+        // Контент вставлен в (left_pad, top_pad) внутри увеличенного буфера
+        // (только при autogrow; иначе паддинги нулевые и в этот блок не входим).
+        image.content_origin_x = image.content_origin_x.saturating_add(left_pad as u32);
+        image.content_origin_y = image.content_origin_y.saturating_add(top_pad as u32);
     }
 
     let trail_width = image.width as usize;
@@ -202,4 +212,70 @@ pub(crate) fn apply_shake_effect(image: &mut RenderedTextImage, shake: &ShakeEff
     }
 
     blend_full_image_over(&mut image.rgba, trail.as_slice());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::parse::ReflectAxis;
+    use super::apply_reflect_effect;
+    use crate::tabs::typing::render_next::types::RenderedTextImage;
+
+    fn sample_image() -> RenderedTextImage {
+        let width = 13usize;
+        let height = 9usize;
+        let mut rgba = vec![0u8; width * height * 4];
+        for (idx, byte) in rgba.iter_mut().enumerate() {
+            *byte = ((idx * 53 + idx / 3 + 7) % 256) as u8;
+        }
+        RenderedTextImage {
+            width: width as u32,
+            height: height as u32,
+            rgba,
+            warnings: Vec::new(),
+            content_origin_x: 0,
+            content_origin_y: 0,
+        }
+    }
+
+    /// Verbatim sequential reference of the reflect gather (pre-parallelization).
+    fn apply_reflect_seq(image: &mut RenderedTextImage, axis: ReflectAxis) {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        let source = image.rgba.clone();
+        let mut out = vec![0u8; source.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let src_x = match axis {
+                    ReflectAxis::X => x,
+                    ReflectAxis::Y => width - 1 - x,
+                };
+                let src_y = match axis {
+                    ReflectAxis::X => height - 1 - y,
+                    ReflectAxis::Y => y,
+                };
+                let src_idx = (src_y * width + src_x) * 4;
+                let dst_idx = (y * width + x) * 4;
+                out[dst_idx..dst_idx + 4].copy_from_slice(&source[src_idx..src_idx + 4]);
+            }
+        }
+        image.rgba = out;
+    }
+
+    #[test]
+    fn reflect_x_parallel_matches_sequential() {
+        let mut parallel = sample_image();
+        let mut sequential = sample_image();
+        apply_reflect_effect(&mut parallel, ReflectAxis::X);
+        apply_reflect_seq(&mut sequential, ReflectAxis::X);
+        assert_eq!(parallel.rgba, sequential.rgba);
+    }
+
+    #[test]
+    fn reflect_y_parallel_matches_sequential() {
+        let mut parallel = sample_image();
+        let mut sequential = sample_image();
+        apply_reflect_effect(&mut parallel, ReflectAxis::Y);
+        apply_reflect_seq(&mut sequential, ReflectAxis::Y);
+        assert_eq!(parallel.rgba, sequential.rgba);
+    }
 }

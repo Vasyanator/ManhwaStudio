@@ -11,7 +11,9 @@ Main structs:
 - `UploadTask`: incremental texture upload state with per-frame budget.
 
 Async/background pipeline:
-- `spawn_loader_thread`: decodes pages in worker pool and sends `LoaderEvent`.
+- `spawn_loader_thread`: decodes pages in worker pool and sends `LoaderEvent`; workers throttle
+  their look-ahead to `DECODE_AHEAD_WINDOW` pages past the promotion frontier so a slow early page
+  cannot let decoded-but-unpromotable pages pile up unbounded in `decoded_pending_by_idx`.
 - `spawn_overlay_loader_thread`: loads clean overlays in background and prebuilds the
   `RgbaImage` + `ColorImage` payload before it reaches the GUI thread.
 - `decode_worker_count`: picks decode worker parallelism (logical cores by default, env override).
@@ -19,8 +21,8 @@ Async/background pipeline:
 - `upload_textures_incremental`: frame-budgeted GPU upload to avoid GUI freezes.
 - `poll_overlay_loader_events`: applies decoded overlays into shared model.
 - `decode_image_rgba`: common image decode path with optional experimental GPU decode via ffmpeg.
-- `page_cache`: when enabled from startup, main page decode also seeds the shared page RGBA cache
-  to avoid a second full decode pass later.
+- `page_cache`: when enabled and allowed by the memory profile at startup, main page decode also
+  seeds the shared page RGBA cache to avoid a second full decode pass later.
 
 App/frame flow:
 - `new`: builds models, tabs, and input manager registrations.
@@ -32,13 +34,20 @@ App/frame flow:
 Hotkeys:
 - Translation canvas zoom/edit commands + panel toggles (`P/O/K/M/D` by default).
 - Cleaning canvas zoom commands.
+
+Profiling (optional, behind the `profiling` cargo feature):
+- `update` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
+  per-frame phases (worker polling, GPU upload, active-tab draw). The puffin_egui profiler
+  window is shown while the feature is compiled in. All puffin references are gated behind
+  `#[cfg(feature = "profiling")]` so the default build pulls in no puffin and has zero overhead.
+  How to run: `cargo run --features profiling`.
 */
 
-use crate::ai_backend_capabilities;
+use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleTextField, BubbleType,
     CanvasDrawParams, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, OnTopFocusMode,
-    SourceTextureUploadBudget, spawn_overlay_autosave_thread,
+    SourceTextureUploadBudget, TranslationStatusDisplay, spawn_overlay_autosave_thread,
 };
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, InputManagerV2};
 use crate::memory_manager::{
@@ -55,10 +64,11 @@ use crate::tabs::AppTab;
 use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
 use crate::tabs::cleaning::CleaningTabState;
 use crate::tabs::notes::NotesTabState;
+use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::settings::SettingsTabState;
 use crate::tabs::terms::TermsTabState;
 use crate::tabs::translation::backend_health::{
-    AiBackendDeviceOption, AiBackendHealthSnapshot, AiBackendProbeCommand, spawn_ai_backend_probe,
+    AiBackendDeviceOption, AiBackendHealthSnapshot, AiBackendProbeCommand,
 };
 use crate::tabs::translation::{
     HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
@@ -77,7 +87,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -85,6 +95,11 @@ use std::time::{Duration, Instant};
 
 const DECODE_TILE_SIDE: u32 = 2048;
 const LOADER_QUEUE_CAPACITY: usize = 2;
+/// Maximum number of source pages workers may decode ahead of the next page still waiting
+/// for in-order promotion. Bounds `decoded_pending_by_idx` so a slow early page cannot let
+/// later pages pile up unbounded in RAM. Must be >= 1 so the page that unblocks promotion is
+/// always inside the window (otherwise the loader would deadlock).
+const DECODE_AHEAD_WINDOW: usize = 8;
 const EVENT_POLL_BUDGET: usize = 8;
 const UPLOAD_TILE_BUDGET_PER_FRAME: usize = 4;
 const UPLOAD_BYTES_BUDGET_PER_FRAME: usize = 24 * 1024 * 1024;
@@ -135,6 +150,10 @@ pub struct MangaApp {
     decoded_queue: VecDeque<DecodedPage>,
     decoded_pending_by_idx: HashMap<usize, DecodedPage>,
     next_decode_idx_to_enqueue: usize,
+    /// Lowest page index still awaiting in-order promotion, published to the decode worker
+    /// pool so it can throttle how far ahead it decodes (see `DECODE_AHEAD_WINDOW`). Mirrors
+    /// `next_decode_idx_to_enqueue`; updated whenever promotion advances it.
+    decode_promotion_progress: Arc<AtomicUsize>,
     upload_task: Option<UploadTask>,
     loader_finished: bool,
     overlay_loader_rx: Option<Receiver<OverlayLoaderEvent>>,
@@ -147,12 +166,30 @@ pub struct MangaApp {
     active_tab: AppTab,
     shared_canvas_viewport: CanvasViewportSnapshot,
     active_viewport_owner_tab: Option<AppTab>,
+    /// Current page shared across view tabs (canvas tabs + the PS editor). Lets the PS editor pick
+    /// up the page the canvas was showing and hand its page back on the way out.
+    shared_page_idx: usize,
+    /// Page-local source-pixel center of the shared view, for reproducing the camera position
+    /// across tabs that do not share the canvas scroll model. `None` until a view tab publishes it.
+    shared_page_center: Option<egui::Vec2>,
+    /// The previously active "view" tab (canvas tabs or PS editor), used to detect transitions
+    /// into/out of the PS editor for view sync. Non-view tabs (Settings, Wiki, …) preserve it.
+    prev_view_tab: Option<AppTab>,
     ai_backend_health: Arc<Mutex<AiBackendHealthSnapshot>>,
+    /// Per-frame cached copy of `ai_backend_health`, refreshed once per frame in `update`.
+    /// The AI prompt/version-warning helpers read this snapshot instead of locking and
+    /// cloning the shared health state up to three times per frame.
+    ai_backend_health_cached: AiBackendHealthSnapshot,
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
-    ai_backend_probe_thread: Option<JoinHandle<()>>,
     translation_tab: TranslationTabState,
     cleaning_tab: CleaningTabState,
     typing_tab: TypingTabState,
+    ps_editor_tab: PsEditorTabState,
+    /// Shared unified layer document: the source of truth for per-page layer MODEL state, held by
+    /// both view tabs (`Arc<Mutex<…>>`). Each tab re-projects its current page whenever the doc's
+    /// `version` changes (the in-memory cross-tab sync). This field keeps the `Arc` alive.
+    #[allow(dead_code)]
+    layer_doc: std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>,
     characters_tab: CharactersTabState,
     terms_tab: TermsTabState,
     notes_tab: NotesTabState,
@@ -191,6 +228,11 @@ pub struct MangaApp {
     return_to_launcher: bool,
     /// Shared flag written before the window closes so that `run_main_window` can detect it.
     return_to_launcher_flag: Arc<AtomicBool>,
+    /// Whether the puffin_egui frame-profiler window is shown. Compiled in only under the
+    /// `profiling` feature; defaults to on so the profiler is visible immediately, and can be
+    /// toggled at runtime with F11.
+    #[cfg(feature = "profiling")]
+    profiler_window_open: bool,
 }
 
 /// Which variant of the exit/leave dialog is currently active.
@@ -345,9 +387,14 @@ struct UploadTask {
 impl MangaApp {
     pub fn new(
         project: ProjectData,
-        ai_enabled: bool,
+        ai_backend: AiBackendHandle,
         return_to_launcher_flag: Arc<AtomicBool>,
     ) -> Self {
+        let ai_enabled = ai_backend.ai_enabled;
+        // Enable puffin scope recording once at editor startup. Without this the
+        // `profile_scope!` markers are no-ops and the profiler window stays empty.
+        #[cfg(feature = "profiling")]
+        puffin::set_scopes_on(true);
         let user_settings = crate::config::load_user_settings_for_startup().unwrap_or_else(|err| {
             runtime_log::log_warn(format!(
                 "[memory] failed to load user settings for memory profile; using default: {err}"
@@ -358,6 +405,8 @@ impl MangaApp {
             crate::config::memory_profile_from_user_settings(&user_settings),
         ));
         let cache_pages = project.canvas_settings.cache_pages;
+        let cache_pages_on_initial_load =
+            should_seed_page_cache_on_initial_load(cache_pages, memory_manager.budget());
         let pages: Vec<(usize, PathBuf)> = project
             .pages
             .iter()
@@ -378,7 +427,13 @@ impl MangaApp {
             })
             .collect();
         let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
-        spawn_loader_thread(pages, tx, cache_pages);
+        let decode_promotion_progress = Arc::new(AtomicUsize::new(0));
+        spawn_loader_thread(
+            pages,
+            tx,
+            cache_pages_on_initial_load,
+            Arc::clone(&decode_promotion_progress),
+        );
         let mut canvas = CanvasView::default();
         let loaded_bubble_mode = BubbleMode::from_str(&project.canvas_settings.bubble_type);
         canvas.state.bubble_mode = BubbleMode::Hybrid;
@@ -408,6 +463,7 @@ impl MangaApp {
             AsideBubbleCompactMode::from_str(&project.canvas_settings.aside_compact_mode);
         canvas.state.aside_side_mode =
             AsideBubbleSideMode::from_str(&project.canvas_settings.aside_side_mode);
+        canvas.state.aside_second_column = project.canvas_settings.aside_second_column;
         canvas.state.on_top_focus_mode =
             OnTopFocusMode::from_str(&project.canvas_settings.on_top_focus_mode);
         canvas.state.scale_bubbles = project.canvas_settings.scale_bubbles;
@@ -422,6 +478,8 @@ impl MangaApp {
         canvas.state.spellcheck_translation = project.canvas_settings.spellcheck_translation;
         canvas.state.tabs_autosync_enabled = project.canvas_settings.tabs_autosync_enabled;
         canvas.state.cache_pages = cache_pages;
+        canvas.state.translation_status_display =
+            TranslationStatusDisplay::from_str(&project.canvas_settings.translation_status_display);
         let shared_canvas_settings = SharedCanvasSettings {
             bubble_type: BubbleMode::Hybrid.as_str().to_string(),
             editable_bubble_type: canvas
@@ -446,6 +504,7 @@ impl MangaApp {
             bubble_max_width: canvas.state.bubble_max_width,
             aside_compact_mode: canvas.state.aside_compact_mode.as_str().to_string(),
             aside_side_mode: canvas.state.aside_side_mode.as_str().to_string(),
+            aside_second_column: canvas.state.aside_second_column,
             on_top_focus_mode: canvas.state.on_top_focus_mode.as_str().to_string(),
             scale_bubbles: canvas.state.scale_bubbles,
             aside_scale_pct: canvas.state.aside_scale_pct,
@@ -454,6 +513,11 @@ impl MangaApp {
             spellcheck_translation: canvas.state.spellcheck_translation,
             tabs_autosync_enabled: canvas.state.tabs_autosync_enabled,
             cache_pages: canvas.state.cache_pages,
+            translation_status_display: canvas
+                .state
+                .translation_status_display
+                .as_str()
+                .to_string(),
         };
         let bubbles_model = Arc::new(Mutex::new(BubblesModel::new(
             project.bubbles.as_ref().clone(),
@@ -465,19 +529,11 @@ impl MangaApp {
         canvas.set_bubbles_model(Arc::clone(&bubbles_model));
         let shared_canvas_viewport = canvas.viewport_snapshot();
         let applied_bubbles_revision = bubbles_model.lock().map(|m| m.revision()).unwrap_or(0);
-        ai_backend_capabilities::set_torch_available(if ai_enabled { None } else { Some(false) });
-        let ai_backend_health = Arc::new(Mutex::new(if ai_enabled {
-            AiBackendHealthSnapshot::default()
-        } else {
-            AiBackendHealthSnapshot::disabled()
-        }));
-        let mut ai_backend_probe_tx = None;
-        let mut ai_backend_probe_thread = None;
-        if ai_enabled {
-            let (tx, handle) = spawn_ai_backend_probe(Arc::clone(&ai_backend_health));
-            ai_backend_probe_tx = Some(tx);
-            ai_backend_probe_thread = Some(handle);
-        }
+        // The backend process + health/device probe are owned app-globally by
+        // `AiBackendSupervisor` (see `run_main`); the studio just shares its handle so
+        // the backend keeps running across launcher<->studio transitions.
+        let ai_backend_health = Arc::clone(&ai_backend.health);
+        let ai_backend_probe_tx = ai_backend.probe_tx.clone();
         let text_mask_model = Arc::new(Mutex::new(TextMaskModel::new()));
         let mut translation_tab = TranslationTabState::new(
             ai_enabled,
@@ -502,12 +558,18 @@ impl MangaApp {
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
         typing_tab.set_bubbles_model(Arc::clone(&bubbles_model));
         typing_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
-        let mut settings_tab = SettingsTabState::new(
-            ai_enabled,
-            Arc::clone(&ai_backend_health),
-            ai_backend_probe_tx.clone(),
-            Arc::clone(&memory_manager),
-        );
+        let mut ps_editor_tab = PsEditorTabState::default();
+        ps_editor_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
+        // Shared unified layer document, owned at the app level and held by both view tabs. It is the
+        // source of truth for per-page layer MODEL state; each tab re-projects its current page when
+        // the doc's `version` changes, which is the in-memory cross-tab sync.
+        let layer_doc = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::models::layer_model::layer_doc::LayerDoc::new(),
+        ));
+        typing_tab.set_layer_doc(std::sync::Arc::clone(&layer_doc));
+        ps_editor_tab.set_layer_doc(std::sync::Arc::clone(&layer_doc));
+        let mut settings_tab =
+            SettingsTabState::new(ai_backend.clone(), Arc::clone(&memory_manager));
         settings_tab.set_canvas_settings_binding(
             project.paths.settings_file.clone(),
             bubbles_model
@@ -552,6 +614,7 @@ impl MangaApp {
             decoded_queue: VecDeque::new(),
             decoded_pending_by_idx: HashMap::new(),
             next_decode_idx_to_enqueue: 0,
+            decode_promotion_progress,
             upload_task: None,
             loader_finished: false,
             overlay_loader_rx: None,
@@ -564,12 +627,17 @@ impl MangaApp {
             active_tab: AppTab::Translation,
             shared_canvas_viewport,
             active_viewport_owner_tab: Some(AppTab::Translation),
+            shared_page_idx: 0,
+            shared_page_center: None,
+            prev_view_tab: Some(AppTab::Translation),
             ai_backend_health,
+            ai_backend_health_cached: AiBackendHealthSnapshot::default(),
             ai_backend_probe_tx: ai_backend_probe_tx.clone(),
-            ai_backend_probe_thread,
             translation_tab,
             cleaning_tab,
             typing_tab,
+            ps_editor_tab,
+            layer_doc,
             characters_tab: CharactersTabState::default(),
             terms_tab: TermsTabState::default(),
             notes_tab: NotesTabState::default(),
@@ -598,6 +666,8 @@ impl MangaApp {
             maximize_root_window_on_first_frame: true,
             return_to_launcher: false,
             return_to_launcher_flag,
+            #[cfg(feature = "profiling")]
+            profiler_window_open: true,
         }
     }
 
@@ -606,21 +676,32 @@ impl MangaApp {
         self.has_unsaved_changes_cached
     }
 
+    /// Refreshes the cached unsaved-changes flag.
+    ///
+    /// `has_unsaved_changes_cached` is a sticky latch that is only cleared on an explicit
+    /// save (`mark_saved_to_project`). While it is already true there is nothing to
+    /// recompute, so the per-frame model locks and the staging-dir probe are skipped.
+    /// While it is false the work is throttled to roughly once per second via the existing
+    /// `next_unsaved_dir_check_s` timer; this keeps the GUI thread off the shared model
+    /// locks every frame while still surfacing new unsaved state within ~1s.
     fn refresh_unsaved_changes_cache(&mut self, now: f64) {
+        if self.has_unsaved_changes_cached || now < self.next_unsaved_dir_check_s {
+            return;
+        }
+        self.next_unsaved_dir_check_s = now + 1.0;
         if let Ok(model) = self.bubbles_model.lock()
             && model.has_unsaved_changes()
         {
             self.has_unsaved_changes_cached = true;
+            return;
         }
         if let Ok(model) = self.clean_overlays_model.lock()
             && model.has_project_unsaved_changes()
         {
             self.has_unsaved_changes_cached = true;
+            return;
         }
-        if !self.has_unsaved_changes_cached && now >= self.next_unsaved_dir_check_s {
-            self.has_unsaved_changes_cached = self.project.paths.unsaved_dir.exists();
-            self.next_unsaved_dir_check_s = now + 1.0;
-        }
+        self.has_unsaved_changes_cached = self.project.paths.unsaved_dir.exists();
     }
 
     /// Snapshot dirty overlay pages, save them in a background thread, then merge the
@@ -629,6 +710,15 @@ impl MangaApp {
         if self.save_to_project_rx.is_some() {
             return;
         }
+        // Flush the PS editor's active-page raster layers into the staging dir so the merge below
+        // picks them up. Other visited pages were already written on their page switch.
+        self.ps_editor_tab.flush_layers(&self.project);
+        // Flush the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
+        // legacy chapter that was only viewed (no edits → no placement save) still migrates its text
+        // before the unsaved→committed merge. The typing tab owns text persistence now. The returned set
+        // is the OWNED text pages (doc-resident this session) — the merge replaces those pages' text and
+        // preserves committed text for pages NOT in it (no silent drop on a PS raster-only edit).
+        let owned_text_pages = self.typing_tab.flush_text_layers();
         let unsaved_dir = self.project.paths.unsaved_dir.clone();
         let project_dir = self.project.paths.project_dir.clone();
         let unsaved_clean_layers_dir = self.project.paths.unsaved_clean_layers_dir.clone();
@@ -653,7 +743,7 @@ impl MangaApp {
                 )));
                 return;
             }
-            let result = merge_unsaved_into_project(&unsaved_dir, &project_dir);
+            let result = merge_unsaved_into_project(&unsaved_dir, &project_dir, &owned_text_pages);
             let _ = tx.send(result);
         });
         self.save_to_project_rx = Some(rx);
@@ -915,6 +1005,7 @@ impl MangaApp {
             bubble_max_width: self.canvas.state.bubble_max_width,
             aside_compact_mode: self.canvas.state.aside_compact_mode.as_str().to_string(),
             aside_side_mode: self.canvas.state.aside_side_mode.as_str().to_string(),
+            aside_second_column: self.canvas.state.aside_second_column,
             on_top_focus_mode: self.canvas.state.on_top_focus_mode.as_str().to_string(),
             scale_bubbles: self.canvas.state.scale_bubbles,
             aside_scale_pct: self.canvas.state.aside_scale_pct,
@@ -923,6 +1014,12 @@ impl MangaApp {
             spellcheck_translation: self.canvas.state.spellcheck_translation,
             tabs_autosync_enabled: self.canvas.state.tabs_autosync_enabled,
             cache_pages: self.canvas.state.cache_pages,
+            translation_status_display: self
+                .canvas
+                .state
+                .translation_status_display
+                .as_str()
+                .to_string(),
         };
 
         if let Ok(mut bubbles_model) = self.bubbles_model.lock() {
@@ -973,15 +1070,24 @@ impl MangaApp {
             });
     }
 
+    /// Refreshes the per-frame AI backend health cache from the shared probe state.
+    ///
+    /// Must be called once per frame before any helper that reads
+    /// `ai_backend_health_cached`, so the shared mutex is locked and cloned at most once
+    /// per frame instead of per consumer.
+    fn refresh_ai_backend_health_cache(&mut self) {
+        self.ai_backend_health_cached = match self.ai_backend_health.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+    }
+
     fn refresh_ai_device_selection_prompt(&mut self) {
         if self.ai_device_prompt_open {
             return;
         }
 
-        let snapshot = match self.ai_backend_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let snapshot = &self.ai_backend_health_cached;
         if !snapshot.connected
             || (!snapshot.torch_device_needs_selection && !snapshot.onnx_device_needs_selection)
         {
@@ -1006,10 +1112,9 @@ impl MangaApp {
             return;
         }
 
-        let snapshot = match self.ai_backend_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        // Clone the per-frame cached snapshot (no shared lock): the device-selection window
+        // closure below mutably borrows `self`, so it needs an owned snapshot to read from.
+        let snapshot = self.ai_backend_health_cached.clone();
         if !snapshot.connected
             || (!snapshot.torch_device_needs_selection && !snapshot.onnx_device_needs_selection)
         {
@@ -1163,10 +1268,7 @@ impl MangaApp {
     }
 
     fn current_ai_backend_version_mismatch(&self) -> Option<(String, String)> {
-        let snapshot = match self.ai_backend_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let snapshot = &self.ai_backend_health_cached;
         if !snapshot.connected {
             return None;
         }
@@ -1228,41 +1330,98 @@ impl MangaApp {
             });
     }
 
-    fn active_tab_is_canvas(&self) -> bool {
-        matches!(
-            self.active_tab,
-            AppTab::Translation | AppTab::Cleaning | AppTab::Typing
-        )
-    }
-
     fn apply_shared_viewport_to_active_canvas(&mut self) {
-        if !self.active_tab_is_canvas() {
-            return;
+        let entering_from_ps = self.prev_view_tab == Some(AppTab::PsEditor);
+        // Leaving the PS editor: flush its in-memory raster/group edits to disk and bump the shared
+        // layer revision, so the destination tab reloads the latest state (e.g. a raster the PS
+        // editor just cut into two). PS otherwise only persists on a page-switch, not a tab-switch.
+        if entering_from_ps && self.active_tab != AppTab::PsEditor {
+            self.ps_editor_tab.flush_layers(&self.project);
         }
-        if self.active_viewport_owner_tab == Some(self.active_tab) {
-            return;
-        }
-        let snapshot = self.shared_canvas_viewport;
         match self.active_tab {
-            AppTab::Translation => self.canvas.apply_viewport_snapshot(snapshot),
-            AppTab::Cleaning => self.cleaning_tab.apply_viewport_snapshot(snapshot),
-            AppTab::Typing => self.typing_tab.apply_viewport_snapshot(snapshot),
+            AppTab::Translation | AppTab::Cleaning | AppTab::Typing => {
+                // Canvas <-> canvas: reapply the precise scroll snapshot when the owner changed.
+                if self.active_viewport_owner_tab != Some(self.active_tab) {
+                    let snapshot = self.shared_canvas_viewport;
+                    match self.active_tab {
+                        AppTab::Translation => self.canvas.apply_viewport_snapshot(snapshot),
+                        AppTab::Cleaning => self.cleaning_tab.apply_viewport_snapshot(snapshot),
+                        AppTab::Typing => self.typing_tab.apply_viewport_snapshot(snapshot),
+                        _ => {}
+                    }
+                    self.active_viewport_owner_tab = Some(self.active_tab);
+                }
+                // Returning from the PS editor: the scroll snapshot is stale, so re-center the
+                // canvas on the page/zoom the PS editor handed back.
+                if entering_from_ps {
+                    let zoom = self.shared_canvas_viewport.zoom;
+                    let page = self.shared_page_idx;
+                    let center = self.shared_page_center;
+                    match self.active_tab {
+                        AppTab::Translation => self.canvas.focus_page(page, center, zoom),
+                        AppTab::Cleaning => self.cleaning_tab.focus_page(page, center, zoom),
+                        AppTab::Typing => self.typing_tab.focus_page(page, center, zoom),
+                        _ => {}
+                    }
+                }
+            }
+            AppTab::PsEditor => {
+                // Entering the PS editor: sync page + clean overlay + camera from the canvas world.
+                if self.prev_view_tab != Some(AppTab::PsEditor) {
+                    let zoom = self.shared_canvas_viewport.zoom;
+                    let page = self.shared_page_idx;
+                    let center = self.shared_page_center;
+                    self.ps_editor_tab
+                        .sync_view_from_canvas(&self.project, page, zoom, center);
+                }
+            }
             _ => {}
         }
-        self.active_viewport_owner_tab = Some(self.active_tab);
     }
 
     fn publish_shared_viewport_from_active_canvas(&mut self) {
-        if !self.active_tab_is_canvas() {
-            return;
+        match self.active_tab {
+            AppTab::Translation | AppTab::Cleaning | AppTab::Typing => {
+                let (snapshot, page_center) = match self.active_tab {
+                    AppTab::Translation => (
+                        self.canvas.viewport_snapshot(),
+                        self.canvas.current_page_local_view_center(),
+                    ),
+                    AppTab::Cleaning => (
+                        self.cleaning_tab.viewport_snapshot(),
+                        self.cleaning_tab.current_page_local_view_center(),
+                    ),
+                    AppTab::Typing => (
+                        self.typing_tab.viewport_snapshot(),
+                        self.typing_tab.current_page_local_view_center(),
+                    ),
+                    _ => unreachable!(),
+                };
+                self.shared_canvas_viewport = snapshot;
+                self.active_viewport_owner_tab = Some(self.active_tab);
+                if let Some((page, center)) = page_center {
+                    self.shared_page_idx = page;
+                    self.shared_page_center = Some(center);
+                }
+            }
+            AppTab::PsEditor => {
+                // The PS editor never owns the canvas scroll snapshot, but it does feed the shared
+                // page, zoom, and camera center back so the canvas can follow it on the way out.
+                if let Some(page) = self.ps_editor_tab.current_page() {
+                    self.shared_page_idx = page;
+                }
+                let (zoom, center) = self.ps_editor_tab.camera();
+                self.shared_canvas_viewport.zoom = zoom;
+                self.shared_page_center = Some(center);
+            }
+            _ => {}
         }
-        self.shared_canvas_viewport = match self.active_tab {
-            AppTab::Translation => self.canvas.viewport_snapshot(),
-            AppTab::Cleaning => self.cleaning_tab.viewport_snapshot(),
-            AppTab::Typing => self.typing_tab.viewport_snapshot(),
-            _ => self.shared_canvas_viewport,
-        };
-        self.active_viewport_owner_tab = Some(self.active_tab);
+        if matches!(
+            self.active_tab,
+            AppTab::Translation | AppTab::Cleaning | AppTab::Typing | AppTab::PsEditor
+        ) {
+            self.prev_view_tab = Some(self.active_tab);
+        }
     }
 
     fn dispatch_hotkeys(&mut self, ctx: &egui::Context) {
@@ -1415,6 +1574,10 @@ impl MangaApp {
             self.decoded_queue.push_back(page);
             self.next_decode_idx_to_enqueue += 1;
         }
+        // Publish promotion progress so the decode worker pool can slide its look-ahead
+        // window and avoid decoding pages far beyond what has been promoted (see 2.10).
+        self.decode_promotion_progress
+            .store(self.next_decode_idx_to_enqueue, AtomicOrdering::Release);
     }
 
     fn upload_textures_incremental(&mut self, ctx: &egui::Context) {
@@ -1458,7 +1621,12 @@ impl MangaApp {
                     task.uploaded_tiles.push(TextureTile {
                         linear_texture: Some(texture),
                         nearest_texture: None,
+                        // Tile sides are bounded by DECODE_TILE_SIDE (2048) and origins by
+                        // page dimensions, all far below f32's exact-integer limit (2^24),
+                        // so these u32->f32 casts are exact. There is no f32::from(u32).
+                        #[allow(clippy::cast_precision_loss)]
                         origin_px: egui::vec2(tile.origin_px[0] as f32, tile.origin_px[1] as f32),
+                        #[allow(clippy::cast_precision_loss)]
                         size_px: egui::vec2(tile.size_px[0] as f32, tile.size_px[1] as f32),
                         rgba: Arc::from(tile.rgba.as_slice()),
                     });
@@ -1510,7 +1678,10 @@ impl MangaApp {
             AppTab::Translation => self.canvas.active_source_page_window(neighbor_radius),
             AppTab::Cleaning => self.cleaning_tab.active_source_page_window(neighbor_radius),
             AppTab::Typing => self.typing_tab.active_source_page_window(neighbor_radius),
-            AppTab::Characters
+            // The PS-like editor owns its own page residency through `CleanOverlaysModel`'s page
+            // cache, so it does not participate in the shared source-texture window.
+            AppTab::PsEditor
+            | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
             | AppTab::Settings
@@ -1523,7 +1694,8 @@ impl MangaApp {
             AppTab::Translation => self.canvas.source_pixel_inspection_active(),
             AppTab::Cleaning => self.cleaning_tab.source_pixel_inspection_active(),
             AppTab::Typing => self.typing_tab.source_pixel_inspection_active(),
-            AppTab::Characters
+            AppTab::PsEditor
+            | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
             | AppTab::Settings
@@ -1567,29 +1739,6 @@ impl MangaApp {
                 });
             }
         }
-        resources
-    }
-
-    fn tab_gpu_memory_snapshot(&self, pinned_pages: &BTreeSet<usize>) -> Vec<CacheResourceInfo> {
-        let mut resources = Vec::new();
-        resources.extend(self.canvas.clean_overlay_gpu_memory_snapshot(pinned_pages));
-        resources.extend(
-            self.translation_tab
-                .text_detector_gpu_memory_snapshot(pinned_pages),
-        );
-        resources.extend(
-            self.cleaning_tab
-                .clean_overlay_gpu_memory_snapshot(pinned_pages),
-        );
-        resources.extend(
-            self.cleaning_tab
-                .cleaning_mask_gpu_memory_snapshot(pinned_pages),
-        );
-        resources.extend(
-            self.typing_tab
-                .clean_overlay_gpu_memory_snapshot(pinned_pages),
-        );
-        resources.extend(self.typing_tab.gpu_memory_snapshot(pinned_pages));
         resources
     }
 
@@ -1683,9 +1832,18 @@ impl MangaApp {
             },
             pinned_pages,
         };
-        let _ = self.tab_gpu_memory_snapshot(&request.pinned_pages);
+        // Eviction only runs under non-Normal pressure (Minimal profile / Soft pressure).
+        // `evict_tab_gpu_caches` builds its own per-tab sub-snapshots internally, so no
+        // separate snapshot is computed here.
         if request.pressure != MemoryPressure::Normal {
-            let _ = self.evict_tab_gpu_caches(&request);
+            let report = self.evict_tab_gpu_caches(&request);
+            if !report.resources.is_empty() {
+                runtime_log::log_info(format!(
+                    "[memory] tab GPU trim freed {} resources, {} bytes",
+                    report.resources.len(),
+                    report.estimated_freed_bytes
+                ));
+            }
         }
     }
 
@@ -1760,6 +1918,7 @@ impl MangaApp {
     fn ensure_page_cache_loader_started(&mut self) {
         if self.page_cache_loader_started
             || !self.canvas.state.cache_pages
+            || !self.memory_manager_allows_source_page_cache()
             || !self.main_pages_fully_loaded()
             || !self.overlay_loader_finished
         {
@@ -1839,6 +1998,10 @@ impl MangaApp {
         if let Ok(mut overlays) = self.clean_overlays_model.lock() {
             let _ = overlays.store_cached_page_rgba_arc(page.idx, Arc::clone(image));
         }
+    }
+
+    fn memory_manager_allows_source_page_cache(&self) -> bool {
+        self.memory_manager.budget().source_page_cpu_cache_bytes > 0
     }
 
     fn sync_project_from_bubbles_model(&mut self) {
@@ -2033,19 +2196,18 @@ fn build_system_font_definitions(
     defs
 }
 
-impl Drop for MangaApp {
-    fn drop(&mut self) {
-        if let Some(tx) = self.ai_backend_probe_tx.as_ref() {
-            let _ = tx.send(AiBackendProbeCommand::Stop);
-        }
-        if let Some(handle) = self.ai_backend_probe_thread.take() {
-            let _ = handle.join();
-        }
-    }
-}
+// The AI backend process + health/device probe outlive the studio window now (owned
+// by `AiBackendSupervisor` in `run_main`), so `MangaApp` no longer stops them on drop.
 
 impl eframe::App for MangaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Advance the puffin frame and open the top-level scope for this frame. `new_frame`
+        // must run exactly once per frame before any `profile_scope!` so recorded scopes are
+        // attributed to the correct frame; the scope guard stays alive for the whole body.
+        #[cfg(feature = "profiling")]
+        puffin::GlobalProfiler::lock().new_frame();
+        #[cfg(feature = "profiling")]
+        puffin::profile_scope!("MangaApp::update");
         ctx.options_mut(|opt| {
             opt.zoom_with_keyboard = false;
         });
@@ -2103,12 +2265,18 @@ impl eframe::App for MangaApp {
         }
 
         self.ensure_fonts(ctx);
-        self.poll_loader_events();
-        self.upload_textures_incremental(ctx);
-        self.ensure_overlay_loader_started();
-        self.poll_overlay_loader_events();
-        self.ensure_page_cache_loader_started();
-        self.poll_page_cache_loader_events();
+        {
+            // Coarse marker for the per-frame worker polling + GPU upload phase: decoded page
+            // promotion, incremental texture upload, and overlay/page-cache loader draining.
+            #[cfg(feature = "profiling")]
+            puffin::profile_scope!("poll_loaders_and_upload");
+            self.poll_loader_events();
+            self.upload_textures_incremental(ctx);
+            self.ensure_overlay_loader_started();
+            self.poll_overlay_loader_events();
+            self.ensure_page_cache_loader_started();
+            self.poll_page_cache_loader_events();
+        }
         self.sync_project_from_bubbles_model();
         self.refresh_hotkey_hints_cache(ctx);
         self.canvas
@@ -2137,8 +2305,15 @@ impl eframe::App for MangaApp {
 
         // Show exit/leave dialog on top of all other content.
         self.draw_exit_dialog(ctx);
+
         self.apply_shared_viewport_to_active_canvas();
 
+        // Coarse marker for the active-tab draw, the single most expensive phase per frame
+        // (canvas/overlay rendering, side panels, tab-specific UI). `profile_scope_custom!`
+        // returns the guard so it can be held across the whole match; it is dropped after the
+        // match closes the scope. `_active_tab_draw_scope` is a held RAII guard, not dead code.
+        #[cfg(feature = "profiling")]
+        let _active_tab_draw_scope = puffin::profile_scope_custom!("active_tab_draw");
         match self.active_tab {
             AppTab::Translation => {
                 self.translation_tab
@@ -2205,6 +2380,14 @@ impl eframe::App for MangaApp {
                     typing.draw(ctx, ui, project, page_infos, textures, status);
                 });
             }
+            AppTab::PsEditor => {
+                self.ps_editor_tab.handle_hotkeys(ctx);
+                let project = &self.project;
+                let ps_editor = &mut self.ps_editor_tab;
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ps_editor.draw(ctx, ui, project);
+                });
+            }
             AppTab::Characters => {
                 let project = &self.project;
                 let tab = &mut self.characters_tab;
@@ -2251,10 +2434,14 @@ impl eframe::App for MangaApp {
                 egui::CentralPanel::default().show(ctx, |ui| self.wiki_tab.draw(ui));
             }
         }
+        // Close the active-tab draw scope before the post-draw GPU trim / memory phases.
+        #[cfg(feature = "profiling")]
+        drop(_active_tab_draw_scope);
         self.trim_source_page_gpu_after_active_canvas();
         self.trim_tab_gpu_after_active_canvas();
         self.poll_memory_pressure_and_evict();
 
+        self.refresh_ai_backend_health_cache();
         self.refresh_ai_device_selection_prompt();
         self.refresh_ai_backend_version_warning();
         self.draw_comic_type_prompt(ctx);
@@ -2269,6 +2456,20 @@ impl eframe::App for MangaApp {
             ctx.request_repaint();
         }
         self.publish_shared_viewport_from_active_canvas();
+
+        // Frame profiler window (feature-gated). F11 toggles visibility; `profiler_window`
+        // returns false when the user closes the window, which we mirror into the field.
+        #[cfg(feature = "profiling")]
+        {
+            if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+                self.profiler_window_open = !self.profiler_window_open;
+            }
+            if self.profiler_window_open {
+                self.profiler_window_open = puffin_egui::profiler_window(ctx);
+                // The profiler view updates every frame; keep repainting while it is open.
+                ctx.request_repaint();
+            }
+        }
     }
 }
 
@@ -2413,16 +2614,36 @@ fn option_label(options: &[AiBackendDeviceOption], selected_id: &str) -> String 
         })
 }
 
+/// Spawns the source-page decode pool.
+///
+/// Decodes `pages` (`(page_idx, source_path)`) in a worker pool and streams each result
+/// to the GUI thread as a `LoaderEvent` over `tx` (a bounded `SyncSender`, which provides
+/// the GUI-side back-pressure on the decode-ahead window). `cache_pages_immediately`
+/// requests seeding the shared page RGBA cache during decode. `promotion_progress` is the
+/// GUI-updated frontier (next page index awaiting promotion); workers park while a job is
+/// more than `DECODE_AHEAD_WINDOW` pages ahead of it so decoded-but-unpromotable pages
+/// cannot pile up unbounded. The job queue is popped in ascending page-index order, which
+/// keeps that look-ahead window deadlock-free.
 fn spawn_loader_thread(
-    pages: Vec<(usize, PathBuf)>,
+    mut pages: Vec<(usize, PathBuf)>,
     tx: SyncSender<LoaderEvent>,
     cache_pages_immediately: bool,
+    promotion_progress: Arc<AtomicUsize>,
 ) {
     thread::spawn(move || {
         if pages.is_empty() {
             let _ = tx.send(LoaderEvent::Finished);
             return;
         }
+
+        // Enforce ascending page-index order so the look-ahead back-pressure below stays
+        // deadlock-free regardless of how `project.pages` was constructed: the page that
+        // unblocks promotion is always popped before any later page can park a worker.
+        pages.sort_by_key(|(idx, _)| *idx);
+        debug_assert!(
+            pages.windows(2).all(|w| w[0].0 <= w[1].0),
+            "decode jobs must be in ascending page-index order"
+        );
 
         let worker_count = decode_worker_count(pages.len());
         let jobs = Arc::new(Mutex::new(VecDeque::from(pages)));
@@ -2431,6 +2652,7 @@ fn spawn_loader_thread(
         for _ in 0..worker_count {
             let tx = tx.clone();
             let jobs = Arc::clone(&jobs);
+            let promotion_progress = Arc::clone(&promotion_progress);
             workers.push(thread::spawn(move || {
                 loop {
                     let job = {
@@ -2442,6 +2664,20 @@ fn spawn_loader_thread(
                     let Some((idx, path)) = job else {
                         return;
                     };
+
+                    // Look-ahead throttle: do not decode pages more than DECODE_AHEAD_WINDOW
+                    // beyond the next page awaiting promotion, so decoded-but-unpromotable
+                    // pages cannot pile up unbounded in the GUI-side pending map. The job
+                    // queue is sorted ascending before this loop, so jobs are popped in
+                    // ascending index order; the page that unblocks promotion is never stuck
+                    // behind a parked worker and this cannot deadlock.
+                    loop {
+                        let progress = promotion_progress.load(AtomicOrdering::Acquire);
+                        if decode_idx_within_window(idx, progress) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
 
                     let event = match decode_page(idx, &path, cache_pages_immediately) {
                         Ok(page) => LoaderEvent::Decoded(page),
@@ -2466,6 +2702,13 @@ fn spawn_loader_thread(
     });
 }
 
+fn should_seed_page_cache_on_initial_load(
+    cache_pages_enabled: bool,
+    memory_budget: crate::memory_manager::MemoryBudget,
+) -> bool {
+    cache_pages_enabled && memory_budget.source_page_cpu_cache_bytes > 0
+}
+
 fn decode_worker_count(job_count: usize) -> usize {
     if job_count == 0 {
         return 1;
@@ -2481,6 +2724,16 @@ fn decode_worker_count(job_count: usize) -> usize {
     configured_threads
         .unwrap_or(default_threads)
         .clamp(1, job_count)
+}
+
+/// Returns true when page `idx` is close enough to the latest promoted page `progress`
+/// to be decoded now, given the `DECODE_AHEAD_WINDOW` look-ahead bound.
+///
+/// `progress` is the lowest page index still awaiting in-order promotion. A page exactly at
+/// `progress` (the one that unblocks promotion) is always inside the window, so the loader
+/// pool always has at least one eligible job and cannot deadlock.
+fn decode_idx_within_window(idx: usize, progress: usize) -> bool {
+    idx < progress.saturating_add(DECODE_AHEAD_WINDOW)
 }
 
 fn decode_page(idx: usize, path: &PathBuf, cache_page_rgba: bool) -> Result<DecodedPage, String> {
@@ -2685,12 +2938,12 @@ fn decode_image_rgba(idx: usize, path: &PathBuf) -> Result<image::RgbaImage, Str
 }
 
 fn try_decode_image_rgba_with_ffmpeg(path: &Path) -> Result<Option<image::RgbaImage>, String> {
-    if !should_try_gpu_decode(path) {
+    // The header is parsed once here (via `should_try_gpu_decode`) and the resulting
+    // dimensions are reused for the raw-output size check below, instead of re-reading the
+    // image header a second time.
+    let Some((width, height)) = should_try_gpu_decode(path) else {
         return Ok(None);
-    }
-
-    let (width, height) =
-        image::image_dimensions(path).map_err(|e| format!("image_dimensions failed: {e}"))?;
+    };
     if width == 0 || height == 0 {
         return Ok(Some(image::RgbaImage::new(width, height)));
     }
@@ -2730,15 +2983,22 @@ fn try_decode_image_rgba_with_ffmpeg(path: &Path) -> Result<Option<image::RgbaIm
         .ok_or_else(|| "ffmpeg returned invalid RGBA buffer".to_string())
 }
 
-fn should_try_gpu_decode(path: &Path) -> bool {
+/// Decides whether to attempt experimental ffmpeg GPU decoding for `path`.
+///
+/// Returns `Some((width, height))` with the parsed header dimensions when GPU decode should
+/// be tried, or `None` otherwise. The caller reuses the returned dimensions so the image
+/// header is parsed only once across the decode-decision and decode-validation steps.
+fn should_try_gpu_decode(path: &Path) -> Option<(u32, u32)> {
     if !gpu_decode_requested() || !ffmpeg_available() || !is_gpu_decode_extension_supported(path) {
-        return false;
+        return None;
     }
-    let Ok((width, height)) = image::image_dimensions(path) else {
-        return false;
-    };
+    let (width, height) = image::image_dimensions(path).ok()?;
     let pixels = (width as u64).saturating_mul(height as u64);
-    pixels >= gpu_decode_min_pixels()
+    if pixels >= gpu_decode_min_pixels() {
+        Some((width, height))
+    } else {
+        None
+    }
 }
 
 fn is_gpu_decode_extension_supported(path: &Path) -> bool {
@@ -2815,14 +3075,38 @@ fn copy_rgba_tile_rows(
     out
 }
 
-/// Recursively copies every file from `unsaved_dir` into `project_dir` (overwriting),
-/// then removes `unsaved_dir`.  Called from a background thread by `start_save_to_project`.
-fn merge_unsaved_into_project(unsaved_dir: &Path, project_dir: &Path) -> Result<(), String> {
+/// Recursively copies every file from `unsaved_dir` into `project_dir` (overwriting), then removes
+/// `unsaved_dir`. Called from a background thread by `start_save_to_project`.
+///
+/// `layers/layers.json` is SPECIAL-CASED: it is merged PER PAGE (not file-overwritten), because the
+/// unsaved staging manifest only holds the pages the doc session actually visited, while the committed
+/// manifest may carry MORE pages (e.g. all of them, written by the eager text migration). A blind
+/// overwrite would DROP the committed-only pages — the ВВД/13 truncation. `owned_text_pages` is the set
+/// of pages whose TEXT the doc loaded this session (from `flush_text_layers`); the merge replaces those
+/// pages' text wholesale (authoritative, incl. deletions) and PRESERVES committed text for pages NOT in
+/// it (a raster-only PS edit must not drop the committed text of a page whose text was never loaded).
+/// Every other file (PNGs, the `text_info.json` legacy/`.bak`, bubbles, …) is copied verbatim as before.
+fn merge_unsaved_into_project(
+    unsaved_dir: &Path,
+    project_dir: &Path,
+    owned_text_pages: &std::collections::HashSet<usize>,
+) -> Result<(), String> {
     if !unsaved_dir.is_dir() {
         // Nothing to merge — treat as success.
         return Ok(());
     }
-    copy_dir_overwrite(unsaved_dir, project_dir)?;
+    let committed_layers = project_dir.join(crate::config::LAYERS_DIR);
+    let unsaved_layers = unsaved_dir.join(crate::config::LAYERS_DIR);
+    // Copy everything EXCEPT the staging `layers/layers.json` (merged below).
+    let layers_manifest = unsaved_layers.join("layers.json");
+    copy_dir_overwrite_except(unsaved_dir, project_dir, &layers_manifest)?;
+    // Merge the layers manifest per-page (committed-only pages preserved; unowned-page text preserved).
+    crate::models::layer_model::persist::merge_unsaved_layers_into_committed(
+        &committed_layers,
+        &unsaved_layers,
+        owned_text_pages,
+    )
+    .map_err(|e| format!("Не удалось слить layers.json: {e}"))?;
     fs::remove_dir_all(unsaved_dir).map_err(|e| {
         format!(
             "Не удалось удалить временную папку {}: {e}",
@@ -2832,9 +3116,9 @@ fn merge_unsaved_into_project(unsaved_dir: &Path, project_dir: &Path) -> Result<
     Ok(())
 }
 
-/// Recursively copies files from `src` into `dst`, creating subdirectories as needed.
-/// Existing files in `dst` are overwritten.
-fn copy_dir_overwrite(src: &Path, dst: &Path) -> Result<(), String> {
+/// Recursively copies files from `src` into `dst`, creating subdirectories as needed. Existing files
+/// in `dst` are overwritten. The file at the absolute path `skip` is NOT copied (handled separately).
+fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), String> {
     fs::create_dir_all(dst)
         .map_err(|e| format!("Не удалось создать папку {}: {e}", dst.display()))?;
     let entries = fs::read_dir(src)
@@ -2842,9 +3126,12 @@ fn copy_dir_overwrite(src: &Path, dst: &Path) -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("Ошибка чтения записи в {}: {e}", src.display()))?;
         let src_path = entry.path();
+        if src_path == skip {
+            continue;
+        }
         let dst_path = dst.join(entry.file_name());
         if src_path.is_dir() {
-            copy_dir_overwrite(&src_path, &dst_path)?;
+            copy_dir_overwrite_except(&src_path, &dst_path, skip)?;
         } else {
             fs::copy(&src_path, &dst_path).map_err(|e| {
                 format!(
@@ -2860,7 +3147,11 @@ fn copy_dir_overwrite(src: &Path, dst: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ai_backend_version_warning_message;
+    use super::{
+        DECODE_AHEAD_WINDOW, ai_backend_version_warning_message, decode_idx_within_window,
+        should_seed_page_cache_on_initial_load,
+    };
+    use crate::memory_manager::{MemoryBudget, MemoryProfile};
 
     #[test]
     fn formats_ai_backend_version_warning() {
@@ -2868,5 +3159,57 @@ mod tests {
             ai_backend_version_warning_message("3.4.0", "3.3.0"),
             "Версии студии и ИИ бэкенда не соответствуют: 3.4.0/3.3.0. Возможна некорректная работа некоторых ИИ сервисов"
         );
+    }
+
+    #[test]
+    fn initial_page_cache_seed_requires_enabled_cache_and_memory_budget() {
+        assert!(!should_seed_page_cache_on_initial_load(
+            true,
+            MemoryBudget::for_profile(MemoryProfile::Minimal)
+        ));
+        assert!(!should_seed_page_cache_on_initial_load(
+            false,
+            MemoryBudget::for_profile(MemoryProfile::Medium)
+        ));
+        assert!(should_seed_page_cache_on_initial_load(
+            true,
+            MemoryBudget::for_profile(MemoryProfile::Medium)
+        ));
+    }
+
+    #[test]
+    fn decode_window_always_admits_the_page_that_unblocks_promotion() {
+        // The page exactly at the promotion frontier must always be decodable, otherwise the
+        // loader could deadlock waiting for a page no worker is allowed to decode. Page counts
+        // are far from usize::MAX in practice, so the frontier is always < progress + window.
+        for progress in [0usize, 1, 7, 42, 100_000] {
+            assert!(decode_idx_within_window(progress, progress));
+        }
+    }
+
+    #[test]
+    fn decode_window_bounds_look_ahead() {
+        let progress = 10usize;
+        // Last in-window index and first out-of-window index relative to the frontier.
+        assert!(decode_idx_within_window(
+            progress + DECODE_AHEAD_WINDOW - 1,
+            progress
+        ));
+        assert!(!decode_idx_within_window(
+            progress + DECODE_AHEAD_WINDOW,
+            progress
+        ));
+        assert!(!decode_idx_within_window(
+            progress + DECODE_AHEAD_WINDOW + 5,
+            progress
+        ));
+    }
+
+    #[test]
+    fn decode_window_does_not_overflow_near_usize_max() {
+        // saturating_add keeps the bound well-defined (no panic) even when progress is at the
+        // maximum; the comparison still resolves without overflowing.
+        assert!(decode_idx_within_window(usize::MAX - 1, usize::MAX));
+        assert!(!decode_idx_within_window(usize::MAX, usize::MAX));
     }
 }

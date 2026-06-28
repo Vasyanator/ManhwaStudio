@@ -16,6 +16,7 @@ Notes:
 */
 
 use super::font_registry::{InlineFontRegistry, normalize_inline_font_label};
+use super::types::{PxOrPercent, parse_machine_tag};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
 const VERTICAL_HALF_SPACE: char = '\u{200A}';
@@ -102,6 +103,23 @@ struct InlineStyleState {
     kerning_stack: Vec<[f32; 2]>,
     stretch_stack: Vec<[f32; 2]>,
     offset_stack: Vec<InlineGlyphOffset>,
+    // Какие стеки толкнул каждый открытый машиночитаемый тег `<m>` — чтобы `</m>`
+    // снял ровно их.
+    machine_frames: Vec<MachineFramePush>,
+}
+
+/// Отметка о том, в какие стеки сложил значения один открывающий тег `<m>`.
+#[derive(Debug, Default)]
+struct MachineFramePush {
+    bold: bool,
+    italic: bool,
+    font: bool,
+    size: bool,
+    color: bool,
+    line_spacing: bool,
+    kerning: bool,
+    stretch: bool,
+    offset: bool,
 }
 
 impl InlineStyleState {
@@ -125,7 +143,7 @@ impl InlineStyleState {
     }
 }
 
-pub(crate) fn parse_inline_style_tags(text: &str) -> ParsedInlineStyles {
+pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> ParsedInlineStyles {
     let mut plain_text = String::with_capacity(text.len());
     let mut spans = Vec::<InlineStyleSpan>::new();
     let mut state = InlineStyleState::default();
@@ -205,6 +223,11 @@ pub(crate) fn parse_inline_style_tags(text: &str) -> ParsedInlineStyles {
                     state.offset_stack.pop();
                     true
                 }
+                "/m" => {
+                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                    close_machine_tag(&mut state);
+                    true
+                }
                 "br" | "br/" | "/br" => {
                     plain_text.push('\n');
                     true
@@ -246,15 +269,21 @@ pub(crate) fn parse_inline_style_tags(text: &str) -> ParsedInlineStyles {
                 i = end + 1;
                 continue;
             }
-            if let Some(stretching) = parse_stretching_tag_value(raw) {
+            if let Some(stretching) = parse_stretching_tag_value(raw, base_font_size_px) {
                 flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
                 state.stretch_stack.push(stretching);
                 i = end + 1;
                 continue;
             }
-            if let Some(glyph_offset) = parse_offset_tag_value(raw) {
+            if let Some(glyph_offset) = parse_offset_tag_value(raw, base_font_size_px) {
                 flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
                 state.offset_stack.push(glyph_offset);
+                i = end + 1;
+                continue;
+            }
+            if let Some(attrs) = parse_machine_tag(raw) {
+                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                apply_machine_tag(&mut state, &attrs, base_font_size_px);
                 i = end + 1;
                 continue;
             }
@@ -508,7 +537,7 @@ fn parse_color_tag_value(raw_tag: &str) -> Option<[u8; 4]> {
     parse_hex_color_rgba(value)
 }
 
-fn parse_offset_tag_value(raw_tag: &str) -> Option<InlineGlyphOffset> {
+fn parse_offset_tag_value(raw_tag: &str, base_font_size_px: f32) -> Option<InlineGlyphOffset> {
     let trimmed = raw_tag.trim();
     let (tag_name, value) = trimmed.split_once('=')?;
     if !tag_name.trim().eq_ignore_ascii_case("offset") {
@@ -520,14 +549,16 @@ fn parse_offset_tag_value(raw_tag: &str) -> Option<InlineGlyphOffset> {
         .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
         .trim();
     let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
-    let x = parts.first()?.parse::<f32>().ok()?;
-    let y = parts.get(1)?.parse::<f32>().ok()?;
+    // X/Y/«по линии» поддерживают суффикс `%` (проценты от кегля); без него — пиксели.
+    let x = PxOrPercent::parse(parts.first()?)?.as_px_of(base_font_size_px);
+    let y = PxOrPercent::parse(parts.get(1)?)?.as_px_of(base_font_size_px);
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
     let line_px = parts
         .get(2)
-        .and_then(|value| value.parse::<f32>().ok())
+        .and_then(|value| PxOrPercent::parse(value))
+        .map(|value| value.as_px_of(base_font_size_px))
         .filter(|value| value.is_finite())
         .unwrap_or(0.0)
         .clamp(-1000.0, 1000.0);
@@ -565,37 +596,229 @@ fn parse_inline_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_tag_pair_value(raw_tag: &str, tag_name: &str, clamp: [f32; 2]) -> Option<[f32; 2]> {
+/// Применить машиночитаемый тег `<m ...>`: сложить все заданные стили в их стеки и
+/// запомнить кадр, чтобы `</m>` снял ровно их. См. контракт ключей в `parse_machine_tag`.
+fn apply_machine_tag(
+    state: &mut InlineStyleState,
+    attrs: &[(char, String)],
+    base_font_size_px: f32,
+) {
+    let mut frame = MachineFramePush::default();
+    let mut stretch_w: Option<f32> = None;
+    let mut stretch_h: Option<f32> = None;
+    let mut offset = InlineGlyphOffset::global_only([0.0, 0.0]);
+    let mut has_offset = false;
+
+    for (key, value) in attrs {
+        match key {
+            'b' => {
+                state.bold_depth = state.bold_depth.saturating_add(1);
+                frame.bold = true;
+            }
+            'i' => {
+                state.italic_depth = state.italic_depth.saturating_add(1);
+                frame.italic = true;
+            }
+            'f' => {
+                let label = value.trim();
+                if !label.is_empty() {
+                    state.font_stack.push(label.to_string());
+                    frame.font = true;
+                }
+            }
+            's' => {
+                if let Ok(px) = value.trim().parse::<f32>()
+                    && px.is_finite()
+                    && px > 0.0
+                {
+                    state.size_stack.push(px);
+                    frame.size = true;
+                }
+            }
+            'c' => {
+                if let Some(color) = parse_hex_color_rgba(value) {
+                    state.color_stack.push(color);
+                    frame.color = true;
+                }
+            }
+            'l' => {
+                if let Some(pair) = machine_pair_value(value) {
+                    state.line_spacing_stack.push(pair);
+                    frame.line_spacing = true;
+                }
+            }
+            'k' => {
+                if let Some(pair) = machine_pair_value(value) {
+                    state.kerning_stack.push(pair);
+                    frame.kerning = true;
+                }
+            }
+            'w' => {
+                stretch_w = PxOrPercent::parse(value)
+                    .map(|parsed| parsed.as_percent_of(base_font_size_px).clamp(1.0, 300.0));
+            }
+            'h' => {
+                stretch_h = PxOrPercent::parse(value)
+                    .map(|parsed| parsed.as_percent_of(base_font_size_px).clamp(1.0, 300.0));
+            }
+            'x' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.global_px[0] = parsed.as_px_of(base_font_size_px).clamp(-100.0, 100.0);
+                    has_offset = true;
+                }
+            }
+            'y' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.global_px[1] = parsed.as_px_of(base_font_size_px).clamp(-100.0, 100.0);
+                    has_offset = true;
+                }
+            }
+            'n' => {
+                if let Some(parsed) = PxOrPercent::parse(value) {
+                    offset.line_px = parsed.as_px_of(base_font_size_px).clamp(-1000.0, 1000.0);
+                    has_offset = true;
+                }
+            }
+            'g' => {
+                if let Ok(deg) = value.trim().parse::<f32>()
+                    && deg.is_finite()
+                {
+                    offset.group_rotation_rad = deg.clamp(-360.0, 360.0).to_radians();
+                    has_offset = true;
+                }
+            }
+            'r' => {
+                if let Ok(deg) = value.trim().parse::<f32>()
+                    && deg.is_finite()
+                {
+                    offset.glyph_rotation_rad = deg.clamp(-360.0, 360.0).to_radians();
+                    has_offset = true;
+                }
+            }
+            'q' => {
+                offset.shift_following = true;
+                has_offset = true;
+            }
+            _ => {}
+        }
+    }
+
+    if stretch_w.is_some() || stretch_h.is_some() {
+        state
+            .stretch_stack
+            .push([stretch_w.unwrap_or(100.0), stretch_h.unwrap_or(100.0)]);
+        frame.stretch = true;
+    }
+    if has_offset {
+        state.offset_stack.push(offset);
+        frame.offset = true;
+    }
+
+    state.machine_frames.push(frame);
+}
+
+/// Снять стили, сложенные парным открывающим `<m ...>`.
+fn close_machine_tag(state: &mut InlineStyleState) {
+    let Some(frame) = state.machine_frames.pop() else {
+        return;
+    };
+    if frame.bold {
+        state.bold_depth = state.bold_depth.saturating_sub(1);
+    }
+    if frame.italic {
+        state.italic_depth = state.italic_depth.saturating_sub(1);
+    }
+    if frame.font {
+        state.font_stack.pop();
+    }
+    if frame.size {
+        state.size_stack.pop();
+    }
+    if frame.color {
+        state.color_stack.pop();
+    }
+    if frame.line_spacing {
+        state.line_spacing_stack.pop();
+    }
+    if frame.kerning {
+        state.kerning_stack.pop();
+    }
+    if frame.stretch {
+        state.stretch_stack.pop();
+    }
+    if frame.offset {
+        state.offset_stack.pop();
+    }
+}
+
+/// Значение `px-или-%` в пару `[px, percent]` (активна ровно одна компонента),
+/// с клампом до ±300 — как у line-spacing/kerning.
+fn machine_pair_value(value: &str) -> Option<[f32; 2]> {
+    let parsed = PxOrPercent::parse(value)?;
+    let (px, percent) = PxOrPercent {
+        value: parsed.value.clamp(-300.0, 300.0),
+        is_percent: parsed.is_percent,
+    }
+    .as_px_percent();
+    Some([px, percent])
+}
+
+/// Извлечь значение тега `name=...`, обрезав кавычки/пробелы.
+fn tag_value<'a>(raw_tag: &'a str, tag_name: &str) -> Option<&'a str> {
     let trimmed = raw_tag.trim();
     let (raw_name, value) = trimmed.split_once('=')?;
     if !raw_name.trim().eq_ignore_ascii_case(tag_name) {
         return None;
     }
+    Some(
+        value
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+            .trim(),
+    )
+}
 
-    let value = value
-        .trim()
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
-        .trim();
-    let (x_raw, y_raw) = value.split_once(',')?;
-    let x = x_raw.trim().parse::<f32>().ok()?;
-    let y = y_raw.trim().parse::<f32>().ok()?;
-    if !x.is_finite() || !y.is_finite() {
-        return None;
+/// Разобрать одиночное значение `px-или-%` (или устаревшую пару `px,percent`)
+/// в пару `[px, percent]`, где активна ровно одна компонента (для нового формата).
+fn parse_value_or_legacy_pair(raw_tag: &str, tag_name: &str, clamp_abs: f32) -> Option<[f32; 2]> {
+    let value = tag_value(raw_tag, tag_name)?;
+    if let Some((x_raw, y_raw)) = value.split_once(',') {
+        // Устаревший формат: отдельные пиксели и проценты, складывались в рендере.
+        let px = x_raw.trim().parse::<f32>().ok()?;
+        let percent = y_raw.trim().parse::<f32>().ok()?;
+        if !px.is_finite() || !percent.is_finite() {
+            return None;
+        }
+        return Some([px.clamp(-clamp_abs, clamp_abs), percent.clamp(-clamp_abs, clamp_abs)]);
     }
-    Some([x.clamp(-clamp[0], clamp[0]), y.clamp(-clamp[1], clamp[1])])
+    let parsed = PxOrPercent::parse(value)?;
+    let (px, percent) = PxOrPercent {
+        value: parsed.value.clamp(-clamp_abs, clamp_abs),
+        is_percent: parsed.is_percent,
+    }
+    .as_px_percent();
+    Some([px, percent])
 }
 
 fn parse_line_spacing_tag_value(raw_tag: &str) -> Option<[f32; 2]> {
-    parse_tag_pair_value(raw_tag, "line-spacing", [300.0, 300.0])
+    parse_value_or_legacy_pair(raw_tag, "line-spacing", 300.0)
 }
 
 fn parse_kerning_tag_value(raw_tag: &str) -> Option<[f32; 2]> {
-    parse_tag_pair_value(raw_tag, "kerning", [300.0, 300.0])
+    parse_value_or_legacy_pair(raw_tag, "kerning", 300.0)
 }
 
-fn parse_stretching_tag_value(raw_tag: &str) -> Option<[f32; 2]> {
-    let pair = parse_tag_pair_value(raw_tag, "stretching", [300.0, 300.0])?;
-    Some([pair[0].clamp(1.0, 300.0), pair[1].clamp(1.0, 300.0)])
+/// Разобрать `stretching=ширина,высота`. Каждая компонента может иметь суффикс `%`
+/// (проценты от кегля) либо быть в пикселях; результат — множители в процентах.
+fn parse_stretching_tag_value(raw_tag: &str, base_font_size_px: f32) -> Option<[f32; 2]> {
+    let value = tag_value(raw_tag, "stretching")?;
+    let (x_raw, y_raw) = value.split_once(',')?;
+    let width = PxOrPercent::parse(x_raw)?.as_percent_of(base_font_size_px);
+    let height = PxOrPercent::parse(y_raw)?.as_percent_of(base_font_size_px);
+    if !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    Some([width.clamp(1.0, 300.0), height.clamp(1.0, 300.0)])
 }
 
 fn parse_hex_color_rgba(value: &str) -> Option<[u8; 4]> {
@@ -716,7 +939,7 @@ mod tests {
 
     #[test]
     fn parse_inline_style_tags_tracks_font_label() {
-        let parsed = parse_inline_style_tags("a<font=My Font><b>bc</b></font>d");
+        let parsed = parse_inline_style_tags("a<font=My Font><b>bc</b></font>d", 24.0);
 
         assert_eq!(parsed.plain_text, "abcd");
         assert_eq!(parsed.spans.len(), 3);
@@ -735,6 +958,7 @@ mod tests {
     fn parse_inline_style_tags_tracks_font_size_and_non_attrs_overrides() {
         let parsed = parse_inline_style_tags(
             "a<size=36><color=#11223344><offset=3,-4>bc</offset></color></size>d",
+            24.0,
         );
 
         assert_eq!(parsed.plain_text, "abcd");
@@ -757,8 +981,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_machine_tag_combines_all_inline_params() {
+        // Один компактный тег `<m ...>` задаёт сразу несколько параметров.
+        let parsed = parse_inline_style_tags(
+            "a<m b s=36 f=\"My Font\" c=11223344 l=50% k=10 w=120% h=80% x=3 n=12 q g=30>bc</m>d",
+            24.0,
+        );
+
+        assert_eq!(parsed.plain_text, "abcd");
+        assert_eq!(parsed.spans.len(), 3);
+        let span = &parsed.spans[1];
+        assert_eq!(parsed.plain_text.get(span.start..span.end), Some("bc"));
+        assert!(span.bold);
+        assert_eq!(span.font_size_px, Some(36.0));
+        assert_eq!(span.font_label.as_deref(), Some("My Font"));
+        assert_eq!(span.text_color, Some([0x11, 0x22, 0x33, 0x44]));
+        // l=50% → проценты, k=10 → пиксели.
+        assert_eq!(span.line_spacing_px, Some(0.0));
+        assert_eq!(span.line_spacing_percent, Some(50.0));
+        assert_eq!(span.kerning_px, Some(10.0));
+        assert_eq!(span.kerning_percent, Some(0.0));
+        assert_eq!(span.glyph_stretch_percent, Some([120.0, 80.0]));
+        let Some(offset) = span.glyph_offset else {
+            panic!("offset keys should produce an offset");
+        };
+        assert_eq!(offset.global_px, [3.0, 0.0]);
+        assert_eq!(offset.line_px, 12.0);
+        assert!(offset.shift_following);
+        assert!((offset.group_rotation_rad.to_degrees() - 30.0).abs() < 0.01);
+
+        // После `</m>` все стили сняты.
+        assert!(!parsed.spans[2].bold);
+        assert_eq!(parsed.spans[2].font_size_px, None);
+        assert_eq!(parsed.spans[2].glyph_offset, None);
+    }
+
+    #[test]
     fn parse_inline_style_tags_tracks_extended_offset_fields() {
-        let parsed = parse_inline_style_tags("a<offset=3,-4,12,1,30,-15>bc</offset>d");
+        let parsed = parse_inline_style_tags("a<offset=3,-4,12,1,30,-15>bc</offset>d", 24.0);
 
         assert_eq!(parsed.plain_text, "abcd");
         assert_eq!(parsed.spans.len(), 3);

@@ -31,7 +31,8 @@ use crate::tabs::typing::render_next::pipeline::{
 };
 use crate::tabs::typing::render_next::raster::{
     PixelBounds, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
-    sample_swash_alpha, trim_rendered_image_to_alpha_bounds,
+    include_rotated_rect_bounds, rotated_rect_world_bounds, sample_swash_alpha,
+    trim_rendered_image_to_alpha_bounds,
 };
 use crate::tabs::typing::render_next::types::{
     KerningMode, RenderedTextImage, TextLayoutMode, TextRenderParams, TextVectorLineDistanceMode,
@@ -382,6 +383,8 @@ fn render_text_with_drawn_lines_layout_once(
                 height,
                 rgba: RenderedTextImage::transparent(width, height).rgba,
                 warnings,
+                content_origin_x: 0,
+                content_origin_y: 0,
             });
         }
         return Ok(RenderedTextImage {
@@ -393,6 +396,8 @@ fn render_text_with_drawn_lines_layout_once(
             )
             .rgba,
             warnings,
+            content_origin_x: 0,
+            content_origin_y: 0,
         });
     }
 
@@ -492,6 +497,8 @@ fn render_text_with_drawn_lines_layout_once(
         height: out_height,
         rgba,
         warnings,
+        content_origin_x: 0,
+        content_origin_y: 0,
     })
 }
 
@@ -1189,6 +1196,8 @@ fn render_text_with_formula_layout_once(
         height: out_height,
         rgba,
         warnings: Vec::new(),
+        content_origin_x: 0,
+        content_origin_y: 0,
     })
 }
 
@@ -2035,73 +2044,6 @@ fn build_formula_arc_length_table(
 // Formula rotated bounds are clearer with explicit source/destination coordinates than with
 // a one-off wrapper struct used only by this helper.
 #[allow(clippy::too_many_arguments)]
-fn include_rotated_rect_bounds(
-    bounds: &mut PixelBounds,
-    src_left: f32,
-    src_top: f32,
-    src_width: f32,
-    src_height: f32,
-    dst_center_x: f32,
-    dst_center_y: f32,
-    rotation_rad: f32,
-) {
-    let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
-        src_left,
-        src_top,
-        src_width,
-        src_height,
-        dst_center_x,
-        dst_center_y,
-        rotation_rad,
-    );
-    let min_x_i = min_x.floor() as i32;
-    let min_y_i = min_y.floor() as i32;
-    let max_x_i = max_x.ceil() as i32;
-    let max_y_i = max_y.ceil() as i32;
-    bounds.include_rect(
-        min_x_i,
-        min_y_i,
-        (max_x_i - min_x_i).max(1),
-        (max_y_i - min_y_i).max(1),
-    );
-}
-
-fn rotated_rect_world_bounds(
-    src_left: f32,
-    src_top: f32,
-    src_width: f32,
-    src_height: f32,
-    dst_center_x: f32,
-    dst_center_y: f32,
-    rotation_rad: f32,
-) -> (f32, f32, f32, f32) {
-    let src_center_x = src_left + src_width * 0.5;
-    let src_center_y = src_top + src_height * 0.5;
-    let corners = [
-        (src_left, src_top),
-        (src_left + src_width, src_top),
-        (src_left + src_width, src_top + src_height),
-        (src_left, src_top + src_height),
-    ];
-    let cos_a = rotation_rad.cos();
-    let sin_a = rotation_rad.sin();
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for (x, y) in corners {
-        let rel_x = x - src_center_x;
-        let rel_y = y - src_center_y;
-        let tx = dst_center_x + rel_x * cos_a - rel_y * sin_a;
-        let ty = dst_center_y + rel_x * sin_a + rel_y * cos_a;
-        min_x = min_x.min(tx);
-        min_y = min_y.min(ty);
-        max_x = max_x.max(tx);
-        max_y = max_y.max(ty);
-    }
-    (min_x, min_y, max_x, max_y)
-}
-
 fn optical_horizontal_pair_adjustment(
     prev: GlyphInkProfile,
     next: GlyphInkProfile,

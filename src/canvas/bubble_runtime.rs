@@ -28,17 +28,19 @@ Notes:
 */
 
 use super::helpers::{
-    bubble_fingerprint, bubbles_stamp, sanitize_clipboard_text, side_to_string,
-    upsert_rect_coords_into_extra,
+    bubble_fingerprint, bubbles_stamp, default_text_area_box, image_area_rect_from_bubble,
+    normalize_image_text_areas, parse_image_text_areas, sanitize_clipboard_text,
+    serialize_image_text_areas, side_to_string, upsert_rect_coords_into_extra,
 };
 use super::types::{
-    AsideDragState, BubbleAction, BubbleCopyPasteTarget, BubbleHistoryEntry, BubbleTextField,
-    CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput, OnTopDragState,
-    PendingBubblePaste, RectCoords, RuntimeBubble,
+    AsideDragState, AsideItem, BubbleAction, BubbleCopyPasteTarget, BubbleHistoryEntry,
+    BubbleTextField, CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput,
+    ImageTextArea, OnTopDragState, PageBubbleBuckets, PendingBubblePaste, RectCoords,
+    RuntimeBubble,
 };
 use super::{
-    BUBBLE_HISTORY_LIMIT, BubbleType, CanvasHooks, CanvasView, DUPLICATE_BUBBLE_OFFSET_PX,
-    TEXT_UPSERT_DEBOUNCE_SECS, bubbles_history_hash, read_system_clipboard_text,
+    BUBBLE_HISTORY_LIMIT, BubbleClass, BubbleType, CanvasHooks, CanvasView,
+    DUPLICATE_BUBBLE_OFFSET_PX, TEXT_UPSERT_DEBOUNCE_SECS, read_system_clipboard_text,
     rect_coords_from_bubble,
 };
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings, runtime_bubble_to_record};
@@ -47,15 +49,81 @@ use crate::runtime_log;
 use eframe::egui;
 use egui::{Pos2, Rect};
 use serde_json::{Map, Value};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+
+/// The subset of egui input events the canvas reacts to in `capture_clipboard_events`.
+///
+/// Extracted from `ctx.input` by reference so the per-frame events vector is not cloned;
+/// only the small paste payload is copied out. Project-owned, so matches stay exhaustive.
+#[derive(Debug)]
+enum ClipboardEvent {
+    Copy,
+    Cut,
+    Paste(String),
+}
+
+/// One sortable aside/on-top entry: `(item, vertical anchor, horizontal anchor, bubble id)`.
+///
+/// The trailing three fields are the sort key (vertical, then horizontal anchor, then id for
+/// stability) used to order a column top-to-bottom before the keys are dropped.
+type PageBubbleEntry = (AsideItem, f32, f32, i64);
+
+/// Single-pass accumulator for the four `(side, type)` aside/on-top columns of one page.
+///
+/// Entries are routed into per-column vectors during one scan of the runtime bubbles, then each
+/// column is sorted and the sort keys are dropped by [`Self::finish`].
+#[derive(Default)]
+struct PageBubbleBucketAccumulator {
+    aside_left: Vec<PageBubbleEntry>,
+    aside_right: Vec<PageBubbleEntry>,
+    on_top_left: Vec<PageBubbleEntry>,
+    on_top_right: Vec<PageBubbleEntry>,
+}
+
+impl PageBubbleBucketAccumulator {
+    /// Routes one entry into the column for its `(displayed_type, side)`.
+    ///
+    /// Displayed bubble types resolve to Aside or OnTop only; a `Default` would be dropped here,
+    /// matching the old per-call filter that compared against a concrete Aside/OnTop request.
+    fn push(&mut self, displayed_type: BubbleType, side: Side, entry: PageBubbleEntry) {
+        match (displayed_type, side) {
+            (BubbleType::Aside, Side::Left) => self.aside_left.push(entry),
+            (BubbleType::Aside, Side::Right) => self.aside_right.push(entry),
+            (BubbleType::OnTop, Side::Left) => self.on_top_left.push(entry),
+            (BubbleType::OnTop, Side::Right) => self.on_top_right.push(entry),
+            (BubbleType::Default, Side::Left | Side::Right) => {}
+        }
+    }
+
+    /// Sorts each column top-to-bottom and returns the ordered, key-stripped buckets.
+    fn finish(self) -> PageBubbleBuckets {
+        PageBubbleBuckets {
+            aside_left: sort_page_bubble_column(self.aside_left),
+            aside_right: sort_page_bubble_column(self.aside_right),
+            on_top_left: sort_page_bubble_column(self.on_top_left),
+            on_top_right: sort_page_bubble_column(self.on_top_right),
+        }
+    }
+}
+
+/// Sorts one column by `(vertical anchor, horizontal anchor, bubble id)` and drops the sort keys.
+fn sort_page_bubble_column(mut entries: Vec<PageBubbleEntry>) -> Vec<AsideItem> {
+    entries.sort_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    entries.into_iter().map(|(item, ..)| item).collect()
+}
 
 pub(super) struct BubbleRuntimeState {
     pub(super) runtime_bubbles: HashMap<i64, RuntimeBubble>,
     pub(super) selected_bubble: Option<i64>,
     pub(super) move_active_bid: Option<i64>,
     pub(super) active_rect_handle: Option<(i64, usize)>,
+    /// Active image-bubble text-area resize handle as `(bubble_id, area_idx, handle_idx)`.
+    pub(super) active_area_handle: Option<(i64, usize, usize)>,
     pub(super) aside_drag_state: Option<AsideDragState>,
     pub(super) on_top_drag_state: Option<OnTopDragState>,
     pub(super) next_bubble_id: i64,
@@ -86,6 +154,7 @@ impl Default for BubbleRuntimeState {
             selected_bubble: None,
             move_active_bid: None,
             active_rect_handle: None,
+            active_area_handle: None,
             aside_drag_state: None,
             on_top_drag_state: None,
             next_bubble_id: 1,
@@ -108,6 +177,21 @@ impl Default for BubbleRuntimeState {
             synced_bubbles_revision: 0,
             bubbles_model: None,
         }
+    }
+}
+
+impl BubbleRuntimeState {
+    /// Returns true while a continuous positional drag/resize gesture is in progress.
+    ///
+    /// These are the per-frame "follow the pointer" gestures (aside drag, on-top drag, the
+    /// 8-point rect resize, and an image text-area resize). Positional model writes are debounced
+    /// while one is active and committed when it ends; one-shot placement (`move_active_bid`) is
+    /// not included because it writes once per click, not every frame.
+    fn positional_drag_gesture_active(&self) -> bool {
+        self.aside_drag_state.is_some()
+            || self.on_top_drag_state.is_some()
+            || self.active_rect_handle.is_some()
+            || self.active_area_handle.is_some()
     }
 }
 
@@ -314,6 +398,7 @@ impl CanvasView {
                 img_u: center.x,
                 img_v: center.y,
                 side,
+                bubble_class: BubbleClass::Text,
                 bubble_type: BubbleType::Default,
                 text: String::new(),
                 original_text,
@@ -323,6 +408,8 @@ impl CanvasView {
                 height_px: 80.0,
                 line_x: 0.0,
                 mounted: false,
+                text_areas: Vec::new(),
+                image_block_rects: Vec::new(),
             },
         );
         self.bubble_runtime.pending_upsert.insert(id);
@@ -351,6 +438,20 @@ impl CanvasView {
         bubble_id: i64,
         translated_text: String,
     ) -> bool {
+        // Image bubbles keep their text in `text_areas`; the persist/flush path derives the
+        // canonical text from `text_areas[0]`, so a result written only to the legacy `text`
+        // field would be overwritten by the stale area on the next flush. Route image bubbles
+        // through the area-aware path, preserving the existing area-0 original.
+        let image_area_original = self
+            .bubble_runtime
+            .runtime_bubbles
+            .get(&bubble_id)
+            .filter(|rt| rt.bubble_class == BubbleClass::Image && !rt.text_areas.is_empty())
+            .map(|rt| rt.text_areas[0].original.clone());
+        if let Some(original) = image_area_original {
+            return self
+                .apply_machine_translation_areas(bubble_id, vec![(original, translated_text)]);
+        }
         let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble_id) else {
             return false;
         };
@@ -390,6 +491,109 @@ impl CanvasView {
         }
     }
 
+    pub fn apply_machine_translation_result_with_original(
+        &mut self,
+        bubble_id: i64,
+        original_text: String,
+        translated_text: String,
+    ) -> bool {
+        // Image bubbles store text per area in `text_areas`, and the persist/flush path reads the
+        // canonical text from `text_areas[0]`. Writing only the legacy fields here would be
+        // discarded on the next flush, so route single-area image results through the area-aware
+        // path that updates `text_areas[0]` and mirrors it back to the legacy fields.
+        let is_image_with_areas = self
+            .bubble_runtime
+            .runtime_bubbles
+            .get(&bubble_id)
+            .is_some_and(|rt| rt.bubble_class == BubbleClass::Image && !rt.text_areas.is_empty());
+        if is_image_with_areas {
+            return self.apply_machine_translation_areas(
+                bubble_id,
+                vec![(original_text, translated_text)],
+            );
+        }
+        let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble_id) else {
+            return false;
+        };
+        rt.original_text = original_text.clone();
+        rt.text = translated_text.clone();
+        rt.mounted = true;
+        self.bubble_runtime.pending_text_upsert.remove(&bubble_id);
+        self.bubble_runtime.pending_upsert.insert(bubble_id);
+
+        let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
+            return true;
+        };
+
+        self.capture_bubble_history_before_mutation();
+        let update_result = {
+            let Ok(mut locked) = model.lock() else {
+                runtime_log::log_warn(format!(
+                    "[canvas::bubble_runtime] failed to lock BubblesModel for multimodal translation result; bubble_id={bubble_id}"
+                ));
+                return false;
+            };
+            locked.update_translation_and_original_deferred_save(
+                bubble_id,
+                original_text,
+                translated_text,
+                "translated",
+            )
+        };
+        match update_result {
+            Ok(Some((revision, save_task))) => {
+                save_task.persist();
+                self.bubble_runtime.synced_bubbles_revision = revision;
+                self.bubble_runtime.pending_upsert.remove(&bubble_id);
+                true
+            }
+            Ok(None) => true,
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[canvas::bubble_runtime] failed to persist multimodal translation result; bubble_id={bubble_id}; error={err:#}"
+                ));
+                false
+            }
+        }
+    }
+
+    /// Applies a per-area AI translation result to an image bubble.
+    ///
+    /// Used for both multi-area image bubbles and single-area ones (the legacy single-result
+    /// apply paths delegate here, since image-bubble text is canonically stored in `text_areas`).
+    /// `areas` holds `(original_text, translation)` in text-area order; entry `i` updates
+    /// `text_areas[i]`. Area 0 is mirrored to the legacy fields. Returns `false` when the bubble is
+    /// missing or has no text areas. Persistence is routed through the normal pending-upsert flush
+    /// (which serializes `text_areas` and mirrors area 0), so the result is captured for undo and
+    /// saved like any other area edit.
+    pub fn apply_machine_translation_areas(
+        &mut self,
+        bubble_id: i64,
+        areas: Vec<(String, String)>,
+    ) -> bool {
+        let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble_id) else {
+            return false;
+        };
+        if rt.text_areas.is_empty() || areas.is_empty() {
+            return false;
+        }
+        for (idx, (original, translation)) in areas.iter().enumerate() {
+            if let Some(area) = rt.text_areas.get_mut(idx) {
+                area.original = original.clone();
+                area.translation = translation.clone();
+            }
+        }
+        if let Some(first) = rt.text_areas.first() {
+            rt.original_text = first.original.clone();
+            rt.text = first.translation.clone();
+        }
+        rt.mounted = true;
+        self.bubble_runtime.pending_text_upsert.remove(&bubble_id);
+        self.capture_bubble_history_before_mutation();
+        self.bubble_runtime.pending_upsert.insert(bubble_id);
+        true
+    }
+
     pub fn patch_bubble_extra_fields(
         &mut self,
         project: &ProjectData,
@@ -410,6 +614,7 @@ impl CanvasView {
         let rt_img_u = rt.img_u;
         let rt_img_v = rt.img_v;
         let rt_side = rt.side;
+        let rt_bubble_class = rt.bubble_class;
         let rt_bubble_type = rt.bubble_type;
         let rt_text = rt.text.clone();
         let rt_original_text = rt.original_text.clone();
@@ -439,11 +644,27 @@ impl CanvasView {
             rt_img_u,
             rt_img_v,
             Some(side_to_string(rt_side)),
+            Some(rt_bubble_class.as_str().to_string()),
             Some(rt_bubble_type.as_str().to_string()),
             rt_text,
             rt_original_text,
             Some(extra),
         );
+
+        // When the patch changes the image-area rect (e.g. a Shift+Q crop selection sets `crop_rect`
+        // + `rect_coords`), the runtime rect must be updated too: this call advances the model
+        // revision, so the regular model→runtime sync would not re-apply it and the red area would
+        // keep its default size. Only react when the rect was actually patched, so unrelated footer
+        // patches do not revert a stale crop rect over a freshly resized runtime rect.
+        let patched_rect = if patch.contains_key("rect_coords") || patch.contains_key("crop_rect") {
+            if rt_bubble_class == BubbleClass::Image {
+                image_area_rect_from_bubble(&rec)
+            } else {
+                rect_coords_from_bubble(&rec)
+            }
+        } else {
+            None
+        };
 
         let Ok(mut locked) = model.lock() else {
             runtime_log::log_warn(format!(
@@ -456,6 +677,17 @@ impl CanvasView {
                 self.bubble_runtime.synced_bubbles_revision = locked.revision();
                 self.bubble_runtime.pending_upsert.remove(&bubble_id);
                 self.bubble_runtime.pending_text_upsert.remove(&bubble_id);
+                if let Some(rect) = patched_rect
+                    && let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble_id)
+                {
+                    let rect = rect.normalized();
+                    rt.rect_coords = rect;
+                    if rt.bubble_class == BubbleClass::Image {
+                        normalize_image_text_areas(&mut rt.text_areas, rect);
+                    }
+                    // Height/anchor change with the new rect; re-measure on next layout.
+                    rt.mounted = false;
+                }
                 true
             }
             Err(err) => {
@@ -467,32 +699,45 @@ impl CanvasView {
         }
     }
 
+    /// Captures the pre-mutation bubble state for undo, exactly once per logical change.
+    ///
+    /// The snapshot is taken as a shared `Arc` (O(1)) together with the model revision and is
+    /// deduplicated by revision: the model revision is monotonic and bumped on every mutation, so
+    /// repeated captures while the model is unchanged (e.g. the per-frame flush calls during one
+    /// continuous drag, which is debounced and writes the model only on release) collapse to a
+    /// single undo entry. This replaces the former per-call full snapshot + `serde_json` content
+    /// hash.
     pub(super) fn capture_bubble_history_before_mutation(&mut self) {
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             return;
         };
-        let Ok(locked) = model.lock() else {
-            runtime_log::log_warn(
-                "[canvas::bubble_runtime] failed to lock BubblesModel for undo snapshot",
-            );
-            return;
+        let (bubbles, revision) = {
+            let Ok(locked) = model.lock() else {
+                runtime_log::log_warn(
+                    "[canvas::bubble_runtime] failed to lock BubblesModel for undo snapshot",
+                );
+                return;
+            };
+            (locked.snapshot_shared(), locked.revision())
         };
-        self.push_bubble_undo_snapshot(locked.snapshot());
+        self.push_bubble_undo_snapshot(bubbles, revision);
     }
 
-    fn push_bubble_undo_snapshot(&mut self, bubbles: Vec<Bubble>) {
-        let hash = bubbles_history_hash(&bubbles);
+    fn push_bubble_undo_snapshot(&mut self, bubbles: Arc<Vec<Bubble>>, revision: u64) {
+        // Dedup by revision: a capture for a model state already on top of the stack is a no-op,
+        // so a gesture that changed nothing (or repeated captures within one unchanged model
+        // state) does not push a duplicate undo entry.
         if self
             .bubble_runtime
             .bubble_undo_stack
             .last()
-            .is_some_and(|entry| entry.hash == hash)
+            .is_some_and(|entry| entry.revision == revision)
         {
             return;
         }
         self.bubble_runtime
             .bubble_undo_stack
-            .push(BubbleHistoryEntry { bubbles, hash });
+            .push(BubbleHistoryEntry { bubbles, revision });
         if self.bubble_runtime.bubble_undo_stack.len() > BUBBLE_HISTORY_LIMIT {
             let overflow = self.bubble_runtime.bubble_undo_stack.len() - BUBBLE_HISTORY_LIMIT;
             self.bubble_runtime.bubble_undo_stack.drain(0..overflow);
@@ -500,19 +745,18 @@ impl CanvasView {
         self.bubble_runtime.bubble_redo_stack.clear();
     }
 
-    fn push_bubble_redo_snapshot(&mut self, bubbles: Vec<Bubble>) {
-        let hash = bubbles_history_hash(&bubbles);
+    fn push_bubble_redo_snapshot(&mut self, bubbles: Arc<Vec<Bubble>>, revision: u64) {
         if self
             .bubble_runtime
             .bubble_redo_stack
             .last()
-            .is_some_and(|entry| entry.hash == hash)
+            .is_some_and(|entry| entry.revision == revision)
         {
             return;
         }
         self.bubble_runtime
             .bubble_redo_stack
-            .push(BubbleHistoryEntry { bubbles, hash });
+            .push(BubbleHistoryEntry { bubbles, revision });
         if self.bubble_runtime.bubble_redo_stack.len() > BUBBLE_HISTORY_LIMIT {
             let overflow = self.bubble_runtime.bubble_redo_stack.len() - BUBBLE_HISTORY_LIMIT;
             self.bubble_runtime.bubble_redo_stack.drain(0..overflow);
@@ -533,19 +777,19 @@ impl CanvasView {
             );
             return false;
         };
-        let current = locked.snapshot();
-        let current_hash = bubbles_history_hash(&current);
+        let current = locked.snapshot_shared();
+        let current_revision = locked.revision();
         let mut redo_pushed = false;
         if self
             .bubble_runtime
             .bubble_redo_stack
             .last()
-            .is_none_or(|entry| entry.hash != current_hash)
+            .is_none_or(|entry| entry.revision != current_revision)
         {
-            self.push_bubble_redo_snapshot(current);
+            self.push_bubble_redo_snapshot(current, current_revision);
             redo_pushed = true;
         }
-        if let Err(err) = locked.reset(target.bubbles.clone()) {
+        if let Err(err) = locked.reset(target.bubbles.as_ref().clone()) {
             if redo_pushed {
                 self.bubble_runtime.bubble_redo_stack.pop();
             }
@@ -575,20 +819,20 @@ impl CanvasView {
             );
             return false;
         };
-        let current = locked.snapshot();
-        let current_hash = bubbles_history_hash(&current);
+        let current = locked.snapshot_shared();
+        let current_revision = locked.revision();
         let mut undo_pushed = false;
         if self
             .bubble_runtime
             .bubble_undo_stack
             .last()
-            .is_none_or(|entry| entry.hash != current_hash)
+            .is_none_or(|entry| entry.revision != current_revision)
         {
             self.bubble_runtime
                 .bubble_undo_stack
                 .push(BubbleHistoryEntry {
                     bubbles: current,
-                    hash: current_hash,
+                    revision: current_revision,
                 });
             if self.bubble_runtime.bubble_undo_stack.len() > BUBBLE_HISTORY_LIMIT {
                 let overflow = self.bubble_runtime.bubble_undo_stack.len() - BUBBLE_HISTORY_LIMIT;
@@ -596,7 +840,7 @@ impl CanvasView {
             }
             undo_pushed = true;
         }
-        if let Err(err) = locked.reset(target.bubbles.clone()) {
+        if let Err(err) = locked.reset(target.bubbles.as_ref().clone()) {
             if undo_pushed {
                 self.bubble_runtime.bubble_undo_stack.pop();
             }
@@ -678,6 +922,7 @@ impl CanvasView {
         let bubble = self.bubble_runtime.runtime_bubbles.get(&bid)?;
         Some(CopiedBubbleData {
             bubble_type: bubble.bubble_type,
+            bubble_class: bubble.bubble_class,
             text: bubble.text.clone(),
             original_text: bubble.original_text.clone(),
             extra: self.bubble_extra_without_rect_coords(project, bid),
@@ -716,6 +961,7 @@ impl CanvasView {
 
         if let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) {
             rt.bubble_type = payload.bubble_type;
+            rt.bubble_class = payload.bubble_class;
             rt.text = payload.text.clone();
             rt.original_text = payload.original_text.clone();
             rt.mounted = true;
@@ -737,6 +983,7 @@ impl CanvasView {
                         updated_rt.img_u,
                         updated_rt.img_v,
                         Some(side_to_string(updated_rt.side)),
+                        Some(updated_rt.bubble_class.as_str().to_string()),
                         Some(updated_rt.bubble_type.as_str().to_string()),
                         updated_rt.text.clone(),
                         updated_rt.original_text.clone(),
@@ -922,10 +1169,23 @@ impl CanvasView {
 
     pub(super) fn capture_clipboard_events(&mut self, project: &ProjectData, ctx: &egui::Context) {
         let keyboard_input_active = ctx.wants_keyboard_input();
-        let events = ctx.input(|i| i.events.clone());
-        for ev in events {
+        // Inspect events by reference inside the input closure and copy out only the few
+        // clipboard variants we act on (Copy/Cut and the small paste payload), instead of
+        // cloning the whole per-frame events vector (key/pointer/text events included).
+        let clipboard_events: Vec<ClipboardEvent> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|ev| match ev {
+                    egui::Event::Copy => Some(ClipboardEvent::Copy),
+                    egui::Event::Cut => Some(ClipboardEvent::Cut),
+                    egui::Event::Paste(text) => Some(ClipboardEvent::Paste(text.clone())),
+                    _ => None,
+                })
+                .collect()
+        });
+        for ev in clipboard_events {
             match ev {
-                egui::Event::Copy => {
+                ClipboardEvent::Copy => {
                     if let Some(focused) = self.bubble_runtime.focused_text_input {
                         if focused.has_selection {
                             continue;
@@ -949,7 +1209,7 @@ impl CanvasView {
                         );
                     }
                 }
-                egui::Event::Cut => {
+                ClipboardEvent::Cut => {
                     if self.bubble_runtime.focused_text_input.is_some() || keyboard_input_active {
                         continue;
                     }
@@ -961,7 +1221,7 @@ impl CanvasView {
                         );
                     }
                 }
-                egui::Event::Paste(mut text) => {
+                ClipboardEvent::Paste(mut text) => {
                     text = sanitize_clipboard_text(&text);
                     if let Some(pending) = self.bubble_runtime.pending_bubble_paste.take() {
                         let now_s = ctx.input(|i| i.time);
@@ -985,7 +1245,6 @@ impl CanvasView {
                         );
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -1168,15 +1427,25 @@ impl CanvasView {
     fn upsert_runtime_from_bubble(&mut self, bubble: &Bubble, fingerprint: u64) {
         let side = super::bubble_side(bubble);
         let bubble_type = self.effective_bubble_type_for_record(bubble);
+        let bubble_class = self.effective_bubble_class_for_record(bubble);
         let new_u = bubble.img_u.clamp(0.0, 1.0);
         let new_v = bubble.img_v.clamp(0.0, 1.0);
         let (min_margin_u, min_margin_v) = self.bubble_min_uv_margin_for_page(bubble.img_idx);
-        let coords_from_record = rect_coords_from_bubble(bubble);
+        // For image bubbles the single red rect is the image area (the page-crop region for
+        // page-crop bubbles); text bubbles use their plain `rect_coords`.
+        let coords_from_record = if bubble_class == BubbleClass::Image {
+            image_area_rect_from_bubble(bubble)
+        } else {
+            rect_coords_from_bubble(bubble)
+        };
+        // Image bubbles carry their own text areas; text bubbles keep this empty.
+        let text_areas = parse_image_text_areas(bubble);
         if let Some(existing) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble.id) {
             let du = new_u - existing.img_u;
             let dv = new_v - existing.img_v;
             existing.img_idx = bubble.img_idx;
             existing.side = side;
+            existing.bubble_class = bubble_class;
             existing.bubble_type = bubble_type;
             existing.text = bubble.text.clone();
             existing.original_text = bubble.original_text.clone();
@@ -1205,6 +1474,7 @@ impl CanvasView {
             );
             existing.img_u = anchor.x;
             existing.img_v = anchor.y;
+            existing.text_areas = text_areas;
         } else {
             let rect_coords = coords_from_record.unwrap_or_else(|| {
                 self.default_rect_coords_for_page_idx(bubble.img_idx, new_u, new_v)
@@ -1220,6 +1490,7 @@ impl CanvasView {
                     img_u: anchor.x,
                     img_v: anchor.y,
                     side,
+                    bubble_class,
                     bubble_type,
                     text: bubble.text.clone(),
                     original_text: bubble.original_text.clone(),
@@ -1229,6 +1500,8 @@ impl CanvasView {
                     height_px: 80.0,
                     line_x: 0.0,
                     mounted: false,
+                    text_areas,
+                    image_block_rects: Vec::new(),
                 },
             );
         }
@@ -1237,41 +1510,61 @@ impl CanvasView {
             .insert(bubble.id, fingerprint);
     }
 
-    pub(super) fn page_bubbles(
-        &self,
-        page_idx: usize,
-        side: Side,
-        bubble_type: BubbleType,
-    ) -> Vec<i64> {
-        let mut ids: Vec<i64> = self
-            .bubble_runtime
-            .runtime_bubbles
-            .values()
-            .filter(|b| {
-                b.img_idx == page_idx
-                    && b.side == side
-                    && self.displayed_bubble_type_for_runtime(b) == bubble_type
-            })
-            .map(|b| b.id)
-            .collect();
-
-        ids.sort_by(|a, b| {
-            match (
-                self.bubble_runtime.runtime_bubbles.get(a),
-                self.bubble_runtime.runtime_bubbles.get(b),
-            ) {
-                (Some(a_ref), Some(b_ref)) => a_ref
-                    .img_v
-                    .total_cmp(&b_ref.img_v)
-                    .then_with(|| a_ref.img_u.total_cmp(&b_ref.img_u))
-                    .then_with(|| a_ref.id.cmp(&b_ref.id)),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
+    /// Buckets every runtime bubble on `page_idx` into the four aside/on-top columns in one pass.
+    ///
+    /// Each column is ordered by vertical anchor, then horizontal anchor, then bubble id (for a
+    /// stable order), with read-only image-area splitting: a read-only image bubble contributes one
+    /// item per text area routed to the side of that area's own anchor, while text bubbles and
+    /// editable image bubbles contribute one item (`area_idx = None`). This is the single full scan
+    /// of the page's runtime bubbles per frame; callers read the column they need via
+    /// [`PageBubbleBuckets::bucket`].
+    pub(super) fn page_bubbles_bucketed(&self, page_idx: usize) -> PageBubbleBuckets {
+        let mut acc = PageBubbleBucketAccumulator::default();
+        for b in self.bubble_runtime.runtime_bubbles.values() {
+            if b.img_idx != page_idx {
+                continue;
             }
-        });
-        ids.retain(|bid| self.bubble_runtime.runtime_bubbles.contains_key(bid));
-        ids
+            let displayed_type = self.displayed_bubble_type_for_runtime(b);
+            if !self.editable && b.bubble_class == BubbleClass::Image && !b.text_areas.is_empty() {
+                // Read-only image bubble: split into one item per text area, routed to the side of
+                // that area's own anchor.
+                for (idx, area) in b.text_areas.iter().enumerate() {
+                    let area_side = if area.anchor.x < 0.5 {
+                        Side::Left
+                    } else {
+                        Side::Right
+                    };
+                    acc.push(
+                        displayed_type,
+                        area_side,
+                        (
+                            AsideItem {
+                                bid: b.id,
+                                area_idx: Some(idx),
+                            },
+                            area.anchor.y,
+                            area.anchor.x,
+                            b.id,
+                        ),
+                    );
+                }
+            } else {
+                acc.push(
+                    displayed_type,
+                    b.side,
+                    (
+                        AsideItem {
+                            bid: b.id,
+                            area_idx: None,
+                        },
+                        b.img_v,
+                        b.img_u,
+                        b.id,
+                    ),
+                );
+            }
+        }
+        acc.finish()
     }
 
     pub(super) fn apply_pending_actions(&mut self, hooks: &mut dyn CanvasHooks) {
@@ -1358,6 +1651,15 @@ impl CanvasView {
         if self.bubble_runtime.pending_upsert.is_empty() {
             return;
         }
+        // Debounce positional model writes during a continuous drag/resize: the runtime bubble
+        // already follows the pointer this frame (visual state is live), but committing every frame
+        // would run `create_or_replace` -> `Arc::make_mut` (full Vec deep clone) + a save snapshot
+        // per frame. The pending ids stay queued; the gesture-end handlers re-insert the dragged id
+        // into `pending_upsert`, so the final position is committed on release. Text upserts use
+        // their own time-based debounce and do not overlap a drag in practice.
+        if self.bubble_runtime.positional_drag_gesture_active() {
+            return;
+        }
         let mut pending: Vec<i64> = self.bubble_runtime.pending_upsert.iter().copied().collect();
         pending.sort_unstable();
         let will_flush = pending.iter().any(|bid| {
@@ -1374,11 +1676,6 @@ impl CanvasView {
             );
             return;
         };
-        let mut extra_by_id: HashMap<i64, Map<String, Value>> = locked
-            .snapshot()
-            .into_iter()
-            .map(|bubble| (bubble.id, bubble.extra))
-            .collect();
         let mut had_success = false;
         for bid in pending {
             if self.is_bubble_locally_locked(bid) {
@@ -1388,7 +1685,9 @@ impl CanvasView {
                 self.bubble_runtime.pending_upsert.remove(&bid);
                 continue;
             };
-            let extra = extra_by_id.remove(&bid).or_else(|| {
+            // Read only this bubble's `extra` from the model by id (no full snapshot clone);
+            // fall back to the loaded project bubble when the model has not seen this id yet.
+            let extra = locked.extra_of(bid).cloned().or_else(|| {
                 project
                     .bubbles
                     .iter()
@@ -1397,15 +1696,54 @@ impl CanvasView {
             });
             let mut extra = extra.unwrap_or_default();
             upsert_rect_coords_into_extra(&mut extra, rt.rect_coords);
+            // For image bubbles persist all text areas; area 0's text is mirrored to the legacy
+            // record fields (and extra.description) so it stays the single canonical primary.
+            let (record_text, record_original) =
+                if rt.bubble_class == BubbleClass::Image && !rt.text_areas.is_empty() {
+                    extra.insert(
+                        "text_areas".to_string(),
+                        serialize_image_text_areas(&rt.text_areas),
+                    );
+                    // The image area rect (red) lives in `rect_coords`; for page-crop bubbles keep the
+                    // crop region equal to it so the loader/preview crop matches the canvas red rect.
+                    if extra
+                        .get("image_source_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("external")
+                        == "page_crop"
+                    {
+                        let coords = rt.rect_coords.normalized();
+                        extra.insert(
+                            "crop_rect".to_string(),
+                            Value::Array(vec![
+                                Value::from(f64::from(coords.p1.x)),
+                                Value::from(f64::from(coords.p1.y)),
+                                Value::from(f64::from(coords.p2.x)),
+                                Value::from(f64::from(coords.p2.y)),
+                            ]),
+                        );
+                    }
+                    // SAFETY (index): this arm is only entered when `!rt.text_areas.is_empty()`
+                    // (the `if` guard above), so index 0 is always in bounds.
+                    let first = &rt.text_areas[0];
+                    extra.insert(
+                        "description".to_string(),
+                        Value::String(first.description.clone()),
+                    );
+                    (first.translation.clone(), first.original.clone())
+                } else {
+                    (rt.text.clone(), rt.original_text.clone())
+                };
             let rec = runtime_bubble_to_record(
                 rt.id,
                 rt.img_idx,
                 rt.img_u,
                 rt.img_v,
                 Some(side_to_string(rt.side)),
+                Some(rt.bubble_class.as_str().to_string()),
                 Some(rt.bubble_type.as_str().to_string()),
-                rt.text.clone(),
-                rt.original_text.clone(),
+                record_text,
+                record_original,
                 Some(extra),
             );
             match locked.create_or_replace(rec) {
@@ -1459,6 +1797,115 @@ impl CanvasView {
         true
     }
 
+    pub fn create_image_bubble_from_canvas_context_menu(
+        &mut self,
+        ctx: &egui::Context,
+        _project: &ProjectData,
+    ) -> bool {
+        let Some(target) = self.bubble_runtime.canvas_context_menu_target else {
+            return false;
+        };
+        let Some(page_rect) = self
+            .scene
+            .page_rects
+            .get(target.page_idx)
+            .copied()
+            .filter(|rect| rect.is_positive())
+        else {
+            return false;
+        };
+        let scene_pos = egui::pos2(
+            page_rect.left() + page_rect.width() * target.page_uv.x.clamp(0.0, 1.0),
+            page_rect.top() + page_rect.height() * target.page_uv.y.clamp(0.0, 1.0),
+        );
+        self.create_image_bubble_at_scene_pos(ctx, scene_pos)
+            .is_some()
+    }
+
+    pub fn create_image_bubble_at_pointer_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        pointer_pos: Pos2,
+    ) -> bool {
+        self.create_image_bubble_at_scene_pos(ctx, pointer_pos)
+            .is_some()
+    }
+
+    pub fn create_image_bubble_at_scene_pos(
+        &mut self,
+        ctx: &egui::Context,
+        scene_pos: Pos2,
+    ) -> Option<i64> {
+        if !self.editable {
+            return None;
+        }
+        let (page_idx, page_rect) = self
+            .scene
+            .page_rects
+            .iter()
+            .enumerate()
+            .find_map(|(idx, rect)| rect.contains(scene_pos).then_some((idx, *rect)))?;
+        let new_bid = self.create_bubble_at(page_idx, page_rect, scene_pos);
+        self.promote_bubble_to_external_image(ctx, new_bid);
+        Some(new_bid)
+    }
+
+    fn promote_bubble_to_external_image(&mut self, ctx: &egui::Context, bid: i64) {
+        if let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) {
+            rt.bubble_class = BubbleClass::Image;
+            rt.bubble_type = BubbleType::Aside;
+            rt.text.clear();
+            rt.original_text.clear();
+            // Start with a single small text-area box around the bubble anchor (a sub-box of the
+            // red image area, not covering it).
+            let anchor = egui::pos2(rt.img_u, rt.img_v);
+            rt.text_areas = vec![ImageTextArea {
+                area_rect: default_text_area_box(rt.rect_coords, anchor),
+                anchor,
+                original: String::new(),
+                description: String::new(),
+                translation: String::new(),
+            }];
+        }
+        let mut extra = Map::new();
+        extra.insert(
+            "image_source_type".to_string(),
+            Value::String("external".to_string()),
+        );
+        extra.insert("description".to_string(), Value::String(String::new()));
+        if let Some(rt) = self.bubble_runtime.runtime_bubbles.get(&bid) {
+            upsert_rect_coords_into_extra(&mut extra, rt.rect_coords);
+            extra.insert(
+                "text_areas".to_string(),
+                serialize_image_text_areas(&rt.text_areas),
+            );
+            if let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) {
+                let rec = runtime_bubble_to_record(
+                    rt.id,
+                    rt.img_idx,
+                    rt.img_u,
+                    rt.img_v,
+                    Some(side_to_string(rt.side)),
+                    Some(rt.bubble_class.as_str().to_string()),
+                    Some(rt.bubble_type.as_str().to_string()),
+                    rt.text.clone(),
+                    rt.original_text.clone(),
+                    Some(extra),
+                );
+                if let Ok(mut locked) = model.lock()
+                    && locked.create_or_replace(rec).is_ok()
+                {
+                    self.bubble_runtime.synced_bubbles_revision = locked.revision();
+                    self.bubble_runtime.pending_upsert.remove(&bid);
+                }
+            }
+        }
+        self.bubble_runtime.pending_upsert.insert(bid);
+        self.bubble_runtime.selected_bubble = Some(bid);
+        self.bubble_runtime.canvas_context_menu_target = None;
+        ctx.request_repaint();
+    }
+
     fn create_bubble_at(&mut self, page_idx: usize, page_rect: Rect, scene_pos: Pos2) -> i64 {
         let side = if scene_pos.x < page_rect.center().x {
             Side::Left
@@ -1477,6 +1924,7 @@ impl CanvasView {
                 img_u: uv.x,
                 img_v: uv.y,
                 side,
+                bubble_class: BubbleClass::Text,
                 bubble_type: BubbleType::Default,
                 text: String::new(),
                 original_text: String::new(),
@@ -1486,6 +1934,8 @@ impl CanvasView {
                 height_px: 80.0,
                 line_x: 0.0,
                 mounted: false,
+                text_areas: Vec::new(),
+                image_block_rects: Vec::new(),
             },
         );
         self.bubble_runtime.pending_upsert.insert(id);
@@ -1566,5 +2016,660 @@ impl CanvasView {
             self.bubble_runtime.focused_text_input = None;
         }
         self.scene.on_top_hit_rects.remove(&bid);
+        // Evict per-bubble image caches so deleted ids do not leak across a session and a
+        // reused bubble id cannot serve a stale fingerprint/preview from the previous bubble.
+        self.image_bubble_meta_cache.remove(&bid);
+        self.image_bubble_preview_cache.remove(&bid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::types::{BubbleClass, BubbleType, ImageTextArea, RectCoords};
+    use crate::project::Side;
+
+    /// Builds a minimal image runtime bubble with `area_count` text areas and inserts it into
+    /// `canvas`. Each area starts empty so a translation result can be observed landing in it.
+    fn insert_image_bubble_with_areas(canvas: &mut CanvasView, bubble_id: i64, area_count: usize) {
+        let rect = RectCoords {
+            p1: egui::pos2(0.1, 0.1),
+            p2: egui::pos2(0.5, 0.5),
+        };
+        let text_areas = (0..area_count)
+            .map(|_| ImageTextArea {
+                area_rect: rect,
+                anchor: egui::pos2(0.2, 0.2),
+                original: String::new(),
+                description: String::new(),
+                translation: String::new(),
+            })
+            .collect::<Vec<_>>();
+        canvas.bubble_runtime.runtime_bubbles.insert(
+            bubble_id,
+            RuntimeBubble {
+                id: bubble_id,
+                img_idx: 0,
+                img_u: 0.3,
+                img_v: 0.3,
+                side: Side::Left,
+                bubble_class: BubbleClass::Image,
+                bubble_type: BubbleType::Default,
+                text: String::new(),
+                original_text: String::new(),
+                rect_coords: rect,
+                anchor_y: 0.0,
+                max_width_px: 200.0,
+                height_px: 80.0,
+                line_x: 0.0,
+                mounted: false,
+                text_areas,
+                image_block_rects: Vec::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn single_area_image_translation_lands_in_text_areas_not_just_legacy_text() {
+        // Regression: single-area image bubbles route through the legacy
+        // `apply_machine_translation_result_with_original`, but image-bubble text is canonically
+        // stored in `text_areas[0]`. The result must reach `text_areas[0]`, otherwise the flush
+        // (which reads `text_areas[0]`) discards it.
+        let mut canvas = CanvasView::default();
+        insert_image_bubble_with_areas(&mut canvas, 7, 1);
+
+        let applied = canvas.apply_machine_translation_result_with_original(
+            7,
+            "HELLO".to_string(),
+            "Привет".to_string(),
+        );
+
+        assert!(applied);
+        let rt = &canvas.bubble_runtime.runtime_bubbles[&7];
+        assert_eq!(rt.text_areas.len(), 1);
+        assert_eq!(rt.text_areas[0].original, "HELLO");
+        assert_eq!(rt.text_areas[0].translation, "Привет");
+        // Area 0 is mirrored back to the legacy fields so renderers/flush stay consistent.
+        assert_eq!(rt.original_text, "HELLO");
+        assert_eq!(rt.text, "Привет");
+        assert!(canvas.bubble_runtime.pending_upsert.contains(&7));
+    }
+
+    #[test]
+    fn multi_area_image_translation_updates_each_area_in_order() {
+        let mut canvas = CanvasView::default();
+        insert_image_bubble_with_areas(&mut canvas, 9, 2);
+
+        let applied = canvas.apply_machine_translation_areas(
+            9,
+            vec![
+                ("A".to_string(), "А".to_string()),
+                ("B".to_string(), "Б".to_string()),
+            ],
+        );
+
+        assert!(applied);
+        let rt = &canvas.bubble_runtime.runtime_bubbles[&9];
+        assert_eq!(rt.text_areas.len(), 2);
+        assert_eq!(rt.text_areas[0].translation, "А");
+        assert_eq!(rt.text_areas[1].original, "B");
+        assert_eq!(rt.text_areas[1].translation, "Б");
+        // Area 0 mirrors to the legacy fields.
+        assert_eq!(rt.text, "А");
+        assert_eq!(rt.original_text, "A");
+    }
+
+    #[test]
+    fn image_bubble_without_text_areas_uses_legacy_text_field() {
+        // An image bubble that has never been expanded keeps `text_areas` empty; the legacy path
+        // must still write the plain `text`/`original_text` fields used by the flush fallback.
+        let mut canvas = CanvasView::default();
+        insert_image_bubble_with_areas(&mut canvas, 11, 0);
+
+        let applied = canvas.apply_machine_translation_result_with_original(
+            11,
+            "SIGN".to_string(),
+            "Вывеска".to_string(),
+        );
+
+        assert!(applied);
+        let rt = &canvas.bubble_runtime.runtime_bubbles[&11];
+        assert!(rt.text_areas.is_empty());
+        assert_eq!(rt.original_text, "SIGN");
+        assert_eq!(rt.text, "Вывеска");
+    }
+
+    #[test]
+    fn remove_runtime_bubble_evicts_image_caches() {
+        // Regression: deleting a bubble must drop its per-id image fingerprint/preview cache
+        // entries, otherwise they leak for the whole session and a reused id can serve a stale
+        // fingerprint/preview from the previous bubble.
+        use super::super::ImageBubblePreviewCacheEntry;
+        use std::time::Instant;
+
+        let mut canvas = CanvasView::default();
+        insert_image_bubble_with_areas(&mut canvas, 21, 1);
+        canvas
+            .image_bubble_meta_cache
+            .insert(21, (Instant::now(), "len:mtime".to_string()));
+        canvas.image_bubble_preview_cache.insert(
+            21,
+            ImageBubblePreviewCacheEntry {
+                key: "len:mtime".to_string(),
+                texture: None,
+                size_px: [4, 4],
+                error: None,
+            },
+        );
+
+        canvas.remove_runtime_bubble(21);
+
+        assert!(!canvas.image_bubble_meta_cache.contains_key(&21));
+        assert!(!canvas.image_bubble_preview_cache.contains_key(&21));
+        assert!(!canvas.bubble_runtime.runtime_bubbles.contains_key(&21));
+    }
+
+    use crate::project::{CanvasSettings, ProjectPaths};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Builds an empty in-memory `ProjectData` (no pages, no bubbles) for runtime tests.
+    ///
+    /// Only `bubbles` is read by the bubble-runtime flush/sync paths exercised here; all paths are
+    /// empty placeholders and nothing is written to disk by the project itself.
+    fn empty_project() -> ProjectData {
+        let empty = || std::path::PathBuf::new();
+        ProjectData {
+            project_dir: empty(),
+            image_dir: empty(),
+            pages: Vec::new(),
+            bubbles: Arc::new(Vec::new()),
+            paths: ProjectPaths {
+                project_dir: empty(),
+                title_dir: empty(),
+                notes_file: empty(),
+                bubbles_file: empty(),
+                src_dir: empty(),
+                clean_layers_dir: empty(),
+                cleaned_dir: empty(),
+                alt_vers_dir: empty(),
+                saved_dir: empty(),
+                image_bubbles_dir: empty(),
+                text_images_dir: empty(),
+                layers_dir: empty(),
+                text_detection_dir: empty(),
+                characters_dir: empty(),
+                terms_file: empty(),
+                settings_file: empty(),
+                unsaved_dir: empty(),
+                unsaved_bubbles_file: empty(),
+                unsaved_clean_layers_dir: empty(),
+                unsaved_image_bubbles_dir: empty(),
+                unsaved_text_images_dir: empty(),
+                unsaved_layers_dir: empty(),
+            },
+            comic_type: None,
+            canvas_settings: CanvasSettings::default(),
+            settings_data: Value::Null,
+        }
+    }
+
+    /// Builds a `BubblesModel` with isolated temporary save paths so the background saver does not
+    /// touch any real project and concurrent tests do not collide.
+    fn test_model(bubbles: Vec<Bubble>) -> Arc<Mutex<BubblesModel>> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let unsaved =
+            std::env::temp_dir().join(format!("manhwastudio_bubble_runtime_test_{n}.json"));
+        Arc::new(Mutex::new(BubblesModel::new(
+            bubbles,
+            unsaved.with_extension("saved.json"),
+            unsaved,
+            SharedCanvasSettings::default(),
+        )))
+    }
+
+    /// Builds a persisted text `Bubble` record at the given page/anchor.
+    fn text_bubble_record(id: i64, img_idx: usize, u: f32, v: f32, side: Side) -> Bubble {
+        runtime_bubble_to_record(
+            id,
+            img_idx,
+            u,
+            v,
+            Some(side_to_string(side)),
+            Some("text".to_string()),
+            Some("aside".to_string()),
+            String::new(),
+            String::new(),
+            None,
+        )
+    }
+
+    /// Inserts a plain text runtime bubble (no image areas) into `canvas`.
+    fn insert_text_runtime_bubble(
+        canvas: &mut CanvasView,
+        id: i64,
+        img_idx: usize,
+        u: f32,
+        v: f32,
+        side: Side,
+        bubble_type: BubbleType,
+    ) {
+        canvas.bubble_runtime.runtime_bubbles.insert(
+            id,
+            RuntimeBubble {
+                id,
+                img_idx,
+                img_u: u,
+                img_v: v,
+                side,
+                bubble_class: BubbleClass::Text,
+                bubble_type,
+                text: String::new(),
+                original_text: String::new(),
+                rect_coords: RectCoords {
+                    p1: egui::pos2((u - 0.05).max(0.0), (v - 0.05).max(0.0)),
+                    p2: egui::pos2((u + 0.05).min(1.0), (v + 0.05).min(1.0)),
+                },
+                anchor_y: 0.0,
+                max_width_px: 200.0,
+                height_px: 80.0,
+                line_x: 0.0,
+                mounted: true,
+                text_areas: Vec::new(),
+                image_block_rects: Vec::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn drag_gesture_pushes_single_undo_entry_and_debounces_positional_flush() {
+        // A continuous positional drag must (1) write the model only on release (debounced), not
+        // every frame, and (2) push exactly one undo entry capturing the pre-gesture state.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        let revision_before = model.lock().expect("lock model").revision();
+
+        // Gesture start: a drag state is active and the bubble follows the pointer each frame.
+        canvas.bubble_runtime.aside_drag_state = Some(AsideDragState {
+            bid: 1,
+            target: super::super::types::AsideDragTarget::BubbleBody,
+            last_pointer_pos: egui::pos2(0.0, 0.0),
+            moved: true,
+        });
+        for step in 1..=5u16 {
+            let u = 0.30 + 0.05 * f32::from(step);
+            canvas.move_bubble_anchor_impl(1, u, 0.30, true, true);
+            // Per-frame flush during the active drag is debounced: the model is not written, so its
+            // revision stays unchanged and no undo entry is captured yet.
+            canvas.flush_bubble_upserts_to_model(&project);
+        }
+        assert_eq!(
+            model.lock().expect("lock model").revision(),
+            revision_before,
+            "model must not be written while the drag is active"
+        );
+        assert!(canvas.bubble_runtime.bubble_undo_stack.is_empty());
+        // The dragged bubble's final runtime position followed the pointer live.
+        let final_u = canvas.bubble_runtime.runtime_bubbles[&1].img_u;
+        assert!(
+            (final_u - 0.55).abs() < 1e-4,
+            "runtime anchor must track pointer: {final_u}"
+        );
+
+        // Gesture end: clearing the drag state and re-queuing the upsert (as finish_*_drag does)
+        // commits the final position on the next flush.
+        canvas.bubble_runtime.aside_drag_state = None;
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        canvas.flush_bubble_upserts_to_model(&project);
+
+        // Exactly one undo entry, capturing the pre-gesture anchor.
+        assert_eq!(canvas.bubble_runtime.bubble_undo_stack.len(), 1);
+        let undo_anchor = canvas.bubble_runtime.bubble_undo_stack[0].bubbles[0].img_u;
+        assert!(
+            (undo_anchor - 0.30).abs() < 1e-4,
+            "undo must hold pre-gesture anchor: {undo_anchor}"
+        );
+
+        // The model now holds the committed final position.
+        let committed_u = model
+            .lock()
+            .expect("lock model")
+            .with_bubble(1, |b| b.img_u)
+            .expect("bubble 1 exists");
+        assert!(
+            (committed_u - 0.55).abs() < 1e-4,
+            "final position must commit: {committed_u}"
+        );
+    }
+
+    #[test]
+    fn pointer_up_fallback_commits_lingering_aside_drag_exactly_once() {
+        // DATA-LOSS regression: if a positional aside drag's page scrolls off-screen mid-drag, the
+        // widget never delivers `drag_stopped()`, so `finish_aside_drag` never runs from the widget
+        // path. The per-frame pointer-up fallback must commit the final runtime position exactly
+        // once and clear the drag-state, so the move is not lost on reload.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+
+        // Simulate an in-progress drag that already moved the runtime bubble to its final position
+        // (as the per-frame pointer-follow does), but whose widget never delivered `drag_stopped`.
+        canvas.bubble_runtime.aside_drag_state = Some(AsideDragState {
+            bid: 1,
+            target: super::super::types::AsideDragTarget::BubbleBody,
+            last_pointer_pos: egui::pos2(0.0, 0.0),
+            moved: true,
+        });
+        canvas.move_bubble_anchor_impl(1, 0.62, 0.30, true, true);
+        let runtime_u = canvas.bubble_runtime.runtime_bubbles[&1].img_u;
+
+        // Pointer-up fallback: commits the lingering gesture and clears the drag-state.
+        canvas.commit_lingering_drag_gestures_on_pointer_up();
+        assert!(
+            canvas.bubble_runtime.aside_drag_state.is_none(),
+            "fallback must clear the lingering drag-state"
+        );
+        assert!(
+            canvas.bubble_runtime.pending_upsert.contains(&1),
+            "fallback must re-queue the dragged id so the final position commits"
+        );
+
+        // Exactly one commit: flush writes the runtime position to the model.
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert!(
+            !canvas.bubble_runtime.pending_upsert.contains(&1),
+            "the queued upsert must be consumed by exactly one flush"
+        );
+        let committed_u = model
+            .lock()
+            .expect("lock model")
+            .with_bubble(1, |b| b.img_u)
+            .expect("bubble 1 exists");
+        assert!(
+            (committed_u - runtime_u).abs() < 1e-4,
+            "committed position must equal the runtime position: {committed_u} vs {runtime_u}"
+        );
+
+        // Double-commit guard: a second fallback with the state already cleared is a no-op.
+        canvas.commit_lingering_drag_gestures_on_pointer_up();
+        assert!(
+            canvas.bubble_runtime.pending_upsert.is_empty(),
+            "fallback must not re-queue once the gesture state is cleared"
+        );
+    }
+
+    #[test]
+    fn pointer_up_fallback_commits_lingering_handle_gestures() {
+        // The rect/area resize-handle paths normally clear `active_*_handle` on `drag_stopped`; if
+        // the widget never delivers it, the fallback must clear them and re-queue the upsert.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+
+        canvas.bubble_runtime.active_rect_handle = Some((1, 2));
+        canvas.bubble_runtime.active_area_handle = Some((1, 0, 4));
+        canvas.commit_lingering_drag_gestures_on_pointer_up();
+
+        assert!(canvas.bubble_runtime.active_rect_handle.is_none());
+        assert!(canvas.bubble_runtime.active_area_handle.is_none());
+        assert!(canvas.bubble_runtime.pending_upsert.contains(&1));
+    }
+
+    #[test]
+    fn rect_handle_resize_commits_final_rect_on_normal_release() {
+        // Regression (possible data loss): the rect-handle resize debounces model writes while
+        // `active_rect_handle` is set (see `positional_drag_gesture_active`). The on-screen
+        // resize path (`bubble_on_top_ui::resize_rect_by_handle`) re-queues the dragged id in
+        // `pending_upsert` every dragged frame; the `drag_stopped` handler then only clears the
+        // handle. This test simulates that gesture with real runtime/model state and asserts the
+        // final rect is committed to the model on a normal release, so the resize is not lost.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.30, 0.30, Side::Left, BubbleType::Aside);
+
+        // Frame 1 of the drag: handle becomes active, the runtime rect follows the pointer, and the
+        // resize fn re-queues the id. The debounced flush must be a no-op while the gesture runs.
+        canvas.bubble_runtime.active_rect_handle = Some((1, 4));
+        let mid_rect = RectCoords {
+            p1: egui::pos2(0.20, 0.20),
+            p2: egui::pos2(0.40, 0.40),
+        };
+        canvas
+            .bubble_runtime
+            .runtime_bubbles
+            .get_mut(&1)
+            .expect("bubble 1")
+            .rect_coords = mid_rect;
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert!(
+            canvas.bubble_runtime.pending_upsert.contains(&1),
+            "the flush must stay debounced while the rect-handle gesture is active"
+        );
+        assert!(
+            model
+                .lock()
+                .expect("lock model")
+                .with_bubble(1, rect_coords_from_bubble)
+                .flatten()
+                .is_none(),
+            "no rect must be written to the model mid-gesture"
+        );
+
+        // Final dragged frame: the runtime rect reaches its on-screen position and is re-queued one
+        // last time (mirrors `resize_rect_by_handle`'s per-frame `pending_upsert.insert`).
+        let final_rect = RectCoords {
+            p1: egui::pos2(0.15, 0.10),
+            p2: egui::pos2(0.55, 0.62),
+        };
+        canvas
+            .bubble_runtime
+            .runtime_bubbles
+            .get_mut(&1)
+            .expect("bubble 1")
+            .rect_coords = final_rect;
+        canvas.bubble_runtime.pending_upsert.insert(1);
+
+        // Normal on-screen release: `draw_rect_handles`'s `drag_stopped` only clears the handle. The
+        // id is still queued from the final frame, so the next flush must commit the final rect.
+        canvas.bubble_runtime.active_rect_handle = None;
+        assert!(
+            canvas.bubble_runtime.pending_upsert.contains(&1),
+            "the final dragged frame must leave the id queued for the post-release flush"
+        );
+
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert!(
+            !canvas.bubble_runtime.pending_upsert.contains(&1),
+            "the queued upsert must be consumed by exactly one post-release flush"
+        );
+        let committed = model
+            .lock()
+            .expect("lock model")
+            .with_bubble(1, rect_coords_from_bubble)
+            .flatten()
+            .expect("the final rect must be persisted to the model")
+            .normalized();
+        let expected = final_rect.normalized();
+        assert!(
+            (committed.p1.x - expected.p1.x).abs() < 1e-4
+                && (committed.p1.y - expected.p1.y).abs() < 1e-4
+                && (committed.p2.x - expected.p2.x).abs() < 1e-4
+                && (committed.p2.y - expected.p2.y).abs() < 1e-4,
+            "committed rect must equal the final on-screen rect: {committed:?} vs {expected:?}"
+        );
+    }
+
+    #[test]
+    fn hook_bubbles_revision_changes_when_runtime_only_bubble_appears() {
+        // A bubble that lives only in `runtime_bubbles` (created but not yet flushed) must bump the
+        // fingerprint so a caller gating per-frame work on it does not miss the new bubble.
+        let project = empty_project();
+        let model = test_model(Vec::new());
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+
+        let before = canvas.hook_bubbles_revision();
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.20, 0.30, Side::Left, BubbleType::Aside);
+        let after = canvas.hook_bubbles_revision();
+        assert_ne!(
+            before, after,
+            "a runtime-only bubble must change the bubbles-revision fingerprint"
+        );
+    }
+
+    #[test]
+    fn capture_history_dedups_by_revision_not_content() {
+        // Two captures with no intervening model mutation share a revision and must collapse to a
+        // single undo entry; a real mutation between them yields a second entry.
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.40, 0.40, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+
+        canvas.capture_bubble_history_before_mutation();
+        canvas.capture_bubble_history_before_mutation();
+        assert_eq!(
+            canvas.bubble_runtime.bubble_undo_stack.len(),
+            1,
+            "repeat capture of an unchanged model is a no-op"
+        );
+
+        // First real mutation: the pre-write capture dedups against the existing entry (same
+        // revision), then the write advances the model revision. Stack stays at one entry holding
+        // the pre-mutation state.
+        canvas
+            .bubble_runtime
+            .runtime_bubbles
+            .get_mut(&1)
+            .expect("bubble 1")
+            .img_u = 0.60;
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert_eq!(
+            canvas.bubble_runtime.bubble_undo_stack.len(),
+            1,
+            "the first mutation's pre-state was already captured"
+        );
+
+        // Second real mutation: now the pre-write capture sees the advanced revision and pushes a
+        // distinct entry, proving dedup is by revision, not content.
+        canvas
+            .bubble_runtime
+            .runtime_bubbles
+            .get_mut(&1)
+            .expect("bubble 1")
+            .img_u = 0.20;
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert_eq!(canvas.bubble_runtime.bubble_undo_stack.len(), 2);
+    }
+
+    #[test]
+    fn page_bubbles_bucketed_filters_and_orders_each_column() {
+        // The single-pass bucketing must (1) keep only the requested page, (2) route each bubble to
+        // its (side, displayed-type) column, and (3) order each column by vertical anchor, then
+        // horizontal anchor, then bubble id. Assertions use inline expected ids derived by hand from
+        // the inputs (an independent reference), not the bucketer's own output.
+        let mut canvas = CanvasView::default();
+        // Mixed page/side/type bubbles, plus one on another page that must be excluded. Bubbles 2
+        // and 7 share a vertical anchor (0.10) to exercise the horizontal-then-id tiebreak.
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.20, 0.30, Side::Left, BubbleType::Aside);
+        insert_text_runtime_bubble(&mut canvas, 2, 0, 0.10, 0.10, Side::Left, BubbleType::Aside);
+        insert_text_runtime_bubble(
+            &mut canvas,
+            3,
+            0,
+            0.80,
+            0.50,
+            Side::Right,
+            BubbleType::Aside,
+        );
+        insert_text_runtime_bubble(&mut canvas, 4, 0, 0.30, 0.20, Side::Left, BubbleType::OnTop);
+        insert_text_runtime_bubble(
+            &mut canvas,
+            5,
+            0,
+            0.90,
+            0.40,
+            Side::Right,
+            BubbleType::OnTop,
+        );
+        insert_text_runtime_bubble(&mut canvas, 6, 0, 0.15, 0.05, Side::Left, BubbleType::Aside);
+        insert_text_runtime_bubble(&mut canvas, 7, 0, 0.25, 0.10, Side::Left, BubbleType::Aside);
+        // Other-page bubble (must be excluded entirely).
+        insert_text_runtime_bubble(
+            &mut canvas,
+            99,
+            1,
+            0.20,
+            0.20,
+            Side::Left,
+            BubbleType::Aside,
+        );
+
+        let buckets = canvas.page_bubbles_bucketed(0);
+        let ids = |side, bubble_type| {
+            buckets
+                .bucket(side, bubble_type)
+                .iter()
+                .map(|item| item.bid)
+                .collect::<Vec<i64>>()
+        };
+
+        // Left aside: 6@v0.05, then the v0.10 pair ordered by horizontal anchor (2@u0.10 before
+        // 7@u0.25), then 1@v0.30. Excludes the other-page bubble 99.
+        assert_eq!(ids(Side::Left, BubbleType::Aside), vec![6, 2, 7, 1]);
+        // Right aside: only bubble 3.
+        assert_eq!(ids(Side::Right, BubbleType::Aside), vec![3]);
+        // Left on-top: only bubble 4.
+        assert_eq!(ids(Side::Left, BubbleType::OnTop), vec![4]);
+        // Right on-top: only bubble 5.
+        assert_eq!(ids(Side::Right, BubbleType::OnTop), vec![5]);
+    }
+
+    #[test]
+    fn page_bubbles_bucketed_orders_equal_anchors_by_bubble_id() {
+        // Final tiebreak: two bubbles sharing both anchors must order by ascending bubble id so the
+        // ordering is stable frame-to-frame.
+        let mut canvas = CanvasView::default();
+        insert_text_runtime_bubble(
+            &mut canvas,
+            20,
+            0,
+            0.40,
+            0.40,
+            Side::Left,
+            BubbleType::Aside,
+        );
+        insert_text_runtime_bubble(
+            &mut canvas,
+            10,
+            0,
+            0.40,
+            0.40,
+            Side::Left,
+            BubbleType::Aside,
+        );
+
+        let order: Vec<i64> = canvas
+            .page_bubbles_bucketed(0)
+            .bucket(Side::Left, BubbleType::Aside)
+            .iter()
+            .map(|item| item.bid)
+            .collect();
+        assert_eq!(order, vec![10, 20]);
     }
 }

@@ -30,6 +30,15 @@ mod raster;
 pub mod types;
 mod wrap;
 
+// Общая логика дискретных форм текста живёт в подсистеме wrap и используется
+// как панелью typing, так и рендером (см. `wrap::forms`).
+pub(crate) use wrap::forms;
+
+// Резолвер PostScript-имени шрифта переиспользуется PSD-экспортом вкладки typing.
+pub(crate) use font_registry::{
+    load_selected_font_from_path, resolve_font_family_name, resolve_font_postscript_name,
+};
+
 type RenderNextCancel<'a> = Option<(&'a std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>;
 
 // Compile-time smoke anchor for the staged API: keeps the extracted contract wired
@@ -62,6 +71,23 @@ const _: for<'a> fn(
 const _: fn(u32, u32) -> types::RenderedTextImage = types::RenderedTextImage::transparent;
 pub use pipeline::render_text_to_image;
 
+// Anchor: переиспользование post-effects pipeline на сторонних RGBA-картинках (image-оверлеи).
+#[allow(clippy::type_complexity)]
+const _: for<'a> fn(
+    Vec<u8>,
+    u32,
+    u32,
+    &str,
+    RenderNextCancel<'a>,
+) -> Result<types::RenderedTextImage, String> = pipeline::apply_effects_to_image;
+pub use pipeline::apply_effects_to_image;
+
+// Anchor: рендер-подсистема владеет общим выбором формы и предикатами форм
+// поверх scored-wrap (см. `wrap::forms`).
+const _: fn(&str, forms::TextFormPreset, usize) -> Option<Vec<String>> = forms::choose_form;
+const _: fn(&[u32], forms::TextFormPreset, u32) -> bool = forms::sequence_matches;
+const _: fn(&[u32], u32) -> bool = forms::is_christmas_tree;
+
 pub(crate) fn touch_runtime_smoke_contract() {
     formula::touch_formula_smoke_contract();
 
@@ -85,7 +111,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         glyph_height_percent: 100.0,
         glyph_width_percent: 100.0,
         width_px: 128,
-        align: types::HorizontalAlign::Center,
+        align: types::HorizontalAlign::CENTER,
         selected_face_index: 0,
         force_bold: false,
         force_italic: false,
@@ -176,10 +202,10 @@ pub(crate) fn touch_runtime_smoke_contract() {
         types::TEXT_FORMULA_USER_VAR_COUNT,
     ));
     std::hint::black_box([
-        types::HorizontalAlign::Left,
-        types::HorizontalAlign::Center,
-        types::HorizontalAlign::Right,
-        types::HorizontalAlign::Justify,
+        types::HorizontalAlign::LEFT,
+        types::HorizontalAlign::CENTER,
+        types::HorizontalAlign::RIGHT,
+        types::HorizontalAlign::JUSTIFY,
     ]);
     std::hint::black_box([types::KerningMode::Metric, types::KerningMode::Optical]);
     std::hint::black_box([
@@ -269,7 +295,7 @@ mod tests {
             glyph_height_percent: 100.0,
             glyph_width_percent: 100.0,
             width_px: 320,
-            align: HorizontalAlign::Center,
+            align: HorizontalAlign::CENTER,
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,

@@ -7,13 +7,14 @@ Working "Open chapter" launcher page backed by on-disk project discovery.
 Main responsibilities:
 - list titles and chapters from the configured projects root;
 - validate the selected chapter in a background thread before opening;
-- remember the last open-page selection in `user_config.json`.
+- remember the last opened title and per-title last opened chapters in `user_config.json`.
 
 Notes:
 All filesystem scans and validation run in worker threads so the launcher UI remains responsive.
 */
 
 use crate::config;
+use crate::launcher::background::NO_MENU_IMGS_MARKER;
 use crate::launcher::pages::base::{self, PageNavAction};
 use crate::launcher::state::OpenProjectSelection;
 use crate::launcher::theme;
@@ -21,6 +22,7 @@ use crate::runtime_log;
 use crate::widgets::WheelComboBox;
 use egui::{Align, Layout, RichText, Ui};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -28,7 +30,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 const LAST_OPEN_TITLE_KEY: &str = "open_page_last_title";
-const LAST_OPEN_CHAPTER_KEY: &str = "open_page_last_chapter";
+const LAST_OPEN_CHAPTERS_BY_TITLE_KEY: &str = "open_page_last_chapters_by_title";
+const LEGACY_LAST_OPEN_CHAPTER_KEY: &str = "open_page_last_chapter";
 const NO_PROJECTS_MESSAGE: &str = "Проектов нет. Чтобы создать проект, перейдите в \"Новая глава\"";
 
 #[derive(Debug)]
@@ -40,12 +43,14 @@ pub struct OpenPageState {
     selected_chapter: Option<String>,
     /// Chapter name for which an `_unsaved` folder was detected (if any).
     unsaved_chapter: Option<String>,
+    /// Whether the selected title is used as menu decoration (i.e. the
+    /// `no_menu_imgs` marker file is absent from its folder).
+    use_as_menu_decoration: bool,
     status: OpenPageStatus,
     pending_refresh: Option<Receiver<OpenPageRefreshResult>>,
     pending_validation: Option<Receiver<OpenPageValidationResult>>,
     pending_open: Option<Receiver<Result<OpenProjectSelection, String>>>,
-    preferred_title: String,
-    preferred_chapter: String,
+    last_open_selection: LastOpenSelection,
 }
 
 #[derive(Debug)]
@@ -74,9 +79,29 @@ struct OpenPageValidationResult {
     state: crate::ProjectValidationState,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LastOpenSelection {
+    title: String,
+    chapters_by_title: HashMap<String, String>,
+    legacy_chapter: String,
+}
+
+impl LastOpenSelection {
+    fn chapter_for_title(&self, title: &str) -> Option<String> {
+        self.chapters_by_title
+            .get(title)
+            .filter(|chapter| !chapter.is_empty())
+            .cloned()
+            .or_else(|| {
+                (title == self.title && !self.legacy_chapter.is_empty())
+                    .then(|| self.legacy_chapter.clone())
+            })
+    }
+}
+
 impl OpenPageState {
     pub fn new(projects_root: PathBuf, user_settings: &Value) -> Self {
-        let (preferred_title, preferred_chapter) = read_last_open_selection(user_settings);
+        let last_open_selection = read_last_open_selection(user_settings);
         let mut state = Self {
             projects_root,
             titles: Vec::new(),
@@ -84,12 +109,12 @@ impl OpenPageState {
             selected_title: None,
             selected_chapter: None,
             unsaved_chapter: None,
+            use_as_menu_decoration: true,
             status: OpenPageStatus::Loading,
             pending_refresh: None,
             pending_validation: None,
             pending_open: None,
-            preferred_title,
-            preferred_chapter,
+            last_open_selection,
         };
         state.start_refresh(None);
         state
@@ -141,7 +166,22 @@ impl OpenPageState {
                                 });
                                 if title_changed {
                                     self.refresh_unsaved_detection();
+                                    self.refresh_menu_decoration_flag();
                                     self.start_refresh(self.selected_title.clone());
+                                }
+
+                                let mut decoration = self.use_as_menu_decoration;
+                                if ui
+                                    .add_enabled(
+                                        self.selected_title.is_some(),
+                                        egui::Checkbox::new(
+                                            &mut decoration,
+                                            "Использовать тайтл как декорацию в меню",
+                                        ),
+                                    )
+                                    .changed()
+                                {
+                                    self.set_menu_decoration(decoration);
                                 }
 
                                 ui.add_space(10.0);
@@ -271,17 +311,6 @@ impl OpenPageState {
         pending_open_action.or(ui_action)
     }
 
-    pub fn persist_last_selection(&self) -> anyhow::Result<()> {
-        let Some(title) = self.selected_title.as_ref() else {
-            return Ok(());
-        };
-        let Some(chapter) = self.selected_chapter.as_ref() else {
-            return Ok(());
-        };
-
-        persist_last_selection_values(title, chapter)
-    }
-
     pub fn set_projects_root(&mut self, projects_root: PathBuf) {
         if self.projects_root == projects_root {
             return;
@@ -293,6 +322,7 @@ impl OpenPageState {
         self.selected_title = None;
         self.selected_chapter = None;
         self.unsaved_chapter = None;
+        self.use_as_menu_decoration = true;
         self.pending_validation = None;
         self.pending_open = None;
         self.start_refresh(None);
@@ -314,6 +344,48 @@ impl OpenPageState {
             .selected_title
             .as_deref()
             .and_then(|title| crate::find_unsaved_chapter(&self.projects_root, title));
+    }
+
+    /// Path to the `no_menu_imgs` marker file for the selected title, if any.
+    fn menu_decoration_marker_path(&self) -> Option<PathBuf> {
+        let title = self.selected_title.as_ref()?;
+        Some(self.projects_root.join(title).join(NO_MENU_IMGS_MARKER))
+    }
+
+    /// Sync the checkbox state with the on-disk marker for the selected title.
+    fn refresh_menu_decoration_flag(&mut self) {
+        self.use_as_menu_decoration = self
+            .menu_decoration_marker_path()
+            .map(|marker| !marker.exists())
+            .unwrap_or(true);
+    }
+
+    /// Create or remove the `no_menu_imgs` marker so the title is (de)selected
+    /// for the menu background pool.
+    fn set_menu_decoration(&mut self, use_as_decoration: bool) {
+        self.use_as_menu_decoration = use_as_decoration;
+        let Some(marker) = self.menu_decoration_marker_path() else {
+            return;
+        };
+
+        let result = if use_as_decoration {
+            match fs::remove_file(&marker) {
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        } else if marker.exists() {
+            Ok(())
+        } else {
+            fs::write(&marker, b"")
+        };
+
+        if let Err(err) = result {
+            runtime_log::log_warn(format!(
+                "[launcher-open] failed to update menu decoration marker '{}': {}",
+                marker.display(),
+                err
+            ));
+        }
     }
 
     fn can_open(&self) -> bool {
@@ -344,8 +416,8 @@ impl OpenPageState {
         let projects_root = self.projects_root.clone();
         let preferred_title = preferred_title_override
             .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| self.preferred_title.clone());
-        let preferred_chapter = self.preferred_chapter.clone();
+            .unwrap_or_else(|| self.last_open_selection.title.clone());
+        let last_open_selection = self.last_open_selection.clone();
 
         let (tx, rx) = mpsc::channel();
         self.pending_refresh = Some(rx);
@@ -353,7 +425,7 @@ impl OpenPageState {
             .name("launcher-open-refresh".to_string())
             .spawn(move || {
                 let result =
-                    build_refresh_result(&projects_root, &preferred_title, &preferred_chapter);
+                    build_refresh_result(&projects_root, &preferred_title, &last_open_selection);
                 if let Err(err) = tx.send(result) {
                     runtime_log::log_warn(format!(
                         "[launcher-open] failed to send refresh result: {}",
@@ -393,6 +465,7 @@ impl OpenPageState {
                     };
 
                     self.refresh_unsaved_detection();
+                    self.refresh_menu_decoration_flag();
 
                     if self.selected_project_dir().is_some() {
                         self.start_validation_for_current_selection();
@@ -575,9 +648,18 @@ pub fn persist_last_selection_values(title: &str, chapter: &str) -> anyhow::Resu
         &["General", LAST_OPEN_TITLE_KEY],
         Value::String(title.to_string()),
     )?;
+
+    let mut chapters_by_title = cfg
+        .data
+        .get("General")
+        .and_then(|general| general.get(LAST_OPEN_CHAPTERS_BY_TITLE_KEY))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    chapters_by_title.insert(title.to_string(), Value::String(chapter.to_string()));
     cfg.set_path(
-        &["General", LAST_OPEN_CHAPTER_KEY],
-        Value::String(chapter.to_string()),
+        &["General", LAST_OPEN_CHAPTERS_BY_TITLE_KEY],
+        Value::Object(chapters_by_title),
     )?;
     Ok(())
 }
@@ -585,7 +667,7 @@ pub fn persist_last_selection_values(title: &str, chapter: &str) -> anyhow::Resu
 fn build_refresh_result(
     projects_root: &std::path::Path,
     preferred_title: &str,
-    preferred_chapter: &str,
+    last_open_selection: &LastOpenSelection,
 ) -> OpenPageRefreshResult {
     let titles = match crate::list_titles(projects_root) {
         Ok(titles) => titles,
@@ -618,13 +700,12 @@ fn build_refresh_result(
         .map(|title| crate::list_chapters(projects_root, title).unwrap_or_default())
         .unwrap_or_default();
 
-    let selected_chapter = if preferred_chapter.is_empty() {
-        chapters.first().cloned()
-    } else if chapters.iter().any(|chapter| chapter == preferred_chapter) {
-        Some(preferred_chapter.to_string())
-    } else {
-        chapters.first().cloned()
-    };
+    let preferred_chapter = selected_title
+        .as_deref()
+        .and_then(|title| last_open_selection.chapter_for_title(title));
+    let selected_chapter = preferred_chapter
+        .filter(|preferred_chapter| chapters.iter().any(|chapter| chapter == preferred_chapter))
+        .or_else(|| chapters.first().cloned());
 
     OpenPageRefreshResult {
         titles,
@@ -635,7 +716,7 @@ fn build_refresh_result(
     }
 }
 
-fn read_last_open_selection(user_settings: &Value) -> (String, String) {
+fn read_last_open_selection(user_settings: &Value) -> LastOpenSelection {
     let general = user_settings.get("General").and_then(Value::as_object);
     let title = general
         .and_then(|general| general.get(LAST_OPEN_TITLE_KEY))
@@ -644,14 +725,35 @@ fn read_last_open_selection(user_settings: &Value) -> (String, String) {
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
         .to_string();
-    let chapter = general
-        .and_then(|general| general.get(LAST_OPEN_CHAPTER_KEY))
+
+    let chapters_by_title = general
+        .and_then(|general| general.get(LAST_OPEN_CHAPTERS_BY_TITLE_KEY))
+        .and_then(Value::as_object)
+        .map(|chapters| {
+            chapters
+                .iter()
+                .filter_map(|(title, chapter)| {
+                    let chapter = chapter.as_str()?.trim();
+                    (!title.trim().is_empty() && !chapter.is_empty())
+                        .then(|| (title.clone(), chapter.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let legacy_chapter = general
+        .and_then(|general| general.get(LEGACY_LAST_OPEN_CHAPTER_KEY))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
         .to_string();
-    (title, chapter)
+
+    LastOpenSelection {
+        title,
+        chapters_by_title,
+        legacy_chapter,
+    }
 }
 
 fn show_status(ui: &mut Ui, status: &OpenPageStatus) {
@@ -692,5 +794,51 @@ fn show_status(ui: &mut Ui, status: &OpenPageStatus) {
                 theme::STATUS_SUCCESS,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_last_chapter_per_title() {
+        let selection = read_last_open_selection(&json!({
+            "General": {
+                "open_page_last_title": "Title B",
+                "open_page_last_chapters_by_title": {
+                    "Title A": "001",
+                    "Title B": "014"
+                },
+                "open_page_last_chapter": "legacy"
+            }
+        }));
+
+        assert_eq!(selection.title, "Title B");
+        assert_eq!(
+            selection.chapter_for_title("Title A").as_deref(),
+            Some("001")
+        );
+        assert_eq!(
+            selection.chapter_for_title("Title B").as_deref(),
+            Some("014")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_legacy_chapter_only_for_last_title() {
+        let selection = read_last_open_selection(&json!({
+            "General": {
+                "open_page_last_title": "Title B",
+                "open_page_last_chapter": "legacy"
+            }
+        }));
+
+        assert_eq!(
+            selection.chapter_for_title("Title B").as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(selection.chapter_for_title("Title A"), None);
     }
 }

@@ -16,8 +16,27 @@ owned by the model/runtime so edits and export payloads remain intact.
 
 Bubble editing is split between runtime state and UI layers. `bubble_runtime.rs` owns pending
 upserts/deletes, shared-model sync, undo/redo snapshots, clipboard flows, and failed-write
-preservation. `bubble_aside_ui.rs` and `bubble_on_top_ui.rs` only handle layout, hit rectangles,
-focus, drag, and resize widgets.
+preservation. Bubbles have a domain class (`TextBubble` or `ImageBubble`); text bubbles may render
+as aside/on-top/default, while image bubbles always use the aside layout path. `bubble_aside_ui.rs`
+and `bubble_on_top_ui.rs` only handle layout, hit rectangles, focus, drag, and resize widgets.
+
+An image bubble is a *group* of text areas (`RuntimeBubble.text_areas`, persisted via
+`extra["text_areas"]`; see `parse_image_text_areas` / `serialize_image_text_areas` in `helpers.rs`).
+The red `rect_coords` is the single image-area rectangle: drawn red, movable, and resizable via 8
+handles; it is not a text area. For page-crop bubbles it is the crop region — `crop_rect` is kept
+equal to `rect_coords` on save and `helpers::image_area_rect_from_bubble` resolves the crop region
+as the image area, so the canvas owns the only red rect (the translation tab draws no separate crop
+overlay). Every text area (including area 0) is an independent image-space sub-box clamped inside
+`rect_coords`, with its own anchor (inside its rect), text, resize handles, and palette color
+(`image_area_palette`, a reverse rainbow from blue). The bubble side comes from
+`image_bubble_side_from_areas` (sign of `Σ(anchor_u − 0.5)`). Editable, one card holds the preview,
+one framed row block per area (`Оригинал`/`Описание`/`Перевод`), an "add area" button, then the
+action row; each area draws its own colored rect, anchor point, and link line (aimed at that block's
+center). The aside column is built from `AsideItem`s, not raw bubble ids: a read-only image bubble
+splits into one `AsideItem` per area, each rendered as an ordinary text-only aside card placed by
+its own anchor side. Drag routing (`AsideDragTarget`): a row block moves only its area; the card body
+outside blocks, or empty space inside the red rect, moves the red rect (areas + anchors follow); an
+area rect on the page moves that area; an anchor point moves only inside its own area.
 
 Clean overlays enter through `CleanOverlaysModel`. Normal canvas visibility uses the
 model's shared visibility flag. A canvas may also set a local clean-overlay visibility
@@ -34,6 +53,13 @@ Source page geometry is separate from source page GPU residency. Scene layout an
 handles for source imagery. NEAREST source textures are materialized lazily while pixel inspection
 is active and are dropped outside the active page window.
 
+Pixel inspection has a single DPI-correct trigger: `device_pixels_per_source` (`zoom *
+pixels_per_point`) compared against `PIXEL_INSPECTION_MIN_DEVICE_PX`, exposed as
+`pixel_inspection_recommended`. The same notion drives NEAREST sampling for source tiles, the clean
+overlay, and the cleaning text mask, plus the pixel grid, so a magnified source pixel looks identical
+across layers. The grid is drawn in one late overlay pass (`draw_pixel_grid_overlay`), not in base
+layers. Overlay and text-mask tile draws viewport-cull tiles against the visible clip rect.
+
 Directed zoom is anchored in content/world space and clamps the requested horizontal
 scroll offset to the current scrollable range. The canvas creates horizontal scroll range
 before the visual strip fully reaches viewport width, so anchor compensation has a stable
@@ -46,11 +72,20 @@ X range before the old overflow point.
 - `overlay_runtime.rs`: clean overlay CPU/GPU runtime state, background preparation, and
   local/shared visibility state.
 - `bubble_runtime.rs`: runtime bubble state, model synchronization, undo/redo, and clipboard.
-- `bubble_aside_ui.rs`: aside bubble column layout and interactions.
+- `bubble_aside_ui.rs`: aside bubble column layout and interactions. Layout runs as
+  `build_aside_desired_slots` (measure) -> `pack_aside_slots` (pure vertical packing) ->
+  `draw_aside_slots`. `draw_aside_side` picks single- or two-column layout per side: with
+  `CanvasState::aside_second_column` on and enough free span for both columns plus gaps to stay
+  inside the viewport, a side splits into near/far columns. Distribution is near-priority
+  (`split_near_priority`): isolated bubbles stay near, only overlapping clusters split alternately
+  near/far. Columns are equal width (min width, hugging the ribbon, when stretching is off; up to
+  max width when on). Far links stay roughly horizontal while the near column packs invisible spacers
+  at far anchor heights so its cards spread and far links thread the gaps.
 - `bubble_on_top_ui.rs`: on-page bubble widgets, focus controls, move, and resize handling.
 - `settings.rs`: canvas settings snapshots and persistence worker.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
 - `types.rs`: passive DTOs and runtime payload types.
+- `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`). The `ScrollArea` still allocates the page strip and owns scrolling, but each page's authoritative screen `image_rect` and its `page_in_view` visibility are now produced by this transform: `reserve_canvas_page_frame` establishes one per-frame transform from the first laid-out page (`scale == state.zoom`, `translation = old_image_left_top - world_min*scale`) and maps every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the transform-derived rect drifts >0.5px from the old ad-hoc rect. Future increments will remove the `ScrollArea` and make the transform the sole camera.
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
 
 ## Contracts and invariants
@@ -62,10 +97,51 @@ X range before the old overflow point.
   inside the specific `CanvasView`.
 - Canvas scroll areas need per-instance egui ids. Cross-tab viewport sync must go through
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
+- The page strip in `scene.rs` deliberately zeroes the ambient `item_spacing` while
+  allocating page rows so screen tops stay linear in world space and the `ViewTransform`
+  (`screen = world*scale + translation`) can reproduce them. Inter-page gaps come only from
+  the explicit `edge_margin`/`page_spacing` settings, never from theme spacing. The spacing
+  is restored before drawing aside/on-top bubbles, whose inner widgets inherit the ui style.
 - `CanvasHooks` callbacks must stay lightweight and must not mutate shared models while canvas
   locks are held. Use typed canvas APIs or tab-owned worker/event channels for heavier work.
+- Vertical-scrollbar marks are tab-owned. After `draw_canvas_scene` lays out the strip,
+  `mod.rs::render_scrollbar_marks` asks the active tab via `CanvasHooks::canvas_scrollbar_marks`
+  (default none) and paints the returned marks onto the native vertical bar with
+  `widgets::paint_marks_on_bar`, then re-draws the handle on top so it stays visible. The
+  `egui::ScrollArea::both` engine is untouched (both axes scroll natively). Tabs position marks in
+  content space via `CanvasScrollbarContext::content_y` (`world_y * zoom` from
+  `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content.
 - Bubble persistence is routed through `BubblesModel` saver tasks; canvas runtime should keep
   unsaved runtime edits explicit until they are flushed to the model.
+- Bubble undo entries (`BubbleHistoryEntry`) hold an `Arc<Vec<Bubble>>` snapshot plus the model
+  revision they were taken at. Capturing is an O(1) Arc bump, and entries are deduplicated by
+  revision (monotonic, bumped per mutation), not by content hash. `flush_bubble_upserts_to_model`
+  debounces positional model writes while a continuous drag/resize gesture is active
+  (`aside_drag_state` / `on_top_drag_state` / `active_rect_handle` / `active_area_handle`): the
+  runtime bubble still follows the pointer each frame, but the model is written only on release,
+  so one gesture yields exactly one undo entry and one model commit. Gesture-end handlers must
+  re-insert the dragged id into `pending_upsert` so the final position commits. If the dragged
+  widget stops being rendered mid-drag (its page scrolls fully off-screen) egui never delivers
+  `drag_stopped()`, so the per-frame `mod.rs::commit_lingering_drag_gestures_on_pointer_up`
+  fallback (run in `draw` after the scene pass, only when the primary pointer is up) is the
+  data-loss guard: it routes aside/on-top drags through `finish_*_drag` and mirrors the rect/area
+  handle `drag_stopped` paths (`pending_upsert.insert` + clear `active_*_handle`). It is the single
+  source of truth for that commit and is skipped for a normally-finishing gesture, which already
+  cleared its state before the fallback runs, so each gesture commits exactly once.
+- `hook_bubbles_revision()` is a cheap `u64` fingerprint of the bubble set `hook_bubbles_snapshot`
+  would build: it folds `BubblesModel::revision()` with the runtime-only set
+  (`runtime_bubbles` count + `next_bubble_id`), so a runtime-only, not-yet-flushed bubble bumps it.
+  Use it for equality gating between frames, not for ordering.
+- `page_bubbles_bucketed(page)` buckets all runtime bubbles of a page into the four
+  `(side, type)` aside/on-top columns in a single pass. It is the sole bubble-column scanner;
+  consumers read the relevant `(side, type)` column from one bucketed result per page per pass
+  instead of re-scanning runtime bubbles once per column.
+- Per-bubble image caches on `CanvasView` (`image_bubble_meta_cache`,
+  `image_bubble_preview_cache`, keyed by bubble id) must be evicted whenever a bubble is fully
+  removed. `remove_runtime_bubble` is the single full-removal path and owns that eviction, so
+  deleted ids never leak and a reused id cannot serve a stale fingerprint/preview.
+- `BubbleClass::Image` is not a display type. It must not resolve through on-top display settings;
+  image-specific metadata belongs in bubble `extra`.
 - Source page GPU residency is verified manually for now because `egui::TextureHandle` creation
   and eviction require a live GUI context; pure tests should target memory-manager policy instead.
 - Clean-overlay memory eviction may drop only reconstructable GPU texture pages. It must not drop

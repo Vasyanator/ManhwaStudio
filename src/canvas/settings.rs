@@ -27,7 +27,8 @@ Notes:
 use super::types::CanvasSettingsSaveRequest;
 use super::workers::spawn_canvas_settings_saver_thread;
 use super::{
-    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleType, CanvasView, OnTopFocusMode,
+    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleType, CanvasView,
+    OnTopFocusMode, TranslationStatusDisplay,
 };
 use crate::config;
 use crate::models::bubbles_model::SharedCanvasSettings;
@@ -90,6 +91,7 @@ impl CanvasView {
         self.state.aside_compact_mode =
             AsideBubbleCompactMode::from_str(&snapshot.aside_compact_mode);
         self.state.aside_side_mode = AsideBubbleSideMode::from_str(&snapshot.aside_side_mode);
+        self.state.aside_second_column = snapshot.aside_second_column;
         self.state.on_top_focus_mode = OnTopFocusMode::from_str(&snapshot.on_top_focus_mode);
         self.state.scale_bubbles = snapshot.scale_bubbles;
         self.state.aside_scale_pct = snapshot.aside_scale_pct.clamp(25, 300);
@@ -98,6 +100,8 @@ impl CanvasView {
         self.state.spellcheck_translation = snapshot.spellcheck_translation;
         self.state.tabs_autosync_enabled = snapshot.tabs_autosync_enabled;
         self.state.cache_pages = snapshot.cache_pages;
+        self.state.translation_status_display =
+            TranslationStatusDisplay::from_str(&snapshot.translation_status_display);
         self.sync_cache_pages_setting_to_model();
     }
 
@@ -141,6 +145,7 @@ impl CanvasView {
             bubble_max_width: self.state.bubble_max_width,
             aside_compact_mode: self.state.aside_compact_mode.as_str().to_string(),
             aside_side_mode: self.state.aside_side_mode.as_str().to_string(),
+            aside_second_column: self.state.aside_second_column,
             on_top_focus_mode: self.state.on_top_focus_mode.as_str().to_string(),
             scale_bubbles: self.state.scale_bubbles,
             aside_scale_pct: self.state.aside_scale_pct,
@@ -149,6 +154,7 @@ impl CanvasView {
             spellcheck_translation: self.state.spellcheck_translation,
             tabs_autosync_enabled: self.state.tabs_autosync_enabled,
             cache_pages: self.state.cache_pages,
+            translation_status_display: self.state.translation_status_display.as_str().to_string(),
         }
     }
 
@@ -300,6 +306,10 @@ pub(crate) fn save_canvas_settings_to_project_file(
         Value::Bool(snapshot.spellcheck_translation),
     );
     canvas_obj.insert("cache_pages".to_string(), Value::Bool(snapshot.cache_pages));
+    canvas_obj.insert(
+        "translation_status_display".to_string(),
+        Value::String(snapshot.translation_status_display.clone()),
+    );
     canvas_obj.remove("copy_from_field");
     canvas_obj.remove("paste_into_field");
     root_obj.insert("canvas".to_string(), Value::Object(canvas_obj));
@@ -363,6 +373,10 @@ pub(crate) fn save_canvas_settings_to_user_file(
         Value::String(snapshot.aside_side_mode.clone()),
     );
     canvas_obj.insert(
+        "aside_second_column".to_string(),
+        Value::Bool(snapshot.aside_second_column),
+    );
+    canvas_obj.insert(
         "scale_bubbles".to_string(),
         Value::Bool(snapshot.scale_bubbles),
     );
@@ -387,6 +401,10 @@ pub(crate) fn save_canvas_settings_to_user_file(
         Value::Bool(snapshot.spellcheck_translation),
     );
     canvas_obj.insert("cache_pages".to_string(), Value::Bool(snapshot.cache_pages));
+    canvas_obj.insert(
+        "translation_status_display".to_string(),
+        Value::String(snapshot.translation_status_display.clone()),
+    );
     root_obj.insert("Canvas".to_string(), Value::Object(canvas_obj));
 
     let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;

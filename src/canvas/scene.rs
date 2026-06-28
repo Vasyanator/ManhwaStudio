@@ -40,11 +40,12 @@ use super::types::{
     CanvasContextMenuTarget, CanvasFrameParams, CanvasScenePageFrame, OverlayUploadBudget,
     PendingZoomAnchor, SourceTextureUploadBudget,
 };
+use super::view_transform::DVec2;
 use super::{
-    BubbleCopyPasteTarget, BubbleType, CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode,
+    BubbleCopyPasteTarget, CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode, ViewTransform,
 };
 use crate::app::{PageImageInfo, PageTexture};
-use crate::project::{ProjectData, Side};
+use crate::project::ProjectData;
 use crate::runtime_log;
 use crate::widgets::WheelSlider;
 use eframe::egui;
@@ -52,7 +53,12 @@ use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use std::collections::HashMap;
 
 const HORIZONTAL_SCROLL_EARLY_FACTOR: f32 = 1.7;
-const PIXEL_GRID_MIN_STEP_PT: f32 = 4.0;
+
+/// Screen-point margin by which the viewport is expanded before testing page
+/// visibility. Matches the pre-existing `ui.clip_rect().expand(256.0)` used to
+/// build `viewport_rect`, so transform-derived visibility stays pixel-equivalent
+/// to the old allocation-based test while decoupling it from the allocation.
+const PAGE_VISIBILITY_MARGIN_PX: f32 = 256.0;
 
 pub(super) struct CanvasSceneState {
     pub(super) page_rects: Vec<Rect>,
@@ -70,11 +76,28 @@ pub(super) struct CanvasSceneState {
     pub(super) visible_scene_rect: Option<Rect>,
     pub(super) scroll_inner_rect: Option<Rect>,
     pub(super) scroll_content_size: Vec2,
+    /// Solid (non-floating) scrollbar rects from the last frame, when the
+    /// corresponding axis overflows (else `None`). Used by tabs to occlude tool
+    /// cursors/input over the bars (mirrors egui's bar placement).
+    pub(super) scroll_vertical_bar_rect: Option<Rect>,
+    pub(super) scroll_horizontal_bar_rect: Option<Rect>,
     pub(super) initial_horizontal_scroll_centered: bool,
     pub(super) pending_zoom_anchor: Option<PendingZoomAnchor>,
     pub(super) pending_scroll_offset: Option<Vec2>,
     pub(super) on_top_hit_rects: HashMap<i64, Rect>,
     pub(super) canvas_left_top_controls_rect: Option<Rect>,
+    /// World<->screen transform established once per frame from the first laid-out
+    /// page's `ScrollArea` geometry and then used to derive every page's authoritative
+    /// screen `image_rect`. The `ScrollArea` still allocates/scrolls; this only maps
+    /// `world * scale + translation` so a future camera switch keeps the same pixels.
+    pub(super) view: ViewTransform,
+    /// True once `self.scene.view` has been established for the current frame (so the
+    /// per-frame translation is derived from the FIRST page only and reused for the
+    /// rest). Reset to `false` at the start of each scene draw.
+    pub(super) view_established_this_frame: bool,
+    /// Set once after the first transform-vs-layout drift warning so the runtime
+    /// drift signal cannot spam the log. Never reset.
+    pub(super) view_drift_warned: bool,
 }
 
 struct ReservedCanvasPage {
@@ -124,11 +147,16 @@ impl Default for CanvasSceneState {
             visible_scene_rect: None,
             scroll_inner_rect: None,
             scroll_content_size: Vec2::ZERO,
+            scroll_vertical_bar_rect: None,
+            scroll_horizontal_bar_rect: None,
             initial_horizontal_scroll_centered: false,
             pending_zoom_anchor: None,
             pending_scroll_offset: None,
             on_top_hit_rects: HashMap::new(),
             canvas_left_top_controls_rect: None,
+            view: ViewTransform::default(),
+            view_established_this_frame: false,
+            view_drift_warned: false,
         }
     }
 }
@@ -162,6 +190,37 @@ impl CanvasView {
         let centered_strip_inset_x = ((row_screen_width - content_screen_width).max(0.0)) * 0.5;
         let image_offset_x = ((content_screen_width - image_screen_width) * 0.5).max(0.0);
         (row_screen_width, centered_strip_inset_x + image_offset_x)
+    }
+
+    /// Derives the single per-frame `ViewTransform` translation from one page's
+    /// already-allocated screen `image_rect` and its world rect.
+    ///
+    /// Solves `image_rect.left_top() = world_min * scale + translation` for
+    /// `translation`. Because the horizontal centering offset (`image_offset_x ==
+    /// world_min.x * scale`) and the vertical strip origin are page-independent, the
+    /// translation derived from any single page (in practice the first laid-out one)
+    /// reproduces every other page's old `image_rect`. Returned transform mirrors
+    /// `self.state.zoom` as its scale.
+    #[must_use]
+    fn view_from_layout(scale: f32, world_min: Pos2, image_left_top: Pos2) -> ViewTransform {
+        let scale_f64 = f64::from(scale);
+        let translation = DVec2::new(
+            f64::from(image_left_top.x) - f64::from(world_min.x) * scale_f64,
+            f64::from(image_left_top.y) - f64::from(world_min.y) * scale_f64,
+        );
+        ViewTransform::new(scale, translation)
+    }
+
+    /// Pure page-visibility predicate: the page is in view when its transform-derived
+    /// screen rect intersects `viewport` expanded by `PAGE_VISIBILITY_MARGIN_PX`.
+    ///
+    /// Decoupled from the `ScrollArea` allocation: visibility is computed from the
+    /// `ViewTransform` instead of the allocated row rect, yet stays pixel-equivalent
+    /// because `image_rect` is now itself transform-derived.
+    #[must_use]
+    fn page_in_view(view: &ViewTransform, world_rect: Rect, viewport: Rect) -> bool {
+        view.world_rect_to_screen(world_rect)
+            .intersects(viewport.expand(PAGE_VISIBILITY_MARGIN_PX))
     }
 
     fn viewport_content_inset_x(&self, viewport_width: f32) -> f32 {
@@ -223,7 +282,15 @@ impl CanvasView {
         }
         .max(1.0);
         let expanded_aside_width = base_bubble_width * aside_scale;
-        let side_space = (side_margin * 2.0) + expanded_aside_width;
+        // Reserve room for one aside column, or two when the second-column mode is enabled so the
+        // far column stays reachable via horizontal scroll (ribbon->near, near->far, far->edge gaps
+        // plus two equal columns). The actual per-side split still depends on live viewport span.
+        let columns = if self.state.aside_second_column {
+            2.0
+        } else {
+            1.0
+        };
+        let side_space = side_margin * (columns + 1.0) + expanded_aside_width * columns;
 
         let [has_left_aside, has_right_aside] = self
             .scene
@@ -415,8 +482,19 @@ impl CanvasView {
             scroll_area = scroll_area.scroll_offset(offset);
         }
 
-        scroll_area.show(ui, |ui| {
+        let scene_output = scroll_area.show(ui, |ui| {
             self.scene.visible_scene_rect = Some(ui.clip_rect());
+            // The page strip is positioned explicitly (edge_margin / page_spacing in world
+            // units scaled by zoom); egui's ambient item_spacing must not add incidental
+            // gaps between page rows, otherwise screen tops stop being linear in world space
+            // and the camera transform (screen = world*scale + translation) can no longer
+            // reproduce them. Zero item_spacing only for the strip layout (the add_space +
+            // allocate_exact_size cursor below), then restore it before drawing aside/on-top
+            // bubbles: those bubbles are positioned by explicit child rects, but their inner
+            // widgets inherit this ui's style spacing when no per-bubble scale override
+            // applies, so a globally zeroed spacing would collapse intra-bubble layout.
+            let saved_item_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
             let edge_margin_world = self.state.edge_margin.max(0.0);
             let edge_margin = edge_margin_world * self.state.zoom;
             let page_gap_world = if self.state.separate_pages {
@@ -428,7 +506,13 @@ impl CanvasView {
             ui.add_space(edge_margin);
 
             let viewport_center_y = ui.clip_rect().center().y;
-            let viewport_rect = ui.clip_rect().expand(256.0);
+            // Unexpanded viewport; `Self::page_in_view` expands it by
+            // `PAGE_VISIBILITY_MARGIN_PX` internally (equivalent to the old
+            // `clip_rect().expand(256.0)` test).
+            let viewport_rect = ui.clip_rect();
+            // The per-frame transform must be re-established from this frame's first
+            // laid-out page, so clear the previous frame's "established" marker.
+            self.scene.view_established_this_frame = false;
             let mut nearest_page = 0usize;
             let mut nearest_dist = f32::MAX;
             let mut has_drawn_any_page = false;
@@ -477,6 +561,11 @@ impl CanvasView {
                 page_world_top += page_size_px.y;
             }
 
+            // Strip rows are fully allocated; restore the ambient spacing so aside/on-top
+            // bubble child UIs (which inherit this ui's style when unscaled) keep their
+            // intended intra-bubble layout.
+            ui.spacing_mut().item_spacing = saved_item_spacing;
+
             for reserved_page in &reserved_pages {
                 let page_texture = texture_cache.get_mut(&reserved_page.page_idx);
                 self.draw_canvas_page_base_layers(CanvasPageBaseLayerParams {
@@ -518,8 +607,123 @@ impl CanvasView {
             }
 
             self.scene.scroll_center_idx = nearest_page;
+
+            // The transform was already established during page reservation and now
+            // drives every page's `image_rect`. Re-validate it here against the first
+            // laid-out page for self-consistency (round-trip, clamp, anchor cross-check);
+            // this is diagnostic only and never mutates `self.scene.view`.
+            if self.scene.view_established_this_frame
+                && let Some(first) = reserved_pages.first()
+            {
+                let idx = first.page_idx;
+                let image_rect = first.page_frame.image_rect;
+                if let Some(world_rect) = self.scene.page_world_rects.get(idx).copied() {
+                    self.warn_on_view_transform_drift(self.scene.view, world_rect, image_rect);
+                }
+            }
+
+            // Bottom strip margin: zero item_spacing again so egui does not insert an
+            // incidental theme gap before this trailing space, keeping the bottom edge
+            // margin exactly `edge_margin` (matching the top edge).
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
             ui.add_space(edge_margin);
-        })
+        });
+        // Tabs decorate the vertical scrollbar (e.g. translation status marks) after
+        // the scene is laid out, so the bar geometry and bubble positions are final.
+        self.render_scrollbar_marks(ui, &scene_output, project, hooks);
+        scene_output
+    }
+
+    /// Shadow validation: checks that the freshly computed `view` reproduces the
+    /// laid-out page geometry and is self-consistent, logging at most once on drift.
+    ///
+    /// This is the only consumer of `self.scene.view` and is purely diagnostic: it
+    /// never mutates layout, never panics, and never alters rendering. The `with_anchor`
+    /// based `view` and the `ScrollArea` layout must agree (`screen = world * scale +
+    /// translation`); a drift would mean a future camera switch would visibly jump, so a
+    /// one-shot warning is emitted. The `screen_to_world(world_to_screen(p)) == p`
+    /// round-trip guards the inverse, and `clamp_translation` over the page's own world
+    /// rect and screen image rect must be a no-op (the page is already within bounds).
+    fn warn_on_view_transform_drift(
+        &mut self,
+        view: ViewTransform,
+        world_rect: Rect,
+        image_rect: Rect,
+    ) {
+        if self.scene.view_drift_warned {
+            return;
+        }
+        // Tolerance in screen points; generous so sub-pixel rounding never warns.
+        const DRIFT_TOLERANCE_PX: f32 = 1.0;
+        let mapped = view.world_rect_to_screen(world_rect);
+        let forward_drift = (mapped.min.x - image_rect.min.x)
+            .abs()
+            .max((mapped.min.y - image_rect.min.y).abs())
+            .max((mapped.max.x - image_rect.max.x).abs())
+            .max((mapped.max.y - image_rect.max.y).abs());
+        let round_trip = view.screen_to_world(view.world_to_screen(world_rect.min));
+        let round_trip_drift = (round_trip.x - world_rect.min.x)
+            .abs()
+            .max((round_trip.y - world_rect.min.y).abs());
+        // The page is already laid out inside the strip, so clamping its own world rect
+        // against its own screen rect must leave the translation unchanged.
+        let clamped = view.clamp_translation(world_rect, image_rect);
+        let clamp_drift = ((clamped.translation.x - view.translation.x).abs())
+            .max((clamped.translation.y - view.translation.y).abs());
+        // `with_anchor(scale, world_min -> screen_min)` must reconstruct the same transform
+        // as the direct translation formula used to build `view`; this cross-checks the two
+        // construction paths the future camera will rely on.
+        let anchored =
+            ViewTransform::default().with_anchor(view.scale, world_rect.min, image_rect.left_top());
+        let anchor_drift = ((anchored.translation.x - view.translation.x).abs())
+            .max((anchored.translation.y - view.translation.y).abs());
+
+        if forward_drift > DRIFT_TOLERANCE_PX
+            || round_trip_drift > DRIFT_TOLERANCE_PX
+            || clamp_drift > f64::from(DRIFT_TOLERANCE_PX)
+            || anchor_drift > f64::from(DRIFT_TOLERANCE_PX)
+        {
+            self.scene.view_drift_warned = true;
+            runtime_log::log_warn(format!(
+                "[canvas::scene] shadow ViewTransform drift; forward={forward_drift:.3}px \
+                 round_trip={round_trip_drift:.3}px clamp={clamp_drift:.3} \
+                 anchor={anchor_drift:.3} scale={:.3}",
+                view.scale
+            ));
+        }
+    }
+
+    /// Maximum per-edge drift, in screen points, allowed between the old ad-hoc
+    /// `image_rect` and the transform-derived one before the equivalence guard warns.
+    const IMAGE_RECT_DRIFT_TOLERANCE_PX: f32 = 0.5;
+
+    /// Returns the largest absolute per-edge difference between two screen rects.
+    #[must_use]
+    fn max_edge_drift(a: Rect, b: Rect) -> f32 {
+        (a.min.x - b.min.x)
+            .abs()
+            .max((a.min.y - b.min.y).abs())
+            .max((a.max.x - b.max.x).abs())
+            .max((a.max.y - b.max.y).abs())
+    }
+
+    /// Equivalence guard for increment 3: warns at most once if the transform-derived
+    /// page `image_rect` drifts from the old ad-hoc rect by more than
+    /// `IMAGE_RECT_DRIFT_TOLERANCE_PX` on any edge. Reuses the `view_drift_warned`
+    /// once-guard so it can never spam, never panics, and never alters rendering.
+    fn warn_on_image_rect_drift(&mut self, old_image_rect: Rect, derived_image_rect: Rect) {
+        if self.scene.view_drift_warned {
+            return;
+        }
+        let drift = Self::max_edge_drift(old_image_rect, derived_image_rect);
+        if drift > Self::IMAGE_RECT_DRIFT_TOLERANCE_PX {
+            self.scene.view_drift_warned = true;
+            runtime_log::log_warn(format!(
+                "[canvas::scene] ViewTransform image_rect drift {drift:.3}px exceeds \
+                 {tol:.3}px; old={old_image_rect:?} derived={derived_image_rect:?}",
+                tol = Self::IMAGE_RECT_DRIFT_TOLERANCE_PX
+            ));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -550,11 +754,46 @@ impl CanvasView {
         } else {
             Sense::click()
         };
+        // The `ScrollArea` stays authoritative for content size, scrollbars, and scroll
+        // offset read-back, so the row is allocated exactly as before.
         let (row_rect, response) = ui.allocate_exact_size(row_size, row_sense);
-        let image_rect = Rect::from_min_size(
+        // Old ad-hoc screen rect: kept to bootstrap the per-frame transform and as the
+        // equivalence-guard reference. The transform-derived rect below is authoritative.
+        let old_image_rect = Rect::from_min_size(
             egui::pos2(row_rect.left() + image_left_offset, row_rect.top()),
             image_size,
         );
+
+        if page_idx >= self.scene.page_world_rects.len() {
+            self.scene
+                .page_world_rects
+                .resize(page_idx + 1, Rect::from_min_size(Pos2::ZERO, Vec2::ZERO));
+        }
+        // World rect is computed exactly as before (content-centered, unscaled strip).
+        let world_rect = Rect::from_min_size(
+            egui::pos2(
+                ((content_world_width - page_size_px.x) * 0.5).max(0.0),
+                page_world_top,
+            ),
+            page_size_px,
+        );
+        self.scene.page_world_rects[page_idx] = world_rect;
+
+        // Establish the single per-frame transform from the FIRST laid-out page's old
+        // geometry, then map every page (including this first one) through it. Because
+        // the horizontal centering offset equals `world_min.x * scale` and the vertical
+        // strip origin is page-independent, this one translation reproduces every page's
+        // old `image_rect`.
+        if !self.scene.view_established_this_frame {
+            self.scene.view =
+                Self::view_from_layout(self.state.zoom, world_rect.min, old_image_rect.left_top());
+            self.scene.view_established_this_frame = true;
+        }
+        let image_rect = self.scene.view.world_rect_to_screen(world_rect);
+        // Equivalence guard: warn at most once if the transform-derived rect drifts from
+        // the old ad-hoc rect by more than half a pixel on any edge. Diagnostic only; the
+        // transform-derived rect is the one actually used.
+        self.warn_on_image_rect_drift(old_image_rect, image_rect);
 
         if page_idx >= self.scene.page_rects.len() {
             self.scene
@@ -562,18 +801,6 @@ impl CanvasView {
                 .resize(page_idx + 1, Rect::from_min_size(Pos2::ZERO, Vec2::ZERO));
         }
         self.scene.page_rects[page_idx] = image_rect;
-        if page_idx >= self.scene.page_world_rects.len() {
-            self.scene
-                .page_world_rects
-                .resize(page_idx + 1, Rect::from_min_size(Pos2::ZERO, Vec2::ZERO));
-        }
-        self.scene.page_world_rects[page_idx] = Rect::from_min_size(
-            egui::pos2(
-                ((content_world_width - page_size_px.x) * 0.5).max(0.0),
-                page_world_top,
-            ),
-            page_size_px,
-        );
         self.scene.page_aside_widths.insert(
             page_idx,
             self.aside_available_widths_for_page_viewport(image_rect, ui.clip_rect()),
@@ -590,7 +817,7 @@ impl CanvasView {
                 page_idx,
                 row_rect,
                 image_rect,
-                page_in_view: image_rect.intersects(viewport_rect),
+                page_in_view: Self::page_in_view(&self.scene.view, world_rect, viewport_rect),
             },
             response,
         ))
@@ -618,13 +845,16 @@ impl CanvasView {
             let mut nearest_used_this_frame = false;
             let mut source_upload_work_remaining = false;
             let current_frame = ui.ctx().cumulative_frame_nr();
+            // `scale` is points-per-source-pixel; it mirrors `self.state.zoom` but is read
+            // from the authoritative transform so tile placement matches `image_rect`.
+            let scale = self.scene.view.scale;
             for (tile_idx, tile) in page_texture.tiles.iter_mut().enumerate() {
                 let tile_rect = Rect::from_min_size(
                     egui::pos2(
-                        page_frame.image_rect.left() + tile.origin_px.x * self.state.zoom,
-                        page_frame.image_rect.top() + tile.origin_px.y * self.state.zoom,
+                        page_frame.image_rect.left() + tile.origin_px.x * scale,
+                        page_frame.image_rect.top() + tile.origin_px.y * scale,
                     ),
-                    tile.size_px * self.state.zoom,
+                    tile.size_px * scale,
                 );
                 if !tile_rect.intersects(viewport_rect) {
                     continue;
@@ -724,14 +954,26 @@ impl CanvasView {
             self.state.zoom,
         );
 
-        if self.pixel_grid_visible {
-            self.draw_pixel_grid_on_page(ui, page_frame.image_rect);
-        }
+        // The pixel grid is drawn in a single late overlay pass
+        // (`draw_visible_pixel_grid_overlay`) so it sits above source, overlay,
+        // and mask layers; it is intentionally not drawn here.
     }
 
+    /// Draws the per-pixel inspection grid over `image_rect`. The grid is gated
+    /// on the same DPI-correct magnification notion (`zoom * pixels_per_point`)
+    /// and threshold as NEAREST sampling, so both switch on together.
     fn draw_pixel_grid_on_page(&self, ui: &mut egui::Ui, image_rect: Rect) {
-        let zoom = self.state.zoom;
-        if zoom < PIXEL_GRID_MIN_STEP_PT || !image_rect.is_positive() {
+        // Points-per-source-pixel from the authoritative transform (numerically equal to
+        // `self.state.zoom`); keeps grid alignment consistent with the painted tiles.
+        let zoom = self.scene.view.scale;
+        // Gate on the UNCLAMPED ppp so the grid switches on together with NEAREST sampling
+        // (which also uses the raw `ctx.pixels_per_point()`); clamp only the alignment math
+        // below, where a sub-1 ppp would distort the pixel-snapping arithmetic.
+        let real_pixels_per_point = ui.ctx().pixels_per_point();
+        let pixels_per_point = real_pixels_per_point.max(1.0);
+        if !super::pixel_inspection_recommended_for(zoom, real_pixels_per_point)
+            || !image_rect.is_positive()
+        {
             return;
         }
         let clip_rect = ui.clip_rect().intersect(image_rect);
@@ -739,7 +981,6 @@ impl CanvasView {
             return;
         }
 
-        let pixels_per_point = ui.ctx().pixels_per_point().max(1.0);
         let stroke_width = 1.0 / pixels_per_point;
         let align = |value: f32| ((value * pixels_per_point).round() + 0.5) / pixels_per_point;
         let stroke = egui::Stroke::new(
@@ -807,10 +1048,12 @@ impl CanvasView {
             return;
         }
 
-        let aside_left_bubble_ids =
-            self.page_bubbles(page_frame.page_idx, Side::Left, BubbleType::Aside);
-        let aside_right_bubble_ids =
-            self.page_bubbles(page_frame.page_idx, Side::Right, BubbleType::Aside);
+        // Single-pass bucketing: bucket this page's runtime bubbles once instead of two
+        // independent `page_bubbles` scans (aside Left, aside Right). The owned buckets borrow
+        // nothing from `self`, so we move their Vecs out before the `&mut self` draw call below.
+        let buckets = self.page_bubbles_bucketed(page_frame.page_idx);
+        let aside_left_items = buckets.aside_left;
+        let aside_right_items = buckets.aside_right;
         bubble_aside_ui::draw_aside_for_page(
             self,
             ui,
@@ -818,8 +1061,8 @@ impl CanvasView {
             page_frame.page_idx,
             page_frame.row_rect,
             page_frame.image_rect,
-            aside_left_bubble_ids,
-            aside_right_bubble_ids,
+            aside_left_items,
+            aside_right_items,
             hooks,
         );
     }
@@ -835,13 +1078,16 @@ impl CanvasView {
             return;
         }
 
-        let mut on_top_bubble_ids =
-            self.page_bubbles(page_frame.page_idx, Side::Left, BubbleType::OnTop);
-        on_top_bubble_ids.extend(self.page_bubbles(
-            page_frame.page_idx,
-            Side::Right,
-            BubbleType::OnTop,
-        ));
+        // Single-pass bucketing: bucket this page's runtime bubbles once instead of two
+        // independent `page_bubbles` scans (on-top Left, on-top Right). On-top bubbles are always
+        // text bubbles, so each item maps to a plain bubble id; preserve Left-then-Right order.
+        let buckets = self.page_bubbles_bucketed(page_frame.page_idx);
+        let on_top_bubble_ids: Vec<i64> = buckets
+            .on_top_left
+            .into_iter()
+            .chain(buckets.on_top_right)
+            .map(|item| item.bid)
+            .collect();
         bubble_on_top_ui::draw_on_top_for_page(
             self,
             ui,
@@ -921,6 +1167,19 @@ impl CanvasView {
                     if !self.create_bubble_from_canvas_context_menu(ui.ctx(), project, None) {
                         runtime_log::log_warn(format!(
                             "[canvas::scene] failed to create bubble from context menu; page_idx={}",
+                            page_frame.page_idx
+                        ));
+                    }
+                    self.bubble_runtime.canvas_context_menu_target = None;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(self.editable, egui::Button::new("Создать ImageBubble"))
+                    .clicked()
+                {
+                    if !self.create_image_bubble_from_canvas_context_menu(ui.ctx(), project) {
+                        runtime_log::log_warn(format!(
+                            "[canvas::scene] failed to create image bubble from context menu; page_idx={}",
                             page_frame.page_idx
                         ));
                     }
@@ -1095,6 +1354,246 @@ impl CanvasView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a `CanvasView` with the scene state needed by the pure scroll/zoom
+    /// helpers, without touching any live egui `Ui`/`Context`.
+    fn view_with_layout(zoom: f32, content_world_width: f32, viewport: Rect) -> CanvasView {
+        let mut view = CanvasView::default();
+        view.state.zoom = zoom;
+        view.scene.content_world_width = content_world_width;
+        view.scene.scroll_inner_rect = Some(viewport);
+        view
+    }
+
+    #[test]
+    fn zoom_anchor_round_trip_reproduces_offset_across_scales() {
+        // Contract: an anchor captured by `capture_pending_zoom_anchor` at the
+        // current zoom reproduces the same scroll offset via
+        // `scroll_offset_for_zoom_anchor` when zoom is unchanged (the round trip the
+        // directed-zoom path relies on). Tested for the clamp endpoints and 1.0.
+        let viewport = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let content_world_width = 1400.0;
+        for scale in [0.2_f32, 1.0, 5.0] {
+            let mut view = view_with_layout(scale, content_world_width, viewport);
+            // A scroll offset inside the valid range for this zoom.
+            let max_x = view.max_scroll_offset_x_for_viewport(viewport.width());
+            let start_offset = egui::vec2(max_x * 0.5, 120.0);
+            view.scene.scroll_offset = start_offset;
+
+            // Capture an anchor at an interior viewport point.
+            let anchor_pos = Some(egui::pos2(640.0, 300.0));
+            view.capture_pending_zoom_anchor(anchor_pos, viewport);
+            let anchor = view
+                .scene
+                .pending_zoom_anchor
+                .expect("anchor must be captured for a positive viewport");
+
+            // With zoom unchanged, the reconstructed offset must match the (clamped)
+            // starting offset.
+            let reproduced = view.scroll_offset_for_zoom_anchor(anchor);
+            let expected_x = start_offset.x.clamp(0.0, max_x);
+            assert!(
+                (reproduced.x - expected_x).abs() <= 1e-2,
+                "scale {scale}: x {reproduced:?} != {expected_x}"
+            );
+            assert!(
+                (reproduced.y - start_offset.y).abs() <= 1e-2,
+                "scale {scale}: y {reproduced:?} != {start_offset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_scroll_offset_x_is_monotonic_non_decreasing_in_zoom() {
+        // Contract: for a fixed viewport and content, the horizontal scroll range
+        // never shrinks as zoom increases.
+        let viewport = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let content_world_width = 1400.0;
+        let mut prev = f32::NEG_INFINITY;
+        for step in 0..=48 {
+            let zoom = 0.2 + (step as f32) * (5.0 - 0.2) / 48.0;
+            let view = view_with_layout(zoom, content_world_width, viewport);
+            let max_x = view.max_scroll_offset_x_for_viewport(viewport.width());
+            assert!(
+                max_x + 1e-3 >= prev,
+                "max scroll x decreased at zoom {zoom}: {max_x} < {prev}"
+            );
+            prev = max_x;
+        }
+    }
+
+    #[test]
+    fn page_world_rect_is_horizontally_centered_in_content_width() {
+        // Contract: `reserve_canvas_page_frame` writes a `page_world_rect` whose
+        // left/right margins inside `content_world_width` are equal (content-centered
+        // world strip). This complements `centered_scroll_keeps_pages_centered`, which
+        // pins the screen-space centering.
+        let content_world_width = 1400.0_f32;
+        for page_width in [1400.0_f32, 900.0, 320.0] {
+            let left = ((content_world_width - page_width) * 0.5).max(0.0);
+            let world_rect =
+                Rect::from_min_size(egui::pos2(left, 50.0), egui::vec2(page_width, 1000.0));
+            let right_margin = content_world_width - world_rect.max.x;
+            assert!(
+                (world_rect.min.x - right_margin).abs() <= f32::EPSILON,
+                "page width {page_width} not centered in content width"
+            );
+        }
+    }
+
+    #[test]
+    fn view_from_layout_reproduces_every_page_old_image_rect() {
+        // Contract for increment 3: the single per-frame transform, derived from the
+        // FIRST page's old ad-hoc geometry, reproduces every other page's old
+        // `image_rect` within the 0.5px equivalence tolerance. This mirrors
+        // `reserve_canvas_page_frame`'s layout math for a multi-page strip.
+        //
+        // This test pins the "linear strip, no item_spacing" contract: `row_top` is modeled
+        // as a purely linear function of `page_world_top` (strip_top + (world_top -
+        // first_world_top) * zoom), with NO incidental inter-row gap. That matches the
+        // strip layout only because `draw_canvas_scene` zeroes the ambient
+        // `item_spacing` before allocating page rows. If a non-zero inter-row gap were
+        // reintroduced, the real `row_top` would drift from this linear model by
+        // accumulated spacing per page and the transform could no longer reproduce it,
+        // so this assertion would fail.
+        let viewport_width = 1000.0_f32;
+        let content_world_width = 1400.0_f32;
+        for zoom in [0.2_f32, 1.0, 2.5, 5.0] {
+            let content_screen_width = content_world_width * zoom;
+            // Page sizes in source pixels and their world top offsets down the strip.
+            let pages: [(Vec2, f32); 3] = [
+                (egui::vec2(1400.0, 1000.0), 17.0),
+                (egui::vec2(900.0, 1300.0), 1017.0),
+                (egui::vec2(320.0, 480.0), 2317.0),
+            ];
+            // A fixed scroll-content left/top origin (where `row_rect` is allocated).
+            let strip_left = 8.0_f32;
+            let strip_top = 17.0_f32 * zoom; // matches edge_margin_world * zoom
+
+            let mut view: Option<ViewTransform> = None;
+            for (page_size_px, page_world_top) in pages {
+                let image_size = page_size_px * zoom;
+                let (_row_w, image_left_offset) = CanvasView::canvas_page_x_layout(
+                    viewport_width,
+                    content_screen_width,
+                    image_size.x,
+                );
+                // The row top advances with the world top (same accumulation as layout),
+                // so `row_rect.top == strip_top - edge_margin_top + page_world_top*zoom`.
+                // Using a constant strip origin: row_top = strip_top + (page_world_top -
+                // first_world_top) * zoom. Express it directly relative to world.
+                let row_top = strip_top + (page_world_top - pages[0].1) * zoom;
+                let old_image_rect = Rect::from_min_size(
+                    egui::pos2(strip_left + image_left_offset, row_top),
+                    image_size,
+                );
+                let world_rect = Rect::from_min_size(
+                    egui::pos2(
+                        ((content_world_width - page_size_px.x) * 0.5).max(0.0),
+                        page_world_top,
+                    ),
+                    page_size_px,
+                );
+                let v = *view.get_or_insert_with(|| {
+                    CanvasView::view_from_layout(zoom, world_rect.min, old_image_rect.left_top())
+                });
+                let derived = v.world_rect_to_screen(world_rect);
+                let drift = CanvasView::max_edge_drift(old_image_rect, derived);
+                assert!(
+                    drift <= CanvasView::IMAGE_RECT_DRIFT_TOLERANCE_PX,
+                    "zoom {zoom}: page (size {page_size_px:?}) drift {drift} exceeds tolerance; \
+                     old={old_image_rect:?} derived={derived:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reintroduced_inter_row_spacing_breaks_linear_strip_contract() {
+        // Negative control for the "linear strip, no item_spacing" contract pinned by
+        // `view_from_layout_reproduces_every_page_old_image_rect`. If `draw_canvas_scene`
+        // stopped zeroing the ambient `item_spacing`, every page after the first would have
+        // its `row_top` shifted down by `item_spacing.y * page_index`, so the single
+        // per-frame `ViewTransform` (anchored on the first page) could no longer reproduce
+        // the shifted rects. This test simulates that drift and asserts it is detected,
+        // proving the contract test is sensitive to a reintroduced inter-row gap rather than
+        // passing vacuously.
+        let viewport_width = 1000.0_f32;
+        let content_world_width = 1400.0_f32;
+        // A representative ambient theme spacing (the app theme uses 12.0); any non-zero
+        // value reproduces the regression this guards against.
+        const SIMULATED_ITEM_SPACING_Y: f32 = 12.0;
+        let zoom = 1.0_f32;
+        let content_screen_width = content_world_width * zoom;
+        let pages: [(Vec2, f32); 3] = [
+            (egui::vec2(1400.0, 1000.0), 17.0),
+            (egui::vec2(900.0, 1300.0), 1017.0),
+            (egui::vec2(320.0, 480.0), 2317.0),
+        ];
+        let strip_left = 8.0_f32;
+        let strip_top = 17.0_f32 * zoom;
+
+        let mut view: Option<ViewTransform> = None;
+        let mut max_drift = 0.0_f32;
+        for (page_index, (page_size_px, page_world_top)) in pages.into_iter().enumerate() {
+            let image_size = page_size_px * zoom;
+            let (_row_w, image_left_offset) = CanvasView::canvas_page_x_layout(
+                viewport_width,
+                content_screen_width,
+                image_size.x,
+            );
+            // Inject the incidental spacing egui would insert between consecutive rows: it
+            // accumulates linearly with the page index (none before the first row).
+            let injected_gap = SIMULATED_ITEM_SPACING_Y * page_index as f32;
+            let row_top = strip_top + (page_world_top - pages[0].1) * zoom + injected_gap;
+            let old_image_rect = Rect::from_min_size(
+                egui::pos2(strip_left + image_left_offset, row_top),
+                image_size,
+            );
+            let world_rect = Rect::from_min_size(
+                egui::pos2(
+                    ((content_world_width - page_size_px.x) * 0.5).max(0.0),
+                    page_world_top,
+                ),
+                page_size_px,
+            );
+            // Anchor the transform on the first page (gap == 0), exactly as the runtime does.
+            let v = *view.get_or_insert_with(|| {
+                CanvasView::view_from_layout(zoom, world_rect.min, old_image_rect.left_top())
+            });
+            let derived = v.world_rect_to_screen(world_rect);
+            max_drift = max_drift.max(CanvasView::max_edge_drift(old_image_rect, derived));
+        }
+        assert!(
+            max_drift > CanvasView::IMAGE_RECT_DRIFT_TOLERANCE_PX,
+            "a reintroduced {SIMULATED_ITEM_SPACING_Y}px inter-row gap must break the linear \
+             strip contract, but max drift was only {max_drift}px"
+        );
+    }
+
+    #[test]
+    fn page_in_view_matches_old_intersection_test() {
+        // Contract for increment 4: the transform-based predicate equals the old
+        // `image_rect.intersects(clip.expand(256))` test, because `image_rect` is now
+        // transform-derived. Exercise pages fully inside, just outside the margin, and
+        // far away.
+        let view = ViewTransform::new(1.5, DVec2::new(20.0, -10.0));
+        let viewport = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let cases = [
+            Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 400.0)), // inside
+            Rect::from_min_size(egui::pos2(-50.0, -50.0), egui::vec2(80.0, 80.0)),   // near edge
+            Rect::from_min_size(egui::pos2(5000.0, 5000.0), egui::vec2(200.0, 200.0)), // far
+        ];
+        for world_rect in cases {
+            let image_rect = view.world_rect_to_screen(world_rect);
+            let expected = image_rect.intersects(viewport.expand(PAGE_VISIBILITY_MARGIN_PX));
+            let got = CanvasView::page_in_view(&view, world_rect, viewport);
+            assert_eq!(
+                got, expected,
+                "visibility mismatch for {world_rect:?}: got {got}, expected {expected}"
+            );
+        }
+    }
 
     #[test]
     fn centered_scroll_keeps_pages_centered_across_widths() {

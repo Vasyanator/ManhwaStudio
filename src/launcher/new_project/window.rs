@@ -17,11 +17,12 @@ responsive while the ribbon updates.
 
 use egui::{
     Align, Button, CentralPanel, ComboBox, Frame, Layout, ProgressBar, RichText, ScrollArea,
-    Slider, Stroke, TextEdit, TextureOptions, Ui, ViewportClass, Window, WindowLevel,
+    Slider, Stroke, TextEdit, TextureHandle, TextureOptions, Ui, ViewportClass, Window,
+    WindowLevel,
 };
 use image::{DynamicImage, RgbaImage};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -30,7 +31,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config;
 use crate::launcher::new_project::advanced_download::{
-    AdvancedDownloadController, AdvancedDownloadEvent, advanced_downloader_version_warning_message,
+    AdvancedAutoCandidateSet, AdvancedBrowserBackend, AdvancedDownloadController,
+    AdvancedDownloadEvent, InterceptCounts, advanced_downloader_version_warning_message,
+    build_pages_from_auto_candidates,
 };
 use crate::launcher::new_project::open_source::{
     OpenSourceKind, SourceImportController, SourceImportOptions, SourceLoadEvent,
@@ -42,6 +45,12 @@ use crate::launcher::new_project::project_io::{
 };
 use crate::launcher::new_project::quick_download::{
     QuickDownloadController, QuickDownloadEvent, SUPPORTED_SITES_TOOLTIP,
+};
+use crate::launcher::new_project::reline::{
+    RelineController, RelineCvtColorOptions, RelineEvent, RelineHalftoneOptions, RelineInputImage,
+    RelineLevelOptions, RelineModelCatalogController, RelineModelCatalogEntry,
+    RelineModelCatalogEvent, RelineOptions, RelineResizeOptions, RelineSharpOptions,
+    RelineUpscaleOptions,
 };
 use crate::launcher::new_project::ribbon::{
     ImportedImage, RibbonCrop, RibbonMergeError, RibbonPage, RibbonState, RibbonTile,
@@ -57,7 +66,10 @@ use crate::launcher::new_project::waifu2x::{
 use crate::launcher::state::OpenProjectSelection;
 use crate::paste_image;
 use crate::screen_capture::{self, ScreenRect};
-use crate::widgets::EditableComboBox;
+use crate::widgets::{
+    ArrowStyle, EditableComboBox, GutterItem, MarkedScrollArea, MarkedScrollOutput, ScrollSpan,
+    arrow,
+};
 
 const LEFT_PANEL_WIDTH: f32 = 444.0;
 const SECTION_SPACING: f32 = 14.0;
@@ -85,6 +97,12 @@ const SCREEN_CAPTURE_MIN_SIDE: usize = 48;
 const SCREEN_CAPTURE_CONFIRM_DELAY_MS: u64 = 140;
 const SCREEN_CAPTURE_UI_ENABLED: bool = false;
 const TEST_CHAPTER_SITE_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
+const AUTO_REVIEW_CARD_SIDE: f32 = 230.0;
+const AUTO_REVIEW_CARD_MIN_SIDE: f32 = 168.0;
+const AUTO_REVIEW_CARD_GAP: f32 = 10.0;
+const AUTO_REVIEW_CARD_MARGIN: f32 = 8.0;
+const AUTO_REVIEW_CARD_HEADER_HEIGHT: f32 = 24.0;
+const AUTO_REVIEW_CARD_FOOTER_HEIGHT: f32 = 34.0;
 
 #[derive(Clone)]
 struct OperationProgress {
@@ -160,10 +178,192 @@ impl SimpleModeStep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageProcessor {
+    Waifu2x,
+    Reline,
+}
+
+impl ImageProcessor {
+    fn as_index(self) -> usize {
+        match self {
+            Self::Waifu2x => 0,
+            Self::Reline => 1,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Reline,
+            _ => Self::Waifu2x,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Waifu2x => "waifu2x",
+            Self::Reline => "Reline",
+        }
+    }
+}
+
+/// Display mode of the Reline section: a guided simplified UI or the full expert UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelineUiMode {
+    Simple,
+    Full,
+}
+
+impl RelineUiMode {
+    /// Combo index used by the simple/full toggle (0 = simple, 1 = full).
+    fn as_index(self) -> usize {
+        match self {
+            Self::Simple => 0,
+            Self::Full => 1,
+        }
+    }
+
+    /// Map a combo index back to a mode; any out-of-range value falls back to `Simple`.
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::Full,
+            _ => Self::Simple,
+        }
+    }
+
+    /// Stable string used for config persistence.
+    fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a persisted config string; unknown values fall back to `Simple`.
+    fn from_config_str(value: &str) -> Self {
+        match value {
+            "full" => Self::Full,
+            _ => Self::Simple,
+        }
+    }
+}
+
+/// Guided post-processing preset for the simplified Reline UI.
+///
+/// Each preset expands into a fixed set of Reline pipeline nodes in
+/// `build_reline_simple_options`, so the user picks intent instead of raw parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelineSimplePreset {
+    /// Only run the selected model (clean upscale/restore, no extra nodes).
+    ModelOnly,
+    /// Model plus a light sharpness/level cleanup pass.
+    RestoreLightSharp,
+    /// Model tuned for removing printed halftone screen (descreen).
+    Descreen,
+    /// Model plus halftone (screentone) synthesis.
+    AddHalftone,
+}
+
+impl RelineSimplePreset {
+    /// All presets in display order. Keep in sync with `from_index`/`as_index`.
+    const ALL: [RelineSimplePreset; 4] = [
+        Self::ModelOnly,
+        Self::RestoreLightSharp,
+        Self::Descreen,
+        Self::AddHalftone,
+    ];
+
+    fn as_index(self) -> usize {
+        match self {
+            Self::ModelOnly => 0,
+            Self::RestoreLightSharp => 1,
+            Self::Descreen => 2,
+            Self::AddHalftone => 3,
+        }
+    }
+
+    fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::RestoreLightSharp,
+            2 => Self::Descreen,
+            3 => Self::AddHalftone,
+            _ => Self::ModelOnly,
+        }
+    }
+
+    /// Short label shown on the preset selector.
+    fn label(self) -> &'static str {
+        match self {
+            Self::ModelOnly => "Только модель",
+            Self::RestoreLightSharp => "Реставрация + лёгкая резкость",
+            Self::Descreen => "Убрать растр",
+            Self::AddHalftone => "Добавить скринтон",
+        }
+    }
+
+    /// One-line recommendation shown under the selected preset.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::ModelOnly => "Чистый прогон выбранной модели без дополнительной обработки.",
+            Self::RestoreLightSharp => {
+                "Модель плюс мягкая резкость — универсальный выбор для большинства сканов."
+            }
+            Self::Descreen => "Подходит, когда на скане видна сетка растра печати.",
+            Self::AddHalftone => "Накладывает полутоновую сетку (скринтон) поверх результата.",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AdvancedDownloadMode {
     PatternLinkSearch,
     CanvasDownload,
+    DeepCapture,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdvancedLinkSourceMode {
+    Pattern,
+    AutoReview,
+}
+
+struct AdvancedAutoReviewState {
+    candidates: AdvancedAutoCandidateSet,
+    group_view: bool,
+    removed_items: HashSet<usize>,
+    removed_groups: HashSet<usize>,
+    thumb_textures: HashMap<usize, TextureHandle>,
+    expanded_item: Option<usize>,
+    expanded_texture: Option<(usize, TextureHandle)>,
+    open: bool,
+}
+
+impl AdvancedAutoReviewState {
+    fn new(candidates: AdvancedAutoCandidateSet) -> Self {
+        let removed_groups = auto_review_default_removed_groups(&candidates);
+        let removed_items = auto_review_default_removed_items(&candidates);
+        Self {
+            candidates,
+            group_view: true,
+            removed_items,
+            removed_groups,
+            thumb_textures: HashMap::new(),
+            expanded_item: None,
+            expanded_texture: None,
+            open: true,
+        }
+    }
+
+    fn retained_count(&self) -> usize {
+        self.candidates
+            .items
+            .iter()
+            .filter(|item| {
+                !self.removed_items.contains(&item.id)
+                    && !self.removed_groups.contains(&item.group_id)
+            })
+            .count()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -265,16 +465,6 @@ struct PendingScreenCapture {
     region: ScreenRect,
 }
 
-#[derive(Clone, Copy)]
-struct ScrollArrowMarkerStyle {
-    arrow_width: f32,
-    arrow_height: f32,
-    fill: egui::Color32,
-    stroke: Stroke,
-    tail_length: f32,
-    tail_width: f32,
-}
-
 pub struct NewProjectWindowState {
     left_panel_mode: LeftPanelMode,
     simple_mode_step: SimpleModeStep,
@@ -287,16 +477,18 @@ pub struct NewProjectWindowState {
     import_extra_names: String,
     quick_link: String,
     advanced_page_url: String,
+    selected_advanced_backend: AdvancedBrowserBackend,
     selected_browser: usize,
     selected_site: usize,
     browser_names: Vec<String>,
     site_presets: Vec<(String, String)>,
     advanced_mode: AdvancedDownloadMode,
+    advanced_link_source_mode: AdvancedLinkSourceMode,
     advanced_link_collect_active: bool,
     advanced_link_collect_found_links: usize,
     advanced_link_collect_last_poll_at: Instant,
     advanced_intercept_active: bool,
-    advanced_intercept_found_pages: usize,
+    advanced_intercept_counts: InterceptCounts,
     advanced_intercept_last_poll_at: Instant,
     advanced_downloader_version_warning_open: bool,
     advanced_downloader_version_warning_dismissed: bool,
@@ -304,6 +496,7 @@ pub struct NewProjectWindowState {
     site_name: String,
     image_prefix: String,
     advanced_fetch_parallelism: usize,
+    advanced_auto_review: Option<AdvancedAutoReviewState>,
     stitch_parts: String,
     stitch_target_height: String,
     stitch_band_rows: String,
@@ -313,9 +506,63 @@ pub struct NewProjectWindowState {
     cut_as_chapter_enabled: bool,
     cut_title: usize,
     cut_chapter: usize,
+    image_processor: ImageProcessor,
     waifu_noise: usize,
     waifu_scale: usize,
     waifu_tile_size: String,
+    reline_reader_mode: usize,
+    reline_upscale_enabled: bool,
+    reline_model_name: String,
+    reline_model_catalog_requested: bool,
+    reline_model_catalog_error: Option<String>,
+    reline_model_catalog_entries: Vec<RelineModelCatalogEntry>,
+    reline_model_path: String,
+    reline_model_url: String,
+    reline_tiler: usize,
+    reline_target_scale: String,
+    reline_dtype: usize,
+    reline_exact_tiler_size: String,
+    reline_allow_cpu_upscale: bool,
+    reline_sharp_enabled: bool,
+    reline_sharp_low_input: String,
+    reline_sharp_high_input: String,
+    reline_sharp_gamma: String,
+    reline_sharp_diapason_white: String,
+    reline_sharp_diapason_black: String,
+    reline_sharp_canny: bool,
+    reline_sharp_canny_type: usize,
+    reline_halftone_enabled: bool,
+    reline_halftone_dot_size: String,
+    reline_halftone_angle: String,
+    reline_halftone_dot_type: usize,
+    reline_halftone_mode: usize,
+    reline_halftone_ssaa_scale: String,
+    reline_halftone_ssaa_filter: usize,
+    reline_halftone_disable_auto_dot: bool,
+    reline_resize_enabled: bool,
+    reline_resize_height: String,
+    reline_resize_width: String,
+    reline_resize_percent: String,
+    reline_resize_filter: usize,
+    reline_resize_gamma_correction: bool,
+    reline_resize_spread: bool,
+    reline_resize_spread_size: String,
+    reline_level_enabled: bool,
+    reline_level_low_input: String,
+    reline_level_high_input: String,
+    reline_level_low_output: String,
+    reline_level_high_output: String,
+    reline_level_gamma: String,
+    reline_cvt_color_enabled: bool,
+    reline_cvt_color_type: usize,
+    // Simplified Reline UI state (guided mode shown by default).
+    reline_ui_mode: RelineUiMode,
+    reline_simple_preset: usize,
+    reline_simple_sharp: usize,
+    reline_simple_scale: usize,
+    reline_simple_resize_enabled: bool,
+    reline_simple_resize_target: String,
+    reline_model_picker_open: bool,
     save_title: usize,
     save_title_input: String,
     save_title_combo: EditableComboBox,
@@ -334,6 +581,8 @@ pub struct NewProjectWindowState {
     stitch: StitchController,
     save: ProjectSaveController,
     waifu2x: Waifu2xController,
+    reline: RelineController,
+    reline_model_catalog: RelineModelCatalogController,
     ribbon: RibbonState,
     selected_ribbon_page: Option<usize>,
     clipboard_paste_rx: Option<Receiver<ClipboardPasteResult>>,
@@ -378,16 +627,18 @@ impl NewProjectWindowState {
                 .to_string(),
             quick_link: String::new(),
             advanced_page_url: String::new(),
+            selected_advanced_backend: advanced_download.backend(),
             selected_browser: 0,
             selected_site,
             browser_names,
             site_presets,
             advanced_mode: AdvancedDownloadMode::PatternLinkSearch,
+            advanced_link_source_mode: AdvancedLinkSourceMode::Pattern,
             advanced_link_collect_active: false,
             advanced_link_collect_found_links: 0,
             advanced_link_collect_last_poll_at: Instant::now(),
             advanced_intercept_active: false,
-            advanced_intercept_found_pages: 0,
+            advanced_intercept_counts: InterceptCounts::default(),
             advanced_intercept_last_poll_at: Instant::now(),
             advanced_downloader_version_warning_open: false,
             advanced_downloader_version_warning_dismissed: false,
@@ -395,6 +646,7 @@ impl NewProjectWindowState {
             site_name: String::new(),
             image_prefix: default_prefix,
             advanced_fetch_parallelism: 4,
+            advanced_auto_review: None,
             stitch_parts: String::new(),
             stitch_target_height: "19000".to_string(),
             stitch_band_rows: "4".to_string(),
@@ -404,9 +656,62 @@ impl NewProjectWindowState {
             cut_as_chapter_enabled: false,
             cut_title: 0,
             cut_chapter: 0,
+            image_processor: ImageProcessor::Waifu2x,
             waifu_noise: 4,
             waifu_scale: 0,
             waifu_tile_size: "384".to_string(),
+            reline_reader_mode: 0,
+            reline_upscale_enabled: true,
+            reline_model_name: "1x-MangaJPEGHQ".to_string(),
+            reline_model_catalog_requested: false,
+            reline_model_catalog_error: None,
+            reline_model_catalog_entries: Vec::new(),
+            reline_model_path: String::new(),
+            reline_model_url: String::new(),
+            reline_tiler: 0,
+            reline_target_scale: "1".to_string(),
+            reline_dtype: 0,
+            reline_exact_tiler_size: "800".to_string(),
+            reline_allow_cpu_upscale: true,
+            reline_sharp_enabled: false,
+            reline_sharp_low_input: "0".to_string(),
+            reline_sharp_high_input: "255".to_string(),
+            reline_sharp_gamma: "1.0".to_string(),
+            reline_sharp_diapason_white: "-1".to_string(),
+            reline_sharp_diapason_black: "-1".to_string(),
+            reline_sharp_canny: false,
+            reline_sharp_canny_type: 1,
+            reline_halftone_enabled: false,
+            reline_halftone_dot_size: "7".to_string(),
+            reline_halftone_angle: "0".to_string(),
+            reline_halftone_dot_type: 4,
+            reline_halftone_mode: 0,
+            reline_halftone_ssaa_scale: String::new(),
+            reline_halftone_ssaa_filter: 10,
+            reline_halftone_disable_auto_dot: false,
+            reline_resize_enabled: false,
+            reline_resize_height: String::new(),
+            reline_resize_width: String::new(),
+            reline_resize_percent: String::new(),
+            reline_resize_filter: 13,
+            reline_resize_gamma_correction: false,
+            reline_resize_spread: false,
+            reline_resize_spread_size: "2800".to_string(),
+            reline_level_enabled: false,
+            reline_level_low_input: "0".to_string(),
+            reline_level_high_input: "255".to_string(),
+            reline_level_low_output: "0".to_string(),
+            reline_level_high_output: "255".to_string(),
+            reline_level_gamma: "1.0".to_string(),
+            reline_cvt_color_enabled: false,
+            reline_cvt_color_type: 0,
+            reline_ui_mode: load_reline_ui_mode(),
+            reline_simple_preset: RelineSimplePreset::RestoreLightSharp.as_index(),
+            reline_simple_sharp: 1,
+            reline_simple_scale: 0,
+            reline_simple_resize_enabled: false,
+            reline_simple_resize_target: "2800".to_string(),
+            reline_model_picker_open: false,
             save_title: 0,
             save_title_input: "Title A".to_string(),
             save_title_combo: EditableComboBox::new("launcher_new_project_save_title")
@@ -426,6 +731,8 @@ impl NewProjectWindowState {
             stitch: StitchController::new(),
             save: ProjectSaveController::new(projects_root),
             waifu2x: Waifu2xController::new(),
+            reline: RelineController::new(),
+            reline_model_catalog: RelineModelCatalogController::new(),
             ribbon: RibbonState::new(),
             selected_ribbon_page: None,
             clipboard_paste_rx: None,
@@ -466,12 +773,25 @@ impl NewProjectWindowState {
         self.poll_stitch(ctx);
         self.poll_save(ctx);
         self.poll_waifu2x(ctx);
+        self.poll_reline(ctx);
+        self.poll_reline_model_catalog(ctx);
+        // A native window is its own viewport but shares the launcher's single egui Context,
+        // so its style is global. Switch to this window's dark style for the duration of its
+        // rendering and restore the previous (launcher) style afterwards, so it never leaks
+        // back and leaves the launcher's combo boxes / text fields unstyled. The embedded path
+        // scopes its style via `ui.set_style` instead and needs no global change.
+        let restore_style = (!matches!(viewport_class, ViewportClass::Embedded)).then(|| {
+            let previous = ctx.style();
+            ctx.set_style(standard_dark_style());
+            previous
+        });
         let keep_open = match viewport_class {
             ViewportClass::Embedded => self.show_embedded(ctx),
             _ => self.show_native(ctx),
         };
         self.show_crop_editor_window(ctx);
         self.show_advanced_downloader_version_warning(ctx);
+        self.show_advanced_auto_review_window(ctx);
         self.show_screen_capture_overlay(ctx);
         self.show_batch_processing_window(ctx);
         if self.source_import.is_loading()
@@ -482,6 +802,7 @@ impl NewProjectWindowState {
             || self.stitch.is_loading()
             || self.save.is_loading()
             || self.waifu2x.is_loading()
+            || self.reline.is_loading()
             || self.clipboard_paste_in_flight
             || self.screen_capture_overlay.is_some()
             || self.screen_capture_pending.is_some()
@@ -492,6 +813,9 @@ impl NewProjectWindowState {
         }
         if !keep_open {
             self.handle_window_closed();
+        }
+        if let Some(previous_style) = restore_style {
+            ctx.set_style(previous_style);
         }
         keep_open
     }
@@ -519,7 +843,6 @@ impl NewProjectWindowState {
         if ctx.input(|input| input.viewport().close_requested()) {
             return false;
         }
-        ctx.set_style(standard_dark_style());
 
         CentralPanel::default()
             .frame(
@@ -570,6 +893,7 @@ impl NewProjectWindowState {
             || self.stitch.is_loading()
             || self.save.is_loading()
             || self.waifu2x.is_loading()
+            || self.reline.is_loading()
             || self.clipboard_paste_in_flight
             || self.screen_capture_in_flight;
         ui.set_width(LEFT_PANEL_WIDTH);
@@ -642,7 +966,9 @@ impl NewProjectWindowState {
                     self.show_stitch_section(ui)
                 });
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "waifu2x", |ui| self.show_waifu_section(ui));
+                section_group(ui, "Обработка изображений", |ui| {
+                    self.show_image_processing_section(ui)
+                });
                 ui.add_space(SECTION_SPACING);
                 section_group(ui, "Сохранение", |ui| self.show_save_section(ui));
             });
@@ -983,18 +1309,18 @@ impl NewProjectWindowState {
                     .color(egui::Color32::WHITE)
                     .strong(),
                 );
-                self.show_operation_progress(ui, "waifu2x");
+                self.show_operation_progress(ui, self.current_image_processing_operation());
 
                 ui.add_space(SECTION_SPACING * 1.6);
                 if button_sized(
                     ui,
-                    "Удалить шум через waifu2x",
+                    &format!("Обработать через {}", self.image_processor.title()),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
-                    self.can_start_waifu2x(),
+                    self.can_start_image_processing(),
                 )
                 .clicked()
                 {
-                    self.start_waifu2x();
+                    self.start_image_processing();
                     self.simple_mode_step = SimpleModeStep::Save;
                 }
                 if button_sized(ui, "пропустить", egui::vec2(140.0, 34.0), true).clicked()
@@ -1574,9 +1900,36 @@ impl NewProjectWindowState {
                 .hint_text("Откройте страницу главы в выбранном браузере"),
         );
 
+        field_label(ui, "Движок браузера");
+        ui.add_enabled_ui(
+            !self.advanced_download.is_loading()
+                && !self.advanced_link_collect_active
+                && !self.advanced_intercept_active,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for backend in AdvancedBrowserBackend::ALL {
+                        ui.selectable_value(
+                            &mut self.selected_advanced_backend,
+                            backend,
+                            backend.label(),
+                        );
+                    }
+                });
+            },
+        );
+        self.advanced_download
+            .set_backend(self.selected_advanced_backend);
+
         field_label(ui, "Браузер");
         self.clamp_advanced_indexes();
-        if self.browser_names.is_empty() {
+        if self.selected_advanced_backend == AdvancedBrowserBackend::Cloak {
+            ui.label(RichText::new("CloakBrowser").small());
+            ui.label(
+                RichText::new("Используется отдельный persistent profile CloakBrowser.")
+                    .small()
+                    .weak(),
+            );
+        } else if self.browser_names.is_empty() {
             ui.label(
                 RichText::new("Поддерживаемые браузеры не найдены на этой системе.")
                     .small()
@@ -1594,7 +1947,7 @@ impl NewProjectWindowState {
         let can_open_browser = !self.advanced_download.is_loading()
             && !self.advanced_link_collect_active
             && !self.advanced_intercept_active
-            && !self.browser_names.is_empty()
+            && self.advanced_browser_available()
             && !self.advanced_page_url.trim().is_empty();
         if button_sized(
             ui,
@@ -1616,6 +1969,12 @@ impl NewProjectWindowState {
         ui.separator();
         ui.add_space(8.0);
 
+        if self.selected_advanced_backend != AdvancedBrowserBackend::Cloak
+            && self.advanced_mode == AdvancedDownloadMode::DeepCapture
+        {
+            self.advanced_mode = AdvancedDownloadMode::PatternLinkSearch;
+        }
+
         field_label(ui, "Режим");
         ui.add_enabled_ui(
             !self.advanced_link_collect_active && !self.advanced_intercept_active,
@@ -1631,31 +1990,93 @@ impl NewProjectWindowState {
                         AdvancedDownloadMode::CanvasDownload,
                         "Скачивание Canvas со страницы",
                     );
+                    ui.add_enabled_ui(
+                        self.selected_advanced_backend == AdvancedBrowserBackend::Cloak,
+                        |ui| {
+                            ui.selectable_value(
+                                &mut self.advanced_mode,
+                                AdvancedDownloadMode::DeepCapture,
+                                "Глубокий перехват",
+                            );
+                        },
+                    );
                 });
             },
         );
         ui.add_space(8.0);
 
         if self.advanced_mode == AdvancedDownloadMode::PatternLinkSearch {
-            field_label(
-                ui,
-                "Сайт (пресет) / префиксы ссылок (* — любая последовательность, ? — символ)",
+            ui.add_enabled_ui(
+                !self.advanced_download.is_loading()
+                    && !self.advanced_link_collect_active
+                    && !self.advanced_intercept_active,
+                |ui| {
+                    field_label(ui, "Тип поиска ссылок");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(
+                            &mut self.advanced_link_source_mode,
+                            AdvancedLinkSourceMode::Pattern,
+                            "Обычный шаблон",
+                        );
+                        ui.selectable_value(
+                            &mut self.advanced_link_source_mode,
+                            AdvancedLinkSourceMode::AutoReview,
+                            "Автоподбор",
+                        );
+                    });
+                },
             );
-            let previous_site = self.selected_site;
-            combo_index_pairs(
-                ui,
-                "launcher_new_project_site",
-                &self.site_presets,
-                &mut self.selected_site,
-            );
-            if previous_site != self.selected_site
-                && let Some((_, prefix)) = self.site_presets.get(self.selected_site)
-            {
-                self.image_prefix = prefix.clone();
-            }
+            ui.add_space(6.0);
 
-            field_label(ui, "Префикс");
-            ui.add(TextEdit::singleline(&mut self.image_prefix).desired_width(fill_width(ui)));
+            if self.advanced_link_source_mode == AdvancedLinkSourceMode::Pattern {
+                field_label(
+                    ui,
+                    "Сайт (пресет) / префиксы ссылок (* — любая последовательность, ? — символ)",
+                );
+                let previous_site = self.selected_site;
+                combo_index_pairs(
+                    ui,
+                    "launcher_new_project_site",
+                    &self.site_presets,
+                    &mut self.selected_site,
+                );
+                if previous_site != self.selected_site
+                    && let Some((_, prefix)) = self.site_presets.get(self.selected_site)
+                {
+                    self.image_prefix = prefix.clone();
+                }
+
+                field_label(ui, "Префикс");
+                ui.add(TextEdit::singleline(&mut self.image_prefix).desired_width(fill_width(ui)));
+
+                field_label(ui, "Название нового сайта");
+                ui.add(
+                    TextEdit::singleline(&mut self.site_name)
+                        .desired_width(fill_width(ui))
+                        .hint_text("название для сохранения"),
+                );
+
+                if button_sized(
+                    ui,
+                    "Сохранить префикс",
+                    egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
+                    !self.advanced_download.is_loading()
+                        && !self.advanced_link_collect_active
+                        && !self.advanced_intercept_active,
+                )
+                .clicked()
+                {
+                    self.save_advanced_prefix();
+                }
+            } else {
+                ui.label(
+                    RichText::new(
+                        "Автоподбор соберёт ссылки со страницы, скачает реальные изображения и откроет окно проверки.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
 
             field_label(ui, "Потоков выкачки");
             ui.add_enabled(
@@ -1665,80 +2086,74 @@ impl NewProjectWindowState {
                 Slider::new(&mut self.advanced_fetch_parallelism, 1..=8).text("потоков"),
             );
 
-            field_label(ui, "Название нового сайта");
-            ui.add(
-                TextEdit::singleline(&mut self.site_name)
-                    .desired_width(fill_width(ui))
-                    .hint_text("название для сохранения"),
-            );
-
-            if button_sized(
-                ui,
-                "Сохранить префикс",
-                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
-                !self.advanced_download.is_loading()
-                    && !self.advanced_link_collect_active
-                    && !self.advanced_intercept_active,
-            )
-            .clicked()
-            {
-                self.save_advanced_prefix();
-            }
-            if self.advanced_link_collect_active {
-                ui.label(
-                    RichText::new(format!(
-                        "Собрано ссылок: {}",
-                        self.advanced_link_collect_found_links
-                    ))
-                    .color(egui::Color32::from_rgb(76, 175, 80))
-                    .strong(),
-                );
-                ui.add_space(8.0);
-            }
-            if button_sized(
-                ui,
-                "Скачать сразу",
-                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
-                !self.advanced_download.is_loading()
-                    && !self.advanced_link_collect_active
-                    && !self.advanced_intercept_active
-                    && !self.browser_names.is_empty(),
-            )
-            .clicked()
-            {
-                self.start_advanced_fetch();
-            }
-            if button_sized(
-                ui,
-                "Начать сбор ссылок",
-                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
-                !self.advanced_download.is_loading()
-                    && !self.advanced_link_collect_active
-                    && !self.advanced_intercept_active
-                    && !self.browser_names.is_empty(),
-            )
-            .clicked()
-            {
-                self.start_advanced_link_collect();
-            }
-            if button_sized(
-                ui,
-                "Остановить сбор ссылок",
-                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
-                !self.advanced_download.is_loading()
-                    && self.advanced_link_collect_active
-                    && !self.browser_names.is_empty(),
-            )
-            .clicked()
-            {
-                self.finish_advanced_link_collect();
-            }
-        } else {
+            sub_group(ui, "Сбор и загрузка", |ui| {
+                if self.advanced_link_collect_active {
+                    ui.label(
+                        RichText::new(format!(
+                            "Собрано ссылок: {}",
+                            self.advanced_link_collect_found_links
+                        ))
+                        .color(egui::Color32::from_rgb(76, 175, 80))
+                        .strong(),
+                    );
+                    ui.add_space(8.0);
+                }
+                if button_sized(
+                    ui,
+                    "Скачать сразу",
+                    egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
+                    !self.advanced_download.is_loading()
+                        && !self.advanced_link_collect_active
+                        && !self.advanced_intercept_active
+                        && self.advanced_browser_available(),
+                )
+                .clicked()
+                {
+                    self.start_advanced_fetch();
+                }
+                if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview
+                    && button_sized(
+                        ui,
+                        "Прекратить выкачку",
+                        egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
+                        self.advanced_download.can_cancel_current_auto_fetch(),
+                    )
+                    .clicked()
+                {
+                    self.stop_advanced_auto_fetch();
+                }
+                if button_sized(
+                    ui,
+                    "Начать сбор ссылок",
+                    egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
+                    !self.advanced_download.is_loading()
+                        && !self.advanced_link_collect_active
+                        && !self.advanced_intercept_active
+                        && self.advanced_browser_available(),
+                )
+                .clicked()
+                {
+                    self.start_advanced_link_collect();
+                }
+                if button_sized(
+                    ui,
+                    "Остановить сбор ссылок",
+                    egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
+                    !self.advanced_download.is_loading()
+                        && self.advanced_link_collect_active
+                        && self.advanced_browser_available(),
+                )
+                .clicked()
+                {
+                    self.finish_advanced_link_collect();
+                }
+            });
+        } else if self.advanced_mode == AdvancedDownloadMode::CanvasDownload {
             if self.advanced_intercept_active {
                 ui.label(
                     RichText::new(format!(
                         "Найдено страниц: {}",
-                        self.advanced_intercept_found_pages
+                        self.advanced_intercept_counts.total
                     ))
                     .color(egui::Color32::from_rgb(76, 175, 80))
                     .strong(),
@@ -1752,7 +2167,7 @@ impl NewProjectWindowState {
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
                     && !self.advanced_intercept_active
-                    && !self.browser_names.is_empty(),
+                    && self.advanced_browser_available(),
             )
             .clicked()
             {
@@ -1765,7 +2180,7 @@ impl NewProjectWindowState {
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
                     && !self.advanced_intercept_active
-                    && !self.browser_names.is_empty(),
+                    && self.advanced_browser_available(),
             )
             .clicked()
             {
@@ -1778,14 +2193,455 @@ impl NewProjectWindowState {
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
                     && self.advanced_intercept_active
-                    && !self.browser_names.is_empty(),
+                    && self.advanced_browser_available(),
             )
             .clicked()
             {
                 self.finish_advanced_canvas_intercept();
             }
+        } else {
+            if self.advanced_intercept_active {
+                let counts = self.advanced_intercept_counts;
+                ui.label(
+                    RichText::new(format!(
+                        "Перехвачено {} холстов, найдено {} обычных картинок",
+                        counts.canvases, counts.images
+                    ))
+                    .color(egui::Color32::from_rgb(76, 175, 80))
+                    .strong(),
+                );
+                ui.add_space(8.0);
+            }
+            ui.label(
+                RichText::new(
+                    "Cloak перезагрузит текущую страницу, сохранит загружаемые данные и после остановки откроет проверку найденных картинок.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(8.0);
+            if button_sized(
+                ui,
+                "Начать глубокий перехват",
+                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
+                !self.advanced_download.is_loading()
+                    && !self.advanced_link_collect_active
+                    && !self.advanced_intercept_active
+                    && self.selected_advanced_backend == AdvancedBrowserBackend::Cloak,
+            )
+            .clicked()
+            {
+                self.start_advanced_deep_intercept();
+            }
+            if button_sized(
+                ui,
+                "Завершить глубокий перехват",
+                egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
+                !self.advanced_download.is_loading()
+                    && !self.advanced_link_collect_active
+                    && self.advanced_intercept_active
+                    && self.selected_advanced_backend == AdvancedBrowserBackend::Cloak,
+            )
+            .clicked()
+            {
+                self.finish_advanced_deep_intercept();
+            }
         }
         self.show_operation_progress(ui, "advanced_download");
+    }
+
+    fn show_advanced_auto_review_window(&mut self, ctx: &egui::Context) {
+        let mut apply_clicked = false;
+        let mut close_review = false;
+        if let Some(review) = self.advanced_auto_review.as_mut() {
+            let mut open = review.open;
+            Window::new("Проверка автоподбора ссылок")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(980.0)
+                .default_height(720.0)
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut review.group_view, "Разделять по группам");
+                        ui.separator();
+                        ui.label(format!(
+                            "Картинок: {} / {}",
+                            review.retained_count(),
+                            review.candidates.items.len()
+                        ));
+                        ui.label(format!("Групп: {}", review.candidates.groups.len()));
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Добавить на ленту").clicked() {
+                            apply_clicked = true;
+                        }
+                        if ui.button("Закрыть").clicked() {
+                            close_review = true;
+                        }
+                    });
+                    ui.separator();
+                    ScrollArea::vertical()
+                        .id_salt("advanced_auto_review_scroll")
+                        .max_height(ui.available_height().max(160.0))
+                        .show(ui, |ui| {
+                            if review.group_view {
+                                Self::show_auto_review_groups(ui, review);
+                                ui.separator();
+                                ui.heading("Итоговый порядок");
+                            }
+                            Self::show_auto_review_order(ui, review);
+                        });
+                });
+            review.open = open;
+            if !review.open {
+                close_review = true;
+            }
+        }
+
+        if let Some(review) = self.advanced_auto_review.as_mut() {
+            Self::show_auto_candidate_preview(ctx, review);
+        }
+        if apply_clicked {
+            self.apply_advanced_auto_review();
+        } else if close_review {
+            self.advanced_auto_review = None;
+        }
+    }
+
+    fn show_auto_review_groups(ui: &mut Ui, review: &mut AdvancedAutoReviewState) {
+        let groups = review
+            .candidates
+            .groups
+            .iter()
+            .map(|group| (group.id, group.signature.clone(), group.item_ids.clone()))
+            .collect::<Vec<_>>();
+        for (group_id, signature, item_ids) in groups {
+            let color = advanced_group_color(group_id);
+            let removed = review.removed_groups.contains(&group_id);
+            Frame::group(ui.style())
+                .stroke(Stroke::new(2.0, color))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Группа {} · {} карт.",
+                                group_id + 1,
+                                item_ids.len()
+                            ))
+                            .strong(),
+                        );
+                        ui.label(RichText::new(signature).small().weak());
+                        let label = if removed {
+                            "Вернуть группу"
+                        } else {
+                            "Удалить группу"
+                        };
+                        if ui.button(label).clicked() {
+                            if removed {
+                                review.removed_groups.remove(&group_id);
+                            } else {
+                                review.removed_groups.insert(group_id);
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    Self::show_auto_candidate_cards(ui, review, &item_ids);
+                });
+            ui.add_space(8.0);
+        }
+    }
+
+    fn show_auto_review_order(ui: &mut Ui, review: &mut AdvancedAutoReviewState) {
+        let mut item_ids = review
+            .candidates
+            .items
+            .iter()
+            .map(|item| (item.order_index, item.id))
+            .collect::<Vec<_>>();
+        item_ids.sort_by_key(|(order_index, _)| *order_index);
+        let ids = item_ids
+            .into_iter()
+            .map(|(_, item_id)| item_id)
+            .collect::<Vec<_>>();
+        Self::show_auto_candidate_cards(ui, review, &ids);
+    }
+
+    fn show_auto_candidate_cards(
+        ui: &mut Ui,
+        review: &mut AdvancedAutoReviewState,
+        item_ids: &[usize],
+    ) {
+        let (columns, card_side) = auto_review_card_layout(ui);
+        let card_step = card_side + AUTO_REVIEW_CARD_GAP;
+        for (row_index, row) in item_ids.chunks(columns).enumerate() {
+            let row_width = row
+                .iter()
+                .enumerate()
+                .fold(0.0_f32, |width, (column_index, _)| {
+                    if column_index == 0 {
+                        card_side
+                    } else {
+                        width + card_step
+                    }
+                });
+            let (row_rect, _) =
+                ui.allocate_exact_size(egui::vec2(row_width, card_side), egui::Sense::hover());
+            for (column_index, &item_id) in row.iter().enumerate() {
+                let x = row_rect.left() + card_step * auto_review_index_as_f32(column_index);
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, row_rect.top()),
+                    egui::vec2(card_side, card_side),
+                );
+                let card_id =
+                    ui.id()
+                        .with(("advanced_auto_card", row_index, column_index, item_id));
+                Self::show_auto_candidate_card(ui, review, item_id, rect, card_id);
+            }
+            ui.add_space(AUTO_REVIEW_CARD_GAP);
+        }
+    }
+
+    fn show_auto_candidate_card(
+        ui: &mut Ui,
+        review: &mut AdvancedAutoReviewState,
+        item_id: usize,
+        rect: egui::Rect,
+        card_id: egui::Id,
+    ) {
+        let Some((group_id, order_index, width, height, url)) = review
+            .candidates
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(|item| {
+                (
+                    item.group_id,
+                    item.order_index,
+                    item.width,
+                    item.height,
+                    item.url.clone(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let removed =
+            review.removed_items.contains(&item_id) || review.removed_groups.contains(&group_id);
+        let stroke_color = if removed {
+            egui::Color32::from_gray(80)
+        } else {
+            advanced_group_color(group_id)
+        };
+        let fill = ui.visuals().widgets.noninteractive.bg_fill;
+        let response = ui.interact(rect, card_id, egui::Sense::click());
+        let parent_clip = ui.clip_rect();
+        let card_clip = parent_clip.intersect(rect);
+        ui.painter().with_clip_rect(card_clip).rect(
+            rect,
+            egui::CornerRadius::same(4),
+            fill,
+            Stroke::new(2.0, stroke_color),
+            egui::StrokeKind::Inside,
+        );
+        if response.clicked() && !removed {
+            review.expanded_item = Some(item_id);
+        }
+
+        let inner = rect.shrink(AUTO_REVIEW_CARD_MARGIN);
+        let header_rect = egui::Rect::from_min_size(
+            inner.min,
+            egui::vec2(inner.width(), AUTO_REVIEW_CARD_HEADER_HEIGHT),
+        );
+        let footer_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                inner.left(),
+                inner.bottom() - AUTO_REVIEW_CARD_FOOTER_HEIGHT,
+            ),
+            egui::vec2(inner.width(), AUTO_REVIEW_CARD_FOOTER_HEIGHT),
+        );
+        let image_rect = egui::Rect::from_min_max(
+            egui::pos2(inner.left(), header_rect.bottom() + 4.0),
+            egui::pos2(inner.right(), footer_rect.top() - 6.0),
+        );
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(header_rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.set_clip_rect(parent_clip.intersect(header_rect));
+                ui.label(RichText::new(format!("#{}", order_index + 1)).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = if review.removed_items.contains(&item_id) {
+                        "Вернуть"
+                    } else {
+                        "×"
+                    };
+                    if ui.small_button(label).clicked() {
+                        if review.removed_items.contains(&item_id) {
+                            review.removed_items.remove(&item_id);
+                        } else {
+                            review.removed_items.insert(item_id);
+                        }
+                    }
+                });
+            },
+        );
+
+        if let Some(texture) = Self::auto_thumb_texture(ui, review, item_id) {
+            let response = ui.put(
+                image_rect,
+                egui::Image::new((texture.id(), image_rect.size())).sense(egui::Sense::click()),
+            );
+            if response.clicked() && !removed {
+                review.expanded_item = Some(item_id);
+            }
+        }
+        if removed {
+            ui.painter()
+                .with_clip_rect(parent_clip.intersect(image_rect))
+                .rect_filled(
+                    image_rect,
+                    egui::CornerRadius::same(3),
+                    egui::Color32::from_black_alpha(150),
+                );
+        }
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(footer_rect)
+                .layout(Layout::top_down(Align::Min)),
+            |ui| {
+                ui.set_clip_rect(parent_clip.intersect(footer_rect));
+                ui.label(RichText::new(format!("{width}×{height}")).small());
+                ui.label(RichText::new(shorten_url(&url, 31)).small().weak());
+            },
+        );
+    }
+
+    fn auto_thumb_texture(
+        ui: &mut Ui,
+        review: &mut AdvancedAutoReviewState,
+        item_id: usize,
+    ) -> Option<TextureHandle> {
+        if let Some(texture) = review.thumb_textures.get(&item_id) {
+            return Some(texture.clone());
+        }
+        let thumbnail = review
+            .candidates
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(|item| item.thumbnail.clone())?;
+        let texture = ui.ctx().load_texture(
+            format!("advanced-auto-thumb-{item_id}"),
+            thumbnail,
+            TextureOptions::LINEAR,
+        );
+        review.thumb_textures.insert(item_id, texture.clone());
+        Some(texture)
+    }
+
+    fn show_auto_candidate_preview(ctx: &egui::Context, review: &mut AdvancedAutoReviewState) {
+        let Some(item_id) = review.expanded_item else {
+            return;
+        };
+        let Some((width, height, url, image)) = review
+            .candidates
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(|item| {
+                (
+                    item.width,
+                    item.height,
+                    item.url.clone(),
+                    item.image.clone(),
+                )
+            })
+        else {
+            review.expanded_item = None;
+            return;
+        };
+        if review
+            .expanded_texture
+            .as_ref()
+            .is_none_or(|(texture_item_id, _)| *texture_item_id != item_id)
+        {
+            let preview = dynamic_image_preview(&image, 900, 680);
+            let texture = ctx.load_texture(
+                format!("advanced-auto-preview-{item_id}"),
+                preview,
+                TextureOptions::LINEAR,
+            );
+            review.expanded_texture = Some((item_id, texture));
+        }
+        let mut open = true;
+        Window::new("Просмотр картинки")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(960.0)
+            .default_height(760.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{width}×{height}"));
+                ui.label(RichText::new(url).small().weak());
+                ui.horizontal(|ui| {
+                    if ui.button("Удалить").clicked() {
+                        review.removed_items.insert(item_id);
+                    }
+                    if ui.button("Оставить").clicked() {
+                        review.removed_items.remove(&item_id);
+                    }
+                });
+                ui.separator();
+                if let Some((_, texture)) = &review.expanded_texture {
+                    let size = texture.size_vec2();
+                    ScrollArea::both()
+                        .id_salt("advanced_auto_preview_scroll")
+                        .show(ui, |ui| {
+                            ui.add(egui::Image::new((texture.id(), size)));
+                        });
+                }
+            });
+        if !open {
+            review.expanded_item = None;
+            review.expanded_texture = None;
+        }
+    }
+
+    fn apply_advanced_auto_review(&mut self) {
+        let Some(review) = self.advanced_auto_review.as_ref() else {
+            return;
+        };
+        let pages = match build_pages_from_auto_candidates(
+            &review.candidates,
+            &review.removed_items,
+            &review.removed_groups,
+        ) {
+            Ok(pages) => pages,
+            Err(message) => {
+                self.last_error = Some(message);
+                self.import_status = "Автоподбор не содержит картинок для ленты.".to_string();
+                return;
+            }
+        };
+        let source_url = review.candidates.source_url.clone();
+        let page_count = pages.len();
+        self.ribbon
+            .replace_source(PathBuf::from(&source_url), pages);
+        self.selected_ribbon_page = self.default_selected_page();
+        self.crop_editor = None;
+        self.manual_cut_guides.clear();
+        self.active_progress = None;
+        self.last_error = None;
+        self.simple_stitch_done = false;
+        self.simple_manual_cut_preview_active = false;
+        self.advance_simple_import_step_after_success();
+        self.import_status =
+            format!("Автоподбор добавил {page_count} изображений из {source_url}.");
+        self.advanced_auto_review = None;
     }
 
     fn show_stitch_section(&mut self, ui: &mut Ui) {
@@ -1909,6 +2765,24 @@ impl NewProjectWindowState {
         });
     }
 
+    fn show_image_processing_section(&mut self, ui: &mut Ui) {
+        let processor_labels = ["waifu2x", "Reline"];
+        let mut processor_index = self.image_processor.as_index();
+        field_label(ui, "Движок");
+        combo_index(
+            ui,
+            "launcher_new_project_image_processor",
+            &processor_labels,
+            &mut processor_index,
+        );
+        self.image_processor = ImageProcessor::from_index(processor_index);
+        ui.add_space(8.0);
+        match self.image_processor {
+            ImageProcessor::Waifu2x => self.show_waifu_section(ui),
+            ImageProcessor::Reline => self.show_reline_section(ui),
+        }
+    }
+
     fn show_waifu_section(&mut self, ui: &mut Ui) {
         let noise_levels = ["-1", "0", "1", "2", "3"];
         let scale_levels = ["1", "2", "4", "8", "16", "32"];
@@ -1953,6 +2827,601 @@ impl NewProjectWindowState {
             self.start_waifu2x();
         }
         self.show_operation_progress(ui, "waifu2x");
+    }
+
+    /// Reline section entry point: draws the simple/full toggle and dispatches to the active mode.
+    ///
+    /// The mode is persisted in user config; toggling writes the new mode once (not per frame).
+    fn show_reline_section(&mut self, ui: &mut Ui) {
+        let mut mode_index = self.reline_ui_mode.as_index();
+        field_label(ui, "Интерфейс Reline");
+        combo_index(
+            ui,
+            "launcher_new_project_reline_ui_mode",
+            &["Упрощённый", "Полный"],
+            &mut mode_index,
+        );
+        let new_mode = RelineUiMode::from_index(mode_index);
+        if new_mode != self.reline_ui_mode {
+            self.reline_ui_mode = new_mode;
+            save_reline_ui_mode(new_mode);
+        }
+        ui.add_space(8.0);
+
+        match self.reline_ui_mode {
+            RelineUiMode::Simple => self.show_reline_simple(ui),
+            RelineUiMode::Full => self.show_reline_full(ui),
+        }
+    }
+
+    /// Guided Reline UI: a categorized model gallery plus a small set of high-level controls.
+    ///
+    /// Hidden parameters take safe defaults; the resulting `RelineOptions` are built by
+    /// `build_reline_simple_options`.
+    fn show_reline_simple(&mut self, ui: &mut Ui) {
+        self.ensure_reline_model_catalog_requested();
+
+        field_label(ui, "Модель");
+        self.show_reline_model_gallery(ui);
+        ui.add_space(10.0);
+
+        sub_group(ui, "Режим обработки", |ui| {
+            for preset in RelineSimplePreset::ALL {
+                let mut selected = self.reline_simple_preset == preset.as_index();
+                if ui.radio(selected, preset.label()).clicked() {
+                    selected = true;
+                }
+                if selected {
+                    self.reline_simple_preset = preset.as_index();
+                }
+            }
+            let active = RelineSimplePreset::from_index(self.reline_simple_preset);
+            ui.add_space(4.0);
+            ui.label(RichText::new(active.hint()).small().weak());
+        });
+        ui.add_space(8.0);
+
+        field_label(ui, "Резкость");
+        combo_index(
+            ui,
+            "launcher_new_project_reline_simple_sharp",
+            &["Нет", "Слабая", "Сильная"],
+            &mut self.reline_simple_sharp,
+        );
+
+        field_label(ui, "Целевой масштаб");
+        combo_index(
+            ui,
+            "launcher_new_project_reline_simple_scale",
+            &["Авто (масштаб модели)", "×2", "×4"],
+            &mut self.reline_simple_scale,
+        );
+
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut self.reline_simple_resize_enabled,
+            "Изменить высоту результата (px)",
+        );
+        if self.reline_simple_resize_enabled {
+            ui.add(
+                TextEdit::singleline(&mut self.reline_simple_resize_target).desired_width(160.0),
+            );
+        }
+
+        ui.add_space(10.0);
+        if button_sized(
+            ui,
+            "Прогнать через Reline",
+            egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
+            self.can_start_reline(),
+        )
+        .clicked()
+        {
+            self.start_reline();
+        }
+        self.show_operation_progress(ui, "reline");
+    }
+
+    /// Categorized model picker used by the simplified Reline UI.
+    ///
+    /// Joins the fetched catalog (`reline_model_catalog_entries`) with offline classification
+    /// from `reline_models::classify`. The full categorized list lives inside a collapsible area
+    /// toggled by the "Выбрать модель" button; when collapsed only the selected model's card is
+    /// shown. The expanded list grows inline (no inner scroll) — the surrounding page scrolls.
+    fn show_reline_model_gallery(&mut self, ui: &mut Ui) {
+        use crate::launcher::new_project::reline_models::{ModelCategory, classify};
+
+        if self.reline_model_catalog.is_loading() {
+            ui.label(
+                RichText::new("Загружаем список моделей Reline...")
+                    .small()
+                    .weak(),
+            );
+        }
+        if let Some(error) = &self.reline_model_catalog_error {
+            ui.colored_label(egui::Color32::from_rgb(236, 112, 99), error.clone());
+        }
+
+        ui.horizontal(|ui| {
+            let toggle_label = if self.reline_model_picker_open {
+                "Скрыть список"
+            } else {
+                "Выбрать модель"
+            };
+            if ui.button(toggle_label).clicked() {
+                self.reline_model_picker_open = !self.reline_model_picker_open;
+            }
+            let refresh_label = if self.reline_model_catalog.is_loading() {
+                "Загрузка..."
+            } else {
+                "Обновить"
+            };
+            if ui
+                .add_enabled(
+                    !self.reline_model_catalog.is_loading(),
+                    Button::new(refresh_label),
+                )
+                .on_hover_text("Обновить список моделей из AI backend")
+                .clicked()
+            {
+                self.refresh_reline_model_catalog();
+            }
+        });
+
+        if self.reline_model_catalog_entries.is_empty() {
+            ui.label(
+                RichText::new("Список моделей пуст. Запустите AI backend и нажмите «Обновить».")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+
+        // Collapsed: show only the currently selected model's title and description.
+        if !self.reline_model_picker_open {
+            if self.reline_model_name.trim().is_empty() {
+                ui.label(
+                    RichText::new("Модель не выбрана — нажмите «Выбрать модель».")
+                        .small()
+                        .weak(),
+                );
+            } else {
+                let meta = classify(&self.reline_model_name);
+                ui.label(RichText::new(meta.display_title()).strong());
+                ui.label(RichText::new(&self.reline_model_name).small().weak());
+                ui.label(RichText::new(meta.description).small());
+            }
+            return;
+        }
+
+        // Expanded: full categorized list, grown inline (no inner ScrollArea).
+        // Group entries by classified category, preserving catalog order within each group.
+        let classified: Vec<(usize, ModelCategory)> = self
+            .reline_model_catalog_entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, classify(&entry.name).category))
+            .collect();
+
+        for category in ModelCategory::ALL {
+            let group: Vec<usize> = classified
+                .iter()
+                .filter(|(_, cat)| *cat == category)
+                .map(|(index, _)| *index)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            egui::CollapsingHeader::new(format!("{} ({})", category.title(), group.len()))
+                .default_open(category.order() == 0)
+                .id_salt(("reline_gallery", category.order()))
+                .show(ui, |ui| {
+                    for index in group {
+                        let entry = &self.reline_model_catalog_entries[index];
+                        let name = entry.name.clone();
+                        let downloaded = entry.downloaded;
+                        let meta = classify(&name);
+                        let selected = self.reline_model_name == name;
+
+                        let header = if downloaded {
+                            format!("{}  ✓ скачана", meta.display_title())
+                        } else {
+                            meta.display_title()
+                        };
+                        let response =
+                            ui.selectable_label(selected, RichText::new(header).strong());
+                        ui.label(RichText::new(&name).small().weak());
+                        ui.label(RichText::new(&meta.description).small());
+                        if let Some(recommendation) = &meta.recommendation {
+                            ui.label(
+                                RichText::new(recommendation)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 190, 120)),
+                            );
+                        }
+                        if response.clicked() {
+                            // Pick the model and collapse the list back to the compact card.
+                            self.reline_model_name = name;
+                            self.reline_model_picker_open = false;
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+        }
+    }
+
+    /// Full (expert) Reline UI: every pipeline node with raw parameters. Kept behind the toggle.
+    fn show_reline_full(&mut self, ui: &mut Ui) {
+        const READER_MODES: [&str; 3] = ["rgb", "gray", "dynamic"];
+        const TILERS: [&str; 3] = ["exact", "max", "no_tiling"];
+        const DTYPES: [&str; 3] = ["F32", "F16", "BF16"];
+        const CANNY_TYPES: [&str; 3] = ["invert", "normal", "unsharp"];
+        const DOT_TYPES: [&str; 5] = ["line", "cross", "ellipse", "invline", "circle"];
+        const HALFTONE_MODES: [&str; 4] = ["gray", "rgb", "hsv", "cmyk"];
+        const HALFTONE_FILTERS: [&str; 22] = [
+            "nearest",
+            "box",
+            "sbox4",
+            "sbox8",
+            "linear",
+            "slinear4",
+            "slinear8",
+            "hamming",
+            "shamming4",
+            "shamming8",
+            "catmullrom",
+            "scatmullrom4",
+            "scatmullrom8",
+            "mitchell",
+            "smitchell4",
+            "smitchell8",
+            "lanczos",
+            "slanczos4",
+            "slanczos8",
+            "gauss",
+            "sgauss4",
+            "sgauss8",
+        ];
+        const RESIZE_FILTERS: [&str; 33] = [
+            "nearest",
+            "box",
+            "sbox4",
+            "sbox8",
+            "ibox",
+            "linear",
+            "slinear4",
+            "slinear8",
+            "ilinear",
+            "hamming",
+            "shamming4",
+            "shamming8",
+            "ihamming",
+            "catmullrom",
+            "scatmullrom4",
+            "scatmullrom8",
+            "icatmullrom",
+            "mitchell",
+            "smitchell4",
+            "smitchell8",
+            "imitchell",
+            "lanczos",
+            "slanczos4",
+            "slanczos8",
+            "ilanczos",
+            "gauss",
+            "sgauss4",
+            "sgauss8",
+            "igauss",
+            "dpid_0.25",
+            "dpid_0.5",
+            "dpid_0.75",
+            "dpid_1",
+        ];
+        const CVT_TYPES: [&str; 4] = ["RGB2Gray2020", "RGB2Gray709", "RGB2Gray", "Gray2RGB"];
+        const READER_MODE_HELP: &str = "Как Reline читает исходные пиксели перед обработкой. rgb сохраняет цвет, gray загружает изображение в оттенках серого, dynamic позволяет Reline выбрать режим по исходнику.";
+        const UPSCALE_HELP: &str = "Загружает локальную или автоматически скачанную модель Reline и запускает тайловую реставрацию/увеличение. 1x модели подходят для очистки, устранения JPEG-артефактов и растра; 2x/4x модели увеличивают масштаб.";
+        const SHARP_HELP: &str = "Этап очистки и повышения резкости: входные уровни, гамма, фильтрация белого/чёрного диапазона и опциональная обработка краёв через Canny.";
+        const HALFTONE_HELP: &str = "Создаёт или корректирует полутоновые точки/скринтон. Размер точки, угол, тип, цветовой режим и SSAA управляют рисунком сетки.";
+        const RESIZE_HELP: &str = "Меняет размер после предыдущих этапов Reline по ширине, высоте или проценту с выбранным фильтром. Параметры разброса (spread) относятся к настройкам изменения размера для больших изображений.";
+        const LEVEL_HELP: &str =
+            "Финальная коррекция уровней: входные и выходные точки чёрного/белого плюс гамма.";
+        const CVT_COLOR_HELP: &str =
+            "Преобразует RGB и оттенки серого с выбранной матрицей конвертации Reline.";
+
+        self.ensure_reline_model_catalog_requested();
+
+        field_label_hover(ui, "Режим чтения", READER_MODE_HELP);
+        combo_index(
+            ui,
+            "launcher_new_project_reline_reader_mode",
+            &READER_MODES,
+            &mut self.reline_reader_mode,
+        );
+
+        let response = egui::CollapsingHeader::new("Реставрация / увеличение")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.reline_upscale_enabled,
+                    "Включить реставрацию / увеличение",
+                );
+                field_label(ui, "Модель из каталога");
+                self.show_reline_model_combo(ui);
+                field_label(ui, "Локальный путь к модели");
+                ui.add(
+                    TextEdit::singleline(&mut self.reline_model_path).desired_width(fill_width(ui)),
+                );
+                field_label(ui, "Прямой URL модели");
+                ui.add(
+                    TextEdit::singleline(&mut self.reline_model_url).desired_width(fill_width(ui)),
+                );
+                field_label(ui, "Тайлинг");
+                combo_index(
+                    ui,
+                    "launcher_new_project_reline_tiler",
+                    &TILERS,
+                    &mut self.reline_tiler,
+                );
+                field_label(ui, "Целевой масштаб (пусто = масштаб модели)");
+                ui.add(TextEdit::singleline(&mut self.reline_target_scale).desired_width(160.0));
+                field_label(ui, "Тип вычислений");
+                combo_index(
+                    ui,
+                    "launcher_new_project_reline_dtype",
+                    &DTYPES,
+                    &mut self.reline_dtype,
+                );
+                field_label(ui, "Размер exact-тайла");
+                ui.add(
+                    TextEdit::singleline(&mut self.reline_exact_tiler_size).desired_width(160.0),
+                );
+                ui.checkbox(
+                    &mut self.reline_allow_cpu_upscale,
+                    "Разрешить обработку на CPU",
+                );
+            });
+        response.header_response.on_hover_text(UPSCALE_HELP);
+
+        let response = egui::CollapsingHeader::new("Резкость").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_sharp_enabled, "Включить резкость");
+            numeric_text_field(
+                ui,
+                "Нижний входной уровень",
+                &mut self.reline_sharp_low_input,
+            );
+            numeric_text_field(
+                ui,
+                "Верхний входной уровень",
+                &mut self.reline_sharp_high_input,
+            );
+            numeric_text_field(ui, "Гамма", &mut self.reline_sharp_gamma);
+            numeric_text_field(ui, "Белый диапазон", &mut self.reline_sharp_diapason_white);
+            numeric_text_field(ui, "Чёрный диапазон", &mut self.reline_sharp_diapason_black);
+            ui.checkbox(&mut self.reline_sharp_canny, "Canny-контур");
+            field_label(ui, "Режим Canny");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_canny_type",
+                &CANNY_TYPES,
+                &mut self.reline_sharp_canny_type,
+            );
+        });
+        response.header_response.on_hover_text(SHARP_HELP);
+
+        let response = egui::CollapsingHeader::new("Полутон / скринтон").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_halftone_enabled, "Включить полутон");
+            numeric_text_field(ui, "Размер точки", &mut self.reline_halftone_dot_size);
+            numeric_text_field(ui, "Угол", &mut self.reline_halftone_angle);
+            field_label(ui, "Тип точки");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_dot_type",
+                &DOT_TYPES,
+                &mut self.reline_halftone_dot_type,
+            );
+            field_label(ui, "Цветовой режим полутона");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_halftone_mode",
+                &HALFTONE_MODES,
+                &mut self.reline_halftone_mode,
+            );
+            numeric_text_field(
+                ui,
+                "Масштаб SSAA (пусто = выключено)",
+                &mut self.reline_halftone_ssaa_scale,
+            );
+            field_label(ui, "Фильтр SSAA");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_halftone_filter",
+                &HALFTONE_FILTERS,
+                &mut self.reline_halftone_ssaa_filter,
+            );
+            ui.checkbox(
+                &mut self.reline_halftone_disable_auto_dot,
+                "Отключить авторазмер точки",
+            );
+        });
+        response.header_response.on_hover_text(HALFTONE_HELP);
+
+        let response = egui::CollapsingHeader::new("Изменение размера").show(ui, |ui| {
+            ui.checkbox(
+                &mut self.reline_resize_enabled,
+                "Включить изменение размера",
+            );
+            numeric_text_field(ui, "Высота", &mut self.reline_resize_height);
+            numeric_text_field(ui, "Ширина", &mut self.reline_resize_width);
+            numeric_text_field(ui, "Процент", &mut self.reline_resize_percent);
+            field_label(ui, "Фильтр");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_resize_filter",
+                &RESIZE_FILTERS,
+                &mut self.reline_resize_filter,
+            );
+            ui.checkbox(&mut self.reline_resize_gamma_correction, "Гамма-коррекция");
+            ui.checkbox(&mut self.reline_resize_spread, "Разброс (spread)");
+            numeric_text_field(ui, "Размер разброса", &mut self.reline_resize_spread_size);
+        });
+        response.header_response.on_hover_text(RESIZE_HELP);
+
+        let response = egui::CollapsingHeader::new("Уровни").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_level_enabled, "Включить уровни");
+            numeric_text_field(
+                ui,
+                "Нижний входной уровень",
+                &mut self.reline_level_low_input,
+            );
+            numeric_text_field(
+                ui,
+                "Верхний входной уровень",
+                &mut self.reline_level_high_input,
+            );
+            numeric_text_field(
+                ui,
+                "Нижний выходной уровень",
+                &mut self.reline_level_low_output,
+            );
+            numeric_text_field(
+                ui,
+                "Верхний выходной уровень",
+                &mut self.reline_level_high_output,
+            );
+            numeric_text_field(ui, "Гамма", &mut self.reline_level_gamma);
+        });
+        response.header_response.on_hover_text(LEVEL_HELP);
+
+        let response = egui::CollapsingHeader::new("Цветовое преобразование").show(ui, |ui| {
+            ui.checkbox(
+                &mut self.reline_cvt_color_enabled,
+                "Включить цветовое преобразование",
+            );
+            field_label(ui, "Тип преобразования");
+            combo_index(
+                ui,
+                "launcher_new_project_reline_cvt_type",
+                &CVT_TYPES,
+                &mut self.reline_cvt_color_type,
+            );
+        });
+        response.header_response.on_hover_text(CVT_COLOR_HELP);
+
+        if button_sized(
+            ui,
+            "Прогнать через Reline",
+            egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
+            self.can_start_reline(),
+        )
+        .clicked()
+        {
+            self.start_reline();
+        }
+        self.show_operation_progress(ui, "reline");
+    }
+
+    fn ensure_reline_model_catalog_requested(&mut self) {
+        if self.reline_model_catalog_requested {
+            return;
+        }
+        self.reline_model_catalog_requested = true;
+        self.reline_model_catalog_error = None;
+        self.reline_model_catalog.begin();
+    }
+
+    fn refresh_reline_model_catalog(&mut self) {
+        self.reline_model_catalog_requested = true;
+        self.reline_model_catalog_error = None;
+        self.reline_model_catalog.begin();
+    }
+
+    fn show_reline_model_combo(&mut self, ui: &mut Ui) {
+        let mut options: Vec<(String, String, String)> = self
+            .reline_model_catalog_entries
+            .iter()
+            .map(|entry| {
+                let label = if entry.downloaded {
+                    format!("{} (скачана)", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+                (entry.name.clone(), label, entry.filename.clone())
+            })
+            .collect();
+
+        let current_model = self.reline_model_name.trim();
+        if !current_model.is_empty() && !options.iter().any(|(name, _, _)| name == current_model) {
+            options.insert(
+                0,
+                (
+                    current_model.to_string(),
+                    format!("{current_model} (текущее значение)"),
+                    String::new(),
+                ),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            let refresh_width = 96.0;
+            let combo_width =
+                (ui.available_width() - refresh_width - ui.spacing().item_spacing.x).max(150.0);
+            ComboBox::from_id_salt("launcher_new_project_reline_model_name")
+                .width(combo_width)
+                .selected_text(if self.reline_model_name.trim().is_empty() {
+                    "Не выбрана"
+                } else {
+                    self.reline_model_name.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.reline_model_name,
+                        String::new(),
+                        "Не выбирать из каталога",
+                    )
+                    .on_hover_text("Используйте локальный путь или прямой URL модели ниже");
+                    if options.is_empty() {
+                        ui.label("Список моделей не загружен");
+                    } else {
+                        for (name, label, filename) in &options {
+                            let response = ui.selectable_value(
+                                &mut self.reline_model_name,
+                                name.clone(),
+                                label,
+                            );
+                            if !filename.trim().is_empty() {
+                                response.on_hover_text(format!("Файл: {filename}"));
+                            }
+                        }
+                    }
+                });
+
+            let refresh_label = if self.reline_model_catalog.is_loading() {
+                "Загрузка..."
+            } else {
+                "Обновить"
+            };
+            if ui
+                .add_enabled(
+                    !self.reline_model_catalog.is_loading(),
+                    Button::new(refresh_label).min_size(egui::vec2(refresh_width, 28.0)),
+                )
+                .on_hover_text("Обновить список моделей из AI backend")
+                .clicked()
+            {
+                self.refresh_reline_model_catalog();
+            }
+        });
+
+        if self.reline_model_catalog.is_loading() {
+            ui.label(
+                RichText::new("Загружаем список моделей Reline...")
+                    .small()
+                    .weak(),
+            );
+        }
+        if let Some(error) = &self.reline_model_catalog_error {
+            ui.colored_label(egui::Color32::from_rgb(236, 112, 99), error);
+        }
     }
 
     fn show_save_section(&mut self, ui: &mut Ui) {
@@ -2203,10 +3672,9 @@ impl NewProjectWindowState {
                 ui.set_min_height((available_height - 8.0).max(220.0));
                 let mut cut_marker_screen_positions = Vec::new();
                 let mut page_boundary_screen_positions = Vec::new();
-                let scroll_output = ScrollArea::vertical()
-                    .id_salt("launcher_new_project_ribbon_scroll")
-                    .auto_shrink([false, false])
-                    .max_height((available_height - 8.0).max(220.0))
+                let scroll_output = MarkedScrollArea::vertical("launcher_new_project_ribbon_scroll")
+                    .floating(false)
+                    .gutter_width(MANUAL_CUT_SCROLL_ARROW_WIDTH)
                     .show(ui, |ui| {
                         if self.source_import.is_loading()
                             || self.advanced_download.is_loading()
@@ -2215,6 +3683,7 @@ impl NewProjectWindowState {
                             || self.stitch.is_loading()
                             || self.save.is_loading()
                             || self.waifu2x.is_loading()
+                            || self.reline.is_loading()
                         {
                             let progress = self.current_progress(true);
                             ui.add(
@@ -2404,10 +3873,8 @@ impl NewProjectWindowState {
                         }
                     });
                 self.draw_manual_cut_scroll_markers(
-                    ui,
-                    scroll_output.inner_rect,
-                    scroll_output.content_size.y,
-                    scroll_output.state.offset.y,
+                    &scroll_output,
+                    ui.painter(),
                     &cut_marker_screen_positions,
                     &page_boundary_screen_positions,
                 );
@@ -2421,6 +3888,7 @@ impl NewProjectWindowState {
             && !self.stitch.is_loading()
             && !self.save.is_loading()
             && !self.waifu2x.is_loading()
+            && !self.reline.is_loading()
             && !self.ribbon.pages().is_empty()
     }
 
@@ -2956,6 +4424,17 @@ impl NewProjectWindowState {
             .collect()
     }
 
+    fn current_reline_images(&self) -> Vec<RelineInputImage> {
+        self.ribbon
+            .pages()
+            .iter()
+            .map(|page| RelineInputImage {
+                name: page.name.clone(),
+                image: arc_image_clone(page.full_image()),
+            })
+            .collect()
+    }
+
     fn current_save_images(&self) -> Vec<ProjectSaveImage> {
         self.ribbon
             .pages()
@@ -3048,6 +4527,7 @@ impl NewProjectWindowState {
             && !self.stitch.is_loading()
             && !self.save.is_loading()
             && !self.waifu2x.is_loading()
+            && !self.reline.is_loading()
             && !self.ribbon.pages().is_empty()
     }
 
@@ -3357,48 +4837,54 @@ impl NewProjectWindowState {
         screen_positions
     }
 
+    /// Draws cut and page-boundary arrows in the markable scrollbar gutter.
+    ///
+    /// `cut`/`page_boundary` positions are screen Y values collected while the
+    /// ribbon content is rendered; they are converted back to content space and
+    /// projected onto the bar via the widget gutter. Page boundaries (blue) are
+    /// drawn under cut markers (red).
     fn draw_manual_cut_scroll_markers(
         &self,
-        ui: &Ui,
-        scroll_inner_rect: egui::Rect,
-        content_height: f32,
-        scroll_offset_y: f32,
+        output: &MarkedScrollOutput<()>,
+        painter: &egui::Painter,
         cut_screen_positions: &[f32],
         page_boundary_screen_positions: &[f32],
     ) {
-        if content_height <= 1.0 {
+        if output.content_size.y <= 1.0 {
             return;
         }
-        draw_scroll_arrow_markers(
-            ui,
-            scroll_inner_rect,
-            content_height,
-            scroll_offset_y,
-            page_boundary_screen_positions,
-            ScrollArrowMarkerStyle {
-                arrow_width: PAGE_BOUNDARY_SCROLL_ARROW_WIDTH,
-                arrow_height: PAGE_BOUNDARY_SCROLL_ARROW_HEIGHT,
-                fill: egui::Color32::from_rgb(40, 132, 255),
-                stroke: Stroke::new(1.0, egui::Color32::from_rgb(130, 190, 255)),
-                tail_length: 10.0 / 3.0,
-                tail_width: 4.0 / 3.0,
-            },
-        );
-        draw_scroll_arrow_markers(
-            ui,
-            scroll_inner_rect,
-            content_height,
-            scroll_offset_y,
-            cut_screen_positions,
-            ScrollArrowMarkerStyle {
-                arrow_width: MANUAL_CUT_SCROLL_ARROW_WIDTH,
-                arrow_height: MANUAL_CUT_SCROLL_ARROW_HEIGHT,
-                fill: egui::Color32::from_rgb(255, 0, 0),
-                stroke: Stroke::new(2.0, egui::Color32::from_rgb(255, 86, 86)),
-                tail_length: 10.0,
-                tail_width: 4.0,
-            },
-        );
+        // Screen Y collected during rendering -> content-space Y for the gutter.
+        let to_content = |screen_y: f32| screen_y - output.inner_rect.top() + output.offset.y;
+
+        let page_boundary_style = ArrowStyle {
+            width: PAGE_BOUNDARY_SCROLL_ARROW_WIDTH,
+            height: PAGE_BOUNDARY_SCROLL_ARROW_HEIGHT,
+            fill: egui::Color32::from_rgb(40, 132, 255),
+            stroke: Stroke::new(1.0, egui::Color32::from_rgb(130, 190, 255)),
+            tail_length: 10.0 / 3.0,
+            tail_width: 4.0 / 3.0,
+        };
+        let manual_cut_style = ArrowStyle {
+            width: MANUAL_CUT_SCROLL_ARROW_WIDTH,
+            height: MANUAL_CUT_SCROLL_ARROW_HEIGHT,
+            fill: egui::Color32::from_rgb(255, 0, 0),
+            stroke: Stroke::new(2.0, egui::Color32::from_rgb(255, 86, 86)),
+            tail_length: 10.0,
+            tail_width: 4.0,
+        };
+
+        let mut items: Vec<GutterItem> = Vec::new();
+        items.extend(page_boundary_screen_positions.iter().map(|&screen_y| {
+            arrow(
+                ScrollSpan::pixel_at(to_content(screen_y)),
+                page_boundary_style,
+            )
+            .layer(0)
+        }));
+        items.extend(cut_screen_positions.iter().map(|&screen_y| {
+            arrow(ScrollSpan::pixel_at(to_content(screen_y)), manual_cut_style).layer(1)
+        }));
+        output.paint_gutter(painter, items);
     }
 
     fn open_folder_dialog(&mut self) {
@@ -3499,6 +4985,38 @@ impl NewProjectWindowState {
         });
         self.import_status = "Подготавливаем waifu2x runtime...".to_string();
         self.waifu2x.begin(images, options);
+    }
+
+    fn start_reline(&mut self) {
+        let options = match self.reline_ui_mode {
+            RelineUiMode::Simple => self.build_reline_simple_options(),
+            RelineUiMode::Full => self.parse_reline_options(),
+        };
+        let Some(options) = options else {
+            return;
+        };
+        let images = self.current_reline_images();
+        if images.is_empty() {
+            self.last_error = Some("Сначала откройте или скачайте изображения.".to_string());
+            self.import_status = "Reline недоступен: лента пуста.".to_string();
+            return;
+        }
+        self.last_error = None;
+        self.active_progress = Some(OperationProgress {
+            operation: "reline",
+            stage: "prepare".to_string(),
+            current: 0,
+            total: images.len(),
+        });
+        self.import_status = "Отправляем изображения в Reline backend...".to_string();
+        self.reline.begin(images, options);
+    }
+
+    fn start_image_processing(&mut self) {
+        match self.image_processor {
+            ImageProcessor::Waifu2x => self.start_waifu2x(),
+            ImageProcessor::Reline => self.start_reline(),
+        }
     }
 
     fn poll_folder_load(&mut self, ctx: &egui::Context) {
@@ -3782,23 +5300,30 @@ impl NewProjectWindowState {
                 }
                 AdvancedDownloadEvent::InterceptStarted { current_url } => {
                     self.advanced_intercept_active = true;
-                    self.advanced_intercept_found_pages = 0;
+                    self.advanced_intercept_counts = InterceptCounts::default();
                     self.advanced_intercept_last_poll_at = Instant::now() - Duration::from_secs(1);
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "Перехват Canvas запущен в Selenium-браузере: {current_url}. Выполните нужные действия на странице и затем нажмите «Завершить перехват»."
-                    );
+                    self.import_status = if self.advanced_mode == AdvancedDownloadMode::DeepCapture
+                    {
+                        format!(
+                            "Глубокий перехват запущен в CloakBrowser: {current_url}. Выполните нужные действия на странице и затем завершите перехват."
+                        )
+                    } else {
+                        format!(
+                            "Перехват Canvas запущен в браузере: {current_url}. Выполните нужные действия на странице и затем нажмите «Завершить перехват»."
+                        )
+                    };
                 }
-                AdvancedDownloadEvent::InterceptCountUpdated { found_pages } => {
-                    self.advanced_intercept_found_pages = found_pages;
+                AdvancedDownloadEvent::InterceptCountUpdated { counts } => {
+                    self.advanced_intercept_counts = counts;
                     self.advanced_intercept_last_poll_at = Instant::now();
                 }
                 AdvancedDownloadEvent::Loaded(result) => {
                     self.advanced_link_collect_active = false;
                     self.advanced_link_collect_found_links = 0;
                     self.advanced_intercept_active = false;
-                    self.advanced_intercept_found_pages = 0;
+                    self.advanced_intercept_counts = InterceptCounts::default();
                     let page_count = result.pages.len();
                     self.ribbon
                         .replace_source(PathBuf::from(&result.source_url), result.pages);
@@ -3827,6 +5352,20 @@ impl NewProjectWindowState {
                         result.source_url,
                     ));
                 }
+                AdvancedDownloadEvent::AutoCandidatesReady(candidates) => {
+                    self.advanced_link_collect_active = false;
+                    self.advanced_link_collect_found_links = 0;
+                    self.advanced_intercept_active = false;
+                    self.advanced_intercept_counts = InterceptCounts::default();
+                    let item_count = candidates.items.len();
+                    let group_count = candidates.groups.len();
+                    self.advanced_auto_review = Some(AdvancedAutoReviewState::new(candidates));
+                    self.active_progress = None;
+                    self.last_error = None;
+                    self.import_status = format!(
+                        "Автоподбор подготовил {item_count} картинок в {group_count} группах. Проверьте список перед добавлением на ленту."
+                    );
+                }
                 AdvancedDownloadEvent::Failed {
                     user_message,
                     log_message,
@@ -3834,7 +5373,7 @@ impl NewProjectWindowState {
                     self.advanced_link_collect_active = false;
                     self.advanced_link_collect_found_links = 0;
                     self.advanced_intercept_active = false;
-                    self.advanced_intercept_found_pages = 0;
+                    self.advanced_intercept_counts = InterceptCounts::default();
                     crate::runtime_log::log_error(format!(
                         "[new-project] advanced downloader failed: {log_message}"
                     ));
@@ -3847,7 +5386,7 @@ impl NewProjectWindowState {
                     self.advanced_link_collect_active = false;
                     self.advanced_link_collect_found_links = 0;
                     self.advanced_intercept_active = false;
-                    self.advanced_intercept_found_pages = 0;
+                    self.advanced_intercept_counts = InterceptCounts::default();
                     crate::runtime_log::log_error(
                         "[new-project] advanced downloader worker disconnected unexpectedly",
                     );
@@ -3929,8 +5468,13 @@ impl NewProjectWindowState {
             return;
         };
         self.advanced_intercept_last_poll_at = Instant::now();
-        self.advanced_download
-            .begin_query_canvas_intercept_count(browser);
+        if self.advanced_mode == AdvancedDownloadMode::DeepCapture {
+            self.advanced_download
+                .begin_query_deep_intercept_count(browser);
+        } else {
+            self.advanced_download
+                .begin_query_canvas_intercept_count(browser);
+        }
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
@@ -4159,6 +5703,101 @@ impl NewProjectWindowState {
         }
     }
 
+    fn poll_reline(&mut self, ctx: &egui::Context) {
+        if let Some(event) = self.reline.poll(ctx) {
+            match event {
+                RelineEvent::Progress {
+                    stage,
+                    current,
+                    total,
+                } => {
+                    self.last_error = None;
+                    self.active_progress = Some(OperationProgress {
+                        operation: "reline",
+                        stage: stage.clone(),
+                        current,
+                        total,
+                    });
+                    self.import_status = progress_status_label(&stage, current, total);
+                }
+                RelineEvent::Completed(result) => {
+                    let page_count = result.pages.len();
+                    self.ribbon.replace_current(result.pages);
+                    self.selected_ribbon_page = self.default_selected_page();
+                    self.crop_editor = None;
+                    self.manual_cut_guides.clear();
+                    self.active_progress = None;
+                    self.last_error = None;
+                    self.import_status = format!(
+                        "Reline обработал {} изображений через {}.",
+                        result.processed_images, result.backend_endpoint
+                    );
+                    crate::runtime_log::log_info(format!(
+                        "[new-project] Reline completed: pages={}, endpoint='{}'",
+                        page_count, result.backend_endpoint
+                    ));
+                }
+                RelineEvent::Failed {
+                    user_message,
+                    log_message,
+                } => {
+                    crate::runtime_log::log_error(format!(
+                        "[new-project] Reline failed: {log_message}"
+                    ));
+                    self.active_progress = None;
+                    self.import_status = "Reline завершился с ошибкой.".to_string();
+                    self.last_error = Some(user_message);
+                }
+                RelineEvent::WorkerDisconnected => {
+                    crate::runtime_log::log_error(
+                        "[new-project] Reline worker disconnected unexpectedly",
+                    );
+                    self.active_progress = None;
+                    self.import_status = "Reline завершился с ошибкой.".to_string();
+                    self.last_error =
+                        Some("Фоновый поток Reline неожиданно завершился.".to_string());
+                }
+            }
+        }
+    }
+
+    fn poll_reline_model_catalog(&mut self, ctx: &egui::Context) {
+        if let Some(event) = self.reline_model_catalog.poll(ctx) {
+            match event {
+                RelineModelCatalogEvent::Loaded(models) => {
+                    self.reline_model_catalog_error = None;
+                    self.reline_model_catalog_entries = models;
+                    if self.reline_model_name.trim().is_empty()
+                        && let Some(first_model) = self.reline_model_catalog_entries.first()
+                    {
+                        self.reline_model_name = first_model.name.clone();
+                    }
+                    crate::runtime_log::log_info(format!(
+                        "[new-project] loaded Reline model catalog: models={}",
+                        self.reline_model_catalog_entries.len()
+                    ));
+                }
+                RelineModelCatalogEvent::Failed {
+                    user_message,
+                    log_message,
+                } => {
+                    self.reline_model_catalog_error = Some(user_message);
+                    crate::runtime_log::log_error(format!(
+                        "[new-project] Reline model catalog failed: {log_message}"
+                    ));
+                }
+                RelineModelCatalogEvent::WorkerDisconnected => {
+                    self.reline_model_catalog_error = Some(
+                        "Фоновый поток списка моделей Reline неожиданно завершился.".to_string(),
+                    );
+                    crate::runtime_log::log_error(
+                        "[new-project] Reline model catalog worker disconnected unexpectedly",
+                    );
+                }
+            }
+        }
+    }
+
     fn source_import_options(&self) -> SourceImportOptions {
         SourceImportOptions {
             filter_same_width: self.filter_same_width,
@@ -4195,6 +5834,327 @@ impl NewProjectWindowState {
         })
     }
 
+    fn parse_reline_options(&mut self) -> Option<RelineOptions> {
+        const READER_MODES: [&str; 3] = ["rgb", "gray", "dynamic"];
+        const TILERS: [&str; 3] = ["exact", "max", "no_tiling"];
+        const DTYPES: [&str; 3] = ["F32", "F16", "BF16"];
+        const CANNY_TYPES: [&str; 3] = ["invert", "normal", "unsharp"];
+        const DOT_TYPES: [&str; 5] = ["line", "cross", "ellipse", "invline", "circle"];
+        const HALFTONE_MODES: [&str; 4] = ["gray", "rgb", "hsv", "cmyk"];
+        const HALFTONE_FILTERS: [&str; 22] = [
+            "nearest",
+            "box",
+            "sbox4",
+            "sbox8",
+            "linear",
+            "slinear4",
+            "slinear8",
+            "hamming",
+            "shamming4",
+            "shamming8",
+            "catmullrom",
+            "scatmullrom4",
+            "scatmullrom8",
+            "mitchell",
+            "smitchell4",
+            "smitchell8",
+            "lanczos",
+            "slanczos4",
+            "slanczos8",
+            "gauss",
+            "sgauss4",
+            "sgauss8",
+        ];
+        const RESIZE_FILTERS: [&str; 33] = [
+            "nearest",
+            "box",
+            "sbox4",
+            "sbox8",
+            "ibox",
+            "linear",
+            "slinear4",
+            "slinear8",
+            "ilinear",
+            "hamming",
+            "shamming4",
+            "shamming8",
+            "ihamming",
+            "catmullrom",
+            "scatmullrom4",
+            "scatmullrom8",
+            "icatmullrom",
+            "mitchell",
+            "smitchell4",
+            "smitchell8",
+            "imitchell",
+            "lanczos",
+            "slanczos4",
+            "slanczos8",
+            "ilanczos",
+            "gauss",
+            "sgauss4",
+            "sgauss8",
+            "igauss",
+            "dpid_0.25",
+            "dpid_0.5",
+            "dpid_0.75",
+            "dpid_1",
+        ];
+        const CVT_TYPES: [&str; 4] = ["RGB2Gray2020", "RGB2Gray709", "RGB2Gray", "Gray2RGB"];
+
+        let reader_mode = selected_label(&READER_MODES, self.reline_reader_mode, "режим чтения")?;
+        let tiler = selected_label(&TILERS, self.reline_tiler, "тайлинг Reline")?;
+        let dtype = selected_label(&DTYPES, self.reline_dtype, "тип вычислений Reline")?;
+        let canny_type = selected_label(&CANNY_TYPES, self.reline_sharp_canny_type, "режим Canny")?;
+        let dot_type = selected_label(&DOT_TYPES, self.reline_halftone_dot_type, "тип точки")?;
+        let halftone_mode = selected_label(
+            &HALFTONE_MODES,
+            self.reline_halftone_mode,
+            "цветовой режим полутона",
+        )?;
+        let halftone_filter = selected_label(
+            &HALFTONE_FILTERS,
+            self.reline_halftone_ssaa_filter,
+            "фильтр SSAA",
+        )?;
+        let resize_filter = selected_label(
+            &RESIZE_FILTERS,
+            self.reline_resize_filter,
+            "фильтр изменения размера",
+        )?;
+        let cvt_type = selected_label(
+            &CVT_TYPES,
+            self.reline_cvt_color_type,
+            "тип цветового преобразования",
+        )?;
+
+        let exact_tiler_size = self.parse_required_u32_field(
+            &self.reline_exact_tiler_size.clone(),
+            "Размер exact-тайла",
+        )?;
+        let target_scale =
+            self.parse_optional_u32_field(&self.reline_target_scale.clone(), "Целевой масштаб")?;
+        let sharp_low_input = self.parse_required_i32_field(
+            &self.reline_sharp_low_input.clone(),
+            "Нижний входной уровень резкости",
+        )?;
+        let sharp_high_input = self.parse_required_i32_field(
+            &self.reline_sharp_high_input.clone(),
+            "Верхний входной уровень резкости",
+        )?;
+        let sharp_gamma =
+            self.parse_required_f32_field(&self.reline_sharp_gamma.clone(), "Гамма резкости")?;
+        let sharp_diapason_white = self.parse_required_i32_field(
+            &self.reline_sharp_diapason_white.clone(),
+            "Белый диапазон резкости",
+        )?;
+        let sharp_diapason_black = self.parse_required_i32_field(
+            &self.reline_sharp_diapason_black.clone(),
+            "Чёрный диапазон резкости",
+        )?;
+        let halftone_dot_size = self.parse_required_i32_field(
+            &self.reline_halftone_dot_size.clone(),
+            "Размер точки полутона",
+        )?;
+        let halftone_angle =
+            self.parse_required_i32_field(&self.reline_halftone_angle.clone(), "Угол полутона")?;
+        let halftone_ssaa_scale = self
+            .parse_optional_f32_field(&self.reline_halftone_ssaa_scale.clone(), "Масштаб SSAA")?;
+        let resize_height =
+            self.parse_optional_u32_field(&self.reline_resize_height.clone(), "Высота")?;
+        let resize_width =
+            self.parse_optional_u32_field(&self.reline_resize_width.clone(), "Ширина")?;
+        let resize_percent =
+            self.parse_optional_f32_field(&self.reline_resize_percent.clone(), "Процент")?;
+        if self.reline_resize_enabled
+            && resize_height.is_none()
+            && resize_width.is_none()
+            && resize_percent.is_none()
+        {
+            self.last_error =
+                Some("Изменение размера Reline требует высоту, ширину или процент.".to_string());
+            self.import_status = "Некорректные параметры Reline.".to_string();
+            return None;
+        }
+        let resize_spread_size = self
+            .parse_required_u32_field(&self.reline_resize_spread_size.clone(), "Размер разброса")?;
+        let level_low_input = self.parse_required_i32_field(
+            &self.reline_level_low_input.clone(),
+            "Нижний входной уровень",
+        )?;
+        let level_high_input = self.parse_required_i32_field(
+            &self.reline_level_high_input.clone(),
+            "Верхний входной уровень",
+        )?;
+        let level_low_output = self.parse_required_i32_field(
+            &self.reline_level_low_output.clone(),
+            "Нижний выходной уровень",
+        )?;
+        let level_high_output = self.parse_required_i32_field(
+            &self.reline_level_high_output.clone(),
+            "Верхний выходной уровень",
+        )?;
+        let level_gamma =
+            self.parse_required_f32_field(&self.reline_level_gamma.clone(), "Гамма")?;
+
+        Some(RelineOptions {
+            reader_mode: reader_mode.to_string(),
+            upscale: RelineUpscaleOptions {
+                enabled: self.reline_upscale_enabled,
+                model_name: self.reline_model_name.trim().to_string(),
+                model_path: self.reline_model_path.trim().to_string(),
+                model_url: self.reline_model_url.trim().to_string(),
+                tiler: tiler.to_string(),
+                target_scale,
+                dtype: dtype.to_string(),
+                exact_tiler_size,
+                allow_cpu_upscale: self.reline_allow_cpu_upscale,
+            },
+            sharp: RelineSharpOptions {
+                enabled: self.reline_sharp_enabled,
+                low_input: sharp_low_input,
+                high_input: sharp_high_input,
+                gamma: sharp_gamma,
+                diapason_white: sharp_diapason_white,
+                diapason_black: sharp_diapason_black,
+                canny: self.reline_sharp_canny,
+                canny_type: canny_type.to_string(),
+            },
+            halftone: RelineHalftoneOptions {
+                enabled: self.reline_halftone_enabled,
+                dot_size: halftone_dot_size,
+                angle: halftone_angle,
+                dot_type: dot_type.to_string(),
+                halftone_mode: halftone_mode.to_string(),
+                ssaa_scale: halftone_ssaa_scale,
+                ssaa_filter: halftone_filter.to_string(),
+                disable_auto_dot: self.reline_halftone_disable_auto_dot,
+            },
+            resize: RelineResizeOptions {
+                enabled: self.reline_resize_enabled,
+                height: resize_height,
+                width: resize_width,
+                percent: resize_percent,
+                filter: resize_filter.to_string(),
+                gamma_correction: self.reline_resize_gamma_correction,
+                spread: self.reline_resize_spread,
+                spread_size: resize_spread_size,
+            },
+            level: RelineLevelOptions {
+                enabled: self.reline_level_enabled,
+                low_input: level_low_input,
+                high_input: level_high_input,
+                low_output: level_low_output,
+                high_output: level_high_output,
+                gamma: level_gamma,
+            },
+            cvt_color: RelineCvtColorOptions {
+                enabled: self.reline_cvt_color_enabled,
+                cvt_type: cvt_type.to_string(),
+            },
+        })
+    }
+
+    /// Build `RelineOptions` from the simplified UI state (preset + high-level controls).
+    ///
+    /// Maps the guided controls onto safe pipeline defaults: upscale always runs with the
+    /// selected model; the preset decides whether sharpening and halftone nodes are added; the
+    /// sharpness control governs Canny-based edge enhancement; level/cvt_color stay disabled.
+    /// Returns `None` (and sets `last_error`) only when the optional resize field is invalid.
+    fn build_reline_simple_options(&mut self) -> Option<RelineOptions> {
+        let preset = RelineSimplePreset::from_index(self.reline_simple_preset);
+
+        // Target scale: 0 = model's native scale, 1 = ×2, 2 = ×4.
+        let target_scale = match self.reline_simple_scale {
+            1 => Some(2),
+            2 => Some(4),
+            _ => None,
+        };
+
+        // Sharpness strength: 0 = none, 1 = light (normal edges), 2 = strong (unsharp edges).
+        let (sharp_node_enabled, canny, canny_type) = match self.reline_simple_sharp {
+            1 => (true, true, "normal"),
+            2 => (true, true, "unsharp"),
+            _ => (false, false, "normal"),
+        };
+
+        // The preset decides which optional nodes participate; ModelOnly stays a clean pass.
+        let (sharp_enabled, halftone_enabled) = match preset {
+            RelineSimplePreset::ModelOnly => (false, false),
+            RelineSimplePreset::RestoreLightSharp | RelineSimplePreset::Descreen => {
+                (sharp_node_enabled, false)
+            }
+            RelineSimplePreset::AddHalftone => (sharp_node_enabled, true),
+        };
+
+        let resize_enabled = self.reline_simple_resize_enabled;
+        let resize_height = if resize_enabled {
+            Some(self.parse_required_u32_field(
+                &self.reline_simple_resize_target.clone(),
+                "Высота результата",
+            )?)
+        } else {
+            None
+        };
+
+        Some(RelineOptions {
+            reader_mode: "rgb".to_string(),
+            upscale: RelineUpscaleOptions {
+                enabled: true,
+                model_name: self.reline_model_name.trim().to_string(),
+                model_path: String::new(),
+                model_url: String::new(),
+                tiler: "exact".to_string(),
+                target_scale,
+                dtype: "F32".to_string(),
+                exact_tiler_size: 800,
+                allow_cpu_upscale: true,
+            },
+            sharp: RelineSharpOptions {
+                enabled: sharp_enabled,
+                low_input: 0,
+                high_input: 255,
+                gamma: 1.0,
+                diapason_white: -1,
+                diapason_black: -1,
+                canny,
+                canny_type: canny_type.to_string(),
+            },
+            halftone: RelineHalftoneOptions {
+                enabled: halftone_enabled,
+                dot_size: 7,
+                angle: 0,
+                dot_type: "circle".to_string(),
+                halftone_mode: "gray".to_string(),
+                ssaa_scale: None,
+                ssaa_filter: "shamming4".to_string(),
+                disable_auto_dot: false,
+            },
+            resize: RelineResizeOptions {
+                enabled: resize_enabled,
+                height: resize_height,
+                width: None,
+                percent: None,
+                filter: "catmullrom".to_string(),
+                gamma_correction: false,
+                spread: false,
+                spread_size: 2800,
+            },
+            level: RelineLevelOptions {
+                enabled: false,
+                low_input: 0,
+                high_input: 255,
+                low_output: 0,
+                high_output: 255,
+                gamma: 1.0,
+            },
+            cvt_color: RelineCvtColorOptions {
+                enabled: false,
+                cvt_type: "RGB2Gray2020".to_string(),
+            },
+        })
+    }
+
     fn can_start_waifu2x(&self) -> bool {
         !self.source_import.is_loading()
             && !self.advanced_download.is_loading()
@@ -4202,7 +6162,100 @@ impl NewProjectWindowState {
             && !self.stitch.is_loading()
             && !self.save.is_loading()
             && !self.waifu2x.is_loading()
+            && !self.reline.is_loading()
             && !self.ribbon.pages().is_empty()
+    }
+
+    fn can_start_reline(&self) -> bool {
+        // The simplified UI drives the model only through the gallery, so a model must be picked.
+        let model_ready = match self.reline_ui_mode {
+            RelineUiMode::Simple => !self.reline_model_name.trim().is_empty(),
+            RelineUiMode::Full => true,
+        };
+        model_ready
+            && !self.source_import.is_loading()
+            && !self.advanced_download.is_loading()
+            && !self.quick_download.is_loading()
+            && !self.stitch.is_loading()
+            && !self.save.is_loading()
+            && !self.waifu2x.is_loading()
+            && !self.reline.is_loading()
+            && !self.ribbon.pages().is_empty()
+    }
+
+    fn can_start_image_processing(&self) -> bool {
+        match self.image_processor {
+            ImageProcessor::Waifu2x => self.can_start_waifu2x(),
+            ImageProcessor::Reline => self.can_start_reline(),
+        }
+    }
+
+    fn current_image_processing_operation(&self) -> &'static str {
+        match self.image_processor {
+            ImageProcessor::Waifu2x => "waifu2x",
+            ImageProcessor::Reline => "reline",
+        }
+    }
+
+    fn parse_required_u32_field(&mut self, raw: &str, field_name: &str) -> Option<u32> {
+        match raw.trim().parse::<u32>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => {
+                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
+                self.import_status = "Некорректные параметры Reline.".to_string();
+                None
+            }
+        }
+    }
+
+    fn parse_optional_u32_field(&mut self, raw: &str, field_name: &str) -> Option<Option<u32>> {
+        if raw.trim().is_empty() {
+            return Some(None);
+        }
+        match raw.trim().parse::<u32>() {
+            Ok(value) if value > 0 => Some(Some(value)),
+            _ => {
+                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
+                self.import_status = "Некорректные параметры Reline.".to_string();
+                None
+            }
+        }
+    }
+
+    fn parse_required_i32_field(&mut self, raw: &str, field_name: &str) -> Option<i32> {
+        match raw.trim().parse::<i32>() {
+            Ok(value) => Some(value),
+            _ => {
+                self.last_error = Some(format!("{field_name} должен быть целым числом."));
+                self.import_status = "Некорректные параметры Reline.".to_string();
+                None
+            }
+        }
+    }
+
+    fn parse_required_f32_field(&mut self, raw: &str, field_name: &str) -> Option<f32> {
+        match raw.trim().parse::<f32>() {
+            Ok(value) => Some(value),
+            _ => {
+                self.last_error = Some(format!("{field_name} должен быть числом."));
+                self.import_status = "Некорректные параметры Reline.".to_string();
+                None
+            }
+        }
+    }
+
+    fn parse_optional_f32_field(&mut self, raw: &str, field_name: &str) -> Option<Option<f32>> {
+        if raw.trim().is_empty() {
+            return Some(None);
+        }
+        match raw.trim().parse::<f32>() {
+            Ok(value) if value > 0.0 => Some(Some(value)),
+            _ => {
+                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
+                self.import_status = "Некорректные параметры Reline.".to_string();
+                None
+            }
+        }
     }
 
     fn waifu_backend_path_display(&self) -> String {
@@ -4212,6 +6265,8 @@ impl NewProjectWindowState {
     fn handle_window_closed(&mut self) {
         self.waifu2x.shutdown();
         self.waifu2x = Waifu2xController::new();
+        self.reline = RelineController::new();
+        self.reline_model_catalog = RelineModelCatalogController::new();
     }
 
     fn clamp_advanced_indexes(&mut self) {
@@ -4223,8 +6278,23 @@ impl NewProjectWindowState {
         }
     }
 
+    fn advanced_browser_available(&self) -> bool {
+        match self.selected_advanced_backend {
+            AdvancedBrowserBackend::Selenium => !self.browser_names.is_empty(),
+            AdvancedBrowserBackend::Cloak => true,
+        }
+    }
+
     fn selected_browser_name(&self) -> Option<String> {
-        self.browser_names.get(self.selected_browser).cloned()
+        match self.selected_advanced_backend {
+            AdvancedBrowserBackend::Selenium => {
+                self.browser_names.get(self.selected_browser).cloned()
+            }
+            AdvancedBrowserBackend::Cloak => Some(
+                self.advanced_download
+                    .browser_name_for_backend("CloakBrowser"),
+            ),
+        }
     }
 
     fn start_advanced_open(&mut self) {
@@ -4240,7 +6310,7 @@ impl NewProjectWindowState {
         }
         self.last_error = None;
         self.advanced_link_collect_found_links = 0;
-        self.advanced_intercept_found_pages = 0;
+        self.advanced_intercept_counts = InterceptCounts::default();
         self.active_progress = Some(OperationProgress {
             operation: "advanced_download",
             stage: "browser".to_string(),
@@ -4267,11 +6337,31 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status = "Собираем ссылки из активной вкладки браузера...".to_string();
-        self.advanced_download.begin_fetch(
-            browser,
-            self.image_prefix.trim().to_string(),
-            self.advanced_fetch_parallelism,
-        );
+        if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
+            self.advanced_download
+                .begin_fetch_auto(browser, self.advanced_fetch_parallelism);
+        } else {
+            self.advanced_download.begin_fetch(
+                browser,
+                self.image_prefix.trim().to_string(),
+                self.advanced_fetch_parallelism,
+            );
+        }
+    }
+
+    fn stop_advanced_auto_fetch(&mut self) {
+        match self.advanced_download.request_cancel_current_auto_fetch() {
+            Ok(()) => {
+                self.import_status =
+                    "Останавливаем автоподбор после уже скачанных картинок...".to_string();
+            }
+            Err(err) => {
+                self.last_error = Some("Не удалось остановить автоподбор.".to_string());
+                crate::runtime_log::log_warn(format!(
+                    "[new-project] failed to request advanced auto fetch cancellation: {err}"
+                ));
+            }
+        }
     }
 
     fn start_advanced_link_collect(&mut self) {
@@ -4289,11 +6379,16 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status = "Запускаем фоновый сбор ссылок в Selenium-браузере...".to_string();
-        self.advanced_download.begin_start_link_collect(
-            browser,
-            self.image_prefix.trim().to_string(),
-            self.advanced_fetch_parallelism,
-        );
+        if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
+            self.advanced_download
+                .begin_start_auto_link_collect(browser, self.advanced_fetch_parallelism);
+        } else {
+            self.advanced_download.begin_start_link_collect(
+                browser,
+                self.image_prefix.trim().to_string(),
+                self.advanced_fetch_parallelism,
+            );
+        }
     }
 
     fn finish_advanced_link_collect(&mut self) {
@@ -4303,7 +6398,7 @@ impl NewProjectWindowState {
             return;
         };
         self.last_error = None;
-        self.advanced_intercept_found_pages = 0;
+        self.advanced_intercept_counts = InterceptCounts::default();
         self.active_progress = Some(OperationProgress {
             operation: "advanced_download",
             stage: "download".to_string(),
@@ -4312,7 +6407,11 @@ impl NewProjectWindowState {
         });
         self.import_status =
             "Останавливаем сбор ссылок и скачиваем найденные страницы...".to_string();
-        self.advanced_download.begin_stop_link_collect(browser);
+        if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
+            self.advanced_download.begin_stop_auto_link_collect(browser);
+        } else {
+            self.advanced_download.begin_stop_link_collect(browser);
+        }
     }
 
     fn start_advanced_canvas_fetch(&mut self) {
@@ -4322,7 +6421,7 @@ impl NewProjectWindowState {
             return;
         };
         self.last_error = None;
-        self.advanced_intercept_found_pages = 0;
+        self.advanced_intercept_counts = InterceptCounts::default();
         self.active_progress = Some(OperationProgress {
             operation: "advanced_download",
             stage: "collect_canvas".to_string(),
@@ -4366,6 +6465,47 @@ impl NewProjectWindowState {
         self.import_status =
             "Останавливаем перехват Canvas и сохраняем найденные холсты...".to_string();
         self.advanced_download.begin_stop_canvas_intercept(browser);
+    }
+
+    fn start_advanced_deep_intercept(&mut self) {
+        if self.selected_advanced_backend != AdvancedBrowserBackend::Cloak {
+            self.last_error =
+                Some("Глубокий перехват доступен только для CloakBrowser.".to_string());
+            return;
+        }
+        let Some(browser) = self.selected_browser_name() else {
+            self.last_error = Some("CloakBrowser недоступен.".to_string());
+            self.import_status = "Браузер для глубокого перехвата недоступен.".to_string();
+            return;
+        };
+        self.last_error = None;
+        self.active_progress = Some(OperationProgress {
+            operation: "advanced_download",
+            stage: "browser".to_string(),
+            current: 0,
+            total: 0,
+        });
+        self.import_status =
+            "Запускаем глубокий перехват в CloakBrowser и перезагружаем страницу...".to_string();
+        self.advanced_download.begin_start_deep_intercept(browser);
+    }
+
+    fn finish_advanced_deep_intercept(&mut self) {
+        let Some(browser) = self.selected_browser_name() else {
+            self.last_error = Some("CloakBrowser недоступен.".to_string());
+            self.import_status = "Браузер для глубокого перехвата недоступен.".to_string();
+            return;
+        };
+        self.last_error = None;
+        self.active_progress = Some(OperationProgress {
+            operation: "advanced_download",
+            stage: "download".to_string(),
+            current: 0,
+            total: 0,
+        });
+        self.import_status =
+            "Останавливаем глубокий перехват и отбираем декодируемые картинки...".to_string();
+        self.advanced_download.begin_stop_deep_intercept(browser);
     }
 
     fn save_advanced_prefix(&mut self) {
@@ -4531,6 +6671,28 @@ fn field_label(ui: &mut Ui, label: &str) {
     ui.label(RichText::new(label).small());
 }
 
+fn field_label_hover(ui: &mut Ui, label: &str, hover_text: &str) {
+    ui.label(RichText::new(label).small())
+        .on_hover_text(hover_text);
+}
+
+fn numeric_text_field(ui: &mut Ui, label: &str, value: &mut String) {
+    field_label(ui, label);
+    ui.add(TextEdit::singleline(value).desired_width(160.0));
+}
+
+fn selected_label<'a>(values: &'a [&str], selected: usize, field_name: &str) -> Option<&'a str> {
+    match values.get(selected).copied() {
+        Some(value) => Some(value),
+        None => {
+            crate::runtime_log::log_error(format!(
+                "[new-project] invalid combo index for {field_name}: {selected}"
+            ));
+            None
+        }
+    }
+}
+
 fn combo_index(ui: &mut Ui, id: &str, values: &[&str], selected: &mut usize) {
     ComboBox::from_id_salt(id)
         .width(fill_width(ui))
@@ -4586,62 +6748,107 @@ fn manual_cut_y_is_valid(y: usize, page_height: usize) -> bool {
         && y.saturating_add(MANUAL_CUT_MIN_EDGE_DISTANCE_PX) <= page_height
 }
 
-fn draw_scroll_arrow_markers(
-    ui: &Ui,
-    scroll_inner_rect: egui::Rect,
-    content_height: f32,
-    scroll_offset_y: f32,
-    screen_positions: &[f32],
-    style: ScrollArrowMarkerStyle,
-) {
-    if screen_positions.is_empty() {
-        return;
-    }
-    let marker_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            scroll_inner_rect.right() - style.arrow_width,
-            scroll_inner_rect.top(),
-        ),
-        egui::pos2(scroll_inner_rect.right(), scroll_inner_rect.bottom()),
-    )
-    .shrink2(egui::vec2(2.0, 4.0));
-    if marker_rect.height() <= style.arrow_height {
-        return;
-    }
-
-    let painter = ui.painter();
-    for screen_y in screen_positions {
-        let content_y =
-            (*screen_y - scroll_inner_rect.top() + scroll_offset_y).clamp(0.0, content_height);
-        let ratio = (content_y / content_height).clamp(0.0, 1.0);
-        let marker_y = egui::lerp(marker_rect.top()..=marker_rect.bottom(), ratio);
-        let arrow_half_height = style.arrow_height * 0.5;
-        let arrow_tip = egui::pos2(marker_rect.right(), marker_y);
-        let arrow_tail = marker_rect.left();
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                arrow_tip,
-                egui::pos2(arrow_tail, marker_y - arrow_half_height),
-                egui::pos2(arrow_tail, marker_y + arrow_half_height),
-            ],
-            style.fill,
-            style.stroke,
-        ));
-        painter.line_segment(
-            [
-                egui::pos2(arrow_tail - style.tail_length, marker_y),
-                egui::pos2(arrow_tail + style.tail_length * 0.2, marker_y),
-            ],
-            Stroke::new(style.tail_width, style.fill),
-        );
-    }
-}
-
 fn standard_dark_style() -> egui::Style {
     egui::Style {
         visuals: egui::Visuals::dark(),
         ..Default::default()
     }
+}
+
+fn advanced_group_color(group_id: usize) -> egui::Color32 {
+    const COLORS: [egui::Color32; 10] = [
+        egui::Color32::from_rgb(244, 67, 54),
+        egui::Color32::from_rgb(33, 150, 243),
+        egui::Color32::from_rgb(76, 175, 80),
+        egui::Color32::from_rgb(255, 193, 7),
+        egui::Color32::from_rgb(156, 39, 176),
+        egui::Color32::from_rgb(0, 188, 212),
+        egui::Color32::from_rgb(255, 112, 67),
+        egui::Color32::from_rgb(139, 195, 74),
+        egui::Color32::from_rgb(121, 85, 72),
+        egui::Color32::from_rgb(96, 125, 139),
+    ];
+    COLORS[group_id % COLORS.len()]
+}
+
+fn auto_review_card_layout(ui: &Ui) -> (usize, f32) {
+    let available_width = ui.available_width().min(ui.clip_rect().width()).max(1.0);
+    let mut columns = 1usize;
+    loop {
+        let next_columns = columns.saturating_add(1);
+        let gap_width = auto_review_gap_width(next_columns);
+        let next_width = ((available_width - gap_width) / auto_review_columns_as_f32(next_columns))
+            .floor()
+            .min(AUTO_REVIEW_CARD_SIDE);
+        if next_width < AUTO_REVIEW_CARD_MIN_SIDE {
+            break;
+        }
+        columns = next_columns;
+    }
+    let gap_width = auto_review_gap_width(columns);
+    let card_side = if columns == 1 {
+        available_width.floor().clamp(1.0, AUTO_REVIEW_CARD_SIDE)
+    } else {
+        ((available_width - gap_width) / auto_review_columns_as_f32(columns))
+            .floor()
+            .clamp(AUTO_REVIEW_CARD_MIN_SIDE, AUTO_REVIEW_CARD_SIDE)
+    };
+    (columns, card_side)
+}
+
+fn auto_review_gap_width(columns: usize) -> f32 {
+    (1..columns).fold(0.0, |width, _| width + AUTO_REVIEW_CARD_GAP)
+}
+
+fn auto_review_columns_as_f32(columns: usize) -> f32 {
+    (0..columns).fold(0.0_f32, |count, _| count + 1.0).max(1.0)
+}
+
+fn auto_review_index_as_f32(index: usize) -> f32 {
+    (0..index).fold(0.0_f32, |count, _| count + 1.0)
+}
+
+fn auto_review_default_removed_groups(candidates: &AdvancedAutoCandidateSet) -> HashSet<usize> {
+    candidates
+        .groups
+        .iter()
+        .filter(|group| group.item_ids.len() <= 1)
+        .map(|group| group.id)
+        .collect()
+}
+
+/// Candidate ids the review opens with unchecked: helper-flagged probable junk
+/// (size-outlier icons, sprites, UI chrome), so the user keeps the real pages.
+fn auto_review_default_removed_items(candidates: &AdvancedAutoCandidateSet) -> HashSet<usize> {
+    candidates
+        .items
+        .iter()
+        .filter(|item| item.probable_junk)
+        .map(|item| item.id)
+        .collect()
+}
+
+fn shorten_url(url: &str, limit: usize) -> String {
+    if url.chars().count() <= limit {
+        return url.to_string();
+    }
+    let mut value = url
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    value.push('…');
+    value
+}
+
+fn dynamic_image_preview(
+    image: &DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> egui::ColorImage {
+    let preview = image.thumbnail(max_width, max_height).to_rgba8();
+    let width = usize::try_from(preview.width()).unwrap_or(1).max(1);
+    let height = usize::try_from(preview.height()).unwrap_or(1).max(1);
+    egui::ColorImage::from_rgba_unmultiplied([width, height], preview.as_raw())
 }
 
 fn button_sized(ui: &mut Ui, label: &str, size: egui::Vec2, enabled: bool) -> egui::Response {
@@ -5382,6 +7589,7 @@ fn progress_operation_title(operation: &str) -> &'static str {
         "quick_download" => "Быстрый выкачиватель",
         "stitch" => "Нарезка",
         "waifu2x" => "waifu2x",
+        "reline" => "Reline",
         _ => "Обработка",
     }
 }
@@ -5417,6 +7625,7 @@ fn progress_stage_title(stage: &str) -> &'static str {
         "normalize" => "Выравнивание ширины",
         "stitch" => "Склейка ленты",
         "waifu2x" => "Обработка waifu2x",
+        "reline" => "Обработка Reline",
         "cuts" => "Поиск линий нарезки",
         "compose" => "Сборка ленты",
         "split" => "Нарезка страниц",
@@ -5481,6 +7690,43 @@ fn save_image_url_preset(site_name: &str, prefix: &str) -> anyhow::Result<()> {
         serde_json::Value::Object(map),
     )?;
     Ok(())
+}
+
+/// Load the persisted Reline UI mode from user config.
+///
+/// Returns `RelineUiMode::Simple` when the key is missing or the config cannot be read, so the
+/// guided UI is the default on first run.
+fn load_reline_ui_mode() -> RelineUiMode {
+    let cfg = match config::load_user_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            crate::runtime_log::log_warn(format!(
+                "[new-project] failed to load user config for Reline UI mode: {err}"
+            ));
+            return RelineUiMode::Simple;
+        }
+    };
+    cfg.get_path(&["NewProjectWindow", "RelineUiMode"])
+        .and_then(serde_json::Value::as_str)
+        .map(RelineUiMode::from_config_str)
+        .unwrap_or(RelineUiMode::Simple)
+}
+
+/// Persist the Reline UI mode to user config. Called only on toggle change, not per frame.
+fn save_reline_ui_mode(mode: RelineUiMode) {
+    let result = (|| -> anyhow::Result<()> {
+        let mut cfg = config::load_user_config()?;
+        cfg.set_path(
+            &["NewProjectWindow", "RelineUiMode"],
+            serde_json::Value::String(mode.as_config_str().to_string()),
+        )?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        crate::runtime_log::log_warn(format!(
+            "[new-project] failed to save Reline UI mode: {err}"
+        ));
+    }
 }
 
 fn arc_image_clone(image: Arc<RgbaImage>) -> RgbaImage {

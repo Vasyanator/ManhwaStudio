@@ -10,6 +10,11 @@ layout, wrapping, and glyph rasterization.
 `TextRenderParams.effects_json`, applies preprocess effects before inline-style
 parsing, and applies post-effects after a `RenderedTextImage` has been produced.
 
+The same post-effect routing is reused by `pipeline::apply_effects_to_image` for imported image
+overlays: there is no text layout, the finished `RenderedTextImage` simply wraps the source RGBA
+buffer, and `apply_effects_pipeline` runs unchanged. Effects must therefore keep operating purely
+on the RGBA buffer (alpha contour / colors), never assuming the pixels came from rasterized text.
+
 The data flow is:
 
 1. `parse.rs` validates persisted JSON and converts aliases into typed effect params.
@@ -21,6 +26,20 @@ The data flow is:
 
 `image_ops.rs` contains shared blur, distance-transform, dilation, sampling, blit, and
 compositing helpers. Concrete effects should use it instead of duplicating image math.
+
+Per-pixel/per-row effect passes are parallelized with `rayon` over rows (`par_chunks_mut`)
+or independent pixels (`par_chunks_mut(4)`), always on the global rayon pool. Parallelized
+passes write each output slot independently from read-only inputs, so they stay bit-identical
+to a sequential pass; each converted effect has a golden test asserting exact parallel-vs-
+sequential equality. `gaussian_blur_rgba_in_place` / `gaussian_blur_alpha_in_place` use a
+separable two-pass Gaussian (horizontal over rows, vertical over rows) that replicates
+`image::imageops::blur` (image 0.25): same kernel-size formula (`kernel_size_from_sigma`),
+same normalized Gaussian weights, an `f32` intermediate horizontal pass (not re-quantized),
+and replicate (clamp-to-edge) handling. It is kept within a 2/255 per-channel tolerance
+(golden tests `separable_blur_matches_image_blur_within_tolerance` and
+`separable_alpha_blur_matches_image_blur_within_tolerance`; verified sigma ∈
+{0.35, 0.5, 1.0, 1.5, 2.4, 4.0, 8.0} on images with a hard 0->255 alpha edge, measured
+max 0/255 for both the RGBA and alpha paths).
 
 ## Files and submodules
 - `mod.rs`: effect pipeline entry points and routing from typed effect specs to modules.
