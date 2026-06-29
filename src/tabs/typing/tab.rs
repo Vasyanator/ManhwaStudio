@@ -1622,12 +1622,20 @@ impl TypingTextOverlayLayer {
     /// Moves a RASTER one step in the page's unified band-Z order (text + raster interleaved). Resolves
     /// the raster's uid from `raster_layers_by_page[page][raster_idx]` and reuses the shared band-Z core.
     fn move_raster_in_unified_z(&mut self, page_idx: usize, raster_idx: usize, up: bool) {
-        let Some(uid) = self
+        let resolved = self
             .raster_layers_by_page
             .get(&page_idx)
             .and_then(|v| v.get(raster_idx))
-            .map(|l| l.uid.clone())
-        else {
+            .map(|l| l.uid.clone());
+        crate::trace_log!(
+            cat::TYPING,
+            "move_raster_in_unified_z page={} idx={} up={} uid={:?}",
+            page_idx,
+            raster_idx,
+            up,
+            resolved
+        );
+        let Some(uid) = resolved else {
             return;
         };
         self.move_node_in_unified_z(page_idx, &uid, up);
@@ -1644,16 +1652,45 @@ impl TypingTextOverlayLayer {
             return;
         };
 
+        // Ensure the page's rasters have on-disk manifest nodes BEFORE `save_page_band_order`:
+        // `apply_band_order` silently SKIPS a `BandRef::Raster` whose node is not yet in the manifest,
+        // and the typing tab otherwise only flushes TEXT — so a raster's new Z would never reach disk
+        // (the doc move below would show it moved, then it would revert on the next reload). Mirrors
+        // the PS editor's pre-reorder flush; `persist_current_page_rasters` uses the SYNCHRONOUS
+        // `doc.flush_page`, so the raster is on disk before the band-order write reassigns its Z.
+        self.persist_current_page_rasters(page_idx);
+
         // Flatten to per-node bands, then swap the target one step with its neighbour.
         let mut order = self.flatten_page_bands_to_refs(page_idx);
-        let Some(i) = order.iter().position(|b| matches!(
+        let n_raster_bands = order
+            .iter()
+            .filter(|b| matches!(b, persist::BandRef::Raster(_)))
+            .count();
+        let target_pos = order.iter().position(|b| matches!(
             b,
             persist::BandRef::PinnedText(u) | persist::BandRef::Raster(u) if u == uid
-        )) else {
+        ));
+        crate::trace_log!(
+            cat::TYPING,
+            "move_node_in_unified_z uid={} up={} order_len={} raster_bands={} target_pos={:?}",
+            uid,
+            up,
+            order.len(),
+            n_raster_bands,
+            target_pos
+        );
+        let Some(i) = target_pos else {
             return;
         };
         let j = if up { i + 1 } else { i.wrapping_sub(1) };
         if (up && j >= order.len()) || (!up && i == 0) {
+            crate::trace_log!(
+                cat::TYPING,
+                "move_node_in_unified_z uid={} at-end i={} len={} -> no-op",
+                uid,
+                i,
+                order.len()
+            );
             return; // already at the requested end
         }
         order.swap(i, j);
@@ -1677,6 +1714,13 @@ impl TypingTextOverlayLayer {
                 let routed = self.route_to_doc(page_idx, |doc| {
                     doc.set_z_order(page_idx, &node_order);
                 });
+                crate::trace_log!(
+                    cat::TYPING,
+                    "move_node_in_unified_z persisted+routed uid={} node_order_len={} routed={}",
+                    uid,
+                    node_order.len(),
+                    routed
+                );
                 if !routed {
                     // No doc wired / page not resident: drop the raster cache too so it reloads.
                     self.raster_layers_by_page.remove(&page_idx);
@@ -6601,6 +6645,103 @@ impl TypingTextOverlayLayer {
         ui.ctx().request_repaint();
     }
 
+    /// Nudges the selected RASTER layer by whole page pixels with the arrow keys (parity with the
+    /// overlay nudge `try_move_selected_overlay_by_arrow_shortcuts`). SHIFT moves by 5 px. Mirrors the
+    /// raster mouse-drag Move path: a perspective-deformed raster translates its mesh, otherwise the
+    /// affine `transform.cx/cy` move (clamped to the page, snapped to whole pixels when
+    /// `strict_pixel_movement`). The change is routed to the shared doc and persisted to disk.
+    ///
+    /// Gated on `selected_raster_idx`, which is mutually exclusive with `selected_overlay_idx`, so this
+    /// only consumes the arrow keys when a raster is selected (the overlay nudge, called first, returns
+    /// before consuming keys when no overlay is selected).
+    fn try_move_selected_raster_by_arrow_shortcuts(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_idx: usize,
+        image_rect: Rect,
+        zoom: f32,
+        panel_text_input_focused: bool,
+        strict_pixel_movement: bool,
+    ) {
+        if panel_text_input_focused {
+            return;
+        }
+
+        let Some(selected_idx) = self.selected_raster_idx else {
+            return;
+        };
+        let has_layer = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .is_some_and(|v| selected_idx < v.len());
+        if !has_layer {
+            return;
+        }
+
+        let (left_1, right_1, up_1, down_1, left_5, right_5, up_5, down_5) =
+            ui.ctx().input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft),
+                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight),
+                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
+                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown),
+                )
+            });
+
+        let delta_x_px = (right_1 as i32 - left_1 as i32) + (right_5 as i32 - left_5 as i32) * 5;
+        let delta_y_px = (down_1 as i32 - up_1 as i32) + (down_5 as i32 - up_5 as i32) * 5;
+        if delta_x_px == 0 && delta_y_px == 0 {
+            return;
+        }
+
+        let page_delta = [delta_x_px as f32, delta_y_px as f32];
+        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|v| v.get_mut(selected_idx))
+        else {
+            return;
+        };
+
+        // A perspective-deformed raster (mesh present) renders from its mesh points, so translate the
+        // mesh; the plain affine raster moves its center. Matches the mouse-drag Move path.
+        if let Some(rec) = layer.deform.as_ref() {
+            let Some(mut mesh) = TypingOverlayDeformMesh::from_deform_rec(rec, page_size) else {
+                return;
+            };
+            mesh.translate(page_delta[0], page_delta[1], page_size);
+            layer.deform = Some(crate::models::layer_model::manifest::DeformRec {
+                cols: mesh.cols,
+                rows: mesh.rows,
+                points_px: mesh.points_px.clone(),
+            });
+            let (uid, transform, deform) =
+                (layer.uid.clone(), layer.transform, layer.deform.clone());
+            self.persist_raster_deform(page_idx, &uid, transform, deform);
+        } else {
+            let mut center = clamp_page_point(
+                [
+                    layer.transform.cx + page_delta[0],
+                    layer.transform.cy + page_delta[1],
+                ],
+                page_size,
+            );
+            if strict_pixel_movement {
+                center = clamp_page_point([center[0].round(), center[1].round()], page_size);
+            }
+            layer.transform.cx = center[0];
+            layer.transform.cy = center[1];
+            let (uid, transform) = (layer.uid.clone(), layer.transform);
+            self.persist_raster_transform(page_idx, &uid, transform);
+        }
+        ui.ctx().request_repaint();
+    }
+
     fn try_trigger_selected_overlay_auto_typing_by_hotkey(
         &mut self,
         ctx: &egui::Context,
@@ -6999,6 +7140,14 @@ impl TypingTextOverlayLayer {
             self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
             self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
             self.try_move_selected_overlay_by_arrow_shortcuts(
+                ui,
+                page_idx,
+                image_rect,
+                zoom,
+                panel_text_input_focused,
+                strict_pixel_movement,
+            );
+            self.try_move_selected_raster_by_arrow_shortcuts(
                 ui,
                 page_idx,
                 image_rect,

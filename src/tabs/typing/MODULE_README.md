@@ -62,7 +62,8 @@ The main data flow is:
    layers** interleaved with the overlays by band Z (`TypingRasterLayer` / `ensure_raster_layers_for_page`
    via `layer_model::persist::load_page_rasters`). Rasters are now **editable** in this tab, not
    read-only: `interact_page_rasters` adds canvas select + move/rotate drag (parity with overlays;
-   scale via `-`/`=`/`0`). Selecting a raster opens the **same right-side edit panel that image
+   scale via `-`/`=`/`0`, arrow-key pixel nudge via `try_move_selected_raster_by_arrow_shortcuts`).
+   Selecting a raster opens the **same right-side edit panel that image
    overlays use** (scale + rotation + the effects cards, no text params): `selected_item_for_edit`
    builds an `Image`-kind `TypingSelectedOverlayForEdit` carrying a `TypingEditTarget::Raster{page,uid}`,
    and `queue_selected_overlay_edit_request` routes `ImageTransform`/`ImageEffects` to

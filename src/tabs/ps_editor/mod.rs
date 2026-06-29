@@ -2127,7 +2127,24 @@ impl PsEditorTabState {
             RowSel::Text(uid) => persist::BandRef::PinnedText(uid.clone()),
             RowSel::Group(_) => return,
         };
-        // Ensure freshly-added rasters have manifest nodes before reordering bands.
+        // Ensure the page's rasters are on disk BEFORE the synchronous band-order write below:
+        // `persist_current_page` now ENQUEUES (async) so it cannot guarantee the raster nodes are
+        // written in time, and `apply_band_order` SILENTLY SKIPS a `BandRef::Raster` missing from the
+        // manifest (dropping its new Z → the reorder is lost on reload). A synchronous `flush_page`
+        // writes them now; `persist_current_page` still runs for the deletion (`removed_uids`)
+        // bookkeeping, and its later job preserves the band Z set here (z is read back from disk).
+        if let Some(doc) = self.layer_doc.clone()
+            && let Ok(mut guard) = doc.lock()
+            && let Err(err) = guard.flush_page(
+                page_idx,
+                &project.paths.unsaved_layers_dir,
+                Some(&project.paths.layers_dir),
+            )
+        {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] sync flush before band reorder (page {page_idx}): {err}"
+            ));
+        }
         self.persist_current_page(project);
         let (group_of, pinned) = self.current_membership();
         let order = self.build_unified_order(&group_of, &pinned);
@@ -2378,7 +2395,24 @@ impl PsEditorTabState {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
-        // Ensure freshly-added rasters have manifest nodes before reordering bands.
+        // Ensure the page's rasters are on disk BEFORE the synchronous band-order write below:
+        // `persist_current_page` now ENQUEUES (async) so it cannot guarantee the raster nodes are
+        // written in time, and `apply_band_order` SILENTLY SKIPS a `BandRef::Raster` missing from the
+        // manifest (dropping its new Z → the reorder is lost on reload). A synchronous `flush_page`
+        // writes them now; `persist_current_page` still runs for the deletion (`removed_uids`)
+        // bookkeeping, and its later job preserves the band Z set here (z is read back from disk).
+        if let Some(doc) = self.layer_doc.clone()
+            && let Ok(mut guard) = doc.lock()
+            && let Err(err) = guard.flush_page(
+                page_idx,
+                &project.paths.unsaved_layers_dir,
+                Some(&project.paths.layers_dir),
+            )
+        {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] sync flush before band reorder (page {page_idx}): {err}"
+            ));
+        }
         self.persist_current_page(project);
         let (group_of, pinned) = self.current_membership();
         let bands = self.build_unified_order(&group_of, &pinned);
