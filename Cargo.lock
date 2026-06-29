@@ -138,6 +138,8 @@ dependencies = [
 [[package]]
 name = "ag-psd"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "111b567ed4e14c43fd79dfb4a8c7bfbff815223eb76875e170f7a102174b97af"
 dependencies = [
  "flate2",
 ]

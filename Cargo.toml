@@ -4,7 +4,7 @@ version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ag-psd"]
+members = ["."]
 
 [features]
 active-logs = []
@@ -38,7 +38,7 @@ libc = "0.2"
 texture-synthesis = "0.8.2"
 translators = { version = "0.1.5", default-features = false, features = ["google"] }
 rayon = "1"
-ag-psd = { path = "crates/ag-psd" }
+ag-psd = "0.1.0"
 zspell = "0.5"
 genai = "0.6"
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "crypto-rust", "vendored"] }
