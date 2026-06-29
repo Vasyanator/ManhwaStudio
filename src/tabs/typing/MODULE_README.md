@@ -27,9 +27,15 @@ The main data flow is:
    normalized up front by the SHARED codec `text_payload::migrate_overlay_entries` (absolute ribbon
    `x`/`y` via `project::LegacyRibbonGeometry`, top-left `u`/`v` via the PNG footprint) — IN MEMORY
    only; `text_info.json` is never rewritten. Persistence is owned by the shared `LayerDoc`: overlays
-   become **text nodes** in `layers.json` with their FULL inline payload via the doc's text flush
-   (`flush_page_text` / `write_page_text_payload`). `text_info.json` is READ-ONLY legacy and is ignored
-   once the page has migrated to inline. **Text order is FULLY MANUAL** (auto-Y retired): every text is
+   become **text nodes** in `layers.json` with their FULL inline payload via the doc's text flush.
+   Persistence is now OFF-THREAD: the placement autosave, `flush_text_layers` (save-to-project), and
+   per-page text saves call `doc.enqueue_page_text_save` (the doc's background saver, coalescing PNG
+   encode off-thread; sync-flush fallback when no saver). EXCEPTION: `flush_target_page_text_to_staging`
+   (right before a raster-create worker reads the page's on-disk staging) stays SYNCHRONOUS — an async
+   enqueue would race that read and resurrect a deleted-last-text overlay, and we cannot barrier on the
+   GUI thread. `flush_text_layers` still returns the OWNED page set on a successful enqueue; the
+   save-to-project merge worker barriers the saver before reading staging, so enqueued text is on disk
+   first. `text_info.json` is READ-ONLY legacy and is ignored once the page has migrated to inline. **Text order is FULLY MANUAL** (auto-Y retired): every text is
    pinned-with-explicit-Z on one unified axis with rasters (text may sit BELOW a raster). Legacy
    `TextGroup`s are flattened into per-text bands ON READ by `layer_doc::ensure_page_loaded`, preserving
    the current page-Y visual order; the writers (`write_page_text_payload`) always emit text pinned and
@@ -62,8 +68,9 @@ The main data flow is:
    and `queue_selected_overlay_edit_request` routes `ImageTransform`/`ImageEffects` to
    `apply_raster_transform_edit` / `apply_raster_effects_edit`. Raster effects are **non-destructive**:
    the worker (`render_raster_effects`) renders the chain from the ORIGINAL `base_file`, and
-   `poll_raster_effects_jobs` persists via `persist::update_raster_effects` (writes a `_fx` PNG, keeps
-   the base), so effects survive a restart and removing them restores the original. One selection
+   `poll_raster_effects_jobs` persists via `doc.enqueue_raster_effects` (the off-thread effects-only
+   saver path; writes a `_fx` PNG, keeps the base; sync `persist::update_raster_effects` fallback when
+   no doc/saver), so effects survive a restart and removing them restores the original. One selection
    at a time across the two kinds (`selected_raster_idx` vs `selected_overlay_idx`, funnelled through
    `select_raster`). Transforms persist via `persist::update_raster_transform` (no whole-page
    rewrite). A **right-click (ПКМ) canvas context menu** on a selected raster mirrors the text-overlay

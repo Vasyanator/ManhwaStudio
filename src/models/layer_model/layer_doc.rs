@@ -16,6 +16,14 @@ backed by the existing `persist` functions. Text-node DISK loading is a follow-u
 Persistence is via the existing `persist` API: `load_page_rasters` / `load_page_bands` on the way
 in, `save_page_rasters` + `update_raster_effects` on the way out. The doc is authoritative over the
 rasters it holds, so a flush writes the doc's effects chain (not merely whatever was on disk).
+
+The doc exposes BOTH a synchronous flush (`flush_page` / `flush_page_text`, byte-stable, used by
+tests and read-back paths) and an ADDITIVE async path: with an optional `LayerSaver` enabled
+(`enable_background_saver`), `enqueue_page_save` / `enqueue_page_text_save` build an OWNED page job
+(via `build_page_save_job`, cloning the same data the sync flush gathers) and hand it to the
+coalescing background saver in `saver.rs`; without a saver they fall back to the synchronous flush.
+The saver runs the identical `persist::*` write sequence off-thread, so on-disk bytes match the sync
+flush. `Drop` shuts the saver down (flush queue + join).
 */
 
 use std::collections::HashMap;
@@ -27,6 +35,10 @@ use serde_json::Value;
 use super::manifest::{DeformRec, TransformRec};
 use super::ordering::Band;
 use super::persist::{self, GroupMeta, RasterLayerOut};
+use super::saver::{
+    EffectsSaveItem, LayerSaver, LayerSaverHandle, OwnedRasterLayer, OwnedTextNode, PageSaveJob,
+    RasterSavePart, TextSavePart,
+};
 use super::text_payload;
 use crate::trace::cat;
 
@@ -146,6 +158,31 @@ pub struct DocPage {
     pub groups: Vec<GroupMeta>,
 }
 
+/// An OWNED, fully-decoded page payload built off any doc lock by [`LayerDoc::decode_page_payload`].
+///
+/// It is the exact set of values `ensure_page_loaded` produces BEFORE inserting them into
+/// `LayerDoc::pages`: the page's raster + text `LayerNode`s (already sorted bottom-to-top and
+/// re-ranked to unique contiguous `z`) and its raster-layer groups. All disk I/O and PNG decode that
+/// produced it happened WITHOUT holding the doc lock; moving it into the doc is a cheap, lock-brief
+/// insert (`insert_decoded_page`). `LayerNode`/`ColorImage`/`Value` are `Send`, so a payload can be
+/// produced on a worker thread and inserted on the GUI thread.
+#[must_use]
+pub struct DecodedPagePayload {
+    pub nodes: Vec<LayerNode>,
+    pub groups: Vec<GroupMeta>,
+}
+
+// Compact, pixel-free Debug so a `LoadedPage`/`PageLoadResult` carrying a payload stays `Debug`
+// (the page-loader worker structs derive it) without dumping multi-MB image buffers into logs.
+impl std::fmt::Debug for DecodedPagePayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedPagePayload")
+            .field("nodes", &self.nodes.len())
+            .field("groups", &self.groups.len())
+            .finish()
+    }
+}
+
 /// The shared in-memory layer document: pages loaded on demand, keyed by page index.
 pub struct LayerDoc {
     pages: HashMap<usize, DocPage>,
@@ -154,6 +191,12 @@ pub struct LayerDoc {
     /// store the last version they projected and re-project their current page whenever it changes;
     /// this is the in-memory cross-tab sync (replacing the old disk-revision bridge).
     version: u64,
+    /// Optional background saver (additive). When present, `enqueue_page_save` /
+    /// `enqueue_page_text_save` route page persistence off-thread (coalescing); when absent (the
+    /// default — e.g. unit tests that construct a bare `LayerDoc`), those entry points fall back to the
+    /// synchronous `flush_page` / `flush_page_text`. Created lazily via `enable_background_saver` so a
+    /// constructed-and-dropped doc spawns no thread.
+    saver: Option<LayerSaver>,
 }
 
 impl Default for LayerDoc {
@@ -168,6 +211,7 @@ impl LayerDoc {
         Self {
             pages: HashMap::new(),
             version: 0,
+            saver: None,
         }
     }
 
@@ -193,18 +237,16 @@ impl LayerDoc {
 
     /// Loads `page_idx` into memory if not already resident.
     ///
-    /// Reads the page's raster layers via `persist::load_page_rasters` and builds raster `LayerNode`s.
-    /// Each node's unified `z` comes from the page's bands (`persist::load_page_bands`, matched by
-    /// uid); a raster without a matching band falls back to its load index.
+    /// Convenience composition of [`Self::decode_page_payload`] (disk I/O + PNG decode + legacy
+    /// migration, lock-free) and [`Self::insert_decoded_page`] (the cheap memoized move). Kept for the
+    /// synchronous callers and the unit tests; the off-thread page load splits the two steps so the
+    /// decode runs on a worker and only the insert runs under the shared doc lock.
     ///
-    /// It then loads TEXT nodes: metadata from `persist::load_page_text_nodes`, geometry/pixels/render
-    /// params from the matching `text_info.json` overlay payload (keyed by `payload_uid`). A text
-    /// node's unified `z` comes from its pinned-text band, else its text-group band (by `layer_idx`),
-    /// else a past-the-top fallback — mirroring the typing tab's `overlay_band_z`. Text nodes whose
-    /// overlay payload or PNG is missing are warned about and skipped.
+    /// See [`Self::decode_page_payload`] for the full decode contract (raster + text node build,
+    /// unified-Z re-rank, the FULL-`page_sizes`-map ribbon-migration requirement).
     ///
-    /// All nodes are then sorted bottom-to-top by `z`; rasters are pushed before texts and the sort is
-    /// stable, so a raster sorts before a text at the same `z` (the live render tiebreak).
+    /// # Errors
+    /// Propagates [`Self::decode_page_payload`]'s error string.
     pub fn ensure_page_loaded(
         &mut self,
         page_idx: usize,
@@ -215,7 +257,69 @@ impl LayerDoc {
         if self.pages.contains_key(&page_idx) {
             return Ok(());
         }
-        let _span = crate::trace_scope!(cat::PERSIST, "ensure_page_loaded page={}", page_idx);
+        // Decode off the (here non-existent) lock, then move the payload in. Identical behavior to the
+        // pre-split monolith; the split lets a worker run `decode_page_payload` lock-free and the GUI
+        // thread run only the cheap `insert_decoded_page`.
+        let payload = Self::decode_page_payload(page_idx, primary_dir, fallback_dir, page_sizes)?;
+        self.insert_decoded_page(page_idx, payload);
+        Ok(())
+    }
+
+    /// Inserts an already-decoded page payload into the doc, taking effect only if `page_idx` is not
+    /// already resident (memoization: a live page's in-memory edits are NEVER clobbered by a stale
+    /// background decode). On a real insert the document `version` is bumped so both tabs re-project.
+    ///
+    /// This is the ONLY lock-held step of a page load: it moves an OWNED [`DecodedPagePayload`] (built
+    /// lock-free by [`Self::decode_page_payload`]) into `self.pages`. No disk I/O or PNG decode happens
+    /// here, so a shared `Arc<Mutex<LayerDoc>>` is held only for this cheap move.
+    pub fn insert_decoded_page(&mut self, page_idx: usize, payload: DecodedPagePayload) {
+        if self.pages.contains_key(&page_idx) {
+            // Already loaded (e.g. a concurrent sync load, or the page was edited between the
+            // background decode request and this insert): discard the freshly-decoded payload so live
+            // in-memory edits survive. Mirrors `ensure_page_loaded`'s memoization no-op.
+            crate::trace_log!(
+                cat::PERSIST,
+                "insert_decoded_page page={} already resident; discarding decoded payload",
+                page_idx
+            );
+            return;
+        }
+        crate::trace_log!(
+            cat::PERSIST,
+            "insert_decoded_page page={} nodes={} groups={}",
+            page_idx,
+            payload.nodes.len(),
+            payload.groups.len()
+        );
+        self.pages.insert(
+            page_idx,
+            DocPage {
+                nodes: payload.nodes,
+                groups: payload.groups,
+            },
+        );
+        self.bump_version();
+    }
+
+    /// Decodes a page's full layer payload from disk WITHOUT touching `LayerDoc` state, so it can run
+    /// off the GUI thread (the page loader worker) or under no lock. It performs ALL the disk I/O and
+    /// PNG decode + legacy migration that `ensure_page_loaded` used to do inline, and returns the OWNED
+    /// [`DecodedPagePayload`] to hand to [`Self::insert_decoded_page`].
+    ///
+    /// `page_sizes` MUST be the FULL chapter page-size map (`page_idx -> [w, h]`): the absolute-ribbon
+    /// legacy migration recovers a chapter-wide ribbon scale from EVERY page's aspect ratio, so a
+    /// partial map corrupts the geometry of legacy chapters. The loaded page's own size is
+    /// `page_sizes[page_idx]` (defaulting to `[1, 1]` when absent).
+    ///
+    /// # Errors
+    /// Returns the persist-layer error string if `load_page_rasters` or `load_page_text_nodes` fails.
+    pub fn decode_page_payload(
+        page_idx: usize,
+        primary_dir: &Path,
+        fallback_dir: Option<&Path>,
+        page_sizes: &HashMap<usize, [usize; 2]>,
+    ) -> Result<DecodedPagePayload, String> {
+        let _span = crate::trace_scope!(cat::PERSIST, "decode_page_payload page={}", page_idx);
         // Pixel size of the page being loaded (page-relative uv → page px). The FULL chapter map is
         // required for the cross-entry ribbon migration below — see the comment there.
         let page_size = page_sizes.get(&page_idx).copied().unwrap_or([1, 1]);
@@ -224,7 +328,7 @@ impl LayerDoc {
         let bands = persist::load_page_bands(primary_dir, fallback_dir, page_idx);
         crate::trace_log!(
             cat::PERSIST,
-            "ensure_page_loaded page={} rasters={} groups={} bands={}",
+            "decode_page_payload page={} rasters={} groups={} bands={}",
             page_idx,
             rasters.layers.len(),
             rasters.groups.len(),
@@ -488,7 +592,7 @@ impl LayerDoc {
         // same z, matching the live render tiebreak.
         crate::trace_log!(
             cat::PERSIST,
-            "ensure_page_loaded page={} text_nodes={} inline_built={} migrated={}",
+            "decode_page_payload page={} text_nodes={} inline_built={} migrated={}",
             page_idx,
             texts.len(),
             built_inline.len(),
@@ -525,19 +629,14 @@ impl LayerDoc {
 
         crate::trace_log!(
             cat::PERSIST,
-            "ensure_page_loaded page={} total_nodes={} (final z-order assigned)",
+            "decode_page_payload page={} total_nodes={} (final z-order assigned)",
             page_idx,
             nodes.len()
         );
-        self.pages.insert(
-            page_idx,
-            DocPage {
-                nodes,
-                groups: rasters.groups,
-            },
-        );
-        self.bump_version();
-        Ok(())
+        Ok(DecodedPagePayload {
+            nodes,
+            groups: rasters.groups,
+        })
     }
 
     #[must_use]
@@ -1307,6 +1406,306 @@ impl LayerDoc {
             page.nodes[i].pixels_dirty = false;
         }
         Ok(())
+    }
+
+    // Async-save API (`enable_background_saver` … `clear_page_text_dirty`): wired into the GUI tabs
+    // (PS per-edit/raster flushes, typing text flushes) and the save-to-project / app-close barriers.
+    /// Enables the background (coalescing) saver on this doc, if not already enabled. After this,
+    /// `enqueue_page_save` / `enqueue_page_text_save` route persistence off-thread. Idempotent:
+    /// a second call is a no-op (the existing saver + its worker thread are kept).
+    pub fn enable_background_saver(&mut self) {
+        if self.saver.is_none() {
+            self.saver = Some(LayerSaver::new());
+            crate::trace_log!(cat::PERSIST, "enable_background_saver: saver enabled");
+        }
+    }
+
+    /// A cheap-clone handle to the background saver, if one is enabled, so a merge worker can enqueue
+    /// jobs / run a barrier without locking the doc. `None` when no saver is enabled.
+    #[must_use]
+    pub fn saver_handle(&self) -> Option<LayerSaverHandle> {
+        self.saver.as_ref().map(LayerSaver::handle)
+    }
+
+    /// Shuts the background saver down (sentinel + join), if one is enabled, flushing its queue first.
+    /// Called by `Drop`; safe to call explicitly. A no-op when no saver is enabled.
+    pub fn shutdown_saver(&mut self) {
+        if let Some(saver) = self.saver.take() {
+            saver.shutdown();
+        }
+    }
+
+    /// ASYNC whole-page save: when the background saver is enabled, builds the page's owned save job
+    /// and enqueues it (coalescing, off-thread); otherwise falls back to the synchronous [`flush_page`]
+    /// so behavior is safe either way. No-op (returns `Ok`) if the page is not resident.
+    ///
+    /// Mirrors `flush_page`'s contract: callers that need the bytes ON DISK before reading them must
+    /// `barrier_blocking` the saver handle (the enqueue is fire-and-forget).
+    ///
+    /// # Errors
+    /// Only the synchronous fallback path can return an error (the async path enqueues and returns
+    /// `Ok`); it matches [`flush_page`]'s error propagation.
+    pub fn enqueue_page_save(
+        &mut self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+    ) -> Result<(), String> {
+        if self.saver.is_some() {
+            if let Some(job) = self.build_page_save_job(page_idx, layers_dir, fallback_dir, &[]) {
+                // Clearing `pixels_dirty` mirrors the sync flush: the owned job already captured the
+                // dirty pixels, so a later re-flush of an unchanged page need not re-encode.
+                if let Some(saver) = &self.saver {
+                    saver.enqueue(job);
+                }
+                self.clear_page_dirty(page_idx);
+            }
+            Ok(())
+        } else {
+            self.flush_page(page_idx, layers_dir, fallback_dir)
+        }
+    }
+
+    /// ASYNC text-only save: when the background saver is enabled, builds a TEXT-ONLY owned save job
+    /// and enqueues it; otherwise falls back to the synchronous [`flush_page_text`]. No-op (returns
+    /// `Ok`) if the page is not resident.
+    ///
+    /// # Errors
+    /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
+    pub fn enqueue_page_text_save(
+        &mut self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+    ) -> Result<(), String> {
+        if self.saver.is_some() {
+            if let Some(text) = self.build_text_save_part(page_idx) {
+                let job = PageSaveJob {
+                    page_idx,
+                    layers_dir: layers_dir.to_path_buf(),
+                    fallback_dir: fallback_dir.map(Path::to_path_buf),
+                    raster: None,
+                    text: Some(text),
+                    effects: Vec::new(),
+                };
+                if let Some(saver) = &self.saver {
+                    saver.enqueue(job);
+                }
+                self.clear_page_text_dirty(page_idx);
+            }
+            Ok(())
+        } else {
+            self.flush_page_text(page_idx, layers_dir, fallback_dir)
+        }
+    }
+
+    /// ASYNC targeted effects update for a SINGLE raster: when the background saver is enabled,
+    /// enqueues an effects-only job that reconciles only this raster's chain + rendered PNG (never a
+    /// whole-page raster rewrite); otherwise falls back to the synchronous `persist::update_raster_effects`
+    /// so behavior is safe either way. `display` is the post-effects render (`None` ⇒ CLEAR the chain
+    /// and delete any rendered PNG). The bytes written are identical to the direct sync call; only the
+    /// PNG encode moves off the GUI thread.
+    ///
+    /// Unlike a whole-page save this does NOT depend on the page being resident in the doc — it targets
+    /// the on-disk node by `uid` (mirroring the callers' existing direct `update_raster_effects`).
+    ///
+    /// # Errors
+    /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
+    pub fn enqueue_raster_effects(
+        &self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+        uid: &str,
+        effects: &[serde_json::Value],
+        display: Option<&ColorImage>,
+    ) -> Result<(), String> {
+        if let Some(saver) = &self.saver {
+            saver.enqueue(PageSaveJob {
+                page_idx,
+                layers_dir: layers_dir.to_path_buf(),
+                fallback_dir: fallback_dir.map(Path::to_path_buf),
+                raster: None,
+                text: None,
+                effects: vec![EffectsSaveItem {
+                    uid: uid.to_string(),
+                    effects: effects.to_vec(),
+                    display_image: display.cloned(),
+                }],
+            });
+            Ok(())
+        } else {
+            persist::update_raster_effects(layers_dir, page_idx, uid, effects, display, fallback_dir)
+        }
+    }
+
+    /// Builds the OWNED whole-page save job for the background saver, CLONING all data the persist call
+    /// needs so the worker holds no borrow into the doc. The field selection mirrors `flush_page_inner`
+    /// (rasters bottom-to-top by `z`, base image + `pixels_dirty` + effects/display) and `write_page_text`
+    /// (text nodes bottom-to-top by `z`) EXACTLY, so the worker's `persist::*` calls produce the same
+    /// bytes the synchronous flush would. `removed_raster_uids` matches `flush_page_dropping_raster`'s
+    /// drop set. Returns `None` if the page is not resident.
+    #[must_use]
+    fn build_page_save_job(
+        &self,
+        page_idx: usize,
+        layers_dir: &Path,
+        fallback_dir: Option<&Path>,
+        removed_raster_uids: &[String],
+    ) -> Option<PageSaveJob> {
+        let page = self.pages.get(&page_idx)?;
+        let raster = Self::build_raster_save_part(page, removed_raster_uids);
+        let text = Self::build_text_save_part_from(page);
+        Some(PageSaveJob {
+            page_idx,
+            layers_dir: layers_dir.to_path_buf(),
+            fallback_dir: fallback_dir.map(Path::to_path_buf),
+            raster: Some(raster),
+            text: Some(text),
+            effects: Vec::new(),
+        })
+    }
+
+    /// Builds ONLY the owned text part for a resident page (for the text-only async path). `None` if
+    /// the page is not resident.
+    #[must_use]
+    fn build_text_save_part(&self, page_idx: usize) -> Option<TextSavePart> {
+        let page = self.pages.get(&page_idx)?;
+        Some(Self::build_text_save_part_from(page))
+    }
+
+    /// Gathers the owned RASTER part of a page save, mirroring `flush_page_inner`'s `outs` build
+    /// (bottom-to-top by `z`; base image + `pixels_dirty` + mask-clip; the effects chain + display
+    /// image so the worker can reconcile effects exactly like the sync flush).
+    #[must_use]
+    fn build_raster_save_part(page: &DocPage, removed_raster_uids: &[String]) -> RasterSavePart {
+        let mut raster_indices: Vec<usize> = page
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.is_raster())
+            .map(|(i, _)| i)
+            .collect();
+        raster_indices.sort_by_key(|&i| page.nodes[i].z);
+
+        let mut layers: Vec<OwnedRasterLayer> = Vec::with_capacity(raster_indices.len());
+        for &i in &raster_indices {
+            let node = &page.nodes[i];
+            let NodeBody::Raster {
+                base_image,
+                display_image,
+                effects,
+                mask_clip,
+                ..
+            } = &node.body
+            else {
+                continue;
+            };
+            // The display image is only needed when there is a non-empty effects chain to reconcile
+            // (the sync flush's `update_raster_effects` is gated on a non-empty chain). Cloning it
+            // unconditionally would waste a copy on the common no-effects raster.
+            let display = if effects.is_empty() {
+                None
+            } else {
+                Some(display_image.clone())
+            };
+            layers.push(OwnedRasterLayer {
+                uid: node.uid.clone(),
+                name: node.name.clone(),
+                visible: node.visible,
+                opacity: node.opacity,
+                transform: node.transform,
+                deform: node.deform.clone(),
+                group_uid: node.group_uid.clone(),
+                base_image: base_image.clone(),
+                pixels_dirty: node.pixels_dirty,
+                mask_clip: *mask_clip,
+                display_image: display,
+                effects: effects.clone(),
+            });
+        }
+        RasterSavePart {
+            layers,
+            groups: page.groups.clone(),
+            removed_uids: removed_raster_uids.to_vec(),
+        }
+    }
+
+    /// Gathers the owned TEXT part of a page save, mirroring `write_page_text`'s per-node out build
+    /// (bottom-to-top by `z`; full inline payload + rendered image + `pixels_dirty`). The worker
+    /// reproduces the "rewrite PNG iff dirty or missing" rule from the carried `pixels_dirty`.
+    #[must_use]
+    fn build_text_save_part_from(page: &DocPage) -> TextSavePart {
+        let mut text_indices: Vec<usize> = page
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.kind, NodeKind::Text))
+            .map(|(i, _)| i)
+            .collect();
+        text_indices.sort_by_key(|&i| page.nodes[i].z);
+
+        let mut nodes: Vec<OwnedTextNode> = Vec::with_capacity(text_indices.len());
+        for &i in &text_indices {
+            let node = &page.nodes[i];
+            let NodeBody::Text {
+                render_data,
+                image,
+                payload_uid,
+                mask_clip,
+            } = &node.body
+            else {
+                continue;
+            };
+            nodes.push(OwnedTextNode {
+                uid: node.uid.clone(),
+                name: node.name.clone(),
+                z: node.z,
+                layer_idx: node.text_layer_idx.unwrap_or(0),
+                visible: node.visible,
+                opacity: node.opacity,
+                group_uid: node.group_uid.clone(),
+                payload_uid: payload_uid.clone(),
+                render_data: render_data.clone(),
+                transform: node.transform,
+                deform: node.deform.clone(),
+                mask_clip: *mask_clip,
+                image: image.clone(),
+                pixels_dirty: node.pixels_dirty,
+            });
+        }
+        TextSavePart { nodes }
+    }
+
+    /// Clears `pixels_dirty` on every node of a resident page (after its owned job captured the dirty
+    /// pixels), so an unchanged page need not re-encode on a later async flush — mirroring the sync
+    /// flush's post-write dirty clear.
+    fn clear_page_dirty(&mut self, page_idx: usize) {
+        if let Some(page) = self.pages.get_mut(&page_idx) {
+            for node in &mut page.nodes {
+                node.pixels_dirty = false;
+            }
+        }
+    }
+
+    /// Clears `pixels_dirty` on every TEXT node of a resident page (after a text-only async flush
+    /// captured them), leaving raster dirty flags untouched.
+    fn clear_page_text_dirty(&mut self, page_idx: usize) {
+        if let Some(page) = self.pages.get_mut(&page_idx) {
+            for node in &mut page.nodes {
+                if matches!(node.kind, NodeKind::Text) {
+                    node.pixels_dirty = false;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LayerDoc {
+    /// Shuts the background saver down (flush queue + join the worker) if one was enabled. A doc with
+    /// no saver (the default — most unit tests) does nothing here, spawning/joining no thread.
+    fn drop(&mut self) {
+        self.shutdown_saver();
     }
 }
 
@@ -2610,5 +3009,123 @@ mod tests {
         let r_gen = doc.node(0, "r").unwrap().generation;
         doc.set_text_render(0, "r", serde_json::json!({"x": 1}), img([9, 9], Color32::RED));
         assert_eq!(doc.node(0, "r").unwrap().generation, r_gen, "no-op on a raster node");
+    }
+
+    /// A compact, comparable fingerprint of a loaded page's nodes + groups, so the split path and the
+    /// monolith can be asserted byte-for-byte equal without depending on `LayerNode`/`ColorImage`
+    /// equality (which they do not implement). Captures every field that the split must preserve.
+    fn page_fingerprint(page: &DocPage) -> String {
+        let nodes: Vec<String> = page
+            .nodes
+            .iter()
+            .map(|n| {
+                let kind = match n.kind {
+                    NodeKind::Raster => "R",
+                    NodeKind::Text => "T",
+                };
+                let img = n.display_image();
+                format!(
+                    "{kind}|uid={}|name={}|z={}|vis={}|op={:.4}|grp={:?}|tli={:?}|cx={:.4}|cy={:.4}|rot={:.4}|sc={:.4}|deform={}|wh={}x{}",
+                    n.uid,
+                    n.name,
+                    n.z,
+                    n.visible,
+                    n.opacity,
+                    n.group_uid,
+                    n.text_layer_idx,
+                    n.transform.cx,
+                    n.transform.cy,
+                    n.transform.rotation,
+                    n.transform.scale,
+                    n.deform.is_some(),
+                    img.size[0],
+                    img.size[1],
+                )
+            })
+            .collect();
+        let groups: Vec<String> = page
+            .groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "G|uid={}|name={}|vis={}|op={:.4}|col={}",
+                    g.uid, g.name, g.visible, g.opacity, g.collapsed
+                )
+            })
+            .collect();
+        format!("nodes=[{}] groups=[{}]", nodes.join(", "), groups.join(", "))
+    }
+
+    /// The off-thread split (`decode_page_payload` + `insert_decoded_page`) must produce a loaded page
+    /// IDENTICAL to the legacy synchronous `ensure_page_loaded`, including the legacy `text_info.json`
+    /// migration-on-read path (which the off-thread worker now runs lock-free). Also checks the insert
+    /// memoization: a second insert onto an already-resident page is a no-op (live edits not clobbered).
+    #[test]
+    fn decode_then_insert_matches_ensure_page_loaded_incl_legacy_ribbon() {
+        let dir = temp_dir("decode_split_eq");
+
+        // A raster at the bottom, a PS group, and a LEGACY text group of three unpinned overlays whose
+        // geometry is decoded through the shared codec with the FULL chapter page-size map — exercising
+        // the same legacy migration path the worker must reproduce.
+        persist::add_page_raster(
+            &dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([3, 3], Color32::RED),
+        )
+        .unwrap();
+        add_text_group_band(&dir, 0, 5);
+        for uid in ["tc", "ta", "tb"] {
+            add_legacy_text_ref_node(&dir, uid, 0, 0, false, true, 1.0);
+        }
+        let mk = |uid: &str, y: f32| {
+            save_png(&dir.join(format!("{uid}.png")), 4, 3, [0, 255, 0, 255]);
+            serde_json::json!({
+                "uid": uid, "img_idx": 0, "overlay_type": "text", "file": format!("{uid}.png"),
+                "img_x_px": 5.0, "img_y_px": y, "rotation_deg": 0.0, "scale": 1.0,
+                "render_data": { "text": uid }
+            })
+        };
+        let overlays = serde_json::json!([mk("ta", 10.0), mk("tb", 20.0), mk("tc", 30.0)]);
+        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+
+        // FULL chapter page-size map (a second page is present so the ribbon solve is non-degenerate).
+        let mut page_sizes = HashMap::new();
+        page_sizes.insert(0usize, [1000usize, 1400usize]);
+        page_sizes.insert(1usize, [1000usize, 1600usize]);
+
+        // Reference: the synchronous monolith.
+        let mut doc_ref = LayerDoc::new();
+        doc_ref.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+        let ref_fp = page_fingerprint(doc_ref.page(0).expect("ref page resident"));
+
+        // Split: decode lock-free, then insert.
+        let payload =
+            LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).expect("decode succeeds");
+        let mut doc_split = LayerDoc::new();
+        let version_before = doc_split.version();
+        doc_split.insert_decoded_page(0, payload);
+        let split_fp = page_fingerprint(doc_split.page(0).expect("split page resident"));
+
+        assert_eq!(ref_fp, split_fp, "split path matches ensure_page_loaded (incl. legacy migration)");
+        assert!(
+            doc_split.version() > version_before,
+            "a real insert bumps the doc version (cross-tab re-projection)"
+        );
+
+        // MEMOIZATION: a second insert of a freshly-decoded payload must NOT clobber the resident page.
+        let payload2 =
+            LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).expect("decode succeeds");
+        let version_after_first = doc_split.version();
+        doc_split.insert_decoded_page(0, payload2);
+        assert_eq!(
+            doc_split.version(),
+            version_after_first,
+            "insert onto an already-resident page is a no-op (does not bump version)"
+        );
+        assert_eq!(
+            page_fingerprint(doc_split.page(0).unwrap()),
+            split_fp,
+            "resident page unchanged by the discarded second payload"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

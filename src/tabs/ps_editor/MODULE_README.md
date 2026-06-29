@@ -9,14 +9,29 @@ owns its own pan/zoom camera, layer stack, selection, tool set, and tiled GPU ca
 Data flow for one page:
 
 ```
-project page -> page_loader (worker) -> LoadedPage (source + clean ColorImage)
-             -> LayerStack (Source + Clean base layers, + session raster layers)
+project page -> page_loader (worker) -> LoadedPage (source + clean ColorImage
+                                         + DecodedPagePayload: user raster/text/group nodes,
+                                           decoded LOCK-FREE via LayerDoc::decode_page_payload)
+             -> poll_loader: brief doc lock to insert_decoded_page (NO decode under lock)
+             -> LayerStack (Source + Clean base layers); sync_view_from_doc materializes the
+                user raster layers + text + bands from the shared LayerDoc (source of truth)
              -> per-layer TiledTexture cache (sized to the layer image, budgeted upload)
              -> draw_canvas: composite bottom->top, each layer mapped local->page->screen
                 via its LayerTransform + ViewTransform (rotated/scaled tile meshes)
 tool input  -> active PsTool::interact -> ToolOutcome (dirty rect / selection change)
             -> tile invalidation; marquee drawn from Selection::outline_loops
 ```
+
+PAGE-SWITCH DECODE IS OFF-THREAD. On a page switch the worker now decodes BOTH base layers AND the
+persisted user-layer payload (raster PNGs + text + groups + legacy `text_info.json` migration) via the
+PURE `LayerDoc::decode_page_payload` (it holds no doc `Arc`, only the dirs + the FULL chapter page-size
+map). `poll_loader` takes the shared doc lock ONLY to `insert_decoded_page` (a cheap move, never a
+decode) — so the doc lock is never held across a multi-MB PNG decode and the GUI stays responsive. The
+raster PNGs are decoded exactly ONCE (the former double decode — `load_persisted_into_stack` plus the
+doc's own decode — is gone; `load_persisted_into_stack` was removed and the stack is built from the
+doc by `sync_view_from_doc`). A worker decode failure leaves the page un-inserted; it still opens with
+its two base layers. GPU texture creation / `render_cache` / `node_generations` reset stay on the GUI
+thread (textures cannot be created off-thread).
 
 The two base layers mirror existing shared state **read-only**:
 - `Исходник` (source) comes from `CleanOverlaysModel::cached_page_rgba` (worker-decoded, cached).
@@ -34,7 +49,22 @@ first visit to a page (`load_persisted_into_stack`). After a successful flush, `
 calls `LayerStack::mark_rasters_persisted` to clear each raster's `pixels_dirty` flag: the base PNG is
 now on disk, so a later flush treats the raster as clean and preserves a non-destructive effects chain
 the typing tab may have added in between — leaving the flag set would re-run the dirty path, rewrite
-the base, and silently drop those effects. Base layers are never persisted — they mirror
+the base, and silently drop those effects.
+
+ASYNC PERSISTENCE: layer writes are now OFF-THREAD via the doc's background saver (`models/layer_model/
+saver.rs`). The per-edit `route_to_doc` flush calls `doc.enqueue_page_save`; text edits call
+`doc.enqueue_page_text_save`; the effects poll (`apply_ps_raster_effects_result`) calls
+`doc.enqueue_raster_effects`. `persist_current_page` stays NON-redundant: it reads the PS `self.stack`
+(not the doc) and carries the EXPLICIT `removed_uids` from `self.deleted_raster_uids` (the doc's
+whole-page enqueue passes an empty removed set, which would PRESERVE a deleted raster as "another
+tab's" → resurrection), so it builds an owned `saver::PageSaveJob` (raster part + explicit removed set,
+no effects reconcile — mirroring the sync `save_page_rasters` that preserves another tab's effects) and
+enqueues it through `doc.saver_handle()`, falling back to a synchronous `save_page_rasters` when no
+saver is enabled. The just-enqueued bytes are guaranteed on disk by the save-to-project merge-worker
+barrier and the app-close drain. `layers_dirty` tracks whether the current page has an edit not yet
+enqueued (set on a deferred `edit_doc_node`, cleared on any enqueue/flush); the tab-switch
+`flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). Base layers
+are never persisted — they mirror
 `src/` and `clean_layers/`. See `models/layer_model/` for the on-disk schema and the unified
 layer-model roadmap (groups, text layers, effects, typing-tab sync).
 
@@ -109,6 +139,16 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 ## Contracts and invariants
 - GUI thread never decodes images or holds the model lock across decode: that is `page_loader`'s
   job; the model lock is released before `image::open`.
+- Non-destructive raster effects render off the GUI thread. `apply_effects_to_raster` parses the
+  chain, clones the pre-effects base ColorImage (dropping the stack borrow first), and spawns
+  `render_ps_raster_effects`, which runs the expensive `apply_effects_to_color_image`. A render
+  already in flight stashes the latest request in `pending_raster_effects` (latest-wins).
+  `poll_ps_raster_effects_jobs` (called once per frame from `draw`) consumes the result and does the
+  cheap GUI-side apply — recenter anchoring, `edit_doc_node` routing (swap base/display/effects +
+  bump generation), reversible `persist::update_raster_effects` (base PNG untouched), `render_cache`
+  drop — then re-dispatches any stashed request. This mirrors the typing tab's
+  `apply_raster_effects_edit` / `render_raster_effects` / `poll_raster_effects_jobs` trio. The base
+  PNG is never rewritten by effects; only the `_fx` rendered PNG is, so the chain stays reversible.
 - Base layers (`LayerKind::Source` / `Clean`) are never written back to `CleanOverlaysModel`. Tools
   only mutate the active editable raster layer (`LayerStack::active_editable_mut`).
 - Selection copy/cut (`clip_into_new_layer`) composites the chosen layers bottom-to-top within the
@@ -157,5 +197,8 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   (`tools/select.rs`); the boundary loops come from `Selection::outline_loops`.
 - To change the copy/cut menu or its compositing/cut rules, edit `draw_selection_menu`,
   `clip_op_submenu`, `clip_layer_picker`, and `clip_into_new_layer` in `mod.rs`.
+- To change the raster effects pipeline (off-thread render, recenter, persist), edit
+  `apply_effects_to_raster`, `render_ps_raster_effects`, `poll_ps_raster_effects_jobs`, and
+  `apply_ps_raster_effects_result` in `mod.rs`.
 - To change GPU upload/compositing, edit `layer_render.rs` and `mod.rs::draw_canvas`.
 - To change how base layers are sourced, edit `page_loader.rs`.

@@ -16,6 +16,12 @@ Architecture:
 - `page_loader`: background worker that produces the two base-layer images for the active page.
 - `layer_render`: per-layer tiled texture cache (budgeted upload, dirty tiles).
 - `tools`: `PsTool` trait + selection/brush tools; the tab routes pointer input to the active tool.
+- raster effects: applying a non-destructive effects chain runs the expensive
+  `apply_effects_to_color_image` on a worker thread (`render_ps_raster_effects`), never the GUI
+  thread. `apply_effects_to_raster` clones the base pixels and spawns the render (stashing a
+  latest-wins request via `pending_raster_effects` if one is already in flight);
+  `poll_ps_raster_effects_jobs` (once per frame) does the cheap GUI-side apply (recenter, doc
+  routing, reversible persist). Mirrors the typing tab's `apply_raster_effects_edit` pipeline.
 
 Notes:
 Base layers mirror existing models read-only and are never written back. User raster layers are
@@ -36,6 +42,7 @@ use crate::models::layer_model::effects;
 use crate::models::layer_model::manifest::TransformRec;
 use crate::models::layer_model::ordering::Band;
 use crate::models::layer_model::persist;
+use crate::models::layer_model::saver;
 use crate::project::ProjectData;
 use crate::trace::cat;
 use eframe::egui;
@@ -46,7 +53,9 @@ use page_loader::{PageLoadRequest, PageLoaderHandles, spawn_page_loader_thread};
 use selection::{Selection, SelectionBounds};
 use text_layers::PsTextLayer;
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use tools::brush::BrushTool;
 use tools::deform::DeformTool;
 use tools::select::{SelectMode, SelectTool};
@@ -83,6 +92,11 @@ pub struct PsEditorTabState {
     /// the typing tab), so a deletion must be explicit; the merge skips these so a revision bump
     /// does not resurrect a just-deleted raster. Cleared for a page once its save drops them.
     deleted_raster_uids: HashMap<usize, HashSet<String>>,
+    /// True when the current page has received an edit needing persistence that has NOT yet been
+    /// enqueued/flushed. Per-edit flushes already enqueue (clearing this), so the tab-switch
+    /// `flush_layers` only needs to run when this is set. Conservative: set on any page-mutating edit;
+    /// cleared after a `route_to_doc` enqueue or a `persist_current_page` flush.
+    layers_dirty: bool,
     /// Read-only display of the typing tab's overlays for the current page (text/image overlays
     /// mirrored as text nodes in `layers.json`). Rebuilt on each page load.
     text_layers: Vec<PsTextLayer>,
@@ -132,7 +146,46 @@ pub struct PsEditorTabState {
     /// so the full chapter map can be handed to the shared doc for the legacy ribbon migration without
     /// re-reading every page image on each page load.
     page_sizes_px: HashMap<usize, [usize; 2]>,
+    /// In-flight non-destructive raster-effects render (the expensive `apply_effects_to_color_image`
+    /// runs on a worker thread, never the GUI thread). `poll_ps_raster_effects_jobs` consumes the
+    /// result. Mirrors the typing tab's `raster_effects_state`.
+    raster_effects_state: Option<Receiver<Result<PsRasterEffectsResult, String>>>,
+    /// A raster-effects edit that arrived while a render was already in flight. Only the latest is
+    /// kept (newer edits supersede); it is re-dispatched when the current render completes so the last
+    /// requested effects are never silently dropped (e.g. effecting a second raster right after a
+    /// first). Mirrors the typing tab's `pending_raster_effects`.
+    pending_raster_effects: Option<PendingPsRasterEffects>,
 }
+
+/// Worker result for a non-destructive raster effects render (mirrors the typing tab's
+/// `TypingRasterEffectsResult`): the rendered display image plus the pixel `origin` of the original
+/// base content inside it, used by the GUI-side recenter math. The base PNG is never touched, so the
+/// chain stays reversible.
+#[derive(Debug)]
+struct PsRasterEffectsResult {
+    page_idx: usize,
+    /// Stable doc uid of the effected raster.
+    uid: String,
+    /// Session `LayerId` of the effected raster (used to drop its `render_cache` entry).
+    id: LayerId,
+    /// The post-effects render to display.
+    new_image: ColorImage,
+    /// Pixel offset of the original (pre-effects) base content's top-left inside `new_image`
+    /// (effects like shadow/glow grow the canvas), feeding the recenter anchoring. Matches the
+    /// `[i32; 2]` content origin returned by `apply_effects_to_color_image`.
+    origin: [i32; 2],
+    /// Size `[w, h]` of the pre-effects base image the render started from (recenter reference).
+    base_size: [usize; 2],
+    /// The pre-effects base transform the render started from (recenter reference).
+    base_t: LayerTransform,
+    /// The parsed effects chain that produced `new_image`. Empty means "clear effects".
+    effects: Vec<serde_json::Value>,
+}
+
+/// Inputs needed to re-dispatch a stashed raster-effects request once the in-flight render finishes
+/// (latest-wins): `(layer id, effects-JSON text)`. The page is implicit (the active page when the
+/// poll re-dispatches), matching the typing tab's `pending_raster_effects` stash.
+type PendingPsRasterEffects = (LayerId, String);
 
 /// A camera handed in from `CanvasView`, pending until `page_idx` finishes loading.
 ///
@@ -284,6 +337,7 @@ impl Default for PsEditorTabState {
             next_job_id: 1,
             load_error: None,
             deleted_raster_uids: HashMap::new(),
+            layers_dirty: false,
             text_layers: Vec::new(),
             bands: Vec::new(),
             panel_selection: HashSet::new(),
@@ -302,6 +356,8 @@ impl Default for PsEditorTabState {
             last_overlay_revision: 0,
             node_generations: HashMap::new(),
             page_sizes_px: HashMap::new(),
+            raster_effects_state: None,
+            pending_raster_effects: None,
         }
     }
 }
@@ -642,14 +698,19 @@ impl PsEditorTabState {
             // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
             // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
             guard.mark_changed();
-            // Persist so the change survives a reload / save-to-project.
-            if let Err(err) = guard.flush_page(
+            // Persist so the change survives a reload / save-to-project. ASYNC: enqueue the page job
+            // to the background saver (PNG encode + manifest RMW off the GUI thread); falls back to a
+            // synchronous flush when no saver is enabled. The save-to-project merge worker and the
+            // app-close drain barrier the queue, so an enqueued write is never lost.
+            if let Err(err) = guard.enqueue_page_save(
                 page_idx,
                 &project.paths.unsaved_layers_dir,
                 Some(&project.paths.layers_dir),
             ) {
                 crate::runtime_log::log_warn(format!("[ps_editor] doc flush: {err}"));
             }
+            // This page now has its persist enqueued; the tab-switch flush is redundant for it.
+            self.layers_dirty = false;
         }
         self.sync_view_from_doc(page_idx);
         true
@@ -687,6 +748,9 @@ impl PsEditorTabState {
             // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
             guard.mark_changed();
         }
+        // This edit only changed in-memory MODEL state (it deferred disk persistence to page-leave /
+        // tab-switch), so the page now needs a flush on the next tab-switch.
+        self.layers_dirty = true;
         self.sync_view_from_doc(page_idx);
         true
     }
@@ -701,7 +765,9 @@ impl PsEditorTabState {
         let Ok(mut guard) = doc.lock() else {
             return;
         };
-        if let Err(err) = guard.flush_page_text(
+        // ASYNC text-only persist: enqueue to the background saver (falls back to sync flush when no
+        // saver is enabled). The save-to-project/app-close barriers guarantee the enqueued text lands.
+        if let Err(err) = guard.enqueue_page_text_save(
             page_idx,
             &project.paths.unsaved_layers_dir,
             Some(&project.paths.layers_dir),
@@ -846,24 +912,38 @@ impl PsEditorTabState {
         // Persist the page we are leaving (committed edits are already flushed; this catches any
         // model state not yet written). The new page reloads fresh from disk + the shared doc.
         self.persist_current_page(project);
-        let Some(loader) = &self.loader else {
+        if self.loader.is_none() {
             return;
-        };
+        }
         let job_id = self.next_job_id;
         self.next_job_id += 1;
         self.pending_job_id = Some(job_id);
         self.requested_page_idx = Some(page_idx);
         self.load_error = None;
+        // The worker decodes the persisted user-layer payload off-thread, so it needs the layer dirs
+        // and the FULL chapter page-size map (the doc's legacy ribbon migration requires every page's
+        // aspect ratio). Capturing the page paths here keeps the borrow off `loader` (so we can call
+        // `page_sizes_map(&mut self)`); re-borrow the loader after building the request.
+        let page_path = page.path.clone();
+        let unsaved_layers_dir = project.paths.unsaved_layers_dir.clone();
+        let layers_dir = project.paths.layers_dir.clone();
+        let page_sizes = self.page_sizes_map(project);
         crate::trace_log!(
             cat::PERSIST,
             "page_load request job={} page={}",
             job_id,
             page_idx
         );
+        let Some(loader) = &self.loader else {
+            return;
+        };
         let _ = loader.request_tx.send(Some(PageLoadRequest {
             job_id,
             page_idx,
-            page_path: page.path.clone(),
+            page_path,
+            unsaved_layers_dir,
+            layers_dir,
+            page_sizes,
         }));
     }
 
@@ -872,17 +952,30 @@ impl PsEditorTabState {
     /// Base layers are skipped (they mirror `src/` and `clean_layers/`). Called when leaving a page
     /// and on an explicit project save; previously-visited pages were already written on their own
     /// page switch.
+    ///
+    /// This path is NOT redundant with the per-edit `route_to_doc` enqueue: it reads from the PS
+    /// `self.stack` (not the doc) and carries the EXPLICIT `removed_uids` from `self.deleted_raster_uids`.
+    /// The doc's `enqueue_page_save` passes an empty removed set, so it would PRESERVE a raster the PS
+    /// editor deleted as "another tab's" — a deleted raster would resurrect on disk. So this builds an
+    /// OWNED save job (raster part only — no effects reconcile, mirroring the sync `save_page_rasters`
+    /// that preserves another tab's effects) with the explicit removed set and enqueues it through the
+    /// saver handle (moving the PNG encode off-thread) while preserving the EXACT deletion contract.
+    /// Falls back to the synchronous `save_page_rasters` when no saver is enabled.
     fn persist_current_page(&mut self, project: &ProjectData) {
         let Some(stack) = &self.stack else {
             return;
         };
         let page_idx = stack.page_idx();
         let _s = crate::trace_scope!(cat::PERSIST, "persist_current_page page={}", page_idx);
-        let outs: Vec<persist::RasterLayerOut> = stack
+        // Owned raster layers for the async job. `effects` is left empty + `display_image` None so the
+        // saver's effects-reconcile loop is a no-op for these — mirroring the sync `save_page_rasters`
+        // here, which never reconciles effects (it PRESERVES another tab's on-disk chain on a non-dirty
+        // raster). PS does not own the typing-tab mask-clip flag; `None` preserves the on-disk value.
+        let owned_layers: Vec<saver::OwnedRasterLayer> = stack
             .layers()
             .iter()
             .filter(|layer| layer.kind == LayerKind::Raster)
-            .map(|layer| persist::RasterLayerOut {
+            .map(|layer| saver::OwnedRasterLayer {
                 uid: layer.uid.to_string(),
                 name: layer.name.clone(),
                 visible: layer.visible,
@@ -892,10 +985,11 @@ impl PsEditorTabState {
                 group_uid: layer
                     .group
                     .and_then(|gid| stack.group(gid).map(|g| g.uid.to_string())),
-                image: &layer.image,
+                base_image: layer.image.clone(),
                 pixels_dirty: layer.pixels_dirty,
-                // PS does not own the typing-tab mask-clip flag; `None` preserves the on-disk value.
                 mask_clip: None,
+                display_image: None,
+                effects: Vec::new(),
             })
             .collect();
         let groups: Vec<persist::GroupMeta> = stack
@@ -914,25 +1008,60 @@ impl PsEditorTabState {
             .get(&page_idx)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default();
-        match persist::save_page_rasters(
-            &project.paths.unsaved_layers_dir,
-            page_idx,
-            &outs,
-            &groups,
-            &removed_uids,
-        ) {
+        let raster_count = owned_layers.len();
+        let group_count = groups.len();
+        let removed_count = removed_uids.len();
+
+        // Try the off-thread path: capture the saver handle (clone, no doc lock held during the write).
+        let handle = self
+            .layer_doc
+            .as_ref()
+            .and_then(|doc| doc.lock().ok().and_then(|guard| guard.saver_handle()));
+        let persist_result: Result<(), String> = if let Some(handle) = handle {
+            handle.enqueue(saver::PageSaveJob {
+                page_idx,
+                layers_dir: project.paths.unsaved_layers_dir.clone(),
+                fallback_dir: Some(project.paths.layers_dir.clone()),
+                raster: Some(saver::RasterSavePart {
+                    layers: owned_layers,
+                    groups,
+                    removed_uids,
+                }),
+                text: None,
+                effects: Vec::new(),
+            });
+            Ok(())
+        } else {
+            // No saver: synchronous fallback, byte-identical to the previous direct call.
+            let outs: Vec<persist::RasterLayerOut> = owned_layers
+                .iter()
+                .map(saver::OwnedRasterLayer::as_out)
+                .collect();
+            persist::save_page_rasters(
+                &project.paths.unsaved_layers_dir,
+                page_idx,
+                &outs,
+                &groups,
+                &removed_uids,
+            )
+        };
+
+        match persist_result {
             Ok(()) => {
                 crate::trace_log!(
                     cat::PERSIST,
                     "persist_current_page saved page={} rasters={} groups={} removed={}",
                     page_idx,
-                    outs.len(),
-                    groups.len(),
-                    removed_uids.len()
+                    raster_count,
+                    group_count,
+                    removed_count
                 );
-                // The deletions are now persisted (dropped from the manifest); stop carrying them.
+                // The deletions are captured by the enqueued job (or already written); stop carrying
+                // them so a later flush does not re-emit the now-dropped removed set.
                 self.deleted_raster_uids.remove(&page_idx);
-                // Base PNGs are now on disk: clear `pixels_dirty` so a later flush (e.g. on project
+                // This page's persist is enqueued/written; the tab-switch flush is redundant for it.
+                self.layers_dirty = false;
+                // Base PNGs are (being) written: clear `pixels_dirty` so a later flush (e.g. on project
                 // save) treats these rasters as clean and preserves a non-destructive effects chain
                 // the typing tab added in the meantime, instead of rewriting the base and dropping it.
                 if let Some(stack) = self.stack.as_mut() {
@@ -954,6 +1083,17 @@ impl PsEditorTabState {
         self.persist_current_page(project);
     }
 
+    /// Flushes the active page only when an `edit_doc_node` mutation deferred persistence since the
+    /// last flush (tracked by `layers_dirty`; the per-edit `route_to_doc` path enqueues immediately
+    /// and clears it). Used on a PS→other-tab switch so an unchanged page does not pay a redundant
+    /// snapshot+enqueue every switch. `flush_layers` clears the flag via `persist_current_page`.
+    pub fn flush_layers_if_dirty(&mut self, project: &ProjectData) {
+        if !self.layers_dirty {
+            return;
+        }
+        self.flush_layers(project);
+    }
+
     /// Records that a raster node was removed from the stack this session so the next page save
     /// drops it from the manifest (`save_page_rasters` otherwise preserves rasters it does not own)
     /// and the merge does not resurrect it. No-op for non-raster layers.
@@ -973,59 +1113,6 @@ impl PsEditorTabState {
             .entry(page_idx)
             .or_default()
             .insert(uid);
-    }
-
-    /// Loads persisted raster layers for `page_idx` (unsaved dir first, main dir as fallback) and
-    /// adds them on top of the fresh base layers, preserving their stable uid / visibility / opacity.
-    fn load_persisted_into_stack(stack: &mut LayerStack, page_idx: usize, project: &ProjectData) {
-        match persist::load_page_rasters(
-            &project.paths.unsaved_layers_dir,
-            Some(&project.paths.layers_dir),
-            page_idx,
-        ) {
-            Ok(page) => {
-                // Recreate groups first, mapping each persisted uid to a fresh session id.
-                let mut uid_to_gid: HashMap<String, GroupId> = HashMap::new();
-                for g in page.groups {
-                    let gid = stack.add_group(g.name);
-                    if let Some(group) = stack.group_mut(gid) {
-                        group.visible = g.visible;
-                        group.opacity = g.opacity;
-                        group.collapsed = g.collapsed;
-                        if let Ok(uid) = uuid::Uuid::parse_str(&g.uid) {
-                            group.uid = uid;
-                        }
-                    }
-                    uid_to_gid.insert(g.uid, gid);
-                }
-                for loaded in page.layers {
-                    let id = stack.add_raster_layer_image(
-                        loaded.name,
-                        loaded.image,
-                        rec_to_transform(loaded.transform),
-                    );
-                    if let Some(layer) = stack.layer_mut(id) {
-                        layer.uid = uuid::Uuid::parse_str(&loaded.uid)
-                            .unwrap_or_else(|_| uuid::Uuid::new_v4());
-                        layer.visible = loaded.visible;
-                        layer.opacity = loaded.opacity;
-                        // Restore the non-destructive effects chain + its pre-effects base pixels so
-                        // applying/clearing effects in PS stays reversible (matches the typing tab).
-                        layer.effects = loaded.effects;
-                        layer.base_image = loaded.base_image;
-                        layer.group = loaded
-                            .group_uid
-                            .as_ref()
-                            .and_then(|u| uid_to_gid.get(u).copied());
-                    }
-                }
-            }
-            Err(err) => {
-                crate::runtime_log::log_warn(format!(
-                    "[ps_editor] load layers (page {page_idx}): {err}"
-                ));
-            }
-        }
     }
 
     /// Drains finished load jobs, building a fresh stack for the matching page.
@@ -1059,35 +1146,39 @@ impl PsEditorTabState {
                     page.size[0],
                     page.size[1]
                 );
-                let mut stack =
-                    LayerStack::new(result.page_idx, page.size, page.source, page.clean);
-                // Pull persisted raster layers from disk. The shared `LayerDoc` (loaded just below) is
-                // the source of truth for page state — committed edits are flushed on each edit — so a
-                // re-visit reloads fresh from disk rather than from a session stash.
-                Self::load_persisted_into_stack(&mut stack, result.page_idx, project);
+                // Build a fresh stack with only the two base layers; the user raster layers are
+                // materialized below by `sync_view_from_doc` from the shared `LayerDoc` (the post-
+                // refactor source of truth), so there is NO separate `load_persisted_into_stack` decode
+                // here — the raster PNGs were already decoded ONCE off-thread by the worker.
+                let stack = LayerStack::new(result.page_idx, page.size, page.source, page.clean);
                 self.stack = Some(stack);
-                // Load the disk-truth text layers + bands first (they carry the pin / text-group
-                // metadata the doc node does not), then project the shared `LayerDoc` over the stack
-                // rasters / text model fields / bands so both tabs read one model.
-                self.reload_overlays_view(project, result.page_idx);
-                // Full chapter page sizes: the legacy ribbon migration in the doc needs every page's
-                // aspect ratio to recover the chapter-wide ribbon scale. Seed the loaded page from the
-                // freshly-built stack (authoritative) so a memoized header read can't disagree.
+                // Seed the loaded page's size from the freshly-built stack (authoritative) so a memoized
+                // header read can't disagree with the worker's page-size map.
                 if let Some(size) = self.stack.as_ref().map(|s| s.size()) {
                     self.page_sizes_px.insert(result.page_idx, size);
                 }
-                let page_sizes = self.page_sizes_map(project);
-                if let Some(doc) = &self.layer_doc
-                    && let Ok(mut doc) = doc.lock()
-                    && let Err(err) = doc.ensure_page_loaded(
-                        result.page_idx,
-                        &project.paths.unsaved_layers_dir,
-                        Some(&project.paths.layers_dir),
-                        &page_sizes,
-                    )
-                {
-                    crate::runtime_log::log_warn(format!("[ps_editor] layer_doc load: {err}"));
+                // Move the worker-decoded user-layer payload into the shared doc under a BRIEF lock
+                // (no decode is performed here — the heavy PNG decode already ran lock-free on the
+                // worker). `insert_decoded_page` is memoized: if the page was already resident (e.g. a
+                // concurrent edit between request and insert), it discards the payload and keeps the
+                // live in-memory page. If the worker's decode failed (`layers == None`), the page is
+                // left un-inserted and the projection below shows just the base layers.
+                if let Some(payload) = page.layers {
+                    if let Some(doc) = &self.layer_doc
+                        && let Ok(mut doc) = doc.lock()
+                    {
+                        doc.insert_decoded_page(result.page_idx, payload);
+                    }
+                } else {
+                    crate::runtime_log::log_warn(format!(
+                        "[ps_editor] page {} loaded without a layer payload (decode failed on worker)",
+                        result.page_idx
+                    ));
                 }
+                // Load the disk-truth text-layer metadata + bands (pin / text-group axis the doc node
+                // does not carry), then project the doc over the stack rasters / text / bands so both
+                // tabs read one model.
+                self.reload_overlays_view(project, result.page_idx);
                 self.active_page_idx = Some(result.page_idx);
                 self.selection = None;
                 // Panel selection keys on session ids that the new page's stack reuses; reset it.
@@ -1132,6 +1223,10 @@ impl PsEditorTabState {
         );
         self.ensure_loader();
         self.poll_loader(project);
+        // Consume any finished non-destructive raster-effects render (computed off the GUI thread).
+        if self.poll_ps_raster_effects_jobs(project) {
+            ctx.request_repaint();
+        }
         self.refresh_view_if_doc_version_changed(project);
         // A synced camera waits here until its page finishes loading (the load refits otherwise).
         self.apply_pending_camera();
@@ -1148,7 +1243,7 @@ impl PsEditorTabState {
         self.draw_top_bar(ctx, ui, project);
         self.draw_toolbar(ui);
         self.draw_layers_panel(ui, project);
-        self.draw_effects_editor(ctx, project);
+        self.draw_effects_editor(ctx);
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.draw_canvas(ctx, ui, project);
         });
@@ -1202,6 +1297,10 @@ impl PsEditorTabState {
                 if self.pending_job_id.is_some() {
                     ui.spinner();
                     ui.label("Загрузка страницы…");
+                }
+                if self.raster_effects_state.is_some() {
+                    ui.spinner();
+                    ui.label("Применение эффектов…");
                 }
                 if let Some(err) = &self.load_error {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);
@@ -2137,25 +2236,30 @@ impl PsEditorTabState {
         let mut new_gid: Option<(String, String)> = None; // (uid, name)
 
         // Group-meta ops (collapse / visibility / opacity) are stack-only: `draw_composite` folds
-        // them live from the stack and `save_page_rasters` persists them on page-leave, so there is
-        // no per-tick disk write (important for the opacity slider).
+        // them live from the stack and `save_page_rasters` persists them on page/tab-leave, so there
+        // is no per-tick disk write (important for the opacity slider). They MUST mark `layers_dirty`
+        // so the dirty-gated tab-switch flush (`flush_layers_if_dirty`) still persists them — without
+        // it a vis/opacity/collapse change would revert on the next PS reload (it is not in the doc).
         match &op {
             GroupOp::ToggleCollapse(uid) => {
                 if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
                     g.collapsed = !g.collapsed;
                 }
+                self.layers_dirty = true;
                 return;
             }
             GroupOp::ToggleGroupVisible(uid) => {
                 if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
                     g.visible = !g.visible;
                 }
+                self.layers_dirty = true;
                 return;
             }
             GroupOp::GroupOpacity(uid, v) => {
                 if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
                     g.opacity = *v;
                 }
+                self.layers_dirty = true;
                 return;
             }
             GroupOp::MoveGroup(uid, up) => {
@@ -2347,9 +2451,9 @@ impl PsEditorTabState {
         }
     }
 
-    /// Floating editor for a raster layer's effects chain (destructive: applying bakes the result
-    /// back into the layer's pixels and recenters so the content stays anchored).
-    fn draw_effects_editor(&mut self, ctx: &egui::Context, project: &ProjectData) {
+    /// Floating editor for a raster layer's effects chain (non-destructive: applying renders the
+    /// chain off the GUI thread via `apply_effects_to_raster`, leaving the base pixels reversible).
+    fn draw_effects_editor(&mut self, ctx: &egui::Context) {
         if self.effects_editor.is_none() {
             return;
         }
@@ -2385,7 +2489,7 @@ impl PsEditorTabState {
 
         if apply {
             if let Some((id, text)) = self.effects_editor.take() {
-                self.apply_effects_to_raster(id, &text, project);
+                self.apply_effects_to_raster(id, &text);
             }
         } else if cancel || !open {
             self.effects_editor = None;
@@ -2393,11 +2497,18 @@ impl PsEditorTabState {
     }
 
     /// Applies an effects chain to raster layer `id` **non-destructively** (reversibly), matching the
-    /// typing tab: effects render from the layer's pre-effects `base_image`, the rendered result
+    /// typing tab: effects render from the layer's pre-effects base pixels, the rendered result
     /// becomes the display `image`, and the chain is stored on the layer + persisted via
     /// `update_raster_effects` (base PNG untouched). An empty/blank chain clears effects and restores
-    /// the base pixels. Recenters using the content origin so shadow/glow expansion stays anchored.
-    fn apply_effects_to_raster(&mut self, id: LayerId, json: &str, project: &ProjectData) {
+    /// the base pixels.
+    ///
+    /// The expensive `apply_effects_to_color_image` call (tens of ms on a large page) runs on a
+    /// worker thread, never the GUI thread: this method only parses the JSON, clones the base
+    /// ColorImage (dropping every lock before spawning), and spawns the render. The result is applied
+    /// by `poll_ps_raster_effects_jobs`, which does the cheap recenter / doc-routing / persist on the
+    /// GUI thread. If a render is already in flight, the latest request is stashed (latest-wins) so a
+    /// second raster's effects are not lost.
+    fn apply_effects_to_raster(&mut self, id: LayerId, json: &str) {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
@@ -2415,67 +2526,148 @@ impl PsEditorTabState {
             }
         };
 
-        let prepared = {
-            let Some(stack) = self.stack.as_mut() else {
+        if self.raster_effects_state.is_some() {
+            // A render is already in flight: stash the latest request (superseding any older pending
+            // one) so `poll_ps_raster_effects_jobs` re-dispatches it once the current render finishes.
+            // Otherwise this edit would be silently lost — e.g. effecting a second raster right after
+            // a first, leaving the second without its effects on save.
+            self.pending_raster_effects = Some((id, json.to_string()));
+            return;
+        }
+
+        // Resolve the pre-effects render source on the GUI thread (a cheap clone), then drop the
+        // stack borrow BEFORE spawning so no lock is held across the worker. For a RAW raster the
+        // source is the current display pixels (what's on screen now); for an effected raster it is
+        // the preserved base, so re-applying replaces (not stacks) the chain.
+        let prepared: Option<(ColorImage, [usize; 2], LayerTransform)> = {
+            let Some(stack) = self.stack.as_ref() else {
                 return;
             };
-            let Some(layer) = stack.layer_mut(id) else {
+            let Some(layer) = stack.layer(id) else {
                 return;
             };
             if layer.kind.is_base() {
                 return;
             }
-            // If the raster is currently RAW (no effects), snapshot its current pixels as the base
-            // first, so effects render from what's on screen now (e.g. a raster that was painted,
-            // then gets effects). When effects already exist, keep the preserved base untouched so
-            // re-applying replaces (rather than stacks) the chain.
-            if layer.effects.is_empty() {
-                layer.base_image = layer.image.clone();
-            }
-            // Always render from the pre-effects base pixels so re-applying replaces (not stacks)
-            // the chain and clearing it can restore the original.
-            match effects::apply_effects_to_color_image(&layer.base_image, json) {
-                Ok((image, origin)) => {
-                    Some((image, origin, layer.base_image.size, layer.transform))
-                }
-                Err(err) => {
-                    crate::runtime_log::log_warn(format!("[ps_editor] effects: {err}"));
-                    return;
-                }
-            }
+            let is_raw = layer.effects.is_empty();
+            let base = if is_raw {
+                layer.image.clone()
+            } else {
+                layer.base_image.clone()
+            };
+            let base_size = base.size;
+            Some((base, base_size, layer.transform))
         };
-        let Some((new_image, origin, base_size, base_t)) = prepared else {
+        let Some((base_image, base_size, base_t)) = prepared else {
             return;
         };
-        let new_size = new_image.size;
-        // Keep the original content anchored: the image center moves by the difference between the
-        // new image center and where the original (base) content's center now sits. Anchoring is
-        // relative to the base transform so repeated re-applies stay stable.
-        let dx = new_size[0] as f32 * 0.5 - origin[0] as f32 - base_size[0] as f32 * 0.5;
-        let dy = new_size[1] as f32 * 0.5 - origin[1] as f32 - base_size[1] as f32 * 0.5;
-        let (sin, cos) = base_t.rotation.sin_cos();
-        let scaled = Vec2::new(dx, dy) * base_t.scale;
-        let rotated = Vec2::new(scaled.x * cos - scaled.y * sin, scaled.x * sin + scaled.y * cos);
-
         let Some(uid) = self.raster_uid(id) else {
             return;
         };
+
+        // Spawn the expensive render off the GUI thread; `poll_ps_raster_effects_jobs` applies it.
+        let json_owned = json.to_string();
+        let effects_owned = effects;
+        let (tx, rx) = mpsc::channel::<Result<PsRasterEffectsResult, String>>();
+        thread::spawn(move || {
+            let _ = tx.send(render_ps_raster_effects(
+                page_idx,
+                uid,
+                id,
+                base_image,
+                base_size,
+                base_t,
+                json_owned,
+                effects_owned,
+            ));
+        });
+        self.raster_effects_state = Some(rx);
+    }
+
+    /// Polls the non-destructive raster-effects worker once per frame. When a result arrives it does
+    /// the GUI-side cheap work the typing tab keeps on the main thread: the recenter anchoring math,
+    /// the `edit_doc_node` routing (swap base/display/effects + bump generation), the reversible
+    /// `update_raster_effects` persist, and the `render_cache` drop. Then it re-dispatches any
+    /// request stashed while the render was in flight (latest-wins). Returns `true` when a result was
+    /// consumed (the frame should repaint).
+    fn poll_ps_raster_effects_jobs(&mut self, project: &ProjectData) -> bool {
+        let recv = {
+            let Some(rx) = self.raster_effects_state.as_ref() else {
+                return false;
+            };
+            match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Эффекты растра прерваны (ошибка канала).".to_string()))
+                }
+            }
+        };
+        let Some(recv) = recv else {
+            return false;
+        };
+        self.raster_effects_state = None;
+        let result = match recv {
+            Ok(r) => r,
+            Err(err) => {
+                crate::runtime_log::log_warn(format!("[ps_editor] effects: {err}"));
+                // Still re-dispatch a stashed request so a queued edit is not stranded.
+                self.dispatch_pending_raster_effects();
+                return true;
+            }
+        };
+        self.apply_ps_raster_effects_result(result, project);
+        // Re-dispatch an edit that arrived while this render was in flight, so the last requested
+        // effects (e.g. on a second raster) are not lost. `raster_effects_state` is now `None`, so
+        // this spawns a fresh render instead of re-stashing.
+        self.dispatch_pending_raster_effects();
+        true
+    }
+
+    /// Re-dispatches the stashed raster-effects request, if any. Called from
+    /// `poll_ps_raster_effects_jobs` after the in-flight render is consumed.
+    fn dispatch_pending_raster_effects(&mut self) {
+        if let Some((id, json)) = self.pending_raster_effects.take() {
+            self.apply_effects_to_raster(id, &json);
+        }
+    }
+
+    /// GUI-side apply step for a completed raster-effects render (mirrors the typing tab's
+    /// `poll_raster_effects_jobs` body). Performs the recenter anchoring, routes the swap to the
+    /// shared doc, persists the chain reversibly (base PNG untouched), and drops the layer's GPU
+    /// cache so the new display re-uploads. No long work, no decode, no held lock across a worker.
+    fn apply_ps_raster_effects_result(&mut self, result: PsRasterEffectsResult, project: &ProjectData) {
+        let PsRasterEffectsResult {
+            page_idx,
+            uid,
+            id,
+            new_image,
+            origin,
+            base_size,
+            base_t,
+            effects,
+        } = result;
+
+        let new_size = new_image.size;
+        // World-space center shift that keeps the original content anchored after effects grow the
+        // image (shadow/glow). Pure math, unit-tested in `effects_recenter_offset`.
+        let rotated = effects_recenter_offset(new_size, origin, base_size, base_t);
+
         // Compute the post-effects display, base snapshot, and recentered transform, then write them
-        // to the shared doc (set_effects swaps the effects chain + display; the base snapshot + the
-        // recentered transform are applied directly). The base snapshot only happens going RAW→effects
-        // — when effects already exist, the doc node's base is left untouched. Routed via the doc so
-        // the projection re-derives the stack layer from one model.
+        // to the shared doc. The base snapshot only happens going RAW→effects — when effects already
+        // exist, the doc node's base is left untouched. Routed via the doc so the projection re-derives
+        // the stack layer from one model.
         let (display, new_transform): (Option<ColorImage>, TransformRec) = if effects.is_empty() {
             // No effects: display is the (current) base, placed at the base transform.
             (None, transform_to_rec(base_t))
         } else {
             let mut t = base_t;
             t.center = base_t.center + rotated;
-            // `new_image` becomes the display; the base snapshot (current display) only matters when
-            // the node was RAW — captured below from the node's own display when its effects are empty.
             (Some(new_image), transform_to_rec(t))
         };
         let effects_for_doc = effects.clone();
+        // The RAW→effects base snapshot is keyed on the doc node's own effects state (`e.is_empty()`)
+        // below, the authoritative trigger — the same rule the original synchronous path used.
         self.edit_doc_node(page_idx, |doc| {
             if let Some(node) = doc.node_mut(page_idx, &uid)
                 && let crate::models::layer_model::layer_doc::NodeBody::Raster {
@@ -2506,16 +2698,39 @@ impl PsEditorTabState {
 
         // Persist reversibly: writes the effects chain + the `_fx` rendered PNG (or clears them both),
         // leaving the base PNG intact. (`flush_page` only re-writes non-empty chains, so the CLEAR case
-        // is handled here.) Then bump so the typing tab's read-only raster view reloads.
+        // is handled here.) ASYNC: route through the doc's effects-only saver path (PNG encode
+        // off-thread; targeted single-raster RMW, never a whole-page rewrite) — falls back to the sync
+        // `update_raster_effects` when no saver is enabled. The save-to-project / app-close barriers
+        // guarantee the enqueued effects land. Then the cross-tab bump already happened via the doc edit.
         let rendered_for_persist = if effects.is_empty() { None } else { display.as_ref() };
-        if let Err(err) = persist::update_raster_effects(
-            &project.paths.unsaved_layers_dir,
-            page_idx,
-            &uid,
-            &effects,
-            rendered_for_persist,
-            Some(&project.paths.layers_dir),
-        ) {
+        let effects_persist = self
+            .layer_doc
+            .as_ref()
+            .and_then(|doc| {
+                doc.lock().ok().map(|guard| {
+                    guard.enqueue_raster_effects(
+                        page_idx,
+                        &project.paths.unsaved_layers_dir,
+                        Some(&project.paths.layers_dir),
+                        &uid,
+                        &effects,
+                        rendered_for_persist,
+                    )
+                })
+            })
+            // No doc wired (defensive): fall back to a direct synchronous effects write so the disk
+            // state is still correct, identical to the pre-async behavior.
+            .unwrap_or_else(|| {
+                persist::update_raster_effects(
+                    &project.paths.unsaved_layers_dir,
+                    page_idx,
+                    &uid,
+                    &effects,
+                    rendered_for_persist,
+                    Some(&project.paths.layers_dir),
+                )
+            });
+        if let Err(err) = effects_persist {
             crate::runtime_log::log_warn(format!("[ps_editor] persist effects: {err}"));
         }
         self.render_cache.remove(&id);
@@ -2718,7 +2933,7 @@ impl PsEditorTabState {
                 .and_then(|s| s.layer(s.active_id()))
                 .is_some_and(|l| l.kind == LayerKind::Raster && !l.can_edit_pixels())
         {
-            crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой".to_string());
+            crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой");
         }
 
         // Route input to the active tool unless the user is panning or dragging a text layer.
@@ -2847,7 +3062,13 @@ impl PsEditorTabState {
             egui::StrokeKind::Outside,
         );
 
-        if response.hovered() || pan_active || self.pending_job_id.is_some() {
+        if response.hovered()
+            || pan_active
+            || self.pending_job_id.is_some()
+            || self.raster_effects_state.is_some()
+        {
+            // Keep polling so a finished off-thread effects render is consumed promptly even with no
+            // pointer activity.
             ctx.request_repaint();
         }
     }
@@ -3392,7 +3613,7 @@ impl PsEditorTabState {
             // A merge rewrites the lower layer's base pixels, so refuse while either participant
             // still shows a non-destructive effects chain — bake it first.
             if !upper.effects.is_empty() || !below.effects.is_empty() {
-                crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой".to_string());
+                crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой");
                 return false;
             }
             // Bottom-to-top: below then upper, so the upper composites OVER the below.
@@ -3617,7 +3838,7 @@ fn clip_into_new_layer(
             // A cut removes base pixels: refuse on a raster still showing a non-destructive effects
             // chain (bake it first). Copying from it is fine; only the destructive clear is blocked.
             if layer.kind == LayerKind::Raster && !layer.can_edit_pixels() {
-                crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой".to_string());
+                crate::runtime_log::log_warn("[ps_editor] Сначала запеките слой");
                 continue;
             }
             clear_selected_pixels(layer, selection, bounds);
@@ -3697,6 +3918,82 @@ fn layer_touches_selection(layer: &Layer, selection: &Selection, bounds: Selecti
         }
     }
     false
+}
+
+/// Worker: renders a raster's effects chain from the supplied pre-effects base image
+/// (non-destructive — the caller already cloned the base and dropped every lock). Runs the expensive
+/// `apply_effects_to_color_image` off the GUI thread and returns the data the GUI-side apply step
+/// needs (the new display image, the base content `origin` inside it, and the recenter references).
+///
+/// An empty `effects` chain means "clear effects": the result carries the base image unchanged with a
+/// zero `origin`, so the GUI step restores the base placement.
+///
+/// # Errors
+/// Returns a human-readable message string when the effects render fails (the caller logs it and
+/// keeps the raster unchanged).
+#[allow(clippy::too_many_arguments)]
+// Justification: this is a pure data-shuttle for the worker thread; every argument is an independent
+// piece of the already-resolved render context (no shared state to group them into) and bundling them
+// into an ad-hoc struct would only add indirection without clarifying the contract.
+fn render_ps_raster_effects(
+    page_idx: usize,
+    uid: String,
+    id: LayerId,
+    base_image: ColorImage,
+    base_size: [usize; 2],
+    base_t: LayerTransform,
+    json: String,
+    effects: Vec<serde_json::Value>,
+) -> Result<PsRasterEffectsResult, String> {
+    if effects.is_empty() {
+        // No render needed: clearing effects restores the base. `origin` is the base top-left.
+        return Ok(PsRasterEffectsResult {
+            page_idx,
+            uid,
+            id,
+            new_image: base_image,
+            origin: [0, 0],
+            base_size,
+            base_t,
+            effects,
+        });
+    }
+    match effects::apply_effects_to_color_image(&base_image, &json) {
+        Ok((new_image, origin)) => Ok(PsRasterEffectsResult {
+            page_idx,
+            uid,
+            id,
+            new_image,
+            origin,
+            base_size,
+            base_t,
+            effects,
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+/// World-space center offset that keeps a raster's original content anchored after a
+/// non-destructive effects render resized the image (effects like shadow/glow grow the canvas and
+/// shift the base content to `origin` inside the new image).
+///
+/// `new_size`/`base_size` are `[w, h]` in pixels; `origin` is the base content's top-left inside the
+/// new image (the `[i32; 2]` content origin from `apply_effects_to_color_image`). The raw center
+/// delta is taken in base-local pixels, then mapped through the base transform's scale + rotation so
+/// it is added directly to `LayerTransform::center` in world space. Repeated re-applies stay stable
+/// because the delta is always measured against the same pre-effects base reference.
+#[must_use]
+fn effects_recenter_offset(
+    new_size: [usize; 2],
+    origin: [i32; 2],
+    base_size: [usize; 2],
+    base_t: LayerTransform,
+) -> Vec2 {
+    let dx = new_size[0] as f32 * 0.5 - origin[0] as f32 - base_size[0] as f32 * 0.5;
+    let dy = new_size[1] as f32 * 0.5 - origin[1] as f32 - base_size[1] as f32 * 0.5;
+    let (sin, cos) = base_t.rotation.sin_cos();
+    let scaled = Vec2::new(dx, dy) * base_t.scale;
+    Vec2::new(scaled.x * cos - scaled.y * sin, scaled.x * sin + scaled.y * cos)
 }
 
 /// Converts an in-memory layer transform to its on-disk record (center-anchored, page pixels).
@@ -3792,6 +4089,47 @@ mod tests {
         let mut sel = Selection::empty(4, 4);
         sel.set_rect(1, 1, 3, 3);
         sel
+    }
+
+    #[test]
+    fn recenter_offset_zero_when_growth_is_symmetric() {
+        // Base 10x10 grown to 14x14 with the content centered (origin = 2,2): the content center is
+        // unchanged, so no recenter is needed regardless of transform.
+        let t = LayerTransform {
+            center: Vec2::new(5.0, 5.0),
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        let off = effects_recenter_offset([14, 14], [2, 2], [10, 10], t);
+        assert!(off.length() < 1e-4, "symmetric growth needs no recenter, got {off:?}");
+    }
+
+    #[test]
+    fn recenter_offset_anchors_asymmetric_growth() {
+        // Base 10x10 grown to 16x10 with the content at origin (0,0): the new center sits 3px right of
+        // the base center, so the layer center must shift +3px in x (identity transform).
+        let t = LayerTransform {
+            center: Vec2::ZERO,
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        let off = effects_recenter_offset([16, 10], [0, 0], [10, 10], t);
+        assert!((off.x - 3.0).abs() < 1e-4, "x offset wrong: {off:?}");
+        assert!(off.y.abs() < 1e-4, "y offset wrong: {off:?}");
+    }
+
+    #[test]
+    fn recenter_offset_applies_scale_then_rotation() {
+        // Same +3px base-local x delta, but the base layer is scaled 2x and rotated 90°. Scale doubles
+        // it to 6px, then a 90° rotation maps +x to +y (within float tolerance).
+        let t = LayerTransform {
+            center: Vec2::ZERO,
+            rotation: std::f32::consts::FRAC_PI_2,
+            scale: 2.0,
+        };
+        let off = effects_recenter_offset([16, 10], [0, 0], [10, 10], t);
+        assert!(off.x.abs() < 1e-3, "x should be ~0 after 90° rot: {off:?}");
+        assert!((off.y - 6.0).abs() < 1e-3, "y should be ~6 (3*2 scaled, rotated): {off:?}");
     }
 
     #[test]

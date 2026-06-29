@@ -69,6 +69,24 @@ geometry permanently).
 ribbon solve). Callers build it: typing from its memoized page-image-dimension cache (`page_sizes_map`),
 PS from `project.pages` image dimensions (memoized, the loaded page seeded from the stack size).
 
+### Lock-free decode split (off-thread page load)
+`ensure_page_loaded` is a thin composition of two parts so the page-switch PNG decode can run off the
+GUI thread WITHOUT holding the shared doc lock across a multi-MB decode:
+- `decode_page_payload(page_idx, primary, fallback, page_sizes) -> Result<DecodedPagePayload, String>`
+  — a PURE associated fn (no `&mut self`). It does ALL the disk I/O + PNG decode + legacy migration and
+  returns the OWNED `DecodedPagePayload` (the page's raster + text `LayerNode`s, already z-sorted and
+  re-ranked, plus the raster groups). It still REQUIRES the FULL chapter `page_sizes` map (the
+  absolute-ribbon legacy migration recovers a chapter-wide scale from every page's aspect — a partial
+  map corrupts geometry). `DecodedPagePayload`/`LayerNode`/`ColorImage`/`Value` are `Send`, so the
+  payload can be built on a worker thread.
+- `insert_decoded_page(&mut self, page_idx, payload)` — takes the doc lock only to MOVE the payload into
+  `self.pages` (no I/O). Memoized: an already-resident page discards the incoming payload (live in-memory
+  edits are never clobbered) and does NOT bump the version; a real insert bumps it.
+`ensure_page_loaded` = `decode_page_payload` + `insert_decoded_page` (unchanged behavior for the
+synchronous callers and all tests). The PS page loader (`ps_editor/page_loader.rs`) calls
+`decode_page_payload` lock-free on its worker and `poll_loader` calls `insert_decoded_page` under a brief
+lock — so no doc lock is ever held across a decode.
+
 Loads read the unsaved dir first, falling back to the main dir, for both the manifest and each PNG
 (mirroring `text_images/`). Unmaterializable nodes (text/group) and missing/size-mismatched PNGs
 are skipped with a warning rather than failing the load.
@@ -175,6 +193,27 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
 - `effects.rs` — the "render type 2" seam: `apply_effects_to_color_image(&ColorImage, effects_json)`
   bridges egui `ColorImage` to the typing tab's pure `apply_effects_to_image`. Straight alpha both
   ways; effects may enlarge the canvas (shadow/glow), so center-placed callers must recenter.
+- `saver.rs` — OFF-THREAD coalescing persistence for the doc (additive; does not change any persist
+  write logic). `LayerSaver` owns a worker thread (`recv` + `try_recv` drain) that BUCKETS jobs per
+  `page_idx`, keeping the LATEST data PER KIND (rasters / text / per-uid effects) — so a Full + a
+  TextOnly job for the same page MERGE without dropping either kind. A `PageSaveJob` carries OWNED data
+  (`OwnedRasterLayer` / `OwnedTextNode` mirror the `persist::RasterLayerOut` / `TextPayloadOut` inputs
+  but own their `ColorImage`s; `EffectsSaveItem` mirrors `persist::update_raster_effects`), so the
+  worker holds no doc lock; its `run` replays the EXACT `persist::save_page_rasters` →
+  `write_page_text_payload` → `update_raster_effects` sequence of `LayerDoc::flush_page`.
+  - The `effects` half is a TARGETED per-raster effects-only update (`Vec<EffectsSaveItem>`, latest
+    wins per uid on coalesce). It never rewrites the page raster set and is the ONLY path that can
+    express the CLEAR case (empty chain + `display_image: None`) — the whole-page raster reconcile loop
+    skips empty chains. The PS/typing effects polls route through it via
+    `LayerDoc::enqueue_raster_effects`.
+  - `Barrier` (via `barrier_blocking`) waits until all prior jobs are on disk; `Shutdown` drains then
+    stops. `LayerSaverHandle` is a cheap-clone `Sender` wrapper for a merge worker / app-close drain.
+  WIRING: the doc enables the saver via `enable_background_saver` (called ONCE in `app.rs` on the
+  shared doc at startup) and feeds it through `enqueue_page_save` / `enqueue_page_text_save` /
+  `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). PS per-edit/raster flushes
+  and typing text flushes ENQUEUE; the save-to-project merge worker and the eframe `on_exit` /
+  exit-cleanup paths `barrier_blocking` (and shut down) the saver so no enqueued write is lost. NO
+  barrier ever runs on the GUI thread — only in the merge worker and at teardown.
 
 ### Text migration gate (lazy, on read)
 `ensure_page_loaded` treats a page as MIGRATED once it carries any inline text node (`write_page_text_payload`

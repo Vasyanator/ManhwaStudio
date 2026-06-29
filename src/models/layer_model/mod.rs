@@ -37,4 +37,5 @@ pub mod manifest;
 pub mod migrate;
 pub mod ordering;
 pub mod persist;
+pub mod saver;
 pub mod text_payload;

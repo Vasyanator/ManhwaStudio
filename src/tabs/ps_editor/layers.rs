@@ -398,8 +398,8 @@ impl LayerStack {
             effects: Vec::new(),
             deform: None,
             group: None,
-            // Loaders (`load_persisted_into_stack` / merge) reset this to false after adding; the
-            // clip/paste path marks it dirty. New PS-owned content is dirty by virtue of being new.
+            // The doc projection (`sync_view_from_doc`) / merge paths reset this to false after adding;
+            // the clip/paste path marks it dirty. New PS-owned content is dirty by virtue of being new.
             pixels_dirty: false,
         });
         self.active = id;

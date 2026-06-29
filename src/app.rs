@@ -566,6 +566,18 @@ impl MangaApp {
         let layer_doc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::models::layer_model::layer_doc::LayerDoc::new(),
         ));
+        // Enable the off-thread coalescing layer saver ONCE on the shared doc, right after creation
+        // and before either tab gets its clone. Heavy doc-routed flushes (PS per-edit/raster, typing
+        // text) then enqueue PNG-encode + manifest RMW off the GUI thread; the save-to-project merge
+        // worker and app-close drain barrier the queue so no write is lost. With no saver the doc's
+        // enqueue_page_* methods fall back to a synchronous flush, so wiring is safe either way.
+        if let Ok(mut doc) = layer_doc.lock() {
+            doc.enable_background_saver();
+        } else {
+            runtime_log::log_error(
+                "[app] could not enable background layer saver: shared doc lock poisoned at startup",
+            );
+        }
         typing_tab.set_layer_doc(std::sync::Arc::clone(&layer_doc));
         ps_editor_tab.set_layer_doc(std::sync::Arc::clone(&layer_doc));
         let mut settings_tab =
@@ -719,6 +731,17 @@ impl MangaApp {
         // is the OWNED text pages (doc-resident this session) — the merge replaces those pages' text and
         // preserves committed text for pages NOT in it (no silent drop on a PS raster-only edit).
         let owned_text_pages = self.typing_tab.flush_text_layers();
+        // Capture the background layer-saver handle on the GUI thread (cheap Sender clone; no doc lock
+        // held during the merge). The PS `flush_layers` + typing `flush_text_layers` above now ENQUEUE
+        // their page writes; the merge worker must BARRIER the saver before reading the staging
+        // `layers.json` so every enqueued page is on disk first. The FIFO channel guarantees the
+        // just-enqueued jobs precede the barrier. `None` ⇒ no saver enabled, so the flushes already
+        // wrote synchronously and no barrier is needed.
+        let saver_handle = self
+            .layer_doc
+            .lock()
+            .ok()
+            .and_then(|guard| guard.saver_handle());
         let unsaved_dir = self.project.paths.unsaved_dir.clone();
         let project_dir = self.project.paths.project_dir.clone();
         let unsaved_clean_layers_dir = self.project.paths.unsaved_clean_layers_dir.clone();
@@ -729,6 +752,12 @@ impl MangaApp {
         };
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
+            // Drain the layer saver FIRST: block until every enqueued layer page write (rasters + text
+            // + effects from the flushes above) is on disk, so the merge reads a complete staging
+            // `layers.json`. This barrier runs in the worker, never on the GUI thread.
+            if let Some(handle) = saver_handle {
+                handle.barrier_blocking();
+            }
             if let Err(err) =
                 save_overlay_snapshots_to(&unsaved_clean_layers_dir, &dirty_overlay_snapshots)
             {
@@ -811,6 +840,16 @@ impl MangaApp {
     fn start_exit_cleanup(&mut self, action: PendingCloseAction) {
         if self.pending_exit_cleanup.is_some() {
             return;
+        }
+        // Stop the layer saver BEFORE deleting the unsaved dir. The discard path removes the staging
+        // folder the saver writes into; a still-running saver could recreate files mid/post deletion,
+        // leaving the staging dir partially present. `shutdown_saver` drains the queue then JOINS the
+        // worker, guaranteeing it is no longer writing before the delete job spawns — closing that
+        // race. We do not barrier on the GUI thread here: this is the DISCARD path (the user chose not
+        // to save), so the queued writes target the dir being deleted; only the join matters. The
+        // join (drain of a small queue) is bounded and runs only at teardown.
+        if let Ok(mut guard) = self.layer_doc.lock() {
+            guard.shutdown_saver();
         }
         let rx = Self::spawn_unsaved_delete_job(self.project.paths.unsaved_dir.clone());
         self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
@@ -1335,8 +1374,10 @@ impl MangaApp {
         // Leaving the PS editor: flush its in-memory raster/group edits to disk and bump the shared
         // layer revision, so the destination tab reloads the latest state (e.g. a raster the PS
         // editor just cut into two). PS otherwise only persists on a page-switch, not a tab-switch.
+        // Gated on the dirty flag: per-edit changes already enqueued their page write, so an
+        // unchanged page skips a redundant snapshot+enqueue on every tab switch.
         if entering_from_ps && self.active_tab != AppTab::PsEditor {
-            self.ps_editor_tab.flush_layers(&self.project);
+            self.ps_editor_tab.flush_layers_if_dirty(&self.project);
         }
         match self.active_tab {
             AppTab::Translation | AppTab::Cleaning | AppTab::Typing => {
@@ -2470,6 +2511,31 @@ impl eframe::App for MangaApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// Final shutdown drain for the background layer saver: called by eframe on real process exit
+    /// (window close, return-to-launcher, or any other teardown). Blocks until every queued layer
+    /// write is flushed and the worker thread is joined, so no pending raster/text/effects write is
+    /// lost on exit. Must NOT hold the doc lock across the barrier: it clones the handle, drops the
+    /// lock, then barriers; finally `shutdown_saver` drains the queue + joins the worker. Relying on
+    /// Arc-drop ordering alone is unsafe (a lingering Arc clone in a worker could skip the join).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 1) Barrier without holding the lock (clone the handle, drop the guard, then block).
+        let handle = self
+            .layer_doc
+            .lock()
+            .ok()
+            .and_then(|guard| guard.saver_handle());
+        if let Some(handle) = handle {
+            handle.barrier_blocking();
+        }
+        // 2) Drain remaining queue + join the worker thread (idempotent; safe if already shut down).
+        if let Ok(mut guard) = self.layer_doc.lock() {
+            guard.shutdown_saver();
+        } else {
+            runtime_log::log_error("[app] on_exit: shared doc lock poisoned, saver not joined");
+        }
+        runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
     }
 }
 

@@ -386,6 +386,8 @@ original, and a bbox relative to the sent image) and the model returns
 | Page decode pool → ordered promotion → GPU upload | `app.rs` loader thread |
 | Clean overlay load → model | `app.rs` overlay loader thread |
 | Bubble saver (coalescing) | `BubblesModel::spawn_bubbles_saver_thread` |
+| Layer persistence (coalescing) | `layer_model/saver.rs` |
+| PS page-switch layer DECODE (off-thread) | `ps_editor/page_loader.rs` worker → `LayerDoc::decode_page_payload` (lock-free); GUI thread only `insert_decoded_page` |
 | Canvas settings saver | `canvas/workers.rs` / `settings/mod.rs` |
 | Overlay tile prepare | `canvas/workers.rs spawn_overlay_prepare_thread` |
 | OCR run | `translation/ocr.rs` background thread per request |
@@ -395,6 +397,7 @@ original, and a bbox relative to the sent image) and the model returns
 | AI backend probe | `translation/backend_health.rs` probe thread |
 | AI backend process manager | `settings/mod.rs spawn_ai_backend_process_worker` |
 | Typing text render (live) | `typing/tab.rs` latest-wins render thread |
+| PS editor raster effects render | `ps_editor/mod.rs` `render_ps_raster_effects` worker (latest-wins) |
 | Typing save text_info.json | `typing/tab.rs` deferred worker |
 | Typing export | `typing/tab.rs` background export thread |
 | Region loader (cleaning tools) | `cleaning/tools/base.rs spawn_region_loader_thread` |
@@ -416,6 +419,16 @@ original, and a bbox relative to the sent image) and the model returns
 - **CanvasView** — общий движок; логика вкладки добавляется через `CanvasHooks` и отдельные runtime-слои, не форком canvas-кода.
 - **CleanOverlaysModel** — держать двойное представление (ColorImage + RgbaImage); одностороннее разрушает export и инструменты.
 - **Сохранение** — через saver-thread с coalescing; sync-запись из GUI-потока — ошибка архитектуры.
+- **Слои (layer_model)** — запись на диск асинхронна и коалесцируется через `layer_model/saver.rs`
+  (`LayerDoc::enable_background_saver`, включается один раз в `app.rs`). PS per-edit/raster и typing
+  text/effects flush'и ENQUEUE'ят задания (`enqueue_page_save` / `enqueue_page_text_save` /
+  `enqueue_raster_effects`; sync-fallback при выключенном saver). Гарантия «байты на диске» даётся
+  ТОЛЬКО барьером: `barrier_blocking` в merge-воркере save-to-project (ДО `merge_unsaved_into_project`)
+  и drain (`barrier_blocking` + `shutdown_saver`) в eframe `on_exit` и на exit-cleanup. БАРЬЕР НИКОГДА
+  не выполняется в GUI-потоке. Контракт удаления растров (`removed_uids` в `persist_current_page`) и
+  ownership owned-page merge не менять — async меняет ТОЛЬКО где/когда происходит запись, не сами байты.
+  Исключение, остающееся синхронным: `flush_target_page_text_to_staging` (воркер raster-create читает
+  staging сразу — async race resurrect'ил бы удалённый текст).
 - **Python backend** — сбои не должны зависать GUI; всегда проверять `ensure_ai_backend_healthy()` перед запросами.
 - **App-managed AI models** — Rust worker paths call `src/ai_models.rs` before Python backend
   model initialization; EasyOCR and Surya remain library-cache managed.

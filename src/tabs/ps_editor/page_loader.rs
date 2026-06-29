@@ -15,29 +15,49 @@ Source pixels are reused from `CleanOverlaysModel`'s page cache when present and
 `image::open` otherwise (then stored back into the cache). The clean overlay is read via
 `overlay_rgba`; an absent overlay yields a fully transparent clean layer of the source size. The
 model lock is never held across image decode.
+
+In addition to the two base-layer images, the worker decodes the page's persisted USER layer payload
+(raster + text nodes + groups) off the GUI thread via `LayerDoc::decode_page_payload` — a PURE,
+lock-free function (the worker holds no doc `Arc`, only the inputs). The decoded payload is returned in
+`LoadedPage::layers` for the GUI thread to MOVE into the shared `LayerDoc` with a brief lock
+(`insert_decoded_page`). The heavy multi-MB PNG decode therefore never runs under the doc lock.
 */
 
 use crate::models::clean_overlays_model::CleanOverlaysModel;
+use crate::models::layer_model::layer_doc::{DecodedPagePayload, LayerDoc};
 use eframe::egui::{Color32, ColorImage};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// Request to load the base layers for one page.
+/// Request to load the base layers + persisted user-layer payload for one page.
+///
+/// `unsaved_layers_dir` / `layers_dir` are the staging (primary) and committed (fallback) layer dirs,
+/// and `page_sizes` is the FULL chapter page-size map (`page_idx -> [w, h]`) required by the doc's
+/// lock-free `decode_page_payload` for the legacy absolute-ribbon migration (a partial map corrupts
+/// legacy geometry — see `LayerDoc::decode_page_payload`).
 #[derive(Debug, Clone)]
 pub struct PageLoadRequest {
     pub job_id: u64,
     pub page_idx: usize,
     pub page_path: PathBuf,
+    pub unsaved_layers_dir: PathBuf,
+    pub layers_dir: PathBuf,
+    pub page_sizes: HashMap<usize, [usize; 2]>,
 }
 
-/// Decoded base layers for a page.
+/// Decoded base layers for a page, plus the off-thread-decoded user-layer payload.
+///
+/// `layers` is `None` when the persisted-layer decode failed (the page still opens with its two base
+/// layers; the failure is logged on the worker and does not fail the whole page load).
 #[derive(Debug)]
 pub struct LoadedPage {
     pub size: [usize; 2],
     pub source: ColorImage,
     pub clean: ColorImage,
+    pub layers: Option<DecodedPagePayload>,
 }
 
 /// Result of a page load job; `outcome` carries a user-facing error string on failure.
@@ -139,10 +159,31 @@ fn load_page(
         _ => ColorImage::filled(size, Color32::TRANSPARENT),
     };
 
+    // Decode the persisted user-layer payload OFF the doc lock (the worker holds no doc `Arc`, only
+    // the pure inputs). A failure does NOT fail the whole page load: the page still opens with its two
+    // base layers, and the GUI thread leaves the doc page un-inserted (the per-frame doc projection
+    // then shows just the base layers). The error is logged here so it is not silently swallowed.
+    let layers = match LayerDoc::decode_page_payload(
+        request.page_idx,
+        &request.unsaved_layers_dir,
+        Some(&request.layers_dir),
+        &request.page_sizes,
+    ) {
+        Ok(payload) => Some(payload),
+        Err(err) => {
+            crate::runtime_log::log_warn(format!(
+                "[ps_editor] page {} layer payload decode failed: {err}",
+                request.page_idx
+            ));
+            None
+        }
+    };
+
     Ok(LoadedPage {
         size,
         source,
         clean,
+        layers,
     })
 }
 

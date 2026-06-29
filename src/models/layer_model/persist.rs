@@ -87,7 +87,7 @@ pub struct RasterLayerIn {
 }
 
 /// A layer group's metadata (single-level groups; `parent_uid` is reserved for future nesting).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GroupMeta {
     pub uid: String,
     pub name: String,

@@ -3526,14 +3526,36 @@ impl TypingTextOverlayLayer {
                 Some(&result.display_image)
             };
             let fallback = self.layers_fallback_dir.clone();
-            if let Err(err) = crate::models::layer_model::persist::update_raster_effects(
-                &dir,
-                result.page_idx,
-                &result.uid,
-                &result.effects,
-                rendered,
-                fallback.as_deref(),
-            ) {
+            // ASYNC: route the effects persist through the doc's effects-only saver path (targeted
+            // single-raster RMW, PNG encode off-thread). Falls back to a direct synchronous
+            // `update_raster_effects` when no doc/saver is wired. The save-to-project / app-close
+            // barriers guarantee the enqueued effects land before merge/exit.
+            let effects_persist = self
+                .layer_doc
+                .as_ref()
+                .and_then(|doc| {
+                    doc.lock().ok().map(|guard| {
+                        guard.enqueue_raster_effects(
+                            result.page_idx,
+                            &dir,
+                            fallback.as_deref(),
+                            &result.uid,
+                            &result.effects,
+                            rendered,
+                        )
+                    })
+                })
+                .unwrap_or_else(|| {
+                    crate::models::layer_model::persist::update_raster_effects(
+                        &dir,
+                        result.page_idx,
+                        &result.uid,
+                        &result.effects,
+                        rendered,
+                        fallback.as_deref(),
+                    )
+                });
+            if let Err(err) = effects_persist {
                 crate::runtime_log::log_warn(format!("[typing] persist raster effects: {err}"));
             }
         }
@@ -4422,6 +4444,12 @@ impl TypingTextOverlayLayer {
         let Ok(mut guard) = doc.lock() else {
             return;
         };
+        // INTENTIONALLY SYNCHRONOUS (not enqueued): the caller spawns a worker that immediately reads
+        // this page's on-disk staging `layers.json` via `add_page_raster`. The anti-resurrection
+        // contract requires the page to be PRESENT (possibly empty) on disk BEFORE that read. An async
+        // enqueue would race the worker (it could read stale committed text before the enqueued write
+        // lands), resurrecting a deleted-last-text overlay. We cannot barrier on the GUI thread, and
+        // the empty-page case does no PNG IO, so a direct synchronous flush is both correct and cheap.
         if let Err(err) = guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref()) {
             crate::runtime_log::log_warn(format!(
                 "[typing] flush target page {page_idx} text before raster create: {err}"
@@ -4457,7 +4485,10 @@ impl TypingTextOverlayLayer {
             let result = (|| {
                 let mut guard = doc.lock().map_err(|_| "doc lock poisoned".to_string())?;
                 for page_idx in pages {
-                    guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref())?;
+                    // ASYNC: enqueue to the coalescing saver (falls back to sync flush when no saver).
+                    // This is the placement autosave; no reader depends on it landing synchronously,
+                    // and the save-to-project / app-close barriers guarantee durability.
+                    guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref())?;
                 }
                 Ok(())
             })();
@@ -4491,10 +4522,14 @@ impl TypingTextOverlayLayer {
             return owned;
         };
         for page_idx in guard.resident_pages() {
-            match guard.flush_page_text(page_idx, &layers_dir, fallback_dir.as_deref()) {
-                // Only a SUCCESSFUL flush marks the page owned: the merge then replaces its text
-                // wholesale (incl. deletions). A flush FAILURE leaves the page unowned (fail-safe), so
-                // the merge preserves the committed text rather than dropping it.
+            // ASYNC: enqueue each resident page's text to the coalescing saver (PNG encode off the GUI
+            // thread). The save-to-project merge worker barriers the saver BEFORE reading the staging
+            // `layers.json`, so every enqueued page is on disk before the merge — the FIFO channel +
+            // barrier give the same ordering the old synchronous flush did. A page is marked OWNED on a
+            // successful ENQUEUE (the barrier guarantees the write); an enqueue failure leaves it
+            // unowned (fail-safe), so the merge preserves committed text rather than dropping it. With
+            // no saver, `enqueue_page_text_save` falls back to a synchronous flush, also correct.
+            match guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref()) {
                 Ok(()) => {
                     owned.insert(page_idx);
                 }

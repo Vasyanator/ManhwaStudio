@@ -93,11 +93,11 @@ fn load_secret_config() -> (Option<String>, Option<String>) {
 /// Persists entered credentials so subsequent builds don't re-prompt.
 fn save_secret_config(key_path: &str, password: &str) {
     let path = secret_config_path();
-    if let Some(dir) = path.parent() {
-        if let Err(err) = fs::create_dir_all(dir) {
-            println!("cargo:warning=не удалось создать каталог для {SECRET_CONFIG_REL}: {err}");
-            return;
-        }
+    if let Some(dir) = path.parent()
+        && let Err(err) = fs::create_dir_all(dir)
+    {
+        println!("cargo:warning=не удалось создать каталог для {SECRET_CONFIG_REL}: {err}");
+        return;
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({
         "key_path": key_path,
