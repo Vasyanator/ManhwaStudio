@@ -79,6 +79,7 @@ fonts/groups/**
 # Explicit private/generated/runtime exclusions.
 .hg/
 .git/
+.secret/
 .claude/
 .codex/
 .vscode/
