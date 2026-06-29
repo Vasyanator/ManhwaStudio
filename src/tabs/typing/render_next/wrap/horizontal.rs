@@ -950,6 +950,66 @@ mod tests {
     }
 
     #[test]
+    fn wrap_segments_keep_standalone_dash_with_previous_word() {
+        let texts = build_wrap_segments("слово — слово", false);
+        assert_eq!(texts, vec!["слово — ".to_string(), "слово".to_string()]);
+
+        let hyphen_texts = build_wrap_segments("word - word", false);
+        assert_eq!(
+            hyphen_texts,
+            vec!["word - ".to_string(), "word".to_string()]
+        );
+    }
+
+    #[test]
+    fn minimal_word_wrap_keeps_standalone_dash_at_line_end() {
+        let mut scoring = WrapScoringContext::fallback();
+        let wrapped = wrap_text_with_targets_scored(
+            "слово — слово",
+            WrapSettings {
+                base_units: 5,
+                line_unit_targets: Some(&[5, 5, 5]),
+                line_width_targets_px: None,
+                line_order_phases: None,
+                strict_line_order: false,
+                allow_moderate_trees: false,
+                hanging_punctuation: false,
+                hyphen_dicts: None,
+                word_break_policy: Some(WordBreakPolicy::Minimal),
+                preserve_edge_spaces: false,
+            },
+            &mut scoring,
+        );
+
+        assert_eq!(wrapped.lines[0], "слово —");
+        assert_eq!(wrapped.lines[1], "слово");
+    }
+
+    #[test]
+    fn minimal_word_wrap_can_break_after_inline_em_dash() {
+        let mut scoring = WrapScoringContext::fallback();
+        let wrapped = wrap_text_with_targets_scored(
+            "слово—слово",
+            WrapSettings {
+                base_units: 6,
+                line_unit_targets: Some(&[6, 5]),
+                line_width_targets_px: None,
+                line_order_phases: None,
+                strict_line_order: false,
+                allow_moderate_trees: false,
+                hanging_punctuation: false,
+                hyphen_dicts: None,
+                word_break_policy: Some(WordBreakPolicy::Minimal),
+                preserve_edge_spaces: false,
+            },
+            &mut scoring,
+        );
+
+        assert_eq!(wrapped.lines[0], "слово—");
+        assert_eq!(wrapped.lines[1], "слово");
+    }
+
+    #[test]
     fn minimal_word_wrap_can_break_after_existing_hyphen() {
         let mut scoring = WrapScoringContext::fallback();
         let wrapped = wrap_text_with_targets_scored(

@@ -12,6 +12,8 @@ Purpose:
   дефис в хвосте головной строки;
 - существующий дефис («Рао-кун»): на той же строке — ничего (дефис уже в тексте),
   при переносе — тоже ничего (дефис уже на месте).
+- отдельное тире/дефис между пробелами присоединяется к предыдущему сегменту, чтобы
+  при разрыве строки знак оставался в конце предыдущей строки, а не начинал новую.
 
 Языковые детали (правила связывания слов, словарный перенос, оценка качества
 переноса) вынесены в хуки трейта `Segmenter`; конкретный язык реализует их в своём
@@ -391,6 +393,21 @@ pub(crate) trait Segmenter {
                 break;
             };
 
+            if is_line_end_dash_token(next_word.as_str()) {
+                current_text.push_str(space.as_str());
+                current_text.push_str(next_word.as_str());
+                if let Some(after_dash_space) = tokens.get(idx + 3)
+                    && after_dash_space.chars().all(char::is_whitespace)
+                {
+                    current_text.push_str(after_dash_space.as_str());
+                    out.push(std::mem::take(&mut current_text));
+                    idx += 4;
+                    continue;
+                }
+                idx += 3;
+                continue;
+            }
+
             current_text.push_str(space.as_str());
             let glue_here = binding == BindingMode::Glue
                 && self.binding_conservatism(token, next_word.as_str()) > Conservatism::Safe;
@@ -512,12 +529,23 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+/// True for standalone dash/hyphen tokens that should stay at the previous line end.
+#[must_use]
+fn is_line_end_dash_token(token: &str) -> bool {
+    let trimmed = token.trim();
+    !trimmed.is_empty() && trimmed.chars().all(is_line_end_dash_char)
+}
+
+fn is_line_end_dash_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2212}'
+    )
+}
+
 /// Языко-нейтральная проверка дефиса как точки переноса по существующему дефису.
 fn is_inline_hard_hyphen_break_char_default(text: &str, idx: usize, ch: char) -> bool {
-    if !matches!(ch, '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2212}')
-        || text.contains("://")
-        || text.contains('@')
-    {
+    if !is_line_end_dash_char(ch) || text.contains("://") || text.contains('@') {
         return false;
     }
 

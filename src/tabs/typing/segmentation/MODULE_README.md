@@ -14,6 +14,9 @@
     группы: `Joint::space` (пробел / ничего), `Joint::soft_hyphen` (ничего / дефис),
     `Joint::hard_hyphen` («Рао-кун», дефис уже в тексте), `Joint::glue` (конец);
     билдер `with_conservatism` помечает стык категорией консервативности;
+  - standalone dash/hyphen tokens between words are attached to the previous segment so a line
+    break adjacent to the sign can place it only at the previous line end, never at the next line
+    start;
   - `Conservatism` (`Safe` < `Relaxed` < `Bold` < `Reckless`) — насколько вольным
     надо быть, чтобы разрыв в стыке считался допустимым (обычный пробел → `Safe`,
     отрыв предлога/частицы/«число + единица» → выше);

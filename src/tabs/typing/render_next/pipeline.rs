@@ -2344,6 +2344,29 @@ mod tests {
     }
 
     #[test]
+    fn base_pipeline_keeps_inline_style_across_soft_hyphen_wrap() {
+        let mut params = base_params();
+        params.text = "<b>super\u{00AD}califragilistic</b>".to_string();
+        params.enable_inline_style_tags = true;
+        params.width_px = 110;
+        params.text_wrap_mode = TextWrapMode::Moderate;
+
+        let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
+            panic!("render_next should render inline soft-hyphen wrap case: {error}")
+        });
+
+        assert!(
+            !rendered
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("inline style spans could not be remapped")),
+            "{:?}",
+            rendered.warnings
+        );
+        assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
+    }
+
+    #[test]
     fn base_pipeline_renders_inline_non_attrs_overrides() {
         let mut params = base_params();
         params.text =

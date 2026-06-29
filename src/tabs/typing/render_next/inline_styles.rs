@@ -20,6 +20,7 @@ use super::types::{PxOrPercent, parse_machine_tag};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
 const VERTICAL_HALF_SPACE: char = '\u{200A}';
+const SOFT_HYPHEN: char = '\u{00AD}';
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InlineStyleSpan {
@@ -322,6 +323,17 @@ pub(crate) fn remap_inline_style_spans(
     let mut mapped = Vec::<InlineStyleSpan>::new();
 
     for (target_start, target_end, target_ch) in target_chars {
+        let consumed_soft_hyphen = consume_soft_hyphen_for_wrapped_hyphen(
+            target_ch,
+            &source_chars,
+            &mut source_char_idx,
+            source_spans,
+        );
+        if let Some(style) = consumed_soft_hyphen {
+            push_or_extend_inline_style_span(&mut mapped, target_start, target_end, &style);
+            continue;
+        }
+        skip_unrendered_soft_hyphens(&source_chars, &mut source_char_idx);
         let source_char = source_chars.get(source_char_idx).copied();
         let (style, consumed_source_char) = match source_char {
             Some((source_start, _source_end, source_ch)) if source_ch == target_ch => {
@@ -345,7 +357,7 @@ pub(crate) fn remap_inline_style_spans(
     }
 
     while let Some((_, _, ch)) = source_chars.get(source_char_idx).copied() {
-        if ch.is_whitespace() {
+        if ch.is_whitespace() || ch == SOFT_HYPHEN {
             source_char_idx += 1;
             continue;
         }
@@ -353,6 +365,32 @@ pub(crate) fn remap_inline_style_spans(
     }
 
     Some(mapped)
+}
+
+fn consume_soft_hyphen_for_wrapped_hyphen(
+    target_ch: char,
+    source_chars: &[(usize, usize, char)],
+    source_char_idx: &mut usize,
+    source_spans: &[InlineStyleSpan],
+) -> Option<InlineStyleSpan> {
+    let (source_start, _, source_ch) = source_chars.get(*source_char_idx).copied()?;
+    if source_ch == SOFT_HYPHEN && target_ch == '-' {
+        *source_char_idx = (*source_char_idx).saturating_add(1);
+        return Some(inline_style_at(source_start, source_spans));
+    }
+    None
+}
+
+fn skip_unrendered_soft_hyphens(
+    source_chars: &[(usize, usize, char)],
+    source_char_idx: &mut usize,
+) {
+    while source_chars
+        .get(*source_char_idx)
+        .is_some_and(|(_, _, ch)| *ch == SOFT_HYPHEN)
+    {
+        *source_char_idx = (*source_char_idx).saturating_add(1);
+    }
 }
 
 #[must_use]
@@ -935,6 +973,62 @@ mod tests {
         assert!(!mapped[0].bold);
         assert_eq!(target.get(mapped[1].start..mapped[1].end), Some("\ncd"));
         assert!(mapped[1].bold);
+    }
+
+    #[test]
+    fn remap_inline_style_spans_consumes_soft_hyphen_as_wrapped_hyphen() {
+        let source = "super\u{00AD}califragilistic";
+        let target = "super-\ncalifragilistic";
+        let spans = vec![InlineStyleSpan {
+            start: 0,
+            end: source.len(),
+            bold: true,
+            italic: false,
+            font_label: None,
+            font_size_px: None,
+            text_color: None,
+            line_spacing_px: None,
+            line_spacing_percent: None,
+            kerning_px: None,
+            kerning_percent: None,
+            glyph_stretch_percent: None,
+            glyph_offset: None,
+        }];
+
+        let mapped = remap_inline_style_spans(source, target, spans.as_slice()).expect("mapped");
+
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].start, 0);
+        assert_eq!(mapped[0].end, target.len());
+        assert!(mapped[0].bold);
+    }
+
+    #[test]
+    fn remap_inline_style_spans_keeps_style_across_inserted_emergency_hyphen() {
+        let source = "supercalifragilistic";
+        let target = "super-\ncalifragilistic";
+        let spans = vec![InlineStyleSpan {
+            start: 0,
+            end: source.len(),
+            bold: true,
+            italic: false,
+            font_label: None,
+            font_size_px: None,
+            text_color: None,
+            line_spacing_px: None,
+            line_spacing_percent: None,
+            kerning_px: None,
+            kerning_percent: None,
+            glyph_stretch_percent: None,
+            glyph_offset: None,
+        }];
+
+        let mapped = remap_inline_style_spans(source, target, spans.as_slice()).expect("mapped");
+
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].start, 0);
+        assert_eq!(mapped[0].end, target.len());
+        assert!(mapped[0].bold);
     }
 
     #[test]
