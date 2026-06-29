@@ -278,6 +278,33 @@ def _torch_build_details() -> str:
     return "\n".join(lines)
 
 
+def _mps_status() -> Tuple[bool, str]:
+    """Report Apple Metal (MPS) availability for the current torch build."""
+    try:
+        import torch  # type: ignore
+    except Exception as e:
+        return False, f"torch не импортируется: {e}"
+
+    backend = getattr(getattr(torch, "backends", None), "mps", None)
+    if backend is None:
+        return False, "torch.backends.mps отсутствует в этой сборке torch."
+
+    try:
+        is_built = bool(backend.is_built())
+    except Exception:
+        is_built = False
+    try:
+        is_available = bool(backend.is_available())
+    except Exception:
+        is_available = False
+
+    lines = [
+        f"torch.backends.mps.is_built() = {is_built}",
+        f"torch.backends.mps.is_available() = {is_available}",
+    ]
+    return is_available, "\n".join(lines)
+
+
 def _torch_collect_env_info() -> str:
     try:
         from torch.utils.collect_env import get_pretty_env_info  # type: ignore
@@ -613,6 +640,43 @@ def assert_cuda_or_rocm_available() -> bool:
     raise CudaRocmDiagnosticsError(msg)
 
 
+def _diagnose_apple_metal() -> str:
+    """Apple Silicon (macOS) accelerator diagnostics.
+
+    On macOS the GPU accelerator is Metal (MPS); CUDA and ROCm do not apply, so the
+    absence of CUDA is expected rather than an error. This produces a Metal-focused
+    report instead of the CUDA/ROCm diagnostics used on Linux/Windows.
+    """
+    mps_available, mps_details = _mps_status()
+    _, _, gpu_details = _detect_gpu_macos()
+
+    parts = []
+    parts.append(
+        "Платформа: Apple Silicon / macOS. Ускорение ИИ выполняется через Metal (MPS). "
+        "CUDA и ROCm на этой платформе не поддерживаются — это ожидаемо, а не ошибка.\n"
+    )
+    parts.append("== Apple / Metal (MPS) ==")
+    parts.append(mps_details)
+
+    parts.append("\n== Torch build ==")
+    parts.append(_torch_build_details())
+
+    parts.append("\n== GPU detection ==")
+    parts.append("GPU details:\n" + (gpu_details or "n/a"))
+
+    parts.append("\n== Итог ==")
+    if mps_available:
+        parts.append("- Metal (MPS) доступен: PyTorch использует устройство 'mps'.")
+        parts.append("- ONNX Runtime: CoreMLExecutionProvider или CPUExecutionProvider.")
+        parts.append("- Дискретная NVIDIA/AMD GPU и CUDA/ROCm для Apple Silicon неприменимы.")
+    else:
+        parts.append(
+            "- Metal (MPS) недоступен. Нужны macOS ≥ 12.3 и официальная сборка torch "
+            "для macOS arm64 с поддержкой MPS. Сейчас будет использоваться CPU."
+        )
+    return "\n".join(parts)
+
+
 class AIDevice(str):
     """
     Device wrapper that can be passed directly to torch.device(...).
@@ -765,6 +829,8 @@ class AIDevice(str):
 
     @classmethod
     def diagnose_cuda_rocm(cls) -> str:
+        if _is_macos():
+            return _diagnose_apple_metal()
         try:
             assert_cuda_or_rocm_available()
             return "CUDA/ROCm доступна и torch.cuda.is_available() == True."
