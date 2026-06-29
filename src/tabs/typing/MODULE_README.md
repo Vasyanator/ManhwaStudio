@@ -139,6 +139,12 @@ The main data flow is:
    `ensure_page_staged` finds the page present and does not seed stale committed text.
 4. Create/edit panel changes are converted to `TextRenderParams` and rendered by
    `render_next::render_text_to_image` in background workers.
+   Inline no-break tags (`<no-break>`/`<nobr>` or machine `<m j>`) are editing/form controls:
+   the renderer strips them like other inline tags, while the advanced text-form picker applies
+   them to the source text and writes a tag-free `formed_text` with protected ranges already kept
+   together. Inline alignment tags (`<align=...>` or machine `<m a=...>`) are line-level style
+   spans: the line whose start offset is inside the span uses that alignment for horizontal
+   placement, while the control tag itself is stripped from rendered text.
 5. Finished text or image overlays are appended to the runtime layer, written as PNGs
    in `text_images/`, and serialized back to `text_info.json`.
 6. Export workers compose page source, shared clean overlay snapshots, text/image

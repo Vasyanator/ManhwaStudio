@@ -439,6 +439,11 @@ pub fn render_text_to_image(
                 .to_string(),
         );
     }
+    let inline_line_aligns = compute_inline_line_aligns(
+        params.align,
+        layout_text.as_str(),
+        mapped_inline_style_spans.as_deref(),
+    );
     let requested_inline_fonts = mapped_inline_style_spans
         .as_deref()
         .map(collect_requested_inline_font_labels)
@@ -481,13 +486,9 @@ pub fn render_text_to_image(
             &attrs,
             Shaping::Advanced,
         );
-        if let Some(alignment) = justify_alignment {
-            for line in &mut buffer.lines {
-                line.set_align(Some(alignment));
-            }
-            buffer.shape_until_scroll(&mut font_system, false);
-        }
     }
+    apply_line_aligns_to_buffer(&mut buffer, inline_line_aligns.as_slice());
+    buffer.shape_until_scroll(&mut font_system, false);
 
     if matches!(
         params.text_layout_mode,
@@ -623,6 +624,7 @@ pub fn render_text_to_image(
             &attrs,
             &inline_font_registry_build.registry,
             mapped_inline_style_spans.as_deref(),
+            layout_text.as_str(),
             layout_line_offsets.as_slice(),
             line_baselines.as_slice(),
             width_px,
@@ -661,7 +663,10 @@ pub fn render_text_to_image(
             } else {
                 run_layout.line_width_px
             },
-            params.align,
+            inline_line_aligns
+                .get(line_idx)
+                .copied()
+                .unwrap_or(params.align),
         ) as f32
             - if params.hanging_punctuation {
                 run_layout.leading_hang_px
@@ -812,7 +817,10 @@ pub fn render_text_to_image(
             } else {
                 run_layout.line_width_px
             },
-            params.align,
+            inline_line_aligns
+                .get(line_idx)
+                .copied()
+                .unwrap_or(params.align),
         ) as f32
             - if params.hanging_punctuation {
                 run_layout.leading_hang_px
@@ -1114,6 +1122,7 @@ fn render_horizontal_rotated(
     attrs: &Attrs<'_>,
     inline_font_registry: &super::font_registry::InlineFontRegistry,
     inline_style_spans: Option<&[InlineStyleSpan]>,
+    layout_text: &str,
     layout_line_offsets: &[usize],
     line_baselines: &[f32],
     width_px: u32,
@@ -1123,6 +1132,8 @@ fn render_horizontal_rotated(
 ) -> Result<RenderedTextImage, String> {
     let mut cache = SwashCache::new();
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
+    let inline_line_aligns =
+        compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
 
@@ -1146,7 +1157,10 @@ fn render_horizontal_rotated(
             } else {
                 run_layout.line_width_px
             },
-            params.align,
+            inline_line_aligns
+                .get(line_idx)
+                .copied()
+                .unwrap_or(params.align),
         ) as f32
             - if params.hanging_punctuation {
                 run_layout.leading_hang_px
@@ -1479,6 +1493,37 @@ fn justify_alignment_option(align: HorizontalAlign) -> Option<Align> {
         Some(Align::Justified)
     } else {
         None
+    }
+}
+
+fn compute_inline_line_aligns(
+    base_align: HorizontalAlign,
+    layout_text: &str,
+    spans: Option<&[InlineStyleSpan]>,
+) -> Vec<HorizontalAlign> {
+    let line_offsets = compute_layout_line_offsets(layout_text);
+    let Some(spans) = spans else {
+        return vec![base_align; line_offsets.len()];
+    };
+    line_offsets
+        .iter()
+        .map(|offset| {
+            inline_style_at_offset(spans, *offset)
+                .and_then(|span| span.align)
+                .unwrap_or(base_align)
+        })
+        .collect()
+}
+
+fn apply_line_aligns_to_buffer(
+    buffer: &mut Buffer,
+    line_aligns: &[HorizontalAlign],
+) {
+    for (idx, line) in buffer.lines.iter_mut().enumerate() {
+        let cosmic_align = line_aligns
+            .get(idx)
+            .and_then(|align| justify_alignment_option(*align));
+        line.set_align(cosmic_align);
     }
 }
 

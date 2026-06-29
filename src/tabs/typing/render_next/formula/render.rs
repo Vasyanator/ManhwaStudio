@@ -37,8 +37,8 @@ use crate::tabs::typing::render_next::raster::{
     trim_rendered_image_to_alpha_bounds,
 };
 use crate::tabs::typing::render_next::types::{
-    KerningMode, RenderedTextImage, TextLayoutMode, TextRenderParams, TextVectorLineDistanceMode,
-    TextVectorLineTextDirection,
+    HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextRenderParams,
+    TextVectorLineDistanceMode, TextVectorLineTextDirection,
 };
 use cosmic_text::{
     Attrs, AttrsOwned, Buffer, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping, SwashCache,
@@ -1333,10 +1333,16 @@ fn collect_formula_glyph_seeds(
 
     let mut out = Vec::<FormulaGlyphSeed>::new();
     let mut line_seen = vec![0usize; line_counts.len().max(1)];
+    let inline_line_aligns =
+        compute_inline_line_aligns(params.align, layout_line_offsets, inline_style_spans);
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
-        let line_offset_x = horizontal_line_offset(width_px, run.line_w, params.align) as f32;
+        let line_align = inline_line_aligns
+            .get(line_idx)
+            .copied()
+            .unwrap_or(params.align);
+        let line_offset_x = horizontal_line_offset(width_px, run.line_w, line_align) as f32;
         let baseline_y = line_baselines.get(line_idx).copied().unwrap_or_else(|| {
             horizontal_run_baseline_y(
                 &run,
@@ -1571,6 +1577,25 @@ fn compute_layout_line_offsets(text: &str) -> Vec<usize> {
         }
     }
     offsets
+}
+
+/// Resolve per-line alignment from inline style spans, falling back to the block alignment.
+fn compute_inline_line_aligns(
+    base_align: HorizontalAlign,
+    layout_line_offsets: &[usize],
+    inline_style_spans: Option<&[InlineStyleSpan]>,
+) -> Vec<HorizontalAlign> {
+    let Some(spans) = inline_style_spans else {
+        return vec![base_align; layout_line_offsets.len().max(1)];
+    };
+    layout_line_offsets
+        .iter()
+        .map(|offset| {
+            inline_style_at_offset(spans, *offset)
+                .and_then(|span| span.align)
+                .unwrap_or(base_align)
+        })
+        .collect()
 }
 
 fn spans_have_inline_size_overrides(spans: &[InlineStyleSpan]) -> bool {

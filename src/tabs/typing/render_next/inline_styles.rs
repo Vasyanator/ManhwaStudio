@@ -16,7 +16,7 @@ Notes:
 */
 
 use super::font_registry::{InlineFontRegistry, normalize_inline_font_label};
-use super::types::{PxOrPercent, parse_machine_tag};
+use super::types::{HorizontalAlign, PxOrPercent, parse_machine_tag};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
 const VERTICAL_HALF_SPACE: char = '\u{200A}';
@@ -28,6 +28,7 @@ pub(crate) struct InlineStyleSpan {
     pub(crate) end: usize,
     pub(crate) bold: bool,
     pub(crate) italic: bool,
+    pub(crate) align: Option<HorizontalAlign>,
     pub(crate) font_label: Option<String>,
     pub(crate) font_size_px: Option<f32>,
     pub(crate) text_color: Option<[u8; 4]>,
@@ -69,6 +70,7 @@ impl InlineStyleSpan {
             end,
             bold: false,
             italic: false,
+            align: None,
             font_label: None,
             font_size_px: None,
             text_color: None,
@@ -97,6 +99,7 @@ pub(crate) struct ParsedInlineStyles {
 struct InlineStyleState {
     bold_depth: usize,
     italic_depth: usize,
+    align_stack: Vec<HorizontalAlign>,
     font_stack: Vec<String>,
     size_stack: Vec<f32>,
     color_stack: Vec<[u8; 4]>,
@@ -114,6 +117,7 @@ struct InlineStyleState {
 struct MachineFramePush {
     bold: bool,
     italic: bool,
+    align: bool,
     font: bool,
     size: bool,
     color: bool,
@@ -131,6 +135,7 @@ impl InlineStyleState {
             end,
             bold: self.bold_depth > 0,
             italic: self.italic_depth > 0,
+            align: self.align_stack.last().copied(),
             font_label: self.font_stack.last().cloned(),
             font_size_px: self.size_stack.last().copied(),
             text_color: self.color_stack.last().copied(),
@@ -189,6 +194,15 @@ pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> Par
                     state.italic_depth = state.italic_depth.saturating_sub(1);
                     true
                 }
+                "no-break" | "nobreak" | "nobr" | "/no-break" | "/nobreak" | "/nobr" => {
+                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                    true
+                }
+                "/align" => {
+                    flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                    state.align_stack.pop();
+                    true
+                }
                 "/font" => {
                     flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
                     state.font_stack.pop();
@@ -240,6 +254,12 @@ pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> Par
                 continue;
             }
 
+            if let Some(align) = parse_align_tag_value(raw) {
+                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                state.align_stack.push(align);
+                i = end + 1;
+                continue;
+            }
             if let Some(font_label) = parse_font_tag_label(raw) {
                 flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
                 state.font_stack.push(font_label);
@@ -505,6 +525,7 @@ fn push_or_extend_inline_style_span(
         && last.end == start
         && last.bold == style.bold
         && last.italic == style.italic
+        && last.align == style.align
         && last.font_label == style.font_label
         && last.font_size_px == style.font_size_px
         && last.text_color == style.text_color
@@ -523,6 +544,23 @@ fn push_or_extend_inline_style_span(
     cloned.start = start;
     cloned.end = end;
     spans.push(cloned);
+}
+
+fn parse_align_tag_value(raw_tag: &str) -> Option<HorizontalAlign> {
+    let value = tag_value(raw_tag, "align")?;
+    parse_inline_align_value(value)
+}
+
+fn parse_inline_align_value(value: &str) -> Option<HorizontalAlign> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bias = trimmed.parse::<f32>().ok();
+    Some(HorizontalAlign::from_config(Some(trimmed), bias))
 }
 
 fn parse_font_tag_label(raw_tag: &str) -> Option<String> {
@@ -657,6 +695,12 @@ fn apply_machine_tag(
                 state.italic_depth = state.italic_depth.saturating_add(1);
                 frame.italic = true;
             }
+            'a' => {
+                if let Some(align) = parse_inline_align_value(value) {
+                    state.align_stack.push(align);
+                    frame.align = true;
+                }
+            }
             'f' => {
                 let label = value.trim();
                 if !label.is_empty() {
@@ -765,6 +809,9 @@ fn close_machine_tag(state: &mut InlineStyleState) {
     }
     if frame.italic {
         state.italic_depth = state.italic_depth.saturating_sub(1);
+    }
+    if frame.align {
+        state.align_stack.pop();
     }
     if frame.font {
         state.font_stack.pop();
@@ -898,6 +945,7 @@ mod tests {
         remap_inline_style_spans,
     };
     use crate::tabs::typing::render_next::font_registry::InlineFontRegistry;
+    use crate::tabs::typing::render_next::types::HorizontalAlign;
     use cosmic_text::{Attrs, Metrics, Style, Weight};
 
     #[test]
@@ -909,6 +957,7 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            align: None,
             font_label: None,
             font_size_px: None,
             text_color: None,
@@ -939,6 +988,7 @@ mod tests {
                 end: 2,
                 bold: false,
                 italic: false,
+                align: None,
                 font_label: None,
                 font_size_px: None,
                 text_color: None,
@@ -954,6 +1004,7 @@ mod tests {
                 end: source.len(),
                 bold: true,
                 italic: false,
+                align: None,
                 font_label: None,
                 font_size_px: None,
                 text_color: None,
@@ -984,6 +1035,7 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            align: None,
             font_label: None,
             font_size_px: None,
             text_color: None,
@@ -1012,6 +1064,7 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            align: None,
             font_label: None,
             font_size_px: None,
             text_color: None,
@@ -1049,6 +1102,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_inline_style_tags_strips_no_break_control_tag() {
+        let parsed = parse_inline_style_tags("a<no-break>b c</no-break>d", 24.0);
+
+        assert_eq!(parsed.plain_text, "ab cd");
+    }
+
+    #[test]
+    fn parse_inline_style_tags_tracks_line_alignment() {
+        let parsed = parse_inline_style_tags("a<align=right>bc</align>d", 24.0);
+
+        assert_eq!(parsed.plain_text, "abcd");
+        assert_eq!(parsed.spans.len(), 3);
+        assert_eq!(
+            parsed
+                .plain_text
+                .get(parsed.spans[1].start..parsed.spans[1].end),
+            Some("bc")
+        );
+        assert_eq!(parsed.spans[1].align, Some(HorizontalAlign::RIGHT));
+        assert_eq!(parsed.spans[2].align, None);
+    }
+
+    #[test]
     fn parse_inline_style_tags_tracks_font_size_and_non_attrs_overrides() {
         let parsed = parse_inline_style_tags(
             "a<size=36><color=#11223344><offset=3,-4>bc</offset></color></size>d",
@@ -1078,7 +1154,7 @@ mod tests {
     fn parse_machine_tag_combines_all_inline_params() {
         // Один компактный тег `<m ...>` задаёт сразу несколько параметров.
         let parsed = parse_inline_style_tags(
-            "a<m b s=36 f=\"My Font\" c=11223344 l=50% k=10 w=120% h=80% x=3 n=12 q g=30>bc</m>d",
+            "a<m b a=right s=36 f=\"My Font\" c=11223344 l=50% k=10 w=120% h=80% x=3 n=12 q g=30>bc</m>d",
             24.0,
         );
 
@@ -1087,6 +1163,7 @@ mod tests {
         let span = &parsed.spans[1];
         assert_eq!(parsed.plain_text.get(span.start..span.end), Some("bc"));
         assert!(span.bold);
+        assert_eq!(span.align, Some(HorizontalAlign::RIGHT));
         assert_eq!(span.font_size_px, Some(36.0));
         assert_eq!(span.font_label.as_deref(), Some("My Font"));
         assert_eq!(span.text_color, Some([0x11, 0x22, 0x33, 0x44]));
@@ -1106,6 +1183,7 @@ mod tests {
 
         // После `</m>` все стили сняты.
         assert!(!parsed.spans[2].bold);
+        assert_eq!(parsed.spans[2].align, None);
         assert_eq!(parsed.spans[2].font_size_px, None);
         assert_eq!(parsed.spans[2].glyph_offset, None);
     }
@@ -1134,6 +1212,7 @@ mod tests {
             end: 3,
             bold: true,
             italic: true,
+            align: None,
             font_label: None,
             font_size_px: Some(30.0),
             text_color: None,

@@ -17,6 +17,8 @@
   - standalone dash/hyphen tokens between words are attached to the previous segment so a line
     break adjacent to the sign can place it only at the previous line end, never at the next line
     start;
+  - NBSP (`U+00A0`) is treated as visible non-breaking whitespace: it counts as text but does not
+    split tokenizer segments or create a wrap boundary;
   - `Conservatism` (`Safe` < `Relaxed` < `Bold` < `Reckless`) — насколько вольным
     надо быть, чтобы разрыв в стыке считался допустимым (обычный пробел → `Safe`,
     отрыв предлога/частицы/«число + единица» → выше);

@@ -1876,6 +1876,8 @@ struct AdvancedFormMetricSignature {
 struct TypingInlineTagStyle {
     bold: bool,
     italic: bool,
+    no_break: bool,
+    align: Option<HorizontalAlign>,
     font_label: Option<String>,
     font_size_px: Option<f32>,
     text_color: Option<Color32>,
@@ -1922,6 +1924,8 @@ struct TypingInlineSelectionContext {
 enum TypingInlineTagKind {
     Bold,
     Italic,
+    NoBreak,
+    Align(HorizontalAlign),
     Font(String),
     Size(f32),
     Color(Color32),
@@ -4277,16 +4281,16 @@ impl TypingCreatePanelState {
     /// ⬌ (justify, «Растягивать по ширине блока»). Слайдер и стрелки отключаются при
     /// включённом justify; кнопка ⬌ остаётся активной, чтобы его можно было выключить.
     fn draw_alignment_controls(
-        &mut self,
         ui: &mut egui::Ui,
+        align: &mut HorizontalAlign,
         changed: &mut bool,
         block_hscroll_by_hovered_param: &mut bool,
     ) {
-        let free_align = self.align.justify;
+        let free_align = align.justify;
         ui.horizontal(|ui| {
             // Слайдер + стрелки отключаются при включённом justify.
             ui.add_enabled_ui(!free_align, |ui| {
-                let mut bias_percent = (self.align.bias.clamp(-1.0, 1.0) * 100.0).round() as i32;
+                let mut bias_percent = (align.bias.clamp(-1.0, 1.0) * 100.0).round() as i32;
                 let slider_resp = ui.add(
                     WheelSlider::new(&mut bias_percent, -100..=100)
                         .text("Выравнивание")
@@ -4294,20 +4298,20 @@ impl TypingCreatePanelState {
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &slider_resp);
                 if slider_resp.changed() {
-                    self.align.bias = bias_percent as f32 / 100.0;
+                    align.bias = bias_percent as f32 / 100.0;
                     *changed = true;
                 }
 
                 if ui.button("⬅").on_hover_text("По левому краю").clicked() {
-                    self.align.bias = -1.0;
+                    align.bias = -1.0;
                     *changed = true;
                 }
                 if ui.button("⬇").on_hover_text("По центру").clicked() {
-                    self.align.bias = 0.0;
+                    align.bias = 0.0;
                     *changed = true;
                 }
                 if ui.button("➡").on_hover_text("По правому краю").clicked() {
-                    self.align.bias = 1.0;
+                    align.bias = 1.0;
                     *changed = true;
                 }
             });
@@ -4315,11 +4319,11 @@ impl TypingCreatePanelState {
             // Зажимаемая кнопка-тоггл justify — остаётся активной даже при включённом
             // justify, чтобы его можно было снять.
             if ui
-                .add(egui::Button::new("⬌").selected(self.align.justify))
+                .add(egui::Button::new("⬌").selected(align.justify))
                 .on_hover_text("Растягивать строки по ширине блока")
                 .clicked()
             {
-                self.align.justify = !self.align.justify;
+                align.justify = !align.justify;
                 *changed = true;
             }
         });
@@ -4334,7 +4338,12 @@ impl TypingCreatePanelState {
     ) {
         let selection_mode = inline_style.is_some();
         ui.add_enabled_ui(!selection_mode, |ui| {
-            self.draw_alignment_controls(ui, changed, block_hscroll_by_hovered_param);
+            Self::draw_alignment_controls(
+                ui,
+                &mut self.align,
+                changed,
+                block_hscroll_by_hovered_param,
+            );
 
             let prev_shape = self.text_shape;
             let shape_combo = WheelComboBox::from_label("Форма")
@@ -4435,6 +4444,10 @@ impl TypingCreatePanelState {
             }
         });
         if let Some(style) = inline_style {
+            let mut align = style.align.unwrap_or(self.align);
+            Self::draw_alignment_controls(ui, &mut align, changed, block_hscroll_by_hovered_param);
+            style.align = Some(align);
+
             let mut bold = style.bold;
             let force_bold_resp = ui.checkbox(&mut bold, "Bold");
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_bold_resp);
@@ -4446,6 +4459,12 @@ impl TypingCreatePanelState {
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_italic_resp);
             *changed |= force_italic_resp.changed();
             style.italic = italic;
+
+            let mut no_break = style.no_break;
+            let no_break_resp = ui.checkbox(&mut no_break, "Не разрывать");
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &no_break_resp);
+            *changed |= no_break_resp.changed();
+            style.no_break = no_break;
         } else {
             let force_bold_resp = ui.checkbox(&mut self.force_bold, "Bold");
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_bold_resp);
@@ -5319,7 +5338,7 @@ impl TypingCreatePanelState {
 
     /// Текст, по которому перебираются формы — всегда исходный (`text`).
     fn advanced_form_source_text(&self) -> String {
-        self.text.clone()
+        forms::prepare_inline_no_break_text(&self.text)
     }
 
     /// От чего зависят пиксельные ширины глифов в окне форм.
@@ -5825,7 +5844,7 @@ impl TypingCreatePanelState {
                 if selection_mode {
                     ui.add_space(4.0);
                     ui.small(
-                        "При выделении `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Bold`, `Italic` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
+                        "При выделении `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Выравнивание`, `Bold`, `Italic`, `Не разрывать` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
                     );
                 }
             });
@@ -6299,11 +6318,23 @@ impl TypingCreatePanelState {
                                 Vec2::new(right_col_w, 0.0),
                                 egui::Layout::top_down(Align::Min),
                                 |ui| {
-                                        self.draw_alignment_controls(
-                                            ui,
-                                            &mut changed,
-                                            &mut block_hscroll_by_hovered_param,
-                                        );
+                                        if let Some(style) = inline_style.as_mut() {
+                                            let mut align = style.align.unwrap_or(self.align);
+                                            Self::draw_alignment_controls(
+                                                ui,
+                                                &mut align,
+                                                &mut changed,
+                                                &mut block_hscroll_by_hovered_param,
+                                            );
+                                            style.align = Some(align);
+                                        } else {
+                                            Self::draw_alignment_controls(
+                                                ui,
+                                                &mut self.align,
+                                                &mut changed,
+                                                &mut block_hscroll_by_hovered_param,
+                                            );
+                                        }
 
                                         let prev_shape = self.text_shape;
                                         let shape_combo = WheelComboBox::from_label("Форма")
@@ -6474,6 +6505,16 @@ impl TypingCreatePanelState {
                                             );
                                             changed |= force_italic_resp.changed();
                                             style.italic = italic;
+
+                                            let mut no_break = style.no_break;
+                                            let no_break_resp =
+                                                ui.checkbox(&mut no_break, "Не разрывать");
+                                            mark_hscroll_block_on_hover(
+                                                &mut block_hscroll_by_hovered_param,
+                                                &no_break_resp,
+                                            );
+                                            changed |= no_break_resp.changed();
+                                            style.no_break = no_break;
                                         } else {
                                             let force_bold_resp =
                                                 ui.checkbox(&mut self.force_bold, "Bold");
@@ -6552,7 +6593,7 @@ impl TypingCreatePanelState {
             if selection_mode {
                 ui.add_space(4.0);
                 ui.small(
-                    "При выделении `Цвет`, `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Bold`, `Italic` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
+                    "При выделении `Цвет`, `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Выравнивание`, `Bold`, `Italic`, `Не разрывать` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
                 );
             }
 
@@ -6701,6 +6742,8 @@ impl TypingCreatePanelState {
             match &tag.kind {
                 TypingInlineTagKind::Bold => style.bold = true,
                 TypingInlineTagKind::Italic => style.italic = true,
+                TypingInlineTagKind::NoBreak => style.no_break = true,
+                TypingInlineTagKind::Align(align) => style.align = Some(*align),
                 TypingInlineTagKind::Font(label) => style.font_label = Some(label.clone()),
                 TypingInlineTagKind::Size(size_px) => style.font_size_px = Some(*size_px),
                 TypingInlineTagKind::Color(color) => style.text_color = Some(*color),
@@ -6714,6 +6757,12 @@ impl TypingCreatePanelState {
                     }
                     if machine.italic {
                         style.italic = true;
+                    }
+                    if machine.no_break {
+                        style.no_break = true;
+                    }
+                    if machine.align.is_some() {
+                        style.align = machine.align;
                     }
                     if machine.font_label.is_some() {
                         style.font_label = machine.font_label.clone();
@@ -6759,6 +6808,8 @@ impl TypingCreatePanelState {
         TypingInlineTagStyle {
             bold: selection.style.bold || self.force_bold,
             italic: selection.style.italic || self.force_italic,
+            no_break: selection.style.no_break,
+            align: Some(selection.style.align.unwrap_or(self.align)),
             font_label: Some(
                 selection
                     .style
@@ -6908,6 +6959,10 @@ impl TypingCreatePanelState {
             kerning,
             glyph_stretching,
             glyph_offset,
+            no_break: desired_effective_style.no_break,
+            align: desired_effective_style
+                .align
+                .filter(|align| *align != self.align),
         }
     }
 
@@ -7902,11 +7957,16 @@ fn parse_opening_inline_tag(raw: &str) -> Option<TypingInlineTagKind> {
     match compact.as_str() {
         "b" | "strong" => return Some(TypingInlineTagKind::Bold),
         "i" | "em" => return Some(TypingInlineTagKind::Italic),
+        "no-break" | "nobreak" | "nobr" => return Some(TypingInlineTagKind::NoBreak),
         _ => {}
     }
 
     if let Some(style) = parse_machine_tag_style(raw) {
         return Some(TypingInlineTagKind::Machine(style));
+    }
+
+    if let Some(align) = parse_inline_align_tag(raw) {
+        return Some(TypingInlineTagKind::Align(align));
     }
 
     if let Some((tag_name, value)) = raw.split_once('=')
@@ -7974,6 +8034,8 @@ fn parse_closing_inline_tag(raw: &str) -> Option<TypingInlineTagKind> {
     match compact.as_str() {
         "/b" | "/strong" => Some(TypingInlineTagKind::Bold),
         "/i" | "/em" => Some(TypingInlineTagKind::Italic),
+        "/no-break" | "/nobreak" | "/nobr" => Some(TypingInlineTagKind::NoBreak),
+        "/align" => Some(TypingInlineTagKind::Align(HorizontalAlign::CENTER)),
         "/font" => Some(TypingInlineTagKind::Font(String::new())),
         "/size" => Some(TypingInlineTagKind::Size(0.0)),
         "/color" => Some(TypingInlineTagKind::Color(Color32::TRANSPARENT)),
@@ -7996,6 +8058,8 @@ fn inline_tag_kinds_match(left: &TypingInlineTagKind, right: &TypingInlineTagKin
         (left, right),
         (TypingInlineTagKind::Bold, TypingInlineTagKind::Bold)
             | (TypingInlineTagKind::Italic, TypingInlineTagKind::Italic)
+            | (TypingInlineTagKind::NoBreak, TypingInlineTagKind::NoBreak)
+            | (TypingInlineTagKind::Align(_), TypingInlineTagKind::Align(_))
             | (TypingInlineTagKind::Font(_), TypingInlineTagKind::Font(_))
             | (TypingInlineTagKind::Size(_), TypingInlineTagKind::Size(_))
             | (TypingInlineTagKind::Color(_), TypingInlineTagKind::Color(_))
@@ -8022,6 +8086,31 @@ fn inline_tag_kinds_match(left: &TypingInlineTagKind, right: &TypingInlineTagKin
     )
 }
 
+fn parse_inline_align_tag(raw: &str) -> Option<HorizontalAlign> {
+    let value = inline_tag_value(raw, "align")?;
+    parse_inline_align_value(value)
+}
+
+fn parse_inline_align_value(value: &str) -> Option<HorizontalAlign> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bias = trimmed.parse::<f32>().ok();
+    Some(HorizontalAlign::from_config(Some(trimmed), bias))
+}
+
+fn format_inline_align_value(align: HorizontalAlign) -> String {
+    if align.justify || align.bias <= -0.95 || align.bias.abs() <= 0.05 || align.bias >= 0.95 {
+        align.legacy_str().to_string()
+    } else {
+        format!("{:.2}", align.bias.clamp(-1.0, 1.0))
+    }
+}
+
 /// Собрать машиночитаемый тег `<m ...>` (см. контракт ключей в `parse_machine_tag`).
 /// Возвращает пустую строку, если стиль ничего не задаёт.
 fn build_inline_machine_tag(style: &TypingInlineTagStyle) -> String {
@@ -8031,6 +8120,12 @@ fn build_inline_machine_tag(style: &TypingInlineTagStyle) -> String {
     }
     if style.italic {
         out.push_str(" i");
+    }
+    if style.no_break {
+        out.push_str(" j");
+    }
+    if let Some(align) = style.align {
+        out.push_str(format!(" a={}", format_inline_align_value(align)).as_str());
     }
     if let Some(font_label) = style.font_label.as_deref() {
         let sanitized = font_label.replace(['"', '<', '>'], "");
@@ -8109,6 +8204,12 @@ fn build_inline_opening_tags(style: &TypingInlineTagStyle) -> String {
     if let Some(offset) = style.glyph_offset {
         out.push_str(format_inline_offset_tag(offset).as_str());
     }
+    if style.no_break {
+        out.push_str("<no-break>");
+    }
+    if let Some(align) = style.align {
+        out.push_str(format!("<align={}>", format_inline_align_value(align)).as_str());
+    }
     if style.bold {
         out.push_str("<b>");
     }
@@ -8125,6 +8226,12 @@ fn build_inline_closing_tags(style: &TypingInlineTagStyle) -> String {
     }
     if style.bold {
         out.push_str("</b>");
+    }
+    if style.align.is_some() {
+        out.push_str("</align>");
+    }
+    if style.no_break {
+        out.push_str("</no-break>");
     }
     if style.glyph_offset.is_some() {
         out.push_str("</offset>");
@@ -8279,6 +8386,12 @@ fn parse_machine_tag_style(raw: &str) -> Option<TypingInlineTagStyle> {
         match key {
             'b' => style.bold = true,
             'i' => style.italic = true,
+            'j' | 'J' => style.no_break = true,
+            'a' | 'A' => {
+                if let Some(align) = parse_inline_align_value(value) {
+                    style.align = Some(align);
+                }
+            }
             'f' => {
                 let label = value.trim();
                 if !label.is_empty() {
@@ -11091,6 +11204,8 @@ mod tests {
         let style = TypingInlineTagStyle {
             bold: true,
             italic: false,
+            no_break: true,
+            align: Some(HorizontalAlign::RIGHT),
             font_label: Some("My Font".to_string()),
             font_size_px: Some(36.0),
             text_color: Some(Color32::from_rgb(0x11, 0x22, 0x33)),

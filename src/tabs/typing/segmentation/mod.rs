@@ -20,7 +20,7 @@ pub(crate) mod base;
 pub(crate) mod ru;
 
 pub(crate) use base::{
-    BindingMode, Block, Conservatism, SOFT_HYPHEN, SegmentOptions, Segmenter,
+    BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions, Segmenter,
     build_line_text_and_units, count_layout_units,
 };
 pub(crate) use ru::{HyphenationDictionaries, RussianSegmenter};

@@ -831,6 +831,12 @@ pub struct TextInlineIn {
 /// rendered PNG name + `mask_clip` inline, making `layers.json` self-sufficient for text. This is the
 /// single text writer (the former reference-only `text_info.json` writers were removed in A4–D).
 ///
+/// The page is first seeded from the committed fallback (via [`ensure_page_staged`]) when the staging
+/// manifest has no record of it, so rasters living ONLY in committed (the first text flush after a
+/// chapter re-open, when the previous save removed the `_unsaved` dir) are carried onto the staged
+/// page — otherwise the owned-page merge would whole-page-replace the committed page with a text-only
+/// one and DROP the rasters.
+///
 /// PS-owned fields (`pinned` / `pinned_by_group` / `z` / `group_uid`) on an existing text node are
 /// carried onto the incoming node by [`merge_preserved_text_fields`] (same as the typing rewrite), so
 /// a doc flush does not clobber a pin / Z / PS group set in the PS editor. Does NO PNG IO: the
@@ -877,6 +883,17 @@ pub fn write_page_text_payload(
 
     fs::create_dir_all(layers_dir)
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
+
+    // Seed the page from the committed fallback when the staging manifest has no record of it yet.
+    // Without this, a text-only flush on a page whose rasters live ONLY in the committed manifest (e.g.
+    // the first text edit after re-opening a chapter, when the `_unsaved` staging dir was removed by the
+    // previous save-to-project) would read an EMPTY staging page below, preserve ZERO rasters, and write
+    // a text-only page. `merge_unsaved_layers_into_committed` then treats the rasters as "unsaved wins"
+    // and replaces the committed page wholesale — silently DROPPING the rasters. Seeding here (only when
+    // the page is absent from staging, so a session that already staged a raster deletion is not undone)
+    // carries the committed rasters/groups onto the staging page so the text replace keeps them. Mirrors
+    // `update_raster_effects`/`update_raster_transform`, which already stage via `ensure_page_staged`.
+    ensure_page_staged(&mut manifest, page_idx, fallback_dir)?;
 
     // Keep every non-text node (rasters) plus the page's PS groups; replace only the text nodes.
     // Text groups (`text_groups`) are intentionally NOT carried: text is fully-manual pinned-with-Z now,
@@ -2460,6 +2477,119 @@ mod tests {
             load_page_text_nodes(&committed, None, 3).unwrap().len(),
             0,
             "deleted text stays deleted through an image-create + save (NO resurrection)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn committed_rasters_survive_a_text_only_flush_after_reopen() {
+        // DATA LOSS the user hit: a page with committed RASTERS (e.g. an image cut into pieces, with
+        // non-destructive effects) + committed TEXT. The chapter is RE-OPENED in a fresh session, so the
+        // `_unsaved` staging dir was removed by the previous save. Saving again runs `flush_text_layers`
+        // → `flush_page_text` (text ONLY — no full `flush_page` re-stages the rasters on this path), then
+        // the owned-page merge whole-page-replaces the committed page with the staged one.
+        //
+        // Pre-fix: `write_page_text_payload` preserved rasters by reading ONLY the (empty) staging
+        // manifest, so it staged a TEXT-ONLY page → the owned merge dropped the committed rasters. The
+        // user saw "both raster layers disappear" on the SECOND save/close/open cycle.
+        //
+        // With the fallback-seed in `write_page_text_payload`, the absent staging page is seeded from
+        // committed first, so the staged page carries the committed rasters (+ effects) → they SURVIVE.
+        use crate::models::layer_model::layer_doc::LayerDoc;
+
+        let root = std::env::temp_dir().join(format!("ml_raster_reopen_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let committed = root.join("layers");
+        let unsaved = root.join("layers_unsaved");
+
+        let pic = img([2, 2], Color32::WHITE);
+        let raster = |uid: &str| RasterLayerOut {
+            uid: uid.into(),
+            name: uid.into(),
+            visible: true,
+            opacity: 1.0,
+            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            group_uid: None,
+            image: &pic,
+            pixels_dirty: true,
+            mask_clip: None,
+        };
+        let text_with_png = |dir: &Path, uid: &str, page: usize| -> TextPayloadOut {
+            fs::create_dir_all(dir).unwrap();
+            let file = rendered_file_name(page, uid);
+            write_png(&dir.join(&file), &img([2, 2], Color32::GREEN)).unwrap();
+            let mut out = text_payload_out(uid, 5, 0, false);
+            out.rendered_file = Some(file);
+            out.render_data = serde_json::json!({ "text": uid });
+            out
+        };
+
+        // COMMITTED page 3 (the state after the FIRST successful save + reopen): two rasters, one with a
+        // non-destructive effect, plus a text overlay. NO staging dir yet (it was removed on last save).
+        save_page_rasters(&committed, 3, &[raster("piece1"), raster("piece2")], &[], &[]).unwrap();
+        // Give piece1 a reversible effect (rendered PNG + chain), as the user did.
+        update_raster_effects(
+            &committed,
+            3,
+            "piece1",
+            &[serde_json::json!({ "type": "stroke", "width": 2.0, "color": [0, 0, 0, 255] })],
+            Some(&img([2, 2], Color32::BLACK)),
+            None,
+        )
+        .unwrap();
+        let t3 = text_with_png(&committed, "t3", 3);
+        write_page_text_payload(&committed, None, 3, &[t3]).unwrap();
+
+        // Sanity: committed page 3 has two rasters (one effected) + one text.
+        assert_eq!(load_page_rasters(&committed, None, 3).unwrap().layers.len(), 2, "seed: 2 rasters");
+        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "seed: 1 text");
+        assert!(
+            !read_manifest(&committed.join("layers.json")).unwrap().unwrap().page(3).unwrap()
+                .tree.iter().find(|r| r.uid == "piece1").unwrap().effects.is_empty(),
+            "seed: piece1 carries its effect chain"
+        );
+
+        // REOPEN: fresh session, staging dir absent. The doc loads page 3 from committed.
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        for p in 0..=3 {
+            page_sizes.insert(p, [2, 2]);
+        }
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        assert_eq!(
+            doc.page(3).unwrap().nodes.iter().filter(|n| n.is_raster()).count(),
+            2,
+            "doc reload sees both committed rasters"
+        );
+
+        // SAVE AGAIN: only the TEXT path runs (the real `flush_text_layers` → `flush_page_text`). NO full
+        // `flush_page` re-stages the rasters here.
+        let mut owned: HashSet<usize> = HashSet::new();
+        for p in doc.resident_pages() {
+            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+                owned.insert(p);
+            }
+        }
+        // The staged page must carry the rasters seeded from committed (the fix); pre-fix it had none.
+        assert_eq!(
+            load_page_rasters(&unsaved, Some(committed.as_path()), 3).unwrap().layers.len(),
+            2,
+            "staged page keeps the committed rasters (fallback seed)"
+        );
+
+        // Save-to-project merge with the real owned set.
+        merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).unwrap();
+
+        // CLOSE + OPEN again: committed page 3 still has BOTH rasters AND the text, effect intact.
+        let final_rasters = load_page_rasters(&committed, None, 3).unwrap();
+        assert_eq!(final_rasters.layers.len(), 2, "both rasters survive the second save (the bug)");
+        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "text intact");
+        assert!(
+            !read_manifest(&committed.join("layers.json")).unwrap().unwrap().page(3).unwrap()
+                .tree.iter().find(|r| r.uid == "piece1").unwrap().effects.is_empty(),
+            "piece1's effect chain survives too"
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -25,7 +25,50 @@
 
 ---
 
-## 2. Hierarchical Documentation for Agents
+## 2. Working Modes
+
+This project defines a default operating mode and explicit triggers that switch it.
+
+### 2.1 Sub-Agent Manager Mode (default)
+
+By default you act as a manager of sub-agents, not as a direct implementer.
+
+In this mode:
+
+* Do not write code yourself, except small, local fixes.
+* Do not read large amounts of code yourself; delegate exploration.
+* Your job is to spawn sub-agents, distribute work among them, and keep documentation consistent (`README_AGENT.md`, `MODULE_README.md`, file headers, declaration comments).
+
+Standard pipeline:
+
+1. **Explorers** - launch first to map the scope of work and locate the relevant code.
+2. **Workers** - launch to implement the change once the scope is clear.
+3. **Reviewers** - launch after a large edit to verify correctness and contracts.
+
+Rules:
+
+* When the user asks to fix a specific bug, launch 2-3 explorers in parallel with the same task. Independent explorers surface findings the others miss.
+* Launch independent agents in a single batch so they run concurrently.
+* The "read before editing" obligations in this document (sections 1 and 9) apply to the agents doing the work: explorers and workers must read the relevant `README_AGENT.md`, `MODULE_README.md`, headers, and declaration comments. As manager, instruct them to do so instead of reading the code yourself.
+
+Do NOT enter this mode when:
+
+* The task is small (e.g. cosmetic change, one-line fix).
+* The user explicitly tells you to work alone.
+
+In those cases, do the work directly.
+
+### 2.2 Research vs. Implementation
+
+For bug/issue requests, the user's verb selects the mode:
+
+* Investigative phrasing - "Study", "Look into", "Why...", "Investigate" ("Изучи", "Почему", "Разберись") - means **research only**: investigate and plan the change, do not modify code.
+* Explicit action phrasing - "Fix the bug", "Implement", "Add", "Refactor" ("Исправь", "Реализуй", "Добавь") - means perform the change.
+* If the request is not an explicit instruction to change code, only plan the changes; do not edit.
+
+---
+
+## 3. Hierarchical Documentation for Agents
 
 Documentation for quick codebase onboarding has four levels:
 
@@ -206,7 +249,7 @@ Rules:
 * Explain **why**, not **what**. Do not narrate code that already reads clearly (`// increment i` is noise).
 * Keep comments truthful and in sync with the code; update or remove them when the code changes. A stale comment is worse than none.
 * Prefer clearer code over a comment that exists to excuse confusing code.
-* Do not leave commented-out code; see section 13.
+* Do not leave commented-out code; see section 14.
 * Inline comments, like all agent-facing documentation, are written in English.
 
 ### Reading Order Before Changes
@@ -221,7 +264,7 @@ Before changing source code, use this order:
 
 ---
 
-## 3. Version Control
+## 4. Version Control
 
 This repository uses **Mercurial (`hg`)**, not Git.
 
@@ -231,7 +274,7 @@ This repository uses **Mercurial (`hg`)**, not Git.
 
 ---
 
-## 4. Architecture and Performance
+## 5. Architecture and Performance
 
 ### GUI Thread
 
@@ -290,7 +333,7 @@ Correctness > Stability > Readability > Performance
 
 ---
 
-## 5. Rust Architecture Boundaries
+## 6. Rust Architecture Boundaries
 
 * Keep project-specific architectural contracts in `README_AGENT.md`.
 * Keep domain logic out of thin frontends. CLIs, GUIs, HTTP handlers, and adapters should parse input, call typed module APIs, and display or serialize results.
@@ -302,7 +345,7 @@ Correctness > Stability > Readability > Performance
 
 ---
 
-## 6. Error Handling
+## 7. Error Handling
 
 **Errors must never be ignored.**
 
@@ -361,7 +404,7 @@ For public APIs, prefer typed errors through `thiserror`. `anyhow` is acceptable
 
 ---
 
-## 7. Logging
+## 8. Logging
 
 Use structured logging.
 
@@ -387,7 +430,7 @@ Do not log:
 
 ---
 
-## 8. Before Editing a File
+## 9. Before Editing a File
 
 Always:
 
@@ -402,7 +445,7 @@ Always:
 
 ---
 
-## 9. Rust Rules
+## 10. Rust Rules
 
 The project uses:
 
@@ -453,7 +496,7 @@ small public API surface
 
 ---
 
-## 10. Data Layout, Memory, and Buffers
+## 11. Data Layout, Memory, and Buffers
 
 For image, mask, tile, parser, protocol, tensor-like, and data-conversion changes:
 
@@ -475,7 +518,7 @@ Do not round, clamp, reorder, or drop intermediate data just to pass tests unles
 
 ---
 
-## 11. Python and Other Helper Code
+## 12. Python and Other Helper Code
 
 Python is used for:
 
@@ -505,7 +548,7 @@ log = logging.getLogger(__name__)
 
 ---
 
-## 12. Working with the Codebase
+## 13. Working with the Codebase
 
 Before writing new code:
 
@@ -517,7 +560,7 @@ Before writing new code:
 
 ---
 
-## 13. Minimizing Technical Debt
+## 14. Minimizing Technical Debt
 
 Forbidden:
 
@@ -531,7 +574,7 @@ If something is temporary, state the reason, scope, and removal condition.
 
 ---
 
-## 14. Change Structure
+## 15. Change Structure
 
 Changes must be:
 
@@ -544,7 +587,7 @@ Do not change multiple subsystems unnecessarily. If a change affects a contract 
 
 ---
 
-## 15. Verification After Changes
+## 16. Verification After Changes
 
 After any Rust change, verify compilation and clippy:
 
@@ -567,7 +610,7 @@ Before finishing, ensure:
 
 ---
 
-## 16. Clippy-Clean Rust
+## 17. Clippy-Clean Rust
 
 ### Numeric Casts (`as`)
 
@@ -717,7 +760,7 @@ If the same lint is repeatedly allowed, reconsider the architecture instead of s
 
 ---
 
-## 17. Code Goal
+## 18. Code Goal
 
 Code must be:
 

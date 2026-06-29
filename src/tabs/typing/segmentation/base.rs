@@ -26,6 +26,7 @@ use crate::text_punctuation::is_hanging_punctuation;
 
 /// Мягкий перенос (U+00AD): маркер словарной точки переноса внутри слова.
 pub(crate) const SOFT_HYPHEN: char = '\u{00AD}';
+pub(crate) const NON_BREAKING_SPACE: char = '\u{00A0}';
 
 /// «Категория консервативности» точки переноса: насколько вольным надо быть, чтобы
 /// разрыв в этом стыке считался допустимым. Чем выше категория, тем рискованнее
@@ -282,7 +283,7 @@ pub(crate) trait Segmenter {
         let segment_count = segments.len();
         for segment_idx in 0..segment_count {
             let segment = segments[segment_idx].as_str();
-            if opts.preserve_edge_spaces && segment.chars().all(char::is_whitespace) {
+            if opts.preserve_edge_spaces && segment.chars().all(is_breaking_whitespace) {
                 out.push(Block {
                     unit_count: count_layout_units(segment, opts.hanging_punctuation),
                     text: segment.to_string(),
@@ -291,7 +292,7 @@ pub(crate) trait Segmenter {
                 continue;
             }
 
-            let trimmed_text = segment.trim_end_matches(char::is_whitespace);
+            let trimmed_text = segment.trim_end_matches(is_breaking_whitespace);
             if trimmed_text.is_empty() {
                 continue;
             }
@@ -299,7 +300,7 @@ pub(crate) trait Segmenter {
             let trailing_ws = segment
                 .chars()
                 .rev()
-                .take_while(|ch| ch.is_whitespace())
+                .take_while(|ch| is_breaking_whitespace(*ch))
                 .count();
             let separator = (trailing_ws > 0).then(|| " ".repeat(trailing_ws));
 
@@ -363,7 +364,7 @@ pub(crate) trait Segmenter {
         let mut out = Vec::<String>::new();
         let mut idx = 0usize;
 
-        while idx < tokens.len() && tokens[idx].chars().all(char::is_whitespace) {
+        while idx < tokens.len() && tokens[idx].chars().all(is_breaking_whitespace) {
             if preserve_edge_spaces {
                 out.push(tokens[idx].clone());
             }
@@ -373,7 +374,7 @@ pub(crate) trait Segmenter {
         let mut current_text = String::new();
         while idx < tokens.len() {
             let token = tokens[idx].as_str();
-            if token.chars().all(char::is_whitespace) {
+            if token.chars().all(is_breaking_whitespace) {
                 idx += 1;
                 continue;
             }
@@ -383,7 +384,7 @@ pub(crate) trait Segmenter {
             let Some(space) = tokens.get(idx + 1) else {
                 break;
             };
-            if !space.chars().all(char::is_whitespace) {
+            if !space.chars().all(is_breaking_whitespace) {
                 idx += 1;
                 continue;
             }
@@ -397,7 +398,7 @@ pub(crate) trait Segmenter {
                 current_text.push_str(space.as_str());
                 current_text.push_str(next_word.as_str());
                 if let Some(after_dash_space) = tokens.get(idx + 3)
-                    && after_dash_space.chars().all(char::is_whitespace)
+                    && after_dash_space.chars().all(is_breaking_whitespace)
                 {
                     current_text.push_str(after_dash_space.as_str());
                     out.push(std::mem::take(&mut current_text));
@@ -475,7 +476,7 @@ fn word_head_for_cost(text: &str, part_start: usize, break_at: usize) -> &str {
     let word_start = text[..part_start]
         .char_indices()
         .rev()
-        .find(|(_, ch)| ch.is_whitespace())
+        .find(|(_, ch)| is_breaking_whitespace(*ch))
         .map(|(idx, ch)| idx + ch.len_utf8())
         .unwrap_or(0);
     &text[word_start..break_at]
@@ -486,7 +487,7 @@ fn word_head_for_cost(text: &str, part_start: usize, break_at: usize) -> &str {
 fn word_tail_for_cost(text: &str, break_at: usize) -> &str {
     let rel_end = text[break_at..]
         .char_indices()
-        .find(|(_, ch)| ch.is_whitespace() || *ch == SOFT_HYPHEN)
+        .find(|(_, ch)| is_breaking_whitespace(*ch) || *ch == SOFT_HYPHEN)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len() - break_at);
     &text[break_at..break_at + rel_end]
@@ -529,6 +530,10 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_'
 }
 
+fn is_breaking_whitespace(ch: char) -> bool {
+    ch.is_whitespace() && ch != NON_BREAKING_SPACE
+}
+
 /// True for standalone dash/hyphen tokens that should stay at the previous line end.
 #[must_use]
 fn is_line_end_dash_token(token: &str) -> bool {
@@ -560,8 +565,8 @@ fn is_inline_hard_hyphen_break_char_default(text: &str, idx: usize, ch: char) ->
         return false;
     };
 
-    !left.is_whitespace()
-        && !right.is_whitespace()
+    !is_breaking_whitespace(left)
+        && !is_breaking_whitespace(right)
         && (left.is_alphabetic() || right.is_alphabetic())
 }
 
@@ -573,7 +578,7 @@ fn tokenize_paragraph(paragraph: &str) -> Vec<String> {
     let mut mode_ws: Option<bool> = None;
 
     for (idx, ch) in paragraph.char_indices() {
-        let is_ws = ch.is_whitespace();
+        let is_ws = is_breaking_whitespace(ch);
         match mode_ws {
             None => mode_ws = Some(is_ws),
             Some(prev) if prev != is_ws => {

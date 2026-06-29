@@ -52,7 +52,10 @@ output images, or apply effects.
   walks a break/no-break decision tree with shape pruning (a branch dies when a closed
   line breaks the shape), and accumulates a per-break "cost" (space 0, hard hyphen 1,
   dictionary hyphenation 2/3/4 by `classify_hyphen` quality) plus a word-break count for
-  the panel's grouping and width/cost sorting. Used by the typing panel's "Продвинутая
+  the panel's grouping and width/cost sorting. Before enumeration, `<no-break>`/`<nobr>`
+  and machine `<m j>` inline ranges are stripped from the source text and their internal
+  whitespace is converted to NBSP so the generated `formed_text` has no control tags but keeps
+  those ranges as non-breaking blocks. Used by the typing panel's "Продвинутая
   форма текста" window and re-exported as `render_next::forms` so the renderer subsystem
   shares the same definitions.
 

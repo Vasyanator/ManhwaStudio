@@ -53,9 +53,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use cosmic_text::{Attrs, Buffer, FontSystem, Metrics, Shaping};
 
 use super::is_hanging_punctuation;
+use crate::tabs::typing::render_next::types::parse_machine_tag;
 use crate::tabs::typing::segmentation::{
-    BindingMode, Block, Conservatism, SOFT_HYPHEN, SegmentOptions, build_line_text_and_units,
-    with_default_segmenter,
+    BindingMode, Block, Conservatism, NON_BREAKING_SPACE, SOFT_HYPHEN, SegmentOptions,
+    build_line_text_and_units, with_default_segmenter,
 };
 
 /// Максимум перечисляемых форм за один прогон (защита от комбинаторного взрыва).
@@ -410,6 +411,113 @@ pub(crate) struct FormEnumeration {
     pub(crate) truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InlineNoBreakRun {
+    text: String,
+    no_break: bool,
+}
+
+/// Removes no-break inline tags and makes whitespace inside them non-breaking.
+///
+/// The source editor text keeps the tags. Form enumeration uses this prepared text,
+/// so applying a form writes `formed_text` without the control tags.
+#[must_use]
+pub(crate) fn prepare_inline_no_break_text(text: &str) -> String {
+    inline_no_break_runs(text)
+        .into_iter()
+        .map(|run| run.text)
+        .collect()
+}
+
+fn inline_no_break_runs(text: &str) -> Vec<InlineNoBreakRun> {
+    let mut runs = Vec::<InlineNoBreakRun>::new();
+    let mut no_break_depth = 0usize;
+    let mut machine_stack = Vec::<bool>::new();
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        let Some(ch) = text[cursor..].chars().next() else {
+            break;
+        };
+        if ch == '<'
+            && let Some(rel_end) = text[cursor + ch.len_utf8()..].find('>')
+        {
+            let tag_end = cursor + ch.len_utf8() + rel_end;
+            let raw = text[cursor + ch.len_utf8()..tag_end].trim();
+            let compact = raw
+                .chars()
+                .filter(|character| !character.is_ascii_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase();
+
+            if matches!(compact.as_str(), "no-break" | "nobreak" | "nobr") {
+                no_break_depth = no_break_depth.saturating_add(1);
+                cursor = tag_end + '>'.len_utf8();
+                continue;
+            }
+            if matches!(compact.as_str(), "/no-break" | "/nobreak" | "/nobr") {
+                no_break_depth = no_break_depth.saturating_sub(1);
+                cursor = tag_end + '>'.len_utf8();
+                continue;
+            }
+            if compact == "/m" {
+                if machine_stack.pop().unwrap_or(false) {
+                    no_break_depth = no_break_depth.saturating_sub(1);
+                }
+                cursor = tag_end + '>'.len_utf8();
+                continue;
+            }
+            if let Some(attrs) = parse_machine_tag(raw) {
+                let protects = attrs.iter().any(|(key, _)| matches!(*key, 'j' | 'J'));
+                if protects {
+                    no_break_depth = no_break_depth.saturating_add(1);
+                }
+                machine_stack.push(protects);
+                cursor = tag_end + '>'.len_utf8();
+                continue;
+            }
+        }
+
+        push_inline_no_break_text(
+            &mut runs,
+            &text[cursor..cursor + ch.len_utf8()],
+            no_break_depth > 0,
+        );
+        cursor += ch.len_utf8();
+    }
+
+    runs
+}
+
+fn push_inline_no_break_text(runs: &mut Vec<InlineNoBreakRun>, text: &str, no_break: bool) {
+    let prepared = if no_break {
+        text.chars()
+            .map(|ch| {
+                if ch.is_whitespace() {
+                    NON_BREAKING_SPACE
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>()
+    } else {
+        text.to_string()
+    };
+    if prepared.is_empty() {
+        return;
+    }
+    if let Some(last) = runs.last_mut()
+        && last.no_break == no_break
+    {
+        last.text.push_str(prepared.as_str());
+        return;
+    }
+    runs.push(InlineNoBreakRun {
+        text: prepared,
+        no_break,
+    });
+}
+
 /// Делит строку на ведущую висящую пунктуацию, «ядро» и хвостовую висящую
 /// пунктуацию. Мягкие переносы (`SOFT_HYPHEN`) выбрасываются полностью.
 #[must_use]
@@ -638,7 +746,16 @@ pub(crate) fn enumerate_forms(
     }
 
     with_default_segmenter(|seg| {
-        let hyphenated = seg.soft_hyphenate_overlong(text);
+        let hyphenated = inline_no_break_runs(text)
+            .into_iter()
+            .map(|run| {
+                if run.no_break {
+                    run.text
+                } else {
+                    seg.soft_hyphenate_overlong(run.text.as_str())
+                }
+            })
+            .collect::<String>();
         let blocks = seg.segment(
             &hyphenated,
             SegmentOptions {
@@ -955,6 +1072,36 @@ mod tests {
             assert_eq!(form.word_break_count, 0, "{:?}", form.lines);
             assert_eq!(form.break_cost, 0, "{:?}", form.lines);
         }
+    }
+
+    #[test]
+    fn prepare_inline_no_break_text_strips_tags_and_uses_nbsp() {
+        assert_eq!(
+            prepare_inline_no_break_text("aa <no-break>bb cc</no-break> dd"),
+            "aa bb\u{00A0}cc dd"
+        );
+        assert_eq!(
+            prepare_inline_no_break_text("aa <m j>bb cc</m> dd"),
+            "aa bb\u{00A0}cc dd"
+        );
+    }
+
+    #[test]
+    fn no_break_inline_tag_keeps_contents_in_one_form_block() {
+        let result = enumerate_forms(
+            "aa <no-break>bb cc</no-break> dd",
+            TextFormPreset::FreeNoTree,
+            1000,
+            &CHAR_METRIC,
+        );
+
+        assert!(!result.forms.is_empty());
+        assert!(result.forms.iter().all(|form| {
+            form.lines
+                .iter()
+                .all(|line| !line.contains("<no-break>") && !line.contains("</no-break>"))
+                && !form.lines.iter().any(|line| line == "bb" || line == "cc")
+        }));
     }
 
     #[test]

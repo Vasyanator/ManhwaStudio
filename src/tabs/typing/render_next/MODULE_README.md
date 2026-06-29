@@ -48,7 +48,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `pipeline.rs`: central orchestration, horizontal rendering, line metrics, inline glyph
   overrides, shape comparison, cancellation handling, and post-effect application.
 - `font_registry.rs`: selected font loading and inline-font registry construction.
-- `inline_styles.rs`: parser/remapper for inline tags and attrs-compatible style spans.
+- `inline_styles.rs`: parser/remapper for inline tags, attrs-compatible style spans, and
+  line-level inline alignment markers.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
   bilinear image sampling, and alpha-bounds trimming.
 - `drawn_lines.rs`: raster layout-line tracing and vector-line path normalization for
@@ -81,6 +82,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - Inline style spans use byte offsets after parsing and must be remapped after text
   normalization/wrapping. Do not apply spans from the original tagged text directly to
   reshaped layout text.
+- Inline alignment is resolved per layout line from the style span at the line's start
+  offset. It affects horizontal placement only; glyph attrs do not carry alignment.
 - `TextRenderShapeCompareParams` is a pre-raster optimization contract. It compares
   prepared `layout_text` for shape/wrap parameters and may cancel rendering only when
   `cancel_render_if_layout_text_unchanged` is set.
