@@ -31,7 +31,7 @@ use crate::config;
 use crate::gpu_utils::{
     DirectMlAccelerator, GpuArchitecture, LinuxDriverStatus, RocmInstallationStatus,
     RocmSupportValidation, RuntimeVersion, detect_amd_gpu, detect_amd_gpu_architectures_linux,
-    detect_cuda_runtime_version, detect_directml_accelerators_windows,
+    detect_apple_gpu, detect_cuda_runtime_version, detect_directml_accelerators_windows,
     detect_nvidia_compute_capability, detect_nvidia_gpu, detect_nvidia_gpu_architecture,
     detect_rocm_installation_linux, detect_rocm_runtime_version, linux_driver_status,
     rocm_7_2_supported_llvm_targets, validate_rocm_7_2_support_linux,
@@ -219,6 +219,7 @@ struct GpuInfoReport {
     amd_architectures: Vec<GpuArchitecture>,
     rocm_validation: Option<RocmSupportValidation>,
     directml_accelerators: Vec<DirectMlAccelerator>,
+    apple_gpu: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -658,7 +659,7 @@ impl SettingsPageState {
             self.show_info_row(ui, "Статус", "Проверяется...");
         });
         ui.add_space(10.0);
-        self.show_info_card(ui, "DirectML / CUDA / ROCm", |ui| {
+        self.show_info_card(ui, "Видеоускорители (Apple / NVIDIA / AMD)", |ui| {
             self.show_info_row(ui, "Статус", "Проверяется...");
         });
     }
@@ -675,7 +676,11 @@ impl SettingsPageState {
         });
 
         ui.add_space(10.0);
-        self.show_info_card(ui, "DirectML / CUDA / ROCm", |ui| {
+        self.show_info_card(ui, "Видеоускорители (Apple / NVIDIA / AMD)", |ui| {
+            if let Some(apple) = &report.gpu.apple_gpu {
+                self.show_info_row(ui, "Apple GPU (Metal)", apple);
+                ui.add_space(8.0);
+            }
             self.show_info_row(
                 ui,
                 "NVIDIA",
@@ -1748,6 +1753,7 @@ fn collect_gpu_info() -> GpuInfoReport {
         },
         rocm_validation: cfg!(target_os = "linux").then(validate_rocm_7_2_support_linux),
         directml_accelerators: detect_directml_accelerators_windows(),
+        apple_gpu: detect_apple_gpu(),
     }
 }
 
@@ -1778,7 +1784,14 @@ fn detect_cpu_name() -> Option<String> {
     .filter(|name| !name.is_empty())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn detect_cpu_name() -> Option<String> {
+    command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn detect_cpu_name() -> Option<String> {
     None
 }
@@ -1829,7 +1842,13 @@ fn detect_physical_core_count() -> Option<usize> {
     output.trim().parse::<usize>().ok()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn detect_physical_core_count() -> Option<usize> {
+    command_output("sysctl", &["-n", "hw.physicalcpu"])
+        .and_then(|output| output.trim().parse::<usize>().ok())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn detect_physical_core_count() -> Option<usize> {
     None
 }
@@ -1858,7 +1877,13 @@ fn detect_total_memory_bytes() -> Option<u64> {
     output.trim().parse::<u64>().ok()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn detect_total_memory_bytes() -> Option<u64> {
+    command_output("sysctl", &["-n", "hw.memsize"])
+        .and_then(|output| output.trim().parse::<u64>().ok())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn detect_total_memory_bytes() -> Option<u64> {
     None
 }
@@ -1944,6 +1969,25 @@ fn format_directml_accelerators(accelerators: &[DirectMlAccelerator]) -> String 
 
 fn bool_status(value: bool) -> &'static str {
     if value { "да" } else { "нет" }
+}
+
+#[cfg(target_os = "macos")]
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(target_os = "windows")]

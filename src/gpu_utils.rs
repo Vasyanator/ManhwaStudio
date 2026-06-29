@@ -402,6 +402,50 @@ pub fn has_directml_accelerator_windows() -> bool {
     !detect_directml_accelerators_windows().is_empty()
 }
 
+/// Detect the Apple Silicon / Mac GPU description (macOS only).
+#[must_use]
+pub fn detect_apple_gpu() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    if let Some(output) = command_output("system_profiler", &["SPDisplaysDataType"]) {
+        let mut chipset: Option<String> = None;
+        let mut cores: Option<String> = None;
+        let mut metal: Option<String> = None;
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if let Some(value) = trimmed.strip_prefix("Chipset Model:") {
+                chipset = Some(value.trim().to_string());
+            } else if let Some(value) = trimmed.strip_prefix("Total Number of Cores:") {
+                cores = Some(value.trim().to_string());
+            } else if let Some(value) = trimmed.strip_prefix("Metal Support:") {
+                metal = Some(value.trim().to_string());
+            } else if let Some(value) = trimmed.strip_prefix("Metal Family:") {
+                metal = metal.or_else(|| Some(value.trim().to_string()));
+            }
+        }
+
+        if let Some(name) = chipset.filter(|value| !value.is_empty()) {
+            let mut extra = Vec::new();
+            if let Some(cores) = cores.filter(|value| !value.is_empty()) {
+                extra.push(format!("{cores} ядер GPU"));
+            }
+            if let Some(metal) = metal.filter(|value| !value.is_empty()) {
+                extra.push(metal);
+            }
+            if extra.is_empty() {
+                return Some(name);
+            }
+            return Some(format!("{name} ({})", extra.join(", ")));
+        }
+    }
+
+    command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 #[must_use]
 pub fn is_rocm_7_2_supported_llvm_target(target: &str) -> bool {
     let normalized = target.trim().to_ascii_lowercase();
