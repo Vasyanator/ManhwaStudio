@@ -94,9 +94,13 @@ impl PsTool for TransformTool {
     }
 
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+        use crate::trace::cat;
         let outcome = ToolOutcome::default();
         if !ctx.primary_down {
-            self.drag = None;
+            // Log gesture end once, only when a gesture was actually active.
+            if let Some(drag) = self.drag.take() {
+                crate::trace_log!(cat::INPUT, "transform drag_end mode={:?}", drag.mode);
+            }
         }
 
         let view = ctx.view;
@@ -133,6 +137,13 @@ impl PsTool for TransformTool {
             if ctx.primary_pressed && ctx.pointer_in_viewport && self.drag.is_none() {
                 let mode = self.hit_test(&view, &gizmo, pointer);
                 let center = layer.transform.center.to_pos2();
+                crate::trace_log!(
+                    cat::INPUT,
+                    "transform drag_begin mode={:?} at=({:.1},{:.1})",
+                    mode,
+                    pointer.x,
+                    pointer.y
+                );
                 self.drag = Some(TransformDrag {
                     mode,
                     start_pointer: pointer,

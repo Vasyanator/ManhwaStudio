@@ -22,6 +22,7 @@ FILE HEADER (tabs/typing/mask.rs)
   - `export_masks_snapshot`: отдаёт снимок масок (по страницам) для фонового экспорта
     финальных изображений без доступа к внутреннему mutable-состоянию слоя.
 */
+use crate::trace::cat;
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
@@ -361,6 +362,12 @@ impl TypingMaskLayer {
                     return true;
                 }
                 let changed = job.dirty_rect.is_some();
+                crate::trace_log!(
+                    cat::TYPING,
+                    "mask_fill result=ok page={} changed={}",
+                    job.page_idx,
+                    changed
+                );
                 if changed {
                     mask.data = job.data;
                     if let Some((x, y, w, h)) = job.dirty_rect {
@@ -373,6 +380,7 @@ impl TypingMaskLayer {
                 true
             }
             Ok(Err(err)) | Err(err) => {
+                crate::trace_log!(cat::TYPING, "mask_fill result=err err={}", err);
                 self.set_error(ctx, err);
                 true
             }
@@ -542,6 +550,19 @@ impl TypingMaskLayer {
             if let (Some(erase), Some(pos)) = (mode, pointer_pos)
                 && image_rect.contains(pos)
             {
+                let stroke_continues = matches!(
+                    self.active_stroke,
+                    Some(state) if state.page_idx == page_idx && state.erase == erase
+                );
+                if !stroke_continues {
+                    crate::trace_log!(
+                        cat::TYPING,
+                        "mask_stroke_begin page={} erase={} radius={}",
+                        page_idx,
+                        erase,
+                        self.mask_brush.radius_px()
+                    );
+                }
                 let start_pos = match self.active_stroke {
                     Some(state) if state.page_idx == page_idx && state.erase == erase => {
                         state.last_scene_pos
@@ -711,6 +732,7 @@ impl TypingMaskLayer {
         if !mask.has_active_pixels() {
             return;
         }
+        crate::trace_log!(cat::TYPING, "mask_clear_page page={}", page_idx);
         mask.data.fill(0);
         mask.tile_textures.clear();
         mask.dirty_tiles.clear();
@@ -852,6 +874,14 @@ impl TypingMaskLayer {
         };
         let tolerance = self.fill_tolerance;
 
+        crate::trace_log!(
+            cat::TYPING,
+            "mask_fill dispatch page={} seed=({},{}) tolerance={}",
+            page_idx,
+            seed_x,
+            seed_y,
+            tolerance
+        );
         let (tx, rx) = mpsc::channel::<Result<TypingMaskFillJobResult, String>>();
         thread::spawn(move || {
             let result =

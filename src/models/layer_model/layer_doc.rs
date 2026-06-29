@@ -28,6 +28,7 @@ use super::manifest::{DeformRec, TransformRec};
 use super::ordering::Band;
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use super::text_payload;
+use crate::trace::cat;
 
 /// Decodes a PNG at `path` into an unmultiplied `ColorImage`, mirroring the raster load path's
 /// decode. Returns `None` if the file is absent or undecodable.
@@ -130,6 +131,12 @@ impl LayerNode {
     /// Bumps the GPU-cache invalidation counter (call after changing pixels / display image).
     pub fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        crate::trace_log!(
+            cat::SYNC,
+            "bump_generation uid={} generation={}",
+            self.uid,
+            self.generation
+        );
     }
 }
 
@@ -174,11 +181,13 @@ impl LayerDoc {
     /// Bumps the document version. Called by every mutator so cross-tab listeners re-project.
     fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
+        crate::trace_log!(cat::SYNC, "bump_version version={}", self.version);
     }
 
     /// Explicitly bumps the version. For callers that mutate node fields directly via `node_mut`
     /// (bypassing the version-bumping mutators) and still need cross-tab listeners to re-project.
     pub fn mark_changed(&mut self) {
+        crate::trace_log!(cat::SYNC, "mark_changed version_before={}", self.version);
         self.bump_version();
     }
 
@@ -206,12 +215,21 @@ impl LayerDoc {
         if self.pages.contains_key(&page_idx) {
             return Ok(());
         }
+        let _span = crate::trace_scope!(cat::PERSIST, "ensure_page_loaded page={}", page_idx);
         // Pixel size of the page being loaded (page-relative uv → page px). The FULL chapter map is
         // required for the cross-entry ribbon migration below — see the comment there.
         let page_size = page_sizes.get(&page_idx).copied().unwrap_or([1, 1]);
 
         let rasters = persist::load_page_rasters(primary_dir, fallback_dir, page_idx)?;
         let bands = persist::load_page_bands(primary_dir, fallback_dir, page_idx);
+        crate::trace_log!(
+            cat::PERSIST,
+            "ensure_page_loaded page={} rasters={} groups={} bands={}",
+            page_idx,
+            rasters.layers.len(),
+            rasters.groups.len(),
+            bands.len()
+        );
 
         // uid -> band z, for the raster bands.
         let mut z_by_uid: HashMap<String, u32> = HashMap::new();
@@ -468,6 +486,14 @@ impl LayerDoc {
 
         // Rasters first, then texts, then a STABLE sort by z: this keeps a raster before a text at the
         // same z, matching the live render tiebreak.
+        crate::trace_log!(
+            cat::PERSIST,
+            "ensure_page_loaded page={} text_nodes={} inline_built={} migrated={}",
+            page_idx,
+            texts.len(),
+            built_inline.len(),
+            page_is_migrated
+        );
         nodes.extend(texts);
 
         // FULLY-MANUAL UNIFIED Z (retire auto-Y): every node — raster AND text — gets a UNIQUE explicit
@@ -497,6 +523,12 @@ impl LayerDoc {
             node.z = i as u32;
         }
 
+        crate::trace_log!(
+            cat::PERSIST,
+            "ensure_page_loaded page={} total_nodes={} (final z-order assigned)",
+            page_idx,
+            nodes.len()
+        );
         self.pages.insert(
             page_idx,
             DocPage {
@@ -526,7 +558,14 @@ impl LayerDoc {
 
     /// Drops a page from memory (e.g. when the shared page index moves away).
     pub fn evict_page(&mut self, page_idx: usize) {
-        if self.pages.remove(&page_idx).is_some() {
+        let evicted = self.pages.remove(&page_idx).is_some();
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "evict_page page={} evicted={}",
+            page_idx,
+            evicted
+        );
+        if evicted {
             self.bump_version();
         }
     }
@@ -551,8 +590,36 @@ impl LayerDoc {
             .find(|n| n.uid == uid)
     }
 
+    /// Clones the pre-effects base pixels of a resident raster node, if one exists at
+    /// `(page_idx, uid)`. The effects worker prefers this in-memory source over the on-disk base PNG
+    /// so a freshly created raster (not yet flushed to disk) can still be effected. `None` when the
+    /// page is not resident, the uid is absent, or the node is not a raster.
+    #[must_use]
+    pub fn raster_base_image(&self, page_idx: usize, uid: &str) -> Option<ColorImage> {
+        let node = self
+            .pages
+            .get(&page_idx)?
+            .nodes
+            .iter()
+            .find(|n| n.uid == uid)?;
+        match &node.body {
+            NodeBody::Raster { base_image, .. } => Some(base_image.clone()),
+            NodeBody::Text { .. } => None,
+        }
+    }
+
     /// Sets a node's affine placement. Geometry only — no generation bump (pixels are unchanged).
     pub fn set_transform(&mut self, page_idx: usize, uid: &str, transform: TransformRec) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_transform page={} uid={} cx={} cy={} rot={} scale={}",
+            page_idx,
+            uid,
+            transform.cx,
+            transform.cy,
+            transform.rotation,
+            transform.scale
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.transform = transform;
             self.bump_version();
@@ -564,6 +631,13 @@ impl LayerDoc {
     /// nodes alike: when `Some`, the node is positioned by the mesh and its affine transform no
     /// longer applies (mirrors the deformed-text rendering rule).
     pub fn set_deform(&mut self, page_idx: usize, uid: &str, deform: Option<DeformRec>) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_deform page={} uid={} has_deform={}",
+            page_idx,
+            uid,
+            deform.is_some()
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.deform = deform;
             self.bump_version();
@@ -574,6 +648,13 @@ impl LayerDoc {
     /// re-uploads its texture). No-op if the page/node is absent or the node is not a raster. Persisted
     /// on `flush_page` via `LayerRec.mask_clip`.
     pub fn set_raster_mask_clip(&mut self, page_idx: usize, uid: &str, mask_clip: Option<bool>) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_raster_mask_clip page={} uid={} mask_clip={:?}",
+            page_idx,
+            uid,
+            mask_clip
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             if let NodeBody::Raster { mask_clip: m, .. } = &mut node.body {
                 *m = mask_clip;
@@ -592,6 +673,15 @@ impl LayerDoc {
         effects: Vec<Value>,
         display_image: ColorImage,
     ) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_effects page={} uid={} effects_len={} img={}x{}",
+            page_idx,
+            uid,
+            effects.len(),
+            display_image.size[0],
+            display_image.size[1]
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             if let NodeBody::Raster {
                 effects: e,
@@ -612,10 +702,25 @@ impl LayerDoc {
     /// resident.
     pub fn add_node(&mut self, page_idx: usize, mut node: LayerNode) -> bool {
         let Some(page) = self.pages.get_mut(&page_idx) else {
+            crate::trace_log!(
+                cat::LAYER_MODEL,
+                "add_node page={} uid={} result=false (page not resident)",
+                page_idx,
+                node.uid
+            );
             return false;
         };
         let top_z = page.nodes.iter().map(|n| n.z).max();
         node.z = top_z.map_or(0, |z| z + 1);
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "add_node page={} uid={} kind={:?} z={} count={}",
+            page_idx,
+            node.uid,
+            node.kind,
+            node.z,
+            page.nodes.len() + 1
+        );
         page.nodes.push(node);
         page.nodes.sort_by_key(|n| n.z);
         self.bump_version();
@@ -630,6 +735,14 @@ impl LayerDoc {
         let before = page.nodes.len();
         page.nodes.retain(|n| n.uid != uid);
         let removed = page.nodes.len() != before;
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "remove_node page={} uid={} removed={} count={}",
+            page_idx,
+            uid,
+            removed,
+            page.nodes.len()
+        );
         if removed {
             self.bump_version();
         }
@@ -638,6 +751,13 @@ impl LayerDoc {
 
     /// Sets a node's visibility. No-op if the page or node is absent.
     pub fn set_visibility(&mut self, page_idx: usize, uid: &str, visible: bool) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_visibility page={} uid={} visible={}",
+            page_idx,
+            uid,
+            visible
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.visible = visible;
             self.bump_version();
@@ -646,6 +766,13 @@ impl LayerDoc {
 
     /// Sets a node's opacity, clamped to `0.0..=1.0`. No-op if the page or node is absent.
     pub fn set_opacity(&mut self, page_idx: usize, uid: &str, opacity: f32) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_opacity page={} uid={} opacity={}",
+            page_idx,
+            uid,
+            opacity.clamp(0.0, 1.0)
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.opacity = opacity.clamp(0.0, 1.0);
             self.bump_version();
@@ -654,6 +781,13 @@ impl LayerDoc {
 
     /// Sets a node's group membership (`None` to ungroup). No-op if the page or node is absent.
     pub fn set_group(&mut self, page_idx: usize, uid: &str, group_uid: Option<String>) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_group page={} uid={} group_uid={:?}",
+            page_idx,
+            uid,
+            group_uid
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.group_uid = group_uid;
             self.bump_version();
@@ -665,8 +799,21 @@ impl LayerDoc {
     pub fn add_group(&mut self, page_idx: usize, group: GroupMeta) {
         if let Some(page) = self.pages.get_mut(&page_idx) {
             if page.groups.iter().any(|g| g.uid == group.uid) {
+                crate::trace_log!(
+                    cat::LAYER_MODEL,
+                    "add_group page={} uid={} result=skip (exists)",
+                    page_idx,
+                    group.uid
+                );
                 return;
             }
+            crate::trace_log!(
+                cat::LAYER_MODEL,
+                "add_group page={} uid={} groups={}",
+                page_idx,
+                group.uid,
+                page.groups.len() + 1
+            );
             page.groups.push(group);
             self.bump_version();
         }
@@ -675,6 +822,12 @@ impl LayerDoc {
     /// Removes the `GroupMeta` with `group_uid` from a resident page and clears `group_uid` on every
     /// member node (ungroups them). No-op if the page is absent.
     pub fn remove_group(&mut self, page_idx: usize, group_uid: &str) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "remove_group page={} uid={}",
+            page_idx,
+            group_uid
+        );
         let Some(page) = self.pages.get_mut(&page_idx) else {
             return;
         };
@@ -698,6 +851,18 @@ impl LayerDoc {
         effects: Vec<Value>,
         pixels_dirty: bool,
     ) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_raster_pixels page={} uid={} base={}x{} display={}x{} effects_len={} dirty={}",
+            page_idx,
+            uid,
+            base_image.size[0],
+            base_image.size[1],
+            display_image.size[0],
+            display_image.size[1],
+            effects.len(),
+            pixels_dirty
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             if let NodeBody::Raster {
                 base_image: b,
@@ -726,6 +891,14 @@ impl LayerDoc {
         render_data: Value,
         image: ColorImage,
     ) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_text_render page={} uid={} img={}x{}",
+            page_idx,
+            uid,
+            image.size[0],
+            image.size[1]
+        );
         if let Some(node) = self.node_mut(page_idx, uid) {
             if let NodeBody::Text {
                 render_data: r,
@@ -769,6 +942,15 @@ impl LayerDoc {
         page.nodes[pos].z = z_b;
         page.nodes[other].z = z_a;
         page.nodes.sort_by_key(|n| n.z);
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "reorder_node_one page={} uid={} dir={} z={}->{} result=true",
+            page_idx,
+            uid,
+            if up { "up" } else { "down" },
+            z_a,
+            z_b
+        );
         self.bump_version();
         true
     }
@@ -828,6 +1010,13 @@ impl LayerDoc {
             reordered.push(node);
         }
         page.nodes = reordered;
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "reorder_group_block page={} group_uid={} dir={} result=true",
+            page_idx,
+            group_uid,
+            if up { "up" } else { "down" }
+        );
         self.bump_version();
         true
     }
@@ -838,6 +1027,12 @@ impl LayerDoc {
     /// and persist it to disk; this applies that SAME order to the in-memory doc so cross-tab listeners
     /// re-project without a disk round-trip. No-op if the page is absent.
     pub fn set_z_order(&mut self, page_idx: usize, order: &[String]) {
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "set_z_order page={} order_len={}",
+            page_idx,
+            order.len()
+        );
         let Some(page) = self.pages.get_mut(&page_idx) else {
             return;
         };
@@ -909,7 +1104,19 @@ impl LayerDoc {
         fallback_dir: Option<&Path>,
         removed_raster_uids: &[String],
     ) -> Result<(), String> {
+        let _span = crate::trace_scope!(
+            cat::PERSIST,
+            "flush_page_inner page={} dir={} removed={}",
+            page_idx,
+            layers_dir.display(),
+            removed_raster_uids.len()
+        );
         let Some(page) = self.pages.get_mut(&page_idx) else {
+            crate::trace_log!(
+                cat::PERSIST,
+                "flush_page_inner page={} skipped (not resident)",
+                page_idx
+            );
             return Ok(());
         };
 
@@ -943,6 +1150,13 @@ impl LayerDoc {
             });
         }
 
+        crate::trace_log!(
+            cat::PERSIST,
+            "flush_page_inner page={} rasters={} groups={}",
+            page_idx,
+            outs.len(),
+            page.groups.len()
+        );
         persist::save_page_rasters(layers_dir, page_idx, &outs, &page.groups, removed_raster_uids)?;
 
         // Text flush (schema v3): write every TEXT node's inline payload (see `write_page_text`).
@@ -988,7 +1202,18 @@ impl LayerDoc {
         layers_dir: &Path,
         fallback_dir: Option<&Path>,
     ) -> Result<(), String> {
+        let _span = crate::trace_scope!(
+            cat::PERSIST,
+            "flush_page_text page={} dir={}",
+            page_idx,
+            layers_dir.display()
+        );
         let Some(page) = self.pages.get_mut(&page_idx) else {
+            crate::trace_log!(
+                cat::PERSIST,
+                "flush_page_text page={} skipped (not resident)",
+                page_idx
+            );
             return Ok(());
         };
         Self::write_page_text(page, page_idx, layers_dir, fallback_dir)
@@ -1007,6 +1232,7 @@ impl LayerDoc {
         layers_dir: &Path,
         fallback_dir: Option<&Path>,
     ) -> Result<(), String> {
+        let _span = crate::trace_scope!(cat::PERSIST, "write_page_text page={}", page_idx);
         let mut text_indices: Vec<usize> = page
             .nodes
             .iter()
@@ -1016,6 +1242,7 @@ impl LayerDoc {
             .collect();
         text_indices.sort_by_key(|&i| page.nodes[i].z);
 
+        let mut pngs_written = 0usize;
         let mut text_outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(text_indices.len());
         for &i in &text_indices {
             let node = &page.nodes[i];
@@ -1034,6 +1261,15 @@ impl LayerDoc {
             let present = layers_dir.join(&file_name).is_file()
                 || fallback_dir.is_some_and(|d| d.join(&file_name).is_file());
             let rendered_file = if node.pixels_dirty || !present {
+                pngs_written += 1;
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "write_page_text page={} uid={} rewriting PNG (dirty={} present={})",
+                    page_idx,
+                    node.uid,
+                    node.pixels_dirty,
+                    present
+                );
                 Some(persist::write_text_image(layers_dir, page_idx, &node.uid, image)?)
             } else {
                 Some(file_name)
@@ -1059,6 +1295,13 @@ impl LayerDoc {
                 mask_clip: *mask_clip,
             });
         }
+        crate::trace_log!(
+            cat::PERSIST,
+            "write_page_text page={} text_nodes={} pngs_written={}",
+            page_idx,
+            text_outs.len(),
+            pngs_written
+        );
         persist::write_page_text_payload(layers_dir, fallback_dir, page_idx, &text_outs)?;
         for &i in &text_indices {
             page.nodes[i].pixels_dirty = false;

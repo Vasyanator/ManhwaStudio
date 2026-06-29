@@ -65,6 +65,15 @@ impl TiledTexture {
 
     /// Marks every tile overlapping `rect` (inclusive image px) for re-upload.
     pub fn mark_dirty_rect(&mut self, rect: DirtyRect) {
+        crate::trace_log!(
+            crate::trace::cat::RENDER,
+            "tile mark_dirty_rect layer={} rect=[{},{},{},{}]",
+            self.name,
+            rect.min_x,
+            rect.min_y,
+            rect.max_x,
+            rect.max_y
+        );
         let col0 = rect.min_x / TILE_SIDE;
         let col1 = (rect.max_x / TILE_SIDE).min(self.cols.saturating_sub(1));
         let row0 = rect.min_y / TILE_SIDE;
@@ -78,6 +87,12 @@ impl TiledTexture {
 
     /// Marks every tile for re-upload (used after a non-axis-aligned edit like a cut).
     pub fn mark_all_dirty(&mut self) {
+        crate::trace_log!(
+            crate::trace::cat::RENDER,
+            "tile mark_all_dirty layer={} tiles={}",
+            self.name,
+            self.dirty.len()
+        );
         self.dirty.iter_mut().for_each(|d| *d = true);
     }
 
@@ -117,6 +132,16 @@ impl TiledTexture {
             }
             self.dirty[index] = false;
             uploaded += 1;
+        }
+        // Only emit when tiles were actually uploaded this frame (skip the common 0-upload idle case).
+        if uploaded > 0 {
+            crate::trace_log!(
+                crate::trace::cat::RENDER,
+                "tile upload layer={} count={} budget={}",
+                self.name,
+                uploaded,
+                budget
+            );
         }
         uploaded
     }

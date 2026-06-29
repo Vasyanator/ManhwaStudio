@@ -54,6 +54,7 @@ mod project;
 mod python_manager;
 mod runtime_log;
 mod screen_capture;
+mod trace;
 mod tabs;
 mod text_punctuation;
 mod tools;
@@ -110,6 +111,18 @@ fn run_main() -> anyhow::Result<()> {
 
     init_startup_logging_best_effort();
     let mut cli = Cli::parse();
+    if let Err(err) = trace::init_trace(&config::data_dir(), cli.trace) {
+        eprintln!("failed to initialize tracing: {err}");
+    }
+    trace_log!(
+        trace::cat::STARTUP,
+        "tracing enabled, args: project={:?} no_ai={} update={} test_launcher={} trace={}",
+        cli.project,
+        cli.no_ai,
+        cli.update,
+        cli.test_launcher,
+        cli.trace
+    );
     #[cfg(target_os = "windows")]
     if let Some(install_dir) = cli.create_start_menu_shortcut_install_dir.as_deref() {
         launcher_install::run_windows_create_start_menu_shortcut_for_install(

@@ -141,6 +141,13 @@ impl PsViewport {
         self.zoom = (zoom_x.min(zoom_y) * margin).clamp(MIN_ZOOM, MAX_ZOOM);
         self.center_world = Vec2::new(w * 0.5, h * 0.5);
         self.initialized = true;
+        crate::trace_log!(
+            crate::trace::cat::PS_EDITOR,
+            "viewport fit_page page=[{},{}] zoom={:.3}",
+            page_size[0],
+            page_size[1],
+            self.zoom
+        );
     }
 
     /// Sets 1:1 zoom (one image pixel per screen point) keeping the page centered.
@@ -172,10 +179,22 @@ impl PsViewport {
             let anchor = anchor_screen.unwrap_or_else(|| viewport_rect.center());
             let before = self.transform(viewport_rect).screen_to_world(anchor);
             let factor = WHEEL_ZOOM_STEP.powf(wheel_delta_y);
+            let prev_zoom = self.zoom;
             self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
             // Keep the world point under the cursor stationary while zooming.
             let after = self.transform(viewport_rect).screen_to_world(anchor);
             self.center_world += before.to_vec2() - after.to_vec2();
+            // Log only when the (clamped) zoom actually moved, not on every idle wheel tick at a limit.
+            if (self.zoom - prev_zoom).abs() > f32::EPSILON {
+                crate::trace_log!(
+                    crate::trace::cat::INPUT,
+                    "viewport zoom {:.3}->{:.3} center=({:.1},{:.1})",
+                    prev_zoom,
+                    self.zoom,
+                    self.center_world.x,
+                    self.center_world.y
+                );
+            }
         }
     }
 }

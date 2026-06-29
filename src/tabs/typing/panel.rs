@@ -92,6 +92,7 @@ FILE HEADER (tabs/typing/panel.rs)
     группе имя без скобок.
 */
 use crate::config;
+use crate::trace::cat;
 use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
 use crate::tabs::typing::tab::TypingExportFormat;
 use crate::tabs::typing::tab::TypingTextOverlayLayer;
@@ -7300,6 +7301,15 @@ impl TypingCreatePanelState {
         };
 
         self.latest_token = self.latest_token.saturating_add(1);
+        crate::trace_log!(
+            cat::SYNC,
+            "preview_render dispatch token={} layout={:?} line_mode={:?} width_px={} preempting_inflight={}",
+            self.latest_token,
+            params.text_layout_mode,
+            params.text_line_mode,
+            params.width_px,
+            self.render_in_flight
+        );
         let job = PreviewRenderJob {
             token: self.latest_token,
             params,
@@ -7310,6 +7320,7 @@ impl TypingCreatePanelState {
                 self.status_line = "Рендер в фоне...".to_string();
             }
             Err(err) => {
+                crate::trace_log!(cat::SYNC, "preview_render dispatch send_err token={} err={}", self.latest_token, err);
                 self.render_in_flight = false;
                 self.status_line = format!("Не удалось отправить задачу рендера: {err}");
             }
@@ -7323,12 +7334,25 @@ impl TypingCreatePanelState {
         let mut has_updates = false;
         while let Ok(result) = self.result_rx.try_recv() {
             if result.token != self.latest_token {
+                crate::trace_log!(
+                    cat::SYNC,
+                    "preview_render result=stale_dropped token={} latest={}",
+                    result.token,
+                    self.latest_token
+                );
                 continue;
             }
             has_updates = true;
             self.render_in_flight = false;
             match result.image {
                 Ok(image) => {
+                    crate::trace_log!(
+                        cat::SYNC,
+                        "preview_render result=ok token={} size={}x{}",
+                        result.token,
+                        image.width,
+                        image.height
+                    );
                     self.preview_size = [image.width as usize, image.height as usize];
                     let color_image = ColorImage::from_rgba_unmultiplied(
                         self.preview_size,
@@ -7350,6 +7374,7 @@ impl TypingCreatePanelState {
                     };
                 }
                 Err(err) => {
+                    crate::trace_log!(cat::SYNC, "preview_render result=err token={} err={}", result.token, err);
                     self.status_line = format!("Ошибка рендера: {err}");
                 }
             }
@@ -8984,9 +9009,17 @@ fn spawn_preview_render_worker() -> (Sender<PreviewRenderJob>, Receiver<PreviewR
         .name("typing-text-preview-render-worker".to_string())
         .spawn(move || {
             while let Ok(mut job) = request_rx.recv() {
+                let mut dropped = 0u32;
                 while let Ok(newer_job) = request_rx.try_recv() {
                     job = newer_job;
+                    dropped += 1;
                 }
+                crate::trace_log!(
+                    cat::RENDER,
+                    "preview_render_worker start token={} dropped_stale={}",
+                    job.token,
+                    dropped
+                );
 
                 let result = render_text_to_image(&job.params, None);
                 if let Err(err) = result.as_ref() {

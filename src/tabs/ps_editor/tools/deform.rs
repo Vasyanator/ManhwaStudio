@@ -81,9 +81,12 @@ impl PsTool for DeformTool {
     }
 
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+        use crate::trace::cat;
         let outcome = ToolOutcome::default();
         if !ctx.primary_down {
-            self.drag = None;
+            if let Some(drag) = self.drag.take() {
+                crate::trace_log!(cat::INPUT, "deform drag_end point_idx={}", drag.point_idx);
+            }
         }
 
         let view = ctx.view;
@@ -102,6 +105,12 @@ impl PsTool for DeformTool {
 
         // Initialize an identity grid from the affine footprint the first time we touch this layer.
         if layer.deform.is_none() {
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "deform init_grid cols={} rows={}",
+                DEFAULT_COLS,
+                DEFAULT_ROWS
+            );
             layer.deform = Some(layer.identity_deform_grid(DEFAULT_COLS, DEFAULT_ROWS));
         }
         let (mut points, dims) = match &layer.deform {
@@ -117,6 +126,13 @@ impl PsTool for DeformTool {
             // Begin a grid-point drag on a fresh press over a handle inside the viewport.
             if ctx.primary_pressed && ctx.pointer_in_viewport && self.drag.is_none() {
                 if let Some(idx) = self.hit_test(&view, &points, pointer) {
+                    crate::trace_log!(
+                        cat::INPUT,
+                        "deform drag_begin point_idx={} at=({:.1},{:.1})",
+                        idx,
+                        pointer.x,
+                        pointer.y
+                    );
                     self.drag = Some(PointDrag {
                         point_idx: idx,
                         start_point: points[idx],

@@ -69,10 +69,20 @@ impl PsTool for BrushTool {
     }
 
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+        use crate::trace::cat;
         let mut outcome = ToolOutcome::default();
 
         // End the stroke when the primary button is released or lifted off the canvas.
         if !ctx.primary_down {
+            // Log stroke end only when a stroke was actually in progress (avoids per-frame idle spam).
+            if self.last_world.is_some() {
+                crate::trace_log!(
+                    cat::INPUT,
+                    "brush stroke_end radius={} erase={}",
+                    self.radius(),
+                    self.erase
+                );
+            }
             self.last_world = None;
             return outcome;
         }
@@ -105,6 +115,17 @@ impl PsTool for BrushTool {
             return outcome;
         };
 
+        // Log only the first stamp of a stroke (press), not every dragged point.
+        if ctx.primary_pressed || self.last_world.is_none() {
+            crate::trace_log!(
+                cat::INPUT,
+                "brush stroke_begin radius={} erase={} at=({:.1},{:.1})",
+                radius,
+                erase,
+                to_world.x,
+                to_world.y
+            );
+        }
         self.last_world = Some(to_world);
         let map = LocalMap::from_layer(layer);
         let radius_local = ((radius as f32) / map.scale).round().max(1.0) as i32;
@@ -127,6 +148,8 @@ impl PsTool for BrushTool {
         outcome.dirty = Some(segment_dirty_rect(from, to, radius_local, layer_size));
         outcome
     }
+
+    // (stroke begin/end logged above; per-stamp painting is intentionally untraced)
 
     fn draw_overlay(
         &self,

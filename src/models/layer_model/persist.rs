@@ -18,6 +18,7 @@ use super::manifest::{
     DeformRec, GroupRec, LayerKindRec, LayerRec, LayersManifest, PageLayers, PayloadRef,
     TextGroupRec, TransformRec,
 };
+use crate::trace::cat;
 use eframe::egui::ColorImage;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -142,6 +143,14 @@ pub fn save_page_rasters(
     groups: &[GroupMeta],
     removed_uids: &[String],
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "save_page_rasters page={} layers={} groups={} removed={}",
+        page_idx,
+        layers.len(),
+        groups.len(),
+        removed_uids.len()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -338,7 +347,20 @@ pub fn save_page_rasters(
 
     if recs.is_empty() && group_recs.is_empty() {
         manifest.remove_page(page_idx);
+        crate::trace_log!(
+            cat::PERSIST,
+            "save_page_rasters page={} removed empty page from manifest",
+            page_idx
+        );
     } else {
+        crate::trace_log!(
+            cat::PERSIST,
+            "save_page_rasters page={} recs={} groups={} pngs_kept={}",
+            page_idx,
+            recs.len(),
+            group_recs.len(),
+            keep.len()
+        );
         manifest.upsert_page(PageLayers {
             img_idx: page_idx,
             groups: group_recs,
@@ -346,6 +368,11 @@ pub fn save_page_rasters(
             tree: recs,
         });
     }
+    crate::trace_log!(
+        cat::PERSIST,
+        "save_page_rasters writing manifest {}",
+        manifest_path.display()
+    );
     write_manifest(&manifest_path, &manifest)
 }
 
@@ -360,6 +387,7 @@ pub fn load_page_rasters(
     fallback_dir: Option<&Path>,
     page_idx: usize,
 ) -> Result<PageRasters, String> {
+    let _span = crate::trace_scope!(cat::PERSIST, "load_page_rasters page={}", page_idx);
     let empty = || PageRasters {
         groups: Vec::new(),
         layers: Vec::new(),
@@ -367,6 +395,11 @@ pub fn load_page_rasters(
     // PER-PAGE fallback: a committed-only page (absent from the staging manifest) must still load its
     // committed rasters/groups (the PNGs are then resolved from either dir below).
     let Some(page) = read_page_with_fallback(primary_dir, fallback_dir, page_idx)? else {
+        crate::trace_log!(
+            cat::PERSIST,
+            "load_page_rasters page={} -> no manifest page (empty)",
+            page_idx
+        );
         return Ok(empty());
     };
 
@@ -450,6 +483,13 @@ pub fn load_page_rasters(
             effects: rec.effects.clone(),
         });
     }
+    crate::trace_log!(
+        cat::PERSIST,
+        "load_page_rasters page={} -> rasters={} groups={}",
+        page_idx,
+        out.len(),
+        groups.len()
+    );
     Ok(PageRasters {
         groups,
         layers: out,
@@ -472,6 +512,14 @@ pub fn add_page_raster(
     transform: TransformRec,
     image: &ColorImage,
 ) -> Result<String, String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "add_page_raster page={} uid={} size={}x{}",
+        page_idx,
+        uid,
+        image.size[0],
+        image.size[1]
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -574,6 +622,12 @@ pub fn update_raster_transform(
     transform: TransformRec,
     fallback_dir: Option<&Path>,
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "update_raster_transform page={} uid={}",
+        page_idx,
+        uid
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -608,6 +662,13 @@ pub fn update_raster_geometry(
     deform: Option<DeformRec>,
     fallback_dir: Option<&Path>,
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "update_raster_geometry page={} uid={} has_deform={}",
+        page_idx,
+        uid,
+        deform.is_some()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -641,6 +702,14 @@ pub fn update_raster_effects(
     rendered: Option<&ColorImage>,
     fallback_dir: Option<&Path>,
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "update_raster_effects page={} uid={} effects_len={} has_rendered={}",
+        page_idx,
+        uid,
+        effects.len(),
+        rendered.is_some()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -773,6 +842,12 @@ pub fn write_page_text_payload(
     page_idx: usize,
     nodes: &[TextPayloadOut],
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "write_page_text_payload page={} text_nodes={}",
+        page_idx,
+        nodes.len()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -928,12 +1003,19 @@ pub fn load_page_bands(
 ) -> Vec<super::ordering::Band> {
     // PER-PAGE fallback: a committed-only page (absent from the staging manifest) must still load its
     // committed band order so PS and typing render it in the same unified order.
-    read_page_with_fallback(primary_dir, fallback_dir, page_idx)
+    let bands = read_page_with_fallback(primary_dir, fallback_dir, page_idx)
         .ok()
         .flatten()
         .as_ref()
         .map(super::ordering::page_bands)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    crate::trace_log!(
+        cat::PERSIST,
+        "load_page_bands page={} bands={}",
+        page_idx,
+        bands.len()
+    );
+    bands
 }
 
 /// Rewrites a page's unified band Z from `order` (bottom-to-top): each raster node's Z, each text
@@ -945,6 +1027,12 @@ pub fn save_page_band_order(
     page_idx: usize,
     order: &[BandRef],
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "save_page_band_order page={} bands={}",
+        page_idx,
+        order.len()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -1039,6 +1127,13 @@ pub fn save_page_grouping(
     page_idx: usize,
     edit: &GroupingEdit,
 ) -> Result<(), String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "save_page_grouping page={} new_groups={} remove_groups={}",
+        page_idx,
+        edit.new_groups.len(),
+        edit.remove_groups.len()
+    );
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
@@ -1190,7 +1285,7 @@ pub fn load_page_text_nodes(
         .collect();
     nodes.sort_by_key(|r| r.z);
 
-    Ok(nodes
+    let out: Vec<TextNodeIn> = nodes
         .into_iter()
         .filter_map(|r| {
             // A v3 inline node carries its full payload in `render_data` and may have no `payload_ref`;
@@ -1227,7 +1322,14 @@ pub fn load_page_text_nodes(
                 inline,
             })
         })
-        .collect())
+        .collect();
+    crate::trace_log!(
+        cat::PERSIST,
+        "load_page_text_nodes page={} text_nodes={}",
+        page_idx,
+        out.len()
+    );
+    Ok(out)
 }
 
 /// Reads `layers.json`, migrating any older on-disk format up to the current canonical shape. All
@@ -1287,9 +1389,18 @@ pub fn merge_unsaved_layers_into_committed(
     unsaved_layers_dir: &Path,
     owned_text_pages: &HashSet<usize>,
 ) -> Result<bool, String> {
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "merge_unsaved_layers_into_committed owned_text_pages={}",
+        owned_text_pages.len()
+    );
     let unsaved_path = unsaved_layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(unsaved) = read_manifest(&unsaved_path)? else {
+        crate::trace_log!(
+            cat::PERSIST,
+            "merge_unsaved_layers_into_committed -> no unsaved manifest (no-op)"
+        );
         return Ok(false); // nothing staged — committed stays as-is
     };
     let committed_path = committed_layers_dir.join(MANIFEST_FILE);
@@ -1321,6 +1432,12 @@ pub fn merge_unsaved_layers_into_committed(
         merged.upsert_page(page);
     }
     merged.schema_version = merged.schema_version.max(unsaved.schema_version);
+    crate::trace_log!(
+        cat::PERSIST,
+        "merge_unsaved_layers_into_committed merged_pages={} -> {}",
+        merged.pages.len(),
+        committed_path.display()
+    );
     fs::create_dir_all(committed_layers_dir)
         .map_err(|e| format!("create {}: {e}", committed_layers_dir.display()))?;
     write_manifest(&committed_path, &merged)?;
@@ -1383,6 +1500,15 @@ pub fn write_text_image(
     fs::create_dir_all(layers_dir)
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
     let file = text_image_file_name(page_idx, uid);
+    crate::trace_log!(
+        cat::PERSIST,
+        "write_text_image page={} uid={} file={} size={}x{}",
+        page_idx,
+        uid,
+        file,
+        image.size[0],
+        image.size[1]
+    );
     write_png(&layers_dir.join(&file), image)?;
     Ok(file)
 }

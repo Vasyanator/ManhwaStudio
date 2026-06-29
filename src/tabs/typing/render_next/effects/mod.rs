@@ -19,6 +19,7 @@ Notes:
 
 use super::types::RenderedTextImage;
 use crate::tabs::typing::render_next::raster::is_cancelled;
+use crate::trace::cat;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -48,9 +49,37 @@ pub(crate) fn apply_effects_pipeline(
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<(), String> {
     let effects = parse_effects_json(effects_json)?;
+    if effects.is_empty() {
+        return Ok(());
+    }
+    let _effects_span = crate::trace_scope!(
+        cat::RENDER,
+        "apply_effects_pipeline count={} w={} h={}",
+        effects.len(),
+        image.width,
+        image.height
+    );
     for effect in effects {
         if is_cancelled(cancel) {
             return Ok(());
+        }
+
+        if crate::trace::trace_enabled() {
+            let name = match &effect {
+                EffectSpec::Stroke(_) => "stroke",
+                EffectSpec::Shadow(_) => "shadow",
+                EffectSpec::Blur(_) => "blur",
+                EffectSpec::MotionBlur(_) => "motion_blur",
+                EffectSpec::DryMedia(_) => "dry_media",
+                EffectSpec::GlowV1(_) => "glow_v1",
+                EffectSpec::GlowV2(_) => "glow_v2",
+                EffectSpec::SoftGlow(_) => "soft_glow",
+                EffectSpec::Gradient2(_) => "gradient2",
+                EffectSpec::Gradient4(_) => "gradient4",
+                EffectSpec::Reflect(_) => "reflect",
+                EffectSpec::Shake(_) => "shake",
+            };
+            crate::trace_log!(cat::RENDER, "effect apply={}", name);
         }
 
         match effect {

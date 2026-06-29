@@ -37,6 +37,7 @@ use crate::models::layer_model::manifest::TransformRec;
 use crate::models::layer_model::ordering::Band;
 use crate::models::layer_model::persist;
 use crate::project::ProjectData;
+use crate::trace::cat;
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 use layer_render::TiledTexture;
@@ -107,6 +108,10 @@ pub struct PsEditorTabState {
     /// Last `LayerDoc::version` this tab projected. Each frame, if the live doc version differs, the
     /// tab re-projects its current page from the shared doc — the in-memory cross-tab sync.
     last_doc_version: u64,
+    /// Trace-only: number of composite steps emitted on the previous frame. Used to gate the
+    /// per-frame `draw_composite` detail log so it only fires when the plan size changes (the
+    /// composite is rebuilt every frame, so unconditional logging would flood the trace at 60/s).
+    trace_last_composite_steps: usize,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
     /// shared with the typing tab. `None` until `set_layer_doc` is called by app.rs.
     layer_doc: Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
@@ -290,6 +295,7 @@ impl Default for PsEditorTabState {
             text_drag_last: Vec2::ZERO,
             text_drag_ref: 0.0,
             last_doc_version: 0,
+            trace_last_composite_steps: usize::MAX,
             layer_doc: None,
             pending_actual_size: false,
             pending_camera: None,
@@ -388,6 +394,13 @@ impl PsEditorTabState {
         let Some(stack) = self.stack.as_mut() else {
             return;
         };
+
+        let _s = crate::trace_scope!(
+            cat::SYNC,
+            "sync_view_from_doc page={} doc_version={}",
+            page_idx,
+            guard.version()
+        );
 
         // --- Groups: rebuild from the doc, reusing session ids for surviving uids. ---
         let mut uid_to_gid: HashMap<String, GroupId> = stack
@@ -720,6 +733,13 @@ impl PsEditorTabState {
             self.last_doc_version = current;
             return;
         };
+        crate::trace_log!(
+            cat::SYNC,
+            "doc_version_changed old={} new={} page={} -> reproject",
+            self.last_doc_version,
+            current,
+            page_idx
+        );
         // Reload the disk-truth text-layer RUNTIME (so a text layer the typing tab just created has a
         // local `PsTextLayer` for the projection to reconcile onto), then project the shared doc over
         // the stack rasters / text model / bands. `sync_view_from_doc` updates `last_doc_version` and
@@ -834,6 +854,12 @@ impl PsEditorTabState {
         self.pending_job_id = Some(job_id);
         self.requested_page_idx = Some(page_idx);
         self.load_error = None;
+        crate::trace_log!(
+            cat::PERSIST,
+            "page_load request job={} page={}",
+            job_id,
+            page_idx
+        );
         let _ = loader.request_tx.send(Some(PageLoadRequest {
             job_id,
             page_idx,
@@ -851,6 +877,7 @@ impl PsEditorTabState {
             return;
         };
         let page_idx = stack.page_idx();
+        let _s = crate::trace_scope!(cat::PERSIST, "persist_current_page page={}", page_idx);
         let outs: Vec<persist::RasterLayerOut> = stack
             .layers()
             .iter()
@@ -895,6 +922,14 @@ impl PsEditorTabState {
             &removed_uids,
         ) {
             Ok(()) => {
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "persist_current_page saved page={} rasters={} groups={} removed={}",
+                    page_idx,
+                    outs.len(),
+                    groups.len(),
+                    removed_uids.len()
+                );
                 // The deletions are now persisted (dropped from the manifest); stop carrying them.
                 self.deleted_raster_uids.remove(&page_idx);
                 // Base PNGs are now on disk: clear `pixels_dirty` so a later flush (e.g. on project
@@ -915,6 +950,7 @@ impl PsEditorTabState {
     /// Flushes the active page's raster layers to disk. Call before merging the unsaved staging
     /// folder into the project on "save to project".
     pub fn flush_layers(&mut self, project: &ProjectData) {
+        let _s = crate::trace_scope!(cat::PERSIST, "flush_layers");
         self.persist_current_page(project);
     }
 
@@ -1008,8 +1044,21 @@ impl PsEditorTabState {
             return;
         }
         self.pending_job_id = None;
+        let _s = crate::trace_scope!(
+            cat::PERSIST,
+            "page_load complete job={} page={}",
+            result.job_id,
+            result.page_idx
+        );
         match result.outcome {
             Ok(page) => {
+                crate::trace_log!(
+                    cat::SYNC,
+                    "page_load base_ready page={} size=[{},{}]",
+                    result.page_idx,
+                    page.size[0],
+                    page.size[1]
+                );
                 let mut stack =
                     LayerStack::new(result.page_idx, page.size, page.source, page.clean);
                 // Pull persisted raster layers from disk. The shared `LayerDoc` (loaded just below) is
@@ -1056,6 +1105,7 @@ impl PsEditorTabState {
                 self.sync_view_from_doc(result.page_idx);
             }
             Err(err) => {
+                crate::trace_log!(cat::PERSIST, "page_load failed page={} err={}", result.page_idx, err);
                 crate::runtime_log::log_error(format!("[ps_editor] page load failed: {err}"));
                 self.load_error = Some(err);
             }
@@ -1073,6 +1123,13 @@ impl PsEditorTabState {
 
     /// Main per-frame entry point. Renders the whole tab inside the provided `ui`.
     pub fn draw(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
+        // Per-frame span. Detailed events inside the editor are gated on real state changes
+        // (page load, doc-version change, tool activity) so an idle frame stays quiet.
+        let _frame = crate::trace_scope!(
+            cat::FRAME,
+            "ps_draw page={:?}",
+            self.active_page_idx
+        );
         self.ensure_loader();
         self.poll_loader(project);
         self.refresh_view_if_doc_version_changed(project);
@@ -1649,6 +1706,7 @@ impl PsEditorTabState {
             // Add the local layer first (it is `pixels_dirty`, so a re-projection won't clobber its
             // empty pixels), then mirror it as a doc node so cross-tab reads see it.
             let id = stack.add_raster_layer();
+            crate::trace_log!(cat::PS_EDITOR, "panel add_layer id={} page={:?}", id, page_idx);
             self.panel_primary = Some(RowSel::Raster(id));
             if let (Some(page_idx), Some(node)) =
                 (page_idx, self.stack.as_ref().and_then(|s| s.layer(id)).map(layer_to_raster_node))
@@ -1662,11 +1720,13 @@ impl PsEditorTabState {
             && let Some(stack) = self.stack.as_mut()
         {
             let n = stack.groups().len() + 1;
-            stack.add_group(format!("Группа {n}"));
+            let gid = stack.add_group(format!("Группа {n}"));
+            crate::trace_log!(cat::PS_EDITOR, "panel new_empty_group gid={}", gid);
         }
         if let Some(id) = actions.set_active_raster
             && let Some(stack) = self.stack.as_mut()
         {
+            crate::trace_log!(cat::PS_EDITOR, "panel set_active_raster id={}", id);
             // Active selection is LOCAL-only (not a doc model field): keep it on the stack.
             stack.set_active(id);
         }
@@ -1678,6 +1738,12 @@ impl PsEditorTabState {
                 .as_ref()
                 .and_then(|s| s.layer(id))
                 .is_some_and(|l| !l.visible);
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "panel toggle_visible_raster id={} visible={}",
+                id,
+                new_visible
+            );
             if !self.route_to_doc(page_idx, project, |doc| {
                 doc.set_visibility(page_idx, &uid, new_visible);
             }) && let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(id))
@@ -1689,8 +1755,16 @@ impl PsEditorTabState {
             && let Some(layer) = self.text_layers.get_mut(i)
         {
             layer.visible = !layer.visible;
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "panel toggle_visible_text index={} visible={}",
+                i,
+                layer.visible
+            );
         }
         if let Some((id, value)) = actions.opacity_raster {
+            // Live slider: fires only on actual value change (drag steps), not every idle frame.
+            crate::trace_log!(cat::PS_EDITOR, "panel opacity_raster id={} value={:.3}", id, value);
             // Live slider: mutate the doc node in memory + re-project, but don't flush each frame
             // (persisted on page-leave). Falls back to a local edit if no doc page is resident.
             if let (Some(page_idx), Some(uid)) = (page_idx, self.raster_uid(id)) {
@@ -1705,6 +1779,7 @@ impl PsEditorTabState {
             }
         }
         if let Some(id) = actions.remove_raster {
+            crate::trace_log!(cat::PS_EDITOR, "panel remove_raster id={} page={:?}", id, page_idx);
             // Record the deletion (so the manifest save drops it — `flush_page`/`save_page_rasters`
             // preserve unowned rasters, so a removal must be explicit), remove it from the doc in
             // memory + re-project, then persist via `persist_current_page` (which carries the removed
@@ -1720,12 +1795,15 @@ impl PsEditorTabState {
             self.persist_current_page(project);
         }
         if let Some(id) = actions.merge_req {
+            crate::trace_log!(cat::PS_EDITOR, "panel merge_down id={}", id);
             self.merge_down(id, project);
         }
         if let Some(id) = actions.bake_req {
+            crate::trace_log!(cat::PS_EDITOR, "panel bake_raster id={}", id);
             self.bake_raster(id, project);
         }
         if let Some(id) = actions.open_effects {
+            crate::trace_log!(cat::PS_EDITOR, "panel open_effects id={}", id);
             // Seed the editor with the layer's current (non-destructive) chain so effects can be
             // tweaked or cleared rather than always starting blank.
             let seed = self
@@ -1738,12 +1816,15 @@ impl PsEditorTabState {
             self.effects_editor = Some((id, seed));
         }
         if let Some((index, op)) = actions.text_op {
+            crate::trace_log!(cat::PS_EDITOR, "panel text_op index={} op={:?}", index, op);
             self.apply_text_layer_op(index, op, project);
         }
         if let Some((sel, up)) = actions.move_band {
+            crate::trace_log!(cat::PS_EDITOR, "panel move_band sel={:?} up={}", sel, up);
             self.move_band_one(sel, up, project);
         }
         if let Some(op) = actions.group_op {
+            crate::trace_log!(cat::PS_EDITOR, "panel group_op op={:?}", op);
             self.apply_group_op(op, project);
         }
     }
@@ -2659,6 +2740,23 @@ impl PsEditorTabState {
             } else {
                 ToolOutcome::default()
             };
+            // Log tool routing only on genuine activity (press / release / a selection change),
+            // never on every idle or mid-drag frame — per-stroke detail lives in the tools.
+            if crate::trace::trace_enabled()
+                && (input.primary_pressed || input.primary_released || outcome.selection_changed)
+            {
+                let pi = input.hover_pos.map(|p| view.screen_to_world(p));
+                crate::trace_log!(
+                    cat::INPUT,
+                    "tool_interact tool={:?} pressed={} released={} ptr={:?} dirty={:?} sel_changed={}",
+                    self.active_tool_id(),
+                    input.primary_pressed,
+                    input.primary_released,
+                    pi.map(|p| (p.x.round() as i32, p.y.round() as i32)),
+                    outcome.dirty.map(|d| (d.min_x, d.min_y, d.max_x, d.max_y)),
+                    outcome.selection_changed
+                );
+            }
             self.apply_tool_outcome(outcome);
 
             // Transform tool release on a raster: commit the live (stack-mutated) transform to the
@@ -2673,6 +2771,7 @@ impl PsEditorTabState {
                     .filter(|l| l.kind == LayerKind::Raster)
                     .map(|l| (l.uid.to_string(), transform_to_rec(l.transform)))
             {
+                crate::trace_log!(cat::SYNC, "commit transform page={} uid={}", page_idx, uid);
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.set_transform(page_idx, &uid, transform);
                 });
@@ -2691,6 +2790,7 @@ impl PsEditorTabState {
                     .filter(|l| l.kind == LayerKind::Raster)
                     .map(|l| (l.uid.to_string(), l.deform.clone()))
             {
+                crate::trace_log!(cat::SYNC, "commit deform page={} uid={}", page_idx, uid);
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.set_deform(page_idx, &uid, deform);
                 });
@@ -2711,6 +2811,7 @@ impl PsEditorTabState {
                     .map(|l| (l.uid.to_string(), l.image.clone()))
             {
                 let base = painted.clone();
+                crate::trace_log!(cat::SYNC, "commit brush_pixels page={} uid={}", page_idx, uid);
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
                 });
@@ -2912,6 +3013,18 @@ impl PsEditorTabState {
             ));
         }
         plan.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+
+        // The composite is rebuilt every frame (no cache), so only emit when the plan size changes
+        // to avoid a 60/s flood. `usize::MAX` sentinel forces the first frame to log.
+        if crate::trace::trace_enabled() && plan.len() != self.trace_last_composite_steps {
+            crate::trace_log!(
+                cat::RENDER,
+                "draw_composite page={:?} steps={}",
+                self.active_page_idx,
+                plan.len()
+            );
+            self.trace_last_composite_steps = plan.len();
+        }
 
         for (_, _, step) in plan {
             match step {

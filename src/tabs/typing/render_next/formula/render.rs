@@ -18,6 +18,8 @@ Source:
 из старого `src/tabs/typing/render.rs`
 */
 
+use crate::trace::cat;
+
 use super::{FormulaEvalInput, FormulaProgramBundle};
 use crate::tabs::typing::render_next::drawn_lines::{
     DrawnLinePath, build_vector_line_paths, load_raster_line_paths,
@@ -144,6 +146,7 @@ impl GlyphInkProfile {
 pub(crate) fn render_text_with_formula_layout(
     request: FormulaRenderRequest<'_, '_>,
 ) -> Result<FormulaRenderOutcome, String> {
+    let _span = crate::trace_scope!(cat::RENDER, "render_formula_layout mode={:?}", request.params.text_layout_mode);
     let FormulaRenderRequest {
         params,
         font_system,
@@ -226,6 +229,7 @@ pub(crate) fn render_text_with_formula_layout(
 pub(crate) fn render_text_with_drawn_lines_layout(
     request: FormulaRenderRequest<'_, '_>,
 ) -> Result<FormulaRenderOutcome, String> {
+    let _span = crate::trace_scope!(cat::RENDER, "render_drawn_lines_layout");
     let Some(layout_path) = request.params.drawn_lines_layout.image_path.as_deref() else {
         return Ok(FormulaRenderOutcome::FallbackToStandard(
             "Для раскладки по рисованным линиям не задано layout-изображение.".to_string(),
@@ -253,6 +257,7 @@ pub(crate) fn render_text_with_drawn_lines_layout(
 pub(crate) fn render_text_with_vector_lines_layout(
     request: FormulaRenderRequest<'_, '_>,
 ) -> Result<FormulaRenderOutcome, String> {
+    let _span = crate::trace_scope!(cat::RENDER, "render_vector_lines_layout");
     let paths = build_vector_line_paths(&request.params.vector_lines_layout);
     if paths.iter().all(Option::is_none) {
         return Ok(FormulaRenderOutcome::FallbackToStandard(

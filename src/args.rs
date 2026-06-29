@@ -16,6 +16,7 @@ Main items:
 - `Cli.continue_create_start_menu_shortcut`: скрытый служебный флаг продолжения elevated-создания ярлыка меню Пуск.
 - `Cli.uninstall_signal_file`: скрытый служебный файл-сигнал для сценария "удалить и затем переустановить".
 - `Cli.continue_update`: hidden service flag that resumes update work after executable replacement.
+- `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `src/trace.rs`).
 */
 
 use clap::Parser;
@@ -66,4 +67,7 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false, hide = true)]
     pub continue_update: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub trace: bool,
 }

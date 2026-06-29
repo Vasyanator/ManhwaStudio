@@ -23,6 +23,7 @@ on completion so both tabs re-project the migrated v3 data.
 */
 
 use super::{persist, text_payload};
+use crate::trace::cat;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -119,8 +120,19 @@ pub fn migrate_chapter_to_v3(
     page_sizes: &HashMap<usize, [usize; 2]>,
 ) -> Result<MigrationReport, String> {
     let Some(source_dir) = chapter_needs_migration(layers_dir, legacy_text_images_dir) else {
+        crate::trace_log!(
+            cat::PERSIST,
+            "migrate_chapter_to_v3 layers_dir={} -> no migration needed",
+            layers_dir.display()
+        );
         return Ok(MigrationReport::default()); // nothing to do
     };
+    let _span = crate::trace_scope!(
+        cat::PERSIST,
+        "migrate_chapter_to_v3 layers_dir={} source={}",
+        layers_dir.display(),
+        source_dir.display()
+    );
 
     // Directories an overlay PNG may live in, in search order: the legacy source dir, the canonical
     // committed `layers/` dir, the legacy `text_images/` dir, and the unsaved staging dir.
@@ -215,6 +227,12 @@ pub fn migrate_chapter_to_v3(
         // Write the inline payload into the canonical committed `layers/` dir; `write_page_text_payload`
         // preserves rasters / PS groups / text-group bands + PS-owned pin/z/group fields, and does NOT
         // touch the renamed PNGs.
+        crate::trace_log!(
+            cat::PERSIST,
+            "migrate_chapter_to_v3 page={} migrating {} legacy text overlays -> inline v3",
+            page_idx,
+            outs.len()
+        );
         persist::write_page_text_payload(layers_dir, None, page_idx, &outs)?;
         report.migrated_pages.push(page_idx);
 
@@ -256,11 +274,23 @@ pub fn migrate_chapter_to_v3(
         let bak = next_backup_path(dir);
         std::fs::rename(&src, &bak)
             .map_err(|e| format!("rename {} -> {}: {e}", src.display(), bak.display()))?;
+        crate::trace_log!(
+            cat::PERSIST,
+            "migrate_chapter_to_v3 retiring legacy {} -> {}",
+            src.display(),
+            bak.display()
+        );
         if dir == source_dir.as_path() {
             report.backup_path = Some(bak);
         }
     }
 
+    crate::trace_log!(
+        cat::PERSIST,
+        "migrate_chapter_to_v3 done overlays={} pages={}",
+        report.migrated_overlays,
+        report.migrated_pages.len()
+    );
     Ok(report)
 }
 

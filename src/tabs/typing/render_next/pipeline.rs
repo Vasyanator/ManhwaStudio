@@ -23,6 +23,8 @@ Notes:
   `src/tabs/typing/render.rs`.
 */
 
+use crate::trace::cat;
+
 use super::effects::{apply_effects_pipeline, apply_text_preprocess_effects};
 use super::font_registry::{build_inline_font_registry, load_selected_font_from_path};
 use super::formula::{
@@ -257,6 +259,13 @@ pub fn apply_effects_to_image(
     effects_json: &str,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
+    let _effects_span = crate::trace_scope!(
+        cat::RENDER,
+        "apply_effects_to_image w={} h={} has_effects={}",
+        width,
+        height,
+        !effects_json.trim().is_empty()
+    );
     if is_cancelled(cancel) {
         return Err("render_next render cancelled".to_string());
     }
@@ -292,6 +301,16 @@ pub fn render_text_to_image(
     params: &TextRenderParams,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
+    let _render_span = crate::trace_scope!(
+        cat::RENDER,
+        "render_text_to_image layout={:?} line_mode={:?} wrap={:?} width_px={} font_size={:.1} effects={}",
+        params.text_layout_mode,
+        params.text_line_mode,
+        params.text_wrap_mode,
+        params.width_px,
+        params.font_size_px,
+        !params.effects_json.trim().is_empty()
+    );
     if is_cancelled(cancel) {
         return Err("render_next render cancelled".to_string());
     }
@@ -491,6 +510,7 @@ pub fn render_text_to_image(
             font_size_px,
             base_line_height_px: font_size_px,
         };
+        crate::trace_log!(cat::RENDER, "render_text path=custom_lines mode={:?}", params.text_layout_mode);
         let custom_lines_result = match params.text_layout_mode {
             TextLayoutMode::CustomRasterLines => render_text_with_drawn_lines_layout(request)?,
             TextLayoutMode::CustomVectorLines => render_text_with_vector_lines_layout(request)?,
@@ -518,6 +538,7 @@ pub fn render_text_to_image(
                     .to_string(),
             );
         }
+        crate::trace_log!(cat::RENDER, "render_text path=formula_shape mode={:?}", params.text_layout_mode);
         match render_text_with_formula_layout(FormulaRenderRequest {
             params,
             font_system: &mut font_system,
@@ -562,6 +583,7 @@ pub fn render_text_to_image(
         extra_line_spacing_px,
     );
     if params.text_line_mode == TextLineMode::Vertical {
+        crate::trace_log!(cat::RENDER, "render_text path=vertical lines={}", layout_line_offsets.len());
         let mut rendered = render_vertical_text(VerticalRasterRequest {
             params,
             font_system: &mut font_system,
@@ -593,6 +615,7 @@ pub fn render_text_to_image(
         .as_deref()
         .is_some_and(spans_have_inline_rotation)
     {
+        crate::trace_log!(cat::RENDER, "render_text path=horizontal_rotated lines={}", layout_line_offsets.len());
         let mut rendered = render_horizontal_rotated(
             params,
             &mut font_system,
@@ -613,6 +636,7 @@ pub fn render_text_to_image(
         return Ok(rendered);
     }
 
+    crate::trace_log!(cat::RENDER, "render_text path=horizontal lines={} align={:?}", layout_line_offsets.len(), params.align);
     let mut cache = SwashCache::new();
     let mut bounds = PixelBounds::empty();
     let mut line_idx = 0usize;

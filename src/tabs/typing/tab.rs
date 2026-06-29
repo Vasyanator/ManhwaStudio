@@ -81,6 +81,7 @@ use super::render_next::types::{
     VerticalLineDirection,
 };
 use crate::app::{PageImageInfo, PageTexture};
+use crate::trace::cat;
 use crate::canvas::{
     CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords,
     SourceTextureUploadBudget, parse_image_text_areas,
@@ -393,6 +394,7 @@ impl TypingTabState {
         texture_cache: &mut HashMap<usize, PageTexture>,
         status: CanvasUiStatus,
     ) {
+        let _frame_span = crate::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
         let canvas_rect = ui.max_rect();
         self.text_overlays.set_page_count(project.pages.len());
         // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
@@ -1713,10 +1715,24 @@ impl TypingTextOverlayLayer {
             return;
         }
         if guard.page(current_page).is_some() {
+            crate::trace_log!(
+                cat::SYNC,
+                "reproject_from_doc page={} old_version={} new_version={} resident=true",
+                current_page,
+                self.last_doc_version,
+                guard.version()
+            );
             self.sync_from_doc(current_page, &guard);
         } else {
             // The current page is not resident (e.g. just evicted by a self-write that will reload it
             // shortly). Adopt the version so we don't spin; the page-load path re-projects on arrival.
+            crate::trace_log!(
+                cat::SYNC,
+                "reproject_from_doc page={} old_version={} new_version={} resident=false adopt_only",
+                current_page,
+                self.last_doc_version,
+                guard.version()
+            );
             self.last_doc_version = guard.version();
         }
     }
@@ -1843,6 +1859,12 @@ impl TypingTextOverlayLayer {
     ) {
         use crate::models::layer_model::layer_doc::NodeBody;
         use crate::models::layer_model::ordering::Band;
+        let _sync_span = crate::trace_scope!(
+            cat::SYNC,
+            "sync_from_doc page={} doc_version={}",
+            page_idx,
+            doc.version()
+        );
         let Some(page) = doc.page(page_idx) else {
             return;
         };
@@ -3289,6 +3311,15 @@ impl TypingTextOverlayLayer {
 
         match recv_result {
             Ok(Ok(decoded)) => {
+                crate::trace_log!(
+                    cat::SYNC,
+                    "create_overlay_render result=ok uid={} kind={:?} size={}x{} warnings={}",
+                    decoded.uid,
+                    decoded.kind,
+                    decoded.size_px[0],
+                    decoded.size_px[1],
+                    decoded.warnings.len()
+                );
                 if !decoded.warnings.is_empty() {
                     self.set_create_warning(ctx, decoded.warnings.join("; "));
                 }
@@ -3297,6 +3328,7 @@ impl TypingTextOverlayLayer {
                 true
             }
             Ok(Err(err)) | Err(err) => {
+                crate::trace_log!(cat::SYNC, "create_overlay_render result=err err={}", err);
                 self.set_create_error(ctx, err);
                 true
             }
@@ -3418,10 +3450,23 @@ impl TypingTextOverlayLayer {
         let uid = uid.to_string();
         let primary = self.layers_primary_dir.clone();
         let fallback = self.layers_fallback_dir.clone();
+        // Prefer the resident doc's in-memory base pixels: a freshly created raster (e.g. a cut)
+        // may not be flushed to disk yet, so the disk-only load would fail. Clone the pixels and
+        // drop the guard BEFORE spawning so the lock is never held across the worker thread.
+        let base_in_memory: Option<ColorImage> = self
+            .layer_doc
+            .clone()
+            .and_then(|doc| doc.lock().ok().and_then(|g| g.raster_base_image(page_idx, &uid)));
         let (tx, rx) = mpsc::channel::<Result<TypingRasterEffectsResult, String>>();
         thread::spawn(move || {
             let _ = tx.send(render_raster_effects(
-                page_idx, uid, base_file, primary, fallback, effects,
+                page_idx,
+                uid,
+                base_file,
+                primary,
+                fallback,
+                effects,
+                base_in_memory,
             ));
         });
         self.raster_effects_state = Some(rx);
@@ -3531,13 +3576,26 @@ impl TypingTextOverlayLayer {
         let mut repainted = false;
         match recv_result {
             Ok(Ok(Some(result))) => {
+                crate::trace_log!(
+                    cat::SYNC,
+                    "edit_overlay_render result=ok token={} overlay_idx={} image_effects={} size={}x{} warnings={}",
+                    result.token,
+                    result.overlay_idx,
+                    result.is_image_effects,
+                    result.size_px[0],
+                    result.size_px[1],
+                    result.warnings.len()
+                );
                 if !result.warnings.is_empty() {
                     self.set_create_warning(ctx, result.warnings.join("; "));
                 }
                 repainted |= self.apply_edit_overlay_render_result(result);
             }
-            Ok(Ok(None)) => {}
+            Ok(Ok(None)) => {
+                crate::trace_log!(cat::SYNC, "edit_overlay_render result=none (skipped/cancelled)");
+            }
             Ok(Err(err)) | Err(err) => {
+                crate::trace_log!(cat::SYNC, "edit_overlay_render result=err err={}", err);
                 self.set_create_error(ctx, err);
                 repainted = true;
             }
@@ -3737,6 +3795,16 @@ impl TypingTextOverlayLayer {
 
     fn start_edit_overlay_render_job(&mut self, mut request: TypingEditOverlayRequest) {
         request.token = self.next_edit_render_token();
+        let preempted = self.edit_render_rx.is_some();
+        crate::trace_log!(
+            cat::SYNC,
+            "edit_overlay_render dispatch kind=text token={} overlay_idx={} scale={:.3} rot={:.1} preempted_prev={}",
+            request.token,
+            request.overlay_idx,
+            request.user_scale,
+            request.rotation_deg,
+            preempted
+        );
         let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
         thread::spawn(move || {
             let result = render_and_store_edited_overlay(request);
@@ -3747,6 +3815,16 @@ impl TypingTextOverlayLayer {
 
     fn start_edit_image_effects_render_job(&mut self, mut request: TypingEditImageEffectsRequest) {
         request.token = self.next_edit_render_token();
+        let preempted = self.edit_render_rx.is_some();
+        crate::trace_log!(
+            cat::SYNC,
+            "edit_overlay_render dispatch kind=image_effects token={} overlay_idx={} scale={:.3} rot={:.1} preempted_prev={}",
+            request.token,
+            request.overlay_idx,
+            request.user_scale,
+            request.rotation_deg,
+            preempted
+        );
         let (tx, rx) = mpsc::channel::<Result<Option<TypingEditOverlayResult>, String>>();
         thread::spawn(move || {
             let result = render_and_store_image_effects_overlay(request);
@@ -4023,11 +4101,15 @@ impl TypingTextOverlayLayer {
         self.save_rx = None;
         match recv_result {
             Ok(Ok(())) => {
+                crate::trace_log!(cat::PERSIST, "overlay_placement_save result=ok");
                 // Our own overlay write to `layers.json` / PNGs completed. The MODEL change already
                 // routed through the shared doc (bumping its version, so the PS tab re-projects); this
                 // job only persisted it to disk, so there is nothing more to signal cross-tab.
             }
-            Ok(Err(err)) | Err(err) => self.set_create_error(ctx, err),
+            Ok(Err(err)) | Err(err) => {
+                crate::trace_log!(cat::PERSIST, "overlay_placement_save result=err err={}", err);
+                self.set_create_error(ctx, err);
+            }
         }
 
         if self.save_requested_while_busy {
@@ -4052,6 +4134,12 @@ impl TypingTextOverlayLayer {
                     self.export_rx = None;
                     match result {
                         Ok(result) => {
+                            crate::trace_log!(
+                                cat::PERSIST,
+                                "export result=ok exported={} total={}",
+                                result.exported,
+                                result.total
+                            );
                             self.create_status_error = None;
                             self.export_status = TypingExportUiStatus::Success {
                                 done: result.exported,
@@ -4060,6 +4148,7 @@ impl TypingTextOverlayLayer {
                             let _ = result.output_dir;
                         }
                         Err(err) => {
+                            crate::trace_log!(cat::PERSIST, "export result=err err={}", err);
                             self.export_status = TypingExportUiStatus::Error {
                                 message: err.clone(),
                             };
@@ -4101,6 +4190,13 @@ impl TypingTextOverlayLayer {
             self.set_create_error(ctx, "В проекте нет страниц для экспорта.");
             return;
         }
+        crate::trace_log!(
+            cat::PERSIST,
+            "export dispatch pages={} format={:?} output_dir={}",
+            project.pages.len(),
+            export_format,
+            output_dir.display()
+        );
         let clean_overlays_model = self.clean_overlays_model.clone();
 
         let mut overlays_by_page = HashMap::<usize, Vec<TypingExportOverlaySnapshot>>::new();
@@ -4351,6 +4447,11 @@ impl TypingTextOverlayLayer {
             return;
         };
         let pages: Vec<usize> = pages_with_text.into_iter().collect();
+        crate::trace_log!(
+            cat::PERSIST,
+            "spawn_overlay_placement_save pages={:?}",
+            pages
+        );
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
             let result = (|| {
@@ -4374,6 +4475,7 @@ impl TypingTextOverlayLayer {
     /// so a raster-only PS edit must not drop their committed text). Mirrors the PS editor's
     /// `flush_layers`; best-effort per page.
     pub fn flush_text_layers(&mut self) -> std::collections::HashSet<usize> {
+        let _persist_span = crate::trace_scope!(cat::PERSIST, "flush_text_layers");
         let mut owned: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let Some(layers_dir) = self.layers_primary_dir.clone() else {
             return owned;
@@ -4401,6 +4503,7 @@ impl TypingTextOverlayLayer {
                 )),
             }
         }
+        crate::trace_log!(cat::PERSIST, "flush_text_layers owned_pages={}", owned.len());
         owned
     }
 
@@ -4741,6 +4844,14 @@ impl TypingTextOverlayLayer {
             render_params,
             render_data_json,
         };
+        crate::trace_log!(
+            cat::SYNC,
+            "create_overlay_render dispatch page={} center=({:.1},{:.1}) width_px={}",
+            editor.page_idx,
+            editor.center_page_px[0],
+            editor.center_page_px[1],
+            editor.width_px
+        );
         let (tx, rx) = mpsc::channel::<Result<TypingOverlayDecoded, String>>();
         thread::spawn(move || {
             let result = render_and_store_created_overlay(request);
@@ -5117,6 +5228,15 @@ impl TypingTextOverlayLayer {
             uploaded_bytes += display_rgba.len();
         }
 
+        if uploaded_any {
+            crate::trace_log!(
+                cat::RENDER,
+                "upload_overlay_textures count={} bytes={} pending_remaining={}",
+                uploaded_textures,
+                uploaded_bytes,
+                self.pending_upload_indices.len()
+            );
+        }
         uploaded_any
     }
 
@@ -5195,6 +5315,16 @@ impl TypingTextOverlayLayer {
     }
 
     fn clear_selection(&mut self) {
+        if crate::trace::trace_enabled()
+            && (self.selected_overlay_idx.is_some() || self.selected_raster_idx.is_some())
+        {
+            crate::trace_log!(
+                cat::TYPING,
+                "clear_selection overlay_idx={:?} raster_idx={:?}",
+                self.selected_overlay_idx,
+                self.selected_raster_idx
+            );
+        }
         self.selected_overlay_idx = None;
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
@@ -5209,6 +5339,9 @@ impl TypingTextOverlayLayer {
     /// Selects a raster layer for the current page, clearing any overlay selection (one selection at
     /// a time across the two layer kinds). Selecting a DIFFERENT raster exits raster transform mode.
     fn select_raster(&mut self, raster_idx: usize) {
+        if self.selected_raster_idx != Some(raster_idx) {
+            crate::trace_log!(cat::TYPING, "select_raster raster_idx={}", raster_idx);
+        }
         if self.transform_mode_raster_idx != Some(raster_idx) {
             self.transform_mode_raster_idx = None;
         }
@@ -5290,6 +5423,18 @@ impl TypingTextOverlayLayer {
             .get(overlay_idx)
             .filter(|o| o.kind == TypingOverlayKind::Text)
             .map(|o| (o.page_idx, o.uid.clone()));
+        if crate::trace::trace_enabled() {
+            if let Some(o) = self.overlays.get(overlay_idx) {
+                crate::trace_log!(
+                    cat::TYPING,
+                    "remove_overlay idx={} uid={} kind={:?} page={}",
+                    overlay_idx,
+                    o.uid,
+                    o.kind,
+                    o.page_idx
+                );
+            }
+        }
         self.overlays.remove(overlay_idx);
         self.shape_variant_preview = None;
 
@@ -5354,6 +5499,13 @@ impl TypingTextOverlayLayer {
         else {
             return;
         };
+        crate::trace_log!(
+            cat::TYPING,
+            "remove_raster page={} raster_idx={} uid={}",
+            page_idx,
+            raster_idx,
+            uid
+        );
         // Drop the node from the shared doc (its texture goes with the cached layer below).
         self.route_to_doc(page_idx, |doc| {
             doc.remove_node(page_idx, &uid);
@@ -5965,6 +6117,12 @@ impl TypingTextOverlayLayer {
                             .and_then(|v| v.get(sel))
                             .map(|l| l.transform)
                     {
+                        crate::trace_log!(
+                            cat::INPUT,
+                            "raster_drag_begin owner=selected idx={} selected_was={:?} reason=selected_under_pointer",
+                            sel,
+                            self.selected_raster_idx
+                        );
                         self.raster_drag_state = Some(TypingRasterDragState {
                             page_idx,
                             raster_idx: sel,
@@ -6005,10 +6163,27 @@ impl TypingTextOverlayLayer {
                     self.selected_raster_idx,
                 );
                 if let Some((idx, quad, center, on_rotate)) = target {
+                    // Sticky-focus on DRAG: if the pointer is ALSO over the currently-selected raster's
+                    // quad, this non-selected widget must NOT capture the drag — egui awards both
+                    // `hits.click` and `hits.drag` to the last-registered widget at the pixel (this one),
+                    // which would steal the drag from the selected raster (branch 1). So when the selected
+                    // raster is under the pointer, register THIS widget as click-only: `hits.drag` then
+                    // falls back to branch (1)'s click_and_drag widget (the selected raster), so a drag
+                    // moves the SELECTED layer. A click (press-release) still lands here → reselect.
+                    let pointer_over_selected = pointer.is_some_and(|p| {
+                        self.selected_raster_idx
+                            .and_then(|sel| entries.iter().find(|(i, _, _)| *i == sel))
+                            .is_some_and(|(_, sel_quad, _)| point_in_quad(p, sel_quad))
+                    });
+                    let sense = if pointer_over_selected {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::click_and_drag()
+                    };
                     let resp = ui.interact(
                         egui::Rect::from_points(&quad),
                         egui::Id::new(("typing_raster", page_idx, idx)),
-                        egui::Sense::click_and_drag(),
+                        sense,
                     );
                     if resp.clicked() {
                         self.select_raster(idx);
@@ -6027,6 +6202,12 @@ impl TypingTextOverlayLayer {
                             .and_then(|v| v.get(idx))
                             .map(|l| l.transform)
                     {
+                        crate::trace_log!(
+                            cat::INPUT,
+                            "raster_drag_begin owner=reselect idx={} selected_was={:?} reason=no_selected_under_pointer",
+                            idx,
+                            self.selected_raster_idx
+                        );
                         self.select_raster(idx);
                         self.raster_drag_state = Some(TypingRasterDragState {
                             page_idx,
@@ -6448,6 +6629,15 @@ impl TypingTextOverlayLayer {
 
         self.auto_typing_next_token = self.auto_typing_next_token.wrapping_add(1);
         let token = self.auto_typing_next_token;
+        crate::trace_log!(
+            cat::SYNC,
+            "auto_typing dispatch token={} overlay_idx={} page={} click_uv=({:.3},{:.3})",
+            token,
+            selected_idx,
+            page_idx,
+            click_uv[0],
+            click_uv[1]
+        );
         let (tx, rx) = mpsc::channel::<Result<TypingAutoTypingWorkerResult, String>>();
         thread::spawn(move || {
             let result = detect_bubble_from_overlay_cache(&clean_model, page_idx, click_uv).map(
@@ -6492,8 +6682,17 @@ impl TypingTextOverlayLayer {
             return false;
         };
         match recv_result {
-            Ok(Ok(result)) => self.apply_auto_typing_result(ctx, job_state, result),
+            Ok(Ok(result)) => {
+                crate::trace_log!(
+                    cat::SYNC,
+                    "auto_typing result=ok token={} page={}",
+                    result.token,
+                    result.page_idx
+                );
+                self.apply_auto_typing_result(ctx, job_state, result)
+            }
             Ok(Err(err)) | Err(err) => {
+                crate::trace_log!(cat::SYNC, "auto_typing result=err err={}", err);
                 self.set_create_error(ctx, err);
                 true
             }
@@ -6939,6 +7138,23 @@ impl TypingTextOverlayLayer {
                             )
                     })
                 });
+            // Sticky-фокус на ПЕРЕТАСКИВАНИИ (по позиции курсора, без клика): курсор находится
+            // внутри grab-рамки уже выделенного оверлея. Тогда перекрывающий НЕвыделенный оверлей
+            // регистрируется как click-only (см. ниже), и egui отдаёт drag выделенному оверлею.
+            let pointer_in_selected_overlay_frame = ui
+                .input(|i| i.pointer.latest_pos())
+                .zip(self.selected_overlay_idx)
+                .is_some_and(|(pos, selected_idx)| {
+                    draw_entries.iter().any(|entry| {
+                        entry.idx == selected_idx
+                            && deform_mesh_contains_point(
+                                &entry.selection_mesh_scene,
+                                entry.mesh_cols,
+                                entry.mesh_rows,
+                                pos,
+                            )
+                    })
+                });
             for entry in &draw_entries {
                 let is_transform_mode = self.transform_mode_overlay_idx == Some(entry.idx);
                 let show_rotate_handle =
@@ -6964,10 +7180,22 @@ impl TypingTextOverlayLayer {
                     );
                     interact_rect = interact_rect.union(handle_rect);
                 }
+                // Если курсор внутри рамки уже выделенного оверлея, перекрывающий НЕвыделенный
+                // оверлей не должен перехватывать DRAG: регистрируем его click-only, чтобы egui
+                // отдал drag выделенному оверлею (его виджет sense'ит click_and_drag). Клик
+                // (нажал-отпустил) по-прежнему попадает сюда и переселектит — см. блок
+                // sticky-фокуса по `click_in_selected_frame`.
+                let sense = if pointer_in_selected_overlay_frame
+                    && self.selected_overlay_idx != Some(entry.idx)
+                {
+                    Sense::click()
+                } else {
+                    Sense::click_and_drag()
+                };
                 let response = ui.interact(
                     interact_rect,
                     Id::new(("typing_text_overlay", entry.idx)),
-                    Sense::click_and_drag(),
+                    sense,
                 );
                 let pointer_pos = response.interact_pointer_pos();
                 let pointer_inside_visual = pointer_pos.is_some_and(|pos| {
@@ -7076,6 +7304,11 @@ impl TypingTextOverlayLayer {
                         if menu_ui.button("Войти в режим трансформации").clicked()
                         {
                             if self.ensure_overlay_deform_mesh(entry.idx, image_rect, zoom) {
+                                crate::trace_log!(
+                                    cat::TYPING,
+                                    "overlay_transform_mode enter idx={}",
+                                    entry.idx
+                                );
                                 self.transform_mode_overlay_idx = Some(entry.idx);
                                 self.deform_mode = TypingDeformMode::Perspective;
                                 self.drag_state = None;
@@ -7085,6 +7318,11 @@ impl TypingTextOverlayLayer {
                     } else {
                         if menu_ui.button("Выйти из режима трансформации").clicked()
                         {
+                            crate::trace_log!(
+                                cat::TYPING,
+                                "overlay_transform_mode exit idx={}",
+                                entry.idx
+                            );
                             if self.transform_mode_overlay_idx == Some(entry.idx) {
                                 self.transform_mode_overlay_idx = None;
                             }
@@ -7093,6 +7331,11 @@ impl TypingTextOverlayLayer {
                             menu_ui.close();
                         }
                         if menu_ui.button("Сбросить трансформацию").clicked() {
+                            crate::trace_log!(
+                                cat::TYPING,
+                                "overlay_transform_reset idx={}",
+                                entry.idx
+                            );
                             if let Some(overlay) = self.overlays.get_mut(entry.idx) {
                                 overlay.deform_mesh = None;
                             }
@@ -7111,9 +7354,17 @@ impl TypingTextOverlayLayer {
                             "Включить обрезание маской"
                         };
                         if menu_ui.button(toggle_label).clicked() {
+                            let mut new_state = false;
                             if let Some(overlay) = self.overlays.get_mut(entry.idx) {
                                 overlay.mask_clip_enabled = !overlay.mask_clip_enabled;
+                                new_state = overlay.mask_clip_enabled;
                             }
+                            crate::trace_log!(
+                                cat::TYPING,
+                                "overlay_mask_clip_toggle idx={} enabled={}",
+                                entry.idx,
+                                new_state
+                            );
                             self.mark_overlay_pixels_dirty(entry.idx);
                             self.request_overlay_placement_save();
                             menu_ui.close();
@@ -7168,6 +7419,17 @@ impl TypingTextOverlayLayer {
                             continue;
                         };
 
+                        crate::trace_log!(
+                            cat::INPUT,
+                            "overlay_drag_begin owner={} idx={} selected_was={:?} reason=drag_started",
+                            if self.selected_overlay_idx == Some(entry.idx) {
+                                "selected"
+                            } else {
+                                "reselect"
+                            },
+                            entry.idx,
+                            self.selected_overlay_idx
+                        );
                         self.selected_overlay_idx = Some(entry.idx);
                         let mut mode = if pointer_on_rotate_handle {
                             TypingOverlayDragMode::Rotate
@@ -7231,6 +7493,14 @@ impl TypingTextOverlayLayer {
                                 {
                                     start_center_page_px = overlay.center_page_px;
                                 }
+                                crate::trace_log!(
+                                    cat::INPUT,
+                                    "overlay_drag_begin transform=true idx={} page={} mode={:?} deform_mode={:?}",
+                                    entry.idx,
+                                    page_idx,
+                                    mode,
+                                    self.deform_mode
+                                );
                                 self.drag_state = Some(TypingOverlayDragState {
                                     overlay_idx: entry.idx,
                                     page_idx,
@@ -7263,6 +7533,13 @@ impl TypingTextOverlayLayer {
                                 default_overlay_quad_mesh(overlay, image_rect, zoom)
                             });
                         }
+                        crate::trace_log!(
+                            cat::INPUT,
+                            "overlay_drag_begin transform=false idx={} page={} mode={:?}",
+                            entry.idx,
+                            page_idx,
+                            mode
+                        );
                         self.drag_state = Some(TypingOverlayDragState {
                             overlay_idx: entry.idx,
                             page_idx,
@@ -7529,6 +7806,22 @@ impl TypingTextOverlayLayer {
                         .as_ref()
                         .is_some_and(|state| state.overlay_idx == entry.idx)
                 {
+                    if crate::trace::trace_enabled() {
+                        let (center, angle) = self
+                            .overlays
+                            .get(entry.idx)
+                            .map(|o| (o.center_page_px, o.angle_deg))
+                            .unwrap_or(([0.0, 0.0], 0.0));
+                        crate::trace_log!(
+                            cat::INPUT,
+                            "overlay_drag_end idx={} committed={} center=({:.1},{:.1}) angle={:.1}",
+                            entry.idx,
+                            self.drag_has_changes,
+                            center[0],
+                            center[1],
+                            angle
+                        );
+                    }
                     if self.drag_has_changes {
                         self.flush_overlay_texture_if_stale(entry.idx);
                         self.request_overlay_placement_save();
@@ -11073,9 +11366,24 @@ fn render_raster_effects(
     primary: Option<PathBuf>,
     fallback: Option<PathBuf>,
     effects: Vec<Value>,
+    base_in_memory: Option<ColorImage>,
 ) -> Result<TypingRasterEffectsResult, String> {
-    let base = load_raster_base_png(&base_file, primary.as_deref(), fallback.as_deref())
-        .ok_or_else(|| format!("Не найден исходный PNG растра «{base_file}»."))?;
+    // Prefer the resident doc's in-memory base; fall back to the on-disk base PNG when absent.
+    let (base, source) = match base_in_memory {
+        Some(img) => (img, "memory"),
+        None => {
+            let img = load_raster_base_png(&base_file, primary.as_deref(), fallback.as_deref())
+                .ok_or_else(|| format!("Не найден исходный PNG растра «{base_file}»."))?;
+            (img, "disk")
+        }
+    };
+    crate::trace_log!(
+        crate::trace::cat::RENDER,
+        "render_raster_effects base source={} uid={} base_file={}",
+        source,
+        uid,
+        base_file
+    );
     if effects.is_empty() {
         return Ok(TypingRasterEffectsResult {
             page_idx,

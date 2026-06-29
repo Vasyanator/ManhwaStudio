@@ -59,6 +59,7 @@ impl SelectTool {
     }
 
     fn commit_rect(&self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+        use crate::trace::cat;
         let mut outcome = ToolOutcome::default();
         if let (Some(start), Some(end)) = (self.drag_start, self.last_pointer) {
             ctx.ensure_selection().set_rect(
@@ -68,14 +69,31 @@ impl SelectTool {
                 end.y.round() as i32,
             );
             outcome.selection_changed = true;
+            crate::trace_log!(
+                cat::PS_EDITOR,
+                "selection commit_rect from=({:.1},{:.1}) to=({:.1},{:.1}) any={}",
+                start.x,
+                start.y,
+                end.x,
+                end.y,
+                ctx.selection.as_ref().is_some_and(|s| s.any())
+            );
         }
         outcome
     }
 
     fn commit_lasso(&self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
+        use crate::trace::cat;
         let mut outcome = ToolOutcome::default();
+        let points = self.lasso_points.len();
         ctx.ensure_selection().set_polygon(&self.lasso_points);
         outcome.selection_changed = true;
+        crate::trace_log!(
+            cat::PS_EDITOR,
+            "selection commit_lasso points={} any={}",
+            points,
+            ctx.selection.as_ref().is_some_and(|s| s.any())
+        );
         outcome
     }
 }
@@ -106,6 +124,13 @@ impl PsTool for SelectTool {
             && let Some(pointer) = ctx.pointer_image
         {
             self.dragging = true;
+            crate::trace_log!(
+                crate::trace::cat::INPUT,
+                "selection drag_begin mode={:?} at=({:.1},{:.1})",
+                self.mode,
+                pointer.x,
+                pointer.y
+            );
             match self.mode {
                 SelectMode::Rect => self.drag_start = Some(pointer),
                 SelectMode::Lasso => {
