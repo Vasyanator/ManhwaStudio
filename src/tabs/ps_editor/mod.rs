@@ -65,6 +65,10 @@ use tools::{PsTool, PsToolContext, PsToolId, ToolOutcome};
 /// Max layer tiles uploaded to the GPU per frame across all layers (spreads big-page uploads).
 const TILE_UPLOAD_BUDGET_PER_FRAME: usize = 8;
 
+/// Number of text characters shown in a text-layer row preview (`Текст (preview)`) in the layers
+/// panel. Fixed budget (the typing tab makes this width-adaptive; a constant is enough here).
+const PS_TEXT_PREVIEW_CHARS: usize = 16;
+
 /// State of the PS-like editor tab.
 pub struct PsEditorTabState {
     overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
@@ -255,6 +259,9 @@ struct PanelActions {
     open_effects: Option<LayerId>,
     text_op: Option<(usize, TextLayerOp)>,
     group_op: Option<GroupOp>,
+    /// Set on a primary layer-row click: after the active layer/primary is updated, set the canvas
+    /// marquee to that layer's footprint (`select_active_layer_fully`).
+    request_select_active: bool,
 }
 
 /// An owned, render-ready snapshot of one layer-panel row, built from the tree + stack + text
@@ -602,9 +609,16 @@ impl PsEditorTabState {
             .collect();
         let mut new_text: Vec<PsTextLayer> = Vec::new();
         for node in &page.nodes {
-            let NodeBody::Text { image, .. } = &node.body else {
+            let NodeBody::Text { image, render_data, .. } = &node.body else {
                 continue;
             };
+            // Raw overlay text (for the panel row preview); empty when render_data lacks it.
+            let text_content = render_data
+                .get("text_params")
+                .and_then(|tp| tp.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let cache_key = (page_idx, node.uid.clone());
             let gen_changed =
                 self.node_generations.get(&cache_key).copied() != Some(node.generation);
@@ -637,6 +651,7 @@ impl PsEditorTabState {
                 node.group_uid.clone(),
                 pinned,
                 pinned_by_group,
+                text_content,
                 image.clone(),
                 LayerTransform {
                     center: Vec2::new(node.transform.cx, node.transform.cy),
@@ -1337,13 +1352,33 @@ impl PsEditorTabState {
             });
     }
 
-    /// Sets the selection to the active layer's full footprint: a page rectangle for a base /
-    /// page-sized layer, or the (possibly rotated/scaled) image quad for a transformed raster layer.
+    /// Sets the selection to the active layer's full footprint. When the panel's primary row is a TEXT
+    /// layer, the footprint is that overlay's page-space outline (`PsTextLayer::footprint_polygon`),
+    /// since text layers are NOT in `LayerStack`. Otherwise it falls back to the stack's active layer: a
+    /// page rectangle for a base / page-sized identity layer, or the (possibly rotated/scaled) image
+    /// quad for a transformed raster layer.
     fn select_active_layer_fully(&mut self) {
+        let Some(page) = self.stack.as_ref().map(LayerStack::size) else {
+            return;
+        };
+        // Text layers live outside the stack: use the primary-row text overlay's footprint directly.
+        if let Some(RowSel::Text(uid)) = &self.panel_primary {
+            // Collect the polygon before borrowing `self.selection` mutably (no overlapping borrows).
+            let polygon = self
+                .text_layers
+                .iter()
+                .find(|t| t.uid() == uid)
+                .map(PsTextLayer::footprint_polygon);
+            if let Some(polygon) = polygon {
+                let mut selection = Selection::empty(page[0], page[1]);
+                selection.set_polygon(&polygon);
+                self.selection = Some(selection);
+            }
+            return;
+        }
         let Some(stack) = self.stack.as_ref() else {
             return;
         };
-        let page = stack.size();
         let active = stack.active_id();
         let Some(layer) = stack.layer(active) else {
             return;
@@ -1469,9 +1504,26 @@ impl PsEditorTabState {
                         }
                         tree::LeafKind::Text(i) => {
                             let t = self.text_layers.get(*i);
+                            // Show a text preview (`Текст (preview)`) using the same logic as the typing
+                            // tab; fall back to the stored node name when the overlay has no text. The
+                            // `🅣` icon is added later in `draw_leaf_row`, so it is omitted here.
+                            let name = t.map_or_else(
+                                || "текст".into(),
+                                |t| {
+                                    let preview = crate::tabs::typing::text_preview_label(
+                                        &t.text_content,
+                                        PS_TEXT_PREVIEW_CHARS,
+                                    );
+                                    if preview.is_empty() {
+                                        t.name.clone()
+                                    } else {
+                                        format!("Текст ({preview})")
+                                    }
+                                },
+                            );
                             (
                                 t.map(|t| RowSel::Text(t.uid.clone())),
-                                t.map_or_else(|| "текст".into(), |t| t.name.clone()),
+                                name,
                                 t.is_some_and(|t| t.visible),
                                 false,
                             )
@@ -1577,6 +1629,12 @@ impl PsEditorTabState {
                 && let tree::LeafKind::Base(id) = leaf.kind
             {
                 actions.set_active_raster = Some(id);
+                // Base rows are not in `RowSel`, so they don't call `select_row` and would leave a
+                // STALE `panel_primary`. If it still held a `RowSel::Text`, `select_active_layer_fully`
+                // would draw that text overlay's marquee instead of the base layer's footprint. Clear
+                // it so the selection falls through to the stack/`active_id()` (base) path.
+                self.panel_primary = None;
+                actions.request_select_active = true;
             }
             return;
         };
@@ -1587,6 +1645,8 @@ impl PsEditorTabState {
             if let tree::LeafKind::Raster(id) = leaf.kind {
                 actions.set_active_raster = Some(id);
             }
+            // Cover raster AND text rows: show the clicked (primary) layer's marquee immediately.
+            actions.request_select_active = true;
         }
         // Right-click acts on the current multi-selection; if this row is not selected, select it.
         if resp.secondary_clicked() && !self.panel_selection.contains(&sel) {
@@ -1828,6 +1888,13 @@ impl PsEditorTabState {
             crate::trace_log!(cat::PS_EDITOR, "panel set_active_raster id={}", id);
             // Active selection is LOCAL-only (not a doc model field): keep it on the stack.
             stack.set_active(id);
+        }
+        // After the active layer/primary is updated (and the `&mut self.stack` borrow above is
+        // dropped), show the selected layer's marquee immediately. `select_active_layer_fully`
+        // borrows `self.stack`/`self.text_layers` and writes `self.selection`, so it must run
+        // OUTSIDE the `self.stack.as_mut()` scope.
+        if actions.request_select_active {
+            self.select_active_layer_fully();
         }
         if let Some(id) = actions.toggle_visible_raster
             && let (Some(page_idx), Some(uid)) = (page_idx, self.raster_uid(id))

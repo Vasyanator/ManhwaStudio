@@ -9305,7 +9305,9 @@ fn preview_char_budget(available_px: f32, char_px: f32) -> usize {
 ///   counted from the end of the prefix until the first non-dot char; then `max(0, 3 - count)` regular
 ///   dots are appended.
 /// - Empty (after trim) → `""` (the caller then shows just `Текст`, no parentheses).
-fn text_preview_label(text: &str, max_chars: usize) -> String {
+///
+/// Crate-visible so other tabs (e.g. the PS editor layers panel) reuse the SAME preview logic.
+pub(crate) fn text_preview_label(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim_start();
     if trimmed.is_empty() {
         return String::new();

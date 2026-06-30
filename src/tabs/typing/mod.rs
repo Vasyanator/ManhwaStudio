@@ -22,3 +22,5 @@ mod tab;
 
 pub use panel::{TypingPanelLayout, TypingTopPanelState};
 pub use tab::TypingTabState;
+// Re-export the shared text-preview helper so other tabs (PS editor) reuse the same logic.
+pub(crate) use tab::text_preview_label;

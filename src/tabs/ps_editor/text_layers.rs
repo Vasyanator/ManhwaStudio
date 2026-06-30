@@ -35,6 +35,9 @@ pub struct PsTextLayer {
     pub pinned: bool,
     /// The pin was set implicitly by PS grouping (vs. an explicit user pin).
     pub pinned_by_group: bool,
+    /// Raw text string of the overlay (from the node's `render_data.text_params.text`), used to build
+    /// a row preview label in the PS layers panel. Empty when the node carries no text.
+    pub text_content: String,
     image: ColorImage,
     transform: LayerTransform,
     /// Perspective/bend deformation grid in page pixels (`cols`×`rows` control points), when the
@@ -49,7 +52,8 @@ impl PsTextLayer {
     /// Builds a `PsTextLayer` directly from a `LayerDoc` Text node's projected fields. Pin / text-group
     /// (`layer_idx`) metadata is not carried by the doc node, so the caller supplies it (preserved from
     /// the prior projection or derived from the bands); `texture` is supplied so the GPU handle can be
-    /// reused across re-projections when the node's pixels are unchanged.
+    /// reused across re-projections when the node's pixels are unchanged. `text_content` is the overlay's
+    /// raw text (from the node's `render_data`), used to build the panel row preview; empty when absent.
     #[allow(clippy::too_many_arguments)]
     pub fn from_doc_node(
         uid: String,
@@ -59,6 +63,7 @@ impl PsTextLayer {
         group_uid: Option<String>,
         pinned: bool,
         pinned_by_group: bool,
+        text_content: String,
         image: ColorImage,
         transform: LayerTransform,
         deform: Option<DeformRec>,
@@ -72,6 +77,7 @@ impl PsTextLayer {
             group_uid,
             pinned,
             pinned_by_group,
+            text_content,
             image,
             transform,
             deform,
@@ -83,6 +89,8 @@ impl PsTextLayer {
     /// text node (pin / pinned_by_group / text-group `layer_idx` / unified `group_uid`). The image and
     /// geometry are placeholders, filled by the subsequent `sync_view_from_doc` projection from the doc
     /// (the source of truth). Used so PS gets pin metadata on page-load WITHOUT reading `text_info.json`.
+    /// `text_content` starts empty (render_data is not available on this skeletal path); the projection
+    /// fills it from the doc node.
     pub fn meta_from_node(
         uid: String,
         name: String,
@@ -99,6 +107,7 @@ impl PsTextLayer {
             group_uid,
             pinned,
             pinned_by_group,
+            text_content: String::new(),
             image: ColorImage::filled([1, 1], Color32::TRANSPARENT),
             transform: LayerTransform {
                 center: Vec2::ZERO,
@@ -198,6 +207,34 @@ impl PsTextLayer {
             place(size.x, size.y),
             place(0.0, size.y),
         ]
+    }
+
+    /// The overlay's page-space outline, used to build a canvas selection ("выделить слой полностью")
+    /// for a text layer. For a deformed overlay (perspective/bend) it returns the axis-aligned bbox over
+    /// the deform control points as a 4-point rectangle; otherwise the (possibly rotated/scaled) affine
+    /// image quad. Empty deform points fall back to the affine quad.
+    pub fn footprint_polygon(&self) -> Vec<(f32, f32)> {
+        if let Some(grid) = &self.deform
+            && !grid.points_px.is_empty()
+        {
+            let mut min_x = f32::INFINITY;
+            let mut min_y = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for p in &grid.points_px {
+                min_x = min_x.min(p[0]);
+                min_y = min_y.min(p[1]);
+                max_x = max_x.max(p[0]);
+                max_y = max_y.max(p[1]);
+            }
+            return vec![
+                (min_x, min_y),
+                (max_x, min_y),
+                (max_x, max_y),
+                (min_x, max_y),
+            ];
+        }
+        self.world_corners().iter().map(|p| (p.x, p.y)).collect()
     }
 
     /// Draws the overlay through the viewport, lazily uploading its texture. When a deform grid is

@@ -160,7 +160,10 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - The selection is shown as a thin black-and-white dashed marquee drawn from
   `Selection::outline_loops` (no translucent fill, never blue), matching the in-progress
   drag preview in `tools/select.rs`. "Выделить слой полностью" sets the selection to the active
-  layer's footprint (page rect for a base/page-sized layer, transformed quad polygon otherwise).
+  layer's footprint (page rect for a base/page-sized layer, transformed quad polygon otherwise);
+  when the panel's primary row is a TEXT layer (not in `LayerStack`) it uses that overlay's
+  `PsTextLayer::footprint_polygon` instead. Clicking any layer row also requests this selection so
+  the marquee follows the active/primary layer immediately.
 - The transform tool (`tools/transform.rs`) mutates only the active raster layer's `LayerTransform`
   (no pixels), so it needs **no** tile re-upload — `draw` re-evaluates the transform each frame.
   Base layers are not transformable (`Layer::is_transformable`).
