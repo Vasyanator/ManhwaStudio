@@ -18,13 +18,17 @@ CloakBrowser canvas fetch/intercept emits detailed JSON `log` events while inspe
 
 ## Files and submodules
 
+This package is now headless-only: the legacy PyQt6 "New project" UI (`window.py`,
+`downloaders.py`, `import_ops.py`, `save_ops.py`, `stitching.py`, `waifu2x.py`, the
+`batch_nodes_window/` node editor, and the `test_adv_fetch*` tests) was rewritten in Rust
+under `src/launcher/new_project/` and archived in `old_or_test/2.X/`. Only the browser-fetch
+daemons hosted in-process by the AI backend remain here.
+
+- `__init__.py`: import-light package init. It must NOT import any PyQt6/UI module, because the
+  AI backend imports `modules.new_project.adv_fetch_cli` and initializes this package first.
 - `adv_fetch_cli.py`: Selenium daemon for open-url, candidate fetch, link collection, canvas fetch, and canvas intercept commands.
 - `adv_fetch_cloak_cli.py`: CloakBrowser/Playwright daemon with the same Rust-facing command protocol, deep capture mode, and persistent `modules/browser_profiles/cloak_profile` profile.
-- `test_adv_fetch_cloak_cli.py`: unit tests for Cloak deep-capture ordering, blank detection, and duplicate-collapse contracts that do not require a browser.
-- `common.py`: shared helpers for URL/pattern handling used by new-project download flows.
-- `downloaders.py`: legacy PyQt-facing wrappers for downloader actions.
-- `batch_nodes_window/`: Python legacy batch-node UI/runtime retained for compatibility.
-- `window.py`: legacy Python new-project window.
+- `common.py`: shared helpers for URL/pattern handling used by the fetch daemons.
 
 ## Contracts and invariants
 
@@ -49,4 +53,4 @@ CloakBrowser canvas fetch/intercept emits detailed JSON `log` events while inspe
 
 - To change advanced browser image extraction, edit `adv_fetch_cli.py`.
 - To change wildcard/prefix matching shared by download flows, edit `common.py`.
-- To change legacy Python UI glue, edit `downloaders.py` or `window.py`.
+- The legacy Python "New project" UI now lives in Rust (`src/launcher/new_project/`); the old PyQt6 sources are archived under `old_or_test/2.X/modules/new_project/`.

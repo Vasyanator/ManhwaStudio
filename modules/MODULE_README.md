@@ -2,7 +2,11 @@
 
 ## Purpose
 
-Python support layer for the Rust application. Runtime Python code here backs launcher workflows, browser automation, downloaders, and AI/backend integrations that are not implemented directly in Rust.
+Python support layer for the Rust application. Runtime Python code here backs the AI backend and
+the browser automation it hosts. The legacy 2.x PyQt6 UI (and the non-Qt helpers that only served
+it — `model_manager_qt.py`, `psd_import.py`, `utils_qt.py`, `project.py`, `downloader.py`,
+`manhwa_merge.py`, `smart_hyphenate.py`, and the PyQt6 parts of `new_project/`) was rewritten in
+Rust and moved to `old_or_test/2.X/`; only headless backend/runtime code remains here.
 
 ## Architecture
 
@@ -12,9 +16,10 @@ Python modules may use local browser profiles, Selenium, CloakBrowser/Playwright
 
 ## Files and submodules
 
-- `new_project/`: helper modules for the launcher "New project" workflows, including browser-driven advanced download.
-- `downloader.py`: site-specific quick download helpers used by legacy and launcher flows.
+- `new_project/`: headless browser-fetch daemons (Selenium / CloakBrowser) hosted in-process by the AI backend; no UI here anymore.
 - `browser_f.py`: Selenium browser/profile construction and cookie/header transfer helpers.
+- `ai_device.py`: PyTorch/ONNX device selection helpers used by backend services.
+- `lama_mpe.py` / `ffc.py`: LaMa MPE inpainting runtime used by the backend.
 - `ai_backend/`: Python AI service runtime called by the Rust application.
 
 ## Contracts and invariants
@@ -27,5 +32,5 @@ Python modules may use local browser profiles, Selenium, CloakBrowser/Playwright
 ## Editing map
 
 - To change advanced browser fetching, see `new_project/adv_fetch_cli.py`.
-- To change supported direct downloader sites, see `downloader.py`.
 - To change browser construction, profiles, headers, or Selenium cookies, see `browser_f.py`.
+- To change AI inference services, see `ai_backend/`.
