@@ -101,7 +101,7 @@ use crate::tabs::typing::segmentation::Conservatism;
 use crate::tabs::typing::render_next::load_selected_font_from_path;
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::types::{
-    HorizontalAlign, InlineFontEntry, KerningMode, PxOrPercent, RenderedTextImage,
+    AntiAliasingMode, HorizontalAlign, InlineFontEntry, KerningMode, PxOrPercent, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -1784,6 +1784,7 @@ struct TypingCreatePanelState {
     formula_help_open: bool,
     text_shape: TextShape,
     text_wrap_mode: TextWrapMode,
+    anti_aliasing: AntiAliasingMode,
     allow_moderate_trees: bool,
     shape_min_width_percent: f32,
     shape_variant: u8,
@@ -2041,6 +2042,7 @@ impl TypingCreatePanelState {
             formula_help_open: false,
             text_shape: TextShape::Free,
             text_wrap_mode: TextWrapMode::Aggressive,
+            anti_aliasing: AntiAliasingMode::Strong,
             allow_moderate_trees: false,
             shape_min_width_percent: 50.0,
             shape_variant: 5,
@@ -2596,6 +2598,13 @@ impl TypingCreatePanelState {
                     TextWrapMode::Minimal => "minimal",
                     TextWrapMode::Moderate => "moderate",
                     TextWrapMode::Aggressive => "aggressive",
+                },
+                "anti_aliasing": match self.anti_aliasing {
+                    AntiAliasingMode::None => "none",
+                    AntiAliasingMode::Sharp => "sharp",
+                    AntiAliasingMode::Crisp => "crisp",
+                    AntiAliasingMode::Strong => "strong",
+                    AntiAliasingMode::Smooth => "smooth",
                 },
                 "allow_moderate_trees": self.allow_moderate_trees,
                 "text_shape": match self.text_shape {
@@ -4424,6 +4433,44 @@ impl TypingCreatePanelState {
             }
             if self.text_wrap_mode != prev_wrap_mode {
                 self.sync_wrap_mode_constraints();
+                *changed = true;
+            }
+
+            let prev_anti_aliasing = self.anti_aliasing;
+            let aa_combo = WheelComboBox::from_label("Сглаживание")
+                .selected_text(anti_aliasing_label(self.anti_aliasing))
+                .show_ui_with_wheel(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.anti_aliasing,
+                        AntiAliasingMode::None,
+                        anti_aliasing_label(AntiAliasingMode::None),
+                    );
+                    ui.selectable_value(
+                        &mut self.anti_aliasing,
+                        AntiAliasingMode::Sharp,
+                        anti_aliasing_label(AntiAliasingMode::Sharp),
+                    );
+                    ui.selectable_value(
+                        &mut self.anti_aliasing,
+                        AntiAliasingMode::Crisp,
+                        anti_aliasing_label(AntiAliasingMode::Crisp),
+                    );
+                    ui.selectable_value(
+                        &mut self.anti_aliasing,
+                        AntiAliasingMode::Strong,
+                        anti_aliasing_label(AntiAliasingMode::Strong),
+                    );
+                    ui.selectable_value(
+                        &mut self.anti_aliasing,
+                        AntiAliasingMode::Smooth,
+                        anti_aliasing_label(AntiAliasingMode::Smooth),
+                    );
+                });
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &aa_combo.inner.response);
+            if let Some(steps) = aa_combo.wheel_steps {
+                *changed |= cycle_anti_aliasing(&mut self.anti_aliasing, steps);
+            }
+            if self.anti_aliasing != prev_anti_aliasing {
                 *changed = true;
             }
             let moderate_trees_resp = ui.add_enabled(
@@ -6444,6 +6491,50 @@ impl TypingCreatePanelState {
                                             self.sync_wrap_mode_constraints();
                                             changed = true;
                                         }
+
+                                        let prev_anti_aliasing = self.anti_aliasing;
+                                        let aa_combo = WheelComboBox::from_label("Сглаживание")
+                                            .selected_text(anti_aliasing_label(self.anti_aliasing))
+                                            .show_ui_with_wheel(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.anti_aliasing,
+                                                    AntiAliasingMode::None,
+                                                    anti_aliasing_label(AntiAliasingMode::None),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.anti_aliasing,
+                                                    AntiAliasingMode::Sharp,
+                                                    anti_aliasing_label(AntiAliasingMode::Sharp),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.anti_aliasing,
+                                                    AntiAliasingMode::Crisp,
+                                                    anti_aliasing_label(AntiAliasingMode::Crisp),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.anti_aliasing,
+                                                    AntiAliasingMode::Strong,
+                                                    anti_aliasing_label(AntiAliasingMode::Strong),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.anti_aliasing,
+                                                    AntiAliasingMode::Smooth,
+                                                    anti_aliasing_label(AntiAliasingMode::Smooth),
+                                                );
+                                            });
+                                        mark_hscroll_block_on_hover(
+                                            &mut block_hscroll_by_hovered_param,
+                                            &aa_combo.inner.response,
+                                        );
+                                        if let Some(steps) = aa_combo.wheel_steps {
+                                            changed |= cycle_anti_aliasing(
+                                                &mut self.anti_aliasing,
+                                                steps,
+                                            );
+                                        }
+                                        if self.anti_aliasing != prev_anti_aliasing {
+                                            changed = true;
+                                        }
                                         let moderate_trees_resp = ui.add_enabled(
                                             self.moderate_trees_checkbox_enabled(),
                                             egui::Checkbox::new(
@@ -7292,6 +7383,13 @@ impl TypingCreatePanelState {
         {
             self.text_wrap_mode = wrap_mode;
         }
+        if let Some(anti_aliasing) = text_params_obj
+            .get("anti_aliasing")
+            .and_then(Value::as_str)
+            .and_then(parse_anti_aliasing_str)
+        {
+            self.anti_aliasing = anti_aliasing;
+        }
         // Сформированный текст (если был применён «продвинутый» перенос).
         // Разворачиваем сформированный, если он есть, иначе исходный.
         self.formed_text = text_params_obj
@@ -7558,6 +7656,7 @@ impl TypingCreatePanelState {
             compare_shape_with: None,
             allow_moderate_trees: self.allow_moderate_trees,
             effects_json: self.effects_json(),
+            anti_aliasing: self.anti_aliasing,
         })
     }
 
@@ -10479,6 +10578,30 @@ fn cycle_text_wrap_mode(mode: &mut TextWrapMode, steps: i32) -> bool {
     true
 }
 
+/// Wheel-step the anti-aliasing mode in enum order
+/// (None, Sharp, Crisp, Strong, Smooth). Returns `true` when the value changed.
+fn cycle_anti_aliasing(mode: &mut AntiAliasingMode, steps: i32) -> bool {
+    let mut idx = match *mode {
+        AntiAliasingMode::None => 0,
+        AntiAliasingMode::Sharp => 1,
+        AntiAliasingMode::Crisp => 2,
+        AntiAliasingMode::Strong => 3,
+        AntiAliasingMode::Smooth => 4,
+    };
+    if !cycle_wrapped_index(&mut idx, 5, steps) {
+        return false;
+    }
+
+    *mode = match idx {
+        0 => AntiAliasingMode::None,
+        1 => AntiAliasingMode::Sharp,
+        2 => AntiAliasingMode::Crisp,
+        3 => AntiAliasingMode::Strong,
+        _ => AntiAliasingMode::Smooth,
+    };
+    true
+}
+
 fn cycle_text_line_mode(mode: &mut TextLineMode, steps: i32) -> bool {
     let mut idx = match *mode {
         TextLineMode::Horizontal => 0,
@@ -10576,6 +10699,30 @@ fn text_wrap_mode_label(mode: TextWrapMode) -> &'static str {
         TextWrapMode::Minimal => "Минимальный перенос",
         TextWrapMode::Moderate => "Умеренный перенос",
         TextWrapMode::Aggressive => "Активный перенос",
+    }
+}
+
+/// Parse the persisted anti-aliasing token
+/// (`none`/`sharp`/`crisp`/`strong`/`smooth`). Returns `None` for unknown text.
+fn parse_anti_aliasing_str(raw: &str) -> Option<AntiAliasingMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(AntiAliasingMode::None),
+        "sharp" => Some(AntiAliasingMode::Sharp),
+        "crisp" => Some(AntiAliasingMode::Crisp),
+        "strong" => Some(AntiAliasingMode::Strong),
+        "smooth" => Some(AntiAliasingMode::Smooth),
+        _ => None,
+    }
+}
+
+/// Russian UI label for an anti-aliasing mode.
+fn anti_aliasing_label(mode: AntiAliasingMode) -> &'static str {
+    match mode {
+        AntiAliasingMode::None => "Без сглаживания",
+        AntiAliasingMode::Sharp => "Резкое",
+        AntiAliasingMode::Crisp => "Чёткое",
+        AntiAliasingMode::Strong => "Насыщенное",
+        AntiAliasingMode::Smooth => "Плавное",
     }
 }
 

@@ -266,10 +266,11 @@ Before changing source code, use this order:
 
 ## 4. Version Control
 
-This repository uses **Mercurial (`hg`)**, not Git.
+This repository uses **Git**.
 
-* Before broad changes, check the working copy state with `hg status`.
+* Before broad changes, check the working copy state with `git status`.
 * Do not revert other people's changes without a direct user request.
+* Commit or push only when the user asks; if on the default branch, branch first.
 * If no repository metadata is present, do not initialize a repository on your own; just work with the files.
 
 ---

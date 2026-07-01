@@ -73,7 +73,7 @@ use super::panel::{
 };
 use super::render_next::{apply_effects_to_image, render_text_to_image};
 use super::render_next::types::{
-    HorizontalAlign, KerningMode, PxOrPercent, TEXT_FORMULA_USER_VAR_COUNT,
+    AntiAliasingMode, HorizontalAlign, KerningMode, PxOrPercent, TEXT_FORMULA_USER_VAR_COUNT,
     TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
     TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -12343,6 +12343,11 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
             text_params.get("vector_lines_layout"),
         ),
         effects_json,
+        anti_aliasing: text_params
+            .get("anti_aliasing")
+            .and_then(Value::as_str)
+            .and_then(parse_anti_aliasing_config_str)
+            .unwrap_or(AntiAliasingMode::Strong),
     })
 }
 
@@ -12627,6 +12632,18 @@ fn text_wrap_mode_to_config_str(mode: TextWrapMode) -> &'static str {
         TextWrapMode::Minimal => "minimal",
         TextWrapMode::Moderate => "moderate",
         TextWrapMode::Aggressive => "aggressive",
+    }
+}
+
+/// Parse a persisted anti-aliasing token; `None` for unknown text.
+fn parse_anti_aliasing_config_str(raw: &str) -> Option<AntiAliasingMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(AntiAliasingMode::None),
+        "sharp" => Some(AntiAliasingMode::Sharp),
+        "crisp" => Some(AntiAliasingMode::Crisp),
+        "strong" => Some(AntiAliasingMode::Strong),
+        "smooth" => Some(AntiAliasingMode::Smooth),
+        _ => None,
     }
 }
 
@@ -15792,6 +15809,7 @@ mod tests {
             drawn_lines_layout: TextDrawnLinesLayoutParams::default(),
             vector_lines_layout: TextVectorLinesLayoutParams::default(),
             effects_json: String::new(),
+            anti_aliasing: AntiAliasingMode::Strong,
         }
     }
 

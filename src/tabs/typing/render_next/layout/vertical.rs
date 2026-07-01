@@ -42,7 +42,9 @@ use crate::tabs::typing::render_next::raster::{
 use crate::tabs::typing::render_next::types::{
     RenderedTextImage, TextRenderParams, VerticalLineDirection,
 };
-use crate::tabs::typing::render_next::vector::{OutlineCache, rasterize_outline_into};
+use crate::tabs::typing::render_next::vector::{
+    OutlineCache, build_aa_lut, rasterize_outline_into,
+};
 use cosmic_text::{Buffer, FontSystem, LayoutGlyph, SwashCache};
 
 const OPTICAL_ALPHA_THRESHOLD: u8 = 24;
@@ -204,6 +206,8 @@ pub(crate) fn render_vertical_text(
     // Per-render outline cache: vertical cells rasterize the true font outline
     // (mirroring the horizontal/on-path paths) instead of the swash bitmap.
     let mut outline_cache = OutlineCache::new();
+    // Coverage->alpha transfer table for the selected AA mode, built once per render.
+    let aa_lut = build_aa_lut(params.anti_aliasing);
 
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
@@ -274,6 +278,7 @@ pub(crate) fn render_vertical_text(
                     &outline,
                     &transform,
                     *text_color,
+                    &aa_lut,
                 );
                 continue;
             }

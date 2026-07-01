@@ -77,7 +77,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   themselves are produced by `vector::glyph_contour_from_outline`.
 - `vector.rs`: vector-glyph layer for the `VECTOR_ENGINE_REFACTOR.md` move — swash
   outline extraction/flattening + cache, the single zeno coverage-mask rasterizer
-  (monochrome tint contract + `blend_pixel_over`), and `Outline`->`GlyphContour`
+  (monochrome tint contract + `blend_pixel_over`), the anti-aliasing coverage->alpha
+  transfer table (`build_aa_lut`, applied inside `rasterize_outline_into` before the
+  tint multiply), and `Outline`->`GlyphContour`
   conversion. Wired into the on-path / formula / custom-line composite pass
   (`formula/render.rs`), the horizontal path (`pipeline.rs`, including the
   inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
@@ -96,6 +98,13 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `TextRenderParams` is the only caller-facing input contract. When adding a field or
   enum variant, update `types.rs`, parser/serialization call sites in the parent
   `typing` module, the smoke anchor in `mod.rs`, and focused tests.
+- `TextRenderParams.anti_aliasing` (`AntiAliasingMode`) selects a coverage->alpha
+  transfer curve applied by the monochrome outline rasterizer only; it does NOT
+  affect layout, so it is intentionally excluded from `TextRenderShapeCompareParams`.
+  Each render builds the LUT once via `vector::build_aa_lut` next to its
+  `OutlineCache` and passes it into every `rasterize_outline_into` call.
+  `AntiAliasingMode::Smooth` is the identity table (byte-identical to the pre-AA
+  renderer). The color-glyph bitmap fallback path does not go through the LUT.
 - `RenderedTextImage.rgba` must always be `width * height * 4` bytes in unmultiplied
   RGBA order. Empty/transparent output must still use valid dimensions where possible.
 - Public renderer errors are `Result<_, String>` because callers surface them directly

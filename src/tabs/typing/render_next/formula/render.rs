@@ -50,7 +50,7 @@ use crate::tabs::typing::render_next::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance,
 };
 use crate::tabs::typing::render_next::vector::{
-    Outline, OutlineCache, glyph_contour_from_outline, rasterize_outline_into,
+    Outline, OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
 };
 use crate::tabs::typing::render_next::inline_styles::{
     InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
@@ -414,6 +414,8 @@ fn render_text_with_drawn_lines_layout_once(
     // (via the transforms below) and the composite pass so each glyph is
     // extracted at most once per render.
     let mut outline_cache = OutlineCache::new();
+    // Coverage->alpha transfer table for the selected AA mode, built once per render.
+    let aa_lut = build_aa_lut(params.anti_aliasing);
     let transforms = build_drawn_line_transforms(
         params,
         seeds.as_slice(),
@@ -569,6 +571,7 @@ fn render_text_with_drawn_lines_layout_once(
                 &outline,
                 &glyph_transform,
                 seed.text_color,
+                &aa_lut,
             );
             continue;
         }
@@ -1459,6 +1462,8 @@ fn render_text_with_formula_layout_once(
     // Per-render outline cache for the vector composite pass (color glyphs fall
     // back to the bitmap blit, so they are never extracted here).
     let mut outline_cache = OutlineCache::new();
+    // Coverage->alpha transfer table for the selected AA mode, built once per render.
+    let aa_lut = build_aa_lut(params.anti_aliasing);
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
     let default_extra_line_spacing_px = line_extra_spacing_table.first().copied().unwrap_or(0.0);
@@ -1676,6 +1681,7 @@ fn render_text_with_formula_layout_once(
                 &outline,
                 &glyph_transform,
                 seed.text_color,
+                &aa_lut,
             );
             continue;
         }

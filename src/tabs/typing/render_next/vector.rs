@@ -39,6 +39,7 @@ correct. Parity with swash's own bottom-left-origin bitmap is verified by
 
 use super::glyph_contour::{GlyphContour, PlacedContour};
 use super::raster::blend_pixel_over;
+use super::types::AntiAliasingMode;
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeno::{Command, Fill, Format, Mask, Vector};
@@ -495,6 +496,62 @@ fn point_line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     ((p[0] - a[0]) * aby - (p[1] - a[1]) * abx).abs() / len
 }
 
+/// Contrast gain applied to coverage around the mid value for `Crisp`.
+const AA_CRISP_GAIN: f32 = 1.6;
+/// Contrast gain applied to coverage around the mid value for `Sharp`.
+const AA_SHARP_GAIN: f32 = 2.6;
+/// Contrast gain applied to coverage around the mid value for `Strong`.
+const AA_STRONG_GAIN: f32 = 1.4;
+/// Additive bias (in coverage fraction) applied by `Strong`; lifts mid values so
+/// edges look denser without a hard threshold.
+const AA_STRONG_BIAS: f32 = 0.12;
+
+/// Apply a symmetric contrast transfer to a normalized coverage value.
+///
+/// `c` is coverage in `0.0..=1.0`. The curve pivots around 0.5:
+/// `((c - 0.5) * gain + 0.5 + bias)` clamped back to `0.0..=1.0`. A `gain > 1`
+/// steepens the edge; `bias > 0` lifts every value (denser ink).
+#[must_use]
+fn aa_contrast(c: f32, gain: f32, bias: f32) -> f32 {
+    ((c - 0.5) * gain + 0.5 + bias).clamp(0.0, 1.0)
+}
+
+/// Build the 256-entry coverage->alpha transfer lookup table for an AA mode.
+///
+/// The input index is a raw zeno coverage byte; the output is the transferred
+/// coverage byte fed to the tint multiply. `Smooth` is the exact identity table
+/// (`lut[i] == i`), guaranteeing byte-identical output to the pre-AA renderer;
+/// `None` is a hard threshold at coverage 0.5 (byte 128). Every table is
+/// monotonic non-decreasing with `lut[0] == 0`.
+#[must_use]
+pub(crate) fn build_aa_lut(mode: AntiAliasingMode) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        // `i` is 0..=255, so the truncating cast to u8 is exact.
+        let c = i as f32 / 255.0;
+        let transferred = match mode {
+            // Identity: preserve the exact byte so Smooth is a regression anchor.
+            AntiAliasingMode::Smooth => {
+                *slot = i as u8;
+                continue;
+            }
+            AntiAliasingMode::Crisp => aa_contrast(c, AA_CRISP_GAIN, 0.0),
+            AntiAliasingMode::Sharp => aa_contrast(c, AA_SHARP_GAIN, 0.0),
+            AntiAliasingMode::Strong => aa_contrast(c, AA_STRONG_GAIN, AA_STRONG_BIAS),
+            AntiAliasingMode::None => {
+                if c >= 0.5 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        };
+        // Round the transferred fraction back to a coverage byte.
+        *slot = (transferred * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    lut
+}
+
 /// Rasterize a transformed glyph outline into a straight-alpha RGBA8 canvas.
 ///
 /// Coordinate flow: each glyph-local subpath point is transformed to world
@@ -505,15 +562,21 @@ fn point_line_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 /// coverage mask with zeno over the integer bounding box of the path (clamped to
 /// the canvas), preserving sub-pixel AA (path points are not rounded).
 ///
+/// Anti-aliasing contract: each raw zeno coverage byte is first mapped through
+/// `aa_lut` (a coverage->alpha transfer table from `build_aa_lut`) BEFORE the tint
+/// multiply. Passing an identity table (`AntiAliasingMode::Smooth`) reproduces the
+/// pre-AA coverage byte-for-byte. This applies only to monochrome outline glyphs;
+/// the color-glyph bitmap fallback path does not go through this rasterizer.
+///
 /// Tint contract (doc 4.1, monochrome case): output RGB is replaced by
-/// `color[0..3]`; output alpha is `coverage * color[3] / 255`. Each covered
-/// pixel is composited with `raster::blend_pixel_over`.
+/// `color[0..3]`; output alpha is `transferred_coverage * color[3] / 255`. Each
+/// covered pixel is composited with `raster::blend_pixel_over`.
 ///
 /// `canvas` must be at least `canvas_w * canvas_h * 4` bytes; a shorter buffer
 /// is a no-op. Never panics and never indexes out of range for transforms that
 /// push the glyph partly or fully off-canvas (such pixels are clipped).
 // The rasterizer call site naturally carries canvas target, origin, outline,
-// transform and tint; splitting them would obscure the mapping.
+// transform, tint and the AA transfer table; splitting them would obscure the mapping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_outline_into(
     canvas: &mut [u8],
@@ -524,6 +587,7 @@ pub(crate) fn rasterize_outline_into(
     outline: &Outline,
     transform: &GlyphTransform,
     color: [u8; 4],
+    aa_lut: &[u8; 256],
 ) {
     if canvas_w == 0 || canvas_h == 0 {
         return;
@@ -613,7 +677,8 @@ pub(crate) fn rasterize_outline_into(
     for my in 0..mask_h {
         let canvas_y = win_min_y + my;
         for mx in 0..mask_w {
-            let cov = coverage[my * mask_w + mx];
+            // Map raw coverage through the AA transfer table before tinting.
+            let cov = aa_lut[usize::from(coverage[my * mask_w + mx])];
             if cov == 0 {
                 continue;
             }
@@ -746,6 +811,13 @@ fn douglas_peucker(points: &[[f32; 2]], tolerance: f32) -> Vec<[f32; 2]> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Identity coverage table used by the geometry/parity tests so they keep
+    /// asserting the raw (pre-AA) coverage the rasterizer produced before the
+    /// anti-aliasing transfer was introduced.
+    fn identity_lut() -> [u8; 256] {
+        build_aa_lut(AntiAliasingMode::Smooth)
+    }
 
     /// Load the shared Latin+Cyrillic test face bytes.
     fn load_test_font_bytes() -> Vec<u8> {
@@ -946,6 +1018,7 @@ mod tests {
             &outline,
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
+            &identity_lut(),
         );
 
         // Extract our alpha channel and compare to the reference alpha.
@@ -985,6 +1058,7 @@ mod tests {
             &outline,
             &GlyphTransform::identity(),
             [200, 30, 30, 255],
+            &identity_lut(),
         );
         let mut covered = 0usize;
         for px in canvas_full.chunks_exact(4) {
@@ -1006,6 +1080,7 @@ mod tests {
             &outline,
             &GlyphTransform::identity(),
             [200, 30, 30, 128],
+            &identity_lut(),
         );
         for (full, half) in canvas_full.chunks_exact(4).zip(canvas_half.chunks_exact(4)) {
             let expected = (f32::from(full[3]) * (128.0 / 255.0)).round() as i32;
@@ -1040,6 +1115,7 @@ mod tests {
             &outline,
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
+            &identity_lut(),
         );
         let (idw, idh) = alpha_bbox_dims(&c_id, big, big);
 
@@ -1061,6 +1137,7 @@ mod tests {
             &outline,
             &rot,
             [255, 255, 255, 255],
+            &identity_lut(),
         );
         let (rw, rh) = alpha_bbox_dims(&c_rot, big, big);
 
@@ -1091,6 +1168,7 @@ mod tests {
             &outline,
             &far,
             [255, 255, 255, 255],
+            &identity_lut(),
         );
         assert_eq!(c_off, expected, "off-canvas render must leave the buffer intact");
     }
@@ -1173,6 +1251,7 @@ mod tests {
                     scale: [1.0, 1.0],
                 },
                 [255, 255, 255, 255],
+                &identity_lut(),
             );
             alpha_centroid(&canvas, w, h).expect("non-empty render")
         };
@@ -1251,5 +1330,86 @@ mod tests {
         assert!(cache.get_or_extract(space_key, &font, space, 64.0).is_none());
         assert!(cache.get_or_extract(space_key, &font, space, 64.0).is_none());
         assert_eq!(cache.len(), 2);
+    }
+
+    /// Every AA table must start at 0 and be monotonic non-decreasing.
+    fn assert_lut_monotonic(lut: &[u8; 256]) {
+        assert_eq!(lut[0], 0, "lut[0] must be 0");
+        for i in 1..256 {
+            assert!(
+                lut[i] >= lut[i - 1],
+                "lut must be non-decreasing at {i}: {} < {}",
+                lut[i],
+                lut[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn aa_lut_smooth_is_identity() {
+        let lut = build_aa_lut(AntiAliasingMode::Smooth);
+        for (i, &v) in lut.iter().enumerate() {
+            assert_eq!(usize::from(v), i, "Smooth must be identity at {i}");
+        }
+    }
+
+    #[test]
+    fn aa_lut_none_is_step_at_128() {
+        let lut = build_aa_lut(AntiAliasingMode::None);
+        // c = i/255 >= 0.5 <=> i >= 127.5 <=> i >= 128.
+        for (i, &v) in lut.iter().enumerate() {
+            let expected = if i >= 128 { 255 } else { 0 };
+            assert_eq!(u32::from(v), expected, "None threshold wrong at {i}");
+        }
+    }
+
+    #[test]
+    fn aa_lut_sharpness_ordering_around_mid() {
+        let smooth = build_aa_lut(AntiAliasingMode::Smooth);
+        let crisp = build_aa_lut(AntiAliasingMode::Crisp);
+        let sharp = build_aa_lut(AntiAliasingMode::Sharp);
+        // Above the mid point a steeper curve lifts coverage higher: at index 160
+        // Sharp > Crisp > Smooth.
+        assert!(
+            sharp[160] > crisp[160],
+            "Sharp {} should exceed Crisp {} at 160",
+            sharp[160],
+            crisp[160]
+        );
+        assert!(
+            crisp[160] > smooth[160],
+            "Crisp {} should exceed Smooth {} at 160",
+            crisp[160],
+            smooth[160]
+        );
+        // Below the mid point the steeper curve is darker (pushes toward 0).
+        assert!(sharp[96] < crisp[96], "Sharp should be darker below mid");
+        assert!(crisp[96] < smooth[96], "Crisp should be darker below mid");
+    }
+
+    #[test]
+    fn aa_lut_strong_lifts_mid_above_crisp() {
+        let crisp = build_aa_lut(AntiAliasingMode::Crisp);
+        let strong = build_aa_lut(AntiAliasingMode::Strong);
+        // The additive bias makes Strong denser than Crisp at the exact mid byte.
+        assert!(
+            strong[128] > crisp[128],
+            "Strong bias should lift mid: strong {} vs crisp {}",
+            strong[128],
+            crisp[128]
+        );
+    }
+
+    #[test]
+    fn aa_lut_all_monotonic_and_zero_origin() {
+        for mode in [
+            AntiAliasingMode::None,
+            AntiAliasingMode::Sharp,
+            AntiAliasingMode::Crisp,
+            AntiAliasingMode::Strong,
+            AntiAliasingMode::Smooth,
+        ] {
+            assert_lut_monotonic(&build_aa_lut(mode));
+        }
     }
 }

@@ -62,7 +62,7 @@ use std::process::ExitCode;
 
 use tabs::typing::render_next::render_text_to_image;
 use tabs::typing::render_next::types::{
-    HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
+    AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
     TextVectorLine, TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
     TextVectorPoint, TextWrapMode, VerticalLineDirection,
@@ -120,6 +120,21 @@ fn base_params() -> TextRenderParams {
         drawn_lines_layout: TextDrawnLinesLayoutParams::default(),
         vector_lines_layout: TextVectorLinesLayoutParams::default(),
         effects_json: String::new(),
+        // Mirror the panel default so the golden output matches the app.
+        anti_aliasing: AntiAliasingMode::Strong,
+    }
+}
+
+/// Parse an AA mode name (`none`/`sharp`/`crisp`/`strong`/`smooth`) for the
+/// optional second CLI argument. Returns `None` for an unknown name.
+fn parse_aa_mode(raw: &str) -> Option<AntiAliasingMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(AntiAliasingMode::None),
+        "sharp" => Some(AntiAliasingMode::Sharp),
+        "crisp" => Some(AntiAliasingMode::Crisp),
+        "strong" => Some(AntiAliasingMode::Strong),
+        "smooth" => Some(AntiAliasingMode::Smooth),
+        _ => None,
     }
 }
 
@@ -327,8 +342,21 @@ fn rgba_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> Result<DiffStats, S
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(outdir) = args.next() else {
-        eprintln!("usage: render_gallery <output_dir>");
+        eprintln!("usage: render_gallery <output_dir> [aa_mode]");
         return ExitCode::FAILURE;
+    };
+    // Optional second arg selects the AA mode; default mirrors the panel default.
+    let aa_mode = match args.next() {
+        Some(name) => match parse_aa_mode(&name) {
+            Some(mode) => mode,
+            None => {
+                eprintln!(
+                    "unknown aa_mode {name:?}; expected none|sharp|crisp|strong|smooth"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => AntiAliasingMode::Strong,
     };
     let outdir = PathBuf::from(outdir);
     if let Err(err) = std::fs::create_dir_all(&outdir) {
@@ -336,7 +364,10 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let cases = all_cases();
+    let mut cases = all_cases();
+    for case in &mut cases {
+        case.params.anti_aliasing = aa_mode;
+    }
     let mut ok = 0usize;
     let mut failed = 0usize;
     for case in &cases {

@@ -49,7 +49,7 @@ use super::raster::{
     include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
     trim_rendered_image_to_alpha_bounds,
 };
-use super::vector::{Outline, OutlineCache, rasterize_outline_into};
+use super::vector::{Outline, OutlineCache, build_aa_lut, rasterize_outline_into};
 use super::types::{
     HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
     TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
@@ -805,6 +805,8 @@ pub fn render_text_to_image(
     // Per-render outline cache shared across the draw pass; extracts each glyph
     // outline at most once and is unused by the bounds pass above.
     let mut outline_cache = OutlineCache::new();
+    // Coverage->alpha transfer table for the selected AA mode, built once per render.
+    let aa_lut = build_aa_lut(params.anti_aliasing);
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
@@ -874,6 +876,7 @@ pub fn render_text_to_image(
                 glyph_text_color,
                 x_offset,
                 y_offset,
+                &aa_lut,
             );
         }
 
@@ -937,6 +940,7 @@ pub fn render_text_to_image(
                 hyphen_text_color,
                 x_offset,
                 y_offset,
+                &aa_lut,
             );
         }
         line_idx += 1;
@@ -963,9 +967,10 @@ pub fn render_text_to_image(
 /// `pos_x`/`pos_y` are the glyph pen position in layout pixels (already carrying
 /// the inline glyph offset). Color/emoji glyphs have no monochrome outline and
 /// keep the bitmap blit (identity or center-scaled); ordinary empty glyphs
-/// (zero-size placement) draw nothing.
+/// (zero-size placement) draw nothing. `aa_lut` is the coverage->alpha transfer
+/// table applied only on the outline path; the bitmap fallback is unaffected.
 // The blit call site naturally carries the raster target, glyph, pen position,
-// scale, color and canvas offsets; bundling them would obscure the mapping.
+// scale, color, canvas offsets and the AA table; bundling them would obscure the mapping.
 #[allow(clippy::too_many_arguments)]
 fn draw_horizontal_glyph(
     rgba: &mut [u8],
@@ -981,6 +986,7 @@ fn draw_horizontal_glyph(
     text_color: [u8; 4],
     x_offset: i32,
     y_offset: i32,
+    aa_lut: &[u8; 256],
 ) {
     let physical = glyph.physical((pos_x, pos_y), 1.0);
     let Some(image) = cache.get_image(font_system, physical.cache_key) else {
@@ -1026,6 +1032,7 @@ fn draw_horizontal_glyph(
             &outline,
             &transform,
             text_color,
+            aa_lut,
         );
         return;
     }
@@ -1211,6 +1218,8 @@ fn render_horizontal_rotated(
     let mut cache = SwashCache::new();
     // Per-render outline cache: each glyph outline is extracted at most once.
     let mut outline_cache = OutlineCache::new();
+    // Coverage->alpha transfer table for the selected AA mode, built once per render.
+    let aa_lut = build_aa_lut(params.anti_aliasing);
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
     let inline_line_aligns =
         compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
@@ -1423,6 +1432,7 @@ fn render_horizontal_rotated(
                 outline,
                 &transform,
                 placement.text_color,
+                &aa_lut,
             );
             continue;
         }
@@ -2193,10 +2203,11 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
 mod tests {
     use super::{apply_effects_to_image, render_text_to_image};
     use crate::tabs::typing::render_next::types::{
-        HorizontalAlign, KerningMode, TextDrawnLinesLayoutParams, TextFormulaLayoutParams,
-        TextLayoutMode, TextLineMode, TextRenderParams, TextRenderShapeCompareParams, TextShape,
-        TextVectorLine, TextVectorLineDistanceMode, TextVectorLineTextDirection,
-        TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode, VerticalLineDirection,
+        AntiAliasingMode, HorizontalAlign, KerningMode, TextDrawnLinesLayoutParams,
+        TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
+        TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
+        TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
+        VerticalLineDirection,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2244,6 +2255,9 @@ mod tests {
             drawn_lines_layout: TextDrawnLinesLayoutParams::default(),
             vector_lines_layout: TextVectorLinesLayoutParams::default(),
             effects_json: String::new(),
+            // Identity transfer so existing raster/geometry assertions in these
+            // tests keep matching the pre-AA coverage exactly.
+            anti_aliasing: AntiAliasingMode::Smooth,
         }
     }
 

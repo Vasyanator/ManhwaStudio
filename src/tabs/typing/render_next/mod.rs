@@ -61,6 +61,7 @@ const _: usize = std::mem::size_of::<types::TextRenderParams>()
     + std::mem::size_of::<types::TextVectorLinesLayoutParams>()
     + std::mem::size_of::<types::TextVectorLine>()
     + std::mem::size_of::<types::TextVectorPoint>()
+    + std::mem::size_of::<types::AntiAliasingMode>()
     + types::TEXT_FORMULA_USER_VAR_COUNT;
 
 const _: fn(&types::TextRenderParams) -> Result<types::RenderedTextImage, String> =
@@ -107,8 +108,18 @@ const _: fn(&glyph_contour::PlacedContour, &glyph_contour::PlacedContour) -> f32
 // at runtime. See `vector.rs` and `VECTOR_ENGINE_REFACTOR.md`.
 const _: fn(&swash::FontRef, u16, f32) -> Option<vector::Outline> = vector::extract_glyph_outline;
 #[allow(clippy::type_complexity)]
-const _: fn(&mut [u8], usize, usize, f32, f32, &vector::Outline, &vector::GlyphTransform, [u8; 4]) =
-    vector::rasterize_outline_into;
+const _: fn(
+    &mut [u8],
+    usize,
+    usize,
+    f32,
+    f32,
+    &vector::Outline,
+    &vector::GlyphTransform,
+    [u8; 4],
+    &[u8; 256],
+) = vector::rasterize_outline_into;
+const _: fn(types::AntiAliasingMode) -> [u8; 256] = vector::build_aa_lut;
 const _: fn(&vector::Outline, f32) -> glyph_contour::GlyphContour =
     vector::glyph_contour_from_outline;
 const _: fn() -> vector::OutlineCache = vector::OutlineCache::new;
@@ -174,6 +185,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         drawn_lines_layout: types::TextDrawnLinesLayoutParams::default(),
         vector_lines_layout: types::TextVectorLinesLayoutParams::default(),
         effects_json: String::new(),
+        anti_aliasing: types::AntiAliasingMode::Strong,
     };
 
     let image = match pipeline::smoke_render_text_to_image(&params) {
@@ -218,6 +230,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         &params.drawn_lines_layout,
         &params.vector_lines_layout,
         &params.effects_json,
+        params.anti_aliasing,
     ));
     std::hint::black_box((
         &inline_font.label,
@@ -278,6 +291,13 @@ pub(crate) fn touch_runtime_smoke_contract() {
         types::TextLayoutMode::CustomRasterLines,
         types::TextLayoutMode::CustomVectorLines,
     ]);
+    std::hint::black_box([
+        types::AntiAliasingMode::None,
+        types::AntiAliasingMode::Sharp,
+        types::AntiAliasingMode::Crisp,
+        types::AntiAliasingMode::Strong,
+        types::AntiAliasingMode::Smooth,
+    ]);
     std::hint::black_box((
         &params.drawn_lines_layout.image_path,
         params.drawn_lines_layout.use_tangent_rotation,
@@ -307,9 +327,10 @@ mod tests {
         pipeline::smoke_render_text_to_image,
         touch_runtime_smoke_contract,
         types::{
-            HorizontalAlign, InlineFontEntry, KerningMode, TextDrawnLinesLayoutParams,
-            TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
-            TextVectorLinesLayoutParams, TextWrapMode, VerticalLineDirection,
+            AntiAliasingMode, HorizontalAlign, InlineFontEntry, KerningMode,
+            TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
+            TextRenderParams, TextShape, TextVectorLinesLayoutParams, TextWrapMode,
+            VerticalLineDirection,
         },
     };
     use std::path::PathBuf;
@@ -358,6 +379,7 @@ mod tests {
             drawn_lines_layout: TextDrawnLinesLayoutParams::default(),
             vector_lines_layout: TextVectorLinesLayoutParams::default(),
             effects_json: String::new(),
+            anti_aliasing: AntiAliasingMode::Strong,
         };
 
         let image = match smoke_render_text_to_image(&params) {

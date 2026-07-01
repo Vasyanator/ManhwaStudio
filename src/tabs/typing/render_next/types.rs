@@ -26,6 +26,7 @@ Source compatibility:
 - `TextVectorLinesLayoutParams`
 - `TextVectorLineTextDirection`
 - `TextVectorLineDistanceMode`
+- `AntiAliasingMode`
 - `TEXT_FORMULA_USER_VAR_COUNT`
 */
 
@@ -244,6 +245,9 @@ pub struct TextRenderParams {
     pub drawn_lines_layout: TextDrawnLinesLayoutParams,
     pub vector_lines_layout: TextVectorLinesLayoutParams,
     pub effects_json: String,
+    /// Glyph edge anti-aliasing mode. Does not affect layout, only the
+    /// coverage->alpha transfer curve applied by the outline rasterizer.
+    pub anti_aliasing: AntiAliasingMode,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +407,17 @@ pub enum TextWrapMode {
     Minimal,
     Moderate,
     Aggressive,
+}
+
+/// Glyph edge anti-aliasing style applied as a coverage->alpha transfer curve
+/// in the outline rasterizer. Does not affect layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiAliasingMode {
+    None,
+    Sharp,
+    Crisp,
+    Strong,
+    Smooth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
