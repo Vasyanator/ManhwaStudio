@@ -205,8 +205,33 @@ saving, and export.
   - `helpers.rs`: selection→page resolution, bubble/area seed text, doc-node runtime, page-size/overlay disk loaders.
   - `geometry.rs`: small scalar/coordinate helpers (angle normalize, lerp).
   - `tests.rs`: `#[cfg(test)]` unit tests for the tab.
-- `panel.rs`: floating create/edit/action panels, text/effect controls, font discovery,
-  preview render worker, preset persistence, inline tag helpers, and edit request queue.
+- `panel.rs`: module root of the top panel. Holds the data model (all `struct`/`enum`/`const`
+  definitions incl. `TypingTopPanelState`, `TypingCreatePanelState`, effect cards, inline-tag
+  types) plus the small `Default`/enum-helper impls, and the `mod`/`use` wiring. The behavior
+  (the `impl TypingTopPanelState`/`impl TypingCreatePanelState` method groups and the free-fn
+  slabs) lives in child submodules under `panel/`. Child modules are DESCENDANTS of `panel`, so
+  they read the models' private fields directly; moved methods/free-fns are `pub(super)` (or
+  `pub(in crate::tabs::typing)` for the `TypingTopPanelState` methods that `tab.rs` calls).
+- `panel/` submodules:
+  - `facade.rs`: whole `impl TypingTopPanelState` — public facade, vertical/preview panel drawing,
+    request queues (`pub(in crate::tabs::typing)` for the methods `tab.rs` calls).
+  - `create_state.rs`: `TypingCreatePanelState` construction, focus/eyedropper tracking, font-group
+    management and font-index lookup.
+  - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
+  - `create_presets.rs`: create/formula preset apply & save UI, font-combo binding, face-index clamp.
+  - `create_sections.rs`: top-level section drawing (preview/params/effects/right actions) + effects_json.
+  - `create_main_text.rs`: main text-param UI (left/right columns, inline offset, alignment).
+  - `create_advanced.rs`: advanced params — formula/shape layout, spacing, text accordion, advanced-form window.
+  - `create_edit.rs`: edit-mode params section + inline text-selection / inline-tag styling.
+  - `create_apply.rs`: apply selected-overlay data, font selection, preview render queue/poll, render-param builders.
+  - `text_forms.rs`: char/byte range conversions, advanced-form range-row + sort + card (free fns).
+  - `inline_tags.rs`: inline-tag machine/opening/closing build + parse, offset/stretch/color/align tokens (free fns).
+  - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
+  - `fonts.rs`: font discovery/loading (dir + system), duplicate merge/disambiguation, group listing (free fns).
+  - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
+  - `ui_helpers.rs`: font-family binding/matching, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns).
+  - `effect_parse.rs`: `parse_effect_cards` (free fn).
+  - `tests.rs`: `#[cfg(test)]` unit tests for the panel.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
   tiled mask preview textures, brush/fill editing, async loading/saving, and export
   snapshots.
