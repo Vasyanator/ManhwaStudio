@@ -31,6 +31,30 @@ New functionality belongs in Rust under `src/`.
 
 ---
 
+## Крейты workspace
+
+Проект — cargo workspace: главный бинарник `manhwastudio_rs` (`src/`) плюс
+GUI-free крейты под `crates/`. Слой логики извлечён из `src/`, чтобы правки вкладок
+не пересобирали тяжёлый рендер текста и чтобы границы держал компилятор.
+
+- **`ms-log`** (`crates/ms-log`) — `runtime_log` + `trace`. Pure std, конфиг не читает:
+  каталог логов передаётся параметром. Экспортирует макросы `trace_log!` / `trace_scope!`.
+- **`ms-text-util`** (`crates/ms-text-util`) — `text_punctuation` (набор висячей
+  пунктуации) + `segmentation`. Config-free: набор по умолчанию — `DEFAULT_HANGING_PUNCTUATION`,
+  приложение засевает пользовательское значение на старте через `set_hanging_punctuation`
+  (`main.rs::seed_hanging_punctuation_from_config`).
+- **`ms-text-render`** (`crates/ms-text-render`) — продовый рендер текста вкладки typing
+  (бывший `src/tabs/typing/render_next`). Зависит от `ms-log`, `ms-text-util`; внешне
+  cosmic-text/swash/zeno/image/rayon.
+
+Бинарник держит стабильные пути через реэкспорт-шимы: `crate::runtime_log` / `crate::trace`
+/ `crate::text_punctuation` = соответствующие крейты; `crate::tabs::typing::render_next` =
+`ms_text_render`, `crate::tabs::typing::segmentation` = `ms_text_util::segmentation`
+(см. `src/main.rs` и `src/tabs/typing/mod.rs`). Крейты используют существующий, но ранее
+незадействованный каталог `crates/` (там же лежит `ag-psd`).
+
+---
+
 ## Общая схема слоёв
 
 ```

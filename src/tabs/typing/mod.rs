@@ -16,8 +16,12 @@ mod auto_typing;
 mod mask;
 mod panel;
 mod psd_export;
-pub mod render_next;
-mod segmentation;
+// The text renderer now lives in the `ms-text-render` crate. Re-export keeps
+// existing `crate::tabs::typing::render_next::…` paths valid across the binary.
+pub use ms_text_render as render_next;
+// `segmentation` moved to the `ms-text-util` crate. Re-export keeps existing
+// `crate::tabs::typing::segmentation::…` paths valid.
+pub use ms_text_util::segmentation;
 mod tab;
 
 pub use panel::{TypingPanelLayout, TypingTopPanelState};

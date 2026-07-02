@@ -170,7 +170,10 @@ The main data flow is:
 `panel.rs` owns the floating UI state and emits typed requests; it does not directly
 mutate overlay storage. `mask.rs` owns typing-specific binary clip masks. `auto_typing.rs`
 contains the image analysis used to center selected text over a detected bubble.
-`render_next/` is the production text renderer boundary for this module.
+`render_next` is the production text renderer boundary for this module; it now lives in the
+`ms-text-render` crate (`crates/ms-text-render`) and is re-exported here as
+`crate::tabs::typing::render_next` via `mod.rs` (`pub use ms_text_render as render_next;`).
+`segmentation` likewise comes from `ms-text-util` (re-exported in `mod.rs`).
 
 Typing mask tile textures and text/image overlay display textures are reconstructable GPU caches.
 The module exposes memory snapshots and eviction methods for those textures only. Persistent
@@ -237,10 +240,12 @@ saving, and export.
   snapshots.
 - `auto_typing.rs`: optical center computation for rendered overlays and region-growing
   bubble detection from the shared composited page cache.
-- `render_next/`: text rendering subsystem. Its public contract is
-  `render_next::types::*` plus `render_next::render_text_to_image`; callers in this
-  directory should treat its layout, wrap, raster, formula, and effects modules as
-  renderer internals.
+- `render_next`: text rendering subsystem, now the `ms-text-render` crate re-exported as
+  `render_next` (via `mod.rs`). Its public contract is `render_next::types::*` plus
+  `render_next::render_text_to_image`; callers in this directory should treat its layout,
+  wrap, raster, formula, and effects modules as renderer internals.
+- `segmentation`: re-exported from the `ms-text-util` crate (line/unit segmentation used by
+  the renderer's wrap path and the panel's form preview).
 
 ## Contracts and invariants
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask

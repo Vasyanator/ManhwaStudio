@@ -52,13 +52,21 @@ mod models;
 mod paste_image;
 mod project;
 mod python_manager;
-mod runtime_log;
 mod screen_capture;
-mod trace;
 mod tabs;
-mod text_punctuation;
 mod tools;
 pub mod widgets;
+
+// `runtime_log` and `trace` now live in the standalone `ms-log` crate. These
+// re-exports keep the existing `crate::runtime_log::…` / `crate::trace::…` module
+// paths and the `crate::trace_log!` / `crate::trace_scope!` macro paths valid
+// across the whole binary without touching call sites.
+pub use ms_log::{runtime_log, trace, trace_log, trace_scope};
+
+// `text_punctuation` now lives in the config-free `ms-text-util` crate. Re-export
+// keeps `crate::text_punctuation::…` valid across the binary. The crate no longer
+// reads user config itself; `seed_hanging_punctuation_from_config` seeds it at startup.
+pub use ms_text_util::text_punctuation;
 
 use crate::widgets::WheelComboBox;
 use anyhow::Context;
@@ -145,6 +153,7 @@ fn run_main() -> anyhow::Result<()> {
 
     runtime_log::log_info("starting main application flow");
     auto_detect_missing_ai_install_type_for_startup();
+    seed_hanging_punctuation_from_config();
     let user_settings = config::load_user_settings_for_startup()?;
 
     if cli.continue_update {
@@ -269,6 +278,23 @@ fn ensure_standard_launcher_startup_artifacts() -> anyhow::Result<()> {
     config::ensure_model_dirs()?;
     let _ = config::load_user_config()?;
     Ok(())
+}
+
+/// Seeds the config-free `ms_text_util::text_punctuation` set from user config at
+/// startup. The util crate defaults to `DEFAULT_HANGING_PUNCTUATION`; here the app
+/// (which owns config) overrides it with `TextTab.hanging_punctuation` when present
+/// and non-blank. Best-effort: on any config error the default set is kept.
+fn seed_hanging_punctuation_from_config() {
+    let Ok(cfg) = config::load_user_config() else {
+        return;
+    };
+    if let Some(text) = cfg
+        .get_path(&["TextTab", "hanging_punctuation"])
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| text.chars().any(|ch| !ch.is_whitespace()))
+    {
+        text_punctuation::set_hanging_punctuation(text);
+    }
 }
 
 fn auto_detect_missing_ai_install_type_for_startup() {

@@ -3294,6 +3294,9 @@ dependencies = [
  "libc",
  "libloading",
  "minijinja",
+ "ms-log",
+ "ms-text-render",
+ "ms-text-util",
  "puffin",
  "puffin_egui",
  "rayon",
@@ -3434,6 +3437,32 @@ checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "ms-log"
+version = "0.1.0"
+
+[[package]]
+name = "ms-text-render"
+version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+ "hyphenation",
+ "image 0.25.9",
+ "ms-log",
+ "ms-text-util",
+ "rayon",
+ "serde_json",
+ "swash",
+ "zeno",
+]
+
+[[package]]
+name = "ms-text-util"
+version = "0.1.0"
+dependencies = [
+ "hyphenation",
 ]
 
 [[package]]

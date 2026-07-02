@@ -7,14 +7,10 @@ Golden-image regression harness for the production text renderer
 representative cases to PNGs so the vector-engine refactor can be compared
 tolerance/visual before and after each phase.
 
-Why it mounts the engine via `#[path]`:
-The crate has no `lib.rs`; the production renderer lives at
-`crate::tabs::typing::render_next` and its code uses fully-qualified self-paths
-(`crate::tabs::typing::render_next::...`) plus `crate::trace`,
-`crate::text_punctuation`, `crate::config` and `crate::tabs::typing::segmentation`.
-To exercise the REAL engine (not a copy) from a separate bin crate, this file
-re-mounts exactly that transitive module closure at the same crate paths via
-`#[path]`. No engine file is modified.
+How it reaches the engine:
+The production renderer now lives in the `ms-text-render` crate, so this harness
+simply depends on it (`ms_text_render::render_text_to_image` / `::types::*`) — no
+`#[path]` mounts needed anymore.
 
 Key items:
 - `Case`: one named render case (params + output name).
@@ -27,41 +23,11 @@ Fully deterministic: no randomness, no time, fixed inputs. Uses the repo font
 `test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf` (Latin + Cyrillic).
 */
 
-// The mounted production engine exposes a large public API and several
-// `pub(crate)` re-exports for consumers not included in this harness (e.g. PSD
-// export). This bin only calls `render_text_to_image`, so those embedded items
-// and re-exports are unused in THIS bin crate (which has no library consumers).
-// `dead_code`/`unused_imports` on the embedded engine is therefore expected and
-// not actionable here without editing engine files. Scoped, justified allow.
-#![allow(dead_code, unused_imports)]
-
-// --- Production engine module closure, mounted at the exact crate paths the
-// engine's source expects. Relative paths are resolved from this bin's
-// directory (`src/bin/render_gallery/`), with inline module names contributing
-// directory components for the nested `tabs::typing::*` mounts. ---
-#[path = "../../trace.rs"]
-mod trace;
-#[path = "../../text_punctuation.rs"]
-mod text_punctuation;
-#[path = "../../bubble_status.rs"]
-mod bubble_status;
-#[path = "../../memory_manager.rs"]
-mod memory_manager;
-#[path = "../../config.rs"]
-mod config;
-mod tabs {
-    // `typing` is a real glue file (`tabs/typing.rs`) rather than an inline
-    // module: `#[path]` traversal with `..` requires the intermediate
-    // directories to physically exist, which a purely inline module tree does
-    // not provide.
-    pub mod typing;
-}
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use tabs::typing::render_next::render_text_to_image;
-use tabs::typing::render_next::types::{
+use ms_text_render::render_text_to_image;
+use ms_text_render::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
     TextVectorLine, TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
@@ -336,16 +302,17 @@ fn write_png(path: &Path, image: &RenderedTextImage) -> Result<(), String> {
 }
 
 /// Per-pixel RGBA difference statistics between two equally sized buffers.
+/// Test-only regression helper (used by the `tests` module below).
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DiffStats {
-    width: u32,
-    height: u32,
     /// Largest per-channel absolute delta across all pixels/channels.
     max_channel_delta: u8,
-    /// Per-pixel maximum channel delta (length `width*height`).
+    /// Per-pixel maximum channel delta (one entry per pixel).
     pixel_max_deltas: Vec<u8>,
 }
 
+#[cfg(test)]
 impl DiffStats {
     /// Percentage (0.0..=100.0) of pixels whose maximum channel delta strictly
     /// exceeds `threshold`.
@@ -367,6 +334,7 @@ impl DiffStats {
 ///
 /// # Errors
 /// Returns a message if the buffers do not both equal `width*height*4` bytes.
+#[cfg(test)]
 fn rgba_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> Result<DiffStats, String> {
     let expected = usize::try_from(width)
         .ok()
@@ -396,8 +364,6 @@ fn rgba_diff(a: &[u8], b: &[u8], width: u32, height: u32) -> Result<DiffStats, S
     }
 
     Ok(DiffStats {
-        width,
-        height,
         max_channel_delta,
         pixel_max_deltas,
     })
@@ -496,8 +462,6 @@ mod tests {
     #[test]
     fn diff_stats_empty_is_zero_pct() {
         let stats = DiffStats {
-            width: 0,
-            height: 0,
             max_channel_delta: 0,
             pixel_max_deltas: Vec::new(),
         };

@@ -13,7 +13,7 @@ The top-level flow is:
 
 ```text
 main.rs / args.rs
-    -> config.rs + python_manager.rs + runtime_log.rs
+    -> config.rs + python_manager.rs + ms_log (runtime_log/trace)
     -> launcher/ or ProjectData::load()
     -> MangaApp
     -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel
@@ -69,7 +69,10 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   long-lived Python children that should be killed with the Rust parent on Windows.
 - `gpu_utils.rs`: shared GPU/accelerator capability probes used by installer and launcher/runtime
   settings. Call it from workers, not from frame drawing.
-- `runtime_log.rs`: session log rotation and async log writer for `last.log` / `previous.log`.
+- logging/tracing live in the `ms-log` crate (`crates/ms-log`), re-exported as
+  `crate::runtime_log` / `crate::trace` (+ `trace_log!` / `trace_scope!` macros) from `main.rs`.
+  Text utilities (`text_punctuation`, `segmentation`) live in `ms-text-util`, and the typing text
+  renderer (`render_next`) in `ms-text-render`; all three are re-exported at their old paths.
 - `backend_ipc/`: directory module for the Rust<->Python AI-backend framed IPC. Submodules:
   `transport` (socket path `backend_socket_path()`, `connect_path`, `BackendStream`), `protocol`
   (Rust mirror of `ipc/protocol.py` constants), `frame` (`Frame`, `read_frame`, `write_frame`
