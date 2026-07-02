@@ -63,10 +63,10 @@ use super::optical::{
     optical_base_advance, optical_delta, optical_pair_gap,
 };
 use super::raster::{
-    GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
+    GlyphRgbaView, PixelBounds, RigidPlacement, RgbaCanvasView, build_glyph_rgba_buffer,
     draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba, include_rotated_rect_bounds,
     include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
-    trim_rendered_image_to_alpha_bounds,
+    rotate_placements_about_centroid, trim_rendered_image_to_alpha_bounds,
 };
 use super::vector::{
     Outline, OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
@@ -635,11 +635,15 @@ pub fn render_text_to_image(
 
     // Inline-смещения с поворотом (группы/символа) обычный «прямой» blit не умеет —
     // для таких overlay используем отдельный путь с обратной выборкой и поворотом.
-    if mapped_inline_style_spans
-        .as_deref()
-        .is_some_and(spans_have_inline_rotation)
+    // Глобальный поворот всего блока использует тот же векторный путь: он поворачивает
+    // контуры глифов до растеризации и растит холст под повёрнутый bbox.
+    let has_global_rotation = params.global_rotation_deg.abs() > f32::EPSILON;
+    if has_global_rotation
+        || mapped_inline_style_spans
+            .as_deref()
+            .is_some_and(spans_have_inline_rotation)
     {
-        crate::trace_log!(cat::RENDER, "render_text path=horizontal_rotated lines={}", layout_line_offsets.len());
+        crate::trace_log!(cat::RENDER, "render_text path=horizontal_rotated lines={} global_rotation_deg={}", layout_line_offsets.len(), params.global_rotation_deg);
         let mut rendered = render_horizontal_rotated(
             params,
             &mut font_system,
@@ -653,6 +657,7 @@ pub fn render_text_to_image(
             width_px,
             font_size_px,
             line_height_px,
+            params.global_rotation_deg,
             cancel,
         )?;
         rendered.warnings.extend(warnings);
@@ -1224,6 +1229,34 @@ fn apply_rotated_group_rotations(placements: &mut [RotatedGlyphPlacement]) {
     }
 }
 
+impl RigidPlacement for RotatedGlyphPlacement {
+    fn placement_center(&self) -> (f32, f32) {
+        (self.center_x, self.center_y)
+    }
+    fn set_placement_center(&mut self, x: f32, y: f32) {
+        self.center_x = x;
+        self.center_y = y;
+    }
+    fn add_placement_rotation(&mut self, angle_rad: f32) {
+        self.rotation_rad += angle_rad;
+    }
+}
+
+/// Повернуть ВСЕ размещения как единое жёсткое тело вокруг центроида всей
+/// раскладки (глобальный поворот блока), добавляя `angle_rad` к собственному
+/// повороту каждого глифа. Делегирует общей `rotate_placements_about_centroid`,
+/// чтобы математика поворота совпадала со всеми остальными режимами и с
+/// пост-поворотом слоя по Ctrl+колесо.
+fn apply_global_rotation(placements: &mut [RotatedGlyphPlacement], angle_rad: f32) {
+    rotate_placements_about_centroid(
+        placements
+            .iter_mut()
+            .map(|placement| placement as &mut dyn RigidPlacement)
+            .collect(),
+        angle_rad,
+    );
+}
+
 /// Горизонтальный рендер обычного текста с inline-поворотами смещений.
 /// Собирает размещения всех глифов, применяет повороты групп, считает повёрнутый
 /// bbox и выводит каждый глиф обратной выборкой с поворотом.
@@ -1241,6 +1274,7 @@ fn render_horizontal_rotated(
     width_px: u32,
     font_size_px: f32,
     line_height_px: f32,
+    global_rotation_deg: f32,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
     let mut cache = SwashCache::new();
@@ -1397,6 +1431,13 @@ fn render_horizontal_rotated(
     }
 
     apply_rotated_group_rotations(&mut placements);
+
+    // Глобальный поворот: жёстко вращаем ВСЕ размещения вокруг центроида всей
+    // раскладки. Делается после групповых поворотов и ДО расчёта bbox/размера
+    // холста, поэтому изображение само вырастает под повёрнутые границы.
+    if global_rotation_deg.abs() > f32::EPSILON {
+        apply_global_rotation(&mut placements, global_rotation_deg.to_radians());
+    }
 
     let mut bounds = PixelBounds::empty();
     for placement in &placements {
@@ -2553,6 +2594,7 @@ mod tests {
             // Identity transfer so existing raster/geometry assertions in these
             // tests keep matching the pre-AA coverage exactly.
             anti_aliasing: AntiAliasingMode::Smooth,
+            global_rotation_deg: 0.0,
         }
     }
 
@@ -2706,6 +2748,49 @@ mod tests {
         );
         let (rotated_w, rotated_h) = alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
             .expect("rotated bounds");
+        assert!(
+            rotated_h > plain_h,
+            "90°-rotated block should be taller: {rotated_h} vs {plain_h}"
+        );
+        assert!(
+            rotated_w < plain_w,
+            "90°-rotated block should be narrower: {rotated_w} vs {plain_w}"
+        );
+    }
+
+    #[test]
+    fn global_rotation_rotates_whole_block_while_vector() {
+        let mut params = base_params();
+        params.text = "Hello world".to_string();
+
+        // Baseline: no global rotation -> wide, short horizontal block.
+        params.global_rotation_deg = 0.0;
+        let plain = render_text_to_image(&params, None).expect("plain render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain.width, plain.height, &plain.rgba).expect("plain bounds");
+        assert!(
+            plain_w > plain_h,
+            "horizontal 'Hello world' should be wide and short: {plain_w}x{plain_h}"
+        );
+
+        // A 0.0 value must be a true no-op: the routing gate uses abs > EPSILON,
+        // so it stays on the normal path and is byte-identical across renders.
+        let plain_again = render_text_to_image(&params, None).expect("plain render again");
+        assert_eq!(
+            plain.rgba, plain_again.rgba,
+            "global_rotation_deg = 0.0 must be deterministic and unchanged"
+        );
+
+        // 90° rotates the whole laid-out block (vector) -> tall and narrow.
+        params.global_rotation_deg = 90.0;
+        let rotated = render_text_to_image(&params, None).expect("rotated render");
+        assert!(
+            rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "rotated block must render visible pixels"
+        );
+        let (rotated_w, rotated_h) =
+            alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
+                .expect("rotated bounds");
         assert!(
             rotated_h > plain_h,
             "90°-rotated block should be taller: {rotated_h} vs {plain_h}"
@@ -2939,6 +3024,77 @@ mod tests {
         let rendered = render_text_to_image(&params, None)
             .unwrap_or_else(|error| panic!("render_next should render formula test case: {error}"));
         assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
+    }
+
+    #[test]
+    fn global_rotation_rotates_formula_block() {
+        // A flat horizontal on-path line (y = 0) is wide and short; a 90° global
+        // rotation must turn the whole block tall and narrow, at the vector level.
+        let mut params = base_params();
+        params.text = "FORMULA".to_string();
+        params.width_px = 320;
+        params.text_layout_mode = TextLayoutMode::Formula;
+        params.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * w".to_string(),
+            y_expr: "0".to_string(),
+            rotation_expr: "0".to_string(),
+            use_tangent_rotation: false,
+            ..TextFormulaLayoutParams::default()
+        };
+
+        params.global_rotation_deg = 0.0;
+        let plain = render_text_to_image(&params, None).expect("formula plain render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain.width, plain.height, &plain.rgba).expect("formula bounds");
+
+        params.global_rotation_deg = 90.0;
+        let rotated = render_text_to_image(&params, None).expect("formula rotated render");
+        assert!(rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        let (rotated_w, rotated_h) =
+            alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
+                .expect("formula rotated bounds");
+        assert!(rotated_h > plain_h, "formula 90°: {rotated_h} !> {plain_h}");
+        assert!(rotated_w < plain_w, "formula 90°: {rotated_w} !< {plain_w}");
+    }
+
+    #[test]
+    fn global_rotation_rotates_vector_lines_block() {
+        // Custom vector lines use a fixed canvas; a non-zero global rotation must
+        // grow it to the rotated bounds (no clipping) and turn a wide line tall.
+        let mut params = base_params();
+        params.text = "VECTOR".to_string();
+        params.width_px = 260;
+        params.text_layout_mode = TextLayoutMode::CustomVectorLines;
+        params.vector_lines_layout = TextVectorLinesLayoutParams {
+            width_px: 260,
+            height_px: 80,
+            lines: vec![TextVectorLine {
+                points: vec![
+                    TextVectorPoint { x: 8.0, y: 40.0 },
+                    TextVectorPoint { x: 120.0, y: 40.0 },
+                    TextVectorPoint { x: 240.0, y: 40.0 },
+                ],
+                corner_smoothing_px: 16.0,
+                text_direction: TextVectorLineTextDirection::LeftToRight,
+                distance_mode: TextVectorLineDistanceMode::ByLineLength,
+                flip_text: false,
+            }],
+            ..TextVectorLinesLayoutParams::default()
+        };
+
+        params.global_rotation_deg = 0.0;
+        let plain = render_text_to_image(&params, None).expect("vector-lines plain render");
+        let (plain_w, plain_h) = alpha_bounds_from_rgba(plain.width, plain.height, &plain.rgba)
+            .expect("vector-lines bounds");
+
+        params.global_rotation_deg = 90.0;
+        let rotated = render_text_to_image(&params, None).expect("vector-lines rotated render");
+        assert!(rotated.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        let (rotated_w, rotated_h) =
+            alpha_bounds_from_rgba(rotated.width, rotated.height, &rotated.rgba)
+                .expect("vector-lines rotated bounds");
+        assert!(rotated_h > plain_h, "vector-lines 90°: {rotated_h} !> {plain_h}");
+        assert!(rotated_w < plain_w, "vector-lines 90°: {rotated_w} !< {plain_w}");
     }
 
     #[test]

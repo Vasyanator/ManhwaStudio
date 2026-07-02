@@ -248,6 +248,11 @@ pub struct TextRenderParams {
     /// Glyph edge anti-aliasing mode. Does not affect layout, only the
     /// coverage->alpha transfer curve applied by the outline rasterizer.
     pub anti_aliasing: AntiAliasingMode,
+    /// Global rotation of the whole laid-out text (degrees), applied to glyph
+    /// outlines while still vector, before rasterization. 0.0 = no rotation.
+    /// A non-zero value routes the horizontal path through the rotated renderer
+    /// so the canvas auto-grows to the rotated bounds (no clipping).
+    pub global_rotation_deg: f32,
 }
 
 #[derive(Debug, Clone)]

@@ -1768,6 +1768,9 @@ struct TypingCreatePanelState {
     glyph_width: PxOrPercent,
     width_px: u32,
     align: HorizontalAlign,
+    /// Global rotation of the whole text block in degrees, applied to glyph
+    /// outlines while still vector (before rasterization). 0.0 = no rotation.
+    global_rotation_deg: f32,
     text_line_mode: TextLineMode,
     vertical_line_direction: VerticalLineDirection,
     text_layout_mode: TextLayoutMode,
@@ -2028,6 +2031,7 @@ impl TypingCreatePanelState {
             glyph_width: PxOrPercent::percent(100.0),
             width_px: DEFAULT_PREVIEW_WIDTH_PX,
             align: HorizontalAlign::CENTER,
+            global_rotation_deg: 0.0,
             text_line_mode: TextLineMode::Horizontal,
             vertical_line_direction: VerticalLineDirection::RightToLeft,
             text_layout_mode: TextLayoutMode::Normal,
@@ -2568,6 +2572,7 @@ impl TypingCreatePanelState {
                 // `align_bias` — точное непрерывное смещение слайдера лево↔право.
                 "align": self.align.legacy_str(),
                 "align_bias": self.align.bias,
+                "global_rotation_deg": self.global_rotation_deg,
                 "text_line_mode": match self.text_line_mode {
                     TextLineMode::Horizontal => "horizontal",
                     TextLineMode::Vertical => "vertical",
@@ -4376,6 +4381,23 @@ impl TypingCreatePanelState {
                 changed,
                 block_hscroll_by_hovered_param,
             );
+
+            // Глобальный поворот всего блока: применяется к векторным контурам
+            // глифов ДО растеризации, поэтому получается чётче, чем поворот уже
+            // готового растра оверлея.
+            let rotation_resp = ui
+                .add(
+                    WheelSlider::new(&mut self.global_rotation_deg, -180.0..=180.0)
+                        .text("Глобальный поворот")
+                        .wheel_step(1.0),
+                )
+                .on_hover_text("Даёт более чёткий поворот, чем поворот после создания");
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &rotation_resp);
+            *changed |= rotation_resp.changed();
+            if let Some(steps) = wheel_steps_if_hovered(ui, &rotation_resp) {
+                *changed |=
+                    apply_wheel_step_f32(&mut self.global_rotation_deg, steps, 1.0, -180.0, 180.0);
+            }
 
             let prev_shape = self.text_shape;
             let shape_combo = WheelComboBox::from_label("Форма")
@@ -7229,6 +7251,13 @@ impl TypingCreatePanelState {
                 text_params_obj.get("align_bias").and_then(value_as_f32),
             );
         }
+        // Absent in projects saved before global rotation existed -> keep 0.0.
+        if let Some(global_rotation_deg) = text_params_obj
+            .get("global_rotation_deg")
+            .and_then(value_as_f32)
+        {
+            self.global_rotation_deg = global_rotation_deg;
+        }
         if let Some(text_line_mode) = text_params_obj
             .get("text_line_mode")
             .and_then(Value::as_str)
@@ -7639,6 +7668,7 @@ impl TypingCreatePanelState {
             glyph_width_percent: self.glyph_width.as_percent_of(self.font_size_px.max(1.0)),
             width_px: width_px.max(1),
             align: self.align,
+            global_rotation_deg: self.global_rotation_deg,
             text_line_mode: self.text_line_mode,
             vertical_line_direction: self.vertical_line_direction,
             text_layout_mode: self.text_layout_mode,

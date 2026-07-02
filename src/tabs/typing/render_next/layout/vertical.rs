@@ -58,7 +58,8 @@ use crate::tabs::typing::render_next::pipeline::{
     inline_glyph_scale_for_glyph, inline_kerning_for_glyph, inline_text_color_for_glyph,
 };
 use crate::tabs::typing::render_next::raster::{
-    GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer, draw_scaled_glyph_rgba,
+    GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
+    draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba, include_rotated_rect_bounds,
     include_scaled_rect_bounds, rasterize_unscaled_glyph, sample_swash_alpha,
 };
 use crate::tabs::typing::render_next::types::{
@@ -173,6 +174,29 @@ pub(crate) fn render_vertical_text(
     let mut outline_cache = OutlineCache::new();
     let mut contour_cache = OpticalContourCache::new();
 
+    // Global block rotation (vector level): turn the whole column block rigidly
+    // about its centroid, matching the Ctrl+wheel overlay post-rotation but crisp.
+    // The centroid is computed once up front so the bounds and draw passes rotate
+    // every glyph about the same pivot; `rotate_block` gates all of it so the
+    // non-rotated path stays byte-identical.
+    let global_rotation_rad = params.global_rotation_deg.to_radians();
+    let rotate_block = params.global_rotation_deg.abs() > f32::EPSILON;
+    let (rot_sin, rot_cos) = global_rotation_rad.sin_cos();
+    let (centroid_x, centroid_y) = if rotate_block {
+        vertical_layout_centroid(
+            columns.as_slice(),
+            column_positions.as_slice(),
+            params,
+            font_system,
+            &mut cache,
+            &mut outline_cache,
+            &mut contour_cache,
+            font_size_px,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
     let mut bounds = PixelBounds::empty();
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
@@ -207,14 +231,41 @@ pub(crate) fn render_vertical_text(
             };
             let x = physical.x + image.placement.left;
             let y = physical.y - image.placement.top;
-            include_scaled_rect_bounds(
-                &mut bounds,
-                x as f32,
-                y as f32,
-                image.placement.width as f32,
-                image.placement.height as f32,
-                *glyph_scale,
-            );
+            if rotate_block {
+                // Rotate the glyph's (unscaled==scaled) center about the centroid,
+                // then account for the rotated scaled rect so the canvas grows.
+                let glyph_w = image.placement.width as f32;
+                let glyph_h = image.placement.height as f32;
+                let (scaled_left, scaled_top, scaled_width, scaled_height) =
+                    glyph_scale.scaled_rect(x as f32, y as f32, glyph_w, glyph_h);
+                let (dst_center_x, dst_center_y) = rotate_point_about(
+                    x as f32 + glyph_w * 0.5,
+                    y as f32 + glyph_h * 0.5,
+                    centroid_x,
+                    centroid_y,
+                    rot_sin,
+                    rot_cos,
+                );
+                include_rotated_rect_bounds(
+                    &mut bounds,
+                    scaled_left,
+                    scaled_top,
+                    scaled_width,
+                    scaled_height,
+                    dst_center_x,
+                    dst_center_y,
+                    global_rotation_rad,
+                );
+            } else {
+                include_scaled_rect_bounds(
+                    &mut bounds,
+                    x as f32,
+                    y as f32,
+                    image.placement.width as f32,
+                    image.placement.height as f32,
+                    *glyph_scale,
+                );
+            }
         }
     }
 
@@ -287,21 +338,31 @@ pub(crate) fn render_vertical_text(
             let src_left = (physical.x + image.placement.left) as f32;
             let src_top = (physical.y - image.placement.top) as f32;
 
+            // Rotate the glyph's (unscaled==scaled) center about the block centroid;
+            // with no global rotation this is the identity (centroid at origin, angle
+            // 0), so the non-rotated placement stays byte-identical.
+            let (dst_center_x, dst_center_y) = rotate_point_about(
+                src_left + glyph_w as f32 * 0.5,
+                src_top + glyph_h as f32 * 0.5,
+                centroid_x,
+                centroid_y,
+                rot_sin,
+                rot_cos,
+            );
+
             // Prefer the true font outline: rasterize it at the exact world placement
             // the bitmap blit used (scale about the bitmap center). Vertical cells are
-            // upright, so there is no glyph rotation (rot = 0). The canvas offset is
-            // folded into the rasterizer origin exactly as the horizontal path does.
+            // upright; the only rotation is the global block rotation. The canvas
+            // offset is folded into the rasterizer origin as the horizontal path does.
             if let Some(outline) =
                 resolve_outline_for_glyph(font_system, &mut outline_cache, glyph)
             {
-                let dst_center_x = src_left + glyph_w as f32 * 0.5;
-                let dst_center_y = src_top + glyph_h as f32 * 0.5;
                 // Re-add the subpixel fraction baked into the bitmap coverage so the
                 // outline lands on the same pixels (physical.x/y are integer-only).
                 let transform = glyph_outline_transform(
                     dst_center_x,
                     dst_center_y,
-                    0.0,
+                    global_rotation_rad,
                     placement_left,
                     placement_top,
                     glyph_w as f32,
@@ -327,6 +388,39 @@ pub(crate) fn render_vertical_text(
             // No fillable outline: blit whatever non-empty bitmap `get_image` gave
             // us — real color (COLR/bitmap) glyphs and monochrome embedded-bitmap /
             // sbix / CBDT-mono glyphs alike (spaces are already filtered by size).
+            // Under a global block rotation the bitmap fallback must also rotate, via
+            // the shared reverse-sampling rotator (same path the horizontal mode uses).
+            if rotate_block {
+                let glyph_rgba = build_glyph_rgba_buffer(
+                    &image.content,
+                    image.data.as_slice(),
+                    glyph_w,
+                    glyph_h,
+                    *text_color,
+                );
+                let mut canvas = RgbaCanvasView {
+                    rgba: rgba.as_mut_slice(),
+                    width: out_width as usize,
+                    height: out_height as usize,
+                };
+                draw_rotated_scaled_glyph_rgba(
+                    &mut canvas,
+                    GlyphRgbaView {
+                        rgba: glyph_rgba.as_slice(),
+                        width: glyph_w,
+                        height: glyph_h,
+                    },
+                    src_left,
+                    src_top,
+                    *glyph_scale,
+                    dst_center_x,
+                    dst_center_y,
+                    global_rotation_rad,
+                    x_offset,
+                    y_offset,
+                );
+                continue;
+            }
             let draw_x = physical.x + image.placement.left + x_offset;
             let draw_y = physical.y - image.placement.top + y_offset;
             if glyph_scale.is_identity() {
@@ -379,6 +473,85 @@ pub(crate) fn render_vertical_text(
         content_origin_x: 0,
         content_origin_y: 0,
     })
+}
+
+/// Rotate point `(px, py)` about pivot `(cx, cy)` given precomputed `sin`/`cos`.
+///
+/// Uses the standard screen (y-down) rotation matrix `[cos -sin; sin cos]`, the
+/// same convention as the horizontal path and the Ctrl+wheel overlay
+/// post-rotation, so a positive angle turns text the same visual direction.
+fn rotate_point_about(px: f32, py: f32, cx: f32, cy: f32, sin_a: f32, cos_a: f32) -> (f32, f32) {
+    let rel_x = px - cx;
+    let rel_y = py - cy;
+    (cx + rel_x * cos_a - rel_y * sin_a, cy + rel_x * sin_a + rel_y * cos_a)
+}
+
+/// Centroid (mean of glyph bitmap-box centers) of the whole vertical layout, used
+/// as the pivot for the global block rotation. Mirrors the bounds/draw passes'
+/// per-glyph position math so all three agree on the same centers. Returns
+/// `(0.0, 0.0)` when the layout has no drawable glyph (the caller only uses this
+/// when a rotation is requested).
+#[allow(clippy::too_many_arguments)]
+fn vertical_layout_centroid(
+    columns: &[VerticalRenderColumn],
+    column_positions: &[f32],
+    params: &TextRenderParams,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
+    font_size_px: f32,
+) -> (f32, f32) {
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    let mut count = 0u32;
+    for (column_idx, column) in columns.iter().enumerate() {
+        let Some(column_x) = column_positions.get(column_idx).copied() else {
+            continue;
+        };
+        let cell_baselines = compute_vertical_cell_baselines(
+            column,
+            params,
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+            font_size_px,
+        );
+        for (cell_idx, cell) in column.cells.iter().enumerate() {
+            let VerticalRenderCell::Glyph {
+                glyph,
+                glyph_offset_px,
+                ..
+            } = cell
+            else {
+                continue;
+            };
+            let baseline_y = cell_baselines.get(cell_idx).copied().unwrap_or(font_size_px)
+                + glyph_offset_px[1];
+            let origin_x = column_x + ((column.visual_width_px - glyph.w).max(0.0) * 0.5) - glyph.x
+                + glyph_offset_px[0];
+            let physical = glyph.physical((origin_x, baseline_y), 1.0);
+            let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+                continue;
+            };
+            let glyph_w = image.placement.width as f32;
+            let glyph_h = image.placement.height as f32;
+            if glyph_w <= 0.0 || glyph_h <= 0.0 {
+                continue;
+            }
+            let x = (physical.x + image.placement.left) as f32;
+            let y = (physical.y - image.placement.top) as f32;
+            sum_x += x + glyph_w * 0.5;
+            sum_y += y + glyph_h * 0.5;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return (0.0, 0.0);
+    }
+    let count = count as f32;
+    (sum_x / count, sum_y / count)
 }
 
 // The collector must see layout, spans and per-glyph defaults together to preserve vertical
@@ -1030,11 +1203,52 @@ mod tests {
             effects_json: String::new(),
             // Identity transfer keeps the AA independent of these geometry checks.
             anti_aliasing: AntiAliasingMode::Smooth,
+            global_rotation_deg: 0.0,
         }
     }
 
     fn render(params: &TextRenderParams) -> RenderedTextImage {
         render_text_to_image(params, None).expect("vertical render succeeds")
+    }
+
+    /// Width/height of the non-transparent content, or `None` if fully empty.
+    fn content_bounds(image: &RenderedTextImage) -> Option<(u32, u32)> {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut found = false;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let idx = ((y * image.width + x) * 4 + 3) as usize;
+                if image.rgba.get(idx).copied().unwrap_or(0) > 0 {
+                    found = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        found.then(|| (max_x - min_x + 1, max_y - min_y + 1))
+    }
+
+    #[test]
+    fn global_rotation_rotates_vertical_block() {
+        // Vertical text is tall and narrow; a 90° global rotation turns the whole
+        // column block wide and short, at the vector level.
+        let mut params = vertical_params("ГРОМ");
+
+        params.global_rotation_deg = 0.0;
+        let plain = render(&params);
+        let (plain_w, plain_h) = content_bounds(&plain).expect("vertical plain bounds");
+        assert!(plain_h > plain_w, "vertical text should be tall: {plain_w}x{plain_h}");
+
+        // 0.0 must be a byte-identical no-op versus the default path.
+        assert_eq!(render(&params).rgba, plain.rgba, "0.0 rotation must be a no-op");
+
+        params.global_rotation_deg = 90.0;
+        let rotated = render(&params);
+        let (rotated_w, rotated_h) = content_bounds(&rotated).expect("vertical rotated bounds");
+        assert!(rotated_w > plain_w, "vertical 90°: {rotated_w} !> {plain_w}");
+        assert!(rotated_h < plain_h, "vertical 90°: {rotated_h} !< {plain_h}");
     }
 
     #[test]

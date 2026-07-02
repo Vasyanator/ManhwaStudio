@@ -12258,6 +12258,11 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
             text_params.get("align").and_then(Value::as_str),
             text_params.get("align_bias").and_then(value_as_f32),
         ),
+        // Global vector rotation of the whole block; absent in old projects -> 0.
+        global_rotation_deg: text_params
+            .get("global_rotation_deg")
+            .and_then(value_as_f32)
+            .unwrap_or(0.0),
         selected_face_index: text_params
             .get("selected_face_index")
             .and_then(Value::as_u64)
@@ -15815,6 +15820,7 @@ mod tests {
             vector_lines_layout: TextVectorLinesLayoutParams::default(),
             effects_json: String::new(),
             anti_aliasing: AntiAliasingMode::Strong,
+            global_rotation_deg: 0.0,
         }
     }
 

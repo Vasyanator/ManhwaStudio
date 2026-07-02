@@ -324,6 +324,61 @@ pub(crate) fn rotated_rect_world_bounds(
     (min_x, min_y, max_x, max_y)
 }
 
+/// A glyph placement that can be rotated rigidly as part of a whole-block turn.
+///
+/// Implementors expose their world center and own rotation so the shared
+/// `rotate_placements_about_centroid` pass can apply `global_rotation_deg`
+/// identically on every layout mode (horizontal, vertical, formula/on-path,
+/// custom lines). The rotation convention is the standard screen (y-down)
+/// matrix `[cos -sin; sin cos]` on a positive angle — the SAME one used by the
+/// Ctrl+wheel overlay post-rotation (`default_overlay_quad_scene`), so a
+/// positive angle turns text the same visual direction, only crisper.
+pub(crate) trait RigidPlacement {
+    /// World-space rotation center (the point the placement is pinned to).
+    fn placement_center(&self) -> (f32, f32);
+    /// Replace the world-space center after the block rotation.
+    fn set_placement_center(&mut self, x: f32, y: f32);
+    /// Add `angle_rad` to the placement's own rotation.
+    fn add_placement_rotation(&mut self, angle_rad: f32);
+}
+
+/// Rotate every placement rigidly about the shared centroid by `angle_rad`.
+///
+/// The centroid is the mean of all placement centers. Each center is rotated
+/// about it and `angle_rad` is added to each placement's own rotation, so the
+/// whole laid-out block turns as one rigid body. Empty input or a zero angle is
+/// a no-op. The pivot (centroid) only translates the result; since the caller
+/// grows the canvas to the rotated bounds and trims to alpha, the pivot choice
+/// does not change the final trimmed pixels.
+pub(crate) fn rotate_placements_about_centroid(
+    mut placements: Vec<&mut dyn RigidPlacement>,
+    angle_rad: f32,
+) {
+    if placements.is_empty() || angle_rad == 0.0 {
+        return;
+    }
+    let count = placements.len() as f32;
+    let (mut sum_x, mut sum_y) = (0.0f32, 0.0f32);
+    for placement in &placements {
+        let (x, y) = placement.placement_center();
+        sum_x += x;
+        sum_y += y;
+    }
+    let centroid_x = sum_x / count;
+    let centroid_y = sum_y / count;
+    let (sin_a, cos_a) = angle_rad.sin_cos();
+    for placement in &mut placements {
+        let (x, y) = placement.placement_center();
+        let rel_x = x - centroid_x;
+        let rel_y = y - centroid_y;
+        placement.set_placement_center(
+            centroid_x + rel_x * cos_a - rel_y * sin_a,
+            centroid_y + rel_x * sin_a + rel_y * cos_a,
+        );
+        placement.add_placement_rotation(angle_rad);
+    }
+}
+
 /// Нарисовать глиф с масштабом и поворотом вокруг точки `dst_center` (обратная выборка).
 /// `src_left`/`src_top` — левый верх немасштабированного глифа в координатах контента;
 /// `x_offset`/`y_offset` переводят координаты контента в пиксели холста.
@@ -553,9 +608,57 @@ fn rgba_pixel_at(rgba: &[u8], width: usize, height: usize, x: i32, y: i32) -> [u
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_swash_alpha, trim_rendered_image_to_alpha_bounds};
+    use super::{
+        RigidPlacement, rotate_placements_about_centroid, sample_swash_alpha,
+        trim_rendered_image_to_alpha_bounds,
+    };
     use crate::tabs::typing::render_next::types::RenderedTextImage;
     use cosmic_text::SwashContent;
+
+    /// Minimal `RigidPlacement` for exercising the centroid rotation math.
+    struct TestPlacement {
+        x: f32,
+        y: f32,
+        rot: f32,
+    }
+
+    impl RigidPlacement for TestPlacement {
+        fn placement_center(&self) -> (f32, f32) {
+            (self.x, self.y)
+        }
+        fn set_placement_center(&mut self, x: f32, y: f32) {
+            self.x = x;
+            self.y = y;
+        }
+        fn add_placement_rotation(&mut self, angle_rad: f32) {
+            self.rot += angle_rad;
+        }
+    }
+
+    #[test]
+    fn rotate_placements_about_centroid_turns_block_90_degrees() {
+        // Two points on a horizontal line about centroid (1,0). A +90° screen
+        // rotation (y-down matrix) maps the horizontal pair to a vertical pair
+        // and adds the angle to each own rotation.
+        let mut a = TestPlacement { x: 0.0, y: 0.0, rot: 0.0 };
+        let mut b = TestPlacement { x: 2.0, y: 0.0, rot: 0.0 };
+        let angle = std::f32::consts::FRAC_PI_2;
+        rotate_placements_about_centroid(
+            vec![&mut a as &mut dyn RigidPlacement, &mut b as &mut dyn RigidPlacement],
+            angle,
+        );
+        // Centroid (1,0): a=(-1,0)->(1,-1), b=(1,0)->(1,1) under [cos -sin; sin cos].
+        assert!((a.x - 1.0).abs() < 1e-5 && (a.y - -1.0).abs() < 1e-5, "a={:?}", (a.x, a.y));
+        assert!((b.x - 1.0).abs() < 1e-5 && (b.y - 1.0).abs() < 1e-5, "b={:?}", (b.x, b.y));
+        assert!((a.rot - angle).abs() < 1e-5 && (b.rot - angle).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rotate_placements_about_centroid_zero_angle_is_noop() {
+        let mut a = TestPlacement { x: 3.0, y: 5.0, rot: 0.25 };
+        rotate_placements_about_centroid(vec![&mut a as &mut dyn RigidPlacement], 0.0);
+        assert_eq!((a.x, a.y, a.rot), (3.0, 5.0, 0.25));
+    }
 
     #[test]
     fn sample_swash_alpha_handles_subpixel_content() {

@@ -61,9 +61,9 @@ use crate::tabs::typing::render_next::pipeline::{
     GlyphScaleSettings, KerningSettings, effective_spacing_percent, horizontal_line_offset,
 };
 use crate::tabs::typing::render_next::raster::{
-    PixelBounds, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
-    include_rotated_rect_bounds, rotated_rect_world_bounds, sample_swash_alpha,
-    trim_rendered_image_to_alpha_bounds,
+    PixelBounds, RigidPlacement, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
+    include_rotated_rect_bounds, rotate_placements_about_centroid, rotated_rect_world_bounds,
+    sample_swash_alpha, trim_rendered_image_to_alpha_bounds,
 };
 use crate::tabs::typing::render_next::types::{
     HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextRenderParams,
@@ -133,6 +133,19 @@ struct FormulaGlyphTransform {
     rotation_rad: f32,
 }
 
+impl RigidPlacement for FormulaGlyphTransform {
+    fn placement_center(&self) -> (f32, f32) {
+        (self.center_x, self.center_y)
+    }
+    fn set_placement_center(&mut self, x: f32, y: f32) {
+        self.center_x = x;
+        self.center_y = y;
+    }
+    fn add_placement_rotation(&mut self, angle_rad: f32) {
+        self.rotation_rad += angle_rad;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FormulaArcLengthSample {
     t01: f32,
@@ -148,6 +161,19 @@ struct DrawnLineTransform {
     center_x: f32,
     center_y: f32,
     rotation_rad: f32,
+}
+
+impl RigidPlacement for DrawnLineTransform {
+    fn placement_center(&self) -> (f32, f32) {
+        (self.center_x, self.center_y)
+    }
+    fn set_placement_center(&mut self, x: f32, y: f32) {
+        self.center_x = x;
+        self.center_y = y;
+    }
+    fn add_placement_rotation(&mut self, angle_rad: f32) {
+        self.rotation_rad += angle_rad;
+    }
 }
 
 /// Seed-aware wrapper over [`drawn_line_glyph_destination_center_raw`] that
@@ -418,7 +444,7 @@ fn render_text_with_drawn_lines_layout_once(
     let mut outline_cache = OutlineCache::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
-    let transforms = build_drawn_line_transforms(
+    let mut transforms = build_drawn_line_transforms(
         params,
         seeds.as_slice(),
         paths,
@@ -428,6 +454,20 @@ fn render_text_with_drawn_lines_layout_once(
         &mut outline_cache,
     );
     let skipped = transforms.iter().filter(|item| item.is_none()).count();
+    // Global block rotation (vector level): rotate every placed line-glyph rigidly
+    // about the layout centroid before bounds/draw, so the whole custom-line block
+    // turns as one — matching the Ctrl+wheel overlay post-rotation, only crisper.
+    let global_rotation_rad = params.global_rotation_deg.to_radians();
+    if params.global_rotation_deg.abs() > f32::EPSILON {
+        rotate_placements_about_centroid(
+            transforms
+                .iter_mut()
+                .filter_map(Option::as_mut)
+                .map(|transform| transform as &mut dyn RigidPlacement)
+                .collect(),
+            global_rotation_rad,
+        );
+    }
     let mut bounds = PixelBounds::empty();
     for (seed, transform) in seeds.iter().zip(transforms.iter()) {
         let Some(transform) = transform else {
@@ -502,8 +542,13 @@ fn render_text_with_drawn_lines_layout_once(
     }
 
     let pad = font_size_px.ceil().max(2.0) as u32;
+    // A fixed canvas (vector-lines) is honored only when there is no global
+    // rotation; once the block is rotated the canvas must grow to the rotated
+    // bounds (like the Ctrl+wheel overlay) so no corner is clipped.
+    let honor_fixed_size =
+        fixed_output_size.filter(|_| params.global_rotation_deg.abs() <= f32::EPSILON);
     let (out_width, out_height, x_offset, y_offset) =
-        if let Some((width, height)) = fixed_output_size {
+        if let Some((width, height)) = honor_fixed_size {
             (width.max(1), height.max(1), 0, 0)
         } else {
             (
@@ -1562,6 +1607,19 @@ fn render_text_with_formula_layout_once(
         }
     }
     apply_formula_group_rotations(seeds.as_slice(), transforms.as_mut_slice());
+    // Global block rotation (vector level): rotate every on-path glyph rigidly
+    // about the layout centroid on top of the per-glyph tangent/static rotation,
+    // so the whole formula block turns as one — matching the Ctrl+wheel overlay
+    // post-rotation, only crisper. The rotated-rect bounds below grow the canvas.
+    if params.global_rotation_deg.abs() > f32::EPSILON {
+        rotate_placements_about_centroid(
+            transforms
+                .iter_mut()
+                .map(|transform| transform as &mut dyn RigidPlacement)
+                .collect(),
+            params.global_rotation_deg.to_radians(),
+        );
+    }
 
     let mut bounds = PixelBounds::empty();
     for (seed, transform) in seeds.iter().zip(transforms.iter()) {

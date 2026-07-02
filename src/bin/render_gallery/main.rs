@@ -122,6 +122,7 @@ fn base_params() -> TextRenderParams {
         effects_json: String::new(),
         // Mirror the panel default so the golden output matches the app.
         anti_aliasing: AntiAliasingMode::Strong,
+        global_rotation_deg: 0.0,
     }
 }
 

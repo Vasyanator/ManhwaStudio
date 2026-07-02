@@ -115,6 +115,22 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `OutlineCache` and passes it into every `rasterize_outline_into` call.
   `AntiAliasingMode::Smooth` is the identity table (byte-identical to the pre-AA
   renderer). The color-glyph bitmap fallback path does not go through the LUT.
+- `TextRenderParams.global_rotation_deg` rotates the WHOLE laid-out block while
+  still vector (glyph outlines), before rasterization — the crisp analog of the
+  Ctrl+wheel overlay post-rotation. It applies in EVERY layout mode at the vector
+  level, using one shared pass (`raster::RigidPlacement` +
+  `rotate_placements_about_centroid`): every glyph placement is rotated rigidly
+  about the layout centroid and the angle is added to each glyph's own rotation,
+  then the canvas grows to the rotated bounds (no clipping). Per mode: horizontal
+  routes through `render_horizontal_rotated`; formula/on-path/shape and custom
+  raster/vector lines rotate their `transforms` in `formula/render.rs` (custom
+  vector lines drop their fixed canvas and grow while rotated); vertical rotates
+  its per-glyph placements in `layout/vertical.rs` (centroid via
+  `vertical_layout_centroid`). The rotation matrix (`[cos -sin; sin cos]` on a
+  positive angle, screen y-down) matches `tab.rs::default_overlay_quad_scene`
+  (Ctrl+wheel), so a positive degree value turns text the same visual direction.
+  It does NOT affect layout text, so it is excluded from
+  `TextRenderShapeCompareParams` (like `anti_aliasing`).
 - `RenderedTextImage.rgba` must always be `width * height * 4` bytes in unmultiplied
   RGBA order. Empty/transparent output must still use valid dimensions where possible.
 - Public renderer errors are `Result<_, String>` because callers surface them directly
