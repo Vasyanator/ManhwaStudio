@@ -180,9 +180,31 @@ saving, and export.
 ## Files and submodules
 - `mod.rs`: module wiring and public re-exports for `TypingTabState`,
   `TypingTopPanelState`, and `TypingPanelLayout`.
-- `tab.rs`: main tab state, `CanvasHooks` implementation, overlay runtime/storage,
-  create/edit render workers, overlay transform/deform tools, layout editor helpers,
-  `text_info.json` normalization, image import, and export composition.
+- `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
+  definitions incl. `TypingTabState`, `TypingTextOverlayLayer`, `TypingOverlayRuntime`,
+  `TypingRasterLayer`, deform/export/create/edit/layout structs), the public
+  `TypingTabState` facade + `Default`, the `impl CanvasHooks for TypingHooks`, and the
+  `mod`/`use` wiring. The behavior (methods + free fns) lives in child submodules under
+  `tab/`. All child modules are DESCENDANTS of `tab`, so they read the model's private
+  fields directly; moved methods/free-fns are `pub(super)` (or `pub(in crate::tabs::typing)`
+  when a typing-level sibling like `panel.rs`/`psd_export.rs` calls them).
+- `tab/` submodules (each an `impl TypingTextOverlayLayer` method group and/or free-fn slab):
+  - `doc_layers.rs`: shared `LayerDoc` sync, unified band-Z ordering, raster-layer projection.
+  - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
+  - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
+  - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
+  - `selection_rasters.rs`: overlay/raster selection, remove, raster interact/menu/drag/transform/deform.
+  - `panels.rs`: deformation panel, layers-tab body, layout-editor floating panels.
+  - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
+  - `draw_page.rs`: `draw_page_overlays` (master per-page draw) + repaint/visibility/pixel-snap helpers.
+  - `mesh_geometry.rs`: deform-mesh/handle math, overlay geometry, hit-tests, unified-Z helpers (pure fns).
+  - `layout_editor.rs`: vector-line layout-editor free fns (frame/line hit-test, draw, conversions).
+  - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
+  - `export.rs`: PNG/PSD export jobs + page composition/flatten free fns.
+  - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
+  - `helpers.rs`: selection→page resolution, bubble/area seed text, doc-node runtime, page-size/overlay disk loaders.
+  - `geometry.rs`: small scalar/coordinate helpers (angle normalize, lerp).
+  - `tests.rs`: `#[cfg(test)]` unit tests for the tab.
 - `panel.rs`: floating create/edit/action panels, text/effect controls, font discovery,
   preview render worker, preset persistence, inline tag helpers, and edit request queue.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
@@ -265,7 +287,15 @@ saving, and export.
   not duplicate ownership of project bubbles or clean overlays.
 
 ## Editing map
-- To change text/image overlay behavior on the canvas, edit `tab.rs`.
+- The tab is `tab.rs` (data model + facade + hooks + wiring) plus behavior submodules under
+  `tab/`. Add a new field to `TypingTabState`/`TypingTextOverlayLayer` in `tab.rs`; put the
+  logic in the matching submodule below.
+- To change overlay/raster selection, movement, or context menus, edit `tab/selection_rasters.rs`.
+- To change the master per-page drawing, edit `tab/draw_page.rs`.
+- To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
+- To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.
+- To change persisted overlay schema parsing/normalization, edit `tab/codec.rs`.
+- To change export composition, edit `tab/export.rs`.
 - To change create/edit UI, presets, font loading, inline tag controls, or effect cards,
   edit `panel.rs`.
 - To change clipping mask loading, painting, fill, save, or export snapshots, edit
@@ -275,5 +305,6 @@ saving, and export.
   first and keep call-site changes in this directory typed through `TextRenderParams`.
   See `render_next/MODULE_README.md` and nested renderer readmes before editing
   renderer internals.
-- To change persisted overlay schema, update the parser, normalizer, writer, and export
-  path in `tab.rs`, and update this document if the contract changes.
+- To change persisted overlay schema, update the parser/normalizer in `tab/codec.rs`, the
+  writer path in `tab/persist.rs` / `tab/doc_layers.rs`, and the export path in
+  `tab/export.rs`; update this document if the contract changes.
