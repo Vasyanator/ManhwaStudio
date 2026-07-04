@@ -7,7 +7,8 @@ Main structs:
 - `WikiTabState`: tab state, selected file, async receivers, and image cache.
 - `WikiFileEntry`: one markdown file from `wiki/`.
 - `WikiDocument`: loaded markdown file plus parsed render blocks.
-- `WikiBlock`: simplified markdown blocks (headings, paragraphs, lists, images, code).
+- `WikiBlock`: simplified markdown blocks (headings, paragraphs, lists, image rows, code).
+- `WikiImageSpec`: one image inside a row (resolved source + optional `w=NN%`).
 - `WikiImageEntry`: image cache record (pending/ready/failed).
 - `InlineSegment`: inline markdown fragment for plain/code/bold text.
 
@@ -26,6 +27,14 @@ Inline rendering notes:
   which are stripped before local path resolution.
 - relative local image paths are normalized through `PathBuf` on Windows and
   use the same invalid-character replacement as installer ZIP extraction.
+
+Image rendering notes:
+- a Markdown line made only of `![alt](src)` tags becomes one `ImageRow`; two
+  tags on the same line render side by side, the shorter one vertically centered.
+- each image defaults to `WIKI_DEFAULT_IMAGE_WIDTH_FRACTION` of the content
+  width (so two defaults fill one row) and is never upscaled past its native
+  size; a `w=NN%` token inside the alt text overrides the target width.
+- the alt text itself is not drawn under the image (it only carries directives).
 */
 
 use eframe::egui;
@@ -59,7 +68,21 @@ enum WikiBlock {
     Bullet(String),
     Numbered(String),
     Code(String),
-    Image { alt: String, source: String },
+    /// One or more images sharing a single horizontal row. A one-spec row is a
+    /// normal standalone image; a two-spec row renders the images side by side.
+    ImageRow(Vec<WikiImageSpec>),
+}
+
+/// One image inside a [`WikiBlock::ImageRow`].
+///
+/// `source` is the resolved storage-relative image path or remote URL.
+/// `width_percent` is the optional `w=NN%` directive parsed from the Markdown
+/// alt text (percentage of the wiki content width); `None` selects the default
+/// width fraction. Alt text is not rendered, so it only carries directives.
+#[derive(Debug, Clone)]
+struct WikiImageSpec {
+    source: String,
+    width_percent: Option<f32>,
 }
 
 struct WikiImageEntry {
@@ -74,6 +97,25 @@ struct InlineSegment {
     text: String,
     is_code: bool,
     is_bold: bool,
+}
+
+/// Default display width of a wiki image as a fraction of the available content
+/// width when no `w=NN%` directive is present. Two default images fill one row.
+const WIKI_DEFAULT_IMAGE_WIDTH_FRACTION: f32 = 0.5;
+
+/// Owned render instruction for one slot of an image row, decoupled from the
+/// image cache so the egui layout closure does not need to borrow the tab state.
+enum WikiRowItem {
+    Image {
+        texture: egui::TextureId,
+        size: egui::Vec2,
+    },
+    Pending(String),
+    Error {
+        source: String,
+        error: String,
+    },
+    Missing(String),
 }
 
 enum WikiScanResult {
@@ -225,8 +267,8 @@ impl WikiTabState {
                     );
                 });
             }
-            WikiBlock::Image { alt, source } => {
-                self.draw_image(ui, alt, source);
+            WikiBlock::ImageRow(specs) => {
+                self.draw_image_row(ui, specs);
             }
         }
         ui.add_space(4.0);
@@ -277,48 +319,145 @@ impl WikiTabState {
         }
     }
 
-    fn draw_image(&mut self, ui: &mut egui::Ui, alt: &str, source: &str) {
-        let key = source.to_owned();
-        if !self.image_cache.contains_key(&key) {
-            self.image_cache.insert(
-                key.clone(),
-                WikiImageEntry {
-                    texture: None,
-                    original_size: egui::vec2(1.0, 1.0),
-                    pending: true,
-                    error: None,
-                },
-            );
-            self.spawn_image_load_thread(key.clone());
+    /// Draws a row of one or more images on a single horizontal line.
+    ///
+    /// Each image targets its `w=NN%` directive or the default width fraction of
+    /// the available content width, is never upscaled past its native size, and
+    /// the whole row is uniformly shrunk if the combined width (plus spacing)
+    /// would overflow. Loaded images are vertically centered against the tallest
+    /// one; pending or failed images render an inline placeholder in their slot.
+    fn draw_image_row(&mut self, ui: &mut egui::Ui, specs: &[WikiImageSpec]) {
+        for spec in specs {
+            self.ensure_image_loading(&spec.source);
         }
 
-        let Some(entry) = self.image_cache.get(&key) else {
-            return;
-        };
-        if let Some(texture) = entry.texture.as_ref() {
-            let max_w = ui.available_width().max(1.0);
-            let scale = (max_w / entry.original_size.x).min(1.0);
-            let size = entry.original_size * scale;
-            ui.add(egui::Image::new((texture.id(), size)));
-            if !alt.is_empty() {
-                ui.small(alt);
-            }
-        } else if entry.pending {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Загрузка изображения: {source}"));
-            });
-        } else if let Some(err) = entry.error.as_ref() {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("Не удалось загрузить изображение {source}: {err}"),
-            );
+        let available = ui.available_width().max(1.0);
+        let spacing = ui.spacing().item_spacing.x;
+
+        // First pass: resolve the display size of every already-loaded image.
+        let display_sizes: Vec<Option<egui::Vec2>> = specs
+            .iter()
+            .map(|spec| self.image_display_size(spec, available))
+            .collect();
+
+        // Uniformly shrink the loaded images so the whole row fits the width
+        // (keeps aspect ratios; only ever shrinks, never enlarges).
+        let loaded_count = display_sizes.iter().filter(|size| size.is_some()).count();
+        let total_w: f32 = display_sizes.iter().flatten().map(|size| size.x).sum();
+        let gaps = spacing * (loaded_count.saturating_sub(1)) as f32;
+        let total = total_w + gaps;
+        let shrink = if total > available && total > 0.0 {
+            available / total
         } else {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("Изображение не загружено: {source}"),
-            );
+            1.0
+        };
+
+        // Build owned render items so the layout closure does not borrow `self`.
+        let items: Vec<WikiRowItem> = specs
+            .iter()
+            .zip(display_sizes.iter())
+            .map(|(spec, size)| self.build_row_item(spec, *size, shrink))
+            .collect();
+
+        // `ui.horizontal` uses `Align::Center`, so the shorter image is
+        // vertically centered against the taller one automatically.
+        ui.horizontal(|ui| {
+            for item in &items {
+                match item {
+                    WikiRowItem::Image { texture, size } => {
+                        ui.add(egui::Image::new((*texture, *size)));
+                    }
+                    WikiRowItem::Pending(source) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Загрузка изображения: {source}"));
+                        });
+                    }
+                    WikiRowItem::Error { source, error } => {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("Не удалось загрузить изображение {source}: {error}"),
+                        );
+                    }
+                    WikiRowItem::Missing(source) => {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("Изображение не загружено: {source}"),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Computes the pre-shrink display size of `spec` from its native size and
+    /// width directive, or `None` if the image is not loaded yet.
+    ///
+    /// `available` is the row content width. The target width is `w=NN%` (or the
+    /// default fraction) of `available`, clamped so it never exceeds the native
+    /// width; the height follows the native aspect ratio.
+    fn image_display_size(&self, spec: &WikiImageSpec, available: f32) -> Option<egui::Vec2> {
+        let native = self
+            .image_cache
+            .get(&spec.source)
+            .filter(|entry| entry.texture.is_some())
+            .map(|entry| entry.original_size)
+            .filter(|size| size.x > 0.0 && size.y > 0.0)?;
+        let fraction = spec
+            .width_percent
+            .map_or(WIKI_DEFAULT_IMAGE_WIDTH_FRACTION, |percent| percent / 100.0)
+            .max(0.0);
+        // Target width from the directive, never upscaled past the native width.
+        let target_w = (available * fraction).clamp(1.0, native.x);
+        let scale = target_w / native.x;
+        Some(egui::vec2(target_w, native.y * scale))
+    }
+
+    /// Translates a spec plus its resolved size into an owned [`WikiRowItem`],
+    /// applying the row-wide `shrink` factor to loaded images.
+    fn build_row_item(
+        &self,
+        spec: &WikiImageSpec,
+        display_size: Option<egui::Vec2>,
+        shrink: f32,
+    ) -> WikiRowItem {
+        let Some(entry) = self.image_cache.get(&spec.source) else {
+            return WikiRowItem::Missing(spec.source.clone());
+        };
+        if let (Some(size), Some(texture)) = (display_size, entry.texture.as_ref()) {
+            return WikiRowItem::Image {
+                texture: texture.id(),
+                size: size * shrink,
+            };
         }
+        if entry.pending {
+            WikiRowItem::Pending(spec.source.clone())
+        } else if let Some(error) = entry.error.as_ref() {
+            WikiRowItem::Error {
+                source: spec.source.clone(),
+                error: error.clone(),
+            }
+        } else {
+            WikiRowItem::Missing(spec.source.clone())
+        }
+    }
+
+    /// Inserts a pending cache entry for `source` and starts its background
+    /// decode if the image is not already tracked.
+    fn ensure_image_loading(&mut self, source: &str) {
+        if self.image_cache.contains_key(source) {
+            return;
+        }
+        self.image_cache.insert(
+            source.to_owned(),
+            WikiImageEntry {
+                texture: None,
+                original_size: egui::vec2(1.0, 1.0),
+                pending: true,
+                error: None,
+            },
+        );
+        self.spawn_image_load_thread(source.to_owned());
     }
 
     fn poll_background(&mut self, ctx: &egui::Context) {
@@ -585,12 +724,15 @@ fn parse_markdown_to_blocks(markdown: &str, base_dir: &Path) -> Vec<WikiBlock> {
             blocks.push(WikiBlock::Heading { level, text });
             continue;
         }
-        if let Some((alt, source)) = parse_image_line(trimmed) {
-            let resolved = resolve_image_source(base_dir, &source);
-            blocks.push(WikiBlock::Image {
-                alt,
-                source: resolved,
-            });
+        if let Some(images) = parse_image_row(trimmed) {
+            let specs = images
+                .into_iter()
+                .map(|(alt, source)| WikiImageSpec {
+                    source: resolve_image_source(base_dir, &source),
+                    width_percent: parse_image_alt_width(&alt),
+                })
+                .collect();
+            blocks.push(WikiBlock::ImageRow(specs));
             continue;
         }
         if let Some(text) = parse_bullet(trimmed) {
@@ -610,7 +752,7 @@ fn parse_markdown_to_blocks(markdown: &str, base_dir: &Path) -> Vec<WikiBlock> {
                 || n.starts_with("- ")
                 || n.starts_with("```")
                 || parse_numbered(n).is_some()
-                || parse_image_line(n).is_some()
+                || parse_image_row(n).is_some()
             {
                 break;
             }
@@ -640,21 +782,66 @@ fn parse_heading(line: &str) -> Option<(usize, String)> {
     }
 }
 
-fn parse_image_line(line: &str) -> Option<(String, String)> {
-    if !line.starts_with("![") {
+/// Parses a Markdown line that consists only of `![alt](source)` image tags.
+///
+/// Returns the `(alt, source)` pairs in order (one entry for a standalone image,
+/// two for a side-by-side row). Returns `None` when the line is not purely made
+/// of image tags (mixed text or no image), so it can fall back to a paragraph.
+fn parse_image_row(line: &str) -> Option<Vec<(String, String)>> {
+    let mut rest = line.trim();
+    if !rest.starts_with("![") {
         return None;
     }
-    let alt_end = line.find("](")?;
-    if !line.ends_with(')') {
-        return None;
+    let mut images = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        // A non-empty, non-image remainder means the line mixes text with images
+        // and is not a pure image row, so the whole line is rejected here.
+        let (alt, source, consumed) = parse_leading_image_tag(rest)?;
+        images.push((alt, source));
+        rest = &rest[consumed..];
     }
-    let alt = line[2..alt_end].trim().to_owned();
-    let src = normalize_markdown_image_source(line[(alt_end + 2)..(line.len() - 1)].trim());
-    if src.is_empty() {
+    if images.is_empty() {
         None
     } else {
-        Some((alt, src))
+        Some(images)
     }
+}
+
+/// Parses a single leading `![alt](source)` image tag from `text`.
+///
+/// Returns the trimmed alt text, the normalized image source, and the number of
+/// bytes consumed up to and including the closing `)`. Returns `None` if `text`
+/// does not start with a well-formed image tag or the source is empty.
+fn parse_leading_image_tag(text: &str) -> Option<(String, String, usize)> {
+    if !text.starts_with("![") {
+        return None;
+    }
+    let alt_end = text.find("](")?;
+    let src_start = alt_end + 2;
+    let close_rel = text[src_start..].find(')')?;
+    let close_idx = src_start + close_rel;
+    let alt = text[2..alt_end].trim().to_owned();
+    let source = normalize_markdown_image_source(text[src_start..close_idx].trim());
+    if source.is_empty() {
+        return None;
+    }
+    Some((alt, source, close_idx + 1))
+}
+
+/// Extracts an optional display-width directive from Markdown image alt text.
+///
+/// Recognizes a `w=NN` or `w=NN%` token as a percentage of the wiki content
+/// width. Returns `None` when no positive, valid directive is present.
+fn parse_image_alt_width(alt: &str) -> Option<f32> {
+    alt.split_whitespace().find_map(|token| {
+        let value = token.strip_prefix("w=")?;
+        let value = value.strip_suffix('%').unwrap_or(value);
+        value.parse::<f32>().ok().filter(|percent| *percent > 0.0)
+    })
 }
 
 fn normalize_markdown_image_source(source: &str) -> String {
@@ -873,43 +1060,71 @@ fn load_remote_image_rgba(_url: &str) -> Result<(usize, usize, Vec<u8>), String>
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_image_line, resolve_image_source};
+    use super::{parse_image_alt_width, parse_image_row, resolve_image_source};
     use std::path::Path;
 
     #[test]
-    fn parse_image_line_strips_markdown_angle_delimiters() {
+    fn parse_image_row_strips_markdown_angle_delimiters() {
         let parsed =
-            parse_image_line("![alt text](<images/1: Лента картинок и её параметры/image.png>)");
+            parse_image_row("![alt text](<images/1: Лента картинок и её параметры/image.png>)");
 
         assert_eq!(
             parsed,
-            Some((
+            Some(vec![(
                 "alt text".to_owned(),
                 "images/1: Лента картинок и её параметры/image.png".to_owned()
-            ))
+            )])
         );
     }
 
     #[test]
-    fn parse_image_line_keeps_plain_sources_unchanged() {
-        let parsed = parse_image_line("![alt text](images/with spaces/image.png)");
+    fn parse_image_row_keeps_plain_sources_unchanged() {
+        let parsed = parse_image_row("![alt text](images/with spaces/image.png)");
 
         assert_eq!(
             parsed,
-            Some((
+            Some(vec![(
                 "alt text".to_owned(),
                 "images/with spaces/image.png".to_owned()
-            ))
+            )])
         );
+    }
+
+    #[test]
+    fn parse_image_row_parses_two_images_on_one_line() {
+        let parsed = parse_image_row("![a](images/1_1.png) ![b w=70%](images/1_2.png)");
+
+        assert_eq!(
+            parsed,
+            Some(vec![
+                ("a".to_owned(), "images/1_1.png".to_owned()),
+                ("b w=70%".to_owned(), "images/1_2.png".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_image_row_rejects_mixed_text_or_no_image() {
+        assert_eq!(parse_image_row("![a](images/1.png) trailing text"), None);
+        assert_eq!(parse_image_row("plain paragraph"), None);
+    }
+
+    #[test]
+    fn parse_image_alt_width_reads_percent_directive() {
+        assert_eq!(parse_image_alt_width("image w=70%"), Some(70.0));
+        assert_eq!(parse_image_alt_width("w=50"), Some(50.0));
+        assert_eq!(parse_image_alt_width("image"), None);
+        assert_eq!(parse_image_alt_width("w=0%"), None);
     }
 
     #[test]
     fn resolve_image_source_joins_angle_delimited_relative_path_after_parse() {
-        let (_, source) = parse_image_line("![alt](<images/with spaces/image.png>)")
+        let row = parse_image_row("![alt](<images/with spaces/image.png>)")
             .expect("valid image markdown must parse");
+        let (_, source) = &row[0];
 
         assert_eq!(
-            resolve_image_source(Path::new("wiki"), &source),
+            resolve_image_source(Path::new("wiki"), source),
             "wiki/images/with spaces/image.png"
         );
     }
