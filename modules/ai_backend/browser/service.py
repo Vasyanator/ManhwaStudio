@@ -32,6 +32,13 @@ Notes:
   dependency cannot break AI startup.
 - A single lock serialises browser commands (mirroring the old single stdin loop);
   AI handlers use other services and are unaffected.
+- Thread affinity: the IPC dispatcher runs each request on an arbitrary pool
+  worker, but Playwright's sync objects are greenlet-bound to the thread that
+  created the browser context. So all daemon work that touches the browser
+  (``_handle_command`` and ``close``) is marshalled onto one dedicated owner
+  thread (``_browser_executor``); the daemon's own background loop is given the
+  same hook so its Playwright calls run there too. The lock still serialises;
+  the executor adds the missing single-thread guarantee.
 - Cancellation: for the commands whose long work polls a ``cancel_file``
   (auto-fetch / deep-intercept), the IPC ``cancel_event`` is bridged to a temp
   cancel file. Other commands run to completion, exactly as the stdio daemons did
@@ -43,6 +50,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -79,6 +87,14 @@ class BrowserService:
         # so stray background progress is harmlessly dropped).
         self._active_emitter: Any = None
         self._captured: Optional[dict[str, Any]] = None
+        # Single owner thread for every Playwright/browser call. Playwright's sync
+        # API is greenlet-bound to its creating thread; the dispatcher would
+        # otherwise run the browser launch and later commands on different pool
+        # workers and trip "Cannot switch to a different thread". This executor
+        # pins all browser work to one thread for the service's lifetime.
+        self._browser_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cloak-browser"
+        )
 
     # -- IPC entry point ----------------------------------------------------
 
@@ -113,7 +129,9 @@ class BrowserService:
             self._active_emitter = progress_emitter
             self._captured = None
             try:
-                daemon._handle_command(command)
+                # Marshal onto the owner thread so the browser launch and every
+                # subsequent command share one Playwright greenlet thread.
+                self._run_on_browser_thread(daemon._handle_command, command)
                 captured = self._captured
             finally:
                 self._active_emitter = None
@@ -165,12 +183,27 @@ class BrowserService:
         # or a defensively-emitted error event.
         self._captured = dict(payload)
 
+    def _run_on_browser_thread(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run ``fn`` on the single browser-owner thread and block for its result.
+
+        Playwright's sync API is greenlet-bound to the thread that created the
+        browser context, so every browser call must run on one fixed thread. The
+        IPC dispatcher hands each request to an arbitrary pool worker; this hop
+        re-pins the actual browser work to ``_browser_executor``'s sole thread.
+        Exceptions raised by ``fn`` propagate to the caller unchanged.
+        """
+        return self._browser_executor.submit(fn, *args, **kwargs).result()
+
     def _ensure_daemon(self) -> Any:
         if self._daemon is None:
             self._daemon = self._build_daemon(self._backend)
             # Redirect the daemon's stdout JSON emitter into this service so
             # progress streams over IPC and terminal events become return values.
             self._daemon._emit = self._sink
+            # Let the daemon's own background loop (link collection) run its
+            # Playwright calls on the same owner thread instead of its worker
+            # thread, which would otherwise trip the greenlet cross-thread error.
+            self._daemon._run_on_browser_thread = self._run_on_browser_thread
         return self._daemon
 
     def _build_daemon(self, backend: str) -> Any:
@@ -194,7 +227,9 @@ class BrowserService:
         self._daemon = None
         if daemon is not None:
             try:
-                daemon.close()
+                # Playwright teardown must run on the same owner thread that
+                # created the context, so marshal the close too.
+                self._run_on_browser_thread(daemon.close)
             except Exception:  # noqa: BLE001 - shutdown best-effort
                 LOG.exception("Failed to close browser daemon")
 

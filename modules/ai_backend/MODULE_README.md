@@ -25,7 +25,11 @@ the download contract.
 ## Files and submodules
 - `browser/service.py`: `BrowserService` — hosts the Selenium/CloakBrowser scraping session
   in-process (driving the daemon classes from `modules/new_project/`), behind the `browser.command`
-  IPC method (`ipc/handlers/browser.py`).
+  IPC method (`ipc/handlers/browser.py`). Because Playwright's sync API is greenlet-bound to its
+  creating thread while the dispatcher hands each request to an arbitrary pool worker, all daemon
+  browser work (`_handle_command`, `close`, and the daemon's background loop via the injected
+  `_run_on_browser_thread` hook) is marshalled onto one dedicated owner thread
+  (`_browser_executor`). `test_browser_service.py` covers this thread-affinity contract.
 - `server.py`: service construction, `AppState` wiring, and framed IPC server startup (delegates to
   `ipc/frame_server.py`). The legacy HTTP server has been removed; all IPC goes through the `ipc/`
   package. See `ipc/MODULE_README.md` and `ipc/PROTOCOL.md` for the transport contract.

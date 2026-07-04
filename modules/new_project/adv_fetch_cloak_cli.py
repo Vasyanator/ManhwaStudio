@@ -45,7 +45,7 @@ import traceback
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote, unquote, unquote_to_bytes, urljoin, urlparse, urlunparse
 
 import requests
@@ -144,6 +144,36 @@ class DeepCaptureDomOrder:
     element_to_index: dict[int, int]
 
 
+def _run_inline(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Passthrough browser-thread hook: run ``fn`` on the caller's thread.
+
+    Default for standalone use (the ``run()`` stdin loop), where the main thread
+    both owns the browser and drives every command. The in-process
+    ``BrowserService`` overrides ``_run_on_browser_thread`` to marshal onto its
+    single owner thread instead.
+    """
+    return fn(*args, **kwargs)
+
+
+def _is_target_closed(exc: BaseException) -> bool:
+    """True if ``exc`` is Playwright's "target/page/context closed" error.
+
+    Playwright does not re-export ``TargetClosedError`` from ``sync_api``, and the
+    daemon must not import Playwright at module load (it stays lazy for AI-only
+    startup). So resolve the class lazily and fall back to a message match if the
+    class is somehow unavailable.
+    """
+    try:
+        from playwright._impl._errors import TargetClosedError
+
+        if isinstance(exc, TargetClosedError):
+            return True
+    except Exception:  # noqa: BLE001 - Playwright not importable; use message match
+        pass
+    message = str(exc)
+    return "has been closed" in message or "Target page, context or browser" in message
+
+
 class CloakFetchDaemon:
     def __init__(self) -> None:
         self._context = None
@@ -171,10 +201,16 @@ class CloakFetchDaemon:
         self._cdp_lock = threading.Lock()
         self._canvas_diag_seen_hashes: set[str] = set()
         self._page_diagnostics_attached: set[int] = set()
-        # Tabs in the order they were opened (newest last), tracked from the context
-        # "page" event so "most recently opened" is reliable even when `context.pages`
-        # order is not (e.g. restored tabs in the persistent profile).
-        self._page_open_order: list[Any] = []
+        # Whether the observe-only active-tab monitor context init script is installed.
+        # The monitor timestamps each tab's last foreground transition so the active
+        # tab can be resolved live, with no memory of past/first tabs. See
+        # `_install_active_monitor_context` and `_resolve_active_page`.
+        self._active_monitor_installed = False
+        # Hook to run Playwright-touching work on the browser-owner thread. Default
+        # passthrough keeps standalone behaviour; the in-process BrowserService
+        # overrides it so the background link-collect loop's page calls run on the
+        # one thread that owns the browser context (Playwright is thread-affine).
+        self._run_on_browser_thread: Callable[..., Any] = _run_inline
 
     def run(self) -> int:
         self._emit({"event": "ready", "downloader_version": VERSION})
@@ -212,8 +248,8 @@ class CloakFetchDaemon:
         self._deep_capture_script_installed = False
         self._context_response_listener_installed = False
         self._context_page_diagnostics_installed = False
+        self._active_monitor_installed = False
         self._page_diagnostics_attached.clear()
-        self._page_open_order.clear()
         self._intercept_active = False
         self._link_collect_active = False
         self._deep_capture_active = False
@@ -338,7 +374,7 @@ class CloakFetchDaemon:
                     page.wait_for_timeout(200)
 
     def fetch(self, pattern: str, max_parallel: int = 1) -> FetchResult:
-        page_url = self._select_best_fetch_target(pattern)
+        page_url = self._active_page_url("fetch")
         self._emit_progress("collect", 0, 0)
         candidates = self._collect_candidates(page_url)
         filtered = self._filter_candidates(candidates, pattern)
@@ -354,7 +390,7 @@ class CloakFetchDaemon:
         max_parallel: int = 1,
         cancel_file: Optional[Path] = None,
     ) -> dict[str, Any]:
-        page_url = self._select_best_fetch_target("")
+        page_url = self._active_page_url("auto")
         self._emit_progress("collect", 0, 0)
         candidates = self._collect_auto_candidate_links(page_url)
         return self._download_auto_candidate_links(
@@ -378,7 +414,7 @@ class CloakFetchDaemon:
         if self._canvas_capture is not None or self._intercept_active:
             raise RuntimeError("Сначала завершите текущий перехват Canvas.")
 
-        page_url = self._select_best_fetch_target(pattern)
+        page_url = self._active_page_url("collect")
         stop_event = threading.Event()
         collect_lock = threading.Lock()
         worker = threading.Thread(
@@ -436,7 +472,7 @@ class CloakFetchDaemon:
         if self._canvas_capture is not None or self._intercept_active:
             raise RuntimeError("Сначала завершите текущий перехват Canvas.")
         self._reset_canvas_diagnostics()
-        page_url = self._select_best_canvas_target()
+        page_url = self._active_page_url("canvas")
         self._emit_progress("collect_canvas", 0, 0)
         canvas_entries = self._collect_canvas_entries()
         if not canvas_entries:
@@ -453,7 +489,7 @@ class CloakFetchDaemon:
         if self._canvas_capture is not None or self._intercept_active:
             raise RuntimeError("Перехват Canvas уже запущен.")
         self._reset_canvas_diagnostics()
-        page_url = self._select_best_canvas_target()
+        page_url = self._active_page_url("intercept")
         stop_event = threading.Event()
         capture_lock = threading.Lock()
         self._canvas_capture = CanvasCaptureState(
@@ -513,37 +549,80 @@ class CloakFetchDaemon:
         if self._canvas_capture is not None or self._intercept_active:
             raise RuntimeError("Сначала завершите текущий перехват Canvas.")
 
-        page = self._select_active_page()
-        with self._page_lock:
-            page_url = str(page.url or "").strip()
-            if not page_url or page_url in {"about:blank", "data:,"}:
-                raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
+        output_dir = Path(tempfile.mkdtemp(prefix="mangafucker_adv_cloak_deep_"))
+        raw_dir = output_dir / "_raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        stop_event = threading.Event()
+        self._deep_capture = DeepCaptureState(
+            stop_event=stop_event,
+            lock=threading.Lock(),
+            entries=[],
+            hashes=set(),
+            page_url="",
+            output_dir=output_dir,
+            raw_dir=raw_dir,
+        )
+        self._deep_capture_active = True
+
+        def prepare(page: Any) -> None:
+            # Install the observe-only capture hooks before the reload so the reloaded
+            # document is captured from its first byte.
             self._install_deep_capture_init_script(page)
-            output_dir = Path(tempfile.mkdtemp(prefix="mangafucker_adv_cloak_deep_"))
-            raw_dir = output_dir / "_raw"
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            stop_event = threading.Event()
-            self._deep_capture = DeepCaptureState(
-                stop_event=stop_event,
-                lock=threading.Lock(),
-                entries=[],
-                hashes=set(),
-                page_url=page_url,
-                output_dir=output_dir,
-                raw_dir=raw_dir,
-            )
-            self._deep_capture_active = True
             self._attach_context_response_cache()
             self._attach_response_cache(page)
             self._attach_cdp_network_capture(page)
             self._emit_progress("browser", 0, 0)
-            page.reload(wait_until="domcontentloaded", timeout=60_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10_000)
-            except Exception:  # noqa: BLE001
-                LOG.debug("Deep capture page did not reach networkidle", exc_info=True)
+
+        # Resolve the active tab and reload it, re-resolving if the user closes/switches
+        # the tab mid-reload. Roll back the "started" state on any failure so a retry is
+        # not permanently rejected with "Глубокий перехват уже запущен."
+        try:
+            page = self._reload_capture_page(prepare)
+        except Exception:
+            self._clear_deep_capture_runtime()
+            raise
+        page_url = str(page.url or "").strip()
+        capture = self._deep_capture
+        if capture is not None:
+            capture.page_url = page_url
         self._emit_progress("collect", 0, 0)
         return page_url
+
+    def _reload_capture_page(self, prepare: Callable[[Any], None]) -> Any:
+        """Resolve the active tab, run ``prepare(page)`` on it, and reload it.
+
+        Re-resolves the active tab and retries (bounded) if the tab is closed mid-reload
+        because the user switched/closed tabs. Raises the standard "open a chapter" error
+        if the active tab has no real URL, and re-raises any non-close failure unchanged.
+        Returns the reloaded, still-live page.
+        """
+        last_exc: Optional[Exception] = None
+        for _ in range(3):
+            page = self._resolve_active_page("deep")
+            if page.is_closed():
+                continue
+            try:
+                with self._page_lock:
+                    page_url = str(page.url or "").strip()
+                    if not page_url or page_url in {"about:blank", "data:,"}:
+                        raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
+                    prepare(page)
+                    page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                    except Exception:  # noqa: BLE001
+                        LOG.debug("Deep capture page did not reach networkidle", exc_info=True)
+                return page
+            except Exception as exc:  # noqa: BLE001
+                if not _is_target_closed(exc):
+                    raise
+                last_exc = exc
+                LOG.debug(
+                    "active tab closed during deep-capture reload; re-resolving", exc_info=True
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Активная вкладка закрылась во время запуска перехвата.")
 
     def deep_intercept_status(self) -> dict[str, int]:
         """Live count of what deep capture has gathered so far, split by kind.
@@ -670,6 +749,10 @@ class CloakFetchDaemon:
         self._attach_context_page_diagnostics()
         self._page = self._context.new_page()
         self._attach_page_diagnostics(self._page)
+        # Install the active-tab monitor now (browser is foreground at launch), so
+        # every subsequent user tab switch is recorded and the active tab can be
+        # resolved live without any first-tab/tracked-tab memory.
+        self._install_active_monitor_context()
         self._stop_link_collect()
         self._stop_canvas_capture()
         self._intercept_active = False
@@ -739,8 +822,6 @@ class CloakFetchDaemon:
         page_id = id(page)
         if page_id in self._page_diagnostics_attached:
             return
-        if page not in self._page_open_order:
-            self._page_open_order.append(page)
         try:
             page.on("console", self._emit_page_console_diagnostic)
             page.on("pageerror", self._emit_page_error_diagnostic)
@@ -1240,122 +1321,111 @@ class CloakFetchDaemon:
         self._ensure_browser()
         return [page for page in self._context.pages if not page.is_closed()]
 
-    def _latest_opened(self, pages: list[Any]) -> Optional[Any]:
-        """Return the most recently opened page among `pages` (newest by open order)."""
-        if not pages:
-            return None
-        wanted = {id(page): page for page in pages}
-        for page in reversed(self._page_open_order):
-            match = wanted.get(id(page))
-            if match is not None:
-                return match
-        return pages[-1]
+    def _install_active_monitor_context(self) -> None:
+        """Install the observe-only active-tab monitor once per context.
 
-    def _select_active_page(self) -> Any:
-        """Return the foreground tab the user is actually viewing, for deep capture.
+        Adds `ACTIVE_MONITOR_JS` as a context init script (runs on every future
+        document load, after CloakBrowser's own stealth scripts) and seeds any tabs
+        already open at launch (restored persistent-profile tabs never get the init
+        script because they are not navigated). The monitor only adds passive
+        listeners and one `window` object — no prototype patching — so the anti-detect
+        layer is untouched. Idempotent via `_active_monitor_installed`.
+        """
+        if self._context is None or self._active_monitor_installed:
+            return
+        try:
+            self._context.add_init_script(ACTIVE_MONITOR_JS)
+        except Exception:  # noqa: BLE001
+            LOG.debug("Failed to install active-tab monitor init script", exc_info=True)
+            return
+        self._active_monitor_installed = True
+        try:
+            existing = list(self._context.pages)
+        except Exception:  # noqa: BLE001
+            existing = []
+        for page in existing:
+            try:
+                if not page.is_closed():
+                    page.evaluate(ACTIVE_MONITOR_JS)
+            except Exception:  # noqa: BLE001
+                LOG.debug("Failed to seed active-tab monitor on existing page", exc_info=True)
 
-        The active tab is the one the user has in front: a focused tab (authoritative —
-        the foreground tab of the focused window) wins, else a visible tab, and only when
-        the browser window is hidden/occluded so neither can be read do we fall back to the
-        most recently opened tab. Each candidate group is resolved to its most recently
-        opened member so a freshly opened chapter tab is preferred over the first-opened
-        list tab. Sets `self._page` to the chosen page and brings it to front.
+    def _resolve_active_page(self, reason: str) -> Any:
+        """Resolve the tab the user currently has in front — live, with no memory.
+
+        Ranks live real-URL tabs purely by the active-tab monitor's last-foreground
+        timestamp (`window.__mfActiveMonitor`), which persists through OS-defocus and
+        window occlusion because it records the last *transition* rather than the
+        instantaneous `visibilityState`/`hasFocus()` (both of which read false while
+        the Studio window is focused). Tie-break: current `visibilityState==='visible'`.
+        There is deliberately NO fallback to a tracked page, first/most-recently-opened
+        tab, or the initially opened URL. Degenerate cases: exactly one live real-URL
+        tab is used as-is; none present falls through to `_require_page` (which raises
+        the standard "open a chapter" error). Re-resolves if the chosen tab is already
+        closed. Sets `self._page` as a cache for incidental callers and returns the page.
         """
         with self._page_lock:
-            valid = [
-                page
-                for page in self._valid_pages()
-                if str(page.url or "").strip() not in {"", "about:blank", "data:,"}
-            ]
-            if not valid:
-                return self._require_page()
-            visible_pages: list[Any] = []
-            focused_pages: list[Any] = []
-            for page in valid:
+            for _ in range(3):
+                valid = [
+                    page
+                    for page in self._valid_pages()
+                    if str(page.url or "").strip() not in {"", "about:blank", "data:,"}
+                ]
+                if not valid:
+                    return self._require_page()
+                if len(valid) == 1:
+                    chosen = valid[0]
+                    basis = "only"
+                else:
+                    scored: list[tuple[float, bool, Any]] = []
+                    for page in valid:
+                        active_ts = 0.0
+                        visible = False
+                        try:
+                            info = page.evaluate(ACTIVE_MONITOR_READ_JS)
+                        except Exception:  # noqa: BLE001
+                            info = None
+                        if isinstance(info, dict):
+                            try:
+                                active_ts = float(info.get("a") or 0)
+                            except (TypeError, ValueError):
+                                active_ts = 0.0
+                            visible = bool(info.get("vis"))
+                        scored.append((active_ts, visible, page))
+                    # Rank by last-active timestamp, then current visibility. The key
+                    # returns only comparable scalars so Page objects are never compared.
+                    best = max(scored, key=lambda item: (item[0], 1 if item[1] else 0))
+                    chosen = best[2]
+                    basis = "active" if best[0] > 0 else ("visible" if best[1] else "ambiguous")
+                if chosen.is_closed():
+                    continue
+                self._page = chosen
+                self._attach_page_diagnostics(chosen)
                 try:
-                    state = page.evaluate(
-                        "() => ({ visible: document.visibilityState === 'visible', focused: document.hasFocus() })"
-                    )
+                    chosen.bring_to_front()
                 except Exception:  # noqa: BLE001
-                    LOG.debug("Failed to read page visibility for deep capture", exc_info=True)
-                    continue
-                if isinstance(state, dict):
-                    if state.get("focused"):
-                        focused_pages.append(page)
-                    if state.get("visible"):
-                        visible_pages.append(page)
-            chosen = (
-                self._latest_opened(focused_pages)
-                or self._latest_opened(visible_pages)
-                or self._latest_opened(valid)
-            )
-            self._page = chosen
-            self._attach_page_diagnostics(chosen)
-            try:
-                chosen.bring_to_front()
-            except Exception:  # noqa: BLE001
-                LOG.debug("Failed to bring deep capture page to front", exc_info=True)
-            _debug_log(
-                "cloak deep capture: selected active tab url=%s (focused=%d visible=%d of %d valid)",
-                str(chosen.url or ""),
-                len(focused_pages),
-                len(visible_pages),
-                len(valid),
-            )
-            return chosen
+                    LOG.debug("Failed to bring active page to front", exc_info=True)
+                _debug_log(
+                    "cloak active tab (%s): basis=%s url=%s of %d valid",
+                    reason,
+                    basis,
+                    str(chosen.url or ""),
+                    len(valid),
+                )
+                return chosen
+            return self._require_page()
 
-    def _select_best_fetch_target(self, pattern: str) -> str:
-        with self._page_lock:
-            ranked: list[tuple[int, int, int, Any, str]] = []
-            for index, page in enumerate(self._valid_pages()):
-                page_url = str(page.url or "").strip()
-                if not page_url or page_url in {"about:blank", "data:,"}:
-                    continue
-                self._page = page
-                candidates = self._collect_candidates(page_url)
-                filtered = self._filter_candidates(candidates, pattern)
-                ranked.append((len(filtered), len(candidates), index, page, page_url))
-            if not ranked:
-                page = self._require_page()
-                page_url = str(page.url or "").strip()
-                if not page_url or page_url in {"about:blank", "data:,"}:
-                    raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
-                return page_url
-            best_filtered, best_total, _index, page, page_url = max(ranked)
-            self._page = page
-            self._attach_page_diagnostics(page)
-            page.bring_to_front()
-            _debug_log("cloak page select fetch: filtered=%d total=%d url=%s", best_filtered, best_total, page_url)
-            return page_url
+    def _active_page_url(self, reason: str) -> str:
+        """Resolve the active tab and return its real URL, or raise the standard error.
 
-    def _select_best_canvas_target(self) -> str:
-        with self._page_lock:
-            ranked: list[tuple[int, int, Any, str]] = []
-            for index, page in enumerate(self._valid_pages()):
-                page_url = str(page.url or "").strip()
-                if not page_url or page_url in {"about:blank", "data:,"}:
-                    continue
-                self._page = page
-                ranked.append((self._count_canvas_entries(), index, page, page_url))
-            if not ranked:
-                page = self._require_page()
-                page_url = str(page.url or "").strip()
-                if not page_url or page_url in {"about:blank", "data:,"}:
-                    raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
-                return page_url
-            canvas_count, _index, page, page_url = max(ranked)
-            self._page = page
-            self._attach_page_diagnostics(page)
-            page.bring_to_front()
-            _debug_log("cloak page select canvas: count=%d url=%s", canvas_count, page_url)
-            return page_url
-
-    def _count_canvas_entries(self) -> int:
-        try:
-            return int(self._require_page().evaluate(COUNT_CANVAS_JS) or 0)
-        except Exception:  # noqa: BLE001
-            LOG.debug("Failed to count canvas entries", exc_info=True)
-            return 0
+        Shared entry point for every non-deep download mode (fetch / auto / link
+        collect / canvas) so they all target the same tab the user is viewing.
+        """
+        page = self._resolve_active_page(reason)
+        page_url = str(page.url or "").strip()
+        if not page_url or page_url in {"about:blank", "data:,"}:
+            raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
+        return page_url
 
     def _collect_canvas_entries(self) -> list[dict[str, Any]]:
         with self._page_lock:
@@ -1870,14 +1940,20 @@ class CloakFetchDaemon:
                 collect = self._link_collect
                 if collect is None:
                     return
-                page_url = self._current_url_or(collect.page_url)
+                # This loop runs on its own worker thread, but the calls below drive
+                # Playwright (page.url / page.evaluate). Marshal them onto the browser
+                # owner thread so they don't trip the greenlet cross-thread error.
+                # `_filter_candidates` is pure Python and stays off the owner thread.
+                page_url = self._run_on_browser_thread(self._current_url_or, collect.page_url)
                 if collect.exclude_site_code_links:
-                    filtered = self._collect_auto_candidate_links(page_url)
-                else:
-                    filtered = self._filter_candidates(
-                        self._collect_candidates(page_url),
-                        collect.pattern,
+                    filtered = self._run_on_browser_thread(
+                        self._collect_auto_candidate_links, page_url
                     )
+                else:
+                    candidates = self._run_on_browser_thread(
+                        self._collect_candidates, page_url
+                    )
+                    filtered = self._filter_candidates(candidates, collect.pattern)
                 added_count = 0
                 with collect_lock:
                     for link in filtered:
@@ -2114,6 +2190,17 @@ class CloakFetchDaemon:
             capture.stop_event.set()
         self._deep_capture_active = False
         self._deep_capture = None
+        # Release the per-capture CDP session so a retry/next cycle attaches a fresh
+        # one instead of leaking the previous session (`_attach_cdp_network_capture`
+        # creates a new session each start and has no idempotency guard). Callers run
+        # on the browser-owner thread, so detaching here is thread-safe.
+        session = self._cdp_session
+        self._cdp_session = None
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                LOG.debug("Failed to detach CDP session on deep-capture clear", exc_info=True)
         with self._pending_response_lock:
             self._pending_responses = []
         with self._response_lock:
@@ -2172,6 +2259,64 @@ class CloakFetchDaemon:
 #   A. direct network images   -> handled outside JS (response/CDP capture)
 #   B. visible <canvas> readers -> handled by element snapshots; WebGL needs the
 #      preserveDrawingBuffer override below so read-back is not blank
+# Active-tab monitor: an observe-only script installed into every page (context init
+# script + one-time seed of tabs already open at launch). It timestamps the last time a
+# tab entered the foreground so `_resolve_active_page` can pick the tab the user is
+# actually viewing without any first-tab/tracked-tab memory. Instantaneous
+# `document.visibilityState`/`document.hasFocus()` are unreliable here — when the user
+# clicks the Studio window the Chromium window loses focus and (when occluded) reports
+# every tab hidden. Recording the last *transition* survives that: the tab last brought
+# to the foreground keeps the newest timestamp. STRICTLY observe-only — only passive
+# listeners and one `window` object, no prototype patching — so CloakBrowser stealth is
+# untouched. Idempotent via the `window.__mfActiveMonitor` sentinel.
+ACTIVE_MONITOR_JS = """
+(() => {
+  if (window.__mfActiveMonitor) return;
+  const state = { lastVisible: 0, lastInteract: 0 };
+  window.__mfActiveMonitor = state;
+  const stampVisible = () => {
+    try { if (document.visibilityState === 'visible') state.lastVisible = Date.now(); }
+    catch (e) {}
+  };
+  const stampInteract = () => { state.lastInteract = Date.now(); };
+  stampVisible();
+  try {
+    document.addEventListener('visibilitychange', stampVisible, { capture: true, passive: true });
+    window.addEventListener('focus', stampInteract, { capture: true, passive: true });
+    document.addEventListener('pointerdown', stampInteract, { capture: true, passive: true });
+    document.addEventListener('keydown', stampInteract, { capture: true, passive: true });
+  } catch (e) {}
+})();
+"""
+
+# Reader for the active-tab monitor. Installs the monitor if missing (defensive — a tab
+# that somehow escaped the init script still gets listeners for next time), then returns
+# `{ a: <last foreground timestamp>, vis: <currently visible> }`. Ranked descending.
+ACTIVE_MONITOR_READ_JS = """
+() => {
+  if (!window.__mfActiveMonitor) {
+    try {
+      const state = { lastVisible: 0, lastInteract: 0 };
+      window.__mfActiveMonitor = state;
+      const stampVisible = () => {
+        try { if (document.visibilityState === 'visible') state.lastVisible = Date.now(); }
+        catch (e) {}
+      };
+      const stampInteract = () => { state.lastInteract = Date.now(); };
+      stampVisible();
+      document.addEventListener('visibilitychange', stampVisible, { capture: true, passive: true });
+      window.addEventListener('focus', stampInteract, { capture: true, passive: true });
+      document.addEventListener('pointerdown', stampInteract, { capture: true, passive: true });
+      document.addEventListener('keydown', stampInteract, { capture: true, passive: true });
+    } catch (e) {}
+  }
+  const s = window.__mfActiveMonitor || { lastVisible: 0, lastInteract: 0 };
+  let vis = false;
+  try { vis = document.visibilityState === 'visible'; } catch (e) {}
+  return { a: Math.max(s.lastVisible || 0, s.lastInteract || 0), vis: vis };
+}
+"""
+
 #   C. OffscreenCanvas.convertToBlob descramblers -> captured here
 #   D. decrypted bytes -> Blob -> URL.createObjectURL -> <img> (DRM) -> captured here
 # Captured bytes are queued on `window.__mfDeepCapture.entries` as raw base64 and drained
@@ -2437,21 +2582,6 @@ COLLECT_DOM_IMAGE_ORDER_JS = """
 }
 """
 
-
-COUNT_CANVAS_JS = """
-() => {
-  let total = 0;
-  const walk = (root) => {
-    if (!root || !root.querySelectorAll) return;
-    total += root.querySelectorAll("canvas").length;
-    for (const element of root.querySelectorAll("*")) {
-      if (element.shadowRoot) walk(element.shadowRoot);
-    }
-  };
-  walk(document);
-  return total;
-}
-"""
 
 COLLECT_CANVAS_JS = """
 () => {
