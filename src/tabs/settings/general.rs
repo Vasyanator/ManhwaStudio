@@ -25,7 +25,7 @@ use crate::text_punctuation;
 use crate::memory_manager::MemoryProfile;
 use crate::runtime_log;
 use crate::tabs::typing::TypingPanelLayout;
-use std::thread;
+use ms_thread as thread;
 
 impl SettingsTabState {
     pub(super) fn draw_general(&mut self, ui: &mut egui::Ui) {

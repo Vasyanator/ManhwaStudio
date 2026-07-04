@@ -33,14 +33,16 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
+// `Read::read_to_string` is only used by the native dictionary downloader below.
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 use zspell::Dictionary;
 
 const CUSTOM_DICTIONARY_STEM: &str = "custom";
@@ -837,6 +839,12 @@ fn download_russian_dictionary(root_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Downloads a text file over HTTP into a `String`.
+///
+/// Native builds use `ureq`. On wasm there is no synchronous HTTP client here, so
+/// dictionary download is unavailable and this returns an error instead of a fake
+/// empty file.
+#[cfg(not(target_arch = "wasm32"))]
 fn download_text_file(url: &str) -> Result<String, String> {
     let response = ureq::get(url)
         .call()
@@ -847,6 +855,11 @@ fn download_text_file(url: &str) -> Result<String, String> {
         .read_to_string(&mut body)
         .map_err(|err| format!("failed to read response body for '{url}': {err}"))?;
     Ok(body)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn download_text_file(_url: &str) -> Result<String, String> {
+    Err("загрузка словаря недоступна в веб-версии".to_string())
 }
 
 fn write_text_file(path: &Path, content: &str) -> Result<(), String> {

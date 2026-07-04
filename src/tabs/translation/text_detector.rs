@@ -38,8 +38,8 @@ use image::{ColorType, ImageEncoder};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use ms_thread::{self as thread, JoinHandle};
+use web_time::Duration;
 
 const DETECTOR_EVENT_POLL_BUDGET: usize = 128;
 const MAX_DETECTOR_DIM: u32 = 1600;

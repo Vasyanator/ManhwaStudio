@@ -38,7 +38,7 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc::Sender;
-use std::thread::JoinHandle;
+use ms_thread::JoinHandle;
 
 pub(super) struct CanvasSettingsRuntime {
     pub(super) synced_canvas_revision: u64,

@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 // Download (≈22 GB on first use) + diffusion may take a long time; allow a wide window.
 const FLUX_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);

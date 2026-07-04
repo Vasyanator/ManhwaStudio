@@ -234,15 +234,16 @@ use crate::widgets::{
 };
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke};
-use rfd::FileDialog;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use ms_thread::{self as thread, JoinHandle};
+use web_time::Duration;
+// SystemTime here only carries `std::fs` mtimes (change detection), never a
+// wall-clock `now()`, so it stays std to match `Metadata::modified`.
 use std::time::SystemTime;
 
 /// (detected results per page, total loaded, total failed)
@@ -4953,9 +4954,7 @@ impl TranslationTabState {
                 }
             }
             if ui.small_button("Выбрать файл").clicked()
-                && let Some(path) = FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
-                    .pick_file()
+                && let Some(path) = pick_image_bubble_file()
             {
                 match copy_external_image_bubble(project, bubble_id, &path) {
                     Ok(saved) => self.queue_footer_patch(
@@ -6744,6 +6743,24 @@ fn save_clipboard_image_bubble(project: &ProjectData, bubble_id: i64) -> Result<
         .save(&path)
         .map_err(|err| format!("не удалось сохранить {}: {err}", path.display()))?;
     Ok(path)
+}
+
+/// Opens the native image-file picker for an external image bubble and returns
+/// the chosen path, or `None` if the user cancelled.
+///
+/// Web stub: the browser build has no native file dialog (`rfd`), so this returns
+/// `None` and the "choose file" button is a no-op there (browser file import via
+/// `<input type=file>` is added later).
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_image_bubble_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+        .pick_file()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_image_bubble_file() -> Option<PathBuf> {
+    None
 }
 
 fn copy_external_image_bubble(

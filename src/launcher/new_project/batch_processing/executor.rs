@@ -50,8 +50,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 // ─── Public event type ────────────────────────────────────────────────────────
 
@@ -865,6 +865,17 @@ impl BatchExecutor {
         }
     }
 
+    /// Web stub: image downloads use a native HTTP client (`ureq`) not compiled for
+    /// wasm. Returns a clear error rather than fabricating downloaded pixels.
+    #[cfg(target_arch = "wasm32")]
+    fn download_images_blocking(url: &str) -> Result<Vec<RgbaImage>, ExecError> {
+        Err(ExecError::new(
+            "Загрузка изображений недоступна в веб-версии.",
+            format!("quick_downloader: HTTP client unavailable on web build for '{url}'"),
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn download_images_blocking(url: &str) -> Result<Vec<RgbaImage>, ExecError> {
         // Attempt HTTP download with browser-like headers.
         let agent = ureq::AgentBuilder::new()

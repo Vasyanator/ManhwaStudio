@@ -40,8 +40,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use ms_thread::{self as thread, JoinHandle};
+use web_time::{Duration, Instant};
 
 pub const AI_BACKEND_OFFLINE_ERROR: &str = "ИИ бэкенд отключен";
 
@@ -1228,7 +1228,7 @@ mod tests {
         // we assert the returned flag separately below.
         {
             let mut g = snapshot.lock().unwrap();
-            g.device_checked_at = Some(std::time::Instant::now());
+            g.device_checked_at = Some(web_time::Instant::now());
             g.available_devices = vec!["cpu".to_string()];
         }
 
@@ -1285,7 +1285,7 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
         {
             let mut g = snapshot.lock().unwrap();
-            g.device_checked_at = Some(std::time::Instant::now());
+            g.device_checked_at = Some(web_time::Instant::now());
             g.available_devices = vec!["cpu".to_string()];
         }
         let event = json!({
@@ -1320,7 +1320,7 @@ mod tests {
         let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
         {
             let mut g = snapshot.lock().unwrap();
-            g.device_checked_at = Some(std::time::Instant::now());
+            g.device_checked_at = Some(web_time::Instant::now());
             g.available_devices = vec!["cpu".to_string()];
         }
         // Seed a connected state first to prove offline clears it.

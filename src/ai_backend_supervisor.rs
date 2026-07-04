@@ -29,7 +29,12 @@ Notes:
 
 use crate::backend_ipc;
 use crate::config;
+// The Python backend PROCESS (spawn/stop via `std::process` + `python_manager`) is
+// native-only; the handle/snapshot types and autostart persistence stay
+// target-neutral so shared UI/launcher call sites compile on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::python_manager;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::python_manager::ManagedPythonChild;
 use crate::runtime_log;
 use crate::tabs::translation::backend_health::{
@@ -38,13 +43,15 @@ use crate::tabs::translation::backend_health::{
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
 use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use ms_thread::{self as thread, JoinHandle};
+use web_time::{Duration, Instant};
 
 /// Process-wide handle to the app-global backend, published once the supervisor
 /// starts. Lets code far from `run_main` (e.g. the launcher's browser downloader)
@@ -127,6 +134,7 @@ pub enum AiBackendProcessCommand {
     Shutdown,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 enum AiBackendOutputEvent {
     Stdout(String),
@@ -222,12 +230,22 @@ impl AiBackendSupervisor {
 
         let (probe_tx, probe_thread, process_runtime) = if ai_enabled {
             let (probe_tx, probe_thread) = spawn_ai_backend_probe(Arc::clone(&health));
-            let process_runtime = spawn_ai_backend_process_worker(
+            // The OS backend process is native-only. On web there is no process to
+            // spawn (the whole AI backend is compiled out), so the supervisor keeps a
+            // probe channel but no process runtime.
+            #[cfg(not(target_arch = "wasm32"))]
+            let process_runtime = Some(spawn_ai_backend_process_worker(
                 Arc::clone(&process_snapshot),
                 user_settings_file,
                 auto_start,
-            );
-            (Some(probe_tx), Some(probe_thread), Some(process_runtime))
+            ));
+            #[cfg(target_arch = "wasm32")]
+            let process_runtime: Option<AiBackendProcessRuntime> = {
+                // Touch the otherwise-native inputs so they are not flagged unused.
+                let _ = (&process_snapshot, &user_settings_file, auto_start);
+                None
+            };
+            (Some(probe_tx), Some(probe_thread), process_runtime)
         } else {
             (None, None, None)
         };
@@ -274,6 +292,7 @@ impl Drop for AiBackendSupervisor {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_ai_backend_process_worker(
     snapshot: Arc<Mutex<AiBackendProcessSnapshot>>,
     user_settings_file: PathBuf,
@@ -323,6 +342,7 @@ fn spawn_ai_backend_process_worker(
     AiBackendProcessRuntime { tx, thread }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_process_command(
     command: AiBackendProcessCommand,
     child: &mut Option<ManagedPythonChild>,
@@ -384,6 +404,7 @@ fn handle_process_command(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn start_ai_backend_process(
     child: &mut Option<ManagedPythonChild>,
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
@@ -481,6 +502,7 @@ fn start_ai_backend_process(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn stop_ai_backend_process(
     child: &mut Option<ManagedPythonChild>,
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
@@ -529,6 +551,7 @@ fn stop_ai_backend_process(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn poll_backend_exit(
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
     child: &mut Option<ManagedPythonChild>,
@@ -573,6 +596,7 @@ fn poll_backend_exit(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_backend_output_reader<R: std::io::Read + Send + 'static>(
     stream_name: &'static str,
     stream: R,
@@ -613,6 +637,7 @@ fn spawn_backend_output_reader<R: std::io::Read + Send + 'static>(
         });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn drain_backend_output(
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
     output_rx: &Receiver<AiBackendOutputEvent>,
@@ -632,6 +657,7 @@ fn drain_backend_output(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn append_process_log(snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>, line: String) {
     let now = Instant::now();
     let file_log_line = line.clone();
@@ -655,6 +681,7 @@ fn append_process_log(snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>, line: Str
     runtime_log::log_ai_backend(file_log_line);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn update_process_status(
     snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>,
     running: bool,
@@ -680,6 +707,7 @@ fn update_process_status(
     ));
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn set_autostart_value(snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>, auto_start: bool) {
     let now = Instant::now();
     match snapshot.lock() {
@@ -695,6 +723,7 @@ fn set_autostart_value(snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>, auto_sta
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn format_exit_code(code: Option<i32>) -> String {
     code.map(|value| format!("код выхода {value}"))
         .unwrap_or_else(|| "завершён сигналом".to_string())

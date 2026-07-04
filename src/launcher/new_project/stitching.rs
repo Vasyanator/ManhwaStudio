@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use ms_thread as thread;
 
 const SAFE_ROWS_STRIDE: usize = 32;
 const SEARCH_DELTA: usize = 3000;

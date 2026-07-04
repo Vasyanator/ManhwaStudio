@@ -59,7 +59,7 @@ use text_layers::PsTextLayer;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use ms_thread as thread;
 use tools::brush::BrushTool;
 use tools::deform::DeformTool;
 use tools::select::{SelectMode, SelectTool};

@@ -1255,7 +1255,7 @@ mod tests {
         // Свободной памяти «осталось» меньше порога → защита срабатывает на первой
         // же проверке (узел кратный MEMORY_CHECK_INTERVAL_NODES).
         let low = MIN_AVAILABLE_MEMORY_BYTES - 1;
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let result = with_memory_source(Some(low), || {
             enumerate_forms(BIG_TEXT, TextFormPreset::FreeNoTree, usize::MAX, &CHAR_METRIC)
         });
@@ -1268,7 +1268,7 @@ mod tests {
             result.forms.len()
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < web_time::Duration::from_secs(5),
             "memory guard must return promptly"
         );
     }

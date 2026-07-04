@@ -303,11 +303,16 @@ impl JsonConfig {
     }
 
     pub fn load(&mut self) -> Result<()> {
-        if !self.path.exists() {
+        // Routed through the storage seam so the web build reads config from its
+        // in-memory/IndexedDB store instead of the desktop filesystem.
+        let store = crate::storage::storage();
+        let path_str = self.path.to_string_lossy();
+        if !store.exists(path_str.as_ref()) {
             self.data = Value::Object(Map::new());
             return Ok(());
         }
-        let raw = fs::read_to_string(&self.path)
+        let raw = store
+            .read_to_string(path_str.as_ref())
             .with_context(|| format!("failed to read config {}", self.path.display()))?;
         self.data = serde_json::from_str::<Value>(&raw)
             .with_context(|| format!("failed to parse config {}", self.path.display()))?;
@@ -318,8 +323,10 @@ impl JsonConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        let store = crate::storage::storage();
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            let parent_str = parent.to_string_lossy();
+            store.create_dir_all(parent_str.as_ref()).with_context(|| {
                 format!(
                     "failed to create config parent directory {}",
                     parent.display()
@@ -327,7 +334,8 @@ impl JsonConfig {
             })?;
         }
         let raw = serde_json::to_string_pretty(&self.data).context("failed to serialize config")?;
-        fs::write(&self.path, raw)
+        store
+            .write(self.path.to_string_lossy().as_ref(), raw.as_bytes())
             .with_context(|| format!("failed to write config {}", self.path.display()))?;
         Ok(())
     }

@@ -18,11 +18,10 @@ use crate::project::ProjectData;
 use crate::tabs::characters::{CharacterNoteEntry, load_characters_for_notes};
 use crate::tabs::terms::{TermNoteEntry, load_terms_for_notes};
 use eframe::egui;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use ms_thread as thread;
+use web_time::{Duration, Instant, SystemTime};
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(600);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(800);
@@ -437,11 +436,18 @@ impl NotesTabState {
     }
 
     fn save_template(&mut self, project: &ProjectData) -> Result<(), String> {
+        let store = crate::storage::storage();
         let path = &project.paths.notes_file;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            let parent_str = parent.to_string_lossy();
+            store
+                .create_dir_all(parent_str.as_ref())
+                .map_err(|err| err.to_string())?;
         }
-        fs::write(path, self.template_editor_text.as_bytes()).map_err(|err| err.to_string())?;
+        let path_str = path.to_string_lossy();
+        store
+            .write(path_str.as_ref(), self.template_editor_text.as_bytes())
+            .map_err(|err| err.to_string())?;
         self.editor_dirty = false;
         self.info_message = Some("Шаблон сохранён.".to_string());
         self.error_message = None;
@@ -581,7 +587,8 @@ fn insert_placeholder(target: &mut String, placeholder: &str) {
 }
 
 fn read_text_fallback(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
+    let path_str = path.to_string_lossy();
+    let bytes = crate::storage::storage().read(path_str.as_ref()).ok()?;
     if let Ok(utf8) = String::from_utf8(bytes.clone()) {
         return Some(utf8);
     }
@@ -630,12 +637,16 @@ fn decode_cp1251(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn read_file_signature(path: &Path) -> FileSignature {
-    let Ok(meta) = fs::metadata(path) else {
+    let path_str = path.to_string_lossy();
+    let Ok(meta) = crate::storage::storage().metadata(path_str.as_ref()) else {
         return FileSignature::default();
     };
+    // `Metadata::modified` is `Some` on the native/desktop backend and `None`
+    // on the web in-memory backend (no filesystem mtime). The watcher keys off
+    // whatever the backend provides plus length, degrading gracefully on web.
     FileSignature {
         exists: true,
-        len: meta.len(),
-        modified: meta.modified().ok(),
+        len: meta.len,
+        modified: meta.modified,
     }
 }

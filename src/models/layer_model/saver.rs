@@ -31,7 +31,7 @@ the real `persist::*` write path while the doc is free for the GUI thread.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use ms_thread::{self as thread, JoinHandle};
 
 use eframe::egui::ColorImage;
 use serde_json::Value;
@@ -218,8 +218,14 @@ impl PageSaveJob {
             let mut text_outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(text.nodes.len());
             for node in &text.nodes {
                 let file_name = persist::text_image_file_name(self.page_idx, &node.uid);
-                let present = layers_dir.join(&file_name).is_file()
-                    || fallback_dir.is_some_and(|d| d.join(&file_name).is_file());
+                // Presence check via the storage seam (was `Path::is_file`): a deterministic text-PNG
+                // name is either present or not, and storage `exists` answers the same question.
+                let primary_path = layers_dir.join(&file_name);
+                let present = crate::storage::storage()
+                    .exists(primary_path.to_string_lossy().as_ref())
+                    || fallback_dir.is_some_and(|d| {
+                        crate::storage::storage().exists(d.join(&file_name).to_string_lossy().as_ref())
+                    });
                 let rendered_file = if node.pixels_dirty || !present {
                     Some(persist::write_text_image(
                         layers_dir,

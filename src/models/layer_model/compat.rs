@@ -29,17 +29,23 @@ pure transform over the single `layers.json` Value and cannot see `text_info.jso
 
 use super::manifest::{LayersManifest, LAYERS_SCHEMA_VERSION};
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 
 /// Reads `layers.json` at `path` and returns it as a canonical, current-version `LayersManifest`,
 /// migrating any older format up. `Ok(None)` when the file does not exist; `Err` only on IO / JSON
 /// errors. This is the one entry point `persist::read_manifest` delegates to.
 pub fn read_manifest(path: &Path) -> Result<Option<LayersManifest>, String> {
-    if !path.is_file() {
+    // Route existence + read through the storage seam so the web backend uses its virtual store.
+    // `exists()` is a slight widening of the previous `is_file()` (it also matches a directory), but
+    // `layers.json` is a deterministic FILE name, so a directory there would be a corrupt project and
+    // the subsequent `read_to_string` would surface it as an error rather than silently succeeding.
+    let path_str = path.to_string_lossy();
+    if !crate::storage::storage().exists(path_str.as_ref()) {
         return Ok(None);
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text = crate::storage::storage()
+        .read_to_string(path_str.as_ref())
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let manifest = manifest_from_value(value, &path.display().to_string())?;

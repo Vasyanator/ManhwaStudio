@@ -26,7 +26,7 @@ use crate::{ai_models, config};
 use eframe::egui;
 use image::{ColorType, ImageEncoder};
 use serde_json::{Value, json};
-use std::time::Duration;
+use web_time::Duration;
 
 /// Per-call timeout for the v2 framed backend. Mirrors the previous HTTP read
 /// timeout: model warmup + inpaint can take a while on first use.

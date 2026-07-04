@@ -59,7 +59,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use ms_thread as thread;
 
 const STROKE_OVERLAY_UPLOAD_MIN_INTERVAL_S: f64 = 1.0 / 30.0;
 const TEXT_MASK_TILE_SIDE: usize = 1024;

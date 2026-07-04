@@ -5,6 +5,7 @@ use crate::tabs::translation::panels::bubbles::{
 use crate::widgets::WheelSpinBox;
 use eframe::egui;
 use minijinja::{AutoEscape, Environment, context};
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use serde_json::Value;
 use std::fs;
@@ -18,6 +19,9 @@ const NO_ITEMS_TEXT: &str = "(нет реплик для компоновки)";
 const EMPTY_TEMPLATE_TEXT: &str = "(шаблон MiniJinja пуст)";
 const UNKNOWN_CHARACTER: &str = "(неизвестный персонаж)";
 const NARRATOR_CHARACTER: &str = "(рассказчик)";
+// Only used by the native file-save picker (`select_export_path`), which is
+// compiled out on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_EXPORT_NAME: &str = "composition_export";
 const COMPOSED_TEXT_ROWS: usize = 12;
 const TEMPLATE_ROWS: usize = 6;
@@ -997,6 +1001,13 @@ fn export_docx(project: &ProjectData, text: &str) -> Result<Option<PathBuf>, Str
     Ok(Some(path))
 }
 
+/// Opens the native "save as" dialog for a composed-text export and returns the
+/// chosen path (with the extension enforced), or `None` if the user cancelled.
+///
+/// Web stub: there is no native save dialog in the browser build, so this returns
+/// `None` and the export becomes a no-op (browser download export is added
+/// later). The `_` parameters keep the signature identical on both targets.
+#[cfg(not(target_arch = "wasm32"))]
 fn select_export_path(project: &ProjectData, ext: &str, filter_name: &str) -> Option<PathBuf> {
     let mut path = FileDialog::new()
         .set_directory(&project.project_dir)
@@ -1007,6 +1018,12 @@ fn select_export_path(project: &ProjectData, ext: &str, filter_name: &str) -> Op
     Some(path)
 }
 
+#[cfg(target_arch = "wasm32")]
+fn select_export_path(_project: &ProjectData, _ext: &str, _filter_name: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_path_extension(path: &mut PathBuf, ext: &str) {
     let has_ext = path
         .extension()

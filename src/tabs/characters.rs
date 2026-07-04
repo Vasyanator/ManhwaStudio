@@ -6,10 +6,9 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::{self, JoinHandle};
+use ms_thread::{self as thread, JoinHandle};
 
 const GROUP_ALL: &str = "(все)";
 const CARD_THUMB_SIDE_PX: u32 = 192;
@@ -776,13 +775,16 @@ impl CharactersTabState {
         }
 
         if let Some(old_name) = original_name {
+            let store = crate::storage::storage();
             let old_path = image_path_for(project, &old_name);
             let new_path = image_path_for(project, &new_name);
-            if old_name != new_name && old_path.exists() {
-                if new_path.exists() {
-                    let _ = fs::remove_file(&new_path);
+            let old_path_str = old_path.to_string_lossy();
+            let new_path_str = new_path.to_string_lossy();
+            if old_name != new_name && store.exists(old_path_str.as_ref()) {
+                if store.exists(new_path_str.as_ref()) {
+                    let _ = store.remove_file(new_path_str.as_ref());
                 }
-                let _ = fs::rename(&old_path, &new_path);
+                let _ = store.rename(old_path_str.as_ref(), new_path_str.as_ref());
             }
             self.clear_thumbnail(&old_name);
         }
@@ -790,7 +792,8 @@ impl CharactersTabState {
 
         let target_image_path = image_path_for(project, &new_name);
         if pending.remove_image {
-            let _ = fs::remove_file(&target_image_path);
+            let target_image_str = target_image_path.to_string_lossy();
+            let _ = crate::storage::storage().remove_file(target_image_str.as_ref());
             self.clear_thumbnail(&new_name);
         }
         if let Some(image) = pending.pending_image {
@@ -840,7 +843,9 @@ impl CharactersTabState {
             self.error_message = Some(format!("Не удалось сохранить characters.json: {err}"));
             return None;
         }
-        let _ = fs::remove_file(image_path_for(project, name));
+        let image_path = image_path_for(project, name);
+        let image_path_str = image_path.to_string_lossy();
+        let _ = crate::storage::storage().remove_file(image_path_str.as_ref());
         self.clear_thumbnail(name);
         self.rebuild_group_filters();
         self.info_message = Some("Персонаж удалён.".to_string());
@@ -1096,7 +1101,8 @@ fn spawn_thumbnail_worker() -> (
             match job {
                 ThumbnailJob::Stop => break,
                 ThumbnailJob::Load { name, path } => {
-                    if !path.exists() {
+                    let path_str = path.to_string_lossy();
+                    if !crate::storage::storage().exists(path_str.as_ref()) {
                         let _ = tx_result.send(ThumbnailResult {
                             name,
                             decoded: None,
@@ -1166,7 +1172,10 @@ fn read_image_from_clipboard() -> Result<DecodedImage, String> {
 
 fn save_color_image_png(path: &Path, image: &ColorImage) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        let parent_str = parent.to_string_lossy();
+        crate::storage::storage()
+            .create_dir_all(parent_str.as_ref())
+            .map_err(|err| err.to_string())?;
     }
     let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
     for px in &image.pixels {
@@ -1184,10 +1193,18 @@ fn save_color_image_png(path: &Path, image: &ColorImage) -> Result<(), String> {
 }
 
 fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
-    fs::create_dir_all(&project.paths.characters_dir).map_err(|err| err.to_string())?;
+    let store = crate::storage::storage();
+    let chars_dir = &project.paths.characters_dir;
+    let chars_dir_str = chars_dir.to_string_lossy();
+    store
+        .create_dir_all(chars_dir_str.as_ref())
+        .map_err(|err| err.to_string())?;
     let json_path = json_path_for(project);
-    if json_path.exists() {
-        let raw = fs::read_to_string(&json_path).map_err(|err| err.to_string())?;
+    let json_path_str = json_path.to_string_lossy();
+    if store.exists(json_path_str.as_ref()) {
+        let raw = store
+            .read_to_string(json_path_str.as_ref())
+            .map_err(|err| err.to_string())?;
         if let Ok(parsed) = serde_json::from_str::<Vec<CharacterEntry>>(&raw) {
             let mut normalized = parsed
                 .into_iter()
@@ -1209,13 +1226,16 @@ fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
     }
 
     let mut from_txt = Vec::new();
-    let mut txt_files_to_remove = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(&project.paths.characters_dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
+    let mut txt_files_to_remove: Vec<PathBuf> = Vec::new();
+    if let Ok(dir_entries) = store.read_dir(chars_dir_str.as_ref()) {
+        for dir_entry in dir_entries {
+            // Storage lists only files and directories; treat every non-directory
+            // as a file, mirroring the previous `!path.is_file()` skip.
+            if dir_entry.is_dir {
                 continue;
             }
+            // Rebuild the full path so extension/stem parsing and reads stay identical.
+            let path = chars_dir.join(&dir_entry.name);
             let is_txt = path
                 .extension()
                 .map(|ext| ext.to_string_lossy().to_ascii_lowercase() == "txt")
@@ -1226,7 +1246,9 @@ fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
             let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
                 continue;
             };
-            let description = fs::read_to_string(&path)
+            let path_str = path.to_string_lossy();
+            let description = store
+                .read_to_string(path_str.as_ref())
                 .unwrap_or_default()
                 .trim()
                 .to_string();
@@ -1241,21 +1263,34 @@ fn load_entries(project: &ProjectData) -> Result<Vec<CharacterEntry>, String> {
     dedupe_and_sort_entries(&mut from_txt);
     save_entries(project, &from_txt)?;
     for path in txt_files_to_remove {
-        let _ = fs::remove_file(path);
+        let path_str = path.to_string_lossy();
+        let _ = store.remove_file(path_str.as_ref());
     }
     Ok(from_txt)
 }
 
 fn save_entries(project: &ProjectData, entries: &[CharacterEntry]) -> Result<(), String> {
-    fs::create_dir_all(&project.paths.characters_dir).map_err(|err| err.to_string())?;
+    let store = crate::storage::storage();
+    let chars_dir_str = project.paths.characters_dir.to_string_lossy();
+    store
+        .create_dir_all(chars_dir_str.as_ref())
+        .map_err(|err| err.to_string())?;
     let path = json_path_for(project);
     let tmp = path.with_extension("json.tmp");
+    let path_str = path.to_string_lossy();
+    let tmp_str = tmp.to_string_lossy();
     let raw = serde_json::to_string_pretty(entries).map_err(|err| err.to_string())?;
-    fs::write(&tmp, raw).map_err(|err| err.to_string())?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|err| err.to_string())?;
+    store
+        .write(tmp_str.as_ref(), raw.as_bytes())
+        .map_err(|err| err.to_string())?;
+    if store.exists(path_str.as_ref()) {
+        store
+            .remove_file(path_str.as_ref())
+            .map_err(|err| err.to_string())?;
     }
-    fs::rename(&tmp, &path).map_err(|err| err.to_string())?;
+    store
+        .rename(tmp_str.as_ref(), path_str.as_ref())
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 

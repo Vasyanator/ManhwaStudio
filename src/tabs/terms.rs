@@ -18,7 +18,6 @@ use crate::widgets::WheelComboBox;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 const TAG_ALL: &str = "(все)";
@@ -657,12 +656,16 @@ pub fn load_terms_for_notes(project: &ProjectData) -> Result<Vec<TermNoteEntry>,
 }
 
 fn load_entries(project: &ProjectData) -> Result<Vec<TermEntry>, String> {
+    let store = crate::storage::storage();
     let path = terms_path_for(project);
-    if !path.exists() {
+    let path_str = path.to_string_lossy();
+    if !store.exists(path_str.as_ref()) {
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let raw = store
+        .read_to_string(path_str.as_ref())
+        .map_err(|err| err.to_string())?;
     let parsed: Vec<TermEntry> = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
 
     let mut normalized = parsed
@@ -685,17 +688,29 @@ fn load_entries(project: &ProjectData) -> Result<Vec<TermEntry>, String> {
 }
 
 fn save_entries(project: &ProjectData, entries: &[TermEntry]) -> Result<(), String> {
+    let store = crate::storage::storage();
     let path = terms_path_for(project);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        let parent_str = parent.to_string_lossy();
+        store
+            .create_dir_all(parent_str.as_ref())
+            .map_err(|err| err.to_string())?;
     }
     let tmp = path.with_extension("json.tmp");
+    let path_str = path.to_string_lossy();
+    let tmp_str = tmp.to_string_lossy();
     let raw = serde_json::to_string_pretty(entries).map_err(|err| err.to_string())?;
-    fs::write(&tmp, raw).map_err(|err| err.to_string())?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|err| err.to_string())?;
+    store
+        .write(tmp_str.as_ref(), raw.as_bytes())
+        .map_err(|err| err.to_string())?;
+    if store.exists(path_str.as_ref()) {
+        store
+            .remove_file(path_str.as_ref())
+            .map_err(|err| err.to_string())?;
     }
-    fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    store
+        .rename(tmp_str.as_ref(), path_str.as_ref())
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 

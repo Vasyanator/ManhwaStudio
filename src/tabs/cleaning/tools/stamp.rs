@@ -34,7 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
+use ms_thread as thread;
 
 const STAMP_PREVIEW_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const STAMP_CURSOR_TEXTURE_OPTIONS: TextureOptions = TextureOptions::NEAREST;

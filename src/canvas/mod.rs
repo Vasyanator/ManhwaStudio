@@ -206,6 +206,8 @@ use crate::widgets::{
     BarGeometry, ScrollMark, paint_marks_on_bar, queue_word_to_global_exceptions,
     queue_word_to_project_exceptions,
 };
+// Native-only clipboard backend; absent on the wasm target.
+#[cfg(not(target_arch = "wasm32"))]
 use arboard::Clipboard;
 use eframe::egui;
 use egui::{Pos2, Rect, TextureHandle, Vec2};
@@ -215,7 +217,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use web_time::{Duration, Instant};
+// UNIX_EPOCH is only used to diff a `std::fs` mtime (std SystemTime), so it stays std.
+use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasViewportSnapshot {
@@ -2464,10 +2468,22 @@ fn parse_canvas_ui_font_priority(file_name: &str) -> Option<(u32, &str)> {
     Some((priority, rest_name))
 }
 
+/// Reads plain text from the system clipboard, sanitized for canvas use.
+///
+/// Native builds query `arboard`. On wasm there is no synchronous clipboard-text
+/// API here, so this returns `None` (no fake success) and callers treat it as an
+/// empty clipboard.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_system_clipboard_text() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
     let raw = clipboard.get_text().ok()?;
     Some(sanitize_clipboard_text(&raw))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_system_clipboard_text() -> Option<String> {
+    runtime_log::log_info("[canvas] чтение буфера обмена недоступно в веб-версии".to_string());
+    None
 }
 
 /// Builds the cache key identifying a rendered image-bubble preview.

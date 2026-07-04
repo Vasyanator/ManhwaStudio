@@ -21,7 +21,6 @@ use super::manifest::{
 use crate::trace::cat;
 use eframe::egui::ColorImage;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -252,15 +251,17 @@ pub fn save_page_rasters(
 
     // Nothing to write and nothing recorded before: avoid creating empty artifacts on bare page
     // visits.
+    let layers_dir_str = layers_dir.to_string_lossy();
     if layers.is_empty()
         && groups.is_empty()
         && manifest.page(page_idx).is_none()
-        && !layers_dir.exists()
+        && !crate::storage::storage().exists(layers_dir_str.as_ref())
     {
         return Ok(());
     }
 
-    fs::create_dir_all(layers_dir)
+    crate::storage::storage()
+        .create_dir_all(layers_dir_str.as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
 
     let mut keep: Vec<String> = Vec::with_capacity(layers.len());
@@ -523,7 +524,8 @@ pub fn add_page_raster(
     let manifest_path = layers_dir.join(MANIFEST_FILE);
     let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
-    fs::create_dir_all(layers_dir)
+    crate::storage::storage()
+        .create_dir_all(layers_dir.to_string_lossy().as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
 
     let file = base_file_name(page_idx, uid);
@@ -643,7 +645,8 @@ pub fn update_raster_transform(
         node.transform = Some(transform);
         // The unsaved staging dir may not exist yet (e.g. right after "save to project" removed it),
         // so create it before writing — otherwise the edit would be silently lost.
-        fs::create_dir_all(layers_dir)
+        crate::storage::storage()
+            .create_dir_all(layers_dir.to_string_lossy().as_ref())
             .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
         write_manifest(&manifest_path, &manifest)?;
     }
@@ -683,7 +686,8 @@ pub fn update_raster_geometry(
     {
         node.transform = Some(transform);
         node.deform = deform;
-        fs::create_dir_all(layers_dir)
+        crate::storage::storage()
+            .create_dir_all(layers_dir.to_string_lossy().as_ref())
             .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
         write_manifest(&manifest_path, &manifest)?;
     }
@@ -724,7 +728,8 @@ pub fn update_raster_effects(
     else {
         return Ok(());
     };
-    fs::create_dir_all(layers_dir)
+    crate::storage::storage()
+        .create_dir_all(layers_dir.to_string_lossy().as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
     let old_rendered = node.rendered_file.clone();
     match (effects.is_empty(), rendered) {
@@ -744,7 +749,7 @@ pub fn update_raster_effects(
     if let Some(old) = old_rendered
         && node.rendered_file.as_deref() != Some(old.as_str())
     {
-        let _ = fs::remove_file(layers_dir.join(&old));
+        let _ = crate::storage::storage().remove_file(layers_dir.join(&old).to_string_lossy().as_ref());
     }
     write_manifest(&manifest_path, &manifest)
 }
@@ -877,11 +882,15 @@ pub fn write_page_text_payload(
     // there is genuinely no page record to preserve. A previously-existing page emptied to nothing still
     // falls through so it is recorded PRESENT-but-EMPTY (deletion durability), even if the staging dir
     // must be created for it.
-    if nodes.is_empty() && !page_existed && !layers_dir.exists() {
+    if nodes.is_empty()
+        && !page_existed
+        && !crate::storage::storage().exists(layers_dir.to_string_lossy().as_ref())
+    {
         return Ok(());
     }
 
-    fs::create_dir_all(layers_dir)
+    crate::storage::storage()
+        .create_dir_all(layers_dir.to_string_lossy().as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
 
     // Seed the page from the committed fallback when the staging manifest has no record of it yet.
@@ -1455,7 +1464,8 @@ pub fn merge_unsaved_layers_into_committed(
         merged.pages.len(),
         committed_path.display()
     );
-    fs::create_dir_all(committed_layers_dir)
+    crate::storage::storage()
+        .create_dir_all(committed_layers_dir.to_string_lossy().as_ref())
         .map_err(|e| format!("create {}: {e}", committed_layers_dir.display()))?;
     write_manifest(&committed_path, &merged)?;
     Ok(true)
@@ -1464,22 +1474,24 @@ pub fn merge_unsaved_layers_into_committed(
 fn write_manifest(path: &Path, manifest: &LayersManifest) -> Result<(), String> {
     let text = serde_json::to_string_pretty(manifest)
         .map_err(|e| format!("serialize manifest: {e}"))?;
-    fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+    crate::storage::storage()
+        .write(path.to_string_lossy().as_ref(), text.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Removes base PNGs for `page_idx` that are not in `keep`.
 fn prune_orphan_pngs(layers_dir: &Path, page_idx: usize, keep: &[String]) {
     let prefix = page_file_prefix(page_idx);
-    let Ok(entries) = fs::read_dir(layers_dir) else {
+    let Ok(entries) = crate::storage::storage().read_dir(layers_dir.to_string_lossy().as_ref())
+    else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(&prefix) && name.ends_with(".png") && !keep.iter().any(|k| k == name) {
-            let _ = fs::remove_file(entry.path());
+    for entry in entries {
+        // `DirEntry.name` is only the final component; rebuild the child path by joining the dir.
+        let name = entry.name;
+        if name.starts_with(&prefix) && name.ends_with(".png") && !keep.iter().any(|k| k == &name) {
+            let child = layers_dir.join(&name);
+            let _ = crate::storage::storage().remove_file(child.to_string_lossy().as_ref());
         }
     }
 }
@@ -1497,10 +1509,12 @@ fn read_png_with_fallback(
 }
 
 fn read_png(path: &Path) -> Option<ColorImage> {
-    if !path.is_file() {
-        return None;
-    }
-    let rgba = image::open(path).ok()?.to_rgba8();
+    // Read the encoded bytes through the storage seam, then decode in memory. A missing file or a
+    // directory at this path yields a read error → `None`, matching the previous `is_file()` guard.
+    let bytes = crate::storage::storage()
+        .read(path.to_string_lossy().as_ref())
+        .ok()?;
+    let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
@@ -1514,7 +1528,8 @@ pub fn write_text_image(
     uid: &str,
     image: &ColorImage,
 ) -> Result<String, String> {
-    fs::create_dir_all(layers_dir)
+    crate::storage::storage()
+        .create_dir_all(layers_dir.to_string_lossy().as_ref())
         .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
     let file = text_image_file_name(page_idx, uid);
     crate::trace_log!(
@@ -1538,7 +1553,14 @@ fn write_png(path: &Path, image: &ColorImage) -> Result<(), String> {
     }
     let buf = image::RgbaImage::from_raw(w as u32, h as u32, raw)
         .ok_or_else(|| format!("layer image {}x{} buffer mismatch", w, h))?;
-    buf.save(path)
+    // Encode to an in-memory PNG buffer (identical default `PngEncoder` params to `ImageBuffer::save`
+    // on a `.png` path), then write the bytes through the storage seam so the web backend persists to
+    // its virtual store instead of `std::fs`.
+    let mut png: Vec<u8> = Vec::new();
+    buf.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("encode png {w}x{h}: {e}"))?;
+    crate::storage::storage()
+        .write(path.to_string_lossy().as_ref(), &png)
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -1547,6 +1569,7 @@ mod tests {
     use super::*;
     use crate::models::layer_model::manifest::LAYERS_SCHEMA_VERSION;
     use eframe::egui::Color32;
+    use std::fs;
 
     fn img(size: [usize; 2], c: Color32) -> ColorImage {
         ColorImage::filled(size, c)

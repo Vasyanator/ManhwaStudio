@@ -28,7 +28,7 @@ use egui::{Color32, Rect};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
+use ms_thread as thread;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ZamazkaMode {

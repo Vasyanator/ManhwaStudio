@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use ms_thread as thread;
 
 /// Request to load the base layers + persisted user-layer payload for one page.
 ///

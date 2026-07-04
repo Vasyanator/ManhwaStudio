@@ -15,7 +15,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
@@ -33,7 +33,8 @@ pub fn init_session_logs(log_dir: &Path) -> Result<(), String> {
     prepare_log_files(log_dir)?;
     let last_log_path = log_dir.join("last.log");
     let (tx, rx) = mpsc::channel::<String>();
-    std::thread::Builder::new()
+    // ms_thread: std::thread on native, Web Worker (wasm_thread) on wasm.
+    ms_thread::Builder::new()
         .name("runtime-log-writer".to_string())
         .spawn(move || run_writer(last_log_path, rx))
         .map_err(|err| format!("failed to spawn runtime log thread: {err}"))?;

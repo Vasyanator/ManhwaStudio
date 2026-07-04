@@ -23,11 +23,16 @@ use crate::launcher::theme;
 use crate::runtime_log;
 use crate::widgets::WheelComboBox;
 use egui::{Align, Layout, RichText, Ui};
+// Native file save dialog. On web there is no OS dialog; the save-path picking
+// step is replaced with a "unavailable on web" status (Phase 5 adds download).
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
+// Used only by the native archive writer, which is compiled out on web.
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use ms_thread as thread;
 
 const COMPRESSION_PRESETS: [(&str, i32); 5] = [
     ("Очень быстро", 1),
@@ -272,6 +277,13 @@ impl ExportPageState {
         }
     }
 
+    /// Starts a `.mschapter` export: picks a destination via the OS save dialog
+    /// and runs `tar + zstd` archiving on a worker.
+    ///
+    /// Native only. On web there is no save dialog and archive download is a
+    /// Phase 5 web-glue feature, so the web twin reports the operation as
+    /// unavailable instead of exporting.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_export(&mut self) {
         let Some(selection) = self.current_selection() else {
             self.status = ExportPageStatus::Error("Выберите тайтл и главу.".to_string());
@@ -345,6 +357,14 @@ impl ExportPageState {
                 "[launcher-export] failed to spawn export worker: {err}"
             ));
         }
+    }
+
+    /// Web twin of `start_export`: chapter export is not wired on the web build
+    /// yet, so it surfaces a clear "unavailable on web" status.
+    #[cfg(target_arch = "wasm32")]
+    fn start_export(&mut self) {
+        self.status =
+            ExportPageStatus::Error("Экспорт главы недоступен в веб-версии.".to_string());
     }
 
     fn poll_refresh(&mut self) {
@@ -486,6 +506,9 @@ fn build_refresh_result(
     }
 }
 
+// Only reached through the native `start_export`; compiled out on web where
+// no export path is wired yet.
+#[cfg(not(target_arch = "wasm32"))]
 fn export_chapter_archive(
     chapter_dir: &Path,
     chapter_name: &str,
@@ -514,6 +537,8 @@ fn export_chapter_archive(
     Ok(())
 }
 
+// Only used by the native `start_export`; compiled out on web.
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_mschapter_extension(path: PathBuf) -> PathBuf {
     if path
         .extension()

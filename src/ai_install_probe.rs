@@ -16,14 +16,19 @@ background worker when used from UI code.
 */
 
 use crate::config;
+// The activated-shell Python probe (spawning `sh`/`powershell` + Python) is
+// native-only; the pure report parsing/classification stays target-neutral.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::python_manager::{self, PythonShellKind};
 use crate::runtime_log;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use ms_thread as thread;
 
+#[cfg(not(target_arch = "wasm32"))]
 const AI_PROBE_PYTHON_CODE: &str = r#"
 import json
 from importlib import metadata
@@ -173,6 +178,15 @@ pub fn spawn_ai_computations_probe(
     rx
 }
 
+/// Web stub: probing an installed Python/AI environment requires spawning an
+/// activated shell + Python, which does not exist in the browser. Returns a clear
+/// typed error instead of a fabricated report.
+#[cfg(target_arch = "wasm32")]
+pub fn collect_ai_computations_report(_app_dir: &Path) -> Result<AiComputationsReport, String> {
+    Err("Проверка ИИ окружения недоступна в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn collect_ai_computations_report(app_dir: &Path) -> Result<AiComputationsReport, String> {
     let environment = match python_manager::detect_python_environment(app_dir) {
         Ok(environment) => Some(environment),
@@ -307,6 +321,7 @@ fn short_onnx_execution_provider_name(provider: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ai_probe_shell_script(
     app_dir: &Path,
     environment: Option<&python_manager::PythonEnvironment>,
@@ -341,6 +356,7 @@ fn build_ai_probe_shell_command(script: &str) -> Command {
     command
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn build_ai_probe_shell_command(script: &str) -> Command {
     let mut command = Command::new("sh");
@@ -362,6 +378,7 @@ fn ai_probe_python_command() -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn ai_probe_python_command() -> String {
     format!(
@@ -370,6 +387,7 @@ fn ai_probe_python_command() -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn shell_join_commands(commands: Vec<String>) -> String {
     commands.join(";\n")
 }
@@ -379,6 +397,7 @@ fn configure_shell_encoding_command() -> String {
     "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8".to_string()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn configure_shell_encoding_command() -> String {
     "export LANG=C.UTF-8; export LC_ALL=C.UTF-8".to_string()
@@ -389,6 +408,7 @@ fn change_directory_command(path: &Path) -> String {
     format!("Set-Location -LiteralPath '{}'", powershell_escape(path))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn change_directory_command(path: &Path) -> String {
     format!("cd '{}'", sh_escape(path))
@@ -399,6 +419,7 @@ fn python_shell_kind() -> PythonShellKind {
     PythonShellKind::PowerShell
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn python_shell_kind() -> PythonShellKind {
     PythonShellKind::PosixSh
@@ -409,6 +430,7 @@ fn shell_echo_command(message: &str) -> String {
     format!("Write-Output '{}'", powershell_escape_str(message))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn shell_echo_command(message: &str) -> String {
     format!("printf '%s\n' '{}'", sh_escape_str(message))
@@ -422,6 +444,7 @@ fn apply_hidden_process_flags(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn apply_hidden_process_flags(_command: &mut Command) {}
 
@@ -440,11 +463,13 @@ fn powershell_single_quoted_here_string(value: &str) -> String {
     format!("@'\n{}\n'@", value.replace("\r\n", "\n"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn sh_escape(path: &Path) -> String {
     sh_escape_str(&path.to_string_lossy())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg(not(target_os = "windows"))]
 fn sh_escape_str(value: &str) -> String {
     value.replace('\'', r"'\''")

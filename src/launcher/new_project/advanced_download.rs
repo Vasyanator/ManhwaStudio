@@ -32,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 /// Per-frame timeout for a browser IPC command: if no progress frame or terminal
 /// arrives within this window the call is abandoned (treated as a dead backend).
@@ -1718,14 +1718,14 @@ fn ensure_backend_client() -> Result<backend_ipc::BackendClient, AdvancedDownloa
         handle.send_process(crate::ai_backend_supervisor::AiBackendProcessCommand::Start);
     }
 
-    let deadline = std::time::Instant::now() + BACKEND_START_WAIT;
+    let deadline = web_time::Instant::now() + BACKEND_START_WAIT;
     loop {
         if let Ok(client) = backend_ipc::shared_client()
             && backend_is_ready(&client)
         {
             return Ok(client);
         }
-        if std::time::Instant::now() >= deadline {
+        if web_time::Instant::now() >= deadline {
             return Err(AdvancedDownloadError {
                 user_message: "ИИ бэкенд не запущен. Запустите его в настройках, чтобы \
                     пользоваться браузерным выкачивателем."
@@ -2469,8 +2469,8 @@ fn cleanup_temp_dir(dir: &Path) {
 }
 
 fn advanced_cancel_file_path() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let nanos = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir().join(format!(
         "mangafucker_adv_cancel_{}_{}.flag",

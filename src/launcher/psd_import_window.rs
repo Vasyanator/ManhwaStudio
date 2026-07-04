@@ -31,18 +31,20 @@ use egui::{
 use ag_psd::psd::{Layer, PixelData, ReadOptions};
 use ag_psd::read_psd;
 use image::RgbaImage;
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::Command;
 use std::sync::{
     Arc,
     mpsc::{self, Receiver},
 };
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 use zip::ZipArchive;
 
 const WINDOW_TITLE: &str = "Импорт из PSD";
@@ -833,6 +835,7 @@ impl PsdImportWindowState {
         )
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_files(&mut self) {
         let Some(paths) = FileDialog::new()
             .set_directory(self.projects_root.clone())
@@ -844,6 +847,14 @@ impl PsdImportWindowState {
         self.start_scan(ScanRequest::Files { paths });
     }
 
+    /// Web stub: native file/folder pickers (`rfd`) have no browser equivalent.
+    /// Reports the missing capability instead of opening a dialog.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_files(&mut self) {
+        self.status = ImportStatus::Error("Выбор файлов недоступен в веб-версии.".to_string());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_folder(&mut self) {
         let Some(path) = FileDialog::new()
             .set_directory(self.projects_root.clone())
@@ -852,6 +863,12 @@ impl PsdImportWindowState {
             return;
         };
         self.start_scan(ScanRequest::Folder { path });
+    }
+
+    /// Web stub twin of `pick_files` for the folder picker.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_folder(&mut self) {
+        self.status = ImportStatus::Error("Выбор папки недоступен в веб-версии.".to_string());
     }
 
     fn start_scan(&mut self, request: ScanRequest) {
@@ -1759,8 +1776,8 @@ fn scan_archive(
 }
 
 fn create_temp_extract_dir() -> Result<PathBuf, WorkerError> {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let timestamp = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let dir = std::env::temp_dir().join(format!(
@@ -1775,6 +1792,24 @@ fn create_temp_extract_dir() -> Result<PathBuf, WorkerError> {
     Ok(dir)
 }
 
+/// Web stub: archive extraction shells out to external tools (`rar`/`7z`/…) via
+/// `std::process::Command`, which cannot run in the browser. Returns a clear error.
+#[cfg(target_arch = "wasm32")]
+fn extract_archive_with_commands(
+    path: &Path,
+    _output_dir: &Path,
+    _commands: &[&str],
+) -> Result<(), WorkerError> {
+    Err(WorkerError {
+        user_message: "Распаковка архивов недоступна в веб-версии.".to_string(),
+        log_message: format!(
+            "archive extraction via external tools is unavailable on the web build for '{}'",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_archive_with_commands(
     path: &Path,
     output_dir: &Path,

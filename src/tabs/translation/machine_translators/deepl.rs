@@ -18,14 +18,38 @@ Behavior notes:
 - Retries 429/rate-limit responses with backoff + state refresh fallback.
 */
 
+use super::MachineTranslatorBackend;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeeplMtBackend;
+
+/// Web stub: DeepL translation uses native HTTP (`ureq`) JSON-RPC calls that the
+/// browser build cannot make, so every batch fails with a clear message instead
+/// of returning a fake translation.
+#[cfg(target_arch = "wasm32")]
+impl MachineTranslatorBackend for DeeplMtBackend {
+    fn translate_texts(
+        &self,
+        _source_lang: &str,
+        _target_lang: &str,
+        _texts: Vec<String>,
+    ) -> Result<Vec<Result<String, String>>, String> {
+        Err("Перевод через DeepL недоступен в веб-версии.".to_string())
+    }
+}
+
+// The native DeepL implementation depends on `ureq` (native HTTP), which is not
+// compiled for wasm. The whole native surface lives in this module so the cfg
+// boundary is a single point; on wasm only the stub impl above is compiled.
+#[cfg(not(target_arch = "wasm32"))]
+mod native {
+use super::{DeeplMtBackend, MachineTranslatorBackend};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use ureq::Agent;
-
-use super::MachineTranslatorBackend;
 
 const DEEPL_JSONRPC_URL: &str = "https://www2.deepl.com/jsonrpc";
 const DEEPL_CLIENT_STATE_URL: &str = "https://w.deepl.com/web";
@@ -34,9 +58,6 @@ const DEEPL_RETRY_COUNT: usize = 3;
 const DEEPL_CLIENT_STATE_V: &str = "20180814";
 const DEEPL_PREFERRED_LANGS: [&str; 2] = ["EN", "RU"];
 static DEEPL_GLOBAL_LAST_ACCESS: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DeeplMtBackend;
 
 impl MachineTranslatorBackend for DeeplMtBackend {
     fn translate_texts(
@@ -443,3 +464,4 @@ fn deepl_error_code_text(code: i64) -> &'static str {
 fn is_deepl_rate_limited(status: u16, code: i64) -> bool {
     status == 429 || matches!(code, 1042911 | 1042912)
 }
+} // mod native

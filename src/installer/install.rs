@@ -24,11 +24,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use web_time::Duration;
 #[cfg(target_os = "windows")]
-use std::time::Instant;
+use web_time::Instant;
 #[cfg(target_os = "windows")]
-use std::time::SystemTime;
+use web_time::SystemTime;
 
 use crate::config;
 use crate::gpu_utils::RuntimeVersion;
@@ -462,7 +462,7 @@ impl ExistingInstallApp {
             "Удаляем установленную копию из '{}', затем вернёмся в режим установки...",
             install.install_dir.display()
         );
-        let _ = std::thread::Builder::new()
+        let _ = ms_thread::Builder::new()
             .name("existing-install-reinstall".to_string())
             .spawn(move || {
                 let result = run_existing_install_reinstall_worker(&install);
@@ -779,7 +779,7 @@ impl InstallerApp {
         self.overall_label = format!("Целевая папка: {}", install_target_dir.display());
         self.torch_choice_prompt = None;
 
-        let _ = std::thread::Builder::new()
+        let _ = ms_thread::Builder::new()
             .name("mini-launcher-torch-preflight".to_string())
             .spawn(move || {
                 let result = detect_torch_preflight();
@@ -823,7 +823,7 @@ impl InstallerApp {
             InstallDependencyProfile::Full => config::AiInstallType::Full,
         };
 
-        let _ = std::thread::Builder::new()
+        let _ = ms_thread::Builder::new()
             .name("mini-launcher-python-installer".to_string())
             .spawn(move || {
                 let result = run_install_worker(
@@ -1472,7 +1472,7 @@ pub(super) fn run_windows_uninstall_window(
     let result_sink = Arc::new(Mutex::new(None::<Result<(), String>>));
     let result_sink_for_app = Arc::clone(&result_sink);
 
-    std::thread::Builder::new()
+    ms_thread::Builder::new()
         .name("mini-launcher-uninstall".to_string())
         .spawn(move || {
             let result = run_windows_uninstall_worker(current_exe, install_dir, &tx);
@@ -1518,8 +1518,8 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!(
             "manhwastudio_install_type_test_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0)
         ));

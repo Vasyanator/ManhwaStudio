@@ -44,7 +44,7 @@ use egui::{Color32, Pos2, Rect};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use ms_thread::JoinHandle;
 
 pub(super) struct OverlayRuntimeState {
     pub(super) overlays_visible: bool,

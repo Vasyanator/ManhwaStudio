@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use ms_thread::{self as thread, JoinHandle};
 
 const ADV_REC_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const ADV_REC_MIN_ZOOM: f32 = 0.1;

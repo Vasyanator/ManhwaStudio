@@ -27,17 +27,29 @@ extracts it into `data_dir()/waifu2x` before processing.
 */
 
 use crate::config;
-use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
+use crate::launcher::new_project::ribbon::RibbonPage;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::launcher::new_project::ribbon::{ImportedImage, build_ribbon_pages};
 use image::RgbaImage;
+#[cfg(not(target_arch = "wasm32"))]
 use libloading::Library;
+#[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{CString, c_char, c_int, c_void};
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::Sender;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
-use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
+use ms_thread as thread;
+#[cfg(not(target_arch = "wasm32"))]
 use zip::ZipArchive;
 
 #[derive(Clone)]
@@ -61,6 +73,10 @@ struct PendingWaifu2x {
 pub struct Waifu2xController {
     pending: Option<PendingWaifu2x>,
     backend: Waifu2xBackendProbe,
+    /// Shared FFI runtime holding the loaded waifu2x dynamic library. The dynamic
+    /// library backend does not exist on the web build, so this field (and the
+    /// worker it drives) is native-only.
+    #[cfg(not(target_arch = "wasm32"))]
     runtime: Option<Arc<Waifu2xSharedRuntime>>,
 }
 
@@ -113,6 +129,7 @@ enum Waifu2xAvailability {
     Unavailable { user_message: String },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Waifu2xSharedRuntime {
     backend: Mutex<Waifu2xBackendProbe>,
     state: Mutex<Option<Waifu2xRuntime>>,
@@ -120,12 +137,14 @@ struct Waifu2xSharedRuntime {
     shutdown_requested: AtomicBool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct Waifu2xCancelHandle {
     context: *mut c_void,
     cancel: unsafe extern "C" fn(*mut c_void),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Waifu2xRuntime {
     _library: Library,
     api: Waifu2xApi,
@@ -136,12 +155,15 @@ struct Waifu2xRuntime {
 // SAFETY: The waifu2x context is never accessed concurrently without external synchronisation.
 // `Waifu2xSharedRuntime` serialises load/process through `state: Mutex<_>`, and cross-thread
 // cancellation uses the dedicated C API function designed for that purpose.
+#[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for Waifu2xRuntime {}
 
 // SAFETY: The cancel handle is copied between threads only to call the library's thread-safe
 // cancellation entry point on the same context while the owning runtime stays alive.
+#[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for Waifu2xCancelHandle {}
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoadedWaifu2xConfig {
     noise: i32,
@@ -151,6 +173,7 @@ struct LoadedWaifu2xConfig {
     num_threads: i32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 struct Waifu2xApi {
     abi_version: unsafe extern "C" fn() -> c_int,
@@ -173,6 +196,7 @@ struct Waifu2xApi {
     last_error: unsafe extern "C" fn(*const c_void, *mut c_char, usize) -> usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 struct Waifu2xImage {
     data: *mut u8,
@@ -181,6 +205,7 @@ struct Waifu2xImage {
     channels: c_int,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 struct Waifu2xLoadParams {
     model_dir_utf8: *const c_char,
@@ -192,10 +217,13 @@ struct Waifu2xLoadParams {
     num_threads: c_int,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const WAIFU2X_ABI_VERSION: i32 = 1;
+#[cfg(not(target_arch = "wasm32"))]
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
 impl Waifu2xController {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         let backend = probe_waifu2x_backend();
         let runtime = Some(Arc::new(Waifu2xSharedRuntime::new(backend.clone())));
@@ -203,6 +231,16 @@ impl Waifu2xController {
             pending: None,
             backend,
             runtime,
+        }
+    }
+
+    /// Web build: the waifu2x dynamic library backend does not exist, so the probe
+    /// reports it unavailable and no FFI runtime is created.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Self {
+        Self {
+            pending: None,
+            backend: probe_waifu2x_backend(),
         }
     }
 
@@ -218,6 +256,7 @@ impl Waifu2xController {
         &self.backend.library_path
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn begin(&mut self, images: Vec<Waifu2xInputImage>, options: Waifu2xOptions) {
         let runtime = self
             .runtime
@@ -226,6 +265,19 @@ impl Waifu2xController {
         self.pending = Some(PendingWaifu2x {
             rx: spawn_waifu2x_worker(runtime, images, options),
         });
+    }
+
+    /// Web build: there is no waifu2x backend. Enqueue an immediate failure through
+    /// the normal channel so `poll` surfaces a clear "unavailable on web" error
+    /// instead of silently doing nothing.
+    #[cfg(target_arch = "wasm32")]
+    pub fn begin(&mut self, _images: Vec<Waifu2xInputImage>, _options: Waifu2xOptions) {
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(Waifu2xWorkerEvent::Finished(Err(Waifu2xError {
+            user_message: "waifu2x недоступен в веб-версии.".to_string(),
+            log_message: "waifu2x backend is not available on the web build".to_string(),
+        })));
+        self.pending = Some(PendingWaifu2x { rx });
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<Waifu2xEvent> {
@@ -269,15 +321,23 @@ impl Waifu2xController {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn shutdown(&mut self) {
         if let Some(runtime) = self.runtime.take() {
             runtime.request_shutdown();
         }
         self.pending = None;
     }
+
+    /// Web build: no FFI runtime to tear down; just drop any pending state.
+    #[cfg(target_arch = "wasm32")]
+    pub fn shutdown(&mut self) {
+        self.pending = None;
+    }
 }
 
 impl Waifu2xBackendProbe {
+    #[cfg(not(target_arch = "wasm32"))]
     fn is_available(&self) -> bool {
         matches!(self.availability, Waifu2xAvailability::Available)
     }
@@ -289,6 +349,7 @@ impl Waifu2xBackendProbe {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn missing_error(&self) -> Waifu2xError {
         Waifu2xError {
             user_message: self
@@ -304,6 +365,7 @@ impl Waifu2xBackendProbe {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Waifu2xSharedRuntime {
     fn new(backend: Waifu2xBackendProbe) -> Self {
         Self {
@@ -431,6 +493,7 @@ impl Waifu2xSharedRuntime {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Waifu2xRuntime {
     fn ensure_loaded(
         &mut self,
@@ -563,6 +626,7 @@ impl Waifu2xRuntime {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Waifu2xRuntime {
     fn drop(&mut self) {
         // SAFETY: teardown order mirrors the C API contract. Errors are logged and ignored.
@@ -638,6 +702,7 @@ fn probe_waifu2x_backend() -> Waifu2xBackendProbe {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn install_waifu2x_backend(progress_tx: &Sender<Waifu2xWorkerEvent>) -> Result<(), Waifu2xError> {
     send_progress(progress_tx, "download_waifu2x", 0, 1);
     let package_path = download_waifu2x_package(progress_tx)?;
@@ -651,6 +716,7 @@ fn install_waifu2x_backend(progress_tx: &Sender<Waifu2xWorkerEvent>) -> Result<(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn download_waifu2x_package(
     progress_tx: &Sender<Waifu2xWorkerEvent>,
 ) -> Result<PathBuf, Waifu2xError> {
@@ -680,8 +746,8 @@ fn download_waifu2x_package(
         "[new-project] downloading waifu2x backend from {url}"
     ));
     let response = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(20))
-        .timeout_read(std::time::Duration::from_secs(120))
+        .timeout_connect(web_time::Duration::from_secs(20))
+        .timeout_read(web_time::Duration::from_secs(120))
         .build()
         .get(url)
         .call()
@@ -752,6 +818,7 @@ fn download_waifu2x_package(
     Ok(archive_path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_waifu2x_package(
     archive_path: &Path,
     progress_tx: &Sender<Waifu2xWorkerEvent>,
@@ -844,6 +911,7 @@ fn extract_waifu2x_package(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn waifu2x_download_error(url: &str, err: ureq::Error) -> Waifu2xError {
     match err {
         ureq::Error::Status(status, response) => Waifu2xError {
@@ -861,21 +929,26 @@ fn waifu2x_download_error(url: &str, err: ureq::Error) -> Waifu2xError {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn waifu2x_archive_name() -> &'static str {
     "Win.zip"
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(target_os = "windows"),
+    not(target_os = "macos")
+))]
 fn waifu2x_archive_name() -> &'static str {
     "Lin.zip"
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
 fn waifu2x_archive_name() -> &'static str {
     "Mac.zip"
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn waifu2x_package_url() -> &'static str {
     #[cfg(target_os = "windows")]
     {
@@ -900,6 +973,7 @@ fn waifu2x_package_url() -> &'static str {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn saturating_usize(value: u64) -> usize {
     match usize::try_from(value) {
         Ok(converted) => converted,
@@ -907,6 +981,7 @@ fn saturating_usize(value: u64) -> usize {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_waifu2x_worker(
     runtime: Arc<Waifu2xSharedRuntime>,
     images: Vec<Waifu2xInputImage>,
@@ -944,6 +1019,7 @@ fn spawn_waifu2x_worker(
     rx
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_waifu2x(
     images: Vec<Waifu2xInputImage>,
     options: Waifu2xOptions,
@@ -959,6 +1035,7 @@ fn run_waifu2x(
     runtime.process_images(&images, options, progress_tx)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu2xError> {
     // SAFETY: Loading a shared library is inherently unsafe; the path points to the bundled
     // waifu2x backend resolved by this module.
@@ -1024,6 +1101,7 @@ fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_waifu2x_api(library: &Library, library_path: &Path) -> Result<Waifu2xApi, Waifu2xError> {
     Ok(Waifu2xApi {
         abi_version: load_symbol(library, library_path, b"waifu2x_abi_version\0")?,
@@ -1040,6 +1118,7 @@ fn load_waifu2x_api(library: &Library, library_path: &Path) -> Result<Waifu2xApi
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_symbol<T>(library: &Library, library_path: &Path, symbol: &[u8]) -> Result<T, Waifu2xError>
 where
     T: Copy,
@@ -1057,6 +1136,7 @@ where
     Ok(*symbol_ref)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn last_error_message(api: Waifu2xApi, context: *mut c_void) -> String {
     // SAFETY: querying the required buffer length with a null buffer is part of the API contract.
     let len = unsafe { (api.last_error)(context.cast_const(), std::ptr::null_mut(), 0) };
@@ -1077,6 +1157,7 @@ fn last_error_message(api: Waifu2xApi, context: *mut c_void) -> String {
     String::from_utf8_lossy(&buffer[..used]).into_owned()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn waifu2x_image_to_rgba(api: &Waifu2xApi, image: &mut Waifu2xImage) -> Result<RgbaImage, String> {
     if image.data.is_null() {
         return Err("waifu2x returned a null output buffer".to_string());
@@ -1138,6 +1219,7 @@ fn waifu2x_image_to_rgba(api: &Waifu2xApi, image: &mut Waifu2xImage) -> Result<R
         .ok_or_else(|| "failed to build RGBA image from waifu2x output buffer".to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn available_parallelism_i32() -> i32 {
     match thread::available_parallelism() {
         Ok(value) => i32::try_from(value.get()).unwrap_or(i32::MAX),
@@ -1145,6 +1227,7 @@ fn available_parallelism_i32() -> i32 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn set_cancel_handle(
     cancel_handle: &Mutex<Option<Waifu2xCancelHandle>>,
     handle: Option<Waifu2xCancelHandle>,
@@ -1156,6 +1239,7 @@ fn set_cancel_handle(
     *slot = handle;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn send_progress(
     progress_tx: &Sender<Waifu2xWorkerEvent>,
     stage: &'static str,
@@ -1176,6 +1260,20 @@ fn send_progress(
 
 /// Synchronous waifu2x entry point for use by the batch executor (already off GUI thread).
 /// Returns the resulting `RgbaImage`s or an error string.
+///
+/// Web build: the dynamic-library waifu2x backend does not exist in the browser, so
+/// this returns a clear error instead of processing images.
+#[cfg(target_arch = "wasm32")]
+pub fn run_waifu2x_sync(
+    _images: Vec<Waifu2xInputImage>,
+    _options: Waifu2xOptions,
+) -> Result<Vec<RgbaImage>, String> {
+    Err("waifu2x backend is not available on the web build".to_string())
+}
+
+/// Synchronous waifu2x entry point for use by the batch executor (already off GUI thread).
+/// Returns the resulting `RgbaImage`s or an error string.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_waifu2x_sync(
     images: Vec<Waifu2xInputImage>,
     options: Waifu2xOptions,

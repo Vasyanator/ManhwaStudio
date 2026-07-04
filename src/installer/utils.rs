@@ -27,9 +27,9 @@ use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::thread;
-use std::time::SystemTime;
-use std::time::{Duration, Instant};
+use ms_thread as thread;
+use web_time::SystemTime;
+use web_time::{Duration, Instant};
 
 use crate::config;
 use crate::gpu_utils::{
@@ -3369,10 +3369,10 @@ fn run_command_streaming(
         .take()
         .ok_or_else(|| "не удалось получить stdout процесса".to_string())?;
     let tx_out = tx.cloned();
-    let out_handle = std::thread::spawn(move || stream_reader_lines(stdout, tx_out));
+    let out_handle = ms_thread::spawn(move || stream_reader_lines(stdout, tx_out));
     let err_handle = child.stderr.take().map(|stderr| {
         let tx_err = tx.cloned();
-        std::thread::spawn(move || stream_reader_lines(stderr, tx_err))
+        ms_thread::spawn(move || stream_reader_lines(stderr, tx_err))
     });
 
     let status = child

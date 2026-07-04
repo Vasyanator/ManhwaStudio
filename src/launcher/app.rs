@@ -33,7 +33,7 @@ use crate::tabs::wiki::WikiTabState;
 use eframe::egui::{self, epaint};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc::Receiver};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 const BACKGROUND_COLUMNS: usize = 5;
 const BACKGROUND_SPACING: f32 = 74.0;
@@ -557,33 +557,47 @@ impl LauncherApp {
             return;
         }
 
-        let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT);
-        let mut keep_open = true;
-        let builder = crate::launcher::apply_launcher_window_metadata(
-            egui::ViewportBuilder::default()
-                .with_title("Новый проект")
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([1000.0, 680.0])
-                .with_app_id(&self.app_id)
-                .with_resizable(true)
-                .with_close_button(true)
-                .with_minimize_button(true)
-                .with_maximize_button(true)
-                .with_active(true),
-        );
-        // On Linux/macOS the native hint is reliable; on Windows it misplaces the window,
-        // so maximisation is deferred to the first rendered frame via ViewportCommand.
-        #[cfg(not(target_os = "windows"))]
-        let builder = builder.with_maximized(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
-            #[cfg(target_os = "windows")]
-            if self.new_project_maximize_on_first_frame {
-                self.new_project_maximize_on_first_frame = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-                ctx.request_repaint();
-            }
-            keep_open = self.new_project_window.show(ctx, class);
-        });
+        let mut keep_open;
+
+        // Web: the browser has no separate OS windows, so render the new-project
+        // UI EMBEDDED in the launcher's main viewport (its `show_embedded` path).
+        #[cfg(target_arch = "wasm32")]
+        {
+            keep_open = self.new_project_window.show(ctx, egui::ViewportClass::Embedded);
+        }
+
+        // Native: the new-project window is its own OS window (immediate viewport).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            keep_open = true;
+            let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT);
+            let builder = crate::launcher::apply_launcher_window_metadata(
+                egui::ViewportBuilder::default()
+                    .with_title("Новый проект")
+                    .with_inner_size([1180.0, 760.0])
+                    .with_min_inner_size([1000.0, 680.0])
+                    .with_app_id(&self.app_id)
+                    .with_resizable(true)
+                    .with_close_button(true)
+                    .with_minimize_button(true)
+                    .with_maximize_button(true)
+                    .with_active(true),
+            );
+            // On Linux/macOS the native hint is reliable; on Windows it misplaces the window,
+            // so maximisation is deferred to the first rendered frame via ViewportCommand.
+            #[cfg(not(target_os = "windows"))]
+            let builder = builder.with_maximized(true);
+            ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+                #[cfg(target_os = "windows")]
+                if self.new_project_maximize_on_first_frame {
+                    self.new_project_maximize_on_first_frame = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                    ctx.request_repaint();
+                }
+                keep_open = self.new_project_window.show(ctx, class);
+            });
+        }
+
         if let Some(selection) = self.new_project_window.take_open_project_selection() {
             if let Ok(mut output) = self.output_outcome.lock() {
                 *output = Some(LauncherOutcome::OpenProject(selection.clone()));
@@ -596,6 +610,7 @@ impl LauncherApp {
                     "[launcher-open] failed to persist last selection after save: {err:#}"
                 ));
             }
+            #[cfg(not(target_arch = "wasm32"))]
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             keep_open = false;
         }
@@ -759,27 +774,41 @@ impl eframe::App for LauncherApp {
         }
 
         let viewport_rect = ctx.content_rect();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
-                let rect = viewport_rect;
-                let target_width = calc_column_width(rect.width());
-                if self.background_column_width != target_width {
-                    self.background_column_width = target_width;
-                    if self.background_plan.is_some() {
-                        self.rebuild_background_layout(ctx, target_width, rect.height());
+        // On the web the new-project window renders EMBEDDED in this same viewport
+        // (its own CentralPanel), because the browser has no separate OS windows.
+        // Skip the launcher's own CentralPanel that frame so there is exactly one.
+        #[cfg(target_arch = "wasm32")]
+        let draw_main_panel = !self.state.new_project_window_open;
+        #[cfg(not(target_arch = "wasm32"))]
+        let draw_main_panel = true;
+        if draw_main_panel {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let rect = viewport_rect;
+                    let target_width = calc_column_width(rect.width());
+                    if self.background_column_width != target_width {
+                        self.background_column_width = target_width;
+                        if self.background_plan.is_some() {
+                            self.rebuild_background_layout(ctx, target_width, rect.height());
+                        }
                     }
-                }
 
-                self.poll_workers(ctx, target_width, rect.height());
-                self.draw_background(ui, rect);
-                self.draw_pages(ctx, ui, rect);
-            });
+                    self.poll_workers(ctx, target_width, rect.height());
+                    self.draw_background(ui, rect);
+                    self.draw_pages(ctx, ui, rect);
+                });
+        }
         self.draw_new_project_window(ctx);
         self.draw_psd_import_window(ctx);
         self.draw_wiki_guide_window(ctx);
 
+        // Native: smooth 60 FPS. Web: throttle the forced repaint to reduce
+        // sustained GPU load (a WebGL/driver-stability safeguard for the demo).
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.request_repaint_after(Duration::from_millis(16));
+        #[cfg(target_arch = "wasm32")]
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 

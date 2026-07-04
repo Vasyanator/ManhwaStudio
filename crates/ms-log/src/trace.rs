@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 static TRACE_TX: OnceLock<Sender<String>> = OnceLock::new();
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -97,7 +97,8 @@ pub fn init_trace(log_dir: &Path, enabled: bool) -> Result<(), String> {
     prepare_trace_files(log_dir)?;
     let last_path = log_dir.join("trace-last.log");
     let (tx, rx) = mpsc::channel::<String>();
-    std::thread::Builder::new()
+    // ms_thread: std::thread on native, Web Worker (wasm_thread) on wasm.
+    ms_thread::Builder::new()
         .name("trace-writer".to_string())
         .spawn(move || run_writer(last_path, rx))
         .map_err(|err| format!("failed to spawn trace writer thread: {err}"))?;

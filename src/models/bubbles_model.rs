@@ -25,11 +25,10 @@ use crate::project::Bubble;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use ms_thread as thread;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SharedCanvasSettings {
@@ -136,11 +135,17 @@ impl BubblesModel {
             unsaved_bubbles_path.clone(),
         )));
         let bubble_index_by_id = build_bubble_index(&bubbles);
+        // Query the storage seam for the staging file so the web build checks its
+        // in-memory/IndexedDB store instead of the desktop filesystem.
+        let has_unsaved_changes = {
+            let unsaved_str = unsaved_bubbles_path.to_string_lossy();
+            crate::storage::storage().exists(unsaved_str.as_ref())
+        };
         Self {
             bubbles: Arc::new(bubbles),
             bubble_index_by_id,
             bubbles_path,
-            has_unsaved_changes: unsaved_bubbles_path.exists(),
+            has_unsaved_changes,
             unsaved_bubbles_path,
             revision: 1,
             canvas_settings,
@@ -397,12 +402,19 @@ fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Arc<Vec<Bubble>>>
 }
 
 fn write_bubbles_file(path: &Path, bubbles: &[Bubble]) -> Result<()> {
+    // Routed through the storage seam so the web build persists bubbles to its
+    // in-memory/IndexedDB store instead of the desktop filesystem.
+    let store = crate::storage::storage();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        let parent_str = parent.to_string_lossy();
+        store
+            .create_dir_all(parent_str.as_ref())
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(bubbles).context("failed to serialize bubbles")?;
-    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    store
+        .write(path.to_string_lossy().as_ref(), raw.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 

@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 # Standalone logging + tracing layer for ManhwaStudio.
-# Pure std, no external dependencies, no dependency on the application crate.
+# Depends only on the thread shim (for a wasm-compatible writer thread) — no
+# dependency on the application crate.
 [dependencies]
+web-time = "1"
+ms-thread = { path = "../ms-thread" }

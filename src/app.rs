@@ -90,8 +90,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use ms_thread::{self as thread, JoinHandle};
+use web_time::{Duration, Instant};
 
 const DECODE_TILE_SIDE: u32 = 2048;
 const LOADER_QUEUE_CAPACITY: usize = 2;
@@ -2168,7 +2168,7 @@ impl MangaApp {
                 self.fonts_load_rx = None;
             }
             Err(TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                ctx.request_repaint_after(web_time::Duration::from_millis(100));
             }
         }
     }
@@ -2274,7 +2274,7 @@ impl eframe::App for MangaApp {
             if *ts > 0.0 && now - ts > 5.0 {
                 self.save_to_project_status = None;
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                ctx.request_repaint_after(web_time::Duration::from_secs(1));
             }
         }
 
@@ -3022,7 +3022,13 @@ fn decode_image_rgba(idx: usize, path: &PathBuf) -> Result<image::RgbaImage, Str
             );
         }
     }
-    image::open(path)
+    // Read bytes through the storage seam (native passthrough = same file on
+    // disk; web = in-memory/IndexedDB store) then decode in memory. This is what
+    // lets page images load in the browser build.
+    let bytes = crate::storage::storage()
+        .read(path.to_string_lossy().as_ref())
+        .map_err(|e| format!("idx={idx} read failed: {e}"))?;
+    image::load_from_memory(&bytes)
         .map_err(|e| format!("idx={idx} decode failed: {e}"))
         .map(|img| img.to_rgba8())
 }

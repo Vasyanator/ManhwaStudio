@@ -16,6 +16,9 @@ in `tab.rs` and are reused from here as descendants of module `tab`.
 */
 
 use super::*;
+// `write_image` is a `PngEncoder` method from this trait; needed for the in-memory
+// PNG encode that replaces `image::save_buffer`/`fs::write` on the storage seam.
+use image::ImageEncoder;
 
 pub(super) fn export_typing_pages_to_folder(
     mut jobs: Vec<TypingExportPageJob>,
@@ -23,7 +26,9 @@ pub(super) fn export_typing_pages_to_folder(
     clean_overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
     progress_tx: mpsc::Sender<TypingExportEvent>,
 ) -> Result<TypingExportResult, String> {
-    fs::create_dir_all(&output_dir)
+    // Route directory creation through the storage seam (web build writes to its virtual store).
+    crate::storage::storage()
+        .create_dir_all(output_dir.to_string_lossy().as_ref())
         .map_err(|err| format!("Не удалось создать папку {}: {err}", output_dir.display()))?;
     let total = jobs.len();
     if jobs.is_empty() {
@@ -99,28 +104,41 @@ pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), 
     match job.export_format {
         TypingExportFormat::Png => {
             let (base_rgba, base_w, base_h) = flatten_typing_export_page_rgba(&job)?;
-            image::save_buffer(
-                &job.output_path,
-                &base_rgba,
-                base_w as u32,
-                base_h as u32,
-                image::ColorType::Rgba8,
-            )
-            .map_err(|err| {
-                format!(
-                    "Не удалось сохранить страницу {}: {err}",
-                    job.output_path.display()
+            // Encode RGBA8 to a PNG buffer in memory (default `PngEncoder` params, identical to
+            // `save_buffer` for a `.png` path) then hand the bytes to the storage seam.
+            let mut buf = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut buf)
+                .write_image(
+                    &base_rgba,
+                    base_w as u32,
+                    base_h as u32,
+                    image::ColorType::Rgba8.into(),
                 )
-            })
+                .map_err(|err| {
+                    format!(
+                        "Не удалось сохранить страницу {}: {err}",
+                        job.output_path.display()
+                    )
+                })?;
+            crate::storage::storage()
+                .write(job.output_path.to_string_lossy().as_ref(), &buf)
+                .map_err(|err| {
+                    format!(
+                        "Не удалось сохранить страницу {}: {err}",
+                        job.output_path.display()
+                    )
+                })
         }
         TypingExportFormat::Psd => {
             let bytes = super::super::psd_export::export_typing_single_page_psd(&job)?;
-            fs::write(&job.output_path, &bytes).map_err(|err| {
-                format!(
-                    "Не удалось сохранить страницу {}: {err}",
-                    job.output_path.display()
-                )
-            })
+            crate::storage::storage()
+                .write(job.output_path.to_string_lossy().as_ref(), &bytes)
+                .map_err(|err| {
+                    format!(
+                        "Не удалось сохранить страницу {}: {err}",
+                        job.output_path.display()
+                    )
+                })
         }
     }
 }
@@ -174,7 +192,16 @@ pub(super) fn load_clean_overlay_rgba_from_disk(
     let Some(clean_overlay_path) = clean_overlay_path else {
         return Ok(None);
     };
-    let clean = image::open(clean_overlay_path)
+    let path_str = clean_overlay_path.to_string_lossy();
+    let bytes = crate::storage::storage()
+        .read(path_str.as_ref())
+        .map_err(|err| {
+            format!(
+                "Не удалось открыть clean overlay {}: {err}",
+                clean_overlay_path.display()
+            )
+        })?;
+    let clean = image::load_from_memory(&bytes)
         .map_err(|err| {
             format!(
                 "Не удалось открыть clean overlay {}: {err}",
@@ -611,7 +638,15 @@ impl TypingTextOverlayLayer {
                     page_idx: page.idx,
                     page_path: page.path.clone(),
                     output_path: output_dir.join(out_name),
-                    clean_overlay_path: clean_overlay_path.is_file().then_some(clean_overlay_path),
+                    clean_overlay_path: {
+                        // `is_file()` via the storage seam: exists AND is not a directory.
+                        let store = crate::storage::storage();
+                        let is_file = {
+                            let s = clean_overlay_path.to_string_lossy();
+                            store.exists(s.as_ref()) && !store.is_dir(s.as_ref())
+                        };
+                        is_file.then_some(clean_overlay_path)
+                    },
                     clean_overlay_rgba: None,
                     overlays: overlays_by_page.remove(&page.idx).unwrap_or_default(),
                     rasters: rasters_by_page.remove(&page.idx).unwrap_or_default(),
@@ -653,7 +688,16 @@ impl TypingTextOverlayLayer {
 pub(in crate::tabs::typing) fn flatten_typing_export_page_rgba(
     job: &TypingExportPageJob,
 ) -> Result<(Vec<u8>, usize, usize), String> {
-    let mut base = image::open(&job.page_path)
+    let page_path_str = job.page_path.to_string_lossy();
+    let page_bytes = crate::storage::storage()
+        .read(page_path_str.as_ref())
+        .map_err(|err| {
+            format!(
+                "Не удалось открыть страницу {}: {err}",
+                job.page_path.display()
+            )
+        })?;
+    let mut base = image::load_from_memory(&page_bytes)
         .map_err(|err| {
             format!(
                 "Не удалось открыть страницу {}: {err}",

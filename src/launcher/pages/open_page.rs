@@ -27,7 +27,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use ms_thread as thread;
 
 const LAST_OPEN_TITLE_KEY: &str = "open_page_last_title";
 const LAST_OPEN_CHAPTERS_BY_TITLE_KEY: &str = "open_page_last_chapters_by_title";

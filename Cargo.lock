@@ -1098,6 +1098,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3282,6 +3292,7 @@ dependencies = [
  "arboard",
  "chrono",
  "clap",
+ "console_error_panic_hook",
  "cosmic-text",
  "eframe",
  "egui",
@@ -3290,14 +3301,17 @@ dependencies = [
  "hf-hub",
  "hyphenation",
  "image 0.25.9",
+ "js-sys",
  "keyring",
  "libc",
  "libloading",
  "minijinja",
  "ms-actions",
  "ms-log",
+ "ms-storage",
  "ms-text-render",
  "ms-text-util",
+ "ms-thread",
  "puffin",
  "puffin_egui",
  "rayon",
@@ -3312,6 +3326,10 @@ dependencies = [
  "uds_windows",
  "ureq",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "windows-sys 0.59.0",
  "winresource",
  "zeno",
@@ -3450,6 +3468,18 @@ dependencies = [
 [[package]]
 name = "ms-log"
 version = "0.1.0"
+dependencies = [
+ "ms-thread",
+ "web-time",
+]
+
+[[package]]
+name = "ms-storage"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "web-time",
+]
 
 [[package]]
 name = "ms-text-render"
@@ -3463,6 +3493,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "swash",
+ "web-time",
  "zeno",
 ]
 
@@ -3471,6 +3502,13 @@ name = "ms-text-util"
 version = "0.1.0"
 dependencies = [
  "hyphenation",
+]
+
+[[package]]
+name = "ms-thread"
+version = "0.1.0"
+dependencies = [
+ "wasm_thread",
 ]
 
 [[package]]
@@ -6396,6 +6434,18 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm_thread"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7516db7f32decdadb1c3b8deb1b7d78b9df7606c5cc2f6241737c2ab3a0258e"
+dependencies = [
+ "futures",
+ "js-sys",
+ "wasm-bindgen",
  "web-sys",
 ]
 

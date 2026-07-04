@@ -46,7 +46,6 @@ use ms_actions::{
 };
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
-use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -969,10 +968,19 @@ impl CleanOverlaysModel {
     }
 
     pub fn save_all(&self, clean_layers_dir: &Path) -> anyhow::Result<()> {
-        fs::create_dir_all(clean_layers_dir)?;
+        // Routed through the storage seam so the web build persists overlays into
+        // its in-memory/IndexedDB store instead of the desktop filesystem.
+        let store = crate::storage::storage();
+        let dir_str = clean_layers_dir.to_string_lossy();
+        store.create_dir_all(dir_str.as_ref())?;
         for (stem, image) in self.save_snapshots() {
             let dst = clean_layers_dir.join(format!("{stem}.png"));
-            image.save(&dst)?;
+            let dst_str = dst.to_string_lossy();
+            // Encode straight-alpha RGBA to PNG in memory (default encoder params,
+            // identical to `RgbaImage::save`) before handing bytes to storage.
+            let mut buf = Vec::new();
+            image.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+            store.write(dst_str.as_ref(), &buf)?;
         }
         Ok(())
     }
@@ -1343,10 +1351,18 @@ pub fn save_overlay_snapshots_to(
     if snapshots.is_empty() {
         return Ok(());
     }
-    fs::create_dir_all(dir)?;
+    // Routed through the storage seam (web build writes to its virtual store).
+    let store = crate::storage::storage();
+    let dir_str = dir.to_string_lossy();
+    store.create_dir_all(dir_str.as_ref())?;
     for (_, stem, image) in snapshots {
         let dst = dir.join(format!("{stem}.png"));
-        image.save(&dst)?;
+        let dst_str = dst.to_string_lossy();
+        // Encode straight-alpha RGBA to PNG in memory (default encoder params,
+        // identical to `RgbaImage::save`) before handing bytes to storage.
+        let mut buf = Vec::new();
+        image.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        store.write(dst_str.as_ref(), &buf)?;
     }
     Ok(())
 }

@@ -641,9 +641,19 @@ fn show_inline_param_editor_ui(
                 text_width,
                 "Открыть текстовый файл",
                 || {
-                    rfd::FileDialog::new()
-                        .add_filter("Текстовый файл", &["txt"])
-                        .pick_file()
+                    // Native file picker (`rfd`); on web there is no dialog, so the
+                    // picker yields no path (logged as a dropped capability).
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        rfd::FileDialog::new()
+                            .add_filter("Текстовый файл", &["txt"])
+                            .pick_file()
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        crate::runtime_log::log_warn("file picker unavailable on web build");
+                        None::<std::path::PathBuf>
+                    }
                 },
                 interactive_rects,
             );
@@ -780,7 +790,18 @@ fn show_inline_param_editor_ui(
                 path,
                 text_width,
                 "Выбрать папку",
-                || rfd::FileDialog::new().pick_folder(),
+                || {
+                    // Native folder picker (`rfd`); unavailable on web.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        rfd::FileDialog::new().pick_folder()
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        crate::runtime_log::log_warn("folder picker unavailable on web build");
+                        None::<std::path::PathBuf>
+                    }
+                },
                 interactive_rects,
             );
             inline_text_edit(ui, "Префикс", name_prefix, text_width, interactive_rects);

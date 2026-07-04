@@ -33,12 +33,14 @@ use crate::tools::MaskBrush;
 use crate::widgets::WheelSlider;
 use eframe::egui;
 use egui::{Color32, CursorIcon, Id, PointerButton, Pos2, Rect, Sense};
+// `write_image` is a `PngEncoder` method from this trait; needed for the in-memory
+// PNG encode that replaces `image::save_buffer` on the storage seam.
+use image::ImageEncoder;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use ms_thread as thread;
 
 const MASK_FILE_PREFIX: &str = "mask_page_";
 const MASK_FILE_SUFFIX: &str = ".png";
@@ -1447,28 +1449,31 @@ fn sample_deform_mesh_uv(
 fn load_masks_from_text_images_dir(
     text_images_dir: &Path,
 ) -> Result<Vec<TypingMaskLoadedPage>, String> {
-    if !text_images_dir.is_dir() {
+    // Route mask enumeration/reads through the storage seam (web build lists its virtual store).
+    let store = crate::storage::storage();
+    let dir_str = text_images_dir.to_string_lossy();
+    if !store.is_dir(dir_str.as_ref()) {
         return Ok(Vec::new());
     }
     let mut pages = Vec::<TypingMaskLoadedPage>::new();
-    for entry_res in fs::read_dir(text_images_dir)
-        .map_err(|err| format!("Не удалось прочитать {}: {err}", text_images_dir.display()))?
-    {
-        let entry = match entry_res {
+    let entries = store
+        .read_dir(dir_str.as_ref())
+        .map_err(|err| format!("Не удалось прочитать {}: {err}", text_images_dir.display()))?;
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+        // `entry.name` is the final path component, matching the old `path.file_name()`.
+        let Some(page_idx) = parse_mask_page_idx(&entry.name) else {
+            continue;
+        };
+        let path = text_images_dir.join(&entry.name);
+        let path_str = path.to_string_lossy();
+        let bytes = match store.read(path_str.as_ref()) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(page_idx) = parse_mask_page_idx(file_name) else {
-            continue;
-        };
-        let image = match image::open(&path) {
+        let image = match image::load_from_memory(&bytes) {
             Ok(v) => v.to_luma8(),
             Err(_) => continue,
         };
@@ -1495,7 +1500,10 @@ fn save_masks_to_text_images_dir(
     text_images_dir: &Path,
     pages: &[TypingMaskSavePage],
 ) -> Result<(), String> {
-    fs::create_dir_all(text_images_dir).map_err(|err| {
+    // Route directory creation and mask PNG writes through the storage seam.
+    let store = crate::storage::storage();
+    let dir_str = text_images_dir.to_string_lossy();
+    store.create_dir_all(dir_str.as_ref()).map_err(|err| {
         format!(
             "Не удалось создать папку {}: {err}",
             text_images_dir.display()
@@ -1514,14 +1522,20 @@ fn save_masks_to_text_images_dir(
             rgba[base + 3] = 255;
         }
         let out_path = text_images_dir.join(mask_file_name_for_page(page.page_idx));
-        image::save_buffer(
-            &out_path,
-            &rgba,
-            page.width as u32,
-            page.height as u32,
-            image::ColorType::Rgba8,
-        )
-        .map_err(|err| format!("Не удалось сохранить {}: {err}", out_path.display()))?;
+        // Encode straight RGBA8 to a PNG buffer in memory (default `PngEncoder` params, identical
+        // to `save_buffer` for a `.png` path) then persist through the storage seam.
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                &rgba,
+                page.width as u32,
+                page.height as u32,
+                image::ColorType::Rgba8.into(),
+            )
+            .map_err(|err| format!("Не удалось сохранить {}: {err}", out_path.display()))?;
+        store
+            .write(out_path.to_string_lossy().as_ref(), &buf)
+            .map_err(|err| format!("Не удалось сохранить {}: {err}", out_path.display()))?;
     }
     Ok(())
 }

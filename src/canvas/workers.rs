@@ -38,8 +38,8 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use ms_thread::{self as thread, JoinHandle};
+use web_time::Duration;
 
 pub(super) fn spawn_overlay_prepare_thread() -> (
     Sender<Option<OverlayPrepareRequest>>,

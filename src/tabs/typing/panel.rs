@@ -128,6 +128,8 @@ use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_selection::visuals::paint_text_selection;
 use egui::{Align, Color32, ColorImage, Id, Rect, TextureHandle, TextureOptions, Vec2};
+// Native-only file dialog; the `rfd` crate is absent on the wasm target.
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -137,7 +139,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use ms_thread as thread;
 
 const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
 const TYPING_VERTICAL_PANEL_AREA_ID: &str = "typing_canvas_vertical_panel";

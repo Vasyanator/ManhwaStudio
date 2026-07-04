@@ -40,6 +40,11 @@ Context replicas:
   counted, or reported as failures.
 */
 
+// AI API machine translation runs over `genai` + `tokio`, native-only crates not
+// compiled for wasm. The controller, worker threads, and command/event enums stay
+// target-neutral; only the bodies that touch `genai`/`tokio` (and the `keyring`
+// API-key helpers in `ocr`) are gated behind `not(target_arch = "wasm32")` below.
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 use std::fs;
 use std::io::Cursor;
@@ -48,20 +53,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use ms_thread::{self as thread, JoinHandle};
 
 use super::machine_translators::MachineTranslatorBackend;
 use super::machine_translators::deepl::DeeplMtBackend;
 use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
-use super::ocr::{
-    AiApiService, build_ai_api_client, model_iden_for_ai_api_service, read_ai_api_key,
-};
+use super::ocr::AiApiService;
+#[cfg(not(target_arch = "wasm32"))]
+use super::ocr::{build_ai_api_client, model_iden_for_ai_api_service, read_ai_api_key};
 use crate::project::{Bubble, ProjectData};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::runtime_log;
 use crate::tabs::characters::load_characters_for_notes;
 use crate::tabs::terms::load_terms_for_notes;
 use crate::tabs::translation::panels::bubbles::{bubble_extra_i32, bubble_extra_string};
+#[cfg(not(target_arch = "wasm32"))]
 use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ContentPart, ReasoningEffort,
 };
@@ -236,6 +243,9 @@ impl AiMtReasoning {
         }
     }
 
+    /// Maps to the `genai` reasoning-effort enum. Native-only: `genai` is not
+    /// compiled for the web build.
+    #[cfg(not(target_arch = "wasm32"))]
     fn to_genai(self) -> Option<ReasoningEffort> {
         match self {
             Self::None => None,
@@ -1008,6 +1018,30 @@ pub fn is_probable_quota_or_limit_error(error: &str) -> bool {
         .any(|keyword| haystack.contains(keyword))
 }
 
+/// Web stub: AI API translation runs over `genai` + `tokio`, which are not
+/// compiled for the browser build. Fails the run with a clear message rather than
+/// producing a fake translation. Signature matches the native twin so the neutral
+/// `run_translate_request` dispatch compiles on both targets.
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+fn run_ai_translate_request(
+    run_id: u64,
+    _source_lang: &str,
+    _target_lang: &str,
+    _items: Vec<MtTranslateItem>,
+    _options: AiMtOptions,
+    evt_tx: &Sender<WorkerEvent>,
+    _cancel_requested: &Arc<AtomicBool>,
+    _translated: &mut usize,
+    _errors: &mut usize,
+) {
+    let _ = evt_tx.send(WorkerEvent::RunFailed {
+        run_id,
+        error: "Перевод через AI API недоступен в веб-версии.".to_string(),
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn run_ai_translate_request(
     run_id: u64,
@@ -1099,6 +1133,7 @@ fn run_ai_translate_request(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 async fn run_ai_translate_async(
     run_id: u64,
@@ -1348,6 +1383,7 @@ const IMAGEBUBBLE_CONTEXT_HEADER: &str = "Chapter context so far (already known 
 /// `system(static) + system(chapter context, cached) + user(target image + instruction)`. Because
 /// the context is append-only and the image binary never enters the context, request N+1's input has
 /// request N's input as a literal prefix, so provider prompt caching reuses it across the chapter.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 async fn run_ai_imagebubble_translate_async(
     run_id: u64,
@@ -1527,6 +1563,7 @@ async fn run_ai_imagebubble_translate_async(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn send_imagebubble_progress(
     evt_tx: &Sender<WorkerEvent>,
@@ -1549,6 +1586,7 @@ fn send_imagebubble_progress(
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn imagebubble_context_chars(context: &[String]) -> usize {
     // +1 per joined newline, matching the text actually sent.
     context.iter().map(String::len).sum::<usize>() + context.len().saturating_sub(1)
@@ -1558,6 +1596,7 @@ fn imagebubble_context_chars(context: &[String]) -> usize {
 /// Trimming the front does invalidate the shared cached prefix at that boundary, so this only fires
 /// when the chapter context (text only) actually exceeds the budget — for typical chapters it never
 /// does and the prefix stays fully cacheable. Returns how many items were dropped.
+#[cfg(not(target_arch = "wasm32"))]
 fn prune_imagebubble_context(context: &mut Vec<String>, budget: usize) -> usize {
     let mut pruned = 0usize;
     while context.len() > 1 && imagebubble_context_chars(context) > budget {
@@ -1581,6 +1620,7 @@ fn imagebubble_target_image(
 
 /// Builds the single-turn request for one target ImageBubble: a static system prompt, a cached
 /// system block with the chapter context so far, and a user message with the target image.
+#[cfg(not(target_arch = "wasm32"))]
 fn build_imagebubble_chat_request(
     system_prompt: &str,
     context: &[String],
@@ -1635,6 +1675,7 @@ fn imagebubble_context_line_for_item(item: &MtTranslateItem, source: AiMtContext
 
 /// Builds the chapter context line for a just-translated target image, preferring the model's
 /// resolved original/translation and falling back to the item's stored fields when missing.
+#[cfg(not(target_arch = "wasm32"))]
 fn imagebubble_context_line_for_target(
     item: &MtTranslateItem,
     source: AiMtContextSource,
@@ -1691,6 +1732,7 @@ fn imagebubble_context_line(id: i64, character: &str, text: &str) -> String {
 }
 
 /// Resolved source/translation text of a translated image, used to fold it into later context.
+#[cfg(not(target_arch = "wasm32"))]
 struct ResolvedImageText {
     original: String,
     translation: String,
@@ -1699,6 +1741,7 @@ struct ResolvedImageText {
 /// Sends the per-item translation event for a single target ImageBubble and returns its resolved
 /// text for context folding, or `None` when the model returned nothing usable (already reported as a
 /// failure).
+#[cfg(not(target_arch = "wasm32"))]
 fn emit_imagebubble_result(
     run_id: u64,
     evt_tx: &Sender<WorkerEvent>,
@@ -1771,6 +1814,7 @@ fn emit_imagebubble_result(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn join_nonempty<'a>(parts: impl Iterator<Item = &'a str>) -> String {
     parts
         .map(str::trim)
@@ -1804,6 +1848,7 @@ fn build_ai_mt_imagebubble_system_prompt(
     parts.join("\n\n")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_ai_mt_imagebubble_chat_options(
     reasoning: AiMtReasoning,
     cache_key: &str,
@@ -1917,6 +1962,7 @@ fn push_project_context_parts(parts: &mut Vec<String>, options: &AiMtOptions) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_ai_mt_chat_options(reasoning: AiMtReasoning) -> Option<ChatOptions> {
     reasoning.to_genai().map(|effort| {
         ChatOptions::default()
@@ -1970,6 +2016,7 @@ fn build_ai_mt_batch_prompt(
 
 /// Diagnostic counts for the image binaries attached to a single AI MT request: how many image
 /// parts were sent and their total encoded (pre-base64) size in bytes. Used only for logging.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct MtBatchImageStats {
     image_count: usize,
@@ -2028,6 +2075,7 @@ fn build_ai_mt_user_parts(
     Ok(parts)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_ai_mt_user_message(
     items: &[MtTranslateItem],
     options: &AiMtOptions,
@@ -2226,6 +2274,7 @@ fn build_ai_mt_imagebubble_request_preview(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn replace_last_ai_mt_user_message_with_history(
     chat_req: &mut ChatRequest,
     items: &[MtTranslateItem],
@@ -2244,6 +2293,7 @@ fn replace_last_ai_mt_user_message_with_history(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_ai_mt_history_prompt(
     items: &[MtTranslateItem],
     include_existing_translation: bool,
@@ -2345,6 +2395,7 @@ fn ai_mt_ordered_item_descriptor(
     Ok(format!("Item:\n{json}"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn context_char_budget(percent: u8) -> usize {
     let percent = usize::from(percent.clamp(10, 100));
     AI_MT_CONTEXT_CHAR_BUDGET.saturating_mul(percent) / 100
@@ -2455,6 +2506,7 @@ fn normalize_uv_rect(rect: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     if data.is_empty() {
@@ -2490,6 +2542,7 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prune_ai_mt_chat_context(
     chat_req: &mut ChatRequest,
     history_batch_sizes: &mut VecDeque<usize>,
@@ -2511,6 +2564,7 @@ fn prune_ai_mt_chat_context(
     pruned_replicas
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct AiMtTranslation {
     bubble_id: i64,
@@ -2520,12 +2574,14 @@ struct AiMtTranslation {
     areas: Vec<AiMtArea>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct AiMtArea {
     original_text: String,
     translation: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
     let json_text = extract_json_payload(raw);
     let value: Value = serde_json::from_str(&json_text)
@@ -2583,6 +2639,7 @@ fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
 }
 
 /// Parses one per-area entry `{original_text, translation}` from a multi-area image response.
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_ai_mt_area(value: &Value) -> Option<AiMtArea> {
     let translation = value
         .get("translation")
@@ -2602,6 +2659,7 @@ fn parse_ai_mt_area(value: &Value) -> Option<AiMtArea> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_json_payload(raw: &str) -> String {
     let trimmed = raw.trim();
     if let Some(stripped) = trimmed.strip_prefix("```") {

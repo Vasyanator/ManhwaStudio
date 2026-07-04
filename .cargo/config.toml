@@ -4,3 +4,35 @@ bwin = "build --release --target x86_64-pc-windows-gnu --bin manhwastudio_rs"
 bmac = "build --release --target x86_64-apple-darwin --bin manhwastudio_rs"
 blin = "build --release --target x86_64-unknown-linux-gnu --bin manhwastudio_rs"
 check-all = "check -q --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-gnu"
+# Web build (Variant A: browser threads via wasm atomics). Requires nightly +
+# rust-src because it recompiles std with the atomics/bulk-memory features set
+# below. Invoke as: `cargo +nightly wcheck` / `cargo +nightly wbuild`.
+# See build-wasm.sh and docs/WEB_PORT.md.
+wcheck = "check --target wasm32-unknown-unknown -Z build-std=std,panic_abort --features web --bin manhwastudio_rs"
+wbuild = "build --release --target wasm32-unknown-unknown -Z build-std=std,panic_abort --features web --bin manhwastudio_rs"
+
+# Rustflags for the browser wasm target only. Applied to std too under
+# -Z build-std, so the whole binary is built atomics-capable. Native targets are
+# unaffected. `atomics` is unstable but the standard path for wasm threads.
+#
+# The `--shared-memory`/`--import-memory`/`--max-memory` link args make the module
+# use a SharedArrayBuffer-backed memory that Web Workers (wasm_thread) share — the
+# atomics target-feature alone does NOT emit shared memory. The JS glue
+# (wasm-bindgen) instantiates the shared `WebAssembly.Memory`. max-memory = 2 GiB.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    # wasm-bindgen's thread transform needs a SHARED, IMPORTED memory (it asserts
+    # `mem.import.is_some()`); it then instantiates the shared `WebAssembly.Memory`
+    # in JS. `--shared-memory` requires `--max-memory`.
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--max-memory=2147483648",
+    # `--shared-memory` stops wasm-ld from exporting the heap/TLS symbols that
+    # wasm-bindgen's thread transform needs to inject per-thread TLS/stack.
+    "-C", "link-arg=--export=__heap_base",
+    "-C", "link-arg=--export=__tls_base",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__wasm_init_tls",
+]

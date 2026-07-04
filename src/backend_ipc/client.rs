@@ -29,22 +29,10 @@ connect-per-call path.
 // intentionally unused.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::thread;
-use std::time::Duration;
-
-use serde_json::Value;
-
-use super::frame::{Frame, read_frame, write_frame};
-use super::protocol;
-use super::transport::{BackendStream, backend_socket_path, connect_path};
-
-/// Default connect timeout for the v2 socket, matching the fail-fast intent of
-/// the legacy backend connect paths.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// The whole framed transport (socket I/O, reader thread, reconnect) is native.
+// `CallError` stays target-neutral below; every native item lives in the
+// `#[cfg(not(wasm32))] mod inner` further down, with a wasm stub exposing the same
+// public surface (`BackendClient`, `CallHandle`, `shared_client`) returning errors.
 
 /// Outcome of a single `call` / `call_streaming` request.
 ///
@@ -88,8 +76,159 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
-/// A message the reader thread routes to a waiting caller, keyed by request `id`.
-enum RouterMsg {
+// ============================================================================
+// Web (wasm) stub: the AI backend process and its AF_UNIX transport are compiled
+// out on the browser target. The public surface (`BackendClient`, `CallHandle`,
+// `shared_client`) is kept so shared call sites compile with no cfg; every I/O
+// entry point returns a clear typed error instead of a fake success.
+// ============================================================================
+#[cfg(target_arch = "wasm32")]
+mod wasm_stub {
+    use super::CallError;
+    use serde_json::Value;
+    use std::sync::mpsc::{self, Receiver};
+    use web_time::Duration;
+
+    const WEB_UNAVAILABLE: &str = "AI backend недоступен в веб-версии.";
+
+    /// Web stub for the framed IPC client. Holds no connection; every request
+    /// fails with a transport error.
+    #[derive(Clone, Debug)]
+    pub struct BackendClient;
+
+    impl BackendClient {
+        /// Web stub: there is no backend process to connect to.
+        pub fn connect() -> Result<Self, String> {
+            Err(WEB_UNAVAILABLE.to_string())
+        }
+
+        /// Web stub: no handshake ever runs, so there is no backend version.
+        #[must_use]
+        pub fn backend_version(&self) -> Option<String> {
+            None
+        }
+
+        /// Web stub: the connection is never alive.
+        #[must_use]
+        pub fn is_alive(&self) -> bool {
+            false
+        }
+
+        /// Web stub: requests cannot be issued without a backend.
+        pub fn call(
+            &self,
+            _method: &str,
+            _header_fields: Value,
+            _blob: &[u8],
+            _timeout: Duration,
+        ) -> Result<(Value, Vec<u8>), CallError> {
+            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+        }
+
+        /// Web stub: streaming requests cannot be issued without a backend.
+        pub fn call_streaming(
+            &self,
+            _method: &str,
+            _header_fields: Value,
+            _blob: &[u8],
+            _on_progress: impl FnMut(&Value, &[u8]),
+            _timeout: Duration,
+        ) -> Result<(Value, Vec<u8>), CallError> {
+            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+        }
+
+        /// Web stub: no request can be started, so no handle is returned.
+        pub fn begin_call(
+            &self,
+            _method: &str,
+            _header_fields: Value,
+            _blob: &[u8],
+        ) -> Result<CallHandle, String> {
+            Err(WEB_UNAVAILABLE.to_string())
+        }
+
+        /// Web stub: there is no in-flight request to cancel.
+        pub fn cancel(&self, _id: u64) -> Result<(), String> {
+            Err(WEB_UNAVAILABLE.to_string())
+        }
+
+        /// Web stub: returns an immediately-closed receiver (no events on web).
+        #[must_use]
+        pub fn subscribe(&self, _topic: &str) -> Receiver<Value> {
+            // Drop the sender so the caller observes a closed channel (no events)
+            // rather than a hang; the backend event stream does not exist on web.
+            let (_tx, rx) = mpsc::channel();
+            rx
+        }
+    }
+
+    /// Web stub for an in-flight request handle. No request can exist on web.
+    #[derive(Debug)]
+    pub struct CallHandle;
+
+    impl CallHandle {
+        /// Web stub: no real correlation id is ever allocated.
+        #[must_use]
+        pub fn id(&self) -> u64 {
+            0
+        }
+
+        /// Web stub: nothing to cancel.
+        pub fn cancel(&self) -> Result<(), String> {
+            Err(WEB_UNAVAILABLE.to_string())
+        }
+
+        /// Web stub: no terminal frame will ever arrive.
+        pub fn wait(self, _timeout: Duration) -> Result<(Value, Vec<u8>), CallError> {
+            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+        }
+
+        /// Web stub: no terminal frame will ever arrive.
+        pub fn wait_streaming(
+            self,
+            _on_progress: impl FnMut(&Value, &[u8]),
+            _timeout: Duration,
+        ) -> Result<(Value, Vec<u8>), CallError> {
+            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+        }
+    }
+
+    /// Web stub: no process-wide client can be connected on the browser target.
+    pub fn shared_client() -> Result<BackendClient, String> {
+        Err(WEB_UNAVAILABLE.to_string())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm_stub::{BackendClient, CallHandle, shared_client};
+
+// ============================================================================
+// Native implementation: the real framed transport. All items live in `inner`
+// so a single cfg gate compiles the whole subsystem out on wasm; the public
+// types are re-exported at the end of the module.
+// ============================================================================
+#[cfg(not(target_arch = "wasm32"))]
+mod inner {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    use ms_thread as thread;
+    use web_time::Duration;
+
+    use serde_json::Value;
+
+    use super::CallError;
+    use crate::backend_ipc::frame::{Frame, read_frame, write_frame};
+    use crate::backend_ipc::protocol;
+    use crate::backend_ipc::transport::{BackendStream, backend_socket_path, connect_path};
+
+    /// Default connect timeout for the v2 socket, matching the fail-fast intent of
+    /// the legacy backend connect paths.
+    const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// A message the reader thread routes to a waiting caller, keyed by request `id`.
+    enum RouterMsg {
     /// An interim `progress` frame: `(header, optional preview blob)`.
     Progress(Value, Vec<u8>),
     /// The terminal `response`/`error` frame: `(header, response blob)`.
@@ -528,9 +667,9 @@ fn drain_terminal_after_timeout(
     rx: &Receiver<RouterMsg>,
     id: u64,
 ) -> Result<(Value, Vec<u8>), CallError> {
-    let deadline = std::time::Instant::now() + TIMEOUT_TERMINAL_GRACE;
+    let deadline = web_time::Instant::now() + TIMEOUT_TERMINAL_GRACE;
     loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(web_time::Instant::now());
         if remaining.is_zero() {
             break;
         }
@@ -832,8 +971,8 @@ mod tests {
             let unique = format!(
                 "manhwastudio_v2_test_{}_{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             );
@@ -1240,8 +1379,8 @@ mod tests {
             let unique = format!(
                 "manhwastudio_v2_recon_{}_{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
                     .map(|d| d.as_nanos())
                     .unwrap_or(0)
             );
@@ -1322,9 +1461,9 @@ mod tests {
         let client = connect_to(server.path.clone());
 
         // Wait until the initial connection is accounted for.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = web_time::Instant::now() + Duration::from_secs(2);
         while server.accepted.load(Ordering::SeqCst) < 1 {
-            if std::time::Instant::now() > deadline {
+            if web_time::Instant::now() > deadline {
                 panic!("initial connection never accepted");
             }
             thread::sleep(Duration::from_millis(5));
@@ -1406,8 +1545,8 @@ mod tests {
 
         // Unique temp socket so we never clobber a real backend's socket. The
         // backend binds this base path directly (the single, sole IPC socket).
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let stamp = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let socket_path =
@@ -1454,12 +1593,12 @@ mod tests {
 
         // Wait (poll) up to 120s for the socket file to appear; the backend
         // imports the model stack lazily but binds the socket early.
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let deadline = web_time::Instant::now() + Duration::from_secs(120);
         loop {
             if Path::new(&socket_path).exists() {
                 break;
             }
-            if std::time::Instant::now() > deadline {
+            if web_time::Instant::now() > deadline {
                 let mut log = String::new();
                 if let Ok(mut f) = std::fs::File::open(&log_path) {
                     let _ = f.read_to_string(&mut log);
@@ -1598,3 +1737,7 @@ mod tests {
         // `_guard` drops here: kills the backend and removes the socket files.
     }
 }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use inner::{BackendClient, CallHandle, shared_client};

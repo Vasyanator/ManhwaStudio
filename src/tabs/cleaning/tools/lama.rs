@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 /// Per-call timeout for the v2 framed backend. Mirrors the previous HTTP read
 /// timeout: model warmup + inpaint can take a while on first use.

@@ -13,10 +13,17 @@ Notes:
 - Callers must invoke this from worker/background code, not the GUI thread.
 */
 
+// Hugging Face download stack is native-only (`hf-hub`/`ureq` are compiled out on
+// wasm); the resolver keeps its public signatures on both targets and stubs the
+// actual download on the web build.
+#[cfg(not(target_arch = "wasm32"))]
 use hf_hub::api::sync::ApiBuilder;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Mutex, OnceLock};
 
 pub const HF_OWNER: &str = "Vasyanator2";
@@ -108,6 +115,7 @@ const MANGA_OCR_2025_FILES: &[&str] = &[
     "vocab.txt",
 ];
 
+#[cfg(not(target_arch = "wasm32"))]
 static DOWNLOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn ensure_paddle_ocr_detector(models_root: &Path) -> Result<PathBuf, String> {
@@ -220,6 +228,19 @@ pub fn ensure_lama_model(models_root: &Path, model_file_name: &str) -> Result<Pa
     Ok(models_root.join(model))
 }
 
+/// Web stub: the Hugging Face download stack is compiled out on wasm, so model
+/// files cannot be fetched or verified. Returns a clear typed error instead of a
+/// fake success so callers surface "unavailable on web".
+#[cfg(target_arch = "wasm32")]
+fn ensure_remote_files(
+    _models_root: &Path,
+    _remote_files: &[&str],
+    _reporter: &mut ModelDownloadReporter<'_>,
+) -> Result<(), String> {
+    Err("Загрузка моделей ИИ недоступна в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_remote_files(
     models_root: &Path,
     remote_files: &[&str],
@@ -276,6 +297,7 @@ fn ensure_remote_files(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn download_hf_file_direct(url: &str, local_path: &Path, remote: &str) -> Result<(), String> {
     let parent = local_path
         .parent()
@@ -316,6 +338,7 @@ fn download_hf_file_direct(url: &str, local_path: &Path, remote: &str) -> Result
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_nonempty_file(path: &Path) -> bool {
     path.metadata()
         .map(|metadata| metadata.is_file() && metadata.len() > 0)

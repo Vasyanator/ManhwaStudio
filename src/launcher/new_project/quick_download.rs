@@ -27,11 +27,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+#[cfg(not(target_arch = "wasm32"))]
+use web_time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_PARALLELISM: usize = 8;
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36";
 
@@ -665,6 +668,7 @@ fn pick_latest_mangadex_chapter(manga_id: &str) -> Result<String, QuickDownloadE
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, QuickDownloadError> {
     let response = make_request(url, referer)?
         .into_string()
@@ -675,6 +679,17 @@ fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, QuickDownloadE
     Ok(response)
 }
 
+/// Web stub: the direct downloader uses a native HTTP client (`ureq`) that is not
+/// compiled for wasm. Returns a clear error instead of a fake response.
+#[cfg(target_arch = "wasm32")]
+fn fetch_text(_url: &str, _referer: Option<&str>) -> Result<String, QuickDownloadError> {
+    Err(QuickDownloadError {
+        user_message: "Загрузка глав недоступна в веб-версии.".to_string(),
+        log_message: "quick download HTTP client is not available on the web build".to_string(),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_bytes(url: &str, referer: Option<&str>) -> Result<Vec<u8>, QuickDownloadError> {
     let response = make_request(url, referer)?;
     let mut reader = response.into_reader();
@@ -686,6 +701,15 @@ fn fetch_bytes(url: &str, referer: Option<&str>) -> Result<Vec<u8>, QuickDownloa
     Ok(bytes)
 }
 
+/// Web stub twin of `fetch_bytes`; see `fetch_text`.
+#[cfg(target_arch = "wasm32")]
+fn fetch_bytes(_url: &str, _referer: Option<&str>) -> Result<Vec<u8>, QuickDownloadError> {
+    Err(QuickDownloadError {
+        user_message: "Загрузка глав недоступна в веб-версии.".to_string(),
+        log_message: "quick download HTTP client is not available on the web build".to_string(),
+    })
+}
+
 fn fetch_json_value(url: &str, referer: Option<&str>) -> Result<Value, QuickDownloadError> {
     let text = fetch_text(url, referer)?;
     serde_json::from_str::<Value>(&text).map_err(|err| QuickDownloadError {
@@ -694,6 +718,7 @@ fn fetch_json_value(url: &str, referer: Option<&str>) -> Result<Value, QuickDown
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn make_request(url: &str, referer: Option<&str>) -> Result<ureq::Response, QuickDownloadError> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(REQUEST_TIMEOUT)

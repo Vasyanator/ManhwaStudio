@@ -13,21 +13,42 @@ Behavior notes:
 - Error codes are mapped to readable identifiers close to translatepy.
 */
 
+use super::MachineTranslatorBackend;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct YandexMtBackend;
+
+/// Web stub: Yandex translation uses native HTTP (`ureq`) calls that the browser
+/// build cannot make, so every batch fails with a clear message instead of
+/// returning a fake translation.
+#[cfg(target_arch = "wasm32")]
+impl MachineTranslatorBackend for YandexMtBackend {
+    fn translate_texts(
+        &self,
+        _source_lang: &str,
+        _target_lang: &str,
+        _texts: Vec<String>,
+    ) -> Result<Vec<Result<String, String>>, String> {
+        Err("Перевод через Yandex недоступен в веб-версии.".to_string())
+    }
+}
+
+// The native Yandex implementation depends on `ureq` (native HTTP), which is not
+// compiled for wasm. The whole native surface lives in this module so the cfg
+// boundary is a single point; on wasm only the stub impl above is compiled.
+#[cfg(not(target_arch = "wasm32"))]
+mod native {
+use super::{MachineTranslatorBackend, YandexMtBackend};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use ureq::Agent;
 
-use super::MachineTranslatorBackend;
-
 const API_BASE: &str = "https://translate.yandex.net/api/v1/tr.json";
 const DETECT_HINT: &str = "en";
 const UCID_TTL: Duration = Duration::from_secs(360);
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct YandexMtBackend;
 
 impl MachineTranslatorBackend for YandexMtBackend {
     fn translate_texts(
@@ -268,3 +289,4 @@ struct YandexTranslateResponse {
     #[serde(default)]
     text: Option<Vec<String>>,
 }
+} // mod native

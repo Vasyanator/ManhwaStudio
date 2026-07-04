@@ -21,13 +21,14 @@ use egui::{
     WindowLevel,
 };
 use image::{DynamicImage, RgbaImage};
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config;
 use crate::launcher::new_project::advanced_download::{
@@ -96,6 +97,7 @@ const SCREEN_CAPTURE_VIEWPORT_ID_SALT: &str = "launcher_new_project_screen_captu
 const SCREEN_CAPTURE_MIN_SIDE: usize = 48;
 const SCREEN_CAPTURE_CONFIRM_DELAY_MS: u64 = 140;
 const SCREEN_CAPTURE_UI_ENABLED: bool = false;
+#[cfg(not(target_arch = "wasm32"))]
 const TEST_CHAPTER_SITE_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 const AUTO_REVIEW_CARD_SIDE: f32 = 230.0;
 const AUTO_REVIEW_CARD_MIN_SIDE: f32 = 168.0;
@@ -4299,6 +4301,7 @@ impl NewProjectWindowState {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_cut_like_folder(&mut self) {
         let Some(folder) = FileDialog::new().pick_folder() else {
             return;
@@ -4307,6 +4310,14 @@ impl NewProjectWindowState {
             folder.clone(),
             &format!("Нарезаем по примеру папки '{}'...", folder.display()),
         );
+    }
+
+    /// Web stub: folder picking needs a native dialog (`rfd`) with no browser
+    /// equivalent, so this reports the missing capability instead of opening one.
+    #[cfg(target_arch = "wasm32")]
+    fn start_cut_like_folder(&mut self) {
+        self.last_error = Some("Выбор папки недоступен в веб-версии.".to_string());
+        self.import_status = "Нарезка по примеру папки недоступна в веб-версии.".to_string();
     }
 
     fn start_cut_like_reference(&mut self, reference_dir: PathBuf, status_message: &str) {
@@ -4626,6 +4637,15 @@ impl NewProjectWindowState {
         );
     }
 
+    /// Web stub: saving to an arbitrary folder requires a native folder dialog
+    /// (`rfd`), unavailable in the browser. Reports the missing capability.
+    #[cfg(target_arch = "wasm32")]
+    fn start_save_to_folder(&mut self) {
+        self.last_error = Some("Сохранение в папку недоступно в веб-версии.".to_string());
+        self.import_status = "Сохранение в папку недоступно в веб-версии.".to_string();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_save_to_folder(&mut self) {
         let Some(folder) = FileDialog::new().pick_folder() else {
             return;
@@ -7540,6 +7560,21 @@ fn random_test_chapter_number() -> usize {
     usize::try_from(nanos % 100).unwrap_or(0).saturating_add(1)
 }
 
+/// Web stub: the availability probe uses a native HTTP client (`ureq`) that is not
+/// compiled for wasm. Returns an unavailable result with a diagnostic log message
+/// rather than a fake "reachable" answer.
+#[cfg(target_arch = "wasm32")]
+fn check_test_chapter_site_availability(chapter_url: String) -> TestChapterAvailabilityResult {
+    TestChapterAvailabilityResult {
+        available: false,
+        chapter_url,
+        log_message: Some(
+            "проверка доступности сайта недоступна в веб-версии".to_string(),
+        ),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn check_test_chapter_site_availability(chapter_url: String) -> TestChapterAvailabilityResult {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(TEST_CHAPTER_SITE_CHECK_TIMEOUT)
@@ -7633,6 +7668,7 @@ fn progress_stage_title(stage: &str) -> &'static str {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::Error> {
     if !path.exists() || !dir_has_entries(path)? {
         return Ok(true);
@@ -7644,6 +7680,20 @@ fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::E
         .set_level(MessageLevel::Warning)
         .show()
         == MessageDialogResult::Yes)
+}
+
+/// Web stub: the native confirmation modal (`rfd::MessageDialog`) has no browser
+/// equivalent. Empty/absent targets proceed as on native; for a non-empty target we
+/// cannot prompt, so we log the skipped confirmation and proceed instead of blocking.
+#[cfg(target_arch = "wasm32")]
+fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    if !path.exists() || !dir_has_entries(path)? {
+        return Ok(true);
+    }
+    crate::runtime_log::log_warn(
+        "overwrite confirmation dialog unavailable on web build; proceeding without prompt",
+    );
+    Ok(true)
 }
 
 fn load_image_url_presets() -> Vec<(String, String)> {

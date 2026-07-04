@@ -21,12 +21,19 @@ Logging goes through `crate::runtime_log` (the project-wide structured log),
 consistent with the rest of the backend IPC code.
 */
 
+// AF_UNIX sockets and the connect worker are native-only; only the socket-path
+// helper stays target-neutral so shared call sites keep compiling on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Write};
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use ms_thread as thread;
+#[cfg(not(target_arch = "wasm32"))]
+use web_time::Duration;
 
 /// Tracks whether the current backend outage has already been reported with a
 /// `warn`. The connection probe retries every couple of seconds, so without this
@@ -34,10 +41,12 @@ use std::time::Duration;
 /// backend is simply not running. We warn once on the first failure, then stay
 /// quiet (info level) on every subsequent failed attempt; a successful connect
 /// clears the flag so the next outage is reported again.
+#[cfg(not(target_arch = "wasm32"))]
 static CONNECT_FAILURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Reports a failed connect attempt: a `warn` the first time the backend becomes
 /// unreachable, then a quiet `info` on each retry until the backend comes back.
+#[cfg(not(target_arch = "wasm32"))]
 fn report_connect_failure(msg: &str) {
     if CONNECT_FAILURE_WARNED.swap(true, Ordering::SeqCst) {
         // Already warned about this outage: stay quiet so the ~2s retry loop does
@@ -64,7 +73,10 @@ use uds_windows::UnixStream;
 /// - windows: `std::env::temp_dir().join("manhwastudio_backend_socket")`
 #[must_use]
 pub fn backend_socket_path() -> PathBuf {
-    #[cfg(unix)]
+    // `not(windows)` covers unix (identical to the previous `cfg(unix)` path) and
+    // the wasm target, where the returned path is only ever used for display/logging
+    // since the socket transport itself is compiled out.
+    #[cfg(not(windows))]
     {
         PathBuf::from("/tmp/manhwastudio_backend_socket")
     }
@@ -80,11 +92,13 @@ pub fn backend_socket_path() -> PathBuf {
 /// Delegates `std::io::Read` and `std::io::Write` to the inner stream. On unix it
 /// wraps `std::os::unix::net::UnixStream`; on windows it wraps
 /// `uds_windows::UnixStream`.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct BackendStream {
     inner: UnixStream,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl BackendStream {
     /// Sets the read timeout on the underlying stream. `None` clears the timeout
     /// (blocking reads).
@@ -142,12 +156,14 @@ impl BackendStream {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Read for BackendStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Write for BackendStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write(buf)
@@ -172,6 +188,7 @@ impl Write for BackendStream {
 /// # Errors
 /// Returns a human-readable error string (including the socket path and the OS
 /// error) on connect timeout, connect failure, or timeout-setup failure.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn connect_path(
     path: PathBuf,
     connect_timeout: Duration,
@@ -279,8 +296,8 @@ mod tests {
         let unique = format!(
             "manhwastudio_test_socket_{}_{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         );

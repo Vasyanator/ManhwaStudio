@@ -43,7 +43,10 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
         theme::card_frame().show(ui, |ui| {
             ui.set_width(460.0);
             ui.vertical_centered(|ui| {
+                #[cfg(not(target_arch = "wasm32"))]
                 ui.label(theme::hero_title("ManhwaStudio"));
+                #[cfg(target_arch = "wasm32")]
+                ui.label(theme::hero_title("ManhwaStudio: Веб демо"));
                 ui.add_space(8.0);
 
                 ui.add_space(4.0);
@@ -126,20 +129,35 @@ struct AiInstallNotice {
 }
 
 fn ai_install_notice(install_type: config::AiInstallType) -> Option<AiInstallNotice> {
-    match install_type {
-        config::AiInstallType::None => Some(AiInstallNotice {
-            message: "Программа не установлена и работает в автономном режиме. Использовать можно, но ИИ, и некоторые функции недоступны",
-            fill: Color32::from_rgba_premultiplied(96, 18, 22, 150),
-            stroke: Color32::from_rgba_premultiplied(238, 96, 104, 170),
-            text: Color32::from_rgb(255, 218, 220),
-        }),
-        config::AiInstallType::Base => Some(AiInstallNotice {
-            message: "Установлена облегченная версия программы, работает только часть ИИ возможностей. Для обновления до полной версии перейдите в Настройки > Обновить до полной версии",
-            fill: Color32::from_rgba_premultiplied(104, 78, 16, 148),
-            stroke: Color32::from_rgba_premultiplied(236, 197, 76, 166),
-            text: Color32::from_rgb(255, 240, 184),
-        }),
-        config::AiInstallType::Full => None,
+    // Web (wasm) build: a dedicated "Веб-версия" notice replaces the desktop
+    // install-state notices (the AI/install concept does not apply on the web).
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = install_type;
+        Some(AiInstallNotice {
+            message: "ManhwaStudio написана на Rust, а не веб-языках, и сейчас работает через WebAssembly, что немножко через ж... .\n\nНестабильность веб-версии не отражает реальную стабильность десктопной программы.",
+            fill: Color32::from_rgba_premultiplied(22, 42, 72, 152),
+            stroke: Color32::from_rgba_premultiplied(96, 152, 224, 168),
+            text: Color32::from_rgb(206, 226, 255),
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match install_type {
+            config::AiInstallType::None => Some(AiInstallNotice {
+                message: "Программа не установлена и работает в автономном режиме. Использовать можно, но ИИ, и некоторые функции недоступны",
+                fill: Color32::from_rgba_premultiplied(96, 18, 22, 150),
+                stroke: Color32::from_rgba_premultiplied(238, 96, 104, 170),
+                text: Color32::from_rgb(255, 218, 220),
+            }),
+            config::AiInstallType::Base => Some(AiInstallNotice {
+                message: "Установлена облегченная версия программы, работает только часть ИИ возможностей. Для обновления до полной версии перейдите в Настройки > Обновить до полной версии",
+                fill: Color32::from_rgba_premultiplied(104, 78, 16, 148),
+                stroke: Color32::from_rgba_premultiplied(236, 197, 76, 166),
+                text: Color32::from_rgb(255, 240, 184),
+            }),
+            config::AiInstallType::Full => None,
+        }
     }
 }
 
@@ -151,7 +169,11 @@ fn show_ai_install_notice(ui: &mut Ui, notice: AiInstallNotice) {
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_width(AI_INSTALL_NOTICE_WIDTH);
+            // The web "Веб-версия" notice is longer (two paragraphs); give it room.
+            #[cfg(not(target_arch = "wasm32"))]
             ui.set_max_height(AI_INSTALL_NOTICE_MAX_HEIGHT);
+            #[cfg(target_arch = "wasm32")]
+            ui.set_max_height(200.0);
             ui.add_sized(
                 Vec2::new(AI_INSTALL_NOTICE_WIDTH - 32.0, 0.0),
                 egui::Label::new(

@@ -7,16 +7,21 @@ Main items:
 - `normalize_google_lang`: source/target language normalization.
 
 Behavior:
-- Uses Rust crate `translators` (`GoogleTranslator`) synchronously.
+- Uses Rust crate `translators` (`GoogleTranslator`) synchronously on native.
 - Returns per-item result list (`Ok` translated text or `Err` per bubble).
+- The `translators` crate (native HTTP) is unavailable on the web build, so the
+  wasm target implements the same contract with a body that returns a clear
+  "unavailable on web" error for every item instead of a fake translation.
 */
 
 use super::MachineTranslatorBackend;
+#[cfg(not(target_arch = "wasm32"))]
 use translators::{GoogleTranslator, Translator};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GoogleMtBackend;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MachineTranslatorBackend for GoogleMtBackend {
     fn translate_texts(
         &self,
@@ -44,6 +49,22 @@ impl MachineTranslatorBackend for GoogleMtBackend {
     }
 }
 
+/// Web stub: Google Translate uses the native `translators` crate, which is not
+/// available in the browser build. The whole batch fails with a clear message so
+/// no fake translation is ever produced.
+#[cfg(target_arch = "wasm32")]
+impl MachineTranslatorBackend for GoogleMtBackend {
+    fn translate_texts(
+        &self,
+        _source_lang: &str,
+        _target_lang: &str,
+        _texts: Vec<String>,
+    ) -> Result<Vec<Result<String, String>>, String> {
+        Err("Перевод через Google недоступен в веб-версии.".to_string())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_google_lang(raw: &str, source: bool) -> String {
     let fallback = if source { "auto" } else { "ru" };
     let trimmed = raw.trim().to_ascii_lowercase();

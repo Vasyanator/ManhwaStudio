@@ -57,6 +57,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+// std::time here: `modified` comes from `std::fs` metadata (std SystemTime) and
+// there is no wall-clock `now()` call, so no web-time shim is needed.
 use std::time::UNIX_EPOCH;
 
 use cosmic_text::{FontSystem, fontdb};

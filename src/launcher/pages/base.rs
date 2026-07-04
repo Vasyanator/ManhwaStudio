@@ -18,7 +18,7 @@ use crate::launcher::state::{LauncherPage, OpenProjectSelection};
 use crate::launcher::theme;
 use egui::{Align, Layout, Rect, Ui, UiBuilder};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 const TRANSITION_DURATION: Duration = Duration::from_millis(320);
 const PAGE_MARGIN: f32 = 24.0;

@@ -7,6 +7,7 @@ edition = "2024"
 # src/tabs/typing/render_next. GUI-free: shaping/layout via cosmic-text, vector
 # glyph rasterization via zeno, RGBA output via the image crate.
 [dependencies]
+web-time = "1"
 ms-log = { path = "../ms-log" }
 ms-text-util = { path = "../ms-text-util" }
 cosmic-text = "0.14"

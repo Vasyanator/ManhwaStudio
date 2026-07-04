@@ -66,10 +66,14 @@ pub fn chapter_needs_migration(layers_dir: &Path, legacy_text_images_dir: &Path)
     }
 
     // The legacy file may live in the committed `layers/` dir (post `text_images→layers` move) or the
-    // older `text_images/` dir. Prefer the canonical `layers/` location (newer/complete).
-    let source_dir = if layers_dir.join(TEXT_INFO_FILE).is_file() {
+    // older `text_images/` dir. Prefer the canonical `layers/` location (newer/complete). Existence is
+    // checked through the storage seam; `exists()` widens the old `is_file()` (also matches a dir), but
+    // `text_info.json` is a deterministic FILE name so a directory there would be a corrupt project.
+    let layers_text_info = layers_dir.join(TEXT_INFO_FILE);
+    let legacy_text_info = legacy_text_images_dir.join(TEXT_INFO_FILE);
+    let source_dir = if crate::storage::storage().exists(layers_text_info.to_string_lossy().as_ref()) {
         layers_dir.to_path_buf()
-    } else if legacy_text_images_dir.join(TEXT_INFO_FILE).is_file() {
+    } else if crate::storage::storage().exists(legacy_text_info.to_string_lossy().as_ref()) {
         legacy_text_images_dir.to_path_buf()
     } else {
         return None;
@@ -148,7 +152,7 @@ pub fn migrate_chapter_to_v3(
     let png_dirs_for_footprint = png_dirs.clone();
     let migrated_entries = text_payload::migrate_overlay_entries(&raw_entries, page_sizes, |obj| {
         overlay_png_path(obj, &png_dirs_for_footprint)
-            .and_then(|p| image::image_dimensions(&p).ok())
+            .and_then(|p| overlay_png_dimensions(&p))
             .map_or((0.0, 0.0), |(w, h)| (w as f32, h as f32))
     });
 
@@ -268,11 +272,13 @@ pub fn migrate_chapter_to_v3(
     // the legacy files intact and the migration re-runs.
     for dir in [layers_dir, legacy_text_images_dir] {
         let src = dir.join(TEXT_INFO_FILE);
-        if !src.is_file() {
+        // `exists()` widens the old `is_file()` but `text_info.json` is a deterministic file name.
+        if !crate::storage::storage().exists(src.to_string_lossy().as_ref()) {
             continue;
         }
         let bak = next_backup_path(dir);
-        std::fs::rename(&src, &bak)
+        crate::storage::storage()
+            .rename(src.to_string_lossy().as_ref(), bak.to_string_lossy().as_ref())
             .map_err(|e| format!("rename {} -> {}: {e}", src.display(), bak.display()))?;
         crate::trace_log!(
             cat::PERSIST,
@@ -371,9 +377,25 @@ fn overlay_png_path(obj: &Map<String, Value>, dirs: &[PathBuf]) -> Option<PathBu
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let name = Path::new(file).file_name()?.to_str()?;
+    // Existence is checked through the storage seam. `exists()` also matches a directory, but overlay
+    // PNGs are deterministic file names, so a directory there would be a corrupt project.
     dirs.iter()
         .map(|d| d.join(name))
-        .find(|p| p.is_file())
+        .find(|p| crate::storage::storage().exists(p.to_string_lossy().as_ref()))
+}
+
+/// Reads an overlay PNG's pixel dimensions through the storage seam without fully decoding it.
+/// Returns `None` when the file is missing or is not a decodable image (the caller then falls back to
+/// a `(0.0, 0.0)` footprint, matching the previous `image::image_dimensions(..).ok()` behavior).
+fn overlay_png_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let bytes = crate::storage::storage()
+        .read(path.to_string_lossy().as_ref())
+        .ok()?;
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
 /// Renames (moves) an overlay's original PNG into the v3 uid-keyed name in `layers_dir`, preserving
@@ -390,9 +412,11 @@ fn rename_overlay_png(
 ) -> Option<String> {
     let v3_name = persist::text_image_file_name(page_idx, uid);
     let dst = layers_dir.join(&v3_name);
+    let dst_str = dst.to_string_lossy();
 
-    // Already at the v3 name (e.g. a partial earlier run): reuse it.
-    if dst.is_file() {
+    // Already at the v3 name (e.g. a partial earlier run): reuse it. `exists()` widens the old
+    // `is_file()` but the v3 name is a deterministic file name.
+    if crate::storage::storage().exists(dst_str.as_ref()) {
         report.renamed_pngs += 1;
         return Some(v3_name);
     }
@@ -404,20 +428,27 @@ fn rename_overlay_png(
         ));
         return None;
     };
+    let src_str = src.to_string_lossy();
 
-    if let Err(e) = std::fs::create_dir_all(layers_dir) {
+    if let Err(e) =
+        crate::storage::storage().create_dir_all(layers_dir.to_string_lossy().as_ref())
+    {
         crate::runtime_log::log_warn(format!("[migrate] create {}: {e}", layers_dir.display()));
         return None;
     }
-    // Prefer a rename (atomic, preserves bytes); fall back to copy+remove across filesystems.
-    match std::fs::rename(&src, &dst) {
+    // Prefer a rename (atomic, preserves bytes); fall back to copy+remove across filesystems. The seam
+    // has no `copy`, so emulate it as read+write (bytes preserved exactly), then remove the source.
+    match crate::storage::storage().rename(src_str.as_ref(), dst_str.as_ref()) {
         Ok(()) => {
             report.renamed_pngs += 1;
             Some(v3_name)
         }
-        Err(_) => match std::fs::copy(&src, &dst) {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&src);
+        Err(_) => match crate::storage::storage()
+            .read(src_str.as_ref())
+            .and_then(|bytes| crate::storage::storage().write(dst_str.as_ref(), &bytes))
+        {
+            Ok(()) => {
+                let _ = crate::storage::storage().remove_file(src_str.as_ref());
                 report.renamed_pngs += 1;
                 Some(v3_name)
             }
@@ -438,12 +469,12 @@ fn rename_overlay_png(
 /// rollback record).
 fn next_backup_path(dir: &Path) -> PathBuf {
     let base = dir.join(format!("{TEXT_INFO_FILE}.bak"));
-    if !base.exists() {
+    if !crate::storage::storage().exists(base.to_string_lossy().as_ref()) {
         return base;
     }
     for n in 1u32.. {
         let candidate = dir.join(format!("{TEXT_INFO_FILE}.bak.{n}"));
-        if !candidate.exists() {
+        if !crate::storage::storage().exists(candidate.to_string_lossy().as_ref()) {
             return candidate;
         }
     }

@@ -29,11 +29,28 @@ use crate::project::{Bubble, ProjectData};
 use crate::widgets::{WheelComboBox, WheelSpinBox};
 use eframe::egui;
 use egui::{Color32, Stroke};
-use rfd::FileDialog;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Opens the native image-file picker for an external image bubble and returns
+/// the chosen path, or `None` if the user cancelled.
+///
+/// Web stub: the browser build has no native file dialog (`rfd`), so this returns
+/// `None` and the "choose file" button is a no-op there (browser file import via
+/// `<input type=file>` is added later).
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_image_bubble_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+        .pick_file()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_image_bubble_file() -> Option<PathBuf> {
+    None
+}
 
 pub const FOOTER_NO_CHARACTER: &str = "(не указан)";
 pub const FOOTER_NO_CHARACTERS: &str = "(нет персонажей)";
@@ -907,9 +924,7 @@ impl BubblesPanelState {
                     }
                 }
                 if ui.small_button("Выбрать файл").clicked()
-                    && let Some(path) = FileDialog::new()
-                        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
-                        .pick_file()
+                    && let Some(path) = pick_image_bubble_file()
                 {
                     match copy_external_image_for_bubble(project, bubble_id, &path) {
                         Ok(saved) => queue_footer_patch(

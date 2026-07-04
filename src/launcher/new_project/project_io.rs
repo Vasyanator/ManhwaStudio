@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use ms_thread as thread;
 
 #[derive(Clone)]
 pub struct ProjectCatalogSnapshot {

@@ -22,21 +22,29 @@ main thread to keep the launcher responsive.
 
 use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
 use image::{DynamicImage, ImageFormat, ImageReader};
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const IMAGE_SIGNATURE_BYTES: usize = 32;
+// Picker filter lists are only consumed by the native file dialog (`rfd`); gated out
+// of the web build, which has no dialog to filter.
+#[cfg(not(target_arch = "wasm32"))]
 const IMAGE_DIALOG_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"];
+#[cfg(not(target_arch = "wasm32"))]
 const HTML_DIALOG_EXTENSIONS: &[&str] = &["html", "htm"];
+#[cfg(not(target_arch = "wasm32"))]
 const ARCHIVE_DIALOG_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "tgz", "gz"];
+#[cfg(not(target_arch = "wasm32"))]
 const SUPPORTED_DIALOG_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "html", "htm", "zip", "rar", "7z", "tar",
     "tgz", "gz",
@@ -191,6 +199,7 @@ impl SourceImportController {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn pick_source(kind: OpenSourceKind) -> Option<PathBuf> {
     match kind {
         OpenSourceKind::Folder => FileDialog::new().pick_folder(),
@@ -201,6 +210,14 @@ fn pick_source(kind: OpenSourceKind) -> Option<PathBuf> {
             .add_filter("Архивы", ARCHIVE_DIALOG_EXTENSIONS)
             .pick_file(),
     }
+}
+
+/// Web stub: native file/folder pickers (`rfd`) have no browser equivalent. Returns
+/// `None` (as a cancelled pick) and logs the dropped capability.
+#[cfg(target_arch = "wasm32")]
+fn pick_source(_kind: OpenSourceKind) -> Option<PathBuf> {
+    crate::runtime_log::log_warn("source file picker unavailable on web build");
+    None
 }
 
 fn spawn_source_loader(
@@ -912,6 +929,24 @@ fn create_temp_extract_dir() -> Result<PathBuf, SourceLoadError> {
     Ok(dir)
 }
 
+/// Web stub: archive extraction shells out to external tools (`rar`/`7z`/…) via
+/// `std::process::Command`, which cannot run in the browser. Returns a clear error.
+#[cfg(target_arch = "wasm32")]
+fn extract_archive_with_commands(
+    path: &Path,
+    _output_dir: &Path,
+    _commands: &[&str],
+) -> Result<(), SourceLoadError> {
+    Err(SourceLoadError {
+        user_message: "Распаковка архивов недоступна в веб-версии.".to_string(),
+        log_message: format!(
+            "archive extraction via external tools is unavailable on the web build for '{}'",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_archive_with_commands(
     path: &Path,
     output_dir: &Path,

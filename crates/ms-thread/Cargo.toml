@@ -1,0 +1,19 @@
+[package]
+name = "ms-thread"
+version = "0.1.0"
+edition = "2024"
+
+# Cross-target thread-spawning shim for ManhwaStudio.
+#
+# Re-exports a `std::thread`-compatible surface (`spawn`, `Builder`, `JoinHandle`,
+# `sleep`, `yield_now`, `current`) so call sites are target-agnostic:
+#   - native: forwards straight to `std::thread` (zero behavioral change).
+#   - wasm32: spawning goes through `wasm_thread` (Web Workers); the non-spawning
+#     helpers still come from `std::thread` (they work under the atomics build).
+#
+# On `wasm32-unknown-unknown` `std::thread::spawn` is unsupported and panics, which
+# is why the whole workspace routes thread creation through this shim.
+[dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm_thread = { version = "0.3", features = ["es_modules"] }

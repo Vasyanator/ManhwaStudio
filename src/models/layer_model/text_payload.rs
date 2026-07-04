@@ -24,7 +24,8 @@ const TEXT_INFO_FILE: &str = "text_info.json";
 #[must_use]
 pub fn read_overlay_entries(dirs: &[&Path]) -> Vec<Value> {
     for dir in dirs {
-        if let Ok(raw) = std::fs::read_to_string(dir.join(TEXT_INFO_FILE))
+        let path = dir.join(TEXT_INFO_FILE);
+        if let Ok(raw) = crate::storage::storage().read_to_string(path.to_string_lossy().as_ref())
             && let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&raw)
         {
             return items;

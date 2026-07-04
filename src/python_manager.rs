@@ -16,7 +16,17 @@ Main responsibilities:
 Notes:
 This module does not install Python or packages. The installer owns downloads and dependency
 installation, but it uses this module for the same executable-discovery contract as runtime code.
+
+Web (wasm) build:
+Python process management has no meaning in the browser (no OS processes, no local
+Python runtime), so the entire module compiles out on `wasm32`. Every caller of this
+module is itself a native-only subsystem (installer, launcher settings, AI backend
+supervisor, AI install probe) that gates its use behind the same `not(wasm32)` cfg, so
+no shared/web code references these items.
 */
+
+// Whole native subsystem: compiled out on the web target (convention 3).
+#![cfg(not(target_arch = "wasm32"))]
 
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};

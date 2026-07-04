@@ -41,6 +41,15 @@ Main items:
 - Canvas settings parsing keeps project-scoped keys in `settings.json`, while selected
   canvas preferences can be sourced from global `user_config.json`.
 - Utility helpers for image collection, directory bootstrap and recursive copies.
+
+Storage:
+All filesystem access routes through the `crate::storage::storage()` seam (read/write/
+read_dir/rename/exists/is_dir/create_dir_all/remove_file) instead of `std::fs`, so the same
+loading pipeline works on native (real FS) and web (in-memory store). Images are decoded from
+in-memory bytes (`image::load_from_memory` / `ImageReader`) and encoded to a buffer before being
+handed to the seam; there is no `copy`, so copies are emulated as read + write. The only native-
+specific call left is `canonicalize()` on the incoming real project dir, which has no seam analog
+and runs before the virtual layer applies.
 */
 
 use crate::bubble_status::{
@@ -49,6 +58,7 @@ use crate::bubble_status::{
 use crate::config;
 use crate::config::JsonConfig;
 use crate::runtime_log;
+use crate::storage::storage;
 use anyhow::{Context, Result};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use rayon::prelude::*;
@@ -57,8 +67,6 @@ use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -263,9 +271,15 @@ impl ProjectData {
         user_settings: &Value,
         resume_unsaved: bool,
     ) -> Result<Self> {
+        // `canonicalize` resolves symlinks/`..` against the real filesystem. On
+        // wasm the store is virtual (paths are already canonical, no symlinks),
+        // so it is skipped and the path is used as-is.
+        #[cfg(not(target_arch = "wasm32"))]
         let project_dir = project_dir
             .canonicalize()
             .with_context(|| format!("project dir not found: {}", project_dir.display()))?;
+        #[cfg(target_arch = "wasm32")]
+        let project_dir = project_dir.to_path_buf();
 
         let title_dir = project_dir
             .parent()
@@ -356,7 +370,9 @@ impl ProjectData {
         )?;
 
         // In resume mode, prefer the unsaved bubbles file if it exists.
-        let effective_bubbles_file = if resume_unsaved && unsaved_bubbles_file.exists() {
+        let effective_bubbles_file = if resume_unsaved
+            && storage().exists(unsaved_bubbles_file.to_string_lossy().as_ref())
+        {
             &unsaved_bubbles_file
         } else {
             &bubbles_file
@@ -388,18 +404,23 @@ impl ProjectData {
     }
 
     pub fn exists(&self) -> bool {
-        self.project_dir.is_dir()
+        storage().is_dir(self.project_dir.to_string_lossy().as_ref())
     }
 
     pub fn autosave_bubbles(&self) -> Result<()> {
         let raw = serde_json::to_string_pretty(self.bubbles.as_ref())
             .context("failed to serialize bubbles")?;
-        fs::write(&self.paths.bubbles_file, raw).with_context(|| {
-            format!(
-                "failed to write bubbles file {}",
-                self.paths.bubbles_file.display()
+        storage()
+            .write(
+                self.paths.bubbles_file.to_string_lossy().as_ref(),
+                raw.as_bytes(),
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "failed to write bubbles file {}",
+                    self.paths.bubbles_file.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -415,32 +436,38 @@ impl ProjectData {
             return Ok(());
         }
 
-        fs::create_dir_all(&self.paths.clean_layers_dir).with_context(|| {
-            format!(
-                "failed to create clean layers dir {}",
-                self.paths.clean_layers_dir.display()
-            )
-        })?;
+        storage()
+            .create_dir_all(self.paths.clean_layers_dir.to_string_lossy().as_ref())
+            .with_context(|| {
+                format!(
+                    "failed to create clean layers dir {}",
+                    self.paths.clean_layers_dir.display()
+                )
+            })?;
 
         copy_dir_recursive(&self.paths.cleaned_dir, &self.paths.clean_layers_dir)
     }
 
     pub fn ensure_translation_notes(&self) -> Result<()> {
-        fs::create_dir_all(&self.paths.title_dir).with_context(|| {
-            format!(
-                "failed to create title dir {}",
-                self.paths.title_dir.display()
-            )
-        })?;
-        if self.paths.notes_file.exists() {
+        storage()
+            .create_dir_all(self.paths.title_dir.to_string_lossy().as_ref())
+            .with_context(|| {
+                format!(
+                    "failed to create title dir {}",
+                    self.paths.title_dir.display()
+                )
+            })?;
+        if storage().exists(self.paths.notes_file.to_string_lossy().as_ref()) {
             return Ok(());
         }
-        fs::write(&self.paths.notes_file, b"").with_context(|| {
-            format!(
-                "failed to create translation notes {}",
-                self.paths.notes_file.display()
-            )
-        })?;
+        storage()
+            .write(self.paths.notes_file.to_string_lossy().as_ref(), b"")
+            .with_context(|| {
+                format!(
+                    "failed to create translation notes {}",
+                    self.paths.notes_file.display()
+                )
+            })?;
         Ok(())
     }
 }
@@ -453,19 +480,24 @@ pub enum Side {
 
 fn ensure_src_dir(project_dir: &Path) -> Result<PathBuf> {
     let src = project_dir.join(config::SRC_DIR);
-    if src.is_dir() {
+    if storage().is_dir(src.to_string_lossy().as_ref()) {
         return Ok(src);
     }
 
     let scr = project_dir.join("scr");
-    if scr.is_dir() {
-        fs::rename(&scr, &src).with_context(|| {
-            format!(
-                "failed to rename legacy {} -> {}",
-                scr.display(),
-                src.display()
+    if storage().is_dir(scr.to_string_lossy().as_ref()) {
+        storage()
+            .rename(
+                scr.to_string_lossy().as_ref(),
+                src.to_string_lossy().as_ref(),
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "failed to rename legacy {} -> {}",
+                    scr.display(),
+                    src.display()
+                )
+            })?;
         return Ok(src);
     }
 
@@ -484,16 +516,23 @@ fn ensure_src_dir(project_dir: &Path) -> Result<PathBuf> {
 fn reconcile_clean_layers_dir(project_dir: &Path) -> Result<()> {
     let clean_layers = project_dir.join(config::CLEAN_LAYERS_DIR);
     let cleaned = project_dir.join(config::CLEANED_DIR);
-    if clean_layers.is_dir() || !cleaned.is_dir() {
+    if storage().is_dir(clean_layers.to_string_lossy().as_ref())
+        || !storage().is_dir(cleaned.to_string_lossy().as_ref())
+    {
         return Ok(());
     }
-    fs::rename(&cleaned, &clean_layers).with_context(|| {
-        format!(
-            "failed to rename legacy {} -> {}",
-            cleaned.display(),
-            clean_layers.display()
+    storage()
+        .rename(
+            cleaned.to_string_lossy().as_ref(),
+            clean_layers.to_string_lossy().as_ref(),
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "failed to rename legacy {} -> {}",
+                cleaned.display(),
+                clean_layers.display()
+            )
+        })?;
     runtime_log::log_info(format!(
         "migrated legacy clean-overlay folder: {} -> {}",
         cleaned.display(),
@@ -519,11 +558,15 @@ fn reconcile_clean_layers_dir(project_dir: &Path) -> Result<()> {
 /// Returns an error if the file cannot be created or the encoder fails to write `target`.
 fn write_png_fast(image: &image::DynamicImage, target: &Path) -> Result<()> {
     let rgba = image.to_rgba8();
-    let file = fs::File::create(target)
-        .with_context(|| format!("failed to create PNG {}", target.display()))?;
-    let writer = io::BufWriter::new(file);
-    let encoder = PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::NoFilter);
+    // Encode into an in-memory buffer, then hand the finished PNG bytes to the storage seam.
+    // The seam owns the actual byte sink (real file on native, virtual store on web), so no
+    // direct file handle is created here.
+    let mut buf = Vec::new();
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
     rgba.write_with_encoder(encoder)
+        .with_context(|| format!("failed to encode PNG {}", target.display()))?;
+    storage()
+        .write(target.to_string_lossy().as_ref(), &buf)
         .with_context(|| format!("failed to write PNG {}", target.display()))?;
     Ok(())
 }
@@ -547,15 +590,23 @@ fn write_png_fast(image: &image::DynamicImage, target: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error if the directory cannot be read or a detected JPEG fails to decode or encode.
 fn convert_jpegs_to_png(dir: &Path) -> Result<usize> {
-    if !dir.is_dir() {
+    if !storage().is_dir(dir.to_string_lossy().as_ref()) {
         return Ok(0);
     }
     // Collect candidate files sequentially first: directory iteration and JPEG magic-byte
     // detection are cheap I/O, while the dominant decode+encode cost is parallelized below.
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let path = entry?.path();
-        if !path.is_file() || !file_is_jpeg(&path)? {
+    let entries = storage()
+        .read_dir(dir.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read {}", dir.display()))?;
+    for entry in entries {
+        // Storage entries are either files or directories; a non-directory is a regular file,
+        // mirroring the previous `path.is_file()` filter.
+        if entry.is_dir {
+            continue;
+        }
+        let path = dir.join(&entry.name);
+        if !file_is_jpeg(&path)? {
             continue;
         }
         candidates.push(path);
@@ -592,7 +643,7 @@ fn convert_one_jpeg_to_png(path: &Path) -> Result<bool> {
     let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("image");
     let target = path.with_file_name(format!("{stem}.png"));
     // Never overwrite a distinct existing PNG with converted bytes.
-    if target != *path && target.exists() {
+    if target != *path && storage().exists(target.to_string_lossy().as_ref()) {
         runtime_log::log_warn(format!(
             "skipping JPEG->PNG conversion for {}: target {} already exists",
             path.display(),
@@ -600,14 +651,16 @@ fn convert_one_jpeg_to_png(path: &Path) -> Result<bool> {
         ));
         return Ok(false);
     }
-    let bytes =
-        fs::read(path).with_context(|| format!("failed to read image {}", path.display()))?;
+    let bytes = storage()
+        .read(path.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read image {}", path.display()))?;
     let image = image::load_from_memory(&bytes)
         .with_context(|| format!("failed to decode JPEG image {}", path.display()))?;
     write_png_fast(&image, &target)?;
     // Drop the original only when it was a differently named file (for example `.jpg`).
     if target != *path {
-        fs::remove_file(path)
+        storage()
+            .remove_file(path.to_string_lossy().as_ref())
             .with_context(|| format!("failed to remove converted source {}", path.display()))?;
     }
     Ok(true)
@@ -640,7 +693,8 @@ fn convert_one_jpeg_to_png(path: &Path) -> Result<bool> {
 /// Returns the first real copy/decode/encode error (with path/operation context), or an error if
 /// `src_dir`/`cleaned_dir` cannot be read/created or a unique name cannot be resolved.
 fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
-    fs::create_dir_all(cleaned_dir)
+    storage()
+        .create_dir_all(cleaned_dir.to_string_lossy().as_ref())
         .with_context(|| format!("failed to create cleaned dir {}", cleaned_dir.display()))?;
     if has_any_entries(cleaned_dir)? {
         return Ok(());
@@ -651,14 +705,15 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
     // Each reserved name is materialized as an empty file so the next lookup sees it as taken.
     // The heavy per-file copy/decode/encode then runs in parallel below.
     let mut plans: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-    for entry in
-        fs::read_dir(src_dir).with_context(|| format!("failed to read {}", src_dir.display()))?
-    {
-        let entry = entry?;
-        let src_path = entry.path();
-        if !src_path.is_file() {
+    let entries = storage()
+        .read_dir(src_dir.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read {}", src_dir.display()))?;
+    for entry in entries {
+        // A non-directory storage entry is a regular file, mirroring `src_path.is_file()`.
+        if entry.is_dir {
             continue;
         }
+        let src_path = src_dir.join(&entry.name);
 
         let stem = src_path
             .file_stem()
@@ -672,7 +727,9 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
 
         let dst_path = unique_png_path(cleaned_dir, stem)?;
         // Reserve the name on disk so a later `unique_png_path` for a colliding stem skips it.
-        fs::File::create(&dst_path)
+        // An empty write materializes the 0-byte placeholder the old `File::create` produced.
+        storage()
+            .write(dst_path.to_string_lossy().as_ref(), &[])
             .with_context(|| format!("failed to reserve cleaned file {}", dst_path.display()))?;
         plans.push((src_path, dst_path, ext == "png"));
     }
@@ -684,9 +741,13 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
     plans
         .par_iter()
         .map(|(src_path, dst_path, is_png)| -> Result<()> {
+            let src_str = src_path.to_string_lossy();
+            let dst_str = dst_path.to_string_lossy();
             if *is_png {
-                return fs::copy(src_path, dst_path)
-                    .map(|_| ())
+                // Storage has no `copy`; emulate as read + write of the raw PNG bytes verbatim.
+                return storage()
+                    .read(src_str.as_ref())
+                    .and_then(|bytes| storage().write(dst_str.as_ref(), &bytes))
                     .map_err(|err| {
                         anyhow::Error::new(err).context(format!(
                             "failed to copy {} -> {}",
@@ -699,8 +760,14 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
                     // only logged so it cannot mask the root cause.
                     .map_err(|err| remove_placeholder_on_error(dst_path, err));
             }
-            match image::open(src_path) {
-                Ok(img) => write_png_fast(&img, dst_path)
+            // Decode from storage bytes; a read or decode failure collapses to `None`, matching
+            // the old `image::open(..)` `Err(_)` skip arm (non-image or unreadable source).
+            let decoded = storage()
+                .read(src_str.as_ref())
+                .ok()
+                .and_then(|bytes| image::load_from_memory(&bytes).ok());
+            match decoded {
+                Some(img) => write_png_fast(&img, dst_path)
                     .map_err(|err| {
                         err.context(format!(
                             "failed to convert {} -> {}",
@@ -711,9 +778,9 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
                     // A decode succeeded but the encode failed: drop the placeholder so retry is
                     // not blocked, preserving the encode error as the propagated cause.
                     .map_err(|err| remove_placeholder_on_error(dst_path, err)),
-                Err(_) => {
+                None => {
                     // Non-image files are skipped; remove the reserved empty placeholder.
-                    fs::remove_file(dst_path).with_context(|| {
+                    storage().remove_file(dst_str.as_ref()).with_context(|| {
                         format!(
                             "failed to remove placeholder for non-image {}",
                             src_path.display()
@@ -733,7 +800,7 @@ fn convert_src_to_cleaned(src_dir: &Path, cleaned_dir: &Path) -> Result<()> {
 /// returned error is always `original` (the real copy/decode/encode failure); if the cleanup
 /// removal itself fails it is only logged, never substituted, so the root cause is not masked.
 fn remove_placeholder_on_error(dst_path: &Path, original: anyhow::Error) -> anyhow::Error {
-    if let Err(cleanup_err) = fs::remove_file(dst_path) {
+    if let Err(cleanup_err) = storage().remove_file(dst_path.to_string_lossy().as_ref()) {
         runtime_log::log_warn(format!(
             "failed to remove reserved placeholder {} after a conversion error: {cleanup_err}",
             dst_path.display()
@@ -748,25 +815,24 @@ fn remove_placeholder_on_error(dst_path: &Path, original: anyhow::Error) -> anyh
 /// Returns an error if the file cannot be opened or read; a file shorter than three bytes
 /// returns `Ok(false)`.
 fn file_is_jpeg(path: &Path) -> Result<bool> {
-    use std::io::Read;
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut head = [0u8; 3];
-    match file.read_exact(&mut head) {
-        Ok(()) => Ok(head == [0xFF, 0xD8, 0xFF]),
-        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(err) => {
-            Err(anyhow::Error::new(err)
-                .context(format!("failed to read header of {}", path.display())))
-        }
-    }
+    // The storage seam exposes only whole-file reads, so the full file is loaded to inspect its
+    // three magic bytes. A file shorter than three bytes cannot be a JPEG and yields `Ok(false)`,
+    // matching the previous `UnexpectedEof` handling of the header read.
+    let bytes = storage()
+        .read(path.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read header of {}", path.display()))?;
+    Ok(bytes.starts_with(&[0xFF, 0xD8, 0xFF]))
 }
 
 fn collect_images(dir: &Path) -> Result<Vec<Page>> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("failed to read {}", dir.display()))?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p.is_file())
+    let entries = storage()
+        .read_dir(dir.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read {}", dir.display()))?;
+    let mut files: Vec<PathBuf> = entries
+        .into_iter()
+        // A non-directory storage entry is a regular file, mirroring the old `is_file` filter.
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| dir.join(entry.name))
         .filter(|p| {
             let ext = p
                 .extension()
@@ -801,7 +867,7 @@ fn collect_images(dir: &Path) -> Result<Vec<Page>> {
 /// # Errors
 /// Returns an error if the directory cannot be read or a rename fails.
 fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<()> {
-    if !overlay_dir.is_dir() {
+    if !storage().is_dir(overlay_dir.to_string_lossy().as_ref()) {
         return Ok(());
     }
 
@@ -818,11 +884,15 @@ fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<
 
     // Collect candidate renames keyed by target page position to detect collisions.
     let mut by_page: HashMap<usize, Vec<PathBuf>> = HashMap::new();
-    for entry in fs::read_dir(overlay_dir)
-        .with_context(|| format!("failed to read overlay directory {}", overlay_dir.display()))?
-    {
-        let path = entry?.path();
-        if !path.is_file() || !is_png_path(&path) {
+    let entries = storage()
+        .read_dir(overlay_dir.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read overlay directory {}", overlay_dir.display()))?;
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+        let path = overlay_dir.join(&entry.name);
+        if !is_png_path(&path) {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
@@ -854,7 +924,7 @@ fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<
         // `page_number` is 1-based; pages are stored in reading order.
         let desired_stem = page_stems[page_number - 1];
         let desired_path = overlay_dir.join(format!("{desired_stem}.png"));
-        if desired_path.exists() {
+        if storage().exists(desired_path.to_string_lossy().as_ref()) {
             runtime_log::log_warn(format!(
                 "[cleaned-reconcile] target '{}' already exists; leaving '{}'",
                 desired_path.display(),
@@ -862,13 +932,18 @@ fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<
             ));
             continue;
         }
-        fs::rename(source_path, &desired_path).with_context(|| {
-            format!(
-                "failed to rename legacy clean overlay '{}' -> '{}'",
-                source_path.display(),
-                desired_path.display()
+        storage()
+            .rename(
+                source_path.to_string_lossy().as_ref(),
+                desired_path.to_string_lossy().as_ref(),
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "failed to rename legacy clean overlay '{}' -> '{}'",
+                    source_path.display(),
+                    desired_path.display()
+                )
+            })?;
         runtime_log::log_info(format!(
             "[cleaned-reconcile] page #{page_number} '{}' -> '{}'",
             source_path.display(),
@@ -911,19 +986,19 @@ fn legacy_cleaned_page_number(stem: &str) -> Option<usize> {
 /// fuzzy number match in [`reconcile_clean_overlay_names`] pairs 0-based overlays with the 1-based
 /// source off by one, shifting every overlay back a page and dropping the first one.
 fn overlays_already_canonical(pages: &[Page], overlay_dir: &Path) -> bool {
-    if pages.is_empty() || !overlay_dir.is_dir() {
+    if pages.is_empty() || !storage().is_dir(overlay_dir.to_string_lossy().as_ref()) {
         return false;
     }
-    let Ok(entries) = fs::read_dir(overlay_dir) else {
+    let Ok(entries) = storage().read_dir(overlay_dir.to_string_lossy().as_ref()) else {
         return false;
     };
     let mut seen = vec![false; pages.len()];
     let mut count = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+    for entry in entries {
+        if entry.is_dir {
             continue;
         }
+        let path = overlay_dir.join(&entry.name);
         // Any non-PNG file or a stem that is not a canonical `{:03}` index means the folder is not
         // a clean canonical overlay set, so the reconcile passes should run as usual.
         if !is_png_path(&path) {
@@ -946,7 +1021,7 @@ fn overlays_already_canonical(pages: &[Page], overlay_dir: &Path) -> bool {
 }
 
 fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<()> {
-    if !overlay_dir.is_dir() {
+    if !storage().is_dir(overlay_dir.to_string_lossy().as_ref()) {
         return Ok(());
     }
     // When the overlays already form the complete canonical `000..` sequence they are finished and
@@ -983,7 +1058,9 @@ fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<(
 
     let mut pages_by_key: HashMap<String, Vec<(usize, String, PathBuf)>> = HashMap::new();
     for (page_idx, desired_stem, desired_path, match_key) in rename_targets {
-        if !desired_path.is_file() {
+        // These are concrete `<stem>.png` names, so `exists` stands in for the old `is_file`
+        // check (a directory of that exact name never occurs in a clean-overlay folder).
+        if !storage().exists(desired_path.to_string_lossy().as_ref()) {
             pages_by_key
                 .entry(match_key)
                 .or_default()
@@ -992,11 +1069,15 @@ fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<(
     }
 
     let mut overlays_by_key: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for entry in fs::read_dir(overlay_dir)
-        .with_context(|| format!("failed to read overlay directory {}", overlay_dir.display()))?
-    {
-        let path = entry?.path();
-        if !path.is_file() || !is_png_path(&path) || exact_target_paths.contains(&path) {
+    let entries = storage()
+        .read_dir(overlay_dir.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read overlay directory {}", overlay_dir.display()))?;
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+        let path = overlay_dir.join(&entry.name);
+        if !is_png_path(&path) || exact_target_paths.contains(&path) {
             continue;
         }
 
@@ -1031,17 +1112,22 @@ fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<(
 
         let (page_idx, desired_stem, desired_path) = &page_candidates[0];
         let source_path = &overlay_candidates[0];
-        if desired_path.exists() {
+        if storage().exists(desired_path.to_string_lossy().as_ref()) {
             continue;
         }
 
-        fs::rename(source_path, desired_path).with_context(|| {
-            format!(
-                "failed to rename clean overlay '{}' -> '{}'",
-                source_path.display(),
-                desired_path.display()
+        storage()
+            .rename(
+                source_path.to_string_lossy().as_ref(),
+                desired_path.to_string_lossy().as_ref(),
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "failed to rename clean overlay '{}' -> '{}'",
+                    source_path.display(),
+                    desired_path.display()
+                )
+            })?;
         runtime_log::log_info(format!(
             "[overlay-reconcile] page #{page_idx} stem='{}' '{}' -> '{}'",
             desired_stem,
@@ -1152,10 +1238,11 @@ fn normalize_page_filenames(
 /// # Errors
 /// Returns an error if `from` exists but the rename fails.
 fn rename_if_exists(from: &Path, to: &Path) -> Result<()> {
-    if !from.exists() {
+    if !storage().exists(from.to_string_lossy().as_ref()) {
         return Ok(());
     }
-    fs::rename(from, to)
+    storage()
+        .rename(from.to_string_lossy().as_ref(), to.to_string_lossy().as_ref())
         .with_context(|| format!("failed to rename '{}' -> '{}'", from.display(), to.display()))?;
     Ok(())
 }
@@ -1266,10 +1353,11 @@ fn parse_sort_parts(name: &str) -> (Option<u64>, u8, String) {
 /// Returns an error if the file cannot be read, is not valid bubble JSON, or legacy
 /// conversion fails (for example when page dimensions cannot be read).
 fn load_bubbles(path: &Path, pages: &[Page]) -> Result<(Vec<Bubble>, bool)> {
-    if !path.exists() {
+    if !storage().exists(path.to_string_lossy().as_ref()) {
         return Ok((Vec::new(), false));
     }
-    let data = fs::read_to_string(path)
+    let data = storage()
+        .read_to_string(path.to_string_lossy().as_ref())
         .with_context(|| format!("failed to read bubbles json: {}", path.display()))?;
     let raw: Vec<Value> = serde_json::from_str(&data)
         .with_context(|| format!("invalid bubbles json: {}", path.display()))?;
@@ -1388,9 +1476,23 @@ impl LegacyRibbonGeometry {
         }
         let mut page_aspect = Vec::with_capacity(pages.len());
         for page in pages {
-            let (w, h) = image::image_dimensions(&page.path).with_context(|| {
-                format!("failed to read page dimensions: {}", page.path.display())
-            })?;
+            // Storage has no header-only read; load the bytes and let `ImageReader` parse just the
+            // dimensions from the in-memory stream (no full decode), preserving the previous
+            // `image::image_dimensions` behavior and its single error context.
+            let bytes = storage()
+                .read(page.path.to_string_lossy().as_ref())
+                .with_context(|| {
+                    format!("failed to read page dimensions: {}", page.path.display())
+                })?;
+            let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .with_context(|| {
+                    format!("failed to read page dimensions: {}", page.path.display())
+                })?
+                .into_dimensions()
+                .with_context(|| {
+                    format!("failed to read page dimensions: {}", page.path.display())
+                })?;
             let w = f64::from(w.max(1));
             let h = f64::from(h.max(1));
             page_aspect.push(h / w);
@@ -1567,13 +1669,19 @@ fn solve_page_left(
 /// Returns an error if the backup copy or the rewrite fails.
 fn persist_migrated_bubbles(path: &Path, bubbles: &[Bubble]) -> Result<()> {
     let backup = legacy_backup_path(path);
-    if !backup.exists() {
-        fs::copy(path, &backup)
+    if !storage().exists(backup.to_string_lossy().as_ref()) {
+        // Storage has no `copy`; emulate the one-time backup as read + write of the raw bytes.
+        let original = storage()
+            .read(path.to_string_lossy().as_ref())
+            .with_context(|| format!("failed to back up legacy bubbles to {}", backup.display()))?;
+        storage()
+            .write(backup.to_string_lossy().as_ref(), &original)
             .with_context(|| format!("failed to back up legacy bubbles to {}", backup.display()))?;
     }
     let json =
         serde_json::to_string_pretty(bubbles).context("failed to serialize migrated bubbles")?;
-    fs::write(path, json)
+    storage()
+        .write(path.to_string_lossy().as_ref(), json.as_bytes())
         .with_context(|| format!("failed to write migrated bubbles: {}", path.display()))?;
     runtime_log::log_info(format!(
         "migrated {} legacy bubble(s) to page-normalized format: {}",
@@ -1786,8 +1894,8 @@ pub fn save_comic_type_to_project_file(
     settings_file: &Path,
     comic_type: ComicType,
 ) -> Result<(), String> {
-    let mut root = if settings_file.exists() {
-        match fs::read_to_string(settings_file) {
+    let mut root = if storage().exists(settings_file.to_string_lossy().as_ref()) {
+        match storage().read_to_string(settings_file.to_string_lossy().as_ref()) {
             Ok(raw) => {
                 serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
             }
@@ -1817,20 +1925,26 @@ pub fn save_comic_type_to_project_file(
 
     let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
     if let Some(parent) = settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        storage()
+            .create_dir_all(parent.to_string_lossy().as_ref())
+            .map_err(|err| err.to_string())?;
     }
-    fs::write(settings_file, payload).map_err(|err| err.to_string())?;
+    storage()
+        .write(settings_file.to_string_lossy().as_ref(), payload.as_bytes())
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
 #[allow(dead_code)]
 fn has_any_entries(dir: &Path) -> Result<bool> {
-    if !dir.is_dir() {
+    let dir_str = dir.to_string_lossy();
+    if !storage().is_dir(dir_str.as_ref()) {
         return Ok(false);
     }
-    let mut iter =
-        fs::read_dir(dir).with_context(|| format!("failed to read directory {}", dir.display()))?;
-    Ok(iter.next().transpose()?.is_some())
+    let entries = storage()
+        .read_dir(dir_str.as_ref())
+        .with_context(|| format!("failed to read directory {}", dir.display()))?;
+    Ok(!entries.is_empty())
 }
 
 /// Maximum `<stem>-<i>` suffixes tried before giving up on resolving a unique name.
@@ -1848,12 +1962,12 @@ const UNIQUE_PNG_PATH_MAX_ATTEMPTS: u32 = 65_536;
 /// rather than looping forever or overflowing the suffix counter.
 fn unique_png_path(dst_dir: &Path, stem: &str) -> Result<PathBuf> {
     let base = dst_dir.join(format!("{stem}.png"));
-    if !base.exists() {
+    if !storage().exists(base.to_string_lossy().as_ref()) {
         return Ok(base);
     }
     for i in 1..=UNIQUE_PNG_PATH_MAX_ATTEMPTS {
         let candidate = dst_dir.join(format!("{stem}-{i}.png"));
-        if !candidate.exists() {
+        if !storage().exists(candidate.to_string_lossy().as_ref()) {
             return Ok(candidate);
         }
     }
@@ -1866,23 +1980,34 @@ fn unique_png_path(dst_dir: &Path, stem: &str) -> Result<PathBuf> {
 
 #[allow(dead_code)]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
+    storage()
+        .create_dir_all(dst.to_string_lossy().as_ref())
         .with_context(|| format!("failed to create directory {}", dst.display()))?;
 
-    for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+    let entries = storage()
+        .read_dir(src.to_string_lossy().as_ref())
+        .with_context(|| format!("failed to read {}", src.display()))?;
+    for entry in entries {
+        let src_path = src.join(&entry.name);
+        let dst_path = dst.join(&entry.name);
+        if entry.is_dir {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            match fs::copy(&src_path, &dst_path) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let src_str = src_path.to_string_lossy();
+            let dst_str = dst_path.to_string_lossy();
+            // Storage has no `copy`; emulate as read + write. Preserve the previous NotFound
+            // retry: when the destination's parent directory is missing, create it and copy again.
+            match storage()
+                .read(src_str.as_ref())
+                .and_then(|bytes| storage().write(dst_str.as_ref(), &bytes))
+            {
+                Ok(()) => {}
+                Err(ms_storage::StorageError::NotFound(_)) => {
                     if let Some(parent) = dst_path.parent() {
-                        fs::create_dir_all(parent)?;
+                        storage().create_dir_all(parent.to_string_lossy().as_ref())?;
                     }
-                    fs::copy(&src_path, &dst_path)?;
+                    let bytes = storage().read(src_str.as_ref())?;
+                    storage().write(dst_str.as_ref(), &bytes)?;
                 }
                 Err(e) => {
                     return Err(e).with_context(|| {
@@ -2030,7 +2155,7 @@ mod tests {
 
     /// Builds a process-unique temporary directory under the system temp root.
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use web_time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

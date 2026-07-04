@@ -25,9 +25,13 @@ This module returns RGBA pixels only. Callers remain responsible for spawning a 
 and converting the result into egui or image crate types.
 */
 
+// Native-only clipboard backend; absent on the wasm target.
+#[cfg(not(target_arch = "wasm32"))]
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
 use std::env;
+// Path helpers are only used by the native clipboard readers below.
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -51,6 +55,17 @@ pub struct ClipboardImage {
     pub rgba: Vec<u8>,
 }
 
+/// Reads an RGBA image from the system clipboard.
+///
+/// Native builds try `arboard`, then alternative clipboard representations, then
+/// Linux command-line helpers. On wasm there is no system clipboard image API, so
+/// this returns a clear error instead of a fake success.
+#[cfg(target_arch = "wasm32")]
+pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
+    Err("буфер обмена изображений недоступен в веб-версии".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
     match read_image_from_clipboard_arboard() {
         Ok(image) => Ok(image),
@@ -73,12 +88,14 @@ pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_image_from_clipboard_arboard() -> Result<ClipboardImage, String> {
     let mut clipboard = Clipboard::new().map_err(|err| err.to_string())?;
     let image = clipboard.get_image().map_err(|err| err.to_string())?;
     validate_rgba_image(image.width, image.height, image.bytes.into_owned())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_image_from_clipboard_arboard_alternatives() -> Result<ClipboardImage, String> {
     let mut clipboard = Clipboard::new().map_err(|err| err.to_string())?;
 
@@ -105,6 +122,7 @@ fn read_image_from_clipboard_arboard_alternatives() -> Result<ClipboardImage, St
     Err("альтернативные представления буфера не содержат путь к изображению".to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn validate_rgba_image(
     width: usize,
     height: usize,
@@ -130,6 +148,7 @@ fn validate_rgba_image(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_image_from_path(path: &Path) -> Result<ClipboardImage, String> {
     let decoded = image::open(path)
         .map_err(|err| format!("не удалось открыть изображение '{}': {err}", path.display()))?
@@ -141,6 +160,7 @@ fn read_image_from_path(path: &Path) -> Result<ClipboardImage, String> {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn try_decode_image_reference(raw: &str) -> Result<Option<ClipboardImage>, String> {
     let Some(path) = extract_image_path_reference(raw) else {
         return Ok(None);
@@ -148,6 +168,7 @@ fn try_decode_image_reference(raw: &str) -> Result<Option<ClipboardImage>, Strin
     read_image_from_path(path.as_path()).map(Some)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_image_path_reference(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -171,6 +192,7 @@ fn extract_image_path_reference(raw: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_file_uri(raw: &str) -> Option<PathBuf> {
     let uri = raw.strip_prefix("file://")?;
     let decoded = decode_percent_escaped(uri)?;
@@ -178,6 +200,7 @@ fn parse_file_uri(raw: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn decode_percent_escaped(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -197,10 +220,12 @@ fn decode_percent_escaped(raw: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn hex_to_u8(high: u8, low: u8) -> Option<u8> {
     Some((hex_nibble(high)? << 4) | hex_nibble(low)?)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),

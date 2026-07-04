@@ -1,0 +1,19 @@
+[package]
+name = "ms-storage"
+version = "0.1.0"
+edition = "2024"
+
+# Storage abstraction layer for ManhwaStudio.
+#
+# Provides a synchronous, object-safe `Storage` trait plus two backends that
+# work on every target:
+#   - `NativeStorage`: rooted `std::fs` backend for the desktop build.
+#   - `MemStorage`:    in-memory virtual filesystem used as the web session
+#                      store (hydrated from / flushed to browser IndexedDB by
+#                      the application's web persistence layer).
+#
+# GUI-free, no dependency on the application crate. Pure std + thiserror so it
+# compiles for both `x86_64-*` and `wasm32-unknown-unknown`.
+[dependencies]
+web-time = "1"
+thiserror = "2"

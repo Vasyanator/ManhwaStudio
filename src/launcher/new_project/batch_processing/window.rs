@@ -424,6 +424,14 @@ impl BatchProcessingWindowState {
 
     // ── File save / load ──────────────────────────────────────────────────────
 
+    /// Web stub: saving a graph opens a native save dialog (`rfd`) and writes with
+    /// `std::fs`; neither is available in the browser. Reports the missing capability.
+    #[cfg(target_arch = "wasm32")]
+    fn save_graph(&mut self, _ctx: &egui::Context) {
+        self.set_status("Сохранение графа недоступно в веб-версии.", true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_graph(&mut self, _ctx: &egui::Context) {
         let path = if let Some(p) = &self.save_path {
             Some(p.clone())
@@ -455,6 +463,14 @@ impl BatchProcessingWindowState {
         }
     }
 
+    /// Web stub: loading a graph opens a native open dialog (`rfd`) and reads with
+    /// `std::fs`; neither is available in the browser. Reports the missing capability.
+    #[cfg(target_arch = "wasm32")]
+    fn load_graph(&mut self, _ctx: &egui::Context) {
+        self.set_status("Загрузка графа недоступна в веб-версии.", true);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_graph(&mut self, _ctx: &egui::Context) {
         let path = rfd::FileDialog::new()
             .add_filter("Граф обработки (JSON)", &["json"])

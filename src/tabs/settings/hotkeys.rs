@@ -27,7 +27,7 @@ use crate::input_manager_v2::{
 };
 use crate::runtime_log;
 use crate::tabs::AppTab;
-use std::thread;
+use ms_thread as thread;
 
 impl SettingsTabState {
     pub(super) fn draw_hotkeys(&mut self, ui: &mut egui::Ui, hotkeys_v2: &mut InputManagerV2) {

@@ -33,8 +33,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Reline runs over the v2 framed transport. Endpoint labels are kept only for
 // human-readable log/error messages and the display-only `backend_endpoint`.

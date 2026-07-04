@@ -31,11 +31,13 @@ Inline rendering notes:
 use eframe::egui;
 use egui::{ColorImage, TextureOptions};
 use std::collections::HashMap;
-use std::fs;
+// `Read` and `Duration` are only used by the native remote-image loader below.
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use web_time::Duration;
 
 #[derive(Debug, Clone)]
 struct WikiFileEntry {
@@ -445,7 +447,7 @@ impl WikiTabState {
 
     fn spawn_image_load_thread(&self, key: String) {
         let tx = self.image_tx.clone();
-        std::thread::spawn(move || {
+        ms_thread::spawn(move || {
             let load = if key.starts_with("http://") || key.starts_with("https://") {
                 load_remote_image_rgba(&key)
             } else {
@@ -475,8 +477,12 @@ impl Default for WikiTabState {
 }
 
 fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
-    std::thread::spawn(move || {
-        if let Err(err) = fs::create_dir_all(&wiki_dir) {
+    ms_thread::spawn(move || {
+        // Routed through the storage seam so the web build scans its virtual store
+        // instead of the desktop filesystem.
+        let store = crate::storage::storage();
+        let wiki_dir_str = wiki_dir.to_string_lossy();
+        if let Err(err) = store.create_dir_all(wiki_dir_str.as_ref()) {
             let _ = tx.send(WikiScanResult::Err(format!(
                 "Не удалось создать папку {}: {err}",
                 wiki_dir.display()
@@ -484,8 +490,8 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
             return;
         }
 
-        let read_dir = match fs::read_dir(&wiki_dir) {
-            Ok(dir) => dir,
+        let entries = match store.read_dir(wiki_dir_str.as_ref()) {
+            Ok(entries) => entries,
             Err(err) => {
                 let _ = tx.send(WikiScanResult::Err(format!(
                     "Не удалось прочитать папку {}: {err}",
@@ -496,8 +502,9 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
         };
 
         let mut files = Vec::new();
-        for entry in read_dir.flatten() {
-            let path = entry.path();
+        for entry in entries {
+            // Rebuild each child path by joining the scanned dir with the entry name.
+            let path = wiki_dir.join(&entry.name);
             if !is_markdown_file(&path) {
                 continue;
             }
@@ -515,8 +522,11 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
 }
 
 fn spawn_document_load_thread(path: PathBuf, tx: Sender<WikiDocLoadResult>) {
-    std::thread::spawn(move || {
-        let markdown = match fs::read_to_string(&path) {
+    ms_thread::spawn(move || {
+        // Routed through the storage seam so the web build reads markdown from its
+        // virtual store instead of the desktop filesystem.
+        let path_str = path.to_string_lossy();
+        let markdown = match crate::storage::storage().read_to_string(path_str.as_ref()) {
             Ok(text) => text,
             Err(err) => {
                 let _ = tx.send(WikiDocLoadResult::Err(format!(
@@ -820,11 +830,25 @@ fn sanitize_windows_local_path_component(component: &str) -> String {
 }
 
 fn load_local_image_rgba(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
-    let image = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+    // Routed through the storage seam so the web build decodes image bytes from its
+    // virtual store instead of reading the desktop filesystem directly.
+    let path_str = path.to_string_lossy();
+    let bytes = crate::storage::storage()
+        .read(path_str.as_ref())
+        .map_err(|e| e.to_string())?;
+    let image = image::load_from_memory(&bytes)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
     let (w, h) = image.dimensions();
     Ok((w as usize, h as usize, image.into_raw()))
 }
 
+/// Fetches a remote image over HTTP and decodes it to RGBA.
+///
+/// Native builds use `ureq`. On wasm there is no synchronous HTTP client here, so
+/// remote image loading is unavailable and this returns an error instead of a
+/// blank image.
+#[cfg(not(target_arch = "wasm32"))]
 fn load_remote_image_rgba(url: &str) -> Result<(usize, usize, Vec<u8>), String> {
     let response = ureq::get(url)
         .timeout(Duration::from_secs(20))
@@ -840,6 +864,11 @@ fn load_remote_image_rgba(url: &str) -> Result<(usize, usize, Vec<u8>), String> 
         .to_rgba8();
     let (w, h) = image.dimensions();
     Ok((w as usize, h as usize, image.into_raw()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_remote_image_rgba(_url: &str) -> Result<(usize, usize, Vec<u8>), String> {
+    Err("загрузка изображений по сети недоступна в веб-версии".to_string())
 }
 
 #[cfg(test)]

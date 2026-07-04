@@ -31,12 +31,20 @@ Key functions:
 Notes:
 Detection intentionally uses short-lived system commands and filesystem probes.
 Callers must run these helpers outside the GUI thread.
+
+Web (wasm) build:
+GPU/accelerator detection relies on system commands (`nvidia-smi`, `lspci`, ...) that do
+not exist in the browser. The module still COMPILES on `wasm32` (the launcher
+system-information tab is cross-platform), but the single command primitive
+(`command_output`) is stubbed to return `None`, so every `detect_*` helper reports
+"nothing detected" on web. The public types are plain data and compile everywhere.
 */
 
 use std::fmt::Display;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -645,6 +653,14 @@ fn command_output_from_candidates(commands: &[&str], args: &[&str]) -> Option<St
         .find_map(|command| command_output(command, args))
 }
 
+// The single process-spawning primitive. On wasm there is no subprocess, so it
+// returns `None` and every `detect_*` helper degrades to "nothing detected".
+#[cfg(target_arch = "wasm32")]
+fn command_output(_command: &str, _args: &[&str]) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(command);
     apply_windows_no_window(&mut cmd);
@@ -741,5 +757,7 @@ fn apply_windows_no_window(command: &mut Command) {
     command.creation_flags(0x0800_0000);
 }
 
-#[cfg(not(target_os = "windows"))]
+// Only referenced by the native `command_output`; the `&mut Command` signature
+// means it must be excluded from wasm too (there is no `Command` type there).
+#[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 fn apply_windows_no_window(_command: &mut Command) {}

@@ -58,7 +58,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use ms_thread::{self as thread, JoinHandle};
 
 const CLEANING_PREVIEW_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const SCRATCH_PREVIEW_TILE_SIDE: usize = 1024;

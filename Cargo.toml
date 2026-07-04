@@ -4,10 +4,17 @@ version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread"]
 
 [features]
 active-logs = []
+# Web (wasm) build switch. Enabled by the wcheck/wbuild aliases and build-wasm.sh.
+# Selects the browser storage/network backends and compiles out native-only
+# subsystems (subprocess AI backend, sockets, dynamic libs). See docs/WEB_PORT.md.
+# Currently a marker feature consumed by cfg(feature = "web") gates; wasm-only
+# dependencies are added under [target.'cfg(target_arch = "wasm32")'.dependencies]
+# as subsystems are ported.
+web = []
 # Frame profiler instrumentation. Off by default for zero runtime overhead.
 # Enable with `cargo run --features profiling` to record per-frame puffin scopes
 # and show the puffin_egui profiler window inside the editor.
@@ -17,13 +24,20 @@ profiling = ["dep:puffin", "dep:puffin_egui"]
 name = "render_gallery"
 path = "src/bin/render_gallery/main.rs"
 
+# Cross-target dependencies. These compile on both native and wasm32 (pure Rust
+# or with first-class wasm support: egui/eframe, image, cosmic-text, serde, zip,
+# rayon under the atomics build, etc.). Native-only crates (sockets, native HTTP,
+# subprocess/dylib, OS keyring, clipboard, file dialogs) live in the
+# cfg(not(wasm32)) block below and their call sites are cfg-gated per WEB_PORT.md.
 [dependencies]
 ms-log = { path = "crates/ms-log" }
 ms-text-util = { path = "crates/ms-text-util" }
 ms-text-render = { path = "crates/ms-text-render" }
 ms-actions = { path = "crates/ms-actions", features = ["raster"] }
+ms-storage = { path = "crates/ms-storage" }
+ms-thread = { path = "crates/ms-thread" }
+web-time = "1"
 anyhow = "1"
-arboard = "3"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.33"
@@ -33,29 +47,49 @@ swash = "0.2"
 zeno = "0.3"
 hyphenation = { version = "0.8", features = ["embed_all"] }
 image = { version = "0.25", default-features = true }
-libloading = "0.8"
 minijinja = "2"
-rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = "1"
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 tar = "0.4"
-ureq = { version = "2", features = ["json", "cookies"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 libc = "0.2"
 texture-synthesis = "0.8.2"
-translators = { version = "0.1.5", default-features = false, features = ["google"] }
 rayon = "1"
 ag-psd = "0.1.0"
 zspell = "0.5"
-genai = "0.6"
-keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "crypto-rust", "vendored"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 puffin = { version = "0.20.0", optional = true }
 puffin_egui = { version = "0.30", optional = true }
+
+# Native-only dependencies: native sockets / blocking HTTP (ureq, hf-hub,
+# translators, genai+tokio), dynamic library loading (libloading), OS credential
+# store (keyring), clipboard (arboard), and native file dialogs (rfd). None have
+# a usable wasm32-unknown-unknown path with the current API usage; the web build
+# replaces them (fetch, IndexedDB, download) in the web-glue phase.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = "3"
+libloading = "0.8"
+rfd = "0.15"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+ureq = { version = "2", features = ["json", "cookies"] }
+translators = { version = "0.1.5", default-features = false, features = ["google"] }
+genai = "0.6"
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "crypto-rust", "vendored"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
+# (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /
+# web-sys / futures stack drives the eframe `WebRunner` entry in `web_entry.rs`;
+# `console_error_panic_hook` surfaces Rust panics in the browser console.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "console"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows = "1"

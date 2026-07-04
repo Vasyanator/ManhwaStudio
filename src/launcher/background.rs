@@ -32,8 +32,8 @@ use image::imageops::FilterType;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Marker file placed inside a title folder to exclude it from the menu background pool.
 pub const NO_MENU_IMGS_MARKER: &str = "no_menu_imgs";

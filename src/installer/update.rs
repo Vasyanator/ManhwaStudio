@@ -20,8 +20,8 @@ choice state.
 use eframe::egui;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 use crate::config;
 

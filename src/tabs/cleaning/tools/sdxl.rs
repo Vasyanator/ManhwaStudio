@@ -52,8 +52,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
-use std::time::Duration;
+use ms_thread as thread;
+use web_time::Duration;
 
 // SDXL diffusion may run many steps on CPU; allow a long per-call window.
 const SDXL_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);

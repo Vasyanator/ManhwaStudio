@@ -34,9 +34,11 @@ pub mod state;
 pub mod theme;
 
 use crate::ai_backend_supervisor::AiBackendHandle;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::config;
 use crate::launcher::state::{LauncherOutcome, UpdateNotification};
 use std::sync::mpsc::Receiver;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 
 const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../../app_icon.ico");
@@ -61,6 +63,27 @@ pub fn run_test_launcher(
     Ok(())
 }
 
+/// Web stub for the launcher entry point.
+///
+/// The launcher owns a native OS window through `eframe::run_native`, which has no
+/// browser equivalent (the web build uses a single `WebRunner` entry). The stub keeps
+/// the same signature so shared startup code compiles, logs the dropped capability, and
+/// surfaces a clear "unavailable on web" error instead of faking an outcome.
+#[cfg(target_arch = "wasm32")]
+fn run_launcher_internal(
+    _user_settings: &serde_json::Value,
+    test_mode: bool,
+    _update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+    _ai_backend: &AiBackendHandle,
+) -> anyhow::Result<Option<LauncherOutcome>> {
+    crate::runtime_log::log_warn(format!(
+        "Rust launcher window{} is unavailable on the web build",
+        if test_mode { " test mode" } else { "" }
+    ));
+    Err(anyhow::anyhow!("Оконный лаунчер недоступен в веб-версии"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_launcher_internal(
     user_settings: &serde_json::Value,
     test_mode: bool,

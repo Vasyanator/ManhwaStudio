@@ -2114,7 +2114,7 @@ mod tests {
         // entries, otherwise they leak for the whole session and a reused id can serve a stale
         // fingerprint/preview from the previous bubble.
         use super::super::ImageBubblePreviewCacheEntry;
-        use std::time::Instant;
+        use web_time::Instant;
 
         let mut canvas = CanvasView::default();
         insert_image_bubble_with_areas(&mut canvas, 21, 1);

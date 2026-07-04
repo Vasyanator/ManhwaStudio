@@ -25,19 +25,27 @@
 use crate::backend_ipc::{self, CallError, CallHandle};
 use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
 use crate::{ai_models, config};
+// AI API OCR (`genai`) is native-only: the crate is not compiled for wasm. The
+// worker command/event enums and the controller stay target-neutral; only the
+// bodies that call `genai`/`tokio`/`ureq`/`keyring` are gated below.
+#[cfg(not(target_arch = "wasm32"))]
 use genai::adapter::AdapterKind;
+#[cfg(not(target_arch = "wasm32"))]
 use genai::chat::{ChatMessage, ChatRequest, ContentPart};
+#[cfg(not(target_arch = "wasm32"))]
 use genai::resolver::{AuthData, AuthResolver, ProviderConfig};
+#[cfg(not(target_arch = "wasm32"))]
 use genai::{Client, ModelIden};
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use ms_thread::{self as thread, JoinHandle};
+use web_time::Duration;
 
 /// Per-OCR-request timeout for the v2 framed `call`. Mirrors the previous HTTP
 /// read timeout: model warmup + recognition can take a while on first use.
@@ -162,6 +170,9 @@ impl AiApiService {
         }
     }
 
+    /// Maps this service to its `genai` adapter. Native-only: `genai` (and the
+    /// `AdapterKind` type) is not compiled for the web build.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn adapter_kind(self) -> AdapterKind {
         match self {
             Self::OpenAi => AdapterKind::OpenAI,
@@ -1119,6 +1130,17 @@ fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// Web stub: AI-API OCR runs over `genai` + `tokio`, which are not compiled for
+/// the browser build. Returns a clear error instead of a fake recognition.
+#[cfg(target_arch = "wasm32")]
+fn run_ai_api_ocr_request(
+    _request: &OcrRecognizeRequest,
+    _page_cache: &mut PageImageCache,
+) -> Result<OcrRecognizeResult, String> {
+    Err("Распознавание через AI API недоступно в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn run_ai_api_ocr_request(
     request: &OcrRecognizeRequest,
     page_cache: &mut PageImageCache,
@@ -1179,6 +1201,7 @@ fn normalized_ai_api_system_instruction(options: &OcrRuntimeOptions) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn build_ai_api_client(service: AiApiService, api_key: String) -> Client {
     let api_key = Arc::new(api_key);
     let expected_adapter = service.adapter_kind();
@@ -1194,6 +1217,7 @@ pub(crate) fn build_ai_api_client(service: AiApiService, api_key: String) -> Cli
     Client::builder().with_auth_resolver(auth_resolver).build()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn model_iden_for_ai_api_service(service: AiApiService, model: &str) -> ModelIden {
     let model_name = model
         .trim()
@@ -1202,6 +1226,14 @@ pub(crate) fn model_iden_for_ai_api_service(service: AiApiService, model: &str) 
     ModelIden::new(service.adapter_kind(), model_name)
 }
 
+/// Web stub: model listing / account status need `genai`/`tokio`/`ureq`, absent
+/// on the browser build. Surfaces a clear error rather than empty metadata.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn load_ai_api_metadata(_service: AiApiService) -> Result<AiApiMetadata, String> {
+    Err("Данные AI API недоступны в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn load_ai_api_metadata(service: AiApiService) -> Result<AiApiMetadata, String> {
     let key = read_ai_api_key(service).unwrap_or_default();
     let key_configured = !key.trim().is_empty();
@@ -1228,6 +1260,7 @@ pub(crate) fn load_ai_api_metadata(service: AiApiService) -> Result<AiApiMetadat
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_ai_api_model_names(service: AiApiService, api_key: &str) -> Result<Vec<String>, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1263,6 +1296,7 @@ fn fetch_ai_api_model_names(service: AiApiService, api_key: &str) -> Result<Vec<
     Ok(filtered)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn model_name_for_ai_api_ui(service: AiApiService, model: &str) -> String {
     if service == AiApiService::OpenRouter && !model.contains("::") {
         format!("open_router::{model}")
@@ -1290,6 +1324,7 @@ pub(crate) fn is_likely_multimodal_model(model: &str) -> bool {
         || model.contains("llama-4")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
     let response = ureq::get("https://openrouter.ai/api/v1/key")
         .set("Authorization", &format!("Bearer {api_key}"))
@@ -1332,6 +1367,14 @@ fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
     Ok(format!("OpenRouter: {}", parts.join(", ")))
 }
 
+/// Web stub: the OS credential store (`keyring`) does not exist in the browser,
+/// so storing an API key is rejected with a clear error.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn store_ai_api_key(_service: AiApiService, _api_key: &str) -> Result<(), String> {
+    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn store_ai_api_key(service: AiApiService, api_key: &str) -> Result<(), String> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
@@ -1342,6 +1385,14 @@ pub(crate) fn store_ai_api_key(service: AiApiService, api_key: &str) -> Result<(
         .map_err(|err| format!("Не удалось сохранить API key {}: {err}", service.label()))
 }
 
+/// Web stub: no OS credential store on the browser build, so clearing a key is
+/// rejected with a clear error.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn clear_ai_api_key(_service: AiApiService) -> Result<(), String> {
+    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn clear_ai_api_key(service: AiApiService) -> Result<(), String> {
     match ai_api_keyring_entry(service)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -1352,6 +1403,15 @@ pub(crate) fn clear_ai_api_key(service: AiApiService) -> Result<(), String> {
     }
 }
 
+/// Web stub: no OS credential store on the browser build. Returns a clear error
+/// so callers (OCR warmup, MT run, metadata) surface "unavailable on web" rather
+/// than treating a missing key as an empty one.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_ai_api_key(_service: AiApiService) -> Result<String, String> {
+    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_ai_api_key(service: AiApiService) -> Result<String, String> {
     match ai_api_keyring_entry(service)?.get_password() {
         Ok(key) => Ok(key),
@@ -1363,6 +1423,7 @@ pub(crate) fn read_ai_api_key(service: AiApiService) -> Result<String, String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ai_api_keyring_entry(service: AiApiService) -> Result<keyring::Entry, String> {
     keyring::Entry::new("ManhwaStudio AI API OCR", service.key())
         .map_err(|err| format!("Системное хранилище секретов недоступно: {err}"))

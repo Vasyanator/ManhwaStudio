@@ -79,7 +79,15 @@ pub fn query_virtual_desktop_bounds() -> Result<ScreenRect, String> {
     {
         query_virtual_desktop_bounds_linux()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    // Web build: no desktop to query — the capture flow is a native launcher feature.
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err("Захват экрана недоступен в веб-версии.".to_string())
+    }
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "windows", target_os = "linux"))
+    ))]
     {
         Err("desktop capture is not supported on this platform".to_string())
     }
@@ -98,7 +106,16 @@ pub fn capture_screen_rect(rect: ScreenRect) -> Result<RgbaImage, String> {
     {
         capture_screen_rect_linux(rect)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    // Web build: no desktop to capture — the capture flow is a native launcher feature.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = rect;
+        Err("Захват экрана недоступен в веб-версии.".to_string())
+    }
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(any(target_os = "windows", target_os = "linux"))
+    ))]
     {
         let _ = rect;
         Err("desktop capture is not supported on this platform".to_string())

@@ -459,11 +459,16 @@ impl TypingCreatePanelState {
             }
             if self.preview_enabled && ui.button("Наложить и сохранить в папку").clicked()
             {
-                let mut dialog = FileDialog::new();
-                if let Some(path) = export_default_dir {
-                    dialog = dialog.set_directory(path);
+                // Native folder picker; on web there is no OS dialog (folder export
+                // is handled by a zip download in the web-glue phase).
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let mut dialog = FileDialog::new();
+                    if let Some(path) = export_default_dir {
+                        dialog = dialog.set_directory(path);
+                    }
+                    out.export_to_folder = dialog.pick_folder();
                 }
-                out.export_to_folder = dialog.pick_folder();
             }
             if self.preview_enabled {
                 if ui.button("Вставить картинку из буфера обмена").clicked()
@@ -471,15 +476,21 @@ impl TypingCreatePanelState {
                     out.create_image_request = Some(TypingCreateImageRequest::FromClipboard);
                 }
                 if ui.button("Выбрать картинку из файла").clicked() {
-                    let mut dialog = FileDialog::new();
-                    if let Some(path) = export_default_dir {
-                        dialog = dialog.set_directory(path);
-                    }
-                    if let Some(path) = dialog
-                        .add_filter("Картинки", &["png", "jpg", "jpeg", "webp", "bmp"])
-                        .pick_file()
+                    // Native file picker; web file selection arrives via an
+                    // <input type=file> in the web-glue phase.
+                    #[cfg(not(target_arch = "wasm32"))]
                     {
-                        out.create_image_request = Some(TypingCreateImageRequest::FromFile(path));
+                        let mut dialog = FileDialog::new();
+                        if let Some(path) = export_default_dir {
+                            dialog = dialog.set_directory(path);
+                        }
+                        if let Some(path) = dialog
+                            .add_filter("Картинки", &["png", "jpg", "jpeg", "webp", "bmp"])
+                            .pick_file()
+                        {
+                            out.create_image_request =
+                                Some(TypingCreateImageRequest::FromFile(path));
+                        }
                     }
                 }
             }

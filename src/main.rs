@@ -53,7 +53,10 @@ mod paste_image;
 mod project;
 mod python_manager;
 mod screen_capture;
+mod storage;
 mod tabs;
+#[cfg(target_arch = "wasm32")]
+mod web_entry;
 mod tools;
 pub mod widgets;
 
@@ -68,15 +71,33 @@ pub use ms_log::{runtime_log, trace, trace_log, trace_scope};
 // reads user config itself; `seed_hanging_punctuation_from_config` seeds it at startup.
 pub use ms_text_util::text_punctuation;
 
+// Native-only startup imports. All of these feed the native launcher/installer/
+// update-check flow (`eframe::run_native`, `rfd`, `ureq`, `clap` CLI, native
+// windows) which does not exist on `wasm32`. They are gated so the wasm build
+// does not fail on missing deps or unused imports. `std::ffi::OsStr` and
+// `std::path::{Path, PathBuf}` stay unconditional because the shared filesystem
+// helpers (`list_titles`, `list_chapters`, `validate_project_dir_for_startup`,
+// `count_images_in_dir`, `find_unsaved_chapter`) used by other modules need them
+// on both targets.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::widgets::WheelComboBox;
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
+#[cfg(not(target_arch = "wasm32"))]
 use args::Cli;
+#[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
+#[cfg(not(target_arch = "wasm32"))]
 use installer::install as launcher_install;
+#[cfg(not(target_arch = "wasm32"))]
 use installer::update::UpdateWindowOutcome;
+#[cfg(not(target_arch = "wasm32"))]
 use installer::utils::ExternalUpdateTarget;
+#[cfg(not(target_arch = "wasm32"))]
 use launcher::state::{LauncherOutcome, UpdateNotification};
+#[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
+#[cfg(not(target_arch = "wasm32"))]
 use std::cmp::Ordering;
 #[cfg(target_os = "linux")]
 use std::env;
@@ -84,10 +105,14 @@ use std::ffi::OsStr;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use ms_thread as thread;
+#[cfg(not(target_arch = "wasm32"))]
+use web_time::Duration;
 
 const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../app_icon.ico");
 const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../app_icon_512.png");
@@ -104,6 +129,14 @@ const MAIN_WINDOW_APP_ID: &str = "manhwastudio_rs.main";
 const UPDATE_CHECK_WINDOW_APP_ID: &str = "manhwastudio_rs.update_check";
 const BASIC_LAUNCHER_WINDOW_APP_ID: &str = "manhwastudio_rs.basic_launcher";
 
+// Web entry: boots the eframe WebRunner on the page canvas. Real startup lives
+// in `web_entry.rs`; the native launcher/installer flow below is compiled out.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    web_entry::start();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
     let result = run_main();
     match &result {
@@ -113,6 +146,7 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     install_linux_desktop_integration_async();
@@ -218,6 +252,7 @@ fn run_main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn init_startup_logging_best_effort() {
     let log_dir = config::data_dir();
     if let Err(err) = runtime_log::init_session_logs(&log_dir) {
@@ -226,12 +261,16 @@ fn init_startup_logging_best_effort() {
 }
 
 /// Outcome reported by `run_main_window` after the eframe window closes.
+///
+/// Native-only: this only describes the native windowed run loop.
+#[cfg(not(target_arch = "wasm32"))]
 pub enum RunResult {
     Exit,
     ReturnToLauncher,
 }
 
 /// Returns true when there is a `{chapter}_unsaved` folder adjacent to the chapter dir.
+#[cfg(not(target_arch = "wasm32"))]
 fn detect_unsaved_for_project(project_dir: &Path) -> bool {
     let Some(chapter_name) = project_dir.file_name().and_then(OsStr::to_str) else {
         return false;
@@ -260,6 +299,7 @@ pub(crate) fn find_unsaved_chapter(projects_root: &Path, title: &str) -> Option<
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn init_runtime_logging() {
     let log_dir = config::data_dir();
     if let Err(err) = runtime_log::init_session_logs(&log_dir) {
@@ -273,6 +313,7 @@ fn init_runtime_logging() {
     ));
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_standard_launcher_startup_artifacts() -> anyhow::Result<()> {
     init_runtime_logging();
     config::ensure_model_dirs()?;
@@ -284,6 +325,7 @@ fn ensure_standard_launcher_startup_artifacts() -> anyhow::Result<()> {
 /// startup. The util crate defaults to `DEFAULT_HANGING_PUNCTUATION`; here the app
 /// (which owns config) overrides it with `TextTab.hanging_punctuation` when present
 /// and non-blank. Best-effort: on any config error the default set is kept.
+#[cfg(not(target_arch = "wasm32"))]
 fn seed_hanging_punctuation_from_config() {
     let Ok(cfg) = config::load_user_config() else {
         return;
@@ -297,6 +339,7 @@ fn seed_hanging_punctuation_from_config() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn auto_detect_missing_ai_install_type_for_startup() {
     let raw_settings = match config::load_raw_user_settings_for_startup() {
         Ok(settings) => settings,
@@ -347,6 +390,7 @@ fn auto_detect_missing_ai_install_type_for_startup() {
     ));
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_startup_project_dir(
     cli: &Cli,
     user_settings: &serde_json::Value,
@@ -364,6 +408,7 @@ fn resolve_startup_project_dir(
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
     let path = project_dir.to_path_buf();
     match validate_project_dir_for_startup(&path) {
@@ -376,6 +421,7 @@ fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_project_dir_without_cli_arg(
     user_settings: &serde_json::Value,
     force_update_available: bool,
@@ -447,6 +493,7 @@ fn resolve_project_dir_without_cli_arg(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_startup_update_check(
     force_update_available: bool,
 ) -> mpsc::Receiver<Option<UpdateNotification>> {
@@ -494,12 +541,14 @@ fn spawn_startup_update_check(
     rx
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum MissingPythonEnvAction {
     Install,
     UpdateCustom(ExternalUpdateTarget),
     LaunchLauncher,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
     let output = Arc::new(Mutex::new(MissingPythonEnvAction::LaunchLauncher));
     let output_for_app = Arc::clone(&output);
@@ -537,11 +586,13 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
         .unwrap_or(MissingPythonEnvAction::LaunchLauncher)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct MissingPythonEnvPromptApp {
     output: Arc<Mutex<MissingPythonEnvAction>>,
     error_text: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl MissingPythonEnvPromptApp {
     fn set_output_and_close(&self, action: MissingPythonEnvAction, ctx: &egui::Context) {
         if let Ok(mut output) = self.output.lock() {
@@ -574,6 +625,7 @@ impl MissingPythonEnvPromptApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for MissingPythonEnvPromptApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -616,6 +668,7 @@ impl eframe::App for MissingPythonEnvPromptApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn should_enter_installer_flow(
     force_run_installer: bool,
     auto_install_target: Option<&PathBuf>,
@@ -623,6 +676,7 @@ fn should_enter_installer_flow(
     force_run_installer || auto_install_target.is_some()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_startup_installer(
     app_dir: PathBuf,
     auto_install_target: Option<PathBuf>,
@@ -642,6 +696,7 @@ fn run_startup_installer(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn show_startup_error_dialog(message: &str) {
     runtime_log::log_error(format!("startup error dialog shown: {message}"));
     let _ = rfd::MessageDialog::new()
@@ -652,6 +707,7 @@ fn show_startup_error_dialog(message: &str) {
         .show();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreLaunchAction {
@@ -659,6 +715,7 @@ enum PreLaunchAction {
     RunUpdaterAndExit,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn open_launcher_with_optional_update_check(
     app_dir: &Path,
@@ -678,6 +735,7 @@ fn open_launcher_with_optional_update_check(
     run_python_launcher_and_wait_for_project(app_dir, create_startup_artifacts)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn decide_pre_launch_action(app_dir: &Path) -> anyhow::Result<PreLaunchAction> {
     let config_path = app_dir.join("config.py");
@@ -701,6 +759,7 @@ fn decide_pre_launch_action(app_dir: &Path) -> anyhow::Result<PreLaunchAction> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn spawn_python_update_and_exit(app_dir: &Path) -> anyhow::Result<()> {
     runtime_log::log_info(format!("launching update.py from '{}'", app_dir.display()));
@@ -710,6 +769,7 @@ fn spawn_python_update_and_exit(app_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn run_python_launcher_and_wait_for_project(
     app_dir: &Path,
@@ -766,12 +826,14 @@ fn run_python_launcher_and_wait_for_project(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LauncherSelectionPayload {
     project: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn parse_selected_project_from_stdout(stdout: &str) -> anyhow::Result<Option<PathBuf>> {
     for line in stdout.lines().rev() {
@@ -790,47 +852,55 @@ fn parse_selected_project_from_stdout(stdout: &str) -> anyhow::Result<Option<Pat
     Ok(None)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn has_launcher_script(app_dir: &Path) -> bool {
     app_dir.join("launcher.py").is_file()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[cfg(target_os = "windows")]
 fn build_python_launcher_command(app_dir: &Path) -> Result<std::process::Command, String> {
     python_manager::build_python_script_command(app_dir, "launcher.py")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[cfg(target_os = "windows")]
 fn build_python_update_command(app_dir: &Path) -> Result<std::process::Command, String> {
     python_manager::build_python_script_command(app_dir, "update.py")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[cfg(not(target_os = "windows"))]
 fn build_python_launcher_command(app_dir: &Path) -> Result<std::process::Command, String> {
     python_manager::build_python_script_command(app_dir, "launcher.py")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 #[cfg(not(target_os = "windows"))]
 fn build_python_update_command(app_dir: &Path) -> Result<std::process::Command, String> {
     python_manager::build_python_script_command(app_dir, "update.py")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateCheckDecision {
     LaunchLauncher,
     RunUpdaterAndExit,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct UpdateCheckResult {
     remote_version: String,
     update_available: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 enum UpdateCheckUiState {
     Checking,
@@ -838,6 +908,7 @@ enum UpdateCheckUiState {
     Error { message: String },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct UpdateCheckApp {
     local_version: String,
     state: UpdateCheckUiState,
@@ -845,6 +916,7 @@ struct UpdateCheckApp {
     output_decision: Arc<Mutex<Option<UpdateCheckDecision>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl UpdateCheckApp {
     fn new(
         local_version: String,
@@ -918,6 +990,7 @@ impl UpdateCheckApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for UpdateCheckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_check_result(ctx);
@@ -972,6 +1045,7 @@ impl eframe::App for UpdateCheckApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckDecision> {
     let output = Arc::new(Mutex::new(None::<UpdateCheckDecision>));
     let out = Arc::clone(&output);
@@ -1011,11 +1085,13 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
     Ok(decision)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_local_version_from_config(config_path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(config_path).ok()?;
     parse_version_from_config(&content)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_version_from_config(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -1038,6 +1114,7 @@ fn parse_version_from_config(content: &str) -> Option<String> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn fetch_latest_release_tag() -> Result<String, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -1098,10 +1175,12 @@ fn fetch_latest_release_tag() -> Result<String, String> {
     Err(format!("не найден релиз с asset '{}'", UPDATE_ASSET_NAME))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_remote_newer(local: &str, remote: &str) -> bool {
     compare_versions(remote, local).is_gt()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn compare_versions(a: &str, b: &str) -> Ordering {
     let pa = parse_version_to_parts(a);
     let pb = parse_version_to_parts(b);
@@ -1116,6 +1195,7 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
     pa.len().cmp(&pb.len())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_version_to_parts(version: &str) -> Vec<VersionPart> {
     let normalized = normalize_version(version);
     normalized
@@ -1131,6 +1211,7 @@ fn parse_version_to_parts(version: &str) -> Vec<VersionPart> {
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn normalize_version(version: &str) -> &str {
     let trimmed = version.trim();
     if let Some(rest) = trimmed.strip_prefix('v') {
@@ -1142,6 +1223,7 @@ fn normalize_version(version: &str) -> &str {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn compare_version_part(left: &VersionPart, right: &VersionPart) -> Ordering {
     match (left, right) {
         (VersionPart::Num(a), VersionPart::Num(b)) => a.cmp(b),
@@ -1151,11 +1233,13 @@ fn compare_version_part(left: &VersionPart, right: &VersionPart) -> Ordering {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum VersionPart {
     Num(u64),
     Text(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_main_window(
     project: project::ProjectData,
     ai_backend: ai_backend_supervisor::AiBackendHandle,
@@ -1207,6 +1291,7 @@ fn run_main_window(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 #[allow(dead_code)]
 struct ProjectValidationResult {
@@ -1220,6 +1305,7 @@ pub(crate) enum ProjectValidationState {
     Invalid { message: String },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 #[allow(dead_code)]
 enum ChooserUiState {
@@ -1229,6 +1315,7 @@ enum ChooserUiState {
     Invalid { message: String },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 struct BasicLauncherApp {
     projects_root: PathBuf,
@@ -1241,6 +1328,7 @@ struct BasicLauncherApp {
     output_project_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 impl BasicLauncherApp {
     fn new(projects_root: PathBuf, output_project_dir: Arc<Mutex<Option<PathBuf>>>) -> Self {
@@ -1342,6 +1430,7 @@ impl BasicLauncherApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for BasicLauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_validation();
@@ -1451,6 +1540,7 @@ impl eframe::App for BasicLauncherApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn pick_project_dir_from_basic_launcher_gui(
     projects_root: PathBuf,
@@ -1587,6 +1677,7 @@ pub(crate) fn list_chapters(projects_root: &Path, title: &str) -> std::io::Resul
     Ok(out)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_embedded_icon_data() -> Option<egui::IconData> {
     let image = image::load_from_memory(EMBEDDED_APP_ICON_ICO)
         .or_else(|_| image::load_from_memory(EMBEDDED_APP_ICON_PNG))

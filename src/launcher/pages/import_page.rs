@@ -24,13 +24,17 @@ use crate::launcher::theme;
 use crate::runtime_log;
 use crate::widgets::EditableComboBox;
 use egui::{Align, Layout, RichText, Ui};
+// Native file picker + overwrite-confirmation dialogs. On web there is no OS
+// dialog: archive picking and overwrite confirmation are replaced with
+// "unavailable on web" statuses (Phase 5 wires an <input type=file> import).
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub struct ImportPageState {
@@ -240,6 +244,12 @@ impl ImportPageState {
         self.start_titles_refresh();
     }
 
+    /// Opens the OS file picker to choose a `.mschapter` archive and begins
+    /// loading its metadata.
+    ///
+    /// Native only. The web twin reports that picking a file this way is
+    /// unavailable (Phase 5 replaces it with an `<input type=file>` flow).
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_archive_file(&mut self) {
         let start_dir = self
             .archive_path
@@ -257,6 +267,15 @@ impl ImportPageState {
         self.archive_path = Some(path.clone());
         clear_status_if_success(&mut self.status);
         self.start_metadata_load(path);
+    }
+
+    /// Web twin of `pick_archive_file`: no OS file dialog exists on the web
+    /// build yet, so it surfaces a clear "unavailable on web" status.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_archive_file(&mut self) {
+        self.status = ImportPageStatus::Error(
+            "Выбор файла главы недоступен в веб-версии.".to_string(),
+        );
     }
 
     fn start_titles_refresh(&mut self) {
@@ -361,18 +380,31 @@ impl ImportPageState {
         let title_dir = self.projects_root.join(&title);
         let chapter_dir = title_dir.join(&chapter);
         if chapter_dir.is_dir() {
-            let description = format!(
-                "Глава «{}» в тайтле «{}» уже существует.\nПри импорте она будет полностью заменена.\n\nПродолжить?",
-                chapter, title
-            );
-            let should_continue = MessageDialog::new()
-                .set_title("ManhwaStudio")
-                .set_description(&description)
-                .set_buttons(MessageButtons::YesNo)
-                .set_level(MessageLevel::Warning)
-                .show()
-                == MessageDialogResult::Yes;
-            if !should_continue {
+            // Native shows a blocking overwrite-confirmation dialog. On web no OS
+            // dialog exists, so rather than silently replacing an existing
+            // chapter, refuse the overwrite with a clear status.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let description = format!(
+                    "Глава «{}» в тайтле «{}» уже существует.\nПри импорте она будет полностью заменена.\n\nПродолжить?",
+                    chapter, title
+                );
+                let should_continue = MessageDialog::new()
+                    .set_title("ManhwaStudio")
+                    .set_description(&description)
+                    .set_buttons(MessageButtons::YesNo)
+                    .set_level(MessageLevel::Warning)
+                    .show()
+                    == MessageDialogResult::Yes;
+                if !should_continue {
+                    return;
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.status = ImportPageStatus::Error(
+                    "Замена существующей главы недоступна в веб-версии.".to_string(),
+                );
                 return;
             }
         }

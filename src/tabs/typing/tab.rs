@@ -114,8 +114,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use ms_thread as thread;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 mod geometry;
 use geometry::{lerp, normalize_angle_deg, normalize_angle_rad};

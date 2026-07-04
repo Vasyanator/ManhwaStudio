@@ -28,6 +28,9 @@ use crate::ai_install_probe::{
     spawn_ai_computations_probe,
 };
 use crate::config;
+// GPU/system diagnostics types + probes. `gpu_utils` compiles on wasm with the
+// command primitive stubbed, so on web the system-information tab renders and
+// simply reports "nothing detected"; the import is target-neutral.
 use crate::gpu_utils::{
     DirectMlAccelerator, GpuArchitecture, LinuxDriverStatus, RocmInstallationStatus,
     RocmSupportValidation, RuntimeVersion, detect_amd_gpu, detect_amd_gpu_architectures_linux,
@@ -36,32 +39,57 @@ use crate::gpu_utils::{
     detect_rocm_installation_linux, detect_rocm_runtime_version, linux_driver_status,
     rocm_7_2_supported_llvm_targets, validate_rocm_7_2_support_linux,
 };
+// Installer types/helpers drive the native PyTorch/full-dependency upgrade
+// flow. The installer subsystem is desktop-only, so these are gated to native;
+// on web the whole Torch-upgrade tab is a stub.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::installer::install::{
     InstallEvent, TorchChoicePrompt, TorchInstallSelection, TorchPreflightResult,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use crate::installer::utils;
 use crate::launcher::pages::base::{self, PageNavAction};
 use crate::launcher::theme;
+// Used only by the native Python-environment console (shell spawning); gated to
+// native alongside it.
+#[cfg(not(target_arch = "wasm32"))]
 use crate::python_manager::{self, PythonShellKind};
 use crate::runtime_log;
+// Only used to timestamp exported log filenames in the native save flow.
+#[cfg(not(target_arch = "wasm32"))]
 use chrono::Local;
 use egui::{
-    Align, Align2, Area, Color32, CornerRadius, FontId, Frame, Key, Layout, Order, RichText,
-    ScrollArea, Sense, Stroke, TextEdit, TextStyle, Ui, Vec2,
+    Align, Align2, Area, Color32, CornerRadius, FontId, Frame, Layout, Order, RichText, ScrollArea,
+    Sense, Stroke, Ui, Vec2,
 };
+// `Key`/`TextEdit`/`TextStyle` are used only by the native Python-console tab.
+#[cfg(not(target_arch = "wasm32"))]
+use egui::{Key, TextEdit, TextStyle};
+// Native folder picker for the projects-root field; no OS dialog on web.
+#[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
+// I/O traits used only by the native Python-environment console threads.
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{BufRead, BufReader, BufWriter, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// `Path` is only referenced by native folder-picking and shell-path helpers.
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+// Process spawning for the native Python console; unavailable on web.
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::sync::mpsc::{self, Receiver};
+// `Sender` is used only by the native console channels.
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::Sender;
+use ms_thread as thread;
 
 const STATUS_ERROR: Color32 = Color32::from_rgb(214, 104, 104);
 const TAB_ACTIVE_FILL: Color32 = Color32::from_rgba_premultiplied(72, 72, 78, 176);
@@ -70,14 +98,21 @@ const TAB_STROKE: Color32 = theme::BUTTON_STROKE;
 const TAB_WARNING_FILL: Color32 = Color32::from_rgba_premultiplied(120, 88, 18, 188);
 const TAB_WARNING_STROKE: Color32 = Color32::from_rgba_premultiplied(236, 197, 76, 170);
 const SETTINGS_CARD_EDGE_GAP: f32 = 18.0;
+// Layout constants for the native Python-console tab only.
+#[cfg(not(target_arch = "wasm32"))]
 const CONSOLE_MIN_HEIGHT: f32 = 320.0;
+#[cfg(not(target_arch = "wasm32"))]
 const CONSOLE_INPUT_ROWS: usize = 2;
+// The Python-environment console spawns a native OS shell; it has no web
+// equivalent, so its state types are compiled out on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 enum PythonConsoleEvent {
     Output(String),
     Error(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 struct PythonConsoleRuntime {
     child: Child,
@@ -86,6 +121,7 @@ struct PythonConsoleRuntime {
     terminated: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default)]
 struct PythonConsoleState {
     output: String,
@@ -109,10 +145,14 @@ pub struct SettingsPageState {
     projects_dir_input: String,
     saved_projects_dir: String,
     status: SettingsStatus,
+    // Native Python-environment console; no OS shell on web.
+    #[cfg(not(target_arch = "wasm32"))]
     python_console: PythonConsoleState,
     ai_probe: AiComputationsProbeState,
     system_info_probe: SystemInfoProbeState,
     ai_install_type: config::AiInstallType,
+    // Native PyTorch upgrade flow driven by the desktop installer.
+    #[cfg(not(target_arch = "wasm32"))]
     torch_upgrade: TorchUpgradeState,
     log_popup_open: bool,
     /// Shared app-global backend handle + this page's panel scratch state, so the
@@ -146,6 +186,9 @@ struct SystemInfoProbeState {
     rx: Option<Receiver<Result<SystemInfoReport, String>>>,
 }
 
+// Torch-upgrade state carries installer events; the installer subsystem is
+// desktop-only, so this and its status enum are compiled out on wasm.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default)]
 struct TorchUpgradeState {
     status: TorchUpgradeStatus,
@@ -176,6 +219,7 @@ enum SystemInfoStatus {
     Error(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default, Clone)]
 enum TorchUpgradeStatus {
     #[default]
@@ -241,10 +285,12 @@ impl SettingsPageState {
             projects_dir_input: projects_dir.clone(),
             saved_projects_dir: projects_dir,
             status: SettingsStatus::Idle,
+            #[cfg(not(target_arch = "wasm32"))]
             python_console: PythonConsoleState::default(),
             ai_probe: AiComputationsProbeState::default(),
             system_info_probe: SystemInfoProbeState::default(),
             ai_install_type,
+            #[cfg(not(target_arch = "wasm32"))]
             torch_upgrade: TorchUpgradeState::default(),
             log_popup_open: false,
             ai_backend,
@@ -258,6 +304,11 @@ impl SettingsPageState {
         self.saved_projects_dir = normalized;
     }
 
+    /// Terminates and resets the Python-environment console.
+    ///
+    /// Native only. On web there is no console to close, so the web twin is a
+    /// no-op that keeps the launcher's call site target-agnostic.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn close_python_console(&mut self) {
         if let Some(runtime) = self.python_console.runtime.as_mut() {
             runtime.terminate();
@@ -267,6 +318,10 @@ impl SettingsPageState {
         self.python_console.input.clear();
         self.python_console.output.clear();
     }
+
+    /// Web twin of `close_python_console`: no Python console exists on web.
+    #[cfg(target_arch = "wasm32")]
+    pub fn close_python_console(&mut self) {}
 
     pub fn set_ai_install_type(&mut self, ai_install_type: config::AiInstallType) {
         self.ai_install_type = ai_install_type;
@@ -331,6 +386,12 @@ impl SettingsPageState {
         action
     }
 
+    /// Opens the OS folder picker and stores the chosen projects root in the
+    /// input field.
+    ///
+    /// Native only. The web twin reports that folder picking is unavailable
+    /// (web storage has no OS directories; Phase 5 defines the web flow).
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_projects_dir(&mut self) {
         let current = normalize_projects_dir_value(&self.projects_dir_input);
         let start_dir = if Path::new(&current).is_dir() {
@@ -345,6 +406,14 @@ impl SettingsPageState {
         self.projects_dir_input = normalize_projects_dir_value(&selected_dir.to_string_lossy());
         self.status =
             SettingsStatus::Info("Папка выбрана. Нажмите «Сохранить папку проектов».".to_string());
+    }
+
+    /// Web twin of `pick_projects_dir`: no OS folder dialog on web.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_projects_dir(&mut self) {
+        self.status = SettingsStatus::Info(
+            "Выбор папки недоступен в веб-версии.".to_string(),
+        );
     }
 
     fn save_projects_root(&mut self) -> Result<PathBuf, String> {
@@ -546,6 +615,12 @@ impl SettingsPageState {
         }
     }
 
+    /// Copies the selected runtime log to a user-chosen file via the OS save
+    /// dialog.
+    ///
+    /// Native only. The web twin reports that log export is unavailable (no OS
+    /// save dialog / filesystem on web).
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_log_file(&mut self, kind: LogKind) {
         let log_dir = config::data_dir();
         let (source_name, label) = match kind {
@@ -580,6 +655,14 @@ impl SettingsPageState {
                 ));
             }
         }
+    }
+
+    /// Web twin of `save_log_file`: no OS save dialog or filesystem on web.
+    #[cfg(target_arch = "wasm32")]
+    fn save_log_file(&mut self, _kind: LogKind) {
+        self.status = SettingsStatus::Error(
+            "Сохранение лога недоступно в веб-версии.".to_string(),
+        );
     }
 
     fn show_system_info_tab(&mut self, ui: &mut Ui) {
@@ -1017,6 +1100,11 @@ impl SettingsPageState {
         ));
     }
 
+    /// Renders the PyTorch upgrade tab and drives the installer worker.
+    ///
+    /// Native only. The web twin renders an "unavailable on web" notice because
+    /// the desktop installer subsystem is compiled out on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
     fn show_torch_upgrade_tab(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
         self.poll_torch_upgrade(ui);
         let action = self
@@ -1124,6 +1212,18 @@ impl SettingsPageState {
         action
     }
 
+    /// Web twin of `show_torch_upgrade_tab`: the desktop installer that performs
+    /// PyTorch upgrades has no web counterpart.
+    #[cfg(target_arch = "wasm32")]
+    fn show_torch_upgrade_tab(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
+        ui.label(theme::status(
+            "Управление PyTorch недоступно в веб-версии.",
+            theme::TEXT_MUTED,
+        ));
+        None
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn show_torch_upgrade_progress(&self, ui: &mut Ui) {
         ui.label(theme::status(
             &format!("Этап: {}", self.torch_upgrade.stage_label),
@@ -1154,6 +1254,7 @@ impl SettingsPageState {
             });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_torch_upgrade_preflight(&mut self, ui: &Ui) {
         let (tx, rx) = mpsc::channel();
         self.torch_upgrade = TorchUpgradeState {
@@ -1175,6 +1276,7 @@ impl SettingsPageState {
         ui.ctx().request_repaint();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_torch_upgrade_install(
         &mut self,
         ui: &Ui,
@@ -1206,6 +1308,7 @@ impl SettingsPageState {
         ui.ctx().request_repaint();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn poll_torch_upgrade(&mut self, ui: &Ui) {
         let Some(rx) = self.torch_upgrade.rx.take() else {
             return;
@@ -1286,6 +1389,11 @@ impl SettingsPageState {
         ui.ctx().request_repaint();
     }
 
+    /// Renders the interactive Python-environment console tab.
+    ///
+    /// Native only: it spawns and talks to an OS shell. The web twin renders an
+    /// "unavailable on web" notice.
+    #[cfg(not(target_arch = "wasm32"))]
     fn show_python_environment_tab(&mut self, ui: &mut Ui) {
         self.ensure_python_console_started(ui);
         self.poll_python_console(ui);
@@ -1344,6 +1452,16 @@ impl SettingsPageState {
         ));
     }
 
+    /// Web twin of `show_python_environment_tab`: no OS shell exists on web.
+    #[cfg(target_arch = "wasm32")]
+    fn show_python_environment_tab(&mut self, ui: &mut Ui) {
+        ui.label(theme::status(
+            "Консоль Python-окружения недоступна в веб-версии.",
+            theme::TEXT_MUTED,
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn ensure_python_console_started(&mut self, ui: &Ui) {
         if self.python_console.runtime.is_some() || self.python_console.attempted_start {
             return;
@@ -1371,6 +1489,7 @@ impl SettingsPageState {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn poll_python_console(&mut self, ui: &Ui) {
         let Some(runtime) = self.python_console.runtime.as_mut() else {
             return;
@@ -1415,6 +1534,7 @@ impl SettingsPageState {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn submit_python_console_command(&mut self, ui: &Ui) {
         let command = self.python_console.input.trim_end().to_string();
         self.python_console.input.clear();
@@ -1471,6 +1591,8 @@ impl SettingsPageState {
     }
 }
 
+// Only needed to tear down the native Python console; no drop work on web.
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for SettingsPageState {
     fn drop(&mut self) {
         if let Some(runtime) = self.python_console.runtime.as_mut() {
@@ -1519,6 +1641,8 @@ fn show_two_line_button(
     response
 }
 
+// Console text layout is only used by the native Python-console tab.
+#[cfg(not(target_arch = "wasm32"))]
 fn console_output_layout_job(ui: &Ui, output: &str, wrap_width: f32) -> egui::text::LayoutJob {
     let font_id = TextStyle::Monospace.resolve(ui.style());
     let mut job = egui::text::LayoutJob::simple(
@@ -1531,6 +1655,7 @@ fn console_output_layout_job(ui: &Ui, output: &str, wrap_width: f32) -> egui::te
     job
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PythonConsoleRuntime {
     fn spawn(app_dir: PathBuf) -> Result<Self, String> {
         let mut command = build_python_console_shell_command();
@@ -1643,6 +1768,8 @@ fn persist_projects_root(projects_dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Only invoked from the native Torch-upgrade completion path.
+#[cfg(not(target_arch = "wasm32"))]
 fn persist_ai_install_type(install_type: config::AiInstallType) -> anyhow::Result<()> {
     let mut cfg = config::load_user_config()?;
     cfg.set_path(
@@ -2021,6 +2148,9 @@ fn command_output(command: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+// The following console/shell helpers exist only for the native Python console
+// (OS shell spawning) and are compiled out on web.
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_console_writer_thread(
     stdin: std::process::ChildStdin,
     command_rx: Receiver<String>,
@@ -2051,6 +2181,7 @@ fn spawn_console_writer_thread(
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_console_reader_thread(
     stream: impl std::io::Read + Send + 'static,
     event_tx: Sender<PythonConsoleEvent>,
@@ -2085,6 +2216,7 @@ fn spawn_console_reader_thread(
     });
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn trim_single_trailing_newline(value: &mut String) {
     if value.ends_with("\r\n") {
         value.truncate(value.len().saturating_sub(2));
@@ -2095,7 +2227,7 @@ fn trim_single_trailing_newline(value: &mut String) {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn build_python_console_shell_command() -> Command {
     let mut command = Command::new("powershell");
     command
@@ -2106,86 +2238,86 @@ fn build_python_console_shell_command() -> Command {
     command
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn configure_shell_encoding_command() -> String {
     "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8".to_string()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn configure_shell_encoding_command() -> String {
     "export LANG=C.UTF-8; export LC_ALL=C.UTF-8".to_string()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn build_python_console_shell_command() -> Command {
     Command::new("sh")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn apply_hidden_process_flags(command: &mut Command) {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn apply_hidden_process_flags(_command: &mut Command) {}
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn shell_line_ending() -> &'static str {
     "\r\n"
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn shell_line_ending() -> &'static str {
     "\n"
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn change_directory_command(path: &Path) -> String {
     format!("Set-Location -LiteralPath '{}'", powershell_escape(path))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn change_directory_command(path: &Path) -> String {
     format!("cd '{}'", sh_escape(path))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn python_shell_kind() -> PythonShellKind {
     PythonShellKind::PowerShell
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn python_shell_kind() -> PythonShellKind {
     PythonShellKind::PosixSh
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn shell_echo_command(message: &str) -> String {
     format!("Write-Output '{}'", powershell_escape_str(message))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn shell_echo_command(message: &str) -> String {
     format!("printf '%s\n' '{}'", sh_escape_str(message))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn powershell_escape(path: &Path) -> String {
     powershell_escape_str(&path.to_string_lossy())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 fn powershell_escape_str(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn sh_escape(path: &Path) -> String {
     sh_escape_str(&path.to_string_lossy())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "windows")))]
 fn sh_escape_str(value: &str) -> String {
     value.replace('\'', r"'\''")
 }
