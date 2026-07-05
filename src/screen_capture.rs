@@ -17,9 +17,10 @@ Key functions:
 - capture_screen_rect()
 
 Dependencies:
-- `image` for decoding Linux command output and returning `RgbaImage`;
+- `image` for decoding command output and returning `RgbaImage`;
 - Windows GDI on Windows;
-- optional Linux runtime helpers such as `grim`, `maim`, `import`, `xrandr`, `hyprctl`.
+- optional Linux runtime helpers such as `grim`, `maim`, `import`, `xrandr`, `hyprctl`;
+- the built-in `/usr/sbin/screencapture` CLI tool on macOS.
 
 Notes:
 This module performs blocking OS calls and must always run on a worker thread.
@@ -52,6 +53,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+use std::process::Command;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenRect {
     pub x: i32,
@@ -79,6 +85,10 @@ pub fn query_virtual_desktop_bounds() -> Result<ScreenRect, String> {
     {
         query_virtual_desktop_bounds_linux()
     }
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    {
+        query_virtual_desktop_bounds_macos()
+    }
     // Web build: no desktop to query — the capture flow is a native launcher feature.
     #[cfg(target_arch = "wasm32")]
     {
@@ -86,7 +96,11 @@ pub fn query_virtual_desktop_bounds() -> Result<ScreenRect, String> {
     }
     #[cfg(all(
         not(target_arch = "wasm32"),
-        not(any(target_os = "windows", target_os = "linux"))
+        not(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        ))
     ))]
     {
         Err("desktop capture is not supported on this platform".to_string())
@@ -106,6 +120,10 @@ pub fn capture_screen_rect(rect: ScreenRect) -> Result<RgbaImage, String> {
     {
         capture_screen_rect_linux(rect)
     }
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+    {
+        capture_screen_rect_macos(rect)
+    }
     // Web build: no desktop to capture — the capture flow is a native launcher feature.
     #[cfg(target_arch = "wasm32")]
     {
@@ -114,7 +132,11 @@ pub fn capture_screen_rect(rect: ScreenRect) -> Result<RgbaImage, String> {
     }
     #[cfg(all(
         not(target_arch = "wasm32"),
-        not(any(target_os = "windows", target_os = "linux"))
+        not(any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos"
+        ))
     ))]
     {
         let _ = rect;
@@ -769,4 +791,261 @@ fn decode_capture_command_output(
     image::load_from_memory(stdout)
         .map_err(|err| format!("{command_name} returned invalid image data: {err}"))
         .map(|image| image.to_rgba8())
+}
+
+// --- macOS backend ---------------------------------------------------------
+//
+// macOS ships the `screencapture` CLI at a fixed system path. Mirroring the
+// Linux CLI approach, both public entry points shell out to it on a worker
+// thread. `screencapture -R` consumes a global rectangle expressed in *points*
+// (origin at the top-left of the main display); the PNG it writes is in device
+// pixels, so on HiDPI/Retina displays the decoded image is larger than the
+// requested point rectangle. That is harmless: the import path makes no
+// dimension assumption and simply gains a sharper (2x) image.
+//
+// `query_virtual_desktop_bounds_macos` reports the main display size in *device
+// pixels* (from a PNG header), which does NOT match the point space the overlay
+// and `-R` use. The launcher therefore prefers egui's point-based monitor size
+// for the overlay bounds and only falls back to this helper when that size is
+// unavailable; see `resolve_capture_desktop_bounds` in the new-project window.
+
+/// Absolute path to the built-in macOS screenshot CLI. It is always present on
+/// a stock macOS install; capture fails with a clear error if it is missing.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+const MACOS_SCREENCAPTURE_PATH: &str = "/usr/sbin/screencapture";
+
+/// RAII guard that deletes a temporary screenshot PNG on drop so every early
+/// return and error path cleans up. A `NotFound` removal is treated as success
+/// (screencapture may never have created the file); any other failure is logged
+/// via `runtime_log` at warn level instead of being silently ignored.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+struct MacosCaptureTempFile {
+    path: PathBuf,
+}
+
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+impl MacosCaptureTempFile {
+    /// Takes ownership of `path`; the file it points to is removed when the
+    /// guard is dropped. The file itself is created later by `screencapture`.
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Borrows the temporary file path for building command arguments.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+impl Drop for MacosCaptureTempFile {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            // The file was never written (e.g. screencapture failed): nothing to clean up.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "failed to remove temporary screencapture file '{}': {err}",
+                    self.path.display()
+                ));
+            }
+        }
+    }
+}
+
+/// Verifies the `screencapture` tool exists at its fixed system path.
+///
+/// # Errors
+/// Returns a user-facing error when the tool is missing, so capture never
+/// silently falls back to a fake image.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn ensure_macos_screencapture_available() -> Result<(), String> {
+    if Path::new(MACOS_SCREENCAPTURE_PATH).exists() {
+        Ok(())
+    } else {
+        Err(format!(
+            "macOS screen capture tool is missing at '{MACOS_SCREENCAPTURE_PATH}'"
+        ))
+    }
+}
+
+/// Formats the `screencapture -R` region argument from a `ScreenRect`.
+///
+/// The result is a single argument `-R<x>,<y>,<width>,<height>` where the values
+/// are in points (screencapture's coordinate unit). This is a pure helper so the
+/// argument formatting can be unit-tested without invoking the CLI.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn build_screencapture_region_arg(rect: ScreenRect) -> String {
+    format!("-R{},{},{},{}", rect.x, rect.y, rect.width, rect.height)
+}
+
+/// Builds a process-unique temporary PNG path under the system temp directory.
+///
+/// Uniqueness comes from the process id plus a nanosecond timestamp, mirroring
+/// the temp-path helpers used elsewhere in the codebase (no RNG dependency).
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn unique_macos_capture_path() -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "manhwastudio_capture_{}_{nanos}.png",
+        std::process::id()
+    ))
+}
+
+/// Decodes a screencapture PNG file into an RGBA image.
+///
+/// `source` is a short description of the capture used only for error context.
+///
+/// # Errors
+/// Returns a descriptive error if the file cannot be opened or decoded.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn load_macos_capture_image(path: &Path, source: &str) -> Result<RgbaImage, String> {
+    image::open(path)
+        .map_err(|err| {
+            format!(
+                "screencapture output for {source} could not be decoded from '{}': {err}",
+                path.display()
+            )
+        })
+        .map(|image| image.to_rgba8())
+}
+
+/// Captures a screen region on macOS via `/usr/sbin/screencapture`.
+///
+/// `rect` is a global rectangle in points. The capture is written to a unique
+/// temporary PNG, decoded into an `RgbaImage`, and the temp file is removed by
+/// the RAII guard on every return path (after decoding so the pixels are read
+/// first).
+///
+/// # Errors
+/// Returns a user-facing error if `screencapture` is missing, exits non-zero, or
+/// its output cannot be decoded.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn capture_screen_rect_macos(rect: ScreenRect) -> Result<RgbaImage, String> {
+    ensure_macos_screencapture_available()?;
+
+    let temp_file = MacosCaptureTempFile::new(unique_macos_capture_path());
+    let region_arg = build_screencapture_region_arg(rect);
+
+    // `-x` suppresses the capture sound; `-R…` limits capture to the region;
+    // the trailing path is the PNG screencapture writes.
+    let output = Command::new(MACOS_SCREENCAPTURE_PATH)
+        .arg("-x")
+        .arg(region_arg.as_str())
+        .arg(temp_file.path())
+        .output()
+        .map_err(|err| format!("screencapture unavailable at '{MACOS_SCREENCAPTURE_PATH}': {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(output.stderr.as_slice());
+        let error_text = stderr.trim();
+        return Err(format!(
+            "screencapture failed for region {region_arg} (status {}): {}",
+            output.status,
+            if error_text.is_empty() {
+                "unknown screencapture error"
+            } else {
+                error_text
+            }
+        ));
+    }
+
+    // Decode while the temp file still exists; the guard removes it on drop.
+    load_macos_capture_image(temp_file.path(), &region_arg)
+}
+
+/// Fallback macOS main-display bounds, in *device pixels*, for the capture overlay.
+///
+/// screencapture has no geometry-print mode, so the main display is captured to
+/// a temporary PNG and only its dimensions are read (via the PNG header, without
+/// a full decode). The bounds use origin `(0, 0)` and the PNG's pixel size.
+///
+/// This is a FALLBACK only. The returned size is in device pixels, but the
+/// overlay chain and `screencapture -R` work in logical points, so on a Retina
+/// (2x) display these bounds are 2x too large. The launcher normally sources the
+/// overlay bounds from egui's point-based monitor size and calls this helper only
+/// when that size is unavailable (see `resolve_capture_desktop_bounds`). It also
+/// covers only the main display; extra monitors are not resolved here.
+///
+/// # Errors
+/// Returns a user-facing error if `screencapture` is missing, exits non-zero, or
+/// its output dimensions cannot be read or are empty.
+#[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
+fn query_virtual_desktop_bounds_macos() -> Result<ScreenRect, String> {
+    ensure_macos_screencapture_available()?;
+
+    let temp_file = MacosCaptureTempFile::new(unique_macos_capture_path());
+
+    // Full-screen (main display) capture: no `-R` means the whole main display.
+    let output = Command::new(MACOS_SCREENCAPTURE_PATH)
+        .arg("-x")
+        .arg(temp_file.path())
+        .output()
+        .map_err(|err| format!("screencapture unavailable at '{MACOS_SCREENCAPTURE_PATH}': {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(output.stderr.as_slice());
+        let error_text = stderr.trim();
+        return Err(format!(
+            "screencapture failed to capture the main display (status {}): {}",
+            output.status,
+            if error_text.is_empty() {
+                "unknown screencapture error"
+            } else {
+                error_text
+            }
+        ));
+    }
+
+    // Read only the PNG header dimensions instead of decoding the whole image.
+    let (width, height) = image::image_dimensions(temp_file.path()).map_err(|err| {
+        format!(
+            "failed to read screencapture main-display dimensions from '{}': {err}",
+            temp_file.path().display()
+        )
+    })?;
+
+    if width == 0 || height == 0 {
+        return Err("screencapture returned an empty main display image".to_string());
+    }
+
+    Ok(ScreenRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    })
+}
+
+#[cfg(all(test, target_os = "macos", not(target_arch = "wasm32")))]
+mod macos_tests {
+    use super::{ScreenRect, build_screencapture_region_arg};
+
+    #[test]
+    fn region_arg_formats_points_as_x_y_w_h() {
+        let rect = ScreenRect {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        };
+        assert_eq!(build_screencapture_region_arg(rect), "-R100,200,640,480");
+    }
+
+    #[test]
+    fn region_arg_preserves_negative_origin() {
+        // Displays left of / above the main display have negative point origins.
+        let rect = ScreenRect {
+            x: -1920,
+            y: -50,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(build_screencapture_region_arg(rect), "-R-1920,-50,1920,1080");
+    }
 }

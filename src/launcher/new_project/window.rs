@@ -1731,7 +1731,7 @@ impl NewProjectWindowState {
             if self.is_screen_capture_mode_enabled() {
                 self.stop_screen_capture_mode();
             } else {
-                self.start_screen_capture_mode();
+                self.start_screen_capture_mode(ui.ctx());
             }
         }
         if !SCREEN_CAPTURE_UI_ENABLED {
@@ -1886,8 +1886,14 @@ impl NewProjectWindowState {
             || self.screen_capture_in_flight
     }
 
-    fn start_screen_capture_mode(&mut self) {
-        match screen_capture::query_virtual_desktop_bounds() {
+    /// Enables the screen-capture overlay for a fresh selection.
+    ///
+    /// `ctx` is the launcher viewport context; on macOS it supplies the monitor
+    /// size in logical points used to size and position the overlay. See
+    /// `resolve_capture_desktop_bounds` for why the bounds source is
+    /// platform-dependent.
+    fn start_screen_capture_mode(&mut self, ctx: &egui::Context) {
+        match resolve_capture_desktop_bounds(ctx) {
             Ok(desktop_bounds) => {
                 self.screen_capture_overlay = Some(ScreenCaptureOverlayState {
                     selection: default_screen_capture_selection(desktop_bounds),
@@ -7728,6 +7734,80 @@ fn progress_value(is_loading: bool) -> f32 {
     if is_loading { 0.0 } else { 1.0 }
 }
 
+/// Resolves the virtual-desktop bounds used to place the capture overlay.
+///
+/// The whole capture-overlay chain (the `ViewportBuilder` position/size, the
+/// default selection, `screen_capture_selection_to_global_rect`, and
+/// `screencapture -R`) works in logical points. On macOS the pixel-based
+/// `query_virtual_desktop_bounds` reads a full-screen PNG header and therefore
+/// reports *device pixels*, which on a Retina (2x) display are twice the point
+/// magnitude — that would make the overlay 2x oversized and the captured region
+/// 2x wrong. To keep every stage consistent in points, macOS instead sources the
+/// bounds from egui's monitor size (already in logical points).
+///
+/// Limitation: egui reports the monitor the launcher window currently sits on,
+/// so on a multi-display desktop only that monitor is covered. This is correct
+/// for the common single-display case and strictly better than the previously
+/// 2x-broken pixel-based bounds. If egui has no monitor size yet (`None`), macOS
+/// falls back to the pixel-based query rather than failing.
+///
+/// Non-macOS platforms use `query_virtual_desktop_bounds` exactly as before.
+///
+/// # Errors
+/// Propagates the platform-specific error from `query_virtual_desktop_bounds`
+/// when the desktop bounds cannot be determined.
+fn resolve_capture_desktop_bounds(ctx: &egui::Context) -> Result<ScreenRect, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Prefer egui's point-based monitor size so overlay sizing, the default
+        // selection, and `screencapture -R` all share the point coordinate space.
+        if let Some(bounds) = ctx
+            .input(|input| input.viewport().monitor_size)
+            .and_then(macos_monitor_size_to_bounds)
+        {
+            return Ok(bounds);
+        }
+        // Monitor size unavailable (e.g. not yet populated): degrade to the
+        // existing pixel-based behavior instead of crashing.
+        screen_capture::query_virtual_desktop_bounds()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // `ctx` is only needed for the macOS monitor-size path; other platforms
+        // keep using the pixel-based desktop query unchanged.
+        let _ = ctx;
+        screen_capture::query_virtual_desktop_bounds()
+    }
+}
+
+/// Converts an egui monitor size (logical points) into capture-overlay bounds.
+///
+/// The overlay is anchored at the top-left of the current monitor, so the result
+/// uses origin `(0, 0)` and the rounded point dimensions. Returns `None` for a
+/// non-finite or sub-pixel size so the caller can fall back to the pixel-based
+/// desktop query.
+#[cfg(target_os = "macos")]
+fn macos_monitor_size_to_bounds(monitor_size: egui::Vec2) -> Option<ScreenRect> {
+    let width = monitor_size.x;
+    let height = monitor_size.y;
+    // Reject unusable sizes; a valid monitor is at least one point on each side.
+    if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        return None;
+    }
+    // Round to whole points and clamp to a sane monitor range. Bounding to
+    // `u16::MAX` makes the following f32 -> u32 conversion provably exact
+    // (integral value within `1..=65535`), which is the safety justification the
+    // project's no-blind-`as` rule requires.
+    let width = width.round().clamp(1.0, f32::from(u16::MAX));
+    let height = height.round().clamp(1.0, f32::from(u16::MAX));
+    Some(ScreenRect {
+        x: 0,
+        y: 0,
+        width: width as u32,
+        height: height as u32,
+    })
+}
+
 fn default_screen_capture_selection(desktop_bounds: ScreenRect) -> RibbonCrop {
     let desktop_width = usize::try_from(desktop_bounds.width)
         .unwrap_or(usize::MAX)
@@ -8029,5 +8109,54 @@ fn stitch_mode_start_status(mode: StitchSplitMode) -> &'static str {
         StitchSplitMode::ManualCutPreview => "Сшивание и подготовка ручных линий...",
         StitchSplitMode::AutoCut => "Сшивание и автоматическая нарезка...",
         StitchSplitMode::HeterogeneousBottoms => "Сшивание только в неоднородных местах...",
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_capture_bounds_tests {
+    use super::{ScreenRect, macos_monitor_size_to_bounds};
+
+    #[test]
+    fn retina_point_size_maps_to_point_bounds_at_origin() {
+        // egui reports the monitor in logical points, so a 2x Retina 2880x1800
+        // panel arrives here already as 1440x900 points.
+        let bounds = macos_monitor_size_to_bounds(egui::vec2(1440.0, 900.0));
+        assert_eq!(
+            bounds,
+            Some(ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            })
+        );
+    }
+
+    #[test]
+    fn fractional_points_round_to_nearest_whole_point() {
+        let bounds = macos_monitor_size_to_bounds(egui::vec2(1512.4, 981.6));
+        assert_eq!(
+            bounds,
+            Some(ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1512,
+                height: 982,
+            })
+        );
+    }
+
+    #[test]
+    fn unusable_sizes_return_none_for_fallback() {
+        assert_eq!(macos_monitor_size_to_bounds(egui::vec2(0.0, 900.0)), None);
+        assert_eq!(macos_monitor_size_to_bounds(egui::vec2(1440.0, 0.5)), None);
+        assert_eq!(
+            macos_monitor_size_to_bounds(egui::vec2(f32::NAN, 900.0)),
+            None
+        );
+        assert_eq!(
+            macos_monitor_size_to_bounds(egui::vec2(f32::INFINITY, 900.0)),
+            None
+        );
     }
 }

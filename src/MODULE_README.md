@@ -61,7 +61,10 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   absolute-coordinate bubble migration (`LegacyRibbonGeometry`), unsaved staging paths, and
   filesystem helpers.
 - `config.rs`: runtime path roots, project/user config defaults, `JsonConfig`, application data
-  directories, model root helpers, and `AiInstallType`.
+  directories, model root helpers, and `AiInstallType`. The runtime root is normally the portable
+  launch/exe directory, except on macOS when the executable runs inside a `*.app` bundle: there the
+  read-only bundle forces the writable root to `~/Library/Application Support/ManhwaStudio`
+  (`#[cfg(target_os = "macos")]`, no effect on Linux/Windows).
 - `memory_manager.rs`: image-cache memory profile, pressure classification, budget policy, and
   typed eviction ordering for cache owners; it does not own image data or GPU handles.
 - `python_manager.rs`: the only Rust-side owner of Python environment discovery, Python command

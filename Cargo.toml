@@ -96,7 +96,7 @@ hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 ureq = { version = "2", features = ["json", "cookies"] }
 translators = { version = "0.1.5", default-features = false, features = ["google"] }
 genai = "0.6"
-keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "crypto-rust", "vendored"] }
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser

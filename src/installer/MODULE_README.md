@@ -60,6 +60,10 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   dependency-list packages, and unpack `ManhwaStudio.zip` over the install root.
 - Windows Program Files ACL changes happen at root directory creation time, not as a recursive
   post-install permission rewrite.
+- Per-platform release binary assets are distinct: Windows `manhwastudio_rs.exe`, macOS
+  `manhwastudio_rs_macos`, Linux bare `manhwastudio_rs`. `platform_binary_asset_name()` (present in
+  both `update.rs` and `utils.rs`) selects among them via `cfg!(target_os = ...)`; both copies must
+  stay in sync so the release check and the download stage agree on the asset.
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.

@@ -80,8 +80,10 @@ const SAFETY_NODE_CEILING: usize = 50_000_000;
 
 /// Доступная («OOM-релевантная») память процесса в байтах. На Linux читает
 /// `MemAvailable:` из `/proc/meminfo` (значение в кБ → ×1024); эта метрика
-/// учитывает освобождаемый кеш, поэтому точнее, чем `MemFree`. Возвращает `None`,
-/// если файл/строку нельзя прочитать или распарсить (не-Linux или ошибка).
+/// учитывает освобождаемый кеш, поэтому точнее, чем `MemFree`. На macOS запускает
+/// `vm_stat` и приближает доступную память как (free+inactive+speculative) страниц
+/// × размер страницы — reclaimable-аналог `MemAvailable`. Возвращает `None`, если
+/// источник нельзя прочитать/распарсить (прочие ОС или ошибка).
 #[cfg(target_os = "linux")]
 fn available_memory_bytes() -> Option<u64> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -94,11 +96,129 @@ fn available_memory_bytes() -> Option<u64> {
     None
 }
 
-/// На не-Linux метрика недоступна — память не наблюдаем, работает только
-/// аварийный потолок узлов (`SAFETY_NODE_CEILING`).
-#[cfg(not(target_os = "linux"))]
+/// TTL для кеша macOS-замера памяти. `available_memory_bytes` дёргается из DFS
+/// перебора форм (раз в `MEMORY_CHECK_INTERVAL_NODES` узлов, а перечислений может
+/// быть много подряд). На Linux это дешёвое чтение `/proc/meminfo`, а на macOS —
+/// fork+exec `vm_stat` (несколько мс). 750мс схлопывает частые вызовы в один
+/// замер за окно, не мешая защите по памяти вовремя останавливать перебор.
+#[cfg(target_os = "macos")]
+const MACOS_MEM_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// macOS: приближение доступной памяти через `vm_stat` (см. общий doc выше),
+/// с коротким TTL-кешем (`MACOS_MEM_CACHE_TTL`) поверх подпроцесса, чтобы частые
+/// вызовы из перебора форм не форкали `vm_stat` каждый раз. Контракт возврата тот
+/// же, что у сырого замера: `None` — память неизвестна. Кеш только на macOS;
+/// Linux/прочие ОС вызывают свой путь без кеша.
+#[cfg(target_os = "macos")]
+fn available_memory_bytes() -> Option<u64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    // Локальный TTL-кеш: обоснованное ограниченное исключение из правила «без
+    // глобального мутабельного состояния» (чистый временной кеш). Отравленный
+    // (poisoned) lock не паникует, а откатывается к свежему замеру. Почти дубль
+    // кешей в `memory_manager.rs` / `clean_overlays_model.rs` — они в других
+    // крейтах, поэтому реализация повторяется локально.
+    static CACHE: OnceLock<Mutex<Option<(Instant, Option<u64>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((stamped_at, value)) = guard.as_ref()
+        && stamped_at.elapsed() < MACOS_MEM_CACHE_TTL
+    {
+        return *value;
+    }
+    // Замер БЕЗ удержания lock: никогда не fork+exec под Mutex.
+    let value = probe_available_memory_bytes();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), value));
+    }
+    value
+}
+
+/// Сырой (без кеша) macOS-замер доступной памяти через `vm_stat`. `None`, если
+/// команда не запустилась/вышла с ошибкой или вывод не распарсился. Вызывающие
+/// идут через [`available_memory_bytes`], который кеширует результат на TTL.
+#[cfg(target_os = "macos")]
+fn probe_available_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("vm_stat").output().ok()?;
+    if !out.status.success() {
+        ms_log::runtime_log::log_warn("[wrap/forms] `vm_stat` exited with failure status");
+        return None;
+    }
+    parse_vm_stat_available_bytes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// На прочих (не-Linux, не-macOS) ОС метрика недоступна — память не наблюдаем,
+/// работает только аварийный потолок узлов (`SAFETY_NODE_CEILING`).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn available_memory_bytes() -> Option<u64> {
     None
+}
+
+/// Extracts the page size in bytes from the `vm_stat` header line ending with
+/// "(page size of N bytes)". Returns `None` if the marker is absent or unparseable.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_page_size(line: &str) -> Option<u64> {
+    line.split("page size of")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+}
+
+/// Parses a `vm_stat` "Pages <name>:" row into its page count, stripping the
+/// trailing '.'. Returns `None` when the prefix does not match or the number
+/// cannot be parsed.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_pages(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .trim()
+        .trim_end_matches('.')
+        .parse::<u64>()
+        .ok()
+}
+
+/// Approximates macOS available memory (bytes) from `vm_stat` output as
+/// (free+inactive+speculative) pages * page size — the reclaimable-memory analog
+/// of Linux `MemAvailable`. Inactive/speculative pages are included because they
+/// are reclaimable under pressure. Uses checked arithmetic; on the physically
+/// unreachable overflow it warns and returns `None`. Returns `None` if the page
+/// size or any required page count is missing/unparseable.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_available_bytes(text: &str) -> Option<u64> {
+    let mut page_size: Option<u64> = None;
+    let mut free: Option<u64> = None;
+    let mut inactive: Option<u64> = None;
+    let mut speculative: Option<u64> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if page_size.is_none()
+            && let Some(size) = parse_vm_stat_page_size(line)
+        {
+            page_size = Some(size);
+        }
+        if let Some(v) = parse_vm_stat_pages(line, "Pages free:") {
+            free = Some(v);
+        } else if let Some(v) = parse_vm_stat_pages(line, "Pages inactive:") {
+            inactive = Some(v);
+        } else if let Some(v) = parse_vm_stat_pages(line, "Pages speculative:") {
+            speculative = Some(v);
+        }
+    }
+
+    let page_size = page_size?;
+    let pages = free?.checked_add(inactive?)?.checked_add(speculative?)?;
+    match pages.checked_mul(page_size) {
+        Some(bytes) => Some(bytes),
+        None => {
+            ms_log::runtime_log::log_warn(
+                "[wrap/forms] vm_stat page count * page size overflowed u64; reporting unknown",
+            );
+            None
+        }
+    }
 }
 
 /// Источник свободной памяти, который консультирует `enumerate_dfs`. В обычной
@@ -1299,5 +1419,30 @@ mod tests {
     fn available_memory_parses_meminfo() {
         let bytes = available_memory_bytes().expect("MemAvailable readable on Linux");
         assert!(bytes > 0);
+    }
+
+    #[test]
+    fn parses_macos_vm_stat_available_bytes() {
+        // 16 KiB pages: (8000 free + 4000 inactive + 1000 speculative) * 16384.
+        let sample = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+Pages free:                                8000.\n\
+Pages active:                            234567.\n\
+Pages inactive:                            4000.\n\
+Pages speculative:                         1000.\n\
+Pages wired down:                        333333.\n";
+        assert_eq!(
+            super::parse_vm_stat_available_bytes(sample),
+            Some(13_000 * 16_384)
+        );
+    }
+
+    #[test]
+    fn macos_vm_stat_bad_input_is_none_not_panic() {
+        assert_eq!(super::parse_vm_stat_available_bytes(""), None);
+        // No page-size header => unknown, never a wrong number.
+        assert_eq!(
+            super::parse_vm_stat_available_bytes("Pages free: 10.\nPages inactive: 5.\nPages speculative: 2.\n"),
+            None
+        );
     }
 }

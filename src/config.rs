@@ -93,8 +93,80 @@ fn dir_has_program_markers(dir: &Path) -> bool {
         || dir.join("modules").exists()
 }
 
+/// macOS-only: resolve the writable runtime root when the executable runs from
+/// inside a `*.app` bundle.
+///
+/// Under Gatekeeper quarantine the `.app` bundle (including `Contents/Resources`)
+/// is read-only, so the portable "data next to the binary" layout used on
+/// Linux/Windows cannot write config/models/logs there. This redirects the root
+/// to `~/Library/Application Support/ManhwaStudio` (created if missing).
+///
+/// Returns `None` when the executable is NOT inside an `.app` bundle (a plain
+/// unpacked folder, like the Linux distribution) or when `HOME`/the exe path
+/// cannot be resolved, so the caller keeps the unchanged portable behavior.
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_data_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    if !is_inside_macos_app_bundle(&exe) {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let root = PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("ManhwaStudio");
+    // Create the writable root eagerly. A creation failure is logged but the path
+    // is still returned so a later write surfaces a precise, actionable error
+    // instead of silently falling back to the read-only bundle directory.
+    if let Err(err) = fs::create_dir_all(&root) {
+        eprintln!(
+            "ManhwaStudio: failed to create macOS data root {}: {err}",
+            root.display()
+        );
+    }
+    Some(root)
+}
+
+/// Pure structural check: is `exe_path` located directly inside a macOS
+/// application bundle, i.e. `<name>.app/Contents/MacOS/<exe>`?
+///
+/// Only the directory names are inspected; the path need not exist on disk. This
+/// is the sole signal used to decide whether the bundle-safe data root applies.
+#[cfg(target_os = "macos")]
+fn is_inside_macos_app_bundle(exe_path: &Path) -> bool {
+    // parent must be `MacOS`, grandparent `Contents`, great-grandparent `*.app`.
+    let Some(macos_dir) = exe_path.parent() else {
+        return false;
+    };
+    if macos_dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
+        return false;
+    }
+    let Some(contents_dir) = macos_dir.parent() else {
+        return false;
+    };
+    if contents_dir.file_name().and_then(|n| n.to_str()) != Some("Contents") {
+        return false;
+    }
+    contents_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(".app"))
+}
+
 /// Resolve the app's runtime root.
 fn resolve_runtime_root() -> PathBuf {
+    // macOS: inside a signed/quarantined `.app` the bundle is read-only, so the
+    // writable runtime root moves to Application Support. Outside a bundle (a
+    // plain unpacked folder) this returns None and the portable logic below runs
+    // unchanged, keeping Linux/Windows behavior byte-identical.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bundle_root) = macos_app_bundle_data_root() {
+            return bundle_root;
+        }
+    }
+
     let cwd = std::env::current_dir().ok();
     let exe_dir = std::env::current_exe()
         .ok()
@@ -750,6 +822,30 @@ mod tests {
         assert!(user_settings_has_ai_install_type(
             &json!({"General": {"ai_install_type": "Base"}})
         ));
+    }
+
+    // macOS-only: the bundle detection and its data-root redirect are gated
+    // behind `#[cfg(target_os = "macos")]`, so this test compiles and runs only
+    // on the macOS build (verified there), keeping Linux/Windows byte-identical.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detects_macos_app_bundle_layout() {
+        // Canonical installed bundle layout -> inside a bundle.
+        assert!(is_inside_macos_app_bundle(Path::new(
+            "/Applications/ManhwaStudio.app/Contents/MacOS/manhwastudio_rs"
+        )));
+        // Plain unpacked folder (portable layout on macOS) -> not a bundle.
+        assert!(!is_inside_macos_app_bundle(Path::new(
+            "/Users/alice/ManhwaStudio/manhwastudio_rs"
+        )));
+        // Correct leaf dirs but the top level is not a `.app` -> not a bundle.
+        assert!(!is_inside_macos_app_bundle(Path::new(
+            "/opt/pkg/Contents/MacOS/manhwastudio_rs"
+        )));
+        // Missing the `Contents` level -> not a bundle.
+        assert!(!is_inside_macos_app_bundle(Path::new(
+            "/Applications/ManhwaStudio.app/MacOS/manhwastudio_rs"
+        )));
     }
 
     #[test]

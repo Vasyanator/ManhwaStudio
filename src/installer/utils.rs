@@ -746,7 +746,41 @@ fn run_update_continuation_stage_inner(
     Ok(UpdateContinuationOutcome::Completed)
 }
 
+/// Returns the GitHub *release asset* download file name of the main executable
+/// for the current platform. This is the name of the file uploaded to the
+/// release, NOT the executable's on-disk name — see `platform_executable_file_name`.
+///
+/// Must stay in sync with `platform_binary_asset_name` in `update.rs`:
+/// Windows → `manhwastudio_rs.exe`, macOS → `manhwastudio_rs_macos` (suffixed so
+/// it does not collide with the bare Linux asset), Linux and other Unix →
+/// `manhwastudio_rs`.
+///
+/// On macOS the asset name intentionally differs from the on-disk executable
+/// name: the release ships the binary renamed to `manhwastudio_rs_macos`, but on
+/// disk (and inside `ManhwaStudio.zip`) the executable is the bare
+/// `manhwastudio_rs`. Use this function ONLY for the release download; use
+/// `platform_executable_file_name` for anything that names the file on disk.
 fn platform_binary_asset_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "manhwastudio_rs.exe"
+    } else if cfg!(target_os = "macos") {
+        "manhwastudio_rs_macos"
+    } else {
+        "manhwastudio_rs"
+    }
+}
+
+/// Returns the *on-disk* file name of the main executable for the current
+/// platform: Windows → `manhwastudio_rs.exe`, everything else (Linux and macOS) →
+/// `manhwastudio_rs` (no `_macos` suffix).
+///
+/// This is the name the executable carries on disk and inside the extracted
+/// `ManhwaStudio.zip` payload, which is deliberately different from the release
+/// download name on macOS (see `platform_binary_asset_name`). On Windows/Linux
+/// the two coincide; on macOS they differ, so any code that strips or locates the
+/// executable within the install tree or an extracted archive must use this
+/// function, not the release-asset name.
+fn platform_executable_file_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "manhwastudio_rs.exe"
     } else {
@@ -1191,8 +1225,16 @@ fn download_and_extract_app_archive_for_update(
     Ok(())
 }
 
+/// Removes the platform executable that was shipped inside the extracted
+/// `ManhwaStudio.zip` staging tree so the merge step cannot overwrite the
+/// freshly-updated executable with a stale copy from the archive.
+///
+/// The archive carries the executable under its ON-DISK name
+/// (`platform_executable_file_name`), which on macOS differs from the
+/// `_macos`-suffixed release download name; using the on-disk name here is what
+/// makes the strip fire on every platform.
 fn remove_staged_platform_binary(staging_dir: &Path) -> Result<(), String> {
-    let binary_path = staging_dir.join(platform_binary_asset_name());
+    let binary_path = staging_dir.join(platform_executable_file_name());
     if binary_path.is_file() {
         fs::remove_file(&binary_path).map_err(|e| {
             format!(
@@ -4031,6 +4073,7 @@ mod tests {
     use super::{
         compare_version_strings, dependency_package_name, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages,
+        platform_binary_asset_name, platform_executable_file_name,
         sanitize_windows_archive_path_component,
     };
     use std::cmp::Ordering;
@@ -4079,6 +4122,33 @@ mod tests {
             parse_executable_version_output("ManhwaStudio v3.5.1-beta").as_deref(),
             Some("v3.5.1-beta")
         );
+    }
+
+    #[test]
+    fn on_disk_executable_name_never_carries_macos_asset_suffix() {
+        // The on-disk / in-archive executable name must not carry the `_macos`
+        // suffix that only the release download name uses, otherwise the update
+        // strip step would miss the staged binary on macOS. On non-Windows the
+        // on-disk name is the bare `manhwastudio_rs`.
+        let on_disk = platform_executable_file_name();
+        assert!(
+            !on_disk.contains("_macos"),
+            "on-disk executable name must not use the release-asset `_macos` suffix, got {on_disk}"
+        );
+
+        let asset = platform_binary_asset_name();
+        if cfg!(target_os = "windows") {
+            assert_eq!(on_disk, "manhwastudio_rs.exe");
+            assert_eq!(asset, "manhwastudio_rs.exe");
+        } else {
+            assert_eq!(on_disk, "manhwastudio_rs");
+        }
+        if cfg!(target_os = "macos") {
+            // The two names intentionally differ on macOS: bare on disk, suffixed
+            // as the release download.
+            assert_eq!(asset, "manhwastudio_rs_macos");
+            assert_ne!(on_disk, asset);
+        }
     }
 
     #[test]

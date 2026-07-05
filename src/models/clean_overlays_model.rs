@@ -1555,7 +1555,12 @@ fn resize_nearest(src: &ColorImage, dst_w: usize, dst_h: usize) -> ColorImage {
 }
 
 /// Returns the amount of free (available) RAM in bytes.
-/// Returns `u64::MAX` on platforms or errors where the value cannot be determined.
+///
+/// Source per platform: Linux `MemAvailable` from `/proc/meminfo`, Windows
+/// `GlobalMemoryStatusEx().ullAvailPhys`, macOS an approximation from `vm_stat`
+/// (free+inactive+speculative pages * page size, the reclaimable-memory analog of
+/// `MemAvailable`). Returns `u64::MAX` on platforms or errors where the value
+/// cannot be determined, which callers treat as "no free-memory limit".
 fn free_memory_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -1573,6 +1578,13 @@ fn free_memory_bytes() -> u64 {
             }
         }
         u64::MAX
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match macos_available_memory_bytes() {
+            Some(bytes) => bytes,
+            None => u64::MAX,
+        }
     }
     #[cfg(windows)]
     {
@@ -1595,9 +1607,131 @@ fn free_memory_bytes() -> u64 {
             u64::MAX
         }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         u64::MAX
+    }
+}
+
+/// TTL for the macOS memory-probe cache. `free_memory_bytes` is polled from the
+/// GUI-thread page-cache path (`maybe_evict_page_cache`, once PER PAGE promoted in
+/// `store_cached_page_rgba`); on macOS the raw probe fork+execs `vm_stat` (several
+/// ms), so an uncached per-page probe stalls bulk page loads. 750ms collapses
+/// those bursts into one probe per window while keeping eviction responsive.
+#[cfg(target_os = "macos")]
+const MACOS_MEM_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Cached macOS available-memory probe.
+///
+/// Wraps [`probe_macos_available_memory_bytes`] in a short-TTL in-process cache
+/// (see [`MACOS_MEM_CACHE_TTL`]) so the per-page eviction path does not spawn
+/// `vm_stat` on every cached page. Same contract as the raw probe: `None` means
+/// "unknown", and `free_memory_bytes` maps that to `u64::MAX`. macOS-only; Linux
+/// and Windows call their probes directly with no cache.
+#[cfg(target_os = "macos")]
+fn macos_available_memory_bytes() -> Option<u64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    // Module-local TTL cache: a justified, bounded exception to the "no global
+    // mutable state" rule (a pure timed cache). A poisoned lock falls back to a
+    // fresh probe rather than panicking. Near-duplicate of the caches in
+    // `memory_manager.rs` / `ms-text-render` because those live in other crates.
+    static CACHE: OnceLock<Mutex<Option<(Instant, Option<u64>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock()
+        && let Some((stamped_at, value)) = guard.as_ref()
+        && stamped_at.elapsed() < MACOS_MEM_CACHE_TTL
+    {
+        return *value;
+    }
+    // Probe WITHOUT holding the lock: never fork+exec under a Mutex.
+    let value = probe_macos_available_memory_bytes();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), value));
+    }
+    value
+}
+
+/// Approximates macOS available memory (bytes) by running `vm_stat` and summing
+/// free+inactive+speculative pages * page size. Returns `None` when the command
+/// fails or its output cannot be parsed, so the caller falls back to `u64::MAX`.
+///
+/// This is the raw (uncached) probe; callers go through
+/// [`macos_available_memory_bytes`], which caches the result for a short TTL.
+#[cfg(target_os = "macos")]
+fn probe_macos_available_memory_bytes() -> Option<u64> {
+    let out = std::process::Command::new("vm_stat").output().ok()?;
+    if !out.status.success() {
+        crate::runtime_log::log_warn("[clean-overlays] `vm_stat` exited with failure status");
+        return None;
+    }
+    parse_vm_stat_available_bytes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Extracts the page size in bytes from the `vm_stat` header line ending with
+/// "(page size of N bytes)". Returns `None` if the marker is absent or unparseable.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_page_size(line: &str) -> Option<u64> {
+    line.split("page size of")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+}
+
+/// Parses a `vm_stat` "Pages <name>:" row into its page count, stripping the
+/// trailing '.'. Returns `None` when the prefix does not match or the number
+/// cannot be parsed.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_pages(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .trim()
+        .trim_end_matches('.')
+        .parse::<u64>()
+        .ok()
+}
+
+/// Approximates macOS available memory (bytes) from `vm_stat` output as
+/// (free+inactive+speculative) pages * page size — the reclaimable-memory analog
+/// of Linux `MemAvailable`. Inactive/speculative pages are included because they
+/// are reclaimable under pressure. Uses checked arithmetic; on the physically
+/// unreachable overflow it warns and returns `None`. Returns `None` if the page
+/// size or any required page count is missing/unparseable.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat_available_bytes(text: &str) -> Option<u64> {
+    let mut page_size: Option<u64> = None;
+    let mut free: Option<u64> = None;
+    let mut inactive: Option<u64> = None;
+    let mut speculative: Option<u64> = None;
+
+    for raw in text.lines() {
+        let line = raw.trim();
+        if page_size.is_none()
+            && let Some(size) = parse_vm_stat_page_size(line)
+        {
+            page_size = Some(size);
+        }
+        if let Some(v) = parse_vm_stat_pages(line, "Pages free:") {
+            free = Some(v);
+        } else if let Some(v) = parse_vm_stat_pages(line, "Pages inactive:") {
+            inactive = Some(v);
+        } else if let Some(v) = parse_vm_stat_pages(line, "Pages speculative:") {
+            speculative = Some(v);
+        }
+    }
+
+    let page_size = page_size?;
+    let pages = free?.checked_add(inactive?)?.checked_add(speculative?)?;
+    match pages.checked_mul(page_size) {
+        Some(bytes) => Some(bytes),
+        None => {
+            crate::runtime_log::log_warn(
+                "[clean-overlays] vm_stat page count * page size overflowed u64; reporting unknown",
+            );
+            None
+        }
     }
 }
 
@@ -1856,5 +1990,30 @@ mod tests {
         assert_eq!(report.resources[0].page_idx, Some(0));
         assert!(!model.has_cached_page_rgba(0));
         assert!(model.has_cached_page_rgba(1));
+    }
+
+    #[test]
+    fn parses_macos_vm_stat_free_memory_bytes() {
+        // 4 KiB pages: (12000 free + 3000 inactive + 1000 speculative) * 4096.
+        let sample = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
+Pages free:                               12000.\n\
+Pages active:                            234567.\n\
+Pages inactive:                            3000.\n\
+Pages speculative:                         1000.\n\
+Pages wired down:                        333333.\n";
+        assert_eq!(
+            parse_vm_stat_available_bytes(sample),
+            Some(16_000 * 4096)
+        );
+    }
+
+    #[test]
+    fn macos_vm_stat_bad_input_is_none_not_panic() {
+        assert_eq!(parse_vm_stat_available_bytes(""), None);
+        // Missing the page-size header must yield unknown, not a wrong number.
+        assert_eq!(
+            parse_vm_stat_available_bytes("Pages free: 10.\nPages inactive: 5.\nPages speculative: 2.\n"),
+            None
+        );
     }
 }
