@@ -37,6 +37,11 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   device/provider selection, max loaded models, and CUDA/ROCm diagnostics.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
   `user_config.json` override persistence.
+- `tutorials.rs`: thin "Обучение" pane that delegates to the surface-agnostic
+  `crate::tutorial::draw_tutorials_pane` (same double-interface pattern as `ai_backend.rs`), so the
+  studio and launcher expose the identical tutorial-replay UI. Operates on `SettingsTabState`'s own
+  `tutorial_progress` handle (loaded here; the studio has no tutorial controller yet, so resets
+  persist to config and take effect on the next launcher run / future studio tutorials).
 
 ## Contracts and invariants
 - Do not block the GUI thread with file writes, Python process work, backend probes, or command

@@ -370,7 +370,7 @@ impl Widget for WheelSlider<'_> {
         };
         let pointer_over_slider = !pointer_blocked_by_combo_popup
             && !combo_popup_open(ui.ctx())
-            && pointer_over_response_rect(ui.ctx(), &response);
+            && pointer_over_response_rect(&response);
         if pointer_over_slider && !response.hovered() {
             response = response.highlight();
         }
@@ -413,18 +413,14 @@ fn publish_pointer_hover_state(
     });
 }
 
-fn pointer_over_response_rect(ctx: &egui::Context, response: &Response) -> bool {
-    if response.hovered() || response.contains_pointer() {
-        return true;
-    }
-
-    ctx.input(|input| {
-        input
-            .pointer
-            .hover_pos()
-            .or_else(|| input.pointer.interact_pos())
-            .is_some_and(|pos| response.rect.contains(pos))
-    })
+fn pointer_over_response_rect(response: &Response) -> bool {
+    // Respect element overlap (z-order): rely only on egui's occlusion-aware
+    // hit-test. `contains_pointer()` is derived from the frame hit-test, which
+    // drops widgets covered by a higher layer, so a combo popup, modal, or
+    // tutorial overlay above the slider correctly suppresses its hover/wheel.
+    // Never fall back to the raw pointer position (`hover_pos`) against the
+    // unclipped rect — that would react through anything drawn on top.
+    response.hovered() || response.contains_pointer()
 }
 
 fn apply_hovered_wheel_delta(

@@ -59,6 +59,7 @@ mod tabs;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
 mod tools;
+mod tutorial;
 pub mod widgets;
 
 // `runtime_log` and `trace` now live in the standalone `ms-log` crate. These

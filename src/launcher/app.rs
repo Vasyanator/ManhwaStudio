@@ -30,6 +30,7 @@ use crate::launcher::psd_import_window::PsdImportWindowState;
 use crate::launcher::state::{LauncherOutcome, LauncherPage, LauncherState, UpdateNotification};
 use crate::launcher::theme::VEIL_TINT;
 use crate::tabs::wiki::WikiTabState;
+use crate::tutorial::{TutorialController, TutorialId, TutorialStep};
 use eframe::egui::{self, epaint};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc::Receiver};
@@ -71,6 +72,13 @@ pub struct LauncherApp {
     import_page: ImportPageState,
     export_page: ExportPageState,
     settings_page: SettingsPageState,
+    /// Main-menu onboarding overlay for this launcher viewport. Shares its
+    /// progress handle with `settings_page` so a reset in the "Обучение" tab is
+    /// seen by autoplay when returning to the main page. `pub(crate)` so
+    /// `main_page` can record target rects via `mark`.
+    pub(crate) tutorial: TutorialController<LauncherState>,
+    /// Last-seen page, to edge-trigger autoplay only on entering the main page.
+    tutorial_prev_page: Option<LauncherPage>,
     output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
     pub(crate) update_notification: Option<UpdateNotification>,
     pub(crate) ai_install_type: config::AiInstallType,
@@ -105,6 +113,9 @@ impl LauncherApp {
         ai_backend: AiBackendHandle,
     ) -> Self {
         let ai_install_type = config::AiInstallType::from_user_settings(user_settings);
+        // One shared progress handle: the controller autoplays against it and the
+        // settings "Обучение" pane resets it, so both stay in sync within the run.
+        let tutorial_progress = crate::tutorial::shared_progress();
         let mut app = Self {
             state: LauncherState::new(),
             app_id,
@@ -115,7 +126,27 @@ impl LauncherApp {
             open_page: OpenPageState::new(projects_root.clone(), user_settings),
             import_page: ImportPageState::new(projects_root.clone()),
             export_page: ExportPageState::new(projects_root.clone()),
-            settings_page: SettingsPageState::new(projects_root.clone(), ai_install_type, ai_backend),
+            settings_page: SettingsPageState::new(
+                projects_root.clone(),
+                ai_install_type,
+                ai_backend,
+                tutorial_progress.clone(),
+            ),
+            tutorial: TutorialController::new(
+                tutorial_progress,
+                vec![(
+                    TutorialId::LauncherMain,
+                    crate::launcher::tutorial::steps
+                        as fn() -> Vec<TutorialStep<LauncherState>>,
+                )],
+            )
+            // The launcher's whole look is its animated wallpaper; a lighter dim
+            // keeps it visible while still focusing the highlighted button. The
+            // callout then needs its own ~70% opaque backing so its text stays
+            // readable over that visible backdrop.
+            .with_dim_alpha(110)
+            .with_callout_tint(egui::Color32::from_rgba_unmultiplied(18, 20, 26, 179)),
+            tutorial_prev_page: None,
             output_outcome,
             update_notification: None,
             ai_install_type,
@@ -788,6 +819,20 @@ impl eframe::App for LauncherApp {
             ctx.request_repaint();
         }
 
+        // Autoplay the main-menu tour once per entry to the main page: on first
+        // frame (prev None) and whenever navigation settles back onto Main. Skip
+        // marks completed, so it never re-fires unless the user resets it.
+        let entering_main = self.state.current_page == LauncherPage::Main
+            && self.tutorial_prev_page != Some(LauncherPage::Main);
+        self.tutorial_prev_page = Some(self.state.current_page);
+        if entering_main {
+            self.tutorial.maybe_autoplay(TutorialId::LauncherMain);
+        }
+        // Run any pending step `on_enter` before the UI is built, then clear the
+        // per-frame target registry so this frame's `mark`s repopulate it.
+        self.tutorial.sync(&mut self.state);
+        self.tutorial.begin_frame();
+
         let viewport_rect = ctx.content_rect();
         // On the web the new-project window renders EMBEDDED in this same viewport
         // (its own CentralPanel), because the browser has no separate OS windows.
@@ -817,6 +862,10 @@ impl eframe::App for LauncherApp {
         self.draw_new_project_window(ui);
         self.draw_psd_import_window(ui);
         self.draw_wiki_guide_window(ui);
+
+        // Overlay last so its full-viewport hitbox occludes the page content and
+        // its spotlight/callout sit above everything on the root viewport.
+        self.tutorial.render(ctx);
 
         // Native: smooth 60 FPS. Web: throttle the forced repaint to reduce
         // sustained GPU load (a WebGL/driver-stability safeguard for the demo).

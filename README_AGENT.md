@@ -422,6 +422,36 @@ original, and a bbox relative to the sent image) and the model returns
 
 ---
 
+## Tutorial system (`src/tutorial/`)
+
+Shared onboarding layer. One overlay engine (`engine.rs`) dims the viewport
+except a spotlighted target (dashed outline + arrow + text callout) and absorbs
+**all** input beneath it via a single full-viewport hitbox on `Order::Middle`
+(pure z-order occlusion, not per-widget disabling — a widget that reads the raw
+pointer instead of `Response::contains_pointer`/`hovered` leaks under the dim).
+
+- **`TutorialId`** — central enum, the stable persistence key (`id.rs`);
+  `is_available` gates which ids show in the replay UI.
+- **`TutorialProgress`** (+ `TutorialProgressHandle`) — completed-set + autoplay,
+  persisted to the `user_config.json` `Tutorials` section on a background thread.
+- **`TutorialController<C>`** — per-surface runner: registry + active `Tutorial<C>`
+  + catalog (`TutorialId → steps fn`) + shared progress handle. Enforces one
+  active tutorial per surface, autoplays unseen tutorials on entry (caller
+  edge-triggers `maybe_autoplay`), records completion on the finish/skip edge.
+  `C` is the surface context a step's `on_enter` mutates to navigate the UI.
+- **`draw_tutorials_pane`** (`settings_pane.rs`) — surface-agnostic "Обучение"
+  replay pane reused by the studio Settings tab and the launcher settings page
+  (double interface, like `ai_backend_panel`); depends only on the progress
+  handle, so resetting a tutorial re-arms its autoplay on the owning surface.
+
+Per-surface step scripts live next to their UI (e.g. `src/launcher/tutorial.rs`),
+not in the shared module. The demo bin `src/bin/tutorial_test/` mounts `engine.rs`
+via `#[path]` so demo and production never diverge. Currently wired: the launcher
+main-menu tour (`LauncherMain`); studio surfaces are reserved ids for later phases
+(`docs/tutorial-plan.md`).
+
+---
+
 ## Фоновые пайплайны
 
 | Пайплайн | Где |

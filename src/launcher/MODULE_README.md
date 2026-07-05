@@ -23,6 +23,15 @@ notification.
 - `new_project/`: detached new-project workflow.
 - `psd_import_window.rs`: detached PSD import workflow.
 - `theme.rs`: launcher visual style helpers.
+- `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
+  match the `mark` calls in `main_page.rs`.
+
+## Tutorial wiring
+`app.rs` owns a `TutorialController<LauncherState>` (lighter dim so the wallpaper stays visible) and
+shares its `TutorialProgressHandle` with `settings_page` (the "Обучение" tab). Per-frame in `fn ui`:
+edge-triggered `maybe_autoplay(LauncherMain)` on entering the main page → `sync` + `begin_frame`
+before the panel → `main_page.rs` records button rects via `app.tutorial.mark(...)` → `render` after
+the child windows. See `src/tutorial/MODULE_README.md` for the engine contract.
 
 ## Contracts and invariants
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.

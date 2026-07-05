@@ -864,6 +864,13 @@ impl NewProjectWindowState {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(ui, |ui| {
+                // An immediate viewport's root ui snapshots `ctx.style()` at
+                // creation (the launcher style), so the global-style swap in
+                // `show()` reaches `ctx`-based sub-windows but NOT these panel
+                // widgets. Set this window's dark style directly on the content
+                // ui, mirroring the embedded path, so the launcher theme cannot
+                // leak into the new-project window.
+                ui.set_style(standard_dark_style());
                 self.show_contents(ui, false);
             });
         true

@@ -323,7 +323,15 @@ impl PsdImportWindowState {
         }
         CentralPanel::default()
             .frame(Frame::new().fill(Color32::from_rgb(24, 24, 27)))
-            .show(ui, |ui| self.show_contents(ui));
+            .show(ui, |ui| {
+                // An immediate viewport's root ui snapshots `ctx.style()` at
+                // creation (the launcher style), so the global-style swap in
+                // `show()` does not reach these panel widgets. Set this window's
+                // dark style directly on the content ui (mirroring the embedded
+                // path) so the launcher theme cannot leak in.
+                ui.set_style(standard_dark_style());
+                self.show_contents(ui);
+            });
         true
     }
 

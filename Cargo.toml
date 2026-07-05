@@ -29,6 +29,10 @@ inspection = ["eframe/inspection"]
 name = "render_gallery"
 path = "src/bin/render_gallery/main.rs"
 
+[[bin]]
+name = "tutorial_test"
+path = "src/bin/tutorial_test/main.rs"
+
 # Cross-target dependencies. These compile on both native and wasm32 (pure Rust
 # or with first-class wasm support: egui/eframe, image, cosmic-text, serde, zip,
 # rayon under the atomics build, etc.). Native-only crates (sockets, native HTTP,

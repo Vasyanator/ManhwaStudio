@@ -50,6 +50,7 @@ use crate::installer::install::{
 use crate::installer::utils;
 use crate::launcher::pages::base::{self, PageNavAction};
 use crate::launcher::theme;
+use crate::tutorial::TutorialProgressHandle;
 // Used only by the native Python-environment console (shell spawning); gated to
 // native alongside it.
 #[cfg(not(target_arch = "wasm32"))]
@@ -138,6 +139,7 @@ enum SettingsTab {
     AiBackend,
     TorchUpgrade,
     PythonEnvironment,
+    Tutorials,
 }
 
 pub struct SettingsPageState {
@@ -159,6 +161,9 @@ pub struct SettingsPageState {
     /// launcher exposes the same backend controls as the studio settings tab.
     ai_backend: AiBackendHandle,
     ai_backend_panel: AiBackendPanelState,
+    /// Shared with the launcher's `TutorialController`, so resetting a tutorial
+    /// here re-arms its autoplay on the main page.
+    tutorial_progress: TutorialProgressHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,6 +283,7 @@ impl SettingsPageState {
         projects_root: PathBuf,
         ai_install_type: config::AiInstallType,
         ai_backend: AiBackendHandle,
+        tutorial_progress: TutorialProgressHandle,
     ) -> Self {
         let projects_dir = normalize_projects_dir_value(&projects_root.to_string_lossy());
         Self {
@@ -295,6 +301,7 @@ impl SettingsPageState {
             log_popup_open: false,
             ai_backend,
             ai_backend_panel: AiBackendPanelState::default(),
+            tutorial_progress,
         }
     }
 
@@ -373,6 +380,12 @@ impl SettingsPageState {
                             }
                             SettingsTab::PythonEnvironment => {
                                 self.show_python_environment_tab(ui);
+                            }
+                            SettingsTab::Tutorials => {
+                                crate::tutorial::draw_tutorials_pane(
+                                    ui,
+                                    &self.tutorial_progress,
+                                );
                             }
                         });
                 });
@@ -459,6 +472,7 @@ impl SettingsPageState {
                 config::AiInstallType::None => {}
             }
             self.show_tab_button(ui, SettingsTab::PythonEnvironment, "Python окружение");
+            self.show_tab_button(ui, SettingsTab::Tutorials, "Обучение");
 
             let response = show_two_line_button(
                 ui,

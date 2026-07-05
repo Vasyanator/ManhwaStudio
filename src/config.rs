@@ -452,6 +452,10 @@ pub fn user_config_defaults() -> Value {
             }
         },
         "Hotkeys": {},
+        "Tutorials": {
+            "completed": [],
+            "autoplay": true
+        },
         "TranslarionTab": {
             "TextDetector": {
                 "draw_lines": true,

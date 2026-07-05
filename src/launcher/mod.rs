@@ -18,6 +18,7 @@ Key modules:
 - `psd_import_window`: detached PSD import window backed by a Python worker
 - `state`: shared launcher UI state and page enum
 - `theme`: dark theme styling helpers
+- `tutorial`: launcher main-menu tutorial step script
 
 Notes:
 Launcher returns the selected or newly saved `project_dir` back into startup flow instead of
@@ -32,6 +33,7 @@ pub mod pages;
 pub mod psd_import_window;
 pub mod state;
 pub mod theme;
+pub mod tutorial;
 
 use crate::ai_backend_supervisor::AiBackendHandle;
 #[cfg(not(target_arch = "wasm32"))]

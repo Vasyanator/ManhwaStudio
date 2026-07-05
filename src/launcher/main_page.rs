@@ -16,6 +16,7 @@ use crate::launcher::app::LauncherApp;
 use crate::launcher::pages::base::PageNavAction;
 use crate::launcher::state::LauncherPage;
 use crate::launcher::theme;
+use crate::launcher::tutorial;
 use egui::{Align, Area, Color32, Frame, Grid, Layout, Order, RichText, Stroke, Ui, Vec2};
 
 const LEFT_COLUMN_BUTTON_WIDTH: f32 = 210.0;
@@ -56,30 +57,49 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                         .num_columns(2)
                         .spacing([18.0, 12.0])
                         .show(ui, |ui| {
-                            if primary_menu_button(ui, "Открыть главу", LEFT_COLUMN_BUTTON_WIDTH)
-                            {
+                            // Each menu button records its rect for the tutorial
+                            // overlay before its click is consumed (keys must
+                            // match `launcher::tutorial`).
+                            let open_response = menu_button_response(
+                                ui,
+                                "Открыть главу",
+                                LEFT_COLUMN_BUTTON_WIDTH,
+                            );
+                            app.tutorial.mark(tutorial::TARGET_OPEN, open_response.rect);
+                            if open_response.clicked() {
                                 app.state.import_popup_open = false;
                                 action = Some(PageNavAction::Open(LauncherPage::OpenProject));
                             }
-                            if secondary_menu_button(ui, "Новая глава", RIGHT_COLUMN_BUTTON_WIDTH)
-                            {
+                            let new_response = menu_button_response(
+                                ui,
+                                "Новая глава",
+                                RIGHT_COLUMN_BUTTON_WIDTH,
+                            );
+                            app.tutorial.mark(tutorial::TARGET_NEW, new_response.rect);
+                            if new_response.clicked() {
                                 app.state.import_popup_open = false;
                                 action = Some(PageNavAction::OpenNewProjectWindow);
                             }
                             ui.end_row();
 
-                            let import_response = secondary_menu_button_response(
+                            let import_response = menu_button_response(
                                 ui,
                                 "Импорт главы",
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
                             import_button_rect = Some(import_response.rect);
+                            app.tutorial.mark(tutorial::TARGET_IMPORT, import_response.rect);
                             if import_response.clicked() {
                                 app.state.main_page_message = None;
                                 app.state.import_popup_open = !app.state.import_popup_open;
                             }
-                            if secondary_menu_button(ui, "Экспорт главы", RIGHT_COLUMN_BUTTON_WIDTH)
-                            {
+                            let export_response = menu_button_response(
+                                ui,
+                                "Экспорт главы",
+                                RIGHT_COLUMN_BUTTON_WIDTH,
+                            );
+                            app.tutorial.mark(tutorial::TARGET_EXPORT, export_response.rect);
+                            if export_response.clicked() {
                                 app.state.import_popup_open = false;
                                 app.state.main_page_message = None;
                                 action = Some(PageNavAction::Open(LauncherPage::ExportChapter));
@@ -94,7 +114,10 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                         });
                 });
                 ui.add_space(12.0);
-                if secondary_menu_button(ui, "Настройки", RIGHT_COLUMN_BUTTON_WIDTH) {
+                let settings_response =
+                    menu_button_response(ui, "Настройки", RIGHT_COLUMN_BUTTON_WIDTH);
+                app.tutorial.mark(tutorial::TARGET_SETTINGS, settings_response.rect);
+                if settings_response.clicked() {
                     app.state.import_popup_open = false;
                     action = Some(PageNavAction::Open(LauncherPage::Settings));
                 }
@@ -258,15 +281,9 @@ fn show_update_notice(
     action
 }
 
-fn primary_menu_button(ui: &mut Ui, label: &str, width: f32) -> bool {
-    theme::launcher_button(ui, label, egui::vec2(width, BUTTON_HEIGHT), true).clicked()
-}
-
-fn secondary_menu_button(ui: &mut Ui, label: &str, width: f32) -> bool {
-    secondary_menu_button_response(ui, label, width).clicked()
-}
-
-fn secondary_menu_button_response(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
+/// A main-menu button of the given width. Returns the full `Response` so the
+/// caller can record its rect for the tutorial overlay before consuming clicks.
+fn menu_button_response(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
     theme::launcher_button(ui, label, egui::vec2(width, BUTTON_HEIGHT), true)
 }
 
