@@ -127,10 +127,13 @@ impl TypingCreatePanelState {
             self.effect_to_add = effect_kinds[effect_idx];
 
             if ui.button("+ Добавить").clicked() {
-                self.effects.push(Self::default_effect_card(
-                    self.effect_to_add,
-                    self.text_color,
-                ));
+                // Prefer the user-configured per-kind default; fall back to the built-in
+                // when no override is stored (byte-identical to the historical behavior).
+                let card = effect_defaults::effect_default_card(self.effect_to_add, self.text_color)
+                    .unwrap_or_else(|| {
+                        Self::default_effect_card(self.effect_to_add, self.text_color)
+                    });
+                self.effects.push(card);
                 changed = true;
             }
         });

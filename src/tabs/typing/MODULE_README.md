@@ -248,12 +248,24 @@ saving, and export.
   - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
   - `ui_helpers.rs`: font-family binding/matching, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns).
   - `effect_parse.rs`: `parse_effect_cards` (free fn).
+  - `effect_defaults.rs`: user-configurable DEFAULT parameters per effect kind. Owns a
+    runtime-global `OnceLock<RwLock<HashMap<discriminator, Value>>>` store (seeded at
+    startup from `TextTab.effect_defaults` via `seed_effect_defaults_from_config`),
+    resolves the add-time default card (`effect_default_card`, consulted in
+    `create_sections`), and provides the `EffectDefaultsEditorState` editor widget
+    rendered by the settings pane. Per-card (de)serialization reuses the shared
+    `effect_card_to_value` (`effect_cards.rs`) / `parse_effect_cards` codec; persistence
+    reuses `presets_io::{load,save}_text_tab_effect_defaults` (off-GUI-thread saves).
   - `tests.rs`: `#[cfg(test)]` unit tests for the panel.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
   tiled mask preview textures, brush/fill editing, async loading/saving, and export
   snapshots.
 - `auto_typing.rs`: optical center computation for rendered overlays and region-growing
   bubble detection from the shared composited page cache.
+- `rotation_ctrl_wheel.rs`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,
+  default Vector) selecting how the Ctrl+wheel gesture rotates a selected overlay. Config-free;
+  seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
+  read by the Ctrl+wheel handler in `tab/selection_rasters.rs`. `pub mod` so settings can reach it.
 - `render_next`: text rendering subsystem, now the `ms-text-render` crate re-exported as
   `render_next` (via `mod.rs`). Its public contract is `render_next::types::*` plus
   `render_next::render_text_to_image`; callers in this directory should treat its layout,

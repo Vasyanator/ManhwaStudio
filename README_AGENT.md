@@ -321,6 +321,8 @@ original, and a bbox relative to the sent image) and the model returns
 - **Mask** (`mask.rs`): бинарная маска обрезки (`mask_page_{idx}.png`); кисть draw/erase; clipping текстовых PNG.
 - Деформация: Perspective / Изгиб / кистевые warp (Выпуклость, Впуклость, Сдвиг, Закрутка, Восстановление, Разгладить, Растянуть, Складка) — все модифицируют одну `deform_mesh`, не хранят отдельные параметры.
 - Legacy `transform_uv` и low-res mesh конвертируются в dense surface при загрузке.
+- Ctrl+колесо над выделенным text-оверлеем поворачивает его; режим выбирается app-wide через `crate::tabs::typing::rotation_ctrl_wheel` (пишется из Settings «Тайп», читается в Ctrl+wheel-хендлере typing): `Raster` — placement-поворот растра (`angle_deg`/deform mesh, legacy), `Vector` (default) — поворот render-параметра `global_rotation_deg` с фоновым ре-рендером (резче), с graceful fallback на raster для не-vector оверлеев.
+- Стандартные параметры карточек эффектов: `panel/effect_defaults.rs` держит runtime-global store (`TextTab.effect_defaults`, ключ — дискриминатор эффекта → одно-карточный JSON штатного codec `effects_value_array`/`parse_effect_cards`), seeded на старте (`main.rs`). При добавлении карточки `create_sections.rs` берёт override, иначе встроенный `default_effect_card`. Редактор (`EffectDefaultsEditorState`) переиспользует `draw_effect_card_controls` и рендерится из Settings «Тайп» (double-interface, модель эффектов не экспортируется наружу).
 - Экспорт: фоновое наложение `src + clean overlay + text overlays` с перспективной трансформацией и маской.
 - `text_info.json` сохраняется отложенно через worker-поток после снятия выделения.
 
@@ -352,12 +354,13 @@ original, and a bbox relative to the sent image) and the model returns
 
 ### Settings (`src/tabs/settings/`)
 
-Вкладка имеет четыре pane:
+Вкладка имеет пять pane:
 
 | Pane | Ответственность |
 |---|---|
-| **General** | projects_dir, typing panel layout, ai autostart |
+| **General** | projects_dir, typing panel layout, memory profile |
 | **CanvasRibbon** | SharedCanvasSettings (лента), ComicType, BubbleStatus rules |
+| **Typesetting** («Тайп») | text-typesetting options: висящая пунктуация (`TextTab.hanging_punctuation`, live через `crate::text_punctuation`), режим «Поворот Ctrl+колесо» (`TextTab.rotation_ctrl_wheel_mode`, live через `crate::tabs::typing::rotation_ctrl_wheel`) и редактор стандартных параметров карточек эффектов (`TextTab.effect_defaults`, self-contained typing-panel widget `EffectDefaultsEditorState`) |
 | **AiBackend** | запуск/остановка `ai_backend.py`, device, CUDA/ONNX diagnostics |
 | **Hotkeys** | редактирование binds через `InputManagerV2` |
 

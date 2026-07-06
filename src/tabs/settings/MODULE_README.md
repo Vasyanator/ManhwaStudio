@@ -28,11 +28,20 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
 - `mod.rs`: `SettingsTabState`, pane routing, canvas settings binding, the shared `AiBackendHandle`,
   projects-dir/typing-layout persistence helpers, and the coalesced canvas settings save worker.
   (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
-- `general.rs`: general pane UI, including global memory profile, projects directory, the
-  current typing panel layout persistence behavior, and the app-wide hanging-punctuation
-  list editor (`TextTab.hanging_punctuation`, applied live via `crate::text_punctuation`).
+- `general.rs`: general pane UI, including global memory profile, projects directory, and the
+  current typing panel layout persistence behavior.
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
+- `typesetting.rs`: "Тайп" pane for text-typesetting options: the app-wide
+  hanging-punctuation list editor (`TextTab.hanging_punctuation`, applied live via
+  `crate::text_punctuation` and persisted through `save_hanging_punctuation` in `mod.rs`)
+  the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
+  via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
+  `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
+  and the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
+  held on `SettingsTabState`, rendered via its `ui()`; a self-contained typing-panel widget that
+  owns its own persistence to `TextTab.effect_defaults`, so settings needs no access to the private
+  effect model).
 - `ai_backend.rs`: AI backend pane UI for health display, process start/stop/restart/autostart,
   device/provider selection, max loaded models, and CUDA/ROCm diagnostics.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
@@ -67,5 +76,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `ai_backend.rs` and the worker functions in `mod.rs`.
 - To change projects directory or general user settings, edit `general.rs` and the matching
   persistence helper in `mod.rs`.
+- To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode), edit
+  `typesetting.rs` and the matching persistence helper in `mod.rs`. Runtime globals for these
+  live outside settings (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`).
 - To change configurable shortcut UI or persistence, edit `hotkeys.rs` and coordinate with
   `src/input_manager_v2.rs`.

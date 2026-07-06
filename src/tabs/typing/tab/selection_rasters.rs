@@ -284,6 +284,13 @@ impl TypingTextOverlayLayer {
         self.request_overlay_placement_save();
     }
 
+    /// Ctrl/Cmd+wheel rotation of the selected text overlay by ±2° per notch. Which rotation is driven
+    /// is chosen by the app-wide `rotation_ctrl_wheel::rotation_ctrl_wheel_mode()` setting:
+    /// `Raster` rotates the rasterized PNG placement (`angle_deg` / deform-mesh), while `Vector` adds
+    /// to the render param `global_rotation_deg` and re-renders the glyph outlines sharply. Vector is
+    /// only valid for an eligible text overlay (allowed layout mode, no raster deform mesh); when it is
+    /// not, this quietly falls back to the raster rotation so the wheel still visibly rotates. No-op
+    /// unless a text overlay on `page_idx` is selected, not in transform mode, and Ctrl/Cmd is held.
     pub(super) fn try_rotate_selected_overlay_by_ctrl_wheel(
         &mut self,
         ui: &mut egui::Ui,
@@ -321,17 +328,66 @@ impl TypingTextOverlayLayer {
         let delta_deg: f32 = steps * 2.0;
         let delta_rad = delta_deg.to_radians();
 
-        let (start_angle_deg, start_mesh_scene, start_mesh_dims, had_mesh) = {
+        // Snapshot the overlay's rotation inputs AND its vector eligibility in one borrow.
+        let (start_angle_deg, start_mesh_scene, start_mesh_dims, had_mesh, is_text, layout_allows_vector) = {
             let overlay = &self.overlays[selected_idx];
             let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
+            let is_text = overlay.kind == TypingOverlayKind::Text;
+            let layout_allows_vector = vector_transform_allowed_for_layout_mode(
+                overlay_text_layout_mode(overlay.render_data_json.as_ref()),
+            );
             (
                 overlay.angle_deg,
                 geometry.mesh_scene,
                 (geometry.mesh_cols, geometry.mesh_rows),
                 overlay.deform_mesh.is_some(),
+                is_text,
+                layout_allows_vector,
             )
         };
 
+        // A vector re-render is TEXT-render based: valid only for a text overlay whose layout mode
+        // composes with the post-layout warp and that has NO raster deform mesh (the mesh path is a
+        // raster-only post-process on top of the PNG).
+        let vector_eligible = is_text && layout_allows_vector && !had_mesh;
+        use crate::tabs::typing::rotation_ctrl_wheel::{self, RotationCtrlWheelMode};
+        let mode = rotation_ctrl_wheel::rotation_ctrl_wheel_mode();
+        // Exhaustive on the owned enum (no `_` arm): Raster always drives placement; Vector drives the
+        // render param only when the overlay is eligible, otherwise it falls back to raster below.
+        let use_vector = match mode {
+            RotationCtrlWheelMode::Vector => vector_eligible,
+            RotationCtrlWheelMode::Raster => false,
+        };
+        if matches!(mode, RotationCtrlWheelMode::Vector) && !vector_eligible {
+            // Quiet fallback: the setting asks for a vector rotation but this overlay can't be
+            // re-rendered vectorially, so Ctrl+wheel still rotates the raster placement below.
+            crate::trace_log!(
+                cat::TYPING,
+                "ctrl_wheel rotate: vector mode but overlay idx={} not vector-eligible (text={} layout_ok={} mesh={}); raster fallback",
+                selected_idx,
+                is_text,
+                layout_allows_vector,
+                had_mesh
+            );
+        }
+
+        // Zero the wheel delta regardless of branch (Ctrl-gated raw wheel; egui already zeroes the
+        // smooth delta while Ctrl/Cmd is held, but the raw notch must not scroll the page too).
+        ui.ctx().input_mut(|input| {
+            input.smooth_scroll_delta = Vec2::ZERO;
+        });
+
+        // VECTOR: add the delta to the render param `global_rotation_deg` and re-render sharply. When
+        // the overlay has no usable render_data/text_params (should not happen for an eligible text
+        // overlay), fall through to the raster path so Ctrl+wheel still visibly rotates.
+        if use_vector {
+            let ctx = ui.ctx().clone();
+            if self.rotate_selected_overlay_global_rotation(selected_idx, delta_deg, &ctx) {
+                return;
+            }
+        }
+
+        // RASTER: rotate the already-rasterized placement (EXACT prior behavior; also the fallback).
         if let Some(overlay) = self.overlays.get_mut(selected_idx) {
             if had_mesh {
                 let center_scene = deform_mesh_center_scene(&start_mesh_scene);
@@ -353,11 +409,50 @@ impl TypingTextOverlayLayer {
             }
         }
 
-        ui.ctx().input_mut(|input| {
-            input.smooth_scroll_delta = Vec2::ZERO;
-        });
         self.mark_overlay_geometry_changed(selected_idx, false);
         self.request_overlay_placement_save();
+    }
+
+    /// Applies a Ctrl+wheel VECTOR rotation to a text overlay: adds `delta_deg` to its render param
+    /// `global_rotation_deg`, normalized CONTINUOUSLY into the panel's `(-180, 180]` range (so
+    /// repeated wheel steps keep rotating past ±180 instead of sticking at a clamp), injects it into
+    /// `render_data.text_params`, and dispatches the sharp latest-wins background edit-render via the
+    /// shared `dispatch_vector_rerender` (which writes the render_data back onto the overlay so the
+    /// edit panel re-syncs, and requests a placement save).
+    ///
+    /// Returns `true` when the re-render was dispatched, `false` when the overlay has no usable
+    /// `render_data` / `text_params` object so the caller can fall back to a raster rotation.
+    fn rotate_selected_overlay_global_rotation(
+        &mut self,
+        overlay_idx: usize,
+        delta_deg: f32,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(mut render_data) = self
+            .overlays
+            .get(overlay_idx)
+            .and_then(|o| o.render_data_json.clone())
+        else {
+            return false;
+        };
+        let Some(text_params) = render_data
+            .get_mut("text_params")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        // Read the current global rotation the same way `codec.rs` does (absent -> 0.0), add the
+        // wheel delta, and wrap continuously into (-180, 180] via `normalize_angle_deg`.
+        let current = text_params
+            .get("global_rotation_deg")
+            .and_then(value_as_f32)
+            .unwrap_or(0.0);
+        let new_rotation = normalize_angle_deg(current + delta_deg);
+        text_params.insert("global_rotation_deg".to_string(), json!(new_rotation));
+        // Once the param is committed we own the vector path: dispatch surfaces any render error
+        // itself, so we return `true` even if it reports a failure (no double raster rotation).
+        self.dispatch_vector_rerender(overlay_idx, render_data, ctx);
+        true
     }
 
     pub(super) fn try_scale_selected_overlay_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {

@@ -615,6 +615,83 @@ pub(super) fn save_text_tab_use_system_fonts(enabled: bool) -> Result<(), String
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
+/// Loads the per-effect-kind default overrides from `TextTab.effect_defaults`.
+///
+/// The returned map is keyed by the effect discriminator string (e.g. `"stroke"`,
+/// `"glow_v1"`); each value is the one-card JSON object stored earlier. A missing key,
+/// unreadable file, or malformed JSON yields an empty map — this never panics and never
+/// surfaces an error, because absence simply means "use the built-in defaults".
+pub(super) fn load_text_tab_effect_defaults() -> HashMap<String, Value> {
+    let user_settings_file = config::user_config_path();
+    let Ok(raw) = fs::read_to_string(user_settings_file) else {
+        return HashMap::new();
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        return HashMap::new();
+    };
+    let Some(defaults_obj) = payload
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(TEXT_TAB_EFFECT_DEFAULTS_KEY))
+        .and_then(Value::as_object)
+    else {
+        return HashMap::new();
+    };
+    defaults_obj
+        .iter()
+        .filter(|(_, value)| value.is_object())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Persists the whole per-effect-kind default map to `TextTab.effect_defaults`
+/// (read-modify-write of `user_config.json`, mirroring `save_text_tab_formula_presets`).
+///
+/// The caller passes the FULL current snapshot; keys are written sorted for a stable
+/// file. Returns a human-readable error string on any I/O or serialization failure.
+/// Callers must invoke this off the GUI thread.
+pub(super) fn save_text_tab_effect_defaults(defaults: &HashMap<String, Value>) -> Result<(), String> {
+    let user_settings_file = config::user_config_path();
+    let mut root = if user_settings_file.exists() {
+        match fs::read_to_string(&user_settings_file) {
+            Ok(raw) => {
+                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+            }
+            Err(_) => Value::Object(Map::new()),
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_obj = root.as_object_mut().expect("object ensured");
+    let mut text_tab_obj = root_obj
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut defaults_obj = Map::new();
+    let mut keys: Vec<&String> = defaults.keys().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(value) = defaults.get(key) {
+            defaults_obj.insert(key.clone(), value.clone());
+        }
+    }
+    text_tab_obj.insert(
+        TEXT_TAB_EFFECT_DEFAULTS_KEY.to_string(),
+        Value::Object(defaults_obj),
+    );
+    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
 pub(super) fn save_text_tab_create_presets(
     presets: &HashMap<String, TypingCreatePreset>,
 ) -> Result<(), String> {

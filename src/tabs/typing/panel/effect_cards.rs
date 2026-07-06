@@ -43,6 +43,148 @@ pub(super) fn effect_card_title(effect: &EffectCard) -> &'static str {
     }
 }
 
+/// Serializes a single `EffectCard` to its stored JSON object (the exact shape one
+/// element of `effects_value_array` produces). This is the single source of truth for
+/// per-card serialization: `effects_value_array` maps it over its cards, and the effect
+/// defaults store persists one card with it. Round-trips with `parse_effect_cards`.
+pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
+    match effect {
+        EffectCard::TextShake(shake) => json!({
+            "effect": "text_shake",
+            "effect_type": "preprocess",
+            "enabled": true,
+            "spread_x": shake.spread_x_px,
+            "spread_y": shake.spread_y_px,
+            "seed": shake.seed,
+        }),
+        EffectCard::Stroke(stroke) => json!({
+            "effect": "stroke",
+            "enabled": true,
+            "width": stroke.width_px,
+            "color": stroke.color.rgba(),
+            "opacity_mode": if stroke.opacity_mode == StrokeOpacityMode::FromContour { "from_contour" } else { "static" },
+            "transparency": stroke.transparency_percent,
+            "opacity": 100.0 - stroke.transparency_percent,
+            "smoothing": stroke.smoothing,
+            "smoothing_strength": stroke.smoothing_strength_percent,
+        }),
+        EffectCard::Shadow(shadow) => json!({
+            "effect": "shadow",
+            "enabled": true,
+            "offset_x": shadow.offset_x_px,
+            "offset_y": shadow.offset_y_px,
+            "transparency": shadow.transparency_percent,
+            "opacity": 100.0 - shadow.transparency_percent,
+            "blur": shadow.blur_radius_px,
+            "blur_radius": shadow.blur_radius_px,
+            "blur_px": shadow.blur_radius_px,
+            "mode": if shadow.color_mode == ShadowColorMode::SourceColors { "source" } else { "single" },
+            "use_source_color": shadow.color_mode == ShadowColorMode::SourceColors,
+            "color": shadow.color.rgba(),
+        }),
+        EffectCard::Blur(blur) => json!({
+            "effect": "blur",
+            "enabled": true,
+            "radius": blur.radius_px,
+            "blur": blur.radius_px,
+        }),
+        EffectCard::MotionBlur(blur) => json!({
+            "effect": "motion_blur",
+            "enabled": true,
+            "angle_deg": blur.angle_deg,
+            "distance": blur.distance_px,
+            "distance_px": blur.distance_px,
+            "sharp_copy": match blur.sharp_copy_mode {
+                MotionBlurSharpCopyMode::None => "none",
+                MotionBlurSharpCopyMode::Over => "over",
+                MotionBlurSharpCopyMode::Under => "under",
+            },
+        }),
+        EffectCard::DryMedia(dry_media) => json!({
+            "effect": "dry_media",
+            "enabled": true,
+            "material": match dry_media.material {
+                DryMediaMaterial::Pencil => "pencil",
+                DryMediaMaterial::Chalk => "chalk",
+            },
+            "strength": dry_media.strength,
+            "seed": dry_media.seed,
+            "grain_scale_px": dry_media.grain_scale_px,
+            "grain_amount": dry_media.grain_amount,
+            "edge_roughness": dry_media.edge_roughness,
+            "porosity": dry_media.porosity,
+            "direction_deg": dry_media.direction_deg,
+            "directional_amount": dry_media.directional_amount,
+            "dust_amount": dry_media.dust_amount,
+            "dust_radius_px": dry_media.dust_radius_px,
+            "softness_px": dry_media.softness_px,
+            "use_source_color": dry_media.use_source_color,
+            "color": dry_media.color.rgba(),
+        }),
+        EffectCard::Glow(glow) => match glow.version {
+            GlowEffectVersion::V1 | GlowEffectVersion::V2 => json!({
+                "effect": if glow.version == GlowEffectVersion::V1 { "glow_v1" } else { "glow_v2" },
+                "enabled": true,
+                "radius": glow.radius_px,
+                "color": glow.color.rgba(),
+                "opacity_mode": if glow.opacity_mode == StrokeOpacityMode::FromContour { "from_contour" } else { "static" },
+                "transparency": glow.transparency_percent,
+                "opacity": 100.0 - glow.transparency_percent,
+                "fade_strength": glow.fade_strength,
+                "fade_shift": glow.fade_shift,
+            }),
+            GlowEffectVersion::Soft => json!({
+                "effect": "soft_glow",
+                "enabled": true,
+                "radius": glow.radius_px.round().max(0.0),
+                "softness": glow.softness_px,
+                "color": glow.color.rgba(),
+            }),
+        },
+        EffectCard::Gradient2(gradient) => json!({
+            "effect": "gradient2",
+            "enabled": true,
+            "color1": gradient.color1.rgba(),
+            "color2": gradient.color2.rgba(),
+            "angle_deg": gradient.angle_deg,
+            "width_percent": gradient.width_percent,
+            "respect_source_alpha": gradient.respect_source_alpha,
+            "fill_mode": if gradient.fill_mode == Gradient2FillMode::AllOpaque { "all_opaque" } else { "specific_color" },
+            "target_color": gradient.target_color.rgba(),
+        }),
+        EffectCard::Gradient4(gradient) => json!({
+            "effect": "gradient4",
+            "enabled": true,
+            "color_top_left": gradient.color_top_left.rgba(),
+            "color_top_right": gradient.color_top_right.rgba(),
+            "color_bottom_left": gradient.color_bottom_left.rgba(),
+            "color_bottom_right": gradient.color_bottom_right.rgba(),
+            "width_percent": gradient.width_percent,
+            "respect_source_alpha": gradient.respect_source_alpha,
+            "fill_mode": if gradient.fill_mode == Gradient4FillMode::AllOpaque { "all_opaque" } else { "specific_color" },
+            "target_color": gradient.target_color.rgba(),
+        }),
+        EffectCard::Reflect(reflect) => json!({
+            "effect": "reflect",
+            "enabled": true,
+            "axis": if reflect.axis == ReflectAxis::X { "x" } else { "y" },
+        }),
+        EffectCard::Shake(shake) => json!({
+            "effect": "shake",
+            "enabled": true,
+            "angle_deg": shake.angle_deg,
+            "up": shake.up_px,
+            "down": shake.down_px,
+            "steps": shake.steps,
+            "base_fade": shake.base_fade,
+            "decay": shake.decay,
+            "blur": shake.blur_px,
+            "autogrow": shake.autogrow,
+            "grow_margin": shake.grow_margin_px,
+        }),
+    }
+}
+
 pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCard) -> bool {
     let mut changed = false;
     match effect {

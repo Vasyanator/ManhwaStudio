@@ -3,7 +3,8 @@ FILE OVERVIEW: src/tabs/settings/mod.rs
 Settings tab state and shared runtime for settings subpanes.
 
 Main types:
-- `SettingsPane`: active settings subsection (`General`, `AiBackend`, `Hotkeys`).
+- `SettingsPane`: active settings subsection (`General`, `CanvasRibbon`, `Typesetting`,
+  `AiBackend`, `Hotkeys`).
 - `SettingsTabState`: pane state + the shared `AiBackendHandle` it renders the AI
   backend pane against, plus the user-facing memory profile binding to `MemoryManager`.
 
@@ -18,6 +19,7 @@ mod ai_backend;
 mod canvas_ribbon;
 mod general;
 mod hotkeys;
+mod typesetting;
 #[cfg(feature = "tutorial")]
 mod tutorials;
 
@@ -74,6 +76,7 @@ pub(super) struct CanvasSettingsSaveRequest {
 pub(super) enum SettingsPane {
     General,
     CanvasRibbon,
+    Typesetting,
     AiBackend,
     Hotkeys,
     #[cfg(feature = "tutorial")]
@@ -110,6 +113,12 @@ pub struct SettingsTabState {
     tutorial_progress: crate::tutorial::TutorialProgressHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
     hotkey_capture_command_id: Option<String>,
+    /// Editor for per-effect-kind default parameters, shown in the "Тайп" pane.
+    /// Self-contained typing-panel widget (double-interface pattern like
+    /// `ai_backend_panel`): the effect model stays encapsulated behind this one
+    /// public type; it reads/writes the runtime-global effect-defaults store and
+    /// persists to `TextTab.effect_defaults` on its own background thread.
+    effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState,
 }
 
 impl Default for SettingsTabState {
@@ -153,6 +162,7 @@ impl SettingsTabState {
             tutorial_progress: crate::tutorial::shared_progress(),
             dragged_bubble_condition_node: None,
             hotkey_capture_command_id: None,
+            effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
         }
     }
 }
@@ -213,6 +223,10 @@ impl SettingsTabState {
             if ui.selectable_label(selected, "Лента и пузыри").clicked() {
                 self.active_pane = SettingsPane::CanvasRibbon;
             }
+            let selected = self.active_pane == SettingsPane::Typesetting;
+            if ui.selectable_label(selected, "Тайп").clicked() {
+                self.active_pane = SettingsPane::Typesetting;
+            }
             let selected = self.active_pane == SettingsPane::AiBackend;
             if ui.selectable_label(selected, "ИИ бэкенд").clicked() {
                 self.active_pane = SettingsPane::AiBackend;
@@ -234,6 +248,7 @@ impl SettingsTabState {
         match self.active_pane {
             SettingsPane::General => self.draw_general(ui),
             SettingsPane::CanvasRibbon => self.draw_canvas_ribbon(ui),
+            SettingsPane::Typesetting => self.draw_typesetting(ui),
             SettingsPane::AiBackend => self.draw_ai_backend(ui),
             SettingsPane::Hotkeys => self.draw_hotkeys(ui, hotkeys_v2),
             #[cfg(feature = "tutorial")]
@@ -603,6 +618,42 @@ pub(super) fn save_hanging_punctuation(
     text_tab_obj.insert(
         config::TEXT_TAB_HANGING_PUNCTUATION_KEY.to_string(),
         Value::String(punctuation.to_string()),
+    );
+    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
+pub(super) fn save_rotation_ctrl_wheel_mode(
+    user_settings_file: &Path,
+    mode: crate::tabs::typing::rotation_ctrl_wheel::RotationCtrlWheelMode,
+) -> Result<(), String> {
+    let mut root = if user_settings_file.exists() {
+        match fs::read_to_string(user_settings_file) {
+            Ok(raw) => {
+                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+            }
+            Err(_) => Value::Object(Map::new()),
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_obj = root.as_object_mut().expect("object ensured");
+    let mut text_tab_obj = root_obj
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    text_tab_obj.insert(
+        config::TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY.to_string(),
+        Value::String(mode.as_config_str().to_string()),
     );
     root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
 

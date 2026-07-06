@@ -51,6 +51,7 @@ pub const GENERAL_PROJECTS_DIR_KEY: &str = "projects_dir";
 pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
 pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
+pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiInstallType {
@@ -555,6 +556,10 @@ pub fn user_config_defaults() -> Value {
         "TextTab": {
             "use_system_fonts": false,
             "hanging_punctuation": crate::text_punctuation::DEFAULT_HANGING_PUNCTUATION,
+            "rotation_ctrl_wheel_mode":
+                crate::tabs::typing::rotation_ctrl_wheel::DEFAULT_ROTATION_CTRL_WHEEL_MODE
+                    .as_config_str(),
+            "effect_defaults": {},
             "formula_presets": {
                 "Дуга (мягкая)": {
                     "x_expr": "t * w",

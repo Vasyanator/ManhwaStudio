@@ -170,6 +170,9 @@ const TEXT_TAB_USE_SYSTEM_FONTS_KEY: &str = "use_system_fonts";
 const TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY: &str = "use_legacy_inline_tags";
 const TEXT_TAB_CREATE_PRESETS_KEY: &str = "create_presets";
 const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
+// Per-effect-kind default parameter overrides, keyed by the effect discriminator
+// string (see `effect_defaults::effect_kind_key`); value = the one-card JSON object.
+const TEXT_TAB_EFFECT_DEFAULTS_KEY: &str = "effect_defaults";
 const TEXT_PRESET_NONE_LABEL: &str = "Нет";
 const INLINE_TAG_DIM_TEXT_COLOR: Color32 = Color32::from_gray(120);
 const INLINE_TAG_CONTENT_TEXT_COLOR: Color32 = Color32::WHITE;
@@ -196,6 +199,10 @@ mod ui_helpers;
 use ui_helpers::*;
 mod effect_parse;
 use effect_parse::*;
+mod effect_defaults;
+// Public editor widget for per-effect-kind default parameters, rendered from the
+// settings pane; plus the startup seeding of the runtime-global defaults store.
+pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults_from_config};
 
 #[derive(Clone)]
 struct TypingCreatePreset {

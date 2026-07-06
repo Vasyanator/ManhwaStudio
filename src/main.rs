@@ -194,6 +194,10 @@ fn run_main() -> anyhow::Result<()> {
     runtime_log::log_info("starting main application flow");
     auto_detect_missing_ai_install_type_for_startup();
     seed_hanging_punctuation_from_config();
+    seed_rotation_ctrl_wheel_from_config();
+    // Seed the typing tab's per-effect-kind default overrides so newly added effect
+    // cards pick up the user's stored defaults from the first frame.
+    tabs::typing::seed_effect_defaults_from_config();
     let user_settings = config::load_user_settings_for_startup()?;
 
     if cli.continue_update {
@@ -342,6 +346,25 @@ fn seed_hanging_punctuation_from_config() {
         .filter(|text| text.chars().any(|ch| !ch.is_whitespace()))
     {
         text_punctuation::set_hanging_punctuation(text);
+    }
+}
+
+/// Seeds the runtime `rotation_ctrl_wheel` global from user config at startup.
+/// The module defaults to `DEFAULT_ROTATION_CTRL_WHEEL_MODE` (`Vector`); here the app
+/// overrides it with `TextTab.rotation_ctrl_wheel_mode` when present and recognized.
+/// Best-effort: on any config error or unknown value the default mode is kept.
+#[cfg(not(target_arch = "wasm32"))]
+fn seed_rotation_ctrl_wheel_from_config() {
+    let Ok(cfg) = config::load_user_config() else {
+        return;
+    };
+    use tabs::typing::rotation_ctrl_wheel;
+    if let Some(mode) = cfg
+        .get_path(&["TextTab", "rotation_ctrl_wheel_mode"])
+        .and_then(serde_json::Value::as_str)
+        .and_then(rotation_ctrl_wheel::RotationCtrlWheelMode::from_config_str)
+    {
+        rotation_ctrl_wheel::set_rotation_ctrl_wheel_mode(mode);
     }
 }
 

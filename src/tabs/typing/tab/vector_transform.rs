@@ -373,7 +373,10 @@ impl TypingTextOverlayLayer {
     /// background edit-render (which bakes the warp into the PNG and swaps `source_rgba`/`size_px`/
     /// texture on completion), then request a placement save. Shared by settle and reset. Returns
     /// `false` (surfacing an error) when the params cannot be built or the staging dir is missing.
-    fn dispatch_vector_rerender(
+    ///
+    /// `pub(super)` so sibling `tab` submodules (e.g. the Ctrl+wheel rotation in
+    /// `selection_rasters.rs`) can reuse the convert-agnostic inject → dispatch tail.
+    pub(super) fn dispatch_vector_rerender(
         &mut self,
         overlay_idx: usize,
         render_data: Value,
