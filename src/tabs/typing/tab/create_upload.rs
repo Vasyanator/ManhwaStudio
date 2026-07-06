@@ -18,6 +18,20 @@ private items that stay there as descendants of module `tab`.
 
 use super::*;
 
+/// Layer id of the full-canvas Shift+drag selection-capture overlay.
+///
+/// Kept on [`egui::Order::Middle`] so it sits BELOW the Foreground typing panels (their
+/// Wheel widgets keep winning the z-order hit-test over their own rects and keep
+/// receiving hover/scroll) but ABOVE the Background canvas content (bare-canvas
+/// drag-selection is unaffected). Shared by the spawn site here and the tab's canvas
+/// Shift+wheel font handler so both agree on one layer identity.
+pub(super) fn shift_drag_capture_layer_id() -> egui::LayerId {
+    egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("typing_text_create_shift_capture"),
+    )
+}
+
 impl TypingTextOverlayLayer {
     pub(super) fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
         self.create_selection.is_some()
@@ -82,8 +96,13 @@ impl TypingTextOverlayLayer {
             return;
         }
 
-        egui::Area::new("typing_text_create_shift_capture".into())
-            .order(egui::Order::Foreground)
+        // Middle order (not Foreground): the capture overlay must sit below the Foreground
+        // panels so the panels win the z-order hit-test over their own rects and their Wheel
+        // widgets keep receiving hover/scroll; Middle still sits above the Background canvas,
+        // so drag-selection over bare canvas is unaffected.
+        let capture_layer = shift_drag_capture_layer_id();
+        egui::Area::new(capture_layer.id)
+            .order(capture_layer.order)
             .fixed_pos(canvas_rect.min)
             .show(ctx, |ui| {
                 ui.set_min_size(canvas_rect.size());

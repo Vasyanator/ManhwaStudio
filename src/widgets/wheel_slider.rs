@@ -16,7 +16,8 @@ FILE HEADER (widgets/wheel_slider.rs)
     менял параметры под собой;
   - если курсор находится над popup-списком combobox, hover-визуал слайдера
     подавляется, даже если слайдер геометрически под списком;
-  - публикует hover-состояние, чтобы глобальные wheel-hotkey не забирали событие у слайдера;
+  - hover/wheel определяются только z-order hit-test'ом egui (`response.hovered()`
+    / `contains_pointer()`), поэтому слой поверх слайдера корректно забирает колесо;
   - событие колеса потребляется локально, чтобы не скроллился контейнер выше.
 */
 #![allow(dead_code)]
@@ -25,7 +26,7 @@ use super::wheel_input_guard::{combo_popup_blocks_pointer, combo_popup_open};
 use eframe::egui;
 use egui::style::HandleShape;
 use egui::{
-    Color32, Id, Rect, Response, SliderClamping, SliderOrientation, Ui, Widget, WidgetText, emath,
+    Color32, Response, SliderClamping, SliderOrientation, Ui, Widget, WidgetText, emath,
 };
 use std::ops::RangeInclusive;
 
@@ -34,13 +35,6 @@ type NumParser<'a> = Box<dyn 'a + Fn(&str) -> Option<f64>>;
 type GetSetValue<'a> = Box<dyn 'a + FnMut(Option<f64>) -> f64>;
 
 const SHIFT_WHEEL_STEP_MULTIPLIER: f64 = 5.0;
-const WHEEL_SLIDER_HOVER_BLOCK_ID: &str = "wheel_slider_hover_block";
-
-#[derive(Clone, Copy, Debug)]
-struct WheelSliderHoverBlock {
-    frame_nr: u64,
-    rect: Rect,
-}
 
 pub struct WheelSlider<'a> {
     get_set_value: GetSetValue<'a>,
@@ -275,26 +269,6 @@ impl<'a> WheelSlider<'a> {
         self
     }
 
-    pub fn pointer_recently_over_any(ctx: &egui::Context) -> bool {
-        let Some(block) = ctx.data(|data| {
-            data.get_temp::<WheelSliderHoverBlock>(Id::new(WHEEL_SLIDER_HOVER_BLOCK_ID))
-        }) else {
-            return false;
-        };
-
-        if ctx.cumulative_frame_nr().saturating_sub(block.frame_nr) > 1 {
-            return false;
-        }
-
-        ctx.input(|input| {
-            input
-                .pointer
-                .hover_pos()
-                .or_else(|| input.pointer.interact_pos())
-                .is_some_and(|pos| block.rect.contains(pos))
-        })
-    }
-
     fn effective_wheel_step(&self) -> f64 {
         if let Some(wheel_step) = self.wheel_step {
             return wheel_step.abs();
@@ -374,7 +348,6 @@ impl Widget for WheelSlider<'_> {
         if pointer_over_slider && !response.hovered() {
             response = response.highlight();
         }
-        publish_pointer_hover_state(ui.ctx(), &response, pointer_over_slider);
         let wheel_step = self.effective_wheel_step();
 
         if apply_hovered_wheel_delta(
@@ -390,27 +363,6 @@ impl Widget for WheelSlider<'_> {
 
         response
     }
-}
-
-fn publish_pointer_hover_state(
-    ctx: &egui::Context,
-    response: &Response,
-    pointer_over_slider: bool,
-) {
-    if !pointer_over_slider {
-        return;
-    }
-
-    let frame_nr = ctx.cumulative_frame_nr();
-    ctx.data_mut(|data| {
-        data.insert_temp(
-            Id::new(WHEEL_SLIDER_HOVER_BLOCK_ID),
-            WheelSliderHoverBlock {
-                frame_nr,
-                rect: response.rect,
-            },
-        );
-    });
 }
 
 fn pointer_over_response_rect(response: &Response) -> bool {

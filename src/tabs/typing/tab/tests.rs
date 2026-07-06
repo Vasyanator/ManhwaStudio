@@ -1385,3 +1385,59 @@
             Some(4)
         );
     }
+
+    /// The canvas Shift+wheel font handler must defer ONLY when a real floating panel/popup
+    /// (above the Background canvas) is under the pointer. The Shift-drag selection-capture
+    /// overlay lives on `Order::Middle` with a known id and must NOT count as a panel, or
+    /// drag-selecting text over bare canvas would suppress the font handler.
+    #[test]
+    fn pointer_over_panel_over_canvas_defers_to_foreground_panel_only() {
+        let ctx = egui::Context::default();
+        let panel_rect = Rect::from_min_size(Pos2::new(500.0, 500.0), Vec2::new(120.0, 120.0));
+        let capture_rect = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(120.0, 120.0));
+
+        // Two frames: the first registers the areas, the second exposes their rects to the
+        // z-order hit-test that `layer_id_at` reads.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let ctx = ui.ctx().clone();
+                // A Foreground panel-like area (a real widget covering the whole rect).
+                egui::Area::new(egui::Id::new("test_over_canvas_panel"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(panel_rect.min)
+                    .show(&ctx, |ui| {
+                        ui.allocate_rect(
+                            Rect::from_min_size(ui.min_rect().min, panel_rect.size()),
+                            egui::Sense::click(),
+                        );
+                    });
+                // The Shift-drag selection-capture overlay on its real (Middle) layer id.
+                let capture = super::create_upload::shift_drag_capture_layer_id();
+                egui::Area::new(capture.id)
+                    .order(capture.order)
+                    .fixed_pos(capture_rect.min)
+                    .show(&ctx, |ui| {
+                        ui.allocate_rect(
+                            Rect::from_min_size(ui.min_rect().min, capture_rect.size()),
+                            egui::Sense::click(),
+                        );
+                    });
+            });
+        }
+
+        // Over the Foreground panel: the wheel belongs to that panel → defer.
+        assert!(super::TypingTabState::pointer_over_panel_over_canvas(
+            &ctx,
+            panel_rect.center()
+        ));
+        // Over the Shift-capture overlay (Middle, matching id): bare canvas → do not defer.
+        assert!(!super::TypingTabState::pointer_over_panel_over_canvas(
+            &ctx,
+            capture_rect.center()
+        ));
+        // Over empty space (no floating layer): bare canvas → do not defer.
+        assert!(!super::TypingTabState::pointer_over_panel_over_canvas(
+            &ctx,
+            Pos2::new(5.0, 5.0)
+        ));
+    }

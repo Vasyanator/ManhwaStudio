@@ -25,8 +25,9 @@ FILE HEADER (tabs/typing/tab.rs)
     в текстовом поле панели),
     `Shift+колесо` меняет размер шрифта: в режиме без выделения — на панели `Создание текста`,
     при выделенном `text`-оверлее — в edit-параметрах с live-рендером (в обоих случаях
-    с consume wheel-события до `CanvasView`, чтобы не скроллить холст; при наведении на
-    `WheelSlider` событие остаётся у слайдера),
+    с consume wheel-события до `CanvasView`, чтобы не скроллить холст; когда курсор
+    поверх любой панели (Foreground-слой над холстом по z-order), обработчик уступает
+    событие виджету панели и шрифт холста не меняется),
     hotkey `C` для выделенного `text`-оверлея запускает фоновый авто-тайп:
     берётся оптический центр оверлея, от него ищется пузырь на composited-странице
     (`src + clean overlay` из shared cache), после чего оверлей центрируется по пузырю;
@@ -103,6 +104,7 @@ use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::paste_image;
 use crate::project::{Bubble, ProjectData};
 use crate::tabs::typing::TypingTopPanelState;
+// Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use crate::widgets::WheelSlider;
 use eframe::egui;
 use egui::{Color32, ColorImage, Id, Mesh, Pos2, Rect, Sense, Stroke, TextureOptions, Vec2};
@@ -564,6 +566,19 @@ impl TypingTabState {
         })
     }
 
+    /// True when the pointer sits over a panel/popup drawn above the canvas, so the
+    /// canvas Shift+wheel font handler must defer to that widget instead of firing.
+    ///
+    /// The bare canvas is [`egui::Order::Background`]; the Shift+drag selection-capture
+    /// overlay ([`egui::Order::Middle`]) counts as bare canvas. Any other floating layer
+    /// (a Foreground panel, popup or tooltip) means the wheel belongs to that widget.
+    fn pointer_over_panel_over_canvas(ctx: &egui::Context, pos: egui::Pos2) -> bool {
+        ctx.layer_id_at(pos).is_some_and(|layer| {
+            layer.order != egui::Order::Background
+                && layer != create_upload::shift_drag_capture_layer_id()
+        })
+    }
+
     fn try_adjust_create_panel_font_size_by_shift_wheel(
         &mut self,
         ctx: &egui::Context,
@@ -575,15 +590,11 @@ impl TypingTabState {
         if self.text_overlays.has_selected_overlay() {
             return false;
         }
-        if WheelSlider::pointer_recently_over_any(ctx) {
-            return false;
-        }
-
-        let (shift_down, smooth_scroll_delta, primary_down, hover_pos, interact_pos) =
+        let (shift_down, raw_wheel_delta, primary_down, hover_pos, interact_pos) =
             ctx.input(|input| {
                 (
                     input.modifiers.shift,
-                    input.smooth_scroll_delta,
+                    crate::input_util::raw_wheel_delta(input),
                     input.pointer.primary_down(),
                     input.pointer.hover_pos(),
                     input.pointer.interact_pos(),
@@ -593,17 +604,25 @@ impl TypingTabState {
             return false;
         }
 
-        let pointer_pos = interact_pos.or(hover_pos);
-        if !pointer_pos.is_some_and(|pos| canvas_rect.contains(pos)) {
+        let Some(pointer_pos) = interact_pos
+            .or(hover_pos)
+            .filter(|pos| canvas_rect.contains(*pos))
+        else {
+            return false;
+        };
+        // Fire only over bare canvas (or the Shift-drag selection overlay). A panel/popup
+        // above the canvas owns the wheel — its own Wheel widget applies the 5x Shift step.
+        if Self::pointer_over_panel_over_canvas(ctx, pointer_pos) {
             return false;
         }
 
-        // Match panel wheel behavior: use raw delta only (no smooth inertia)
-        // and keep one discrete step per wheel event.
-        let mut wheel_delta = smooth_scroll_delta.y;
+        // Use the one-frame raw wheel delta, not the smoothed inertia (which ramps over
+        // ~a dozen frames and would apply one step per ramp frame): one physical notch =
+        // one discrete step.
+        let mut wheel_delta = raw_wheel_delta.y;
         if wheel_delta.abs() <= f32::EPSILON {
             // Some backends convert Shift+wheel into horizontal scroll.
-            wheel_delta = smooth_scroll_delta.x;
+            wheel_delta = raw_wheel_delta.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
@@ -634,15 +653,11 @@ impl TypingTabState {
         if self.top_panel.has_focused_text_input(ctx) {
             return false;
         }
-        if WheelSlider::pointer_recently_over_any(ctx) {
-            return false;
-        }
-
-        let (shift_down, smooth_scroll_delta, primary_down, hover_pos, interact_pos) =
+        let (shift_down, raw_wheel_delta, primary_down, hover_pos, interact_pos) =
             ctx.input(|input| {
                 (
                     input.modifiers.shift,
-                    input.smooth_scroll_delta,
+                    crate::input_util::raw_wheel_delta(input),
                     input.pointer.primary_down(),
                     input.pointer.hover_pos(),
                     input.pointer.interact_pos(),
@@ -652,14 +667,22 @@ impl TypingTabState {
             return false;
         }
 
-        let pointer_pos = interact_pos.or(hover_pos);
-        if !pointer_pos.is_some_and(|pos| canvas_rect.contains(pos)) {
+        let Some(pointer_pos) = interact_pos
+            .or(hover_pos)
+            .filter(|pos| canvas_rect.contains(*pos))
+        else {
+            return false;
+        };
+        // Fire only over bare canvas (or the Shift-drag selection overlay); defer to a
+        // panel/popup above the canvas so its Wheel widget handles the Shift+wheel.
+        if Self::pointer_over_panel_over_canvas(ctx, pointer_pos) {
             return false;
         }
 
-        let mut wheel_delta = smooth_scroll_delta.y;
+        // One-frame raw wheel delta (not smoothed inertia): one notch = one step.
+        let mut wheel_delta = raw_wheel_delta.y;
         if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = smooth_scroll_delta.x;
+            wheel_delta = raw_wheel_delta.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
