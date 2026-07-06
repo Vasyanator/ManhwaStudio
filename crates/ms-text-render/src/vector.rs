@@ -44,7 +44,7 @@ correct. Parity with swash's own bottom-left-origin bitmap is verified by
 
 use super::glyph_contour::{GlyphContour, PlacedContour};
 use super::raster::blend_pixel_over;
-use super::types::AntiAliasingMode;
+use super::types::{AntiAliasingMode, VectorMeshWarp};
 use std::collections::HashMap;
 use std::sync::Arc;
 use zeno::{Command, Fill, Format, Mask, Vector};
@@ -639,6 +639,232 @@ pub(crate) fn build_aa_lut(mode: AntiAliasingMode) -> [u8; 256] {
     lut
 }
 
+/// Absolute epsilon under which a mesh node is considered coincident with its
+/// identity position. A mesh whose every node is within this of identity is
+/// treated as a no-op so it renders byte-identically to `None`.
+const MESH_IDENTITY_EPS: f32 = 1e-6;
+
+/// Prepared per-render context for applying a [`VectorMeshWarp`] at the
+/// rasterizer vertex seam.
+///
+/// Owns a copy of the mesh nodes plus the normalization box (pre-warp,
+/// pre-global-rotation layout AABB) and the global rotation to peel/reapply.
+/// Build it ONCE per render via [`MeshWarpContext::new`]; it is `None` (so the
+/// caller uses the byte-identical fast path) for an invalid mesh, a degenerate
+/// box, or an identity mesh.
+///
+/// Order at the seam: the incoming `world` point already carries per-glyph
+/// placement AND the global rotation. `warp_world` PEELS the global rotation
+/// (`R^-1` about the centroid) to reach pre-global-rotation layout space, warps
+/// there over `box`, then RE-APPLIES the rotation (`R` about the centroid). When
+/// there is no global rotation the peel/reapply are skipped entirely.
+#[derive(Debug, Clone)]
+pub(crate) struct MeshWarpContext {
+    cols: usize,
+    rows: usize,
+    /// Warped normalized node positions, row-major, `len == cols * rows`.
+    points_norm: Vec<[f32; 2]>,
+    /// Minimum corner of the normalization box in layout space.
+    box_min: [f32; 2],
+    /// Size of the normalization box `[w, h]`; both strictly positive.
+    box_size: [f32; 2],
+    /// Global-rotation pivot (centroid) in layout space.
+    centroid: [f32; 2],
+    /// `cos`/`sin` of the POSITIVE global rotation angle (peel negates `sin`).
+    cos: f32,
+    sin: f32,
+    /// Whether a non-zero global rotation must be peeled/reapplied.
+    has_rotation: bool,
+}
+
+impl MeshWarpContext {
+    /// Build a warp context, or `None` when the warp must be a no-op.
+    ///
+    /// `box_min`/`box_size` are the pre-warp, pre-global-rotation layout AABB
+    /// (`box_size` components must be finite and `> 0`). `global_rotation_rad`
+    /// and `centroid` describe the global rotation `R` that the placement pass
+    /// has already baked into each glyph's world transform, so the seam can peel
+    /// it, warp in layout space, and reapply it. Returns `None` for an invalid
+    /// mesh (`cols < 2`, `rows < 2`, or `points_norm.len() != cols*rows`), a
+    /// degenerate/non-finite box, a mesh with any non-finite node, or a mesh that
+    /// equals identity within [`MESH_IDENTITY_EPS`] (all render byte-identically
+    /// to `None`).
+    #[must_use]
+    pub(crate) fn new(
+        warp: &VectorMeshWarp,
+        box_min: [f32; 2],
+        box_size: [f32; 2],
+        global_rotation_rad: f32,
+        centroid: [f32; 2],
+    ) -> Option<Self> {
+        let (cols, rows) = (warp.cols, warp.rows);
+        if cols < 2 || rows < 2 || warp.points_norm.len() != cols.checked_mul(rows)? {
+            return None;
+        }
+        // Design B: honor stored source dims as the normalization-box SIZE when both are valid
+        // (finite and > 0), keeping the passed pre-warp content-bounds ORIGIN (`box_min`). This
+        // makes the canvas authoring UI (which normalizes handle positions against the stored src
+        // dims) and the renderer agree. Absent/0 -> keep the live pre-warp-bounds `box_size`.
+        let box_size = if warp.src_width_px.is_finite()
+            && warp.src_height_px.is_finite()
+            && warp.src_width_px > 0.0
+            && warp.src_height_px > 0.0
+        {
+            [warp.src_width_px, warp.src_height_px]
+        } else {
+            box_size
+        };
+        if !box_size[0].is_finite()
+            || !box_size[1].is_finite()
+            || box_size[0] <= 0.0
+            || box_size[1] <= 0.0
+            || !box_min[0].is_finite()
+            || !box_min[1].is_finite()
+        {
+            return None;
+        }
+        // A non-finite (NaN/inf) node would denormalize into a garbage coverage sample for its cell at
+        // the rasterizer seam, so reject the whole warp and fall back to the byte-identical no-warp path.
+        if warp
+            .points_norm
+            .iter()
+            .any(|p| !p[0].is_finite() || !p[1].is_finite())
+        {
+            return None;
+        }
+        if mesh_is_identity(warp) {
+            return None;
+        }
+        let (sin, cos) = global_rotation_rad.sin_cos();
+        Some(Self {
+            cols,
+            rows,
+            points_norm: warp.points_norm.clone(),
+            box_min,
+            box_size,
+            centroid,
+            cos,
+            sin,
+            has_rotation: global_rotation_rad != 0.0,
+        })
+    }
+
+    /// Warp one layout-space `world` point: peel global rotation, warp over the
+    /// box, reapply global rotation. Never panics (indices are clamped).
+    #[must_use]
+    fn warp_world(&self, world: [f32; 2]) -> [f32; 2] {
+        // Peel R^-1 (rotate by -angle about the centroid) to pre-rotation space.
+        let pre = if self.has_rotation {
+            rotate_about(world, self.centroid, self.cos, -self.sin)
+        } else {
+            world
+        };
+        let warped = self.warp_in_box(pre);
+        // Reapply R (rotate by +angle about the centroid).
+        if self.has_rotation {
+            rotate_about(warped, self.centroid, self.cos, self.sin)
+        } else {
+            warped
+        }
+    }
+
+    /// Bilinearly warp a point already in pre-global-rotation layout space.
+    ///
+    /// Normalizes over the box, clamps lattice coordinates into the grid (points
+    /// outside `[0, 1]` clamp to the edge cell), and denormalizes the
+    /// interpolated normalized node value back to layout space.
+    #[must_use]
+    fn warp_in_box(&self, p: [f32; 2]) -> [f32; 2] {
+        let nx = (p[0] - self.box_min[0]) / self.box_size[0];
+        let ny = (p[1] - self.box_min[1]) / self.box_size[1];
+        // Lattice coords, clamped so a point outside the box maps to the edge cell.
+        let gx = (nx * (self.cols - 1) as f32).clamp(0.0, (self.cols - 1) as f32);
+        let gy = (ny * (self.rows - 1) as f32).clamp(0.0, (self.rows - 1) as f32);
+        // Cell base index clamped to the last full cell so the +1 neighbor exists.
+        let j0 = (gx.floor() as usize).min(self.cols - 2);
+        let i0 = (gy.floor() as usize).min(self.rows - 2);
+        let fx = (gx - j0 as f32).clamp(0.0, 1.0);
+        let fy = (gy - i0 as f32).clamp(0.0, 1.0);
+        let p00 = self.points_norm[i0 * self.cols + j0];
+        let p10 = self.points_norm[i0 * self.cols + j0 + 1];
+        let p01 = self.points_norm[(i0 + 1) * self.cols + j0];
+        let p11 = self.points_norm[(i0 + 1) * self.cols + j0 + 1];
+        let wu = lerp(lerp(p00[0], p10[0], fx), lerp(p01[0], p11[0], fx), fy);
+        let wv = lerp(lerp(p00[1], p10[1], fx), lerp(p01[1], p11[1], fx), fy);
+        [
+            self.box_min[0] + wu * self.box_size[0],
+            self.box_min[1] + wv * self.box_size[1],
+        ]
+    }
+
+    /// Invoke `f(x, y)` for the warped+rotated world position of every lattice
+    /// node. Because bilinear interpolation of a cell stays within the AABB of
+    /// its four warped node values (each output coordinate is a convex
+    /// combination of the corner values), the AABB of all these points bounds
+    /// the warped image of the whole box — hence of all glyph ink inside it. The
+    /// caller unions them to grow the canvas so a strong outward warp never
+    /// clips.
+    pub(crate) fn for_each_warped_bound_point(&self, mut f: impl FnMut(f32, f32)) {
+        for node in &self.points_norm {
+            let pre = [
+                self.box_min[0] + node[0] * self.box_size[0],
+                self.box_min[1] + node[1] * self.box_size[1],
+            ];
+            let world = if self.has_rotation {
+                rotate_about(pre, self.centroid, self.cos, self.sin)
+            } else {
+                pre
+            };
+            f(world[0], world[1]);
+        }
+    }
+}
+
+/// Linear interpolation `a + (b - a) * t`.
+#[must_use]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Rotate `pt` about `center` by the angle whose cosine/sine are `cos`/`sin`.
+///
+/// Standard screen (y-down) matrix `[cos -sin; sin cos]`. Pass a negated `sin`
+/// to rotate by the opposite angle (used to peel the global rotation).
+#[must_use]
+fn rotate_about(pt: [f32; 2], center: [f32; 2], cos: f32, sin: f32) -> [f32; 2] {
+    let dx = pt[0] - center[0];
+    let dy = pt[1] - center[1];
+    [
+        center[0] + dx * cos - dy * sin,
+        center[1] + dx * sin + dy * cos,
+    ]
+}
+
+/// Whether every mesh node coincides with its identity normalized position
+/// within [`MESH_IDENTITY_EPS`], making the warp a no-op.
+///
+/// Node `(i, j)` has identity position `(j/(cols-1), i/(rows-1))`. Assumes
+/// `cols >= 2`, `rows >= 2`, and `points_norm.len() == cols*rows` (checked by
+/// [`MeshWarpContext::new`] before this is called).
+#[must_use]
+fn mesh_is_identity(warp: &VectorMeshWarp) -> bool {
+    let inv_cols = 1.0 / (warp.cols - 1) as f32;
+    let inv_rows = 1.0 / (warp.rows - 1) as f32;
+    for i in 0..warp.rows {
+        for j in 0..warp.cols {
+            let node = warp.points_norm[i * warp.cols + j];
+            let id_x = j as f32 * inv_cols;
+            let id_y = i as f32 * inv_rows;
+            if (node[0] - id_x).abs() > MESH_IDENTITY_EPS
+                || (node[1] - id_y).abs() > MESH_IDENTITY_EPS
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Rasterize a transformed glyph outline into a straight-alpha RGBA8 canvas.
 ///
 /// Coordinate flow: each glyph-local subpath point is transformed to world
@@ -667,9 +893,16 @@ pub(crate) fn build_aa_lut(mode: AntiAliasingMode) -> [u8; 256] {
 /// commands, coverage mask). It is reset per call (see [`RasterScratch`]) so the
 /// result is byte-identical to a freshly allocated render regardless of what the
 /// previous glyph left in it.
+///
+/// `warp` optionally deforms each vertex AFTER `transform` (which already
+/// carries per-glyph placement and any global rotation) but BEFORE the mapping
+/// to canvas pixels: `world` is peeled of the global rotation, warped in
+/// pre-global-rotation layout space, and re-rotated (see [`MeshWarpContext`]).
+/// `None` keeps the vertex path byte-for-byte identical to the un-warped
+/// renderer (no extra float work runs).
 // The rasterizer call site naturally carries the scratch, canvas target, origin,
-// outline, transform, tint and the AA transfer table; splitting them would
-// obscure the mapping.
+// outline, transform, tint, the AA transfer table and the optional mesh warp;
+// splitting them would obscure the mapping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_outline_into(
     scratch: &mut RasterScratch,
@@ -682,6 +915,7 @@ pub(crate) fn rasterize_outline_into(
     transform: &GlyphTransform,
     color: [u8; 4],
     aa_lut: &[u8; 256],
+    warp: Option<&MeshWarpContext>,
 ) {
     if canvas_w == 0 || canvas_h == 0 {
         return;
@@ -710,7 +944,14 @@ pub(crate) fn rasterize_outline_into(
     for subpath in &outline.subpaths {
         let mut world_pts = scratch.take_subpath();
         for &local in subpath {
-            let world = transform.apply(local, cos, sin);
+            let placed = transform.apply(local, cos, sin);
+            // Optional mesh warp deforms the placed vertex in layout space
+            // (peel global rotation -> warp -> reapply); `None` is a no-op that
+            // keeps this the byte-identical fast path.
+            let world = match warp {
+                Some(ctx) => ctx.warp_world(placed),
+                None => placed,
+            };
             let cx = world[0] - origin_x;
             let cy = world[1] - origin_y;
             min[0] = min[0].min(cx);
@@ -1137,6 +1378,7 @@ mod tests {
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
             &identity_lut(),
+            None,
         );
 
         // Extract our alpha channel and compare to the reference alpha.
@@ -1180,6 +1422,7 @@ mod tests {
             &GlyphTransform::identity(),
             [200, 30, 30, 255],
             &identity_lut(),
+            None,
         );
         let mut covered = 0usize;
         for px in canvas_full.chunks_exact(4) {
@@ -1203,6 +1446,7 @@ mod tests {
             &GlyphTransform::identity(),
             [200, 30, 30, 128],
             &identity_lut(),
+            None,
         );
         for (full, half) in canvas_full.chunks_exact(4).zip(canvas_half.chunks_exact(4)) {
             let expected = (f32::from(full[3]) * (128.0 / 255.0)).round() as i32;
@@ -1245,6 +1489,7 @@ mod tests {
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
             &lut,
+            None,
         );
 
         // Shared scratch: dirty it with A (different bbox/window), then render B.
@@ -1261,6 +1506,7 @@ mod tests {
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
             &lut,
+            None,
         );
         let mut reused_canvas = vec![0u8; w * h * 4];
         rasterize_outline_into(
@@ -1274,6 +1520,7 @@ mod tests {
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
             &lut,
+            None,
         );
 
         assert_eq!(
@@ -1309,6 +1556,7 @@ mod tests {
             &GlyphTransform::identity(),
             [255, 255, 255, 255],
             &identity_lut(),
+            None,
         );
         let (idw, idh) = alpha_bbox_dims(&c_id, big, big);
 
@@ -1332,6 +1580,7 @@ mod tests {
             &rot,
             [255, 255, 255, 255],
             &identity_lut(),
+            None,
         );
         let (rw, rh) = alpha_bbox_dims(&c_rot, big, big);
 
@@ -1364,6 +1613,7 @@ mod tests {
             &far,
             [255, 255, 255, 255],
             &identity_lut(),
+            None,
         );
         assert_eq!(c_off, expected, "off-canvas render must leave the buffer intact");
     }
@@ -1449,6 +1699,7 @@ mod tests {
                 },
                 [255, 255, 255, 255],
                 &identity_lut(),
+                None,
             );
             alpha_centroid(&canvas, w, h).expect("non-empty render")
         };
@@ -1608,5 +1859,175 @@ mod tests {
         ] {
             assert_lut_monotonic(&build_aa_lut(mode));
         }
+    }
+
+    /// Build a `cols x rows` identity mesh (every node at its identity position).
+    ///
+    /// `src_*` are left at `0.0` so these helpers exercise the LIVE pre-warp-bounds
+    /// normalization path (the passed `box_size`); the explicit-src-dims Design B
+    /// path is covered separately by `mesh_context_honors_explicit_src_dims`.
+    fn identity_mesh(cols: usize, rows: usize) -> VectorMeshWarp {
+        let mut points_norm = Vec::with_capacity(cols * rows);
+        for i in 0..rows {
+            for j in 0..cols {
+                points_norm.push([j as f32 / (cols - 1) as f32, i as f32 / (rows - 1) as f32]);
+            }
+        }
+        VectorMeshWarp {
+            cols,
+            rows,
+            src_width_px: 0.0,
+            src_height_px: 0.0,
+            points_norm,
+        }
+    }
+
+    /// Build a mesh whose every node is shifted from identity by a constant
+    /// normalized offset `dn` (a pure translation-equivalent mesh).
+    fn translation_mesh(cols: usize, rows: usize, dn: [f32; 2]) -> VectorMeshWarp {
+        let mut warp = identity_mesh(cols, rows);
+        for node in &mut warp.points_norm {
+            node[0] += dn[0];
+            node[1] += dn[1];
+        }
+        warp
+    }
+
+    #[test]
+    fn mesh_context_is_none_for_identity_and_invalid() {
+        // Identity mesh -> no-op (None) so it renders byte-identically to no warp.
+        let identity = identity_mesh(13, 13);
+        assert!(
+            MeshWarpContext::new(&identity, [0.0, 0.0], [100.0, 80.0], 0.0, [0.0, 0.0]).is_none(),
+            "identity mesh must produce a None (no-op) context"
+        );
+        // Degenerate box -> None.
+        let shifted = translation_mesh(13, 13, [0.1, 0.0]);
+        assert!(
+            MeshWarpContext::new(&shifted, [0.0, 0.0], [0.0, 80.0], 0.0, [0.0, 0.0]).is_none(),
+            "zero-width box must produce None"
+        );
+        // Wrong point count / too few columns -> None.
+        let bad_len = VectorMeshWarp {
+            cols: 3,
+            rows: 3,
+            src_width_px: 10.0,
+            src_height_px: 10.0,
+            points_norm: vec![[0.0, 0.0]; 8],
+        };
+        assert!(MeshWarpContext::new(&bad_len, [0.0, 0.0], [10.0, 10.0], 0.0, [0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn mesh_context_is_none_for_non_finite_node() {
+        // A NaN node would inject garbage coverage into its cell -> reject the whole warp.
+        let mut nan_node = translation_mesh(13, 13, [0.1, 0.0]);
+        nan_node.points_norm[42][0] = f32::NAN;
+        assert!(
+            MeshWarpContext::new(&nan_node, [0.0, 0.0], [100.0, 80.0], 0.0, [0.0, 0.0]).is_none(),
+            "a NaN node must produce a None (no-op) context"
+        );
+        // An infinite node in the other axis is rejected the same way.
+        let mut inf_node = translation_mesh(13, 13, [0.0, 0.1]);
+        inf_node.points_norm[7][1] = f32::INFINITY;
+        assert!(
+            MeshWarpContext::new(&inf_node, [0.0, 0.0], [100.0, 80.0], 0.0, [0.0, 0.0]).is_none(),
+            "an infinite node must produce a None (no-op) context"
+        );
+    }
+
+    #[test]
+    fn warp_translation_mesh_shifts_points_uniformly() {
+        // A pure translation mesh must map every interior point by a constant
+        // world offset `dn * box_size` (bilinear reproduces the linear coordinate
+        // plus the constant node offset), leaving relative geometry unchanged.
+        let dn = [0.1, -0.2];
+        let warp = translation_mesh(5, 5, dn);
+        let box_min = [5.0, 7.0];
+        let box_size = [40.0, 20.0];
+        let ctx = MeshWarpContext::new(&warp, box_min, box_size, 0.0, [0.0, 0.0])
+            .expect("translation mesh is active (non-identity)");
+        let expected = [dn[0] * box_size[0], dn[1] * box_size[1]];
+        for p in [[15.0, 12.0], [40.0, 20.0], [6.0, 26.0]] {
+            let w = ctx.warp_world(p);
+            assert!(
+                (w[0] - (p[0] + expected[0])).abs() < 1e-3,
+                "x shift mismatch at {p:?}: got {w:?}"
+            );
+            assert!(
+                (w[1] - (p[1] + expected[1])).abs() < 1e-3,
+                "y shift mismatch at {p:?}: got {w:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warp_clamps_points_outside_the_box_to_the_edge() {
+        // Points far outside the box clamp to the edge cell (no extrapolation), so
+        // two different far-left points map to the same warped x.
+        let warp = translation_mesh(4, 4, [0.15, 0.05]);
+        let box_min = [0.0, 0.0];
+        let box_size = [100.0, 100.0];
+        let ctx = MeshWarpContext::new(&warp, box_min, box_size, 0.0, [0.0, 0.0]).expect("active");
+        let a = ctx.warp_world([-500.0, 50.0]);
+        let b = ctx.warp_world([-50.0, 50.0]);
+        assert!(
+            (a[0] - b[0]).abs() < 1e-3,
+            "far-left points must clamp to the same edge x: {a:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn mesh_context_honors_explicit_src_dims() {
+        // Design B: a mesh carrying valid src_width/height_px normalizes over THOSE dims (as the box
+        // SIZE), keeping the passed content-bounds origin — regardless of the live `box_size` passed
+        // by the caller. A pure translation mesh then shifts every point by `dn * src_dims`.
+        let dn = [0.1, -0.2];
+        let mut warp = translation_mesh(5, 5, dn);
+        warp.src_width_px = 100.0;
+        warp.src_height_px = 80.0;
+        let box_min = [5.0, 7.0];
+        // Deliberately different from the src dims: the override must win.
+        let live_box = [40.0, 20.0];
+        let ctx = MeshWarpContext::new(&warp, box_min, live_box, 0.0, [0.0, 0.0])
+            .expect("translation mesh is active (non-identity)");
+        assert_eq!(
+            ctx.box_size,
+            [100.0, 80.0],
+            "explicit src dims must override the live box size"
+        );
+        assert_eq!(ctx.box_min, box_min, "origin must stay the passed content-bounds origin");
+        let expected = [dn[0] * 100.0, dn[1] * 80.0];
+        let p = [20.0, 15.0];
+        let w = ctx.warp_world(p);
+        assert!(
+            (w[0] - (p[0] + expected[0])).abs() < 1e-3,
+            "x shift must use src dims: got {w:?}"
+        );
+        assert!(
+            (w[1] - (p[1] + expected[1])).abs() < 1e-3,
+            "y shift must use src dims: got {w:?}"
+        );
+    }
+
+    #[test]
+    fn warp_bound_points_grow_with_outward_corner() {
+        // Pushing the bottom-right node outward must move at least one warped
+        // bound point beyond the box's far corner, so the canvas-growth pass sees
+        // a larger extent than the identity box.
+        let mut warp = identity_mesh(3, 3);
+        let last = warp.points_norm.len() - 1;
+        warp.points_norm[last] = [1.4, 1.4];
+        let box_min = [0.0, 0.0];
+        let box_size = [50.0, 50.0];
+        let ctx = MeshWarpContext::new(&warp, box_min, box_size, 0.0, [0.0, 0.0]).expect("active");
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        ctx.for_each_warped_bound_point(|x, y| {
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        });
+        assert!(max_x > 50.0, "warped extent must exceed the box width, got {max_x}");
+        assert!(max_y > 50.0, "warped extent must exceed the box height, got {max_y}");
     }
 }

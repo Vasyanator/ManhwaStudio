@@ -200,6 +200,20 @@ saving, and export.
   - `panels.rs`: deformation panel, layers-tab body, layout-editor floating panels.
   - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
   - `draw_page.rs`: `draw_page_overlays` (master per-page draw) + repaint/visibility/pixel-snap helpers.
+  - `vector_transform.rs`: on-canvas VECTOR transform mode for text overlays (Phase 3a + 3b) — seeds a
+    transient 13x13 working mesh over the overlay's oriented source-rect footprint, reuses the shared
+    deform handles/brushes to edit it, and bakes the result into
+    `render_data.text_params.raster_transform` via the background edit-render. The convert → inject →
+    dispatch step is `inject_working_mesh_and_rerender` (shared by settle and the live path). The sharp
+    warped re-render now fires LIVE during the drag: every frame the working mesh actually changes it
+    dispatches the real edit-render (latest-wins via `edit_render_latest_token`, so superseded renders
+    drop; the placement save coalesces behind the in-flight render), and `drag_stopped` does a final
+    settle + `request_overlay_placement_save` for the persisted result. Phase 3b's LIVE GPU texture
+    preview stays as the instant in-flight visual covering the sub-frame gap: it caches the overlay
+    rendered WITHOUT its warp (the un-warped base) and, during a drag, textures that base onto the
+    working mesh (`draw_textured_deform_mesh`) so the text bends in real time until the sharp PNG lands;
+    the plain baked PNG is hidden for that overlay while the warped preview draws, and it falls back to
+    the wireframe-only draw until the base is ready.
   - `mesh_geometry.rs`: deform-mesh/handle math, overlay geometry, hit-tests, unified-Z helpers (pure fns).
   - `layout_editor.rs`: vector-line layout-editor free fns (frame/line hit-test, draw, conversions).
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
@@ -275,9 +289,35 @@ saving, and export.
   from the staging dir with a fallback to the saved (main) `text_images` dir.
 - Text/effect colors stored in `render_data` are straight-alpha RGBA. When serializing
   from egui `Color32`, use unmultiplied sRGBA values.
+- `render_data.text_params.raster_transform` is the optional vector mesh warp
+  (`{cols,rows,src_width_px,src_height_px,points_norm}`, row-major, `len == cols*rows`;
+  absent => no warp). It is authored on the canvas (Phase 3), NOT a panel text param, so the
+  panel carries it VERBATIM: `TypingCreatePanelState.pending_raster_transform` holds the raw
+  `Value`, is loaded on edit and re-emitted on every render_data rebuild, and is decoded for
+  the renderer via `codec::decode_vector_mesh_warp` (rejects malformed input -> `None`, never
+  panics). The legacy `normalize_text_params_object` passes the key through unchanged.
 - Deformation is represented by a high-resolution page-space mesh. Perspective, bend,
   frame, grid, and brush tools edit the shared mesh rather than storing separate tool
   parameters as persistent transform state.
+- On-canvas transform mode has TWO independent kinds that COMPOSE (`transform_mode_kind`,
+  gated by `transform_mode_overlay_idx`): RASTER edits the runtime `deform_mesh` (post-process,
+  baked on top of the PNG — legacy path, unchanged), while VECTOR edits a transient working mesh
+  that is converted to `render_data.text_params.raster_transform` and baked INTO the PNG by the text
+  renderer on re-render. The vector warp is baked into `source_rgba`; the raster mesh still
+  post-processes on top. Vector mode is TEXT-only and available only for `Normal`/`Shape`/
+  `CustomVectorLines` layouts (see `vector_transform_allowed_for_layout_mode`). The UI normalizes
+  handle positions over the stored source dims and the renderer honors those same dims as its warp
+  normalization box (Design B), so the two agree; an identity working mesh round-trips to identity
+  `points_norm` (a renderer no-op). LIVE PREVIEW (Phase 3b): entering vector mode caches the overlay's
+  UN-WARPED base as a reconstructable GPU texture (transient `vector_transform_base` +
+  `vector_transform_base_rx`, cleared on exit). If the overlay currently has NO `raster_transform`, its
+  resident `source_rgba`/texture ALREADY is the un-warped base and is reused directly (no extra render);
+  otherwise a one-off off-thread render with the warp cleared supplies it (`render_vector_transform_base`,
+  never written to disk, polled by `poll_vector_transform_base_render`). During a drag the base is warped
+  onto the working mesh (applying the warp EXACTLY ONCE — texturing the already-warped baked PNG would
+  double-warp), and the plain baked PNG is hidden for that overlay
+  (`vector_transform_preview_active`). On settle/reset the sharp re-render swaps `source_rgba` and the
+  base is invalidated so it re-derives on the next drag.
 - Mask data is binary alpha (`0` or `255`). Mask files live in `text_images/` and are
   page-indexed independently from overlay PNGs.
 - Clipping applies only when the overlay enables `mask_clip_enabled`; export and live
@@ -324,6 +364,8 @@ saving, and export.
 - To change the master per-page drawing, edit `tab/draw_page.rs`.
 - To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
 - To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.
+- To change the on-canvas VECTOR transform (seed/interaction/settle/reset), edit `tab/vector_transform.rs`;
+  its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.
 - To change persisted overlay schema parsing/normalization, edit `tab/codec.rs`.
 - To change export composition, edit `tab/export.rs`.
 - To change create/edit UI, presets, font loading, inline tag controls, or effect cards,

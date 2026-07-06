@@ -71,6 +71,12 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
 - `VerticalLineDirection` controls column ordering only. Glyph raster semantics should
   stay shared with horizontal rendering where possible.
 - Output RGBA must remain unmultiplied and sized as `width * height * 4`.
+- `TextRenderParams.raster_transform` (vector mesh warp) IS honored on this path: the
+  bounds pass captures the un-rotated scaled-glyph `pre_box` (gated on
+  `raster_transform.is_some()`), `MeshWarpContext::new` normalizes over it with the SAME
+  `global_rotation_rad` + `vertical_layout_centroid` the draw pass rotates about, the
+  outline seam passes `Some(&ctx)`, and `for_each_warped_bound_point` grows the canvas.
+  `None`/identity stays byte-identical; the color-glyph bitmap fallback does not warp.
 - Glyph bounds, optical profiles, and blank cells must tolerate missing glyph alpha
   data without panics.
 - Coordinate names should stay explicit: column positions, cell tops, glyph origins,

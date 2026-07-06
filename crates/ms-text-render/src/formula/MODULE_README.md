@@ -53,6 +53,18 @@ the line paths.
   that cannot use a curve safely. Do not silently render a different mode.
 - Rotated raster output must keep `RenderedTextImage.rgba` in unmultiplied RGBA order
   with a valid `width * height * 4` buffer.
+- `TextRenderParams.raster_transform` (vector mesh warp) IS honored on BOTH functions
+  here (`render_text_with_formula_layout_once` for Formula/Shape,
+  `render_text_with_drawn_lines_layout_once` for custom raster/vector lines). Each
+  captures a `warp_pre` (pre-global-rotation content box + centroid = mean of the
+  drawable placement centers, gated on `raster_transform.is_some()`) BEFORE
+  `rotate_placements_about_centroid` mutates the transforms, builds `MeshWarpContext`
+  with that box/centroid + `global_rotation_rad`, passes `Some(&ctx)` at the outline
+  seam, and grows bounds via `for_each_warped_bound_point`. For custom VECTOR lines a
+  non-identity warp DROPS the fixed output canvas (like a global rotation) and grows to
+  the warped bounds so nothing clips; its normalization box is the fixed canvas dims
+  when honored, else the content bounds. `None`/identity is byte-identical; the
+  color-glyph bitmap fallback does not warp.
 - The on-path glyph transform has a single source of truth (`drawn_line_transform_at` +
   `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the ink-distance
   search, and `placed_contour_for_transform` all build the outline->world placement with

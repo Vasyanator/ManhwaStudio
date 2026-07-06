@@ -179,6 +179,43 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (Ctrl+wheel), so a positive degree value turns text the same visual direction.
   It does NOT affect layout text, so it is excluded from
   `TextRenderShapeCompareParams` (like `anti_aliasing`).
+- `TextRenderParams.raster_transform` (`Option<VectorMeshWarp>`) is a VECTOR
+  mesh warp applied to glyph OUTLINES at the single rasterizer vertex seam
+  (`vector::rasterize_outline_into`, `world = transform.apply(local)`), inserted
+  AFTER per-glyph placement (path/formula/cell + group/inline rotation, already
+  baked into the `GlyphTransform`) but BEFORE global rotation and rasterization.
+  Normalization frame is the PRE-warp, PRE-global-rotation content AABB (`box`)
+  the renderer already computes from the laid-out placements. `VectorMeshWarp`
+  is a `cols x rows` lattice; `points_norm[i*cols+j]` is the warped normalized
+  position of the node whose identity position is `(j/(cols-1), i/(rows-1))`.
+  A point is bilinearly interpolated over `box` (points outside `[0,1]` clamp to
+  the edge cell). Order at the seam is peel->warp->reapply:
+  `world0 = R^-1(world about centroid C)` (peel global rotation), warp `world0`
+  over `box`, `world = R(warped about C)` (reapply) — all via
+  `vector::MeshWarpContext` (built once per render). `None`, an identity mesh,
+  an invalid mesh, or a degenerate box take the BYTE-IDENTICAL fast path (`None`
+  at the seam, no extra float work). Canvas bounds grow to the warped+rotated
+  lattice-node extent (`MeshWarpContext::for_each_warped_bound_point` ->
+  `PixelBounds::include_point`) so a strong outward warp never clips. Like
+  `global_rotation_deg`/`anti_aliasing` it does not affect layout, so it is
+  excluded from `TextRenderShapeCompareParams`. It is wired on EVERY layout mode:
+  horizontal (Normal + `render_horizontal_rotated` in `pipeline.rs`), vertical
+  (`layout/vertical.rs`), formula/on-path + `Shape` and custom raster/vector lines
+  (`formula/render.rs`). Each path captures its OWN pre-global-rotation content
+  box + rotation centroid BEFORE it applies the global rotation, then passes
+  `Some(&ctx)` at its `rasterize_outline_into` seam and grows its bounds via
+  `for_each_warped_bound_point`; the centroid/angle passed to
+  `MeshWarpContext::new` are exactly the pivot/angle that path's
+  `apply_global_rotation`/`rotate_placements_about_centroid`/vertical block
+  rotation uses, so the peel/reapply is exact. Custom VECTOR lines normally emit a
+  FIXED output canvas; a non-identity warp drops that fixed canvas (like a global
+  rotation) and grows to the warped bounds so an outward warp never clips. The
+  color-glyph BITMAP fallback on every path does NOT warp (only the monochrome
+  outline seam does), matching the horizontal template. `raster_transform: None`
+  or an identity mesh stays byte-identical on all paths (the pre-box capture is
+  gated on `raster_transform.is_some()` and `MeshWarpContext::new` returns `None`
+  for identity/invalid/degenerate). Production overlays wire it through the on-canvas
+  VECTOR transform mode (`src/tabs/typing/tab/vector_transform.rs`).
 - `TextRenderParams.line_placement_percent` (`[-100, 100]`, default 0) places
   each glyph PERPENDICULAR to the line/path at the vector level: `0` centers the
   glyph ink on the line, `+100` rests it ABOVE (сверху, ink bottom on the line),

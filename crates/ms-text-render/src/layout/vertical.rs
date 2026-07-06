@@ -35,6 +35,13 @@ bounds, optical spacing and visual-width measurement stay swash-bitmap based, so
 switching the draw is AA-only. Only COLR/bitmap color glyphs (no monochrome
 outline) fall back to the `raster.rs` bitmap blit.
 
+Mesh warp (`TextRenderParams.raster_transform`):
+Honored on the outline draw seam. The bounds pass captures the un-rotated scaled
+`pre_box` (gated on `raster_transform.is_some()`); `MeshWarpContext::new`
+normalizes over it and peels/reapplies the SAME `global_rotation_rad` +
+`vertical_layout_centroid` the draw uses, so the warp is exact. `None`/identity is
+byte-identical; the color-glyph bitmap fallback is not warped.
+
 Source:
 - `render_vertical_text`
 - `collect_vertical_render_columns`
@@ -66,7 +73,8 @@ use crate::types::{
     KerningMode, RenderedTextImage, TextRenderParams, VerticalLineDirection,
 };
 use crate::vector::{
-    OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
+    MeshWarpContext, OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline,
+    rasterize_outline_into,
 };
 use cosmic_text::{Buffer, FontSystem, LayoutGlyph, SwashCache};
 
@@ -199,6 +207,12 @@ pub(crate) fn render_vertical_text(
         (0.0, 0.0)
     };
 
+    // A mesh warp normalizes over the PRE-global-rotation content box in layout
+    // space, so capture the un-rotated scaled-glyph AABB in `pre_box` alongside the
+    // (possibly rotated) `bounds`. Gated on `raster_transform` so the no-warp fast
+    // path does no extra work and stays byte-identical.
+    let want_warp = params.raster_transform.is_some();
+    let mut pre_box = PixelBounds::empty();
     let mut bounds = PixelBounds::empty();
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
@@ -233,6 +247,18 @@ pub(crate) fn render_vertical_text(
             };
             let x = physical.x + image.placement.left;
             let y = physical.y - image.placement.top;
+            if want_warp {
+                // Un-rotated scaled glyph box (the same math the non-rotated bounds
+                // branch uses) — this is the warp's normalization frame.
+                include_scaled_rect_bounds(
+                    &mut pre_box,
+                    x as f32,
+                    y as f32,
+                    image.placement.width as f32,
+                    image.placement.height as f32,
+                    *glyph_scale,
+                );
+            }
             if rotate_block {
                 // Rotate the glyph's (unscaled==scaled) center about the centroid,
                 // then account for the rotated scaled rect so the canvas grows.
@@ -276,6 +302,33 @@ pub(crate) fn render_vertical_text(
             u32::try_from(width_px).unwrap_or(1),
             base_line_height_px.ceil().max(1.0) as u32,
         ));
+    }
+
+    // Optional vector mesh warp. Normalize over the PRE-global-rotation content box
+    // (`pre_box`) and peel/reapply the SAME global rotation the bounds/draw passes
+    // use (`global_rotation_rad` about `vertical_layout_centroid`). `None`, an
+    // identity/invalid mesh, or a degenerate box take the byte-identical fast path.
+    let warp_ctx = params.raster_transform.as_ref().and_then(|warp| {
+        if !pre_box.initialized {
+            return None;
+        }
+        let box_min = [pre_box.min_x as f32, pre_box.min_y as f32];
+        let box_size = [
+            (pre_box.max_x - pre_box.min_x) as f32,
+            (pre_box.max_y - pre_box.min_y) as f32,
+        ];
+        MeshWarpContext::new(
+            warp,
+            box_min,
+            box_size,
+            global_rotation_rad,
+            [centroid_x, centroid_y],
+        )
+    });
+    // Grow the canvas to the warped+rotated lattice extent so a strong outward warp
+    // never clips (no-op for `None`/identity).
+    if let Some(ctx) = warp_ctx.as_ref() {
+        ctx.for_each_warped_bound_point(|x, y| bounds.include_point(x, y));
     }
 
     let horizontal_pad = 2u32;
@@ -384,6 +437,7 @@ pub(crate) fn render_vertical_text(
                     &transform,
                     *text_color,
                     &aa_lut,
+                    warp_ctx.as_ref(),
                 );
                 continue;
             }
@@ -1210,6 +1264,7 @@ mod tests {
             anti_aliasing: AntiAliasingMode::Smooth,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            raster_transform: None,
         }
     }
 

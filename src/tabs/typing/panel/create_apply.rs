@@ -168,6 +168,9 @@ impl TypingCreatePanelState {
         {
             self.global_rotation_deg = global_rotation_deg;
         }
+        // Carry the canvas-authored vector mesh warp verbatim so it survives an
+        // edit (the panel rebuilds render_data on every change). Absent -> None.
+        self.pending_raster_transform = text_params_obj.get("raster_transform").cloned();
         // Absent in projects saved before perpendicular line placement -> keep 0.0.
         if let Some(line_placement_percent) = text_params_obj
             .get("line_placement_percent")
@@ -587,6 +590,12 @@ impl TypingCreatePanelState {
             align: self.align,
             global_rotation_deg: self.global_rotation_deg,
             line_placement_percent: self.line_placement_percent,
+            // Decode the carried canvas-authored warp (Phase 3) for the live
+            // preview render; absent/invalid -> None (identity / no warp).
+            raster_transform: self
+                .pending_raster_transform
+                .as_ref()
+                .and_then(decode_vector_mesh_warp),
             text_line_mode: self.text_line_mode,
             vertical_line_direction: self.vertical_line_direction,
             text_layout_mode: self.text_layout_mode,

@@ -74,8 +74,8 @@ use super::raster::{
     rotate_placements_about_centroid, trim_rendered_image_to_alpha_bounds,
 };
 use super::vector::{
-    Outline, OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline,
-    rasterize_outline_into,
+    MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
+    glyph_contour_from_outline, rasterize_outline_into,
 };
 use super::types::{
     HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
@@ -876,6 +876,25 @@ pub fn render_text_to_image(
         ));
     }
 
+    // Optional vector mesh warp: normalize over the UNWARPED content box just
+    // computed (the pre-warp, pre-global-rotation layout AABB). The Normal path
+    // never carries a global rotation (that routes to `render_horizontal_rotated`),
+    // so the peel/reapply angle is 0 and the centroid is unused. The warp context
+    // is `None` (byte-identical fast path) for `None`/identity/invalid meshes.
+    let warp_ctx = params.raster_transform.as_ref().and_then(|warp| {
+        let box_min = [bounds.min_x as f32, bounds.min_y as f32];
+        let box_size = [
+            (bounds.max_x - bounds.min_x) as f32,
+            (bounds.max_y - bounds.min_y) as f32,
+        ];
+        MeshWarpContext::new(warp, box_min, box_size, 0.0, [0.0, 0.0])
+    });
+    // Grow the canvas bounds to the warped extent so a strong outward warp never
+    // clips (identity/None leaves `bounds` untouched).
+    if let Some(ctx) = warp_ctx.as_ref() {
+        ctx.for_each_warped_bound_point(|x, y| bounds.include_point(x, y));
+    }
+
     let left_overhang = u32::try_from((-bounds.min_x).max(0)).unwrap_or(0);
     let right_overhang = u32::try_from((bounds.max_x - width_px as i32).max(0)).unwrap_or(0);
     let horizontal_pad = 2u32;
@@ -913,6 +932,7 @@ pub fn render_text_to_image(
             x_offset,
             y_offset,
             &aa_lut,
+            warp_ctx.as_ref(),
         );
     }
 
@@ -1022,7 +1042,9 @@ fn build_horizontal_placement(
 /// Color/emoji glyphs (captured `fallback`) keep the bitmap blit (identity or
 /// center-scaled). `aa_lut` is the coverage->alpha transfer table applied only on
 /// the outline path; the bitmap fallback is unaffected. `scratch` supplies the
-/// reused per-glyph rasterizer buffers.
+/// reused per-glyph rasterizer buffers. `warp` is the optional vector mesh warp,
+/// applied only on the outline path (the bitmap fallback is not warped in
+/// Phase 1); `None` keeps the byte-identical fast path.
 // The draw call naturally carries the scratch, canvas target + dimensions, the
 // collected placement, the bounds-derived offsets and the AA table; splitting
 // them would only obscure the 1:1 mapping to `rasterize_outline_into`.
@@ -1036,6 +1058,7 @@ fn draw_horizontal_placement(
     x_offset: i32,
     y_offset: i32,
     aa_lut: &[u8; 256],
+    warp: Option<&MeshWarpContext>,
 ) {
     let glyph_w = placement.glyph_w;
     let glyph_h = placement.glyph_h;
@@ -1073,6 +1096,7 @@ fn draw_horizontal_placement(
             &transform,
             placement.text_color,
             aa_lut,
+            warp,
         );
         return;
     }
@@ -1444,11 +1468,60 @@ fn render_horizontal_rotated(
 
     apply_rotated_group_rotations(&mut placements);
 
+    // Optional vector mesh warp. It normalizes over the PRE-global-rotation
+    // layout box (placements carry their group/inline rotation here but NOT yet
+    // the global rotation) and is peeled/reapplied around the same global-rotation
+    // centroid that `apply_global_rotation` uses. Both the box AABB and the
+    // centroid must be captured BEFORE the global rotation is applied.
+    let global_rotation_rad = if global_rotation_deg.abs() > f32::EPSILON {
+        global_rotation_deg.to_radians()
+    } else {
+        0.0
+    };
+    let warp_ctx = params.raster_transform.as_ref().and_then(|warp| {
+        let mut pre_box = PixelBounds::empty();
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        for placement in &placements {
+            let (scaled_left, scaled_top, scaled_width, scaled_height) = placement
+                .scale
+                .scaled_rect(
+                    placement.src_left,
+                    placement.src_top,
+                    placement.glyph_w as f32,
+                    placement.glyph_h as f32,
+                );
+            include_rotated_rect_bounds(
+                &mut pre_box,
+                scaled_left,
+                scaled_top,
+                scaled_width,
+                scaled_height,
+                placement.center_x,
+                placement.center_y,
+                placement.rotation_rad,
+            );
+            sum_x += placement.center_x;
+            sum_y += placement.center_y;
+        }
+        if !pre_box.initialized || placements.is_empty() {
+            return None;
+        }
+        let count = placements.len() as f32;
+        let centroid = [sum_x / count, sum_y / count];
+        let box_min = [pre_box.min_x as f32, pre_box.min_y as f32];
+        let box_size = [
+            (pre_box.max_x - pre_box.min_x) as f32,
+            (pre_box.max_y - pre_box.min_y) as f32,
+        ];
+        MeshWarpContext::new(warp, box_min, box_size, global_rotation_rad, centroid)
+    });
+
     // Глобальный поворот: жёстко вращаем ВСЕ размещения вокруг центроида всей
     // раскладки. Делается после групповых поворотов и ДО расчёта bbox/размера
     // холста, поэтому изображение само вырастает под повёрнутые границы.
     if global_rotation_deg.abs() > f32::EPSILON {
-        apply_global_rotation(&mut placements, global_rotation_deg.to_radians());
+        apply_global_rotation(&mut placements, global_rotation_rad);
     }
 
     let mut bounds = PixelBounds::empty();
@@ -1469,6 +1542,11 @@ fn render_horizontal_rotated(
             placement.center_y,
             placement.rotation_rad,
         );
+    }
+    // Grow the canvas to the warped extent (peel->warp->reapply of the lattice
+    // nodes) so a strong outward warp never clips. No-op for `None`/identity.
+    if let Some(ctx) = warp_ctx.as_ref() {
+        ctx.for_each_warped_bound_point(|x, y| bounds.include_point(x, y));
     }
     if !bounds.initialized {
         return Ok(RenderedTextImage::transparent(
@@ -1519,6 +1597,7 @@ fn render_horizontal_rotated(
                 &transform,
                 placement.text_color,
                 &aa_lut,
+                warp_ctx.as_ref(),
             );
             continue;
         }
@@ -2556,7 +2635,7 @@ mod tests {
         TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
         TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
         TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
-        VerticalLineDirection,
+        VectorMeshWarp, VerticalLineDirection,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2611,6 +2690,7 @@ mod tests {
             anti_aliasing: AntiAliasingMode::Smooth,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            raster_transform: None,
         }
     }
 
@@ -2718,6 +2798,353 @@ mod tests {
         assert!(rendered.width > 0);
         assert!(rendered.height > 0);
         assert!(rendered.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    /// Build a `cols x rows` identity mesh (every node at its identity position).
+    fn identity_mesh(cols: usize, rows: usize) -> VectorMeshWarp {
+        let mut points_norm = Vec::with_capacity(cols * rows);
+        for i in 0..rows {
+            for j in 0..cols {
+                points_norm.push([j as f32 / (cols - 1) as f32, i as f32 / (rows - 1) as f32]);
+            }
+        }
+        VectorMeshWarp {
+            cols,
+            rows,
+            // 0 => exercise the LIVE pre-warp-bounds normalization (Phase 1 path); the explicit
+            // src-dims (Design B) path is unit-tested in `vector.rs`.
+            src_width_px: 0.0,
+            src_height_px: 0.0,
+            points_norm,
+        }
+    }
+
+    /// Full inked-alpha bounding box `(min_x, min_y, max_x, max_y)` in pixels.
+    fn alpha_box(width: u32, height: u32, rgba: &[u8]) -> Option<(usize, usize, usize, usize)> {
+        let (width, height) = (width as usize, height as usize);
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (width, height, 0usize, 0usize);
+        let mut found = false;
+        for y in 0..height {
+            for x in 0..width {
+                if rgba[(y * width + x) * 4 + 3] == 0 {
+                    continue;
+                }
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+        found.then_some((min_x, min_y, max_x, max_y))
+    }
+
+    /// Count of inked (alpha > 0) pixels.
+    fn inked_pixels(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
+    }
+
+    #[test]
+    fn mesh_warp_none_and_identity_are_byte_identical() {
+        // Contract: `None` and an identity mesh both take the byte-identical fast
+        // path, so the output RGBA equals a plain render exactly.
+        let base = base_params();
+        let plain = render_text_to_image(&base, None).expect("plain render");
+
+        let mut identity = base.clone();
+        identity.raster_transform = Some(identity_mesh(13, 13));
+        let warped = render_text_to_image(&identity, None).expect("identity-warp render");
+
+        assert_eq!(
+            (plain.width, plain.height),
+            (warped.width, warped.height),
+            "identity warp must not change canvas size"
+        );
+        assert_eq!(
+            plain.rgba, warped.rgba,
+            "identity warp must be byte-identical to no warp"
+        );
+    }
+
+    #[test]
+    fn mesh_warp_single_corner_grows_canvas_and_shifts_coverage() {
+        // Push the bottom-right lattice node outward (beyond the box). The warped
+        // content must extend farther right/down than the un-warped render, and the
+        // canvas must grow to hold it (no clipping).
+        let base = base_params();
+        let plain = render_text_to_image(&base, None).expect("plain render");
+        let (_, _, plain_max_x, plain_max_y) =
+            alpha_box(plain.width, plain.height, &plain.rgba).expect("plain has ink");
+
+        let mut mesh = identity_mesh(13, 13);
+        let last = mesh.points_norm.len() - 1; // bottom-right node (i=12, j=12).
+        mesh.points_norm[last] = [1.35, 1.35];
+        let mut params = base.clone();
+        params.raster_transform = Some(mesh);
+        let warped = render_text_to_image(&params, None).expect("corner-warp render");
+        let (_, _, warped_max_x, warped_max_y) =
+            alpha_box(warped.width, warped.height, &warped.rgba).expect("warped has ink");
+
+        // Canvas grew in at least one dimension to accommodate the outward warp.
+        assert!(
+            warped.width > plain.width || warped.height > plain.height,
+            "canvas must grow: plain {}x{}, warped {}x{}",
+            plain.width,
+            plain.height,
+            warped.width,
+            warped.height
+        );
+        // Coverage shifted outward (down-right): warped ink reaches farther.
+        assert!(
+            warped_max_x >= plain_max_x && warped_max_y > plain_max_y,
+            "warped ink must reach farther down-right: plain ({plain_max_x},{plain_max_y}) \
+             warped ({warped_max_x},{warped_max_y})"
+        );
+        // No clipping: the trimmed content keeps a transparent border on all sides
+        // (trim pads by 1px), so the farthest ink is strictly inside the canvas.
+        assert!(
+            (warped_max_x as u32) < warped.width - 1 && (warped_max_y as u32) < warped.height - 1,
+            "warped ink must not touch the canvas edge (would indicate clipping)"
+        );
+    }
+
+    #[test]
+    fn mesh_warp_pure_translation_shifts_without_shape_change() {
+        // A translation-equivalent mesh (all nodes shifted by a constant) moves the
+        // content without deforming it: the trimmed content size and inked pixel
+        // count match the un-warped render, but the pre-trim placement shifts.
+        let base = base_params();
+        let plain = render_text_to_image(&base, None).expect("plain render");
+        let (px0, py0, px1, py1) =
+            alpha_box(plain.width, plain.height, &plain.rgba).expect("plain ink");
+        let plain_w = px1 - px0;
+        let plain_h = py1 - py0;
+
+        // Shift every node right+down by a constant normalized offset.
+        let mut mesh = identity_mesh(13, 13);
+        for node in &mut mesh.points_norm {
+            node[0] += 0.25;
+            node[1] += 0.15;
+        }
+        let mut params = base.clone();
+        params.raster_transform = Some(mesh);
+        let warped = render_text_to_image(&params, None).expect("translation-warp render");
+        let (wx0, wy0, wx1, wy1) =
+            alpha_box(warped.width, warped.height, &warped.rgba).expect("warped ink");
+        let warped_w = wx1 - wx0;
+        let warped_h = wy1 - wy0;
+
+        // Shape (trimmed extent) is preserved within a small AA/rounding tolerance.
+        assert!(
+            (warped_w as i32 - plain_w as i32).abs() <= 2,
+            "translated content width must be unchanged: plain {plain_w}, warped {warped_w}"
+        );
+        assert!(
+            (warped_h as i32 - plain_h as i32).abs() <= 2,
+            "translated content height must be unchanged: plain {plain_h}, warped {warped_h}"
+        );
+        // Ink mass is preserved (a shift that clipped would drop inked pixels).
+        let (plain_ink, warped_ink) = (inked_pixels(&plain.rgba), inked_pixels(&warped.rgba));
+        let tolerance = plain_ink / 20 + 4; // 5% + slack for AA at the new subpixel phase.
+        assert!(
+            warped_ink.abs_diff(plain_ink) <= tolerance,
+            "translation must preserve ink mass (no clipping): plain {plain_ink}, warped {warped_ink}"
+        );
+    }
+
+    /// Push the bottom-right lattice node of a fresh 13x13 identity mesh outward by
+    /// `amount` (both axes) so the warp bulges the content down-right beyond the box.
+    fn corner_pushed_mesh(amount: f32) -> VectorMeshWarp {
+        let mut mesh = identity_mesh(13, 13);
+        let last = mesh.points_norm.len() - 1;
+        mesh.points_norm[last] = [1.0 + amount, 1.0 + amount];
+        mesh
+    }
+
+    #[test]
+    fn mesh_warp_applies_on_vertical_path() {
+        // Regression: the warp used to be ignored on the vertical path. Identity must
+        // stay byte-identical; a non-identity corner push must change the pixels and
+        // grow the trimmed canvas outward (down-right) without clipping.
+        let mut base = base_params();
+        base.text = "ТЕКСТ".to_string();
+        base.text_line_mode = TextLineMode::Vertical;
+        base.width_px = 120;
+        let plain = render_text_to_image(&base, None).expect("vertical plain render");
+        let (_, _, plain_max_x, plain_max_y) =
+            alpha_box(plain.width, plain.height, &plain.rgba).expect("vertical plain ink");
+
+        let mut identity = base.clone();
+        identity.raster_transform = Some(identity_mesh(13, 13));
+        let ident = render_text_to_image(&identity, None).expect("vertical identity render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (ident.width, ident.height, &ident.rgba),
+            "vertical identity warp must be byte-identical to no warp"
+        );
+
+        let mut warped_params = base.clone();
+        warped_params.raster_transform = Some(corner_pushed_mesh(0.35));
+        let warped = render_text_to_image(&warped_params, None).expect("vertical warp render");
+        assert_ne!(
+            (plain.width, plain.height, &plain.rgba),
+            (warped.width, warped.height, &warped.rgba),
+            "vertical non-identity warp must change the render"
+        );
+        let (_, _, warped_max_x, warped_max_y) =
+            alpha_box(warped.width, warped.height, &warped.rgba).expect("vertical warp ink");
+        assert!(
+            warped.width > plain.width || warped.height > plain.height,
+            "vertical warp must grow the canvas: plain {}x{} warped {}x{}",
+            plain.width,
+            plain.height,
+            warped.width,
+            warped.height
+        );
+        assert!(
+            warped_max_x >= plain_max_x && warped_max_y >= plain_max_y,
+            "vertical warp ink must reach at least as far down-right: plain \
+             ({plain_max_x},{plain_max_y}) warped ({warped_max_x},{warped_max_y})"
+        );
+        assert!(
+            (warped_max_x as u32) < warped.width - 1 && (warped_max_y as u32) < warped.height - 1,
+            "vertical warp ink must not touch the canvas edge (clipping)"
+        );
+    }
+
+    #[test]
+    fn mesh_warp_applies_on_formula_path() {
+        // Regression: the warp used to be ignored on the formula/on-path path.
+        let mut base = base_params();
+        base.text = "FORMULA".to_string();
+        base.width_px = 320;
+        base.text_layout_mode = TextLayoutMode::Formula;
+        base.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * w".to_string(),
+            y_expr: "0".to_string(),
+            rotation_expr: "0".to_string(),
+            use_tangent_rotation: false,
+            ..TextFormulaLayoutParams::default()
+        };
+        let plain = render_text_to_image(&base, None).expect("formula plain render");
+
+        let mut identity = base.clone();
+        identity.raster_transform = Some(identity_mesh(13, 13));
+        let ident = render_text_to_image(&identity, None).expect("formula identity render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (ident.width, ident.height, &ident.rgba),
+            "formula identity warp must be byte-identical to no warp"
+        );
+
+        let mut warped_params = base.clone();
+        warped_params.raster_transform = Some(corner_pushed_mesh(0.5));
+        let warped = render_text_to_image(&warped_params, None).expect("formula warp render");
+        assert_ne!(
+            (plain.width, plain.height, &plain.rgba),
+            (warped.width, warped.height, &warped.rgba),
+            "formula non-identity warp must change the render"
+        );
+        assert!(
+            warped.width > plain.width || warped.height > plain.height,
+            "formula warp must grow the canvas: plain {}x{} warped {}x{}",
+            plain.width,
+            plain.height,
+            warped.width,
+            warped.height
+        );
+        let (_, _, wmax_x, wmax_y) =
+            alpha_box(warped.width, warped.height, &warped.rgba).expect("formula warp ink");
+        assert!(
+            (wmax_x as u32) < warped.width - 1 && (wmax_y as u32) < warped.height - 1,
+            "formula warp ink must not touch the canvas edge (clipping)"
+        );
+    }
+
+    #[test]
+    fn mesh_warp_applies_on_shape_path() {
+        // `Shape` reuses the formula render path; the warp must apply there too.
+        let mut base = base_params();
+        base.text = "SHAPE PATH".to_string();
+        base.width_px = 240;
+        base.text_layout_mode = TextLayoutMode::Shape;
+        base.text_shape = TextShape::Free;
+        let plain = render_text_to_image(&base, None).expect("shape plain render");
+
+        let mut identity = base.clone();
+        identity.raster_transform = Some(identity_mesh(13, 13));
+        let ident = render_text_to_image(&identity, None).expect("shape identity render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (ident.width, ident.height, &ident.rgba),
+            "shape identity warp must be byte-identical to no warp"
+        );
+
+        let mut warped_params = base.clone();
+        warped_params.raster_transform = Some(corner_pushed_mesh(0.5));
+        let warped = render_text_to_image(&warped_params, None).expect("shape warp render");
+        assert_ne!(
+            (plain.width, plain.height, &plain.rgba),
+            (warped.width, warped.height, &warped.rgba),
+            "shape non-identity warp must change the render"
+        );
+    }
+
+    #[test]
+    fn mesh_warp_applies_on_vector_lines_path() {
+        // Regression: the warp used to be ignored on the custom-vector-lines path,
+        // which also uses a FIXED output canvas. Identity keeps that fixed canvas and
+        // stays byte-identical; a non-identity warp drops the fixed canvas (like a
+        // global rotation) and grows to the warped content bounds without clipping.
+        let mut base = base_params();
+        base.text = "VECTOR".to_string();
+        base.width_px = 260;
+        base.text_layout_mode = TextLayoutMode::CustomVectorLines;
+        base.vector_lines_layout = TextVectorLinesLayoutParams {
+            width_px: 260,
+            height_px: 100,
+            lines: vec![TextVectorLine {
+                points: vec![
+                    TextVectorPoint { x: 8.0, y: 50.0 },
+                    TextVectorPoint { x: 130.0, y: 50.0 },
+                    TextVectorPoint { x: 252.0, y: 50.0 },
+                ],
+                corner_smoothing_px: 16.0,
+                text_direction: TextVectorLineTextDirection::LeftToRight,
+                distance_mode: TextVectorLineDistanceMode::ByLineLength,
+                flip_text: false,
+            }],
+            ..TextVectorLinesLayoutParams::default()
+        };
+        let plain = render_text_to_image(&base, None).expect("vector-lines plain render");
+
+        let mut identity = base.clone();
+        identity.raster_transform = Some(identity_mesh(13, 13));
+        let ident = render_text_to_image(&identity, None).expect("vector-lines identity render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (ident.width, ident.height, &ident.rgba),
+            "vector-lines identity warp must keep the fixed canvas and stay byte-identical"
+        );
+
+        let mut warped_params = base.clone();
+        warped_params.raster_transform = Some(corner_pushed_mesh(0.5));
+        let warped = render_text_to_image(&warped_params, None).expect("vector-lines warp render");
+        assert_ne!(
+            (plain.width, plain.height, &plain.rgba),
+            (warped.width, warped.height, &warped.rgba),
+            "vector-lines non-identity warp must change the render"
+        );
+        assert!(
+            warped.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "vector-lines warp must still ink pixels"
+        );
+        let (_, _, wmax_x, wmax_y) =
+            alpha_box(warped.width, warped.height, &warped.rgba).expect("vector-lines warp ink");
+        assert!(
+            (wmax_x as u32) < warped.width - 1 && (wmax_y as u32) < warped.height - 1,
+            "vector-lines warp ink must not touch the canvas edge (clipping)"
+        );
     }
 
     #[test]

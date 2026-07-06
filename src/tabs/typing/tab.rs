@@ -86,7 +86,7 @@ use super::render_next::types::{
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
     TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
     TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
-    VerticalLineDirection,
+    VectorMeshWarp, VerticalLineDirection,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
@@ -123,6 +123,9 @@ mod export;
 pub(super) use export::*;
 mod codec;
 use codec::*;
+// Re-export the vector-mesh-warp decoder at the tab level so the sibling `panel`
+// module can decode a carried `raster_transform` for its live preview render.
+pub(in crate::tabs::typing) use codec::decode_vector_mesh_warp;
 mod mesh_geometry;
 use mesh_geometry::*;
 mod render_store;
@@ -135,6 +138,7 @@ mod render_jobs;
 mod selection_rasters;
 mod autotype;
 mod draw_page;
+mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
 mod helpers;
@@ -241,6 +245,19 @@ impl TypingDeformMode {
     fn is_brush_mode(self) -> bool {
         !self.is_handle_mode()
     }
+}
+
+/// Which flavour of on-canvas transform mode the selected overlay is in.
+///
+/// `transform_mode_overlay_idx` says WHICH overlay is in transform mode; this says whether the drag
+/// edits the RASTER post-process `deform_mesh` (baked on top of the PNG, unchanged legacy path) or the
+/// VECTOR mesh warp (`render_data.text_params.raster_transform`, baked into the PNG by re-rendering).
+/// The two are independent and compose. Defaults to `Raster`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum TypingTransformModeKind {
+    #[default]
+    Raster,
+    Vector,
 }
 
 #[derive(Debug, Clone)]
@@ -444,6 +461,7 @@ impl TypingTabState {
         needs_repaint |= self.text_overlays.poll_create_raster_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_raster_effects_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_edit_overlay_jobs(ctx);
+        needs_repaint |= self.text_overlays.poll_vector_transform_base_render(ctx);
         needs_repaint |= self.text_overlays.poll_save_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_export_jobs(ctx);
         needs_repaint |= self.mask_layer.poll_loader(ctx);
@@ -1132,6 +1150,47 @@ struct TypingShapeVariant {
     shape_variant: u8,
 }
 
+/// Cached UN-WARPED base image for the live VECTOR-transform GPU preview (Phase 3b).
+///
+/// Held only while a vector-transform session is active. The base is the overlay rendered WITHOUT
+/// its `raster_transform`, so warping it onto the working mesh maps un-warped → warped exactly once
+/// (texturing the already-warped baked PNG would double-warp). It is a reconstructable GPU cache:
+/// `rgba` is kept resident so `texture` can be re-uploaded after a memory-pressure eviction, and the
+/// whole base can be re-rendered if lost.
+struct TypingVectorTransformBaseTexture {
+    /// Overlay this base was rendered for; used to reject a stale base after the transform target
+    /// changes.
+    overlay_idx: usize,
+    size_px: [usize; 2],
+    /// Straight (un-premultiplied) RGBA of the un-warped render (`width * height * 4`). Kept resident
+    /// so the texture can be re-uploaded without a re-render.
+    rgba: Vec<u8>,
+    /// GPU texture uploaded lazily on the GUI thread; `None` ⇒ needs (re)upload from `rgba`.
+    texture: Option<egui::TextureHandle>,
+}
+
+/// Result of the one-off un-warped base render for the vector-transform preview.
+struct TypingVectorBaseRenderResult {
+    /// Cancellation token this render was issued with; compared against the latest token on poll so a
+    /// superseded render is dropped.
+    token: u64,
+    overlay_idx: usize,
+    size_px: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+/// Worker request for the one-off un-warped base render (see `TypingVectorTransformBaseTexture`).
+///
+/// No output path is carried: this render is a transient GPU-cache preview and is never written to
+/// disk, and vector transform is only offered for layouts that need no adjacent layout-image file.
+struct TypingVectorBaseRenderRequest {
+    token: u64,
+    latest_token: Arc<AtomicU64>,
+    overlay_idx: usize,
+    /// Render params built from the overlay's `render_data` with `raster_transform` already CLEARED.
+    render_params: TextRenderParams,
+}
+
 struct TypingShapeVariantPreviewTile {
     variant: TypingShapeVariant,
     size_px: [usize; 2],
@@ -1401,6 +1460,21 @@ struct TypingOverlayDragState {
     start_mesh: TypingOverlayDeformMesh,
 }
 
+/// Active drag while editing the VECTOR transform working mesh (Phase 3a). Separate from
+/// `TypingOverlayDragState` (which drives the overlay's placement / raster deform mesh) so the two
+/// transform kinds never share drag state. `start_mesh` is the working mesh snapshot at drag start
+/// (page px); `mode` reuses the deform drag modes (only the handle / brush / whole-mesh-move variants
+/// are produced for a vector edit — no page transitions or rotate handle).
+#[derive(Debug, Clone)]
+struct TypingVectorTransformDragState {
+    overlay_idx: usize,
+    page_idx: usize,
+    pointer_start_scene: Pos2,
+    mode: TypingOverlayDragMode,
+    start_mesh: TypingOverlayDeformMesh,
+    has_changes: bool,
+}
+
 type TypingOverlayLoadResponse = (PathBuf, Result<Vec<TypingOverlayDecoded>, String>);
 
 /// Eager-migration request payload captured at chapter open:
@@ -1442,6 +1516,32 @@ pub(super) struct TypingTextOverlayLayer {
     last_load_error: Option<String>,
     selected_overlay_idx: Option<usize>,
     transform_mode_overlay_idx: Option<usize>,
+    /// Whether the overlay in `transform_mode_overlay_idx` edits the RASTER post-process mesh or the
+    /// VECTOR mesh warp (Phase 3a). Meaningful only while `transform_mode_overlay_idx.is_some()`; reset
+    /// to `Raster` whenever transform mode is left.
+    transform_mode_kind: TypingTransformModeKind,
+    /// Transient working mesh (13x13 page px) for a VECTOR transform edit. Held only while a vector
+    /// transform session is active; NOT the runtime `deform_mesh` (that stays the raster post-process
+    /// mesh). Reused across frames so a drag can snapshot it; converted to normalized `points_norm` and
+    /// baked via re-render on settle.
+    vector_transform_mesh: Option<TypingOverlayDeformMesh>,
+    /// Source-rect size in CONTENT px used to normalize the vector working mesh (captured on enter:
+    /// the stored `raster_transform` src dims if valid, else the un-warped baked PNG `size_px`). Both
+    /// the seed and settle conversions normalize over these dims so the UI and renderer (Design B)
+    /// agree.
+    vector_transform_src_px: [f32; 2],
+    /// Active vector-transform drag, if any.
+    vector_transform_drag: Option<TypingVectorTransformDragState>,
+    /// Un-warped base texture for the live vector-transform GPU preview (Phase 3b). Rendered once on
+    /// ENTER (or reused from the overlay's current un-warped `source_rgba` when it has no stored warp),
+    /// then warped onto the working mesh during a drag. `None` until ready; a reconstructable GPU cache.
+    vector_transform_base: Option<TypingVectorTransformBaseTexture>,
+    /// In-flight one-off render of the un-warped base for the vector preview. Present only while the
+    /// base render is running; polled by `poll_vector_transform_base_render`.
+    vector_transform_base_rx: Option<Receiver<Result<Option<TypingVectorBaseRenderResult>, String>>>,
+    /// Monotonic cancellation token for the un-warped base render: every request bumps it, so a
+    /// superseded worker (re-enter / target change) sees its token is stale and returns nothing.
+    vector_base_render_token: Arc<AtomicU64>,
     /// Raster analogue of `transform_mode_overlay_idx`: the selected raster (index into
     /// `raster_layers_by_page[page]`) currently in deform/perspective transform mode, if any. Mutually
     /// exclusive with overlay transform mode.
@@ -1553,6 +1653,13 @@ impl Default for TypingTextOverlayLayer {
             last_load_error: None,
             selected_overlay_idx: None,
             transform_mode_overlay_idx: None,
+            transform_mode_kind: TypingTransformModeKind::default(),
+            vector_transform_mesh: None,
+            vector_transform_src_px: [1.0, 1.0],
+            vector_transform_drag: None,
+            vector_transform_base: None,
+            vector_transform_base_rx: None,
+            vector_base_render_token: Arc::new(AtomicU64::new(0)),
             transform_mode_raster_idx: None,
             layout_editor: None,
             deform_mode: TypingDeformMode::Perspective,

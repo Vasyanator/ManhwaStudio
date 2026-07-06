@@ -208,6 +208,48 @@ impl PxOrPercent {
     }
 }
 
+/// Vector mesh warp ("raster-transformation") applied to glyph OUTLINES while
+/// still vector — a lattice deformation inserted AFTER per-glyph layout but
+/// BEFORE the global rotation and rasterization, so warped text stays crisp.
+///
+/// The lattice is a `cols x rows` grid. `points_norm` is row-major with
+/// `len == cols * rows`; `points_norm[i*cols + j]` is the WARPED normalized
+/// position of the node whose IDENTITY (undeformed) normalized position is
+/// `(j/(cols-1), i/(rows-1))`. An identity mesh (every node equal to its
+/// identity position) is a no-op and renders byte-identically to `None`.
+///
+/// Normalization frame: the ORIGIN is the axis-aligned bounding box top-left of
+/// the laid-out glyph placements BEFORE global rotation and BEFORE the warp (the
+/// same content bounds the renderer already computes prior to drawing). The box
+/// SIZE is `src_width_px`/`src_height_px` when both are valid (`> 0`, Design B),
+/// else the live pre-warp bounds size. A point `P` in that pre-global-rotation
+/// layout space is normalized `n = ((P.x-box.min.x)/box.w, (P.y-box.min.y)/box.h)`,
+/// its lattice coords `n * (cols-1, rows-1)` are clamped into the grid, the four
+/// surrounding nodes are bilinearly interpolated to a warped normalized
+/// `(wu, wv)`, and it is denormalized back to
+/// `(box.min.x + wu*box.w, box.min.y + wv*box.h)`. Points outside `[0, 1]` clamp
+/// to the edge cell (no extrapolation).
+///
+/// `src_width_px`/`src_height_px` are the source-rect the mesh was authored over.
+/// Honoring them as the normalization-box SIZE makes the on-canvas authoring UI
+/// (which normalizes handle positions against these dims) and the renderer agree.
+/// When absent/`0`, the renderer falls back to the live pre-warp box size.
+#[derive(Debug, Clone)]
+pub struct VectorMeshWarp {
+    /// Grid columns (`>= 2`, typically 13).
+    pub cols: usize,
+    /// Grid rows (`>= 2`, typically 13).
+    pub rows: usize,
+    /// Authored source-rect width in px. When `> 0` (and finite) it is the warp
+    /// normalization-box WIDTH (Design B); `0`/absent -> live pre-warp box width.
+    pub src_width_px: f32,
+    /// Authored source-rect height in px. When `> 0` (and finite) it is the warp
+    /// normalization-box HEIGHT (Design B); `0`/absent -> live pre-warp box height.
+    pub src_height_px: f32,
+    /// Row-major warped normalized node positions, `len == cols * rows`.
+    pub points_norm: Vec<[f32; 2]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextRenderParams {
     pub text: String,
@@ -260,6 +302,12 @@ pub struct TextRenderParams {
     /// ABOVE the line (сверху, ink bottom on the line), `-100` BELOW it (снизу,
     /// ink top on the line). Applied along the path normal at the vector level.
     pub line_placement_percent: f32,
+    /// Optional vector mesh warp applied to glyph outlines after per-glyph
+    /// layout and before global rotation/rasterization (see [`VectorMeshWarp`]).
+    /// `None` (and an identity mesh) render byte-identically to no warp. Phase 1
+    /// honors it on the horizontal path (Normal, and the rotated variant); other
+    /// layout modes currently ignore it.
+    pub raster_transform: Option<VectorMeshWarp>,
 }
 
 #[derive(Debug, Clone)]

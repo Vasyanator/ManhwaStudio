@@ -17,6 +17,15 @@ Glyph rasterization (formula + custom-line composite pass):
 - COLR/bitmap color glyphs have no monochrome outline (`resolve_glyph_outline`
   returns `None`); those keep the legacy rotated bitmap blit.
 
+Mesh warp (`TextRenderParams.raster_transform`):
+Both render functions honor it at the outline seam. Each captures `warp_pre`
+(pre-global-rotation content box + centroid = mean of the drawable placement
+centers, gated on `raster_transform.is_some()`) BEFORE
+`rotate_placements_about_centroid`, then builds `MeshWarpContext` and grows bounds.
+Custom VECTOR lines drop their FIXED canvas on a non-identity warp (like a global
+rotation) and grow to the warped bounds. `None`/identity is byte-identical; the
+color-glyph bitmap fallback is not warped.
+
 Glyph-ink spacing (MinimumPreviousDistance mode):
 - `seed_ink_geometry`/`CachedGlyphInk` derive a glyph's ink contour from its outline
   (`glyph_contour_from_outline`, cached by cosmic-text `CacheKey`) plus a horizontal
@@ -51,8 +60,8 @@ use crate::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance,
 };
 use crate::vector::{
-    Outline, OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline,
-    rasterize_outline_into,
+    MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
+    glyph_contour_from_outline, rasterize_outline_into,
 };
 use crate::inline_styles::{
     InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
@@ -481,6 +490,65 @@ fn render_text_with_drawn_lines_layout_once(
     // about the layout centroid before bounds/draw, so the whole custom-line block
     // turns as one — matching the Ctrl+wheel overlay post-rotation, only crisper.
     let global_rotation_rad = params.global_rotation_deg.to_radians();
+    // Capture the PRE-global-rotation content box + rotation centroid for an optional
+    // mesh warp, BEFORE `rotate_placements_about_centroid` mutates the transforms in
+    // place. The centroid is the mean of the drawable (Some) placement centers —
+    // exactly the pivot the rotation pass computes — so the warp peels/reapplies the
+    // same global rotation. Gated on `raster_transform` so the fast path is untouched.
+    let warp_pre = if params.raster_transform.is_some() {
+        let mut pre_box = PixelBounds::empty();
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let mut count = 0u32;
+        for (seed, transform) in seeds.iter().zip(transforms.iter()) {
+            let Some(transform) = transform else {
+                continue;
+            };
+            let (cx, cy) = transform.placement_center();
+            sum_x += cx;
+            sum_y += cy;
+            count += 1;
+            let physical = seed.glyph.physical(
+                (
+                    seed.origin_x + seed.glyph_offset_px[0],
+                    seed.origin_y + seed.glyph_offset_px[1],
+                ),
+                1.0,
+            );
+            let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+                continue;
+            };
+            let glyph_w = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
+            let glyph_h = i32::try_from(image.placement.height).unwrap_or(i32::MAX);
+            if glyph_w <= 0 || glyph_h <= 0 {
+                continue;
+            }
+            let src_left = physical.x + image.placement.left;
+            let src_top = physical.y - image.placement.top;
+            let (scaled_left, scaled_top, scaled_width, scaled_height) = seed
+                .glyph_scale
+                .scaled_rect(src_left as f32, src_top as f32, glyph_w as f32, glyph_h as f32);
+            let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
+                transform,
+                scaled_height,
+                line_placement_frac,
+            );
+            include_rotated_rect_bounds(
+                &mut pre_box,
+                scaled_left,
+                scaled_top,
+                scaled_width,
+                scaled_height,
+                dst_center_x,
+                dst_center_y,
+                transform.rotation_rad,
+            );
+        }
+        let inv = 1.0 / count.max(1) as f32;
+        Some((pre_box, [sum_x * inv, sum_y * inv]))
+    } else {
+        None
+    };
     if params.global_rotation_deg.abs() > f32::EPSILON {
         rotate_placements_about_centroid(
             transforms
@@ -565,11 +633,43 @@ fn render_text_with_drawn_lines_layout_once(
     }
 
     let pad = font_size_px.ceil().max(2.0) as u32;
+    // Optional vector mesh warp. The normalization frame is the fixed vector-lines
+    // canvas when it is in play (no global rotation) — matching the authoring UI,
+    // which normalizes handles against that canvas — otherwise the pre-rotation
+    // content bounds. Design B may still override the box SIZE with the mesh's
+    // stored source dims inside `MeshWarpContext::new`. Peel/reapply use the SAME
+    // centroid + angle the rotation pass used. `None`/identity/invalid => fast path.
+    let warp_ctx = params.raster_transform.as_ref().and_then(|warp| {
+        let (pre_box, centroid) = warp_pre.as_ref()?;
+        let (box_min, box_size) = if let Some((width, height)) =
+            fixed_output_size.filter(|_| params.global_rotation_deg.abs() <= f32::EPSILON)
+        {
+            ([0.0, 0.0], [width as f32, height as f32])
+        } else if pre_box.initialized {
+            (
+                [pre_box.min_x as f32, pre_box.min_y as f32],
+                [
+                    (pre_box.max_x - pre_box.min_x) as f32,
+                    (pre_box.max_y - pre_box.min_y) as f32,
+                ],
+            )
+        } else {
+            return None;
+        };
+        MeshWarpContext::new(warp, box_min, box_size, global_rotation_rad, *centroid)
+    });
     // A fixed canvas (vector-lines) is honored only when there is no global
-    // rotation; once the block is rotated the canvas must grow to the rotated
-    // bounds (like the Ctrl+wheel overlay) so no corner is clipped.
-    let honor_fixed_size =
-        fixed_output_size.filter(|_| params.global_rotation_deg.abs() <= f32::EPSILON);
+    // rotation AND no active warp; once the block is rotated OR warped the canvas
+    // must grow to the transformed bounds (like the Ctrl+wheel overlay) so no corner
+    // is clipped.
+    let honor_fixed_size = fixed_output_size
+        .filter(|_| params.global_rotation_deg.abs() <= f32::EPSILON && warp_ctx.is_none());
+    // Grow the content bounds to the warped+rotated lattice extent so a strong
+    // outward warp never clips (no-op for `None`/identity; only reached when the
+    // fixed canvas is not honored, i.e. exactly when the warp is active).
+    if let Some(ctx) = warp_ctx.as_ref() {
+        ctx.for_each_warped_bound_point(|x, y| bounds.include_point(x, y));
+    }
     let (out_width, out_height, x_offset, y_offset) =
         if let Some((width, height)) = honor_fixed_size {
             (width.max(1), height.max(1), 0, 0)
@@ -587,7 +687,7 @@ fn render_text_with_drawn_lines_layout_once(
         };
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
 
-    for (seed, transform) in seeds.drain(..).zip(transforms.into_iter()) {
+    for (seed, transform) in seeds.drain(..).zip(transforms) {
         let Some(transform) = transform else {
             continue;
         };
@@ -643,6 +743,7 @@ fn render_text_with_drawn_lines_layout_once(
                 &glyph_transform,
                 seed.text_color,
                 &aa_lut,
+                warp_ctx.as_ref(),
             );
             continue;
         }
@@ -1641,13 +1742,76 @@ fn render_text_with_formula_layout_once(
     // about the layout centroid on top of the per-glyph tangent/static rotation,
     // so the whole formula block turns as one — matching the Ctrl+wheel overlay
     // post-rotation, only crisper. The rotated-rect bounds below grow the canvas.
+    let global_rotation_rad = params.global_rotation_deg.to_radians();
+    // Capture the PRE-global-rotation content box + rotation centroid for an optional
+    // mesh warp, before `rotate_placements_about_centroid` mutates the transforms.
+    // The centroid is the mean of ALL placement centers (this path passes every
+    // transform to the rotation pass); the pre-box uses the SAME line-placed,
+    // pre-rotation glyph rects the bounds loop uses, so peel/reapply is exact.
+    let warp_pre = if params.raster_transform.is_some() {
+        let mut pre_box = PixelBounds::empty();
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let mut count = 0u32;
+        for (seed, transform) in seeds.iter().zip(transforms.iter()) {
+            let (cx, cy) = transform.placement_center();
+            sum_x += cx;
+            sum_y += cy;
+            count += 1;
+            let physical = seed.glyph.physical(
+                (
+                    seed.origin_x + seed.glyph_offset_px[0],
+                    seed.origin_y + seed.glyph_offset_px[1],
+                ),
+                1.0,
+            );
+            let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+                continue;
+            };
+            let glyph_w = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
+            let glyph_h = i32::try_from(image.placement.height).unwrap_or(i32::MAX);
+            if glyph_w <= 0 || glyph_h <= 0 {
+                continue;
+            }
+            let src_left = physical.x + image.placement.left;
+            let src_top = physical.y - image.placement.top;
+            let (scaled_left, scaled_top, scaled_width, scaled_height) =
+                seed.glyph_scale.scaled_rect(
+                    src_left as f32,
+                    src_top as f32,
+                    glyph_w as f32,
+                    glyph_h as f32,
+                );
+            let (placed_center_x, placed_center_y) = apply_line_placement(
+                transform.center_x,
+                transform.center_y,
+                transform.rotation_rad,
+                scaled_height,
+                line_placement_frac,
+            );
+            include_rotated_rect_bounds(
+                &mut pre_box,
+                scaled_left,
+                scaled_top,
+                scaled_width,
+                scaled_height,
+                placed_center_x,
+                placed_center_y,
+                transform.rotation_rad,
+            );
+        }
+        let inv = 1.0 / count.max(1) as f32;
+        Some((pre_box, [sum_x * inv, sum_y * inv]))
+    } else {
+        None
+    };
     if params.global_rotation_deg.abs() > f32::EPSILON {
         rotate_placements_about_centroid(
             transforms
                 .iter_mut()
                 .map(|transform| transform as &mut dyn RigidPlacement)
                 .collect(),
-            params.global_rotation_deg.to_radians(),
+            global_rotation_rad,
         );
     }
 
@@ -1704,6 +1868,26 @@ fn render_text_with_formula_layout_once(
             width_px,
             base_line_height_px.ceil().max(1.0) as u32,
         ));
+    }
+
+    // Optional vector mesh warp over the PRE-global-rotation content box, peeled/
+    // reapplied around the SAME centroid + angle the rotation pass used. Grow the
+    // canvas so a strong outward warp never clips. `None`/identity/invalid meshes or
+    // a degenerate box take the byte-identical fast path.
+    let warp_ctx = params.raster_transform.as_ref().and_then(|warp| {
+        let (pre_box, centroid) = warp_pre.as_ref()?;
+        if !pre_box.initialized {
+            return None;
+        }
+        let box_min = [pre_box.min_x as f32, pre_box.min_y as f32];
+        let box_size = [
+            (pre_box.max_x - pre_box.min_x) as f32,
+            (pre_box.max_y - pre_box.min_y) as f32,
+        ];
+        MeshWarpContext::new(warp, box_min, box_size, global_rotation_rad, *centroid)
+    });
+    if let Some(ctx) = warp_ctx.as_ref() {
+        ctx.for_each_warped_bound_point(|x, y| bounds.include_point(x, y));
     }
 
     let left_overhang = u32::try_from((-bounds.min_x).max(0)).unwrap_or(0);
@@ -1798,6 +1982,7 @@ fn render_text_with_formula_layout_once(
                 &glyph_transform,
                 seed.text_color,
                 &aa_lut,
+                warp_ctx.as_ref(),
             );
             continue;
         }

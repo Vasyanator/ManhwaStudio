@@ -2034,3 +2034,113 @@ pub(super) fn clamp_overlay_page_coord(value: f32, side_px: usize) -> f32 {
     let side_px = side_px.max(1) as f32;
     value.clamp(overlay_uv_min() * side_px, overlay_uv_max() * side_px)
 }
+
+// ---------------------------------------------------------------------------
+// Vector transform (Phase 3a) — pure page-px <-> normalized conversions.
+//
+// A text overlay's vector warp is authored over an ORIENTED source rectangle
+// centered at `center_page_px` (page px), with content size `(src_w, src_h)`
+// (content px) scaled by `scale` and rotated by `angle_deg`. A lattice node's
+// normalized position `(u, v)` in `[0, 1]` maps to the page point
+//   page = center + Rot(angle) * ((u - 0.5) * src_w * scale, (v - 0.5) * src_h * scale)
+// and back. These match the `raster_transform` renderer contract (points_norm are
+// normalized over the source rect; Design B normalizes the renderer box over the
+// SAME src dims), so a page-px<->normalized round-trip of the identity grid yields
+// the identity normalized grid (a renderer no-op).
+// ---------------------------------------------------------------------------
+
+/// Read a text overlay's `text_layout_mode` out of its `render_data` JSON (defaulting to
+/// `Normal` when absent/unparseable). Pure.
+pub(super) fn overlay_text_layout_mode(render_data: Option<&Value>) -> TextLayoutMode {
+    render_data
+        .and_then(|rd| rd.get("text_params"))
+        .and_then(|tp| tp.get("text_layout_mode"))
+        .and_then(Value::as_str)
+        .and_then(parse_text_layout_mode_config_str)
+        .unwrap_or(TextLayoutMode::Normal)
+}
+
+/// Whether the on-canvas VECTOR transform mode is allowed for a text overlay's layout mode.
+///
+/// Enabled for `Normal`, `Shape`, and `CustomVectorLines`; disabled for `Formula` and
+/// `CustomRasterLines` (their layouts do not compose with the post-layout vector warp yet). Pure.
+pub(super) fn vector_transform_allowed_for_layout_mode(mode: TextLayoutMode) -> bool {
+    match mode {
+        TextLayoutMode::Normal | TextLayoutMode::Shape | TextLayoutMode::CustomVectorLines => true,
+        TextLayoutMode::Formula | TextLayoutMode::CustomRasterLines => false,
+    }
+}
+
+/// Map a normalized `(u, v)` (source-rect space, `[0, 1]`) to a page-px point over the oriented
+/// footprint centered at `center_page_px`, size `(src_w, src_h)` content px scaled by `scale` and
+/// rotated by `angle_deg`. Pure.
+pub(super) fn vector_footprint_page_point(
+    center_page_px: [f32; 2],
+    src_w: f32,
+    src_h: f32,
+    scale: f32,
+    angle_deg: f32,
+    u: f32,
+    v: f32,
+) -> [f32; 2] {
+    let span_w = src_w * scale;
+    let span_h = src_h * scale;
+    let local_x = (u - 0.5) * span_w;
+    let local_y = (v - 0.5) * span_h;
+    let (sin_a, cos_a) = angle_deg.to_radians().sin_cos();
+    [
+        center_page_px[0] + local_x * cos_a - local_y * sin_a,
+        center_page_px[1] + local_x * sin_a + local_y * cos_a,
+    ]
+}
+
+/// Inverse of [`vector_footprint_page_point`]: map a page-px point to normalized `(u, v)` over the
+/// oriented footprint. `src_w * scale` / `src_h * scale` are guarded against zero. Pure.
+pub(super) fn vector_footprint_local_uv(
+    center_page_px: [f32; 2],
+    src_w: f32,
+    src_h: f32,
+    scale: f32,
+    angle_deg: f32,
+    page_point: [f32; 2],
+) -> [f32; 2] {
+    let dx = page_point[0] - center_page_px[0];
+    let dy = page_point[1] - center_page_px[1];
+    // Rotate by -angle to reach footprint-local space.
+    let (sin_a, cos_a) = angle_deg.to_radians().sin_cos();
+    let local_x = dx * cos_a + dy * sin_a;
+    let local_y = -dx * sin_a + dy * cos_a;
+    let span_x = (src_w * scale).abs().max(f32::EPSILON);
+    let span_y = (src_h * scale).abs().max(f32::EPSILON);
+    [local_x / span_x + 0.5, local_y / span_y + 0.5]
+}
+
+/// Bilinearly sample a stored `points_norm` grid (row-major, `cols*rows`) at identity coords
+/// `(u, v)` in `[0, 1]`, returning the WARPED normalized position at that identity location. Used to
+/// resample a stored warp of arbitrary resolution onto the fixed 13x13 working lattice. Clamps
+/// out-of-range and returns `(u, v)` unchanged for a degenerate grid. Pure.
+pub(super) fn sample_points_norm_bilinear(
+    points_norm: &[[f32; 2]],
+    cols: usize,
+    rows: usize,
+    u: f32,
+    v: f32,
+) -> [f32; 2] {
+    if cols < 2 || rows < 2 || points_norm.len() != cols.saturating_mul(rows) {
+        return [u, v];
+    }
+    let gx = (u.clamp(0.0, 1.0) * (cols - 1) as f32).clamp(0.0, (cols - 1) as f32);
+    let gy = (v.clamp(0.0, 1.0) * (rows - 1) as f32).clamp(0.0, (rows - 1) as f32);
+    let j0 = (gx.floor() as usize).min(cols - 2);
+    let i0 = (gy.floor() as usize).min(rows - 2);
+    let fx = (gx - j0 as f32).clamp(0.0, 1.0);
+    let fy = (gy - i0 as f32).clamp(0.0, 1.0);
+    let p00 = points_norm[i0 * cols + j0];
+    let p10 = points_norm[i0 * cols + j0 + 1];
+    let p01 = points_norm[(i0 + 1) * cols + j0];
+    let p11 = points_norm[(i0 + 1) * cols + j0 + 1];
+    [
+        lerp(lerp(p00[0], p10[0], fx), lerp(p01[0], p11[0], fx), fy),
+        lerp(lerp(p00[1], p10[1], fx), lerp(p01[1], p11[1], fx), fy),
+    ]
+}

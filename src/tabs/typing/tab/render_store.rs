@@ -370,6 +370,49 @@ pub(super) fn render_and_store_edited_overlay(
     }))
 }
 
+/// Renders the UN-WARPED base image for a text overlay's live vector-transform preview (Phase 3b).
+///
+/// The request's `render_params` must already have `raster_transform` cleared, so the render is the
+/// overlay WITHOUT its mesh warp — texturing it onto the working mesh applies the warp exactly once.
+/// This is a transient GPU-cache preview: it does NOT write to disk. Returns `Ok(None)` when the render
+/// is superseded (its token no longer matches `latest_token`) or was cancelled mid-flight.
+pub(super) fn render_vector_transform_base(
+    request: TypingVectorBaseRenderRequest,
+) -> Result<Option<TypingVectorBaseRenderResult>, String> {
+    if request.latest_token.load(Ordering::Acquire) != request.token {
+        return Ok(None);
+    }
+    // Vector transform is only offered for Normal/Shape/CustomVectorLines layouts, none of which read
+    // an adjacent raster layout PNG, so no `render_params_with_adjacent_layout_path` fix-up is needed.
+    // The CLEARED warp is honored by the renderer as identity (no-op).
+    let rendered = match render_text_to_image(
+        &request.render_params,
+        Some((&request.latest_token, request.token)),
+    ) {
+        Ok(rendered) => rendered,
+        Err(err) if err == "render_next render cancelled" => return Ok(None),
+        Err(err) => {
+            eprintln!(
+                "ERROR typing::vector_transform_base_render overlay_idx={} width_px={} token={} err={}",
+                request.overlay_idx, request.render_params.width_px, request.token, err
+            );
+            return Err(err);
+        }
+    };
+    if rendered.width == 0 || rendered.height == 0 {
+        return Err("Рендер базового изображения векторной трансформации вернул нулевой размер.".to_string());
+    }
+    if request.latest_token.load(Ordering::Acquire) != request.token {
+        return Ok(None);
+    }
+    Ok(Some(TypingVectorBaseRenderResult {
+        token: request.token,
+        overlay_idx: request.overlay_idx,
+        size_px: [rendered.width as usize, rendered.height as usize],
+        rgba: rendered.rgba,
+    }))
+}
+
 /// Re-рендер image-оверлея: грузит исходник, применяет post-effects тем же pipeline, что и текст,
 /// и сохраняет результат отдельным `_fx`-файлом, сохраняя исходную картинку нетронутой.
 pub(super) fn render_and_store_image_effects_overlay(

@@ -85,6 +85,7 @@ impl TypingCreatePanelState {
             align: HorizontalAlign::CENTER,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            pending_raster_transform: None,
             text_line_mode: TextLineMode::Horizontal,
             vertical_line_direction: VerticalLineDirection::RightToLeft,
             text_layout_mode: TextLayoutMode::Normal,

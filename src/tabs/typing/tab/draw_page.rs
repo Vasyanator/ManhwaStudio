@@ -48,6 +48,17 @@ impl TypingTextOverlayLayer {
         {
             self.transform_mode_overlay_idx = None;
         }
+        // Whenever transform mode is not active, drop the transient VECTOR working state (mesh + drag)
+        // and reset the mode kind. Covers click-away/exit/loader-reset uniformly.
+        if self.transform_mode_overlay_idx.is_none()
+            && (self.transform_mode_kind != TypingTransformModeKind::Raster
+                || self.vector_transform_mesh.is_some()
+                || self.vector_transform_drag.is_some()
+                || self.vector_transform_base.is_some()
+                || self.vector_transform_base_rx.is_some())
+        {
+            self.exit_vector_transform_mode();
+        }
         if self
             .drag_state
             .as_ref()
@@ -92,6 +103,14 @@ impl TypingTextOverlayLayer {
             }
             self.drag_state = None;
             self.drag_has_changes = false;
+            // Settle a vector-transform drag whose pointer was released off-widget (the in-method
+            // `drag_stopped` path handles the normal on-widget release; whichever fires first wins via
+            // the `take`).
+            if let Some(drag) = self.vector_transform_drag.take()
+                && drag.has_changes
+            {
+                self.settle_vector_transform(drag.overlay_idx, ctx);
+            }
         }
 
         let clip_rect = ui.clip_rect().intersect(image_rect);
@@ -319,7 +338,16 @@ impl TypingTextOverlayLayer {
                     })
                 });
             for entry in &draw_entries {
-                let is_transform_mode = self.transform_mode_overlay_idx == Some(entry.idx);
+                // VECTOR transform mode owns this overlay's interaction in a dedicated pass
+                // (`draw_vector_transform_overlay`), so skip the normal select/move/raster-deform
+                // interaction here — the two transform kinds never share drag state.
+                if self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector
+                {
+                    continue;
+                }
+                let is_transform_mode = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Raster;
                 let show_rotate_handle =
                     self.selected_overlay_idx == Some(entry.idx) && !is_transform_mode;
                 let rotate_handle_pos = if show_rotate_handle {
@@ -348,8 +376,18 @@ impl TypingTextOverlayLayer {
                 // отдал drag выделенному оверлею (его виджет sense'ит click_and_drag). Клик
                 // (нажал-отпустил) по-прежнему попадает сюда и переселектит — см. блок
                 // sticky-фокуса по `click_in_selected_frame`.
-                let sense = if pointer_in_selected_overlay_frame
-                    && self.selected_overlay_idx != Some(entry.idx)
+                // Тот же приём для ВЕКТОРНОЙ трансформации: её ручки живут в отдельном пассе
+                // (`draw_vector_transform_overlay`, регистрируется ПОСЛЕ этого цикла), а ручки по
+                // углам сетки лежат вне полигона оверлея, поэтому `pointer_in_selected_overlay_frame`
+                // там ложно false. egui НЕ отдаёт drag позже зарегистрированному перекрывающему
+                // виджету, если более ранний тоже sense'ит drag, — поэтому пока активна векторная
+                // трансформация, все ОСТАЛЬНЫЕ оверлеи (сам трансформируемый уже пропущен `continue`
+                // выше) регистрируем click-only, чтобы drag достался виджету ручек.
+                let vector_transform_active = self.transform_mode_overlay_idx.is_some()
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector;
+                let sense = if vector_transform_active
+                    || (pointer_in_selected_overlay_frame
+                        && self.selected_overlay_idx != Some(entry.idx))
                 {
                     Sense::click()
                 } else {
@@ -435,6 +473,16 @@ impl TypingTextOverlayLayer {
                     }
                 }
 
+                // Vector-transform menu availability for this overlay: `Some(true)` = text overlay
+                // whose layout mode allows the vector warp; `Some(false)` = text overlay whose layout
+                // mode disallows it (disabled + tooltip); `None` = image overlay (item hidden).
+                let vector_menu_state = self.overlays.get(entry.idx).and_then(|overlay| {
+                    (overlay.kind == TypingOverlayKind::Text).then(|| {
+                        vector_transform_allowed_for_layout_mode(overlay_text_layout_mode(
+                            overlay.render_data_json.as_ref(),
+                        ))
+                    })
+                });
                 response.context_menu(|menu_ui| {
                     if self.selected_overlay_idx != Some(entry.idx) {
                         menu_ui.label("Выделите оверлей ЛКМ.");
@@ -464,22 +512,64 @@ impl TypingTextOverlayLayer {
                     }
                     menu_ui.separator();
                     if !is_transform_mode {
-                        if menu_ui.button("Войти в режим трансформации").clicked()
+                        if menu_ui
+                            .button("Войти в режим трансформации (растровая)")
+                            .clicked()
                         {
                             if self.ensure_overlay_deform_mesh(entry.idx, image_rect, zoom) {
                                 crate::trace_log!(
                                     cat::TYPING,
-                                    "overlay_transform_mode enter idx={}",
+                                    "overlay_transform_mode enter idx={} kind=raster",
                                     entry.idx
                                 );
                                 self.transform_mode_overlay_idx = Some(entry.idx);
+                                // Raster transform edits the runtime deform mesh; ensure no vector
+                                // working state lingers.
+                                self.exit_vector_transform_mode();
                                 self.deform_mode = TypingDeformMode::Perspective;
                                 self.drag_state = None;
                             }
                             menu_ui.close();
                         }
+                        // Vector transform is TEXT-only and only for layouts that compose with the
+                        // post-layout warp (Normal / Shape / CustomVectorLines). Image overlays hide
+                        // it; Formula / CustomRasterLines show it disabled with a tooltip.
+                        match vector_menu_state {
+                            Some(true) => {
+                                if menu_ui
+                                    .button("Войти в режим трансформации (векторная)")
+                                    .clicked()
+                                {
+                                    crate::trace_log!(
+                                        cat::TYPING,
+                                        "overlay_transform_mode enter idx={} kind=vector",
+                                        entry.idx
+                                    );
+                                    self.selected_overlay_idx = Some(entry.idx);
+                                    self.transform_mode_overlay_idx = Some(entry.idx);
+                                    self.transform_mode_kind = TypingTransformModeKind::Vector;
+                                    self.deform_mode = TypingDeformMode::Perspective;
+                                    self.drag_state = None;
+                                    self.seed_vector_transform_mesh(entry.idx, image_rect, zoom);
+                                    menu_ui.close();
+                                }
+                            }
+                            Some(false) => {
+                                menu_ui
+                                    .add_enabled(
+                                        false,
+                                        egui::Button::new(
+                                            "Войти в режим трансформации (векторная)",
+                                        ),
+                                    )
+                                    .on_disabled_hover_text("Недоступно для этой раскладки");
+                            }
+                            None => {}
+                        }
                     } else {
-                        if menu_ui.button("Выйти из режима трансформации").clicked()
+                        if menu_ui
+                            .button("Выйти из режима трансформации (растровая)")
+                            .clicked()
                         {
                             crate::trace_log!(
                                 cat::TYPING,
@@ -493,7 +583,10 @@ impl TypingTextOverlayLayer {
                             self.drag_has_changes = false;
                             menu_ui.close();
                         }
-                        if menu_ui.button("Сбросить трансформацию").clicked() {
+                        if menu_ui
+                            .button("Сбросить трансформацию (растровая)")
+                            .clicked()
+                        {
                             crate::trace_log!(
                                 cat::TYPING,
                                 "overlay_transform_reset idx={}",
@@ -1141,6 +1234,13 @@ impl TypingTextOverlayLayer {
                 }
                 MergedFillItem::Overlay(entry_pos) => {
                     let entry = &draw_entries[*entry_pos];
+                    // Hide the plain baked PNG while the live VECTOR-transform warped preview is drawn
+                    // for this overlay (`draw_vector_transform_overlay` below textures the un-warped base
+                    // onto the working mesh). Skipping here avoids double-drawing the static + warped
+                    // copies. Falls back to drawing the baked PNG when the preview is not active.
+                    if self.vector_transform_preview_active(entry.idx) {
+                        continue;
+                    }
                     draw_textured_deform_mesh(
                         &painter,
                         entry.texture.id(),
@@ -1173,7 +1273,15 @@ impl TypingTextOverlayLayer {
                             .unwrap_or_default(),
                     );
                 }
-                if self.transform_mode_overlay_idx == Some(entry.idx) {
+                // RASTER transform mode draws its handles on the overlay's runtime deform mesh here.
+                // VECTOR transform mode draws its OWN handles/wireframe on the working mesh from
+                // `draw_vector_transform_overlay`, so only the dashed selection path (above) is drawn
+                // here for it. A plain (non-transform) selection shows the rotation handle.
+                let raster_transform_here = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Raster;
+                let vector_transform_here = self.transform_mode_overlay_idx == Some(entry.idx)
+                    && self.transform_mode_kind == TypingTransformModeKind::Vector;
+                if raster_transform_here {
                     match self.deform_mode {
                         TypingDeformMode::Perspective => {
                             draw_perspective_handles(&painter, &entry.quad_scene)
@@ -1200,15 +1308,22 @@ impl TypingTextOverlayLayer {
                         ),
                         _ => {}
                     }
-                } else {
+                } else if !vector_transform_here {
                     draw_rotation_handle(&painter, &entry.quad_scene, image_rect);
                 }
             }
+        }
+        // VECTOR transform mode owns its overlay's interaction + handle/wireframe drawing in a
+        // dedicated pass (drawn after the baked-PNG fill so it sits on top). Gated off while the mask
+        // panel or the layout editor is active, matching the normal overlay interaction gate.
+        if !mask_panel_open && !layout_editor_active {
+            self.draw_vector_transform_overlay(ui, ctx, page_idx, image_rect, zoom, &painter);
         }
         if self.layout_editor.is_some() && !mask_panel_open {
             self.draw_layout_editor_on_page(ui, ctx, page_idx, image_rect, zoom, clip_rect);
         }
         if let Some(selected_idx) = self.transform_mode_overlay_idx
+            && self.transform_mode_kind == TypingTransformModeKind::Raster
             && self.selected_overlay_idx == Some(selected_idx)
             && self.deform_mode.is_brush_mode()
             && let Some(selected_entry) =
@@ -1252,6 +1367,8 @@ impl TypingTextOverlayLayer {
             || self.save_rx.is_some()
             || !self.pending_upload_indices.is_empty()
             || self.drag_state.is_some()
+            || self.vector_transform_drag.is_some()
+            || self.vector_transform_base_rx.is_some()
             || self.layout_editor.is_some()
     }
 

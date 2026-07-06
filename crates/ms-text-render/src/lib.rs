@@ -134,6 +134,7 @@ const _: fn(
     &vector::GlyphTransform,
     [u8; 4],
     &[u8; 256],
+    Option<&vector::MeshWarpContext>,
 ) = vector::rasterize_outline_into;
 const _: fn() -> vector::RasterScratch = vector::RasterScratch::new;
 const _: fn(types::AntiAliasingMode) -> [u8; 256] = vector::build_aa_lut;
@@ -205,6 +206,7 @@ pub fn touch_runtime_smoke_contract() {
         anti_aliasing: types::AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
         line_placement_percent: 0.0,
+        raster_transform: None,
     };
 
     let image = match pipeline::smoke_render_text_to_image(&params) {
@@ -407,6 +409,7 @@ mod tests {
             anti_aliasing: AntiAliasingMode::Strong,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            raster_transform: None,
         };
 
         let image = match smoke_render_text_to_image(&params) {

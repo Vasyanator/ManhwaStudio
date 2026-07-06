@@ -90,6 +90,7 @@ fn base_params() -> TextRenderParams {
         anti_aliasing: AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
         line_placement_percent: 0.0,
+        raster_transform: None,
     }
 }
 

@@ -58,6 +58,25 @@ impl PixelBounds {
         self.max_x = self.max_x.max(rect_max_x);
         self.max_y = self.max_y.max(rect_max_y);
     }
+
+    /// Grow the bounds to contain the world point `(x, y)`.
+    ///
+    /// The point is enclosed in its `floor()..ceil()` integer cell so the pixel
+    /// under it is fully inside the bounds. Non-finite coordinates are ignored.
+    /// Used to grow the canvas to a mesh-warped extent (see
+    /// `vector::MeshWarpContext::for_each_warped_bound_point`).
+    pub(crate) fn include_point(&mut self, x: f32, y: f32) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        let min_x = x.floor() as i32;
+        let min_y = y.floor() as i32;
+        // At least one pixel wide/tall so a point on an integer boundary still
+        // contributes a covered cell.
+        let width = ((x.ceil() as i32) - min_x).max(1);
+        let height = ((y.ceil() as i32) - min_y).max(1);
+        self.include_rect(min_x, min_y, width, height);
+    }
 }
 
 pub(crate) fn sample_swash_pixel(

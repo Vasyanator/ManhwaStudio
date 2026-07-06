@@ -726,6 +726,14 @@ impl TypingTextOverlayLayer {
                 doc.set_text_render(page_idx, &uid, render_data, image);
             });
         }
+        // A vector-transform re-render (settle/reset) just changed the overlay's baked pixels and warp;
+        // drop the cached un-warped base so the Phase-3b live preview re-derives it from the fresh state
+        // on the next drag (settle ⇒ re-render un-warped; reset ⇒ reuse the fresh un-warped source_rgba).
+        if self.transform_mode_kind == TypingTransformModeKind::Vector
+            && self.transform_mode_overlay_idx == Some(result.overlay_idx)
+        {
+            self.vector_transform_base = None;
+        }
         self.mark_overlay_pixels_dirty(result.overlay_idx);
         self.edit_render_data_dirty = true;
         true

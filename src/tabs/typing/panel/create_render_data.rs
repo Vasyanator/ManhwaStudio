@@ -217,7 +217,7 @@ impl TypingCreatePanelState {
         font_path: Option<String>,
         font_label: Option<String>,
     ) -> Value {
-        json!({
+        let mut render_data = json!({
             "text_params": {
                 "text": text,
                 "text_color": [self.text_color.r(), self.text_color.g(), self.text_color.b(), self.text_color.a()],
@@ -297,7 +297,17 @@ impl TypingCreatePanelState {
                 "formed_text": self.formed_text,
             },
             "effects": self.effects_value_array(),
-        })
+        });
+        // Carry the canvas-authored vector mesh warp verbatim (Phase 3). Only
+        // emit the key when present so old overlays stay byte-stable/clean.
+        if let Some(raster_transform) = self.pending_raster_transform.clone()
+            && let Some(text_params) = render_data
+                .get_mut("text_params")
+                .and_then(Value::as_object_mut)
+        {
+            text_params.insert("raster_transform".to_string(), raster_transform);
+        }
+        render_data
     }
 
     pub(super) fn shape_layout_to_value(&self) -> Value {

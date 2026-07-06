@@ -124,6 +124,11 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("line_placement_percent")
             .and_then(value_as_f32)
             .unwrap_or(0.0),
+        // Vector mesh warp authored on the canvas (Phase 3); carried verbatim
+        // through render_data. Absent/invalid -> None (identity / no warp).
+        raster_transform: text_params
+            .get("raster_transform")
+            .and_then(decode_vector_mesh_warp),
         selected_face_index: text_params
             .get("selected_face_index")
             .and_then(Value::as_u64)
@@ -214,6 +219,66 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .and_then(Value::as_str)
             .and_then(parse_anti_aliasing_config_str)
             .unwrap_or(AntiAliasingMode::Strong),
+    })
+}
+
+/// Decode a persisted `raster_transform` object into a [`VectorMeshWarp`].
+///
+/// Expects `{ cols, rows, src_width_px, src_height_px, points_norm: [[x,y],..] }`
+/// where `cols >= 2`, `rows >= 2`, and `points_norm.len() == cols * rows`
+/// (row-major). Returns `None` for any missing key, non-object value, degenerate
+/// grid, or point-count mismatch — the caller then treats the warp as absent
+/// (identity / no warp). Never panics. A present-but-malformed object is logged
+/// as a warning so a corrupted project is diagnosable.
+pub(in crate::tabs::typing) fn decode_vector_mesh_warp(value: &Value) -> Option<VectorMeshWarp> {
+    let Some(obj) = value.as_object() else {
+        crate::trace_log!(cat::TYPING, "raster_transform: not an object, ignoring warp");
+        return None;
+    };
+    let cols = obj
+        .get("cols")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    let rows = obj
+        .get("rows")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())?;
+    if cols < 2 || rows < 2 {
+        crate::trace_log!(
+            cat::TYPING,
+            "raster_transform: degenerate grid cols={cols} rows={rows}, ignoring warp"
+        );
+        return None;
+    }
+    let raw_points = obj.get("points_norm").and_then(Value::as_array)?;
+    let expected = cols.checked_mul(rows)?;
+    if raw_points.len() != expected {
+        crate::trace_log!(
+            cat::TYPING,
+            "raster_transform: points_norm len={} != cols*rows={expected}, ignoring warp",
+            raw_points.len()
+        );
+        return None;
+    }
+    let mut points_norm = Vec::with_capacity(expected);
+    for point in raw_points {
+        let arr = point.as_array()?;
+        let x = arr.first().and_then(value_as_f32)?;
+        let y = arr.get(1).and_then(value_as_f32)?;
+        points_norm.push([x, y]);
+    }
+    Some(VectorMeshWarp {
+        cols,
+        rows,
+        // Source-rect dims: when > 0 the renderer honors them as the warp
+        // normalization-box size (Design B); a missing value defaults to 0.0,
+        // which makes the renderer fall back to the live pre-warp box.
+        src_width_px: obj.get("src_width_px").and_then(value_as_f32).unwrap_or(0.0),
+        src_height_px: obj
+            .get("src_height_px")
+            .and_then(value_as_f32)
+            .unwrap_or(0.0),
+        points_norm,
     })
 }
 
@@ -821,6 +886,10 @@ pub(super) fn normalize_text_params_object(
             // `align` сохраняется отдельно для совместимости/PSD-экспорта, но
             // непрерывное значение живёт только здесь.
             "align_bias",
+            // Векторная mesh-деформация текста (авторится на холсте, Phase 3).
+            // Непрозрачный блоб — проносится как есть, чтобы re-normalize
+            // легаси `text_info.json` его не терял.
+            "raster_transform",
         ] {
             if let Some(value) = obj.get(key) {
                 map.insert(key.to_string(), value.clone());

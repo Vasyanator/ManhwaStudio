@@ -831,6 +831,7 @@
             anti_aliasing: AntiAliasingMode::Strong,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            raster_transform: None,
         }
     }
 
@@ -1090,3 +1091,297 @@
 
     // Legacy ribbon/page-index migration tests moved to `models::layer_model::text_payload` together
     // with the `migrate_overlay_entries` logic (the single shared codec).
+
+    #[test]
+    fn decode_vector_mesh_warp_valid_object() {
+        // 2x2 identity-ish mesh: 4 points, row-major.
+        let value = serde_json::json!({
+            "cols": 2,
+            "rows": 2,
+            "src_width_px": 512.0,
+            "src_height_px": 200.0,
+            "points_norm": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        });
+        let warp = decode_vector_mesh_warp(&value).expect("valid mesh should decode");
+        assert_eq!(warp.cols, 2);
+        assert_eq!(warp.rows, 2);
+        assert!((warp.src_width_px - 512.0).abs() < f32::EPSILON);
+        assert!((warp.src_height_px - 200.0).abs() < f32::EPSILON);
+        assert_eq!(warp.points_norm.len(), 4);
+        assert_eq!(warp.points_norm[3], [1.0, 1.0]);
+    }
+
+    #[test]
+    fn decode_vector_mesh_warp_wrong_points_len_is_none() {
+        // cols*rows = 4 but only 3 points supplied.
+        let value = serde_json::json!({
+            "cols": 2,
+            "rows": 2,
+            "points_norm": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        });
+        assert!(decode_vector_mesh_warp(&value).is_none());
+    }
+
+    #[test]
+    fn decode_vector_mesh_warp_missing_keys_is_none() {
+        // Missing `rows` and `points_norm`.
+        let value = serde_json::json!({ "cols": 2 });
+        assert!(decode_vector_mesh_warp(&value).is_none());
+        // Degenerate grid (cols < 2) is rejected too.
+        let degenerate = serde_json::json!({
+            "cols": 1,
+            "rows": 1,
+            "points_norm": [[0.0, 0.0]],
+        });
+        assert!(decode_vector_mesh_warp(&degenerate).is_none());
+    }
+
+    #[test]
+    fn vector_transform_layout_gating_predicate() {
+        // Enabled for Normal / Shape / CustomVectorLines; disabled for Formula / CustomRasterLines.
+        for mode in [
+            TextLayoutMode::Normal,
+            TextLayoutMode::Shape,
+            TextLayoutMode::CustomVectorLines,
+        ] {
+            assert!(
+                vector_transform_allowed_for_layout_mode(mode),
+                "{mode:?} must allow the vector transform"
+            );
+        }
+        for mode in [TextLayoutMode::Formula, TextLayoutMode::CustomRasterLines] {
+            assert!(
+                !vector_transform_allowed_for_layout_mode(mode),
+                "{mode:?} must NOT allow the vector transform"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_base_reuses_current_texture_when_no_warp() {
+        // Phase 3b shortcut: an overlay with NO stored `raster_transform` already IS the un-warped
+        // base, so `request_vector_transform_base` reuses its resident `source_rgba` directly with NO
+        // extra render (no in-flight render receiver).
+        let mut layer = TypingTextOverlayLayer::default();
+        let rgba = vec![7u8; 2 * 2 * 4];
+        let overlay = text_runtime_from_doc_node(
+            "t0",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            0,
+            Some(json!({ "text_params": { "text": "hi" } })), // no raster_transform
+            [2, 2],
+            rgba.clone(),
+        );
+        layer.overlays.push(overlay);
+        layer.transform_mode_overlay_idx = Some(0);
+        layer.transform_mode_kind = TypingTransformModeKind::Vector;
+
+        layer.request_vector_transform_base(0);
+
+        let base = layer
+            .vector_transform_base
+            .as_ref()
+            .expect("no-warp overlay yields an immediate reused base");
+        assert_eq!(base.overlay_idx, 0);
+        assert_eq!(base.size_px, [2, 2]);
+        assert_eq!(base.rgba, rgba, "base reuses the un-warped source_rgba verbatim");
+        assert!(
+            layer.vector_transform_base_rx.is_none(),
+            "no background render is spawned for the no-warp reuse shortcut"
+        );
+    }
+
+    #[test]
+    fn vector_base_render_is_skipped_when_token_superseded() {
+        // The one-off un-warped base render early-outs (no render, no fonts, no disk) when its token is
+        // no longer the latest — the cancellation contract that lets a re-enter / target change drop a
+        // superseded render.
+        let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let request = TypingVectorBaseRenderRequest {
+            token: 3, // stale: latest is 5
+            latest_token: std::sync::Arc::clone(&latest),
+            overlay_idx: 0,
+            // `font_path` is the only required key; it is never opened because the stale token
+            // short-circuits before any render.
+            render_params: text_render_params_from_render_data(
+                &json!({ "text_params": { "text": "x", "font_path": "/nonexistent/font.ttf" } }),
+            )
+            .expect("params build when font_path is present"),
+        };
+        let out = render_vector_transform_base(request).expect("stale token returns Ok, not Err");
+        assert!(out.is_none(), "a superseded base render produces no result");
+    }
+
+    #[test]
+    fn vector_preview_active_requires_drag_and_base() {
+        // The plain-PNG hide gate: the live warped preview draws only with VECTOR mode + an active drag
+        // on the overlay + an available un-warped base.
+        let mut layer = TypingTextOverlayLayer::default();
+        layer.overlays.push(text_runtime_from_doc_node(
+            "t0", 0, [10.0, 20.0], 1.0, 0.0, None, false, 0, None, [2, 2], vec![0u8; 2 * 2 * 4],
+        ));
+        layer.transform_mode_overlay_idx = Some(0);
+        layer.transform_mode_kind = TypingTransformModeKind::Vector;
+        layer.vector_transform_base = Some(TypingVectorTransformBaseTexture {
+            overlay_idx: 0,
+            size_px: [2, 2],
+            rgba: vec![0u8; 2 * 2 * 4],
+            texture: None,
+        });
+        // Base present but no drag yet -> not active (idle shows the baked PNG).
+        assert!(!layer.vector_transform_preview_active(0));
+
+        layer.vector_transform_drag = Some(TypingVectorTransformDragState {
+            overlay_idx: 0,
+            page_idx: 0,
+            pointer_start_scene: Pos2::ZERO,
+            mode: TypingOverlayDragMode::MoveMesh,
+            start_mesh: default_deform_mesh_for_page([10.0, 20.0], [2, 2], 1.0, 0.0, [100, 100]),
+            has_changes: false,
+        });
+        assert!(layer.vector_transform_preview_active(0), "drag + base -> preview active");
+
+        // Base for a DIFFERENT overlay does not activate the preview.
+        layer.vector_transform_base.as_mut().unwrap().overlay_idx = 1;
+        assert!(!layer.vector_transform_preview_active(0));
+    }
+
+    #[test]
+    fn overlay_text_layout_mode_reads_and_defaults() {
+        let rd = serde_json::json!({ "text_params": { "text_layout_mode": "custom_vector_lines" } });
+        assert_eq!(
+            overlay_text_layout_mode(Some(&rd)),
+            TextLayoutMode::CustomVectorLines
+        );
+        // Absent / no render_data -> Normal.
+        assert_eq!(overlay_text_layout_mode(None), TextLayoutMode::Normal);
+        let empty = serde_json::json!({ "text_params": {} });
+        assert_eq!(overlay_text_layout_mode(Some(&empty)), TextLayoutMode::Normal);
+    }
+
+    #[test]
+    fn vector_footprint_round_trips_identity_and_warp() {
+        // Page-px <-> normalized round-trip over an oriented, scaled footprint. For any (u, v) the
+        // inverse of the footprint mapping returns (u, v) — the core invariant that makes an identity
+        // working mesh settle to identity `points_norm` (a renderer no-op).
+        let center = [400.0f32, 260.0];
+        let (src_w, src_h) = (512.0f32, 200.0);
+        let scale = 1.3f32;
+        let angle = 27.0f32; // degrees
+
+        for &(u, v) in &[
+            (0.0f32, 0.0f32),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (0.5, 0.5),
+            (0.25, 0.8),
+        ] {
+            let page = vector_footprint_page_point(center, src_w, src_h, scale, angle, u, v);
+            let back = vector_footprint_local_uv(center, src_w, src_h, scale, angle, page);
+            assert!(
+                (back[0] - u).abs() < 1e-3 && (back[1] - v).abs() < 1e-3,
+                "identity round-trip failed for ({u},{v}): got {back:?}"
+            );
+        }
+
+        // A KNOWN warp: displace one node's normalized position, map it to page px, and confirm the
+        // inverse recovers the warped (u, v) — not the identity position.
+        let warped_uv = [0.7f32, 0.35];
+        let page = vector_footprint_page_point(center, src_w, src_h, scale, angle, warped_uv[0], warped_uv[1]);
+        let back = vector_footprint_local_uv(center, src_w, src_h, scale, angle, page);
+        assert!(
+            (back[0] - warped_uv[0]).abs() < 1e-3 && (back[1] - warped_uv[1]).abs() < 1e-3,
+            "known-warp round-trip failed: got {back:?}"
+        );
+        // The un-rotated center (u=v=0.5) must map exactly to the footprint center.
+        let mid = vector_footprint_page_point(center, src_w, src_h, scale, angle, 0.5, 0.5);
+        assert!((mid[0] - center[0]).abs() < 1e-3 && (mid[1] - center[1]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn sample_points_norm_bilinear_identity_and_interpolation() {
+        // Identity 3x3 grid samples back the identity coordinate.
+        let mut identity = Vec::new();
+        for i in 0..3 {
+            for j in 0..3 {
+                identity.push([j as f32 / 2.0, i as f32 / 2.0]);
+            }
+        }
+        let s = sample_points_norm_bilinear(&identity, 3, 3, 0.25, 0.75);
+        assert!((s[0] - 0.25).abs() < 1e-4 && (s[1] - 0.75).abs() < 1e-4);
+
+        // Degenerate grid returns the query unchanged.
+        let bad = sample_points_norm_bilinear(&[[0.0, 0.0]], 1, 1, 0.4, 0.6);
+        assert!((bad[0] - 0.4).abs() < f32::EPSILON && (bad[1] - 0.6).abs() < f32::EPSILON);
+
+        // Interpolate a translated grid (+0.1 x): every sample shifts by +0.1.
+        let translated: Vec<[f32; 2]> = identity.iter().map(|p| [p[0] + 0.1, p[1]]).collect();
+        let t = sample_points_norm_bilinear(&translated, 3, 3, 0.5, 0.5);
+        assert!((t[0] - 0.6).abs() < 1e-4 && (t[1] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn text_render_params_round_trips_raster_transform() {
+        let render_data = serde_json::json!({
+            "text_params": {
+                "text": "hi",
+                "font_path": "/tmp/font.ttf",
+                "raster_transform": {
+                    "cols": 3,
+                    "rows": 2,
+                    "src_width_px": 100.0,
+                    "src_height_px": 50.0,
+                    "points_norm": [
+                        [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                        [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]
+                    ],
+                },
+            },
+            "effects": [],
+        });
+        let params =
+            text_render_params_from_render_data(&render_data).expect("params should parse");
+        let warp = params.raster_transform.expect("warp should be present");
+        assert_eq!(warp.cols, 3);
+        assert_eq!(warp.rows, 2);
+        assert_eq!(warp.points_norm.len(), 6);
+
+        // Absent key -> None (identity / no warp).
+        let no_warp = serde_json::json!({
+            "text_params": { "text": "hi", "font_path": "/tmp/font.ttf" },
+            "effects": [],
+        });
+        let params = text_render_params_from_render_data(&no_warp).expect("params should parse");
+        assert!(params.raster_transform.is_none());
+    }
+
+    #[test]
+    fn normalize_preserves_raster_transform() {
+        let obj = serde_json::json!({
+            "text": "hi",
+            "raster_transform": {
+                "cols": 2,
+                "rows": 2,
+                "points_norm": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            },
+        });
+        let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+        let carried = normalized
+            .get("raster_transform")
+            .and_then(Value::as_object)
+            .expect("raster_transform must survive normalize");
+        assert_eq!(carried.get("cols").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            carried
+                .get("points_norm")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(4)
+        );
+    }

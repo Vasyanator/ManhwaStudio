@@ -159,6 +159,9 @@ impl TypingTextOverlayLayer {
             .collect();
         self.pending_upload_set = self.pending_upload_indices.iter().copied().collect();
 
+        // Detect (before shifting) whether the overlay under the active transform is the one being
+        // removed, so its transient vector-transform state can be torn down fully rather than reindexed.
+        let removed_was_transform_overlay = self.transform_mode_overlay_idx == Some(overlay_idx);
         shift_index_after_remove(&mut self.selected_overlay_idx, overlay_idx);
         shift_index_after_remove(&mut self.transform_mode_overlay_idx, overlay_idx);
         shift_index_after_remove(&mut self.last_selected_overlay_idx, overlay_idx);
@@ -180,6 +183,34 @@ impl TypingTextOverlayLayer {
                     auto_job.overlay_idx -= 1;
                 }
                 self.auto_typing_job = Some(auto_job);
+            }
+        }
+        // Keep the transient vector-transform state consistent with the shifted overlay indices. When the
+        // removed overlay was the active transform target, tear the whole preview down (resets the mode
+        // kind to Raster and bumps the base-render token); otherwise just reindex so a deleted lower-index
+        // overlay can't leave the drag/base pointing at the wrong overlay.
+        if removed_was_transform_overlay {
+            self.exit_vector_transform_mode();
+        } else {
+            if let Some(mut drag) = self.vector_transform_drag.take() {
+                if drag.overlay_idx == overlay_idx {
+                    self.vector_transform_drag = None;
+                } else {
+                    if drag.overlay_idx > overlay_idx {
+                        drag.overlay_idx -= 1;
+                    }
+                    self.vector_transform_drag = Some(drag);
+                }
+            }
+            if let Some(mut base) = self.vector_transform_base.take() {
+                if base.overlay_idx == overlay_idx {
+                    self.vector_transform_base = None;
+                } else {
+                    if base.overlay_idx > overlay_idx {
+                        base.overlay_idx -= 1;
+                    }
+                    self.vector_transform_base = Some(base);
+                }
             }
         }
         self.drag_has_changes = false;

@@ -107,6 +107,7 @@ use crate::trace::cat;
 use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
 use crate::tabs::typing::tab::TypingExportFormat;
 use crate::tabs::typing::tab::TypingTextOverlayLayer;
+use crate::tabs::typing::tab::decode_vector_mesh_warp;
 use crate::tabs::typing::render_next::forms::{self, PeakBase, TextForm, TextFormPreset};
 use crate::tabs::typing::segmentation::Conservatism;
 use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_path};
@@ -1018,6 +1019,11 @@ struct TypingCreatePanelState {
     /// (сверху), `-100` below (снизу). Only shown/used for line-based layouts
     /// (`Formula`, `CustomVectorLines`).
     line_placement_percent: f32,
+    /// Raw `raster_transform` object carried verbatim through render_data
+    /// rebuilds; authored on the canvas in Phase 3. `None` = no warp; a `Some`
+    /// value is re-emitted into `text_params` on every rebuild so it survives
+    /// text/param edits, and decoded for the live preview render.
+    pending_raster_transform: Option<serde_json::Value>,
     text_line_mode: TextLineMode,
     vertical_line_direction: VerticalLineDirection,
     text_layout_mode: TextLayoutMode,
