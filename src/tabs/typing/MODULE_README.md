@@ -146,7 +146,17 @@ The main data flow is:
    `flush_target_page_text_to_staging(page)` — flushing the doc's CURRENT text present-but-empty — so
    `ensure_page_staged` finds the page present and does not seed stale committed text.
 4. Create/edit panel changes are converted to `TextRenderParams` and rendered by
-   `render_next::render_text_to_image` in background workers.
+   `render_next::render_text_to_image` in background workers. Fonts reach the renderer
+   BY NAME, not by path: `TextRenderParams.font_name` (the font label) and inline
+   `<font=...>` tags are resolved through a caller-supplied `render_next::FontProvider`.
+   The typing tab OWNS font loading and builds that provider (`panel::TabFontProvider`,
+   keyed by normalized label, lazy file read + content-id cache). The create/edit panels
+   each hold an `Arc<dyn FontProvider>` (rebuilt whenever the font list is (re)assigned);
+   the tab layer refreshes its own copy each frame from the panel and captures an `Arc`
+   into every render REQUEST struct so background threads resolve fonts without touching
+   the panel. `render_text_to_image(&params, &dyn FontProvider, cancel)` takes the provider
+   as its middle argument. The forms-metric path still loads its font by path via the compat
+   wrapper `render_next::load_selected_font_from_path`.
    Inline no-break tags (`<no-break>`/`<nobr>` or machine `<m j>`) are editing/form controls:
    the renderer strips them like other inline tags, while the advanced text-form picker applies
    them to the source text and writes a tag-free `formed_text` with protected ranges already kept
@@ -247,6 +257,12 @@ saving, and export.
   - `fonts.rs`: font discovery/loading (dir + system), duplicate merge/disambiguation, group listing (free fns).
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
     representative face's bytes and cached on `FontEntry.coverage`; the dropdown never recomputes it.
+    Discovery also records each font's `original_name` (real family/name of the representative face,
+    fallback post_script_name then file stem) for PSD export and future virtual fonts.
+  - `font_provider.rs`: `TabFontProvider`, the app-side `render_next::FontProvider`. Maps a normalized
+    working name (font label) to a font, reads bytes lazily OUTSIDE its lock and caches
+    `Arc<Vec<u8>>` + content id, and carries each font's `original_name` to the renderer. Built from the
+    panel's font list; shared (`Arc`) with background render threads.
   - `font_coverage.rs`: pure classification of a font's support for the program language's writing
     system (Cyrillic today) → `Full`/`Partial`/`Unsupported` via the swash charmap; drives the
     red/yellow font-dropdown highlight + hover tooltip in `create_presets::draw_font_combo_option`.
@@ -367,7 +383,10 @@ saving, and export.
   overlay kind, placement/deform data, render data, and mask clipping state.
 - Render parameters are serialized through JSON-compatible names that are parsed in
   both `panel.rs` and `tab.rs`; keep enum string mappings synchronized when extending
-  `TextRenderParams`.
+  `TextRenderParams`. The persisted `text_params` carry `font_label`, legacy `font_path`,
+  and the newer `font_original_name` (real family/name). On read, the font NAME for the
+  renderer is derived `font_label || font_family || font || font_path stem`; `font_path`
+  is kept only for back-compat and PSD; PSD export prefers `font_original_name`.
 - Font discovery reads project/app font directories and can include system fonts when
   `TextTab.use_system_fonts` is enabled in `user_config.json`.
 - Shared state enters through `set_bubbles_model` and `set_overlays_model`; typing must

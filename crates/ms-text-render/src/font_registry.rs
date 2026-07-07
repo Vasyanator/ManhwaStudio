@@ -12,17 +12,20 @@ Main responsibilities:
   `FontSystem` из пула не накапливала дублирующиеся faces.
 
 Notes:
-Loading is cache-gated: `load_selected_font_from_path` and
-`build_inline_font_registry` take a `&mut FontFaceCache` (owned by the pooled
-`FontSystem`, see `font_system_pool.rs`). On a cache hit the file is NOT re-read
-and NOT re-loaded into fontdb; the previously loaded face IDs and metadata are
-reused. Default font families are still set every render (cheap, deterministic
-matching). The throwaway-DB helpers `resolve_font_postscript_name` /
+Fonts reach the render path by WORKING NAME through a `FontProvider`; the core
+loader is `load_font_content`, which takes a resolved `FontContent` (bytes +
+face + content id) and never touches the filesystem. Loading is cache-gated by
+`content_id`: on a cache hit the bytes are NOT re-hashed and NOT re-loaded into
+fontdb; the previously loaded face IDs and metadata are reused. Default font
+families are still set every render (cheap, deterministic matching).
+`load_selected_font_from_path` is a THIN COMPAT WRAPPER over `load_font_content`
+for the app's forms-metric measurement path, which still holds a path and its own
+throwaway `FontSystem`. The throwaway-DB helpers `resolve_font_postscript_name` /
 `resolve_font_family_name` are export-only and stay uncached.
 */
 
-use super::font_system_pool::{FileKey, FontFaceCache};
-use super::types::InlineFontEntry;
+use super::font_provider::{FontContent, FontProvider, font_content_id};
+use super::font_system_pool::FontFaceCache;
 use cosmic_text::{Attrs, Family, FontSystem, Stretch, Style, Weight, fontdb};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -64,19 +67,92 @@ pub struct InlineFontRegistryBuild {
     pub warnings: Vec<String>,
 }
 
-/// Loads the font at `font_path`, deduplicated through `font_cache`, and returns
-/// the metadata of the face at `selected_face_index`.
+/// Loads `content`'s bytes into `font_system` (deduplicated by `content.content_id`
+/// through `font_cache`) and returns the metadata of the face at `face_index`.
 ///
-/// On a cache hit (this file already loaded into `font_system`'s db) the file is
-/// neither re-read nor re-registered — the previously loaded fontdb IDs and
-/// resolved face metadata are reused. On a miss the file is read, registered,
-/// and both the IDs and metadata are cached. Either way default families are set
-/// via `apply_default_families` so matching stays deterministic on a reused
-/// system (a no-family face restores the system's pristine defaults).
+/// Behaves exactly like the old path loader but keyed on content id instead of a
+/// file path: on a cache hit the bytes are neither re-hashed nor re-registered —
+/// the previously loaded fontdb IDs and resolved face metadata are reused. On a
+/// miss the bytes are registered and both the IDs and metadata are cached. Either
+/// way default families are set via `apply_default_families` so matching stays
+/// deterministic on a reused system (a no-family face restores the system's
+/// pristine defaults).
 ///
-/// Determinism guard: on a miss, if a DIFFERENT already-loaded file shares this
-/// face's `(family, weight, style, stretch)`, the cache is marked tainted so the
-/// pool drops the system instead of reusing it (see `font_system_pool.rs`).
+/// Determinism guard: on a miss, if a DIFFERENT already-loaded content (different
+/// content id) shares this face's `(family, weight, style, stretch)`, the cache is
+/// marked tainted so the pool drops the system instead of reusing it (see
+/// `font_system_pool.rs`).
+///
+/// # Errors
+/// Returns an error string if fontdb cannot parse the bytes.
+pub fn load_font_content(
+    font_system: &mut FontSystem,
+    font_cache: &mut FontFaceCache,
+    content: &FontContent,
+    face_index: usize,
+) -> Result<RegisteredFontFace, String> {
+    let content_id = content.content_id;
+
+    if font_cache.loaded_ids(content_id).is_some() {
+        // Cache hit: faces are already in this system's db. Reuse resolved
+        // metadata, or resolve it from the already-loaded IDs on first request
+        // for this face index.
+        let selected = if let Some(face) = font_cache.cached_meta(content_id, face_index) {
+            face.clone()
+        } else {
+            // `loaded_ids` is present, so this re-borrow yields the same slice.
+            let ids = font_cache
+                .loaded_ids(content_id)
+                .ok_or_else(|| "font cache lost its loaded face IDs".to_string())?
+                .to_vec();
+            let resolved = resolve_registered_face(font_system, &ids, face_index);
+            font_cache.store_meta(content_id, face_index, resolved.clone());
+            resolved
+        };
+        apply_default_families(font_system, font_cache, &selected);
+        return Ok(selected);
+    }
+
+    // Cache miss: register the bytes into this system's db. fontdb accepts an
+    // `Arc<Vec<u8>>` as a binary source, so the content's `Arc` is reused without
+    // copying the buffer.
+    let source = fontdb::Source::Binary(content.data.clone());
+    let loaded_ids = font_system.db_mut().load_font_source(source);
+    if loaded_ids.is_empty() {
+        return Err("fontdb не смог распарсить данные шрифта".to_string());
+    }
+
+    let selected = resolve_registered_face(font_system, &loaded_ids, face_index);
+    // Determinism guard: if a DIFFERENT already-loaded content declares the same
+    // (family, weight, style, stretch), `Family::Name` matching becomes
+    // history-dependent on this reused system. Taint it so the pool drops it and
+    // never serves a future render (the residual is documented in the pool's
+    // file header). Detect BEFORE storing this content's metadata so we only
+    // compare against prior contents.
+    if font_cache.collides_with_other_file(content_id, &selected) {
+        font_cache.mark_tainted();
+        ms_log::runtime_log::log_warn(format!(
+            "render font family collision: content '{}' (face {face_index}) shares family '{}' \
+             with an earlier font in the reused FontSystem; dropping the system after this render \
+             to keep matching deterministic",
+            content.name,
+            selected.family_name.as_deref().unwrap_or("<none>"),
+        ));
+    }
+    // `load_font_source` returns a `TinyVec`; store an owned `Vec` in the cache.
+    font_cache.store_loaded(content_id, loaded_ids.to_vec());
+    font_cache.store_meta(content_id, face_index, selected.clone());
+    apply_default_families(font_system, font_cache, &selected);
+    Ok(selected)
+}
+
+/// Thin compat wrapper over `load_font_content` for the app's forms-metric
+/// measurement path, which still holds a file path and its own throwaway
+/// `FontSystem`. Reads the file, hashes it into a `content_id` via
+/// `font_content_id`, and delegates to `load_font_content`.
+///
+/// The synthesized `name`/`original_name` (the file stem) are irrelevant to the
+/// renderer here — metric measurement only needs the resolved face metadata.
 ///
 /// # Errors
 /// Returns an error string if the file cannot be read or fontdb cannot parse it.
@@ -86,64 +162,26 @@ pub fn load_selected_font_from_path(
     font_path: &Path,
     selected_face_index: usize,
 ) -> Result<RegisteredFontFace, String> {
-    // Derive the cache key from metadata FIRST so a hit avoids `fs::read`.
-    let key = FileKey::from_path(font_path);
-
-    if font_cache.loaded_ids(&key).is_some() {
-        // Cache hit: faces are already in this system's db. Reuse resolved
-        // metadata, or resolve it from the already-loaded IDs on first request
-        // for this face index.
-        let selected = if let Some(face) = font_cache.cached_meta(&key, selected_face_index) {
-            face.clone()
-        } else {
-            // `loaded_ids` is present, so this re-borrow yields the same slice.
-            let ids = font_cache
-                .loaded_ids(&key)
-                .ok_or_else(|| "font cache lost its loaded face IDs".to_string())?
-                .to_vec();
-            let resolved = resolve_registered_face(font_system, &ids, selected_face_index);
-            font_cache.store_meta(key.clone(), selected_face_index, resolved.clone());
-            resolved
-        };
-        apply_default_families(font_system, font_cache, &selected);
-        return Ok(selected);
-    }
-
-    // Cache miss: read and register the file into this system's db.
-    let font_bytes = fs::read(font_path).map_err(|error| {
+    let bytes = fs::read(font_path).map_err(|error| {
         format!(
             "не удалось прочитать шрифт {}: {error}",
             font_path.display()
         )
     })?;
-    let source = fontdb::Source::Binary(Arc::new(font_bytes));
-    let loaded_ids = font_system.db_mut().load_font_source(source);
-    if loaded_ids.is_empty() {
-        return Err("fontdb не смог распарсить файл шрифта".to_string());
-    }
-
-    let selected = resolve_registered_face(font_system, &loaded_ids, selected_face_index);
-    // Determinism guard: if a DIFFERENT already-loaded file declares the same
-    // (family, weight, style, stretch), `Family::Name` matching becomes
-    // history-dependent on this reused system. Taint it so the pool drops it and
-    // never serves a future render (the residual is documented in the pool's
-    // file header). Detect BEFORE storing this file's metadata so we only compare
-    // against prior files.
-    if font_cache.collides_with_other_file(&key, &selected) {
-        font_cache.mark_tainted();
-        ms_log::runtime_log::log_warn(format!(
-            "render font family collision: '{}' (face {selected_face_index}) shares family '{}' \
-             with an earlier font in the reused FontSystem; dropping the system after this render \
-             to keep matching deterministic",
-            font_path.display(),
-            selected.family_name.as_deref().unwrap_or("<none>"),
-        ));
-    }
-    // `load_font_source` returns a `TinyVec`; store an owned `Vec` in the cache.
-    font_cache.store_loaded(key.clone(), loaded_ids.to_vec());
-    font_cache.store_meta(key, selected_face_index, selected.clone());
-    apply_default_families(font_system, font_cache, &selected);
-    Ok(selected)
+    let content_id = font_content_id(&bytes);
+    let stem = font_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .to_string();
+    let content = FontContent {
+        name: stem.clone(),
+        original_name: stem,
+        data: Arc::new(bytes),
+        face_index: selected_face_index,
+        content_id,
+    };
+    load_font_content(font_system, font_cache, &content, selected_face_index)
 }
 
 /// Reads the face metadata (family/style/weight/stretch) of the face at
@@ -267,13 +305,14 @@ pub fn normalize_inline_font_label(label: &str) -> String {
     label.trim().to_ascii_lowercase()
 }
 
-/// Builds the inline-font registry for the requested labels, loading each font
-/// through the shared `font_cache` so a reused `FontSystem` does not re-register
-/// duplicate faces. Unknown labels and load failures become warnings, not errors.
+/// Builds the inline-font registry for the requested labels, resolving each one
+/// through the caller-supplied `fonts` provider and loading its content through
+/// the shared `font_cache` so a reused `FontSystem` does not re-register duplicate
+/// faces. Unknown names and load failures become warnings, not errors.
 pub fn build_inline_font_registry(
     font_system: &mut FontSystem,
     font_cache: &mut FontFaceCache,
-    available_fonts: &[InlineFontEntry],
+    fonts: &dyn FontProvider,
     requested_labels: &[String],
 ) -> InlineFontRegistryBuild {
     let requested_labels = requested_labels
@@ -284,33 +323,21 @@ pub fn build_inline_font_registry(
         return InlineFontRegistryBuild::default();
     }
 
-    let mut available_by_label = BTreeMap::<String, &InlineFontEntry>::new();
-    for font in available_fonts {
-        available_by_label.insert(normalize_inline_font_label(&font.label), font);
-    }
-
     let mut build = InlineFontRegistryBuild::default();
     for label in requested_labels {
-        let Some(entry) = available_by_label.get(&label).copied() else {
+        let Some(content) = fonts.resolve(&label) else {
             build.warnings.push(format!(
-                "render_next inline style tag requested unknown font label '{label}'"
+                "render_next inline style tag requested unknown font name '{label}'"
             ));
             continue;
         };
 
-        match load_selected_font_from_path(
-            font_system,
-            font_cache,
-            &entry.font_path,
-            entry.face_index,
-        ) {
+        match load_font_content(font_system, font_cache, &content, content.face_index) {
             Ok(face) => {
                 build.registry.insert(label, face);
             }
             Err(error) => build.warnings.push(format!(
-                "render_next failed to load inline font '{}' from {}: {error}",
-                entry.label,
-                entry.font_path.display(),
+                "render_next failed to load inline font '{label}': {error}"
             )),
         }
     }

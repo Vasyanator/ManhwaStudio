@@ -12,7 +12,6 @@ Main responsibilities:
 Source compatibility:
 - `TextRenderParams`
 - `TextRenderShapeCompareParams`
-- `InlineFontEntry`
 - `RenderedTextImage`
 - `HorizontalAlign`
 - `KerningMode`
@@ -254,8 +253,10 @@ pub struct VectorMeshWarp {
 pub struct TextRenderParams {
     pub text: String,
     pub text_color: [u8; 4],
-    pub font_path: PathBuf,
-    pub available_inline_fonts: Vec<InlineFontEntry>,
+    /// Working name of the main font. Resolved to bytes/face through the
+    /// caller-supplied `FontProvider` passed to `render_text_to_image`; the
+    /// renderer never reads a font file itself.
+    pub font_name: String,
     pub font_size_px: f32,
     pub line_spacing_px: f32,
     pub line_spacing_percent: f32,
@@ -317,13 +318,6 @@ pub struct TextRenderShapeCompareParams {
     pub shape_min_width_percent: f32,
     pub shape_variant: u8,
     pub cancel_render_if_layout_text_unchanged: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct InlineFontEntry {
-    pub label: String,
-    pub font_path: PathBuf,
-    pub face_index: usize,
 }
 
 #[derive(Debug, Clone)]

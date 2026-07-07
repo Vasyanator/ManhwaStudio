@@ -861,11 +861,18 @@ impl TypingTextOverlayLayer {
                     rotation_deg: overlay.angle_deg,
                     render_params,
                     render_data_json,
+                    font_provider: Arc::clone(&self.font_provider),
                 };
 
                 self.start_edit_overlay_render_job(edit_request);
             }
         }
+    }
+
+    /// Updates the tab-side font source used by background render workers. Called
+    /// each frame from the canvas hook so a font reload in the panel propagates here.
+    pub(in crate::tabs::typing) fn set_font_provider(&mut self, provider: Arc<dyn FontProvider>) {
+        self.font_provider = provider;
     }
 
     pub(super) fn start_edit_overlay_render_job(&mut self, mut request: TypingEditOverlayRequest) {
@@ -938,13 +945,18 @@ impl TypingTextOverlayLayer {
         let menu_id = self.next_shape_variant_preview_id();
         let cancel_render = Arc::new(AtomicBool::new(false));
         let worker_cancel_render = Arc::clone(&cancel_render);
+        let fonts = Arc::clone(&self.font_provider);
         let (tx, rx) = mpsc::channel::<Result<TypingShapeVariantPreviewResult, String>>();
         thread::spawn(move || {
             if worker_cancel_render.load(Ordering::Relaxed) {
                 return;
             }
-            let tiles =
-                render_shape_variant_preview_tiles(base_params, variants, &worker_cancel_render);
+            let tiles = render_shape_variant_preview_tiles(
+                base_params,
+                variants,
+                &fonts,
+                &worker_cancel_render,
+            );
             if worker_cancel_render.load(Ordering::Relaxed) {
                 return;
             }
@@ -1150,6 +1162,7 @@ impl TypingTextOverlayLayer {
             rotation_deg: overlay.angle_deg,
             render_params,
             render_data_json,
+            font_provider: Arc::clone(&self.font_provider),
         };
         self.shape_variant_preview = None;
         self.start_edit_overlay_render_job(edit_request);

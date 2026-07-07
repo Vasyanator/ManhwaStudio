@@ -57,9 +57,18 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   and `typing/panel.rs`.
 - `pipeline.rs`: central orchestration, horizontal rendering, line metrics, inline glyph
   overrides, shape comparison, cancellation handling, and post-effect application.
-- `font_registry.rs`: selected font loading and inline-font registry construction.
-  Loading is now cache-gated through `FontFaceCache` (see `font_system_pool.rs`)
-  so a reused `FontSystem` does not accumulate duplicate faces.
+- `font_provider.rs`: the caller-supplied font source. Fonts reach the render
+  path by WORKING NAME through the `FontProvider` trait (`FontContent` payload,
+  `FontContentSet` in-memory impl, `font_content_id` cache-key hash). The renderer
+  NEVER reads a font file itself; the caller (typing tab) owns the provider (lazy
+  file read today, virtual fonts later). Groundwork for virtual/composed fonts.
+- `font_registry.rs`: selected/inline font loading and inline-font registry
+  construction. The core loader `load_font_content` takes a resolved `FontContent`
+  (bytes + face + content id) and never touches the filesystem;
+  `load_selected_font_from_path` is a thin compat wrapper over it for the
+  path-based forms-metric measurement path. Loading is cache-gated through
+  `FontFaceCache` (see `font_system_pool.rs`) keyed by `content_id` so a reused
+  `FontSystem` does not accumulate duplicate faces.
 - `font_system_pool.rs`: process-global checkout pool of reusable
   `cosmic_text::FontSystem` instances (+ their `FontFaceCache`). Owns
   `with_leased_font_system` (used by `pipeline::render_text_to_image`) and
@@ -124,7 +133,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `FontFaceCache` from a process-global pool instead of building a fresh
   `FontSystem` per render (the fresh build ran a full system-font scan every
   call). The pool must preserve BYTE-IDENTICAL output across reuse: font loads go
-  through `FontFaceCache` (keyed by path/len/mtime), so a reused system reuses the
+  through `FontFaceCache` (keyed by content id), so a reused system reuses the
   already-loaded faces instead of re-registering duplicates, and default families
   are set every render for deterministic matching. Two determinism guards keep a
   reused system byte-identical to a fresh one:
@@ -134,8 +143,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     installs the selected face's family as all five defaults when it HAS a family
     name, and RESTORES the captured pristine names when it does NOT — so a
     no-family face never inherits a prior render's family from the reused db.
-  - Taint-and-drop: font matching is by family name. If two DIFFERENT files
-    (different `FileKey`) declare the same `(family, weight, style, stretch)`,
+  - Taint-and-drop: font matching is by family name. If two DIFFERENT contents
+    (different content id) declare the same `(family, weight, style, stretch)`,
     `Family::Name` resolution becomes history-dependent. The loader marks the
     cache `tainted` on such a collision (logged once via `runtime_log::log_warn`)
     and `return_to_pool`/`should_requeue` DROP a tainted system so it can never

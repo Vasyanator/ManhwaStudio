@@ -795,8 +795,7 @@
         TextRenderParams {
             text: "Просто без елок".to_string(),
             text_color: [0, 0, 0, 255],
-            font_path: std::path::PathBuf::from("font.ttf"),
-            available_inline_fonts: Vec::new(),
+            font_name: "font".to_string(),
             font_size_px: 24.0,
             line_spacing_px: 4.0,
             line_spacing_percent: 50.0,
@@ -887,8 +886,9 @@
         let params = shape_variant_test_params(TextShape::SoftPeak);
         let variants = build_shape_variant_grid(&params);
         let cancel_render = Arc::new(AtomicBool::new(true));
+        let fonts: Arc<dyn FontProvider> = Arc::new(FontContentSet::default());
 
-        let tiles = render_shape_variant_preview_tiles(params, variants, &cancel_render);
+        let tiles = render_shape_variant_preview_tiles(params, variants, &fonts, &cancel_render);
 
         assert!(tiles.is_empty());
     }
@@ -1206,12 +1206,13 @@
             token: 3, // stale: latest is 5
             latest_token: std::sync::Arc::clone(&latest),
             overlay_idx: 0,
-            // `font_path` is the only required key; it is never opened because the stale token
+            // A font NAME is the only required key now; it is never resolved because the stale token
             // short-circuits before any render.
             render_params: text_render_params_from_render_data(
-                &json!({ "text_params": { "text": "x", "font_path": "/nonexistent/font.ttf" } }),
+                &json!({ "text_params": { "text": "x", "font_label": "SomeFont" } }),
             )
-            .expect("params build when font_path is present"),
+            .expect("params build when a font name is present"),
+            font_provider: Arc::new(FontContentSet::default()),
         };
         let out = render_vector_transform_base(request).expect("stale token returns Ok, not Err");
         assert!(out.is_none(), "a superseded base render produces no result");

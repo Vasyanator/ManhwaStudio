@@ -24,12 +24,34 @@ use super::*;
 pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRenderParams> {
     let render_obj = render_data.as_object()?;
     let text_params = render_obj.get("text_params")?.as_object()?;
-    let font_path = text_params
-        .get("font_path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)?;
+    // The renderer now references fonts by NAME (resolved through the provider).
+    // Derive the working name from the persisted keys, newest first, and fall back
+    // to the legacy `font_path` file stem so old projects keep opening. Bail only
+    // when NONE of these yields a non-empty name.
+    let read_name = |key: &str| {
+        text_params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let font_name = read_name("font_label")
+        .or_else(|| read_name("font_family"))
+        .or_else(|| read_name("font"))
+        .or_else(|| {
+            text_params
+                .get("font_path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .and_then(|path| {
+                    Path::new(path)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(ToOwned::to_owned)
+                })
+        })?;
     let effects_json = render_obj
         .get("effects")
         .and_then(Value::as_array)
@@ -91,8 +113,7 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("text_color")
             .and_then(parse_rgba_value)
             .unwrap_or([0, 0, 0, 255]),
-        font_path,
-        available_inline_fonts: Vec::new(),
+        font_name,
         font_size_px,
         line_spacing_px: line_spacing.as_px_percent().0,
         line_spacing_percent: line_spacing.as_px_percent().1,

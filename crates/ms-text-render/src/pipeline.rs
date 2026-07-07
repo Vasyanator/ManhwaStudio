@@ -46,7 +46,8 @@ Notes:
 use ms_log::trace::cat;
 
 use super::effects::{apply_effects_pipeline, apply_text_preprocess_effects};
-use super::font_registry::{build_inline_font_registry, load_selected_font_from_path};
+use super::font_provider::FontProvider;
+use super::font_registry::{build_inline_font_registry, load_font_content};
 use super::font_system_pool::with_leased_font_system;
 use super::formula::{
     FormulaRenderOutcome, FormulaRenderRequest, render_text_with_drawn_lines_layout,
@@ -358,6 +359,7 @@ fn effective_line_placement_frac(params: &TextRenderParams) -> f32 {
 
 pub fn render_text_to_image(
     params: &TextRenderParams,
+    fonts: &dyn FontProvider,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
     let _render_span = ms_log::trace_scope!(
@@ -403,10 +405,16 @@ pub fn render_text_to_image(
             None
         };
 
-    let selected_face = load_selected_font_from_path(
+    let content = fonts.resolve(&params.font_name).ok_or_else(|| {
+        format!(
+            "шрифт '{}' не найден среди переданных шрифтов",
+            params.font_name
+        )
+    })?;
+    let selected_face = load_font_content(
         font_system,
         font_cache,
-        &params.font_path,
+        &content,
         params.selected_face_index,
     )
     .map_err(|error| format!("не удалось загрузить шрифт в fontdb: {error}"))?;
@@ -517,7 +525,7 @@ pub fn render_text_to_image(
     let inline_font_registry_build = build_inline_font_registry(
         font_system,
         font_cache,
-        params.available_inline_fonts.as_slice(),
+        fonts,
         requested_inline_fonts.as_slice(),
     );
     warnings.extend(inline_font_registry_build.warnings);
@@ -2629,13 +2637,14 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_effects_to_image, render_text_to_image};
+    use super::apply_effects_to_image;
+    use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
-        AntiAliasingMode, HorizontalAlign, KerningMode, TextDrawnLinesLayoutParams,
-        TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
-        TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
-        TextVectorLineTextDirection, TextVectorLinesLayoutParams, TextVectorPoint, TextWrapMode,
-        VectorMeshWarp, VerticalLineDirection,
+        AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage,
+        TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
+        TextRenderParams, TextRenderShapeCompareParams, TextShape, TextVectorLine,
+        TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
+        TextVectorPoint, TextWrapMode, VectorMeshWarp, VerticalLineDirection,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2648,12 +2657,35 @@ mod tests {
             .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
     }
 
+    /// Builds a single-font provider that resolves `params.font_name` to the test
+    /// fixture bytes, so the render path never touches the filesystem itself.
+    fn font_provider(params: &TextRenderParams) -> FontContentSet {
+        let bytes = std::fs::read(test_font_path()).unwrap_or_default();
+        let content_id = font_content_id(&bytes);
+        FontContentSet::new(vec![FontContent {
+            name: params.font_name.clone(),
+            original_name: params.font_name.clone(),
+            data: Arc::new(bytes),
+            face_index: params.selected_face_index,
+            content_id,
+        }])
+    }
+
+    /// Local test wrapper matching the pre-refactor `render_text_to_image(&params,
+    /// cancel)` call shape: builds the fixture font provider from
+    /// `params.font_name` and delegates to the real entry point.
+    fn render_text_to_image(
+        params: &TextRenderParams,
+        cancel: Option<(&Arc<AtomicU64>, u64)>,
+    ) -> Result<RenderedTextImage, String> {
+        crate::pipeline::render_text_to_image(params, &font_provider(params), cancel)
+    }
+
     fn base_params() -> TextRenderParams {
         TextRenderParams {
             text: "Hello world".to_string(),
             text_color: [255, 255, 255, 255],
-            font_path: test_font_path(),
-            available_inline_fonts: Vec::new(),
+            font_name: "test-font".to_string(),
             font_size_px: 36.0,
             line_spacing_px: 0.0,
             line_spacing_percent: 100.0,

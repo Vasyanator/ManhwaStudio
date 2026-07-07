@@ -223,6 +223,7 @@ impl TypingTextOverlayLayer {
             latest_token: Arc::clone(&self.vector_base_render_token),
             overlay_idx,
             render_params,
+            font_provider: Arc::clone(&self.font_provider),
         };
         let (tx, rx) = mpsc::channel::<Result<Option<TypingVectorBaseRenderResult>, String>>();
         thread::spawn(move || {
@@ -422,6 +423,7 @@ impl TypingTextOverlayLayer {
             rotation_deg,
             render_params,
             render_data_json: render_data,
+            font_provider: Arc::clone(&self.font_provider),
         };
         self.start_edit_overlay_render_job(request);
         // Persist the render_data (already carrying/clearing the warp) via the normal save path; it

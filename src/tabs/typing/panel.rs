@@ -112,8 +112,9 @@ use crate::tabs::typing::render_next::forms::{self, PeakBase, TextForm, TextForm
 use crate::tabs::typing::segmentation::Conservatism;
 use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_path};
 use crate::tabs::typing::render_next::render_text_to_image;
+use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
-    AntiAliasingMode, HorizontalAlign, InlineFontEntry, KerningMode, PxOrPercent, RenderedTextImage,
+    AntiAliasingMode, HorizontalAlign, KerningMode, PxOrPercent, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -193,6 +194,8 @@ mod effect_cards;
 use effect_cards::*;
 mod fonts;
 use fonts::*;
+mod font_provider;
+use font_provider::TabFontProvider;
 mod presets_io;
 use presets_io::*;
 mod ui_helpers;
@@ -624,6 +627,10 @@ struct FontEntry {
     /// once at load time from the representative face. Drives the red/yellow
     /// highlight in the font dropdown.
     coverage: FontLanguageCoverage,
+    /// Original family/name read from the font file (representative face); future
+    /// virtual fonts synthesize it as `VirtualFont_a_b_c`. Persisted so PSD export
+    /// and future virtual fonts can recover the real font identity by name.
+    original_name: String,
 }
 
 #[derive(Clone)]
@@ -943,6 +950,9 @@ struct ShakeEffectCard {
 struct PreviewRenderJob {
     token: u64,
     params: TextRenderParams,
+    /// Font source for this render, captured at dispatch time so a later font
+    /// reload cannot change the fonts under an in-flight preview render.
+    fonts: Arc<dyn FontProvider>,
 }
 
 struct PreviewRenderResult {
@@ -986,6 +996,10 @@ struct TypingRightSectionActions {
 struct TypingCreatePanelState {
     fonts_dir: PathBuf,
     fonts: Vec<FontEntry>,
+    /// App-side font source handed to every render: maps a working name (font
+    /// label) to bytes/face. Rebuilt whenever `fonts` is (re)assigned and shared
+    /// (`Arc`) with background render threads.
+    font_provider: Arc<dyn FontProvider>,
     font_groups: Vec<String>,
     selected_font_group: Option<String>,
     use_system_fonts: bool,
@@ -1243,6 +1257,9 @@ struct RawFontFile {
     content_hash: u64,
     faces: Vec<FontFaceEntry>,
     coverage: FontLanguageCoverage,
+    /// Original family/name read from the representative face of this file
+    /// (fallback: post_script_name, then the file stem). See `FontEntry.original_name`.
+    original_name: String,
 }
 
 #[cfg(test)]

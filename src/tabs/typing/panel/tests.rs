@@ -97,6 +97,7 @@ paths change.
             content_hash: hash,
             faces: default_single_face(),
             coverage: FontLanguageCoverage::default(),
+            original_name: String::new(),
         }
     }
 

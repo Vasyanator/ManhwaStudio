@@ -83,6 +83,12 @@ pub(super) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
                 FontLanguageCoverage::default,
                 |data| super::font_coverage::classify_font_bytes(data, rep_face_index),
             );
+            // Original family/name from the representative face; fall back to the
+            // file stem when the font file cannot be parsed.
+            let original_name = bytes
+                .as_deref()
+                .and_then(|data| font_original_name_from_bytes(data, rep_face_index))
+                .unwrap_or_else(|| stem.clone());
             RawFontFile {
                 path,
                 stem,
@@ -90,6 +96,7 @@ pub(super) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
                 content_hash,
                 faces,
                 coverage,
+                original_name,
             }
         })
         .collect();
@@ -124,6 +131,7 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
         let faces = rep.faces.clone();
         let path = rep.path.clone();
         let coverage = rep.coverage.clone();
+        let original_name = rep.original_name.clone();
         let alt_paths = cluster[1..].iter().map(|raw| raw.path.clone()).collect();
         // Объединение групп копий (без повторов, в стабильном порядке).
         let mut groups: Vec<Option<String>> = Vec::new();
@@ -140,9 +148,28 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             disambig: None,
             faces,
             coverage,
+            original_name,
         });
     }
     entries
+}
+
+/// Reads the ORIGINAL family/name of `face_index` from font `bytes` via fontdb.
+/// Falls back to the face's post_script_name; returns `None` only when the file
+/// cannot be parsed or yields no non-empty name.
+#[must_use]
+pub(super) fn font_original_name_from_bytes(bytes: &[u8], face_index: usize) -> Option<String> {
+    let mut db = fontdb::Database::new();
+    let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.to_vec())));
+    let id = ids.get(face_index).or_else(|| ids.first())?;
+    let face = db.face(*id)?;
+    face.families
+        .first()
+        .map(|(name, _)| name.clone())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            Some(face.post_script_name.clone()).filter(|name| !name.is_empty())
+        })
 }
 
 /// Проставляет скобочное уточнение (по группам) тем пунктам, у которых базовое
@@ -230,6 +257,9 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
     // Track the fontdb id per (path, face_index) so the representative face's
     // coverage can be read back via `db.with_face_data` (memory-mapped) below.
     let mut ids_by_path: HashMap<PathBuf, Vec<(usize, fontdb::ID)>> = HashMap::new();
+    // Original family name per (path, face_index), used to pick the representative
+    // face's real name for `FontEntry.original_name`.
+    let mut families_by_path: HashMap<PathBuf, Vec<(usize, String)>> = HashMap::new();
     for face in db.faces() {
         let path = match &face.source {
             fontdb::Source::File(path) => path.clone(),
@@ -250,6 +280,10 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             .entry(path.clone())
             .or_default()
             .push((face_index, face.id));
+        families_by_path
+            .entry(path.clone())
+            .or_default()
+            .push((face_index, family.to_string()));
         by_path.entry(path).or_default().push(FontFaceEntry {
             label: format!(
                 "#{face_index} {family} | {style} | w{} | {}",
@@ -300,6 +334,16 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
                 })
             })
             .unwrap_or_default();
+        // Representative face's real family name; fall back to the file stem.
+        let original_name = families_by_path
+            .get(&path)
+            .and_then(|fams| {
+                fams.iter()
+                    .find(|(idx, _)| *idx == rep_face_index)
+                    .map(|(_, name)| name.clone())
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| stem.to_string());
         entries.push(FontEntry {
             label,
             path,
@@ -308,6 +352,7 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             disambig: None,
             faces,
             coverage,
+            original_name,
         });
     }
 

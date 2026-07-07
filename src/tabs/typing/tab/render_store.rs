@@ -38,7 +38,7 @@ pub(super) fn render_and_store_created_overlay(
         &file_name,
         &request.render_params,
     );
-    let rendered = render_text_to_image(&render_params, None).map_err(|err| {
+    let rendered = render_text_to_image(&render_params, request.font_provider.as_ref(), None).map_err(|err| {
         eprintln!(
             "ERROR typing::create_overlay_render layout={:?} shape={:?} wrap={:?} line_mode={:?} width_px={} page_idx={} err={}",
             render_params.text_layout_mode,
@@ -303,6 +303,7 @@ pub(super) fn render_and_store_edited_overlay(
     );
     let rendered = match render_text_to_image(
         &render_params,
+        request.font_provider.as_ref(),
         Some((&request.latest_token, request.token)),
     ) {
         Ok(rendered) => rendered,
@@ -387,6 +388,7 @@ pub(super) fn render_vector_transform_base(
     // The CLEARED warp is honored by the renderer as identity (no-op).
     let rendered = match render_text_to_image(
         &request.render_params,
+        request.font_provider.as_ref(),
         Some((&request.latest_token, request.token)),
     ) {
         Ok(rendered) => rendered,
@@ -708,6 +710,7 @@ pub(super) fn shape_variant_preview_available(overlay_kind: TypingOverlayKind) -
 pub(super) fn render_shape_variant_preview_tiles(
     base_params: TextRenderParams,
     variants: Vec<TypingShapeVariant>,
+    fonts: &Arc<dyn FontProvider>,
     cancel_render: &Arc<AtomicBool>,
 ) -> Vec<TypingShapeVariantPreviewTile> {
     let mut indexed_variants = variants.into_iter().enumerate();
@@ -732,6 +735,7 @@ pub(super) fn render_shape_variant_preview_tiles(
             let tx = tx.clone();
             let base_params = base_params.clone();
             let cancel_render = Arc::clone(cancel_render);
+            let fonts = Arc::clone(fonts);
             let worker_name = format!(
                 "typing-shape-variant-render-{}-{}",
                 variant.row, variant.col
@@ -740,7 +744,7 @@ pub(super) fn render_shape_variant_preview_tiles(
                 if cancel_render.load(Ordering::Relaxed) {
                     return;
                 }
-                let tile = render_shape_variant_preview_tile(base_params, variant);
+                let tile = render_shape_variant_preview_tile(base_params, variant, fonts.as_ref());
                 if cancel_render.load(Ordering::Relaxed) {
                     return;
                 }
@@ -779,6 +783,7 @@ pub(super) fn render_shape_variant_preview_tiles(
 pub(super) fn render_shape_variant_preview_tile(
     base_params: TextRenderParams,
     variant: TypingShapeVariant,
+    fonts: &dyn FontProvider,
 ) -> Option<TypingShapeVariantPreviewTile> {
     let mut params = base_params.clone();
     params.width_px = variant.width_px;
@@ -793,7 +798,7 @@ pub(super) fn render_shape_variant_preview_tile(
         cancel_render_if_layout_text_unchanged: true,
     });
 
-    match render_text_to_image(&params, None) {
+    match render_text_to_image(&params, fonts, None) {
         Ok(rendered) if rendered.width > 0 && rendered.height > 0 => {
             let width = match usize::try_from(rendered.width) {
                 Ok(width) => width,

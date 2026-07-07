@@ -19,10 +19,9 @@ Public surface:
   остаются внутренними деталями нового рендера.
 */
 
-use std::path::PathBuf;
-
 pub mod drawn_lines;
 mod effects;
+mod font_provider;
 mod font_registry;
 mod font_system_pool;
 mod formula;
@@ -47,9 +46,15 @@ pub use wrap::forms;
 // (владелец — pooled `FontSystem`); внешние вызовы с одноразовой `FontSystem`
 // создают одноразовый `FontFaceCache::new()`.
 pub use font_registry::{
-    load_selected_font_from_path, resolve_font_family_name, resolve_font_postscript_name,
+    load_font_content, load_selected_font_from_path, resolve_font_family_name,
+    resolve_font_postscript_name,
 };
 pub use font_system_pool::FontFaceCache;
+
+// Caller-supplied font source: fonts reach the render path by working name
+// through a `FontProvider`; the renderer never touches the filesystem itself.
+// The path-based `load_selected_font_from_path` above is a thin compat wrapper.
+pub use font_provider::{FontContent, FontContentSet, FontProvider, font_content_id};
 
 // Прогрев пула `FontSystem` из фонового потока: приложение вызывает
 // `ms_text_render::prewarm_font_system_pool()`, чтобы первый пользовательский
@@ -61,7 +66,6 @@ type RenderNextCancel<'a> = Option<(&'a std::sync::Arc<std::sync::atomic::Atomic
 // Compile-time smoke anchor for the staged API: keeps the extracted contract wired
 // together in non-test builds without touching the current production renderer.
 const _: usize = std::mem::size_of::<types::TextRenderParams>()
-    + std::mem::size_of::<types::InlineFontEntry>()
     + std::mem::size_of::<types::RenderedTextImage>()
     + std::mem::size_of::<types::HorizontalAlign>()
     + std::mem::size_of::<types::KerningMode>()
@@ -81,9 +85,10 @@ const _: usize = std::mem::size_of::<types::TextRenderParams>()
 const _: fn(&types::TextRenderParams) -> Result<types::RenderedTextImage, String> =
     pipeline::smoke_render_text_to_image;
 
-const _: for<'a> fn(
-    &types::TextRenderParams,
-    RenderNextCancel<'a>,
+const _: for<'a, 'b, 'c> fn(
+    &'a types::TextRenderParams,
+    &'b dyn font_provider::FontProvider,
+    RenderNextCancel<'c>,
 ) -> Result<types::RenderedTextImage, String> = pipeline::render_text_to_image;
 
 const _: fn(u32, u32) -> types::RenderedTextImage = types::RenderedTextImage::transparent;
@@ -162,16 +167,10 @@ pub fn touch_runtime_smoke_contract() {
     formula::touch_formula_smoke_contract();
 
     let formula_layout = types::TextFormulaLayoutParams::default();
-    let inline_font = types::InlineFontEntry {
-        label: "render-next-smoke".to_string(),
-        font_path: PathBuf::from("fonts/render-next-smoke.ttf"),
-        face_index: 0,
-    };
     let params = types::TextRenderParams {
         text: "render-next smoke".to_string(),
         text_color: [255, 255, 255, 255],
-        font_path: PathBuf::from("fonts/render-next-smoke.ttf"),
-        available_inline_fonts: vec![inline_font.clone()],
+        font_name: "render-next-smoke".to_string(),
         font_size_px: 24.0,
         line_spacing_px: 28.0,
         line_spacing_percent: 100.0,
@@ -219,8 +218,7 @@ pub fn touch_runtime_smoke_contract() {
     std::hint::black_box((
         &params.text,
         params.text_color,
-        &params.font_path,
-        &params.available_inline_fonts,
+        &params.font_name,
         params.font_size_px,
         params.line_spacing_px,
         params.line_spacing_percent,
@@ -254,11 +252,6 @@ pub fn touch_runtime_smoke_contract() {
         params.anti_aliasing,
         params.global_rotation_deg,
         params.line_placement_percent,
-    ));
-    std::hint::black_box((
-        &inline_font.label,
-        &inline_font.font_path,
-        inline_font.face_index,
     ));
     std::hint::black_box((image.width, image.height, &image.rgba, &image.warnings));
     std::hint::black_box((
@@ -354,13 +347,11 @@ mod tests {
         pipeline::smoke_render_text_to_image,
         touch_runtime_smoke_contract,
         types::{
-            AntiAliasingMode, HorizontalAlign, InlineFontEntry, KerningMode,
-            TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
-            TextRenderParams, TextShape, TextVectorLinesLayoutParams, TextWrapMode,
-            VerticalLineDirection,
+            AntiAliasingMode, HorizontalAlign, KerningMode, TextDrawnLinesLayoutParams,
+            TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
+            TextVectorLinesLayoutParams, TextWrapMode, VerticalLineDirection,
         },
     };
-    use std::path::PathBuf;
 
     #[test]
     fn smoke_pipeline_returns_transparent_placeholder_image() {
@@ -369,12 +360,7 @@ mod tests {
         let params = TextRenderParams {
             text: "Smoke".to_string(),
             text_color: [255, 255, 255, 255],
-            font_path: PathBuf::from("fonts/test.ttf"),
-            available_inline_fonts: vec![InlineFontEntry {
-                label: "Test".to_string(),
-                font_path: PathBuf::from("fonts/test-inline.ttf"),
-                face_index: 0,
-            }],
+            font_name: "test-font".to_string(),
             font_size_px: 42.0,
             line_spacing_px: 0.0,
             line_spacing_percent: 100.0,

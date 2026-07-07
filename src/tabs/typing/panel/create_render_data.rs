@@ -57,11 +57,17 @@ impl TypingCreatePanelState {
             .get(font_idx)
             .map(|font| font.label.clone())
             .unwrap_or_default();
+        let font_original_name = self
+            .fonts
+            .get(font_idx)
+            .map(|font| font.original_name.clone())
+            .unwrap_or_default();
         self.build_render_data_json_with_font(
             self.text.clone(),
             self.width_px.max(1),
             Some(font_path),
             Some(font_label),
+            Some(font_original_name),
         )
     }
 
@@ -72,6 +78,7 @@ impl TypingCreatePanelState {
             width_px.max(1),
             Some(font.path.to_string_lossy().to_string()),
             Some(font.label.clone()),
+            Some(font.original_name.clone()),
         ))
     }
 
@@ -81,6 +88,7 @@ impl TypingCreatePanelState {
         width_px: u32,
         font_path: Option<String>,
         font_label: Option<String>,
+        font_original_name: Option<String>,
     ) -> Value {
         let mut render_data = json!({
             "text_params": {
@@ -156,6 +164,10 @@ impl TypingCreatePanelState {
                 "shape_variant": self.shape_variant,
                 "font_path": font_path,
                 "font_label": font_label,
+                // Real font family/name from the file. Preferred by PSD export and
+                // future virtual fonts; kept alongside `font_path`/`font_label` for
+                // back-compat with older projects.
+                "font_original_name": font_original_name,
                 // Сформированный (разбитый на строки) текст «продвинутой формы».
                 // Если не пуст — именно он идёт в рендер; `text` остаётся исходным.
                 // Переживает перезапуск.

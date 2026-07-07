@@ -704,7 +704,7 @@ pub(super) fn spawn_preview_render_worker() -> (Sender<PreviewRenderJob>, Receiv
                     dropped
                 );
 
-                let result = render_text_to_image(&job.params, None);
+                let result = render_text_to_image(&job.params, job.fonts.as_ref(), None);
                 if let Err(err) = result.as_ref() {
                     eprintln!(
                         "ERROR typing::preview_render layout={:?} shape={:?} wrap={:?} line_mode={:?} width_px={} err={}",

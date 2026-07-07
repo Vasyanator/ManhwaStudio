@@ -81,6 +81,7 @@ use super::panel::{
     TypingOverlayEditRequest, TypingOverlayKind, TypingPanelLayout, TypingSelectedOverlayForEdit,
 };
 use super::render_next::{apply_effects_to_image, render_text_to_image};
+use super::render_next::{FontContentSet, FontProvider};
 use super::render_next::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, PxOrPercent, TEXT_FORMULA_USER_VAR_COUNT,
     TextDrawnLinesLayoutParams,
@@ -772,6 +773,10 @@ impl CanvasHooks for TypingHooks<'_> {
     ) {
         self.text_overlays
             .set_clean_overlays_model(canvas.clean_overlays_model_handle());
+        // Keep the tab-side render font source in sync with the panel's current font
+        // list so background renders resolve fonts by name (and pick up reloads).
+        self.text_overlays
+            .set_font_provider(self.top_panel.font_provider());
         self.text_overlays.flush_edit_save_on_selection_change();
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
@@ -1065,6 +1070,8 @@ struct TypingCreateOverlayRequest {
     center_page_px: [f32; 2],
     render_params: TextRenderParams,
     render_data_json: Value,
+    /// Font source captured at dispatch time so the worker resolves fonts by name.
+    font_provider: Arc<dyn FontProvider>,
 }
 
 struct TypingCreateImageOverlayRequest {
@@ -1145,6 +1152,8 @@ struct TypingEditOverlayRequest {
     rotation_deg: f32,
     render_params: TextRenderParams,
     render_data_json: Value,
+    /// Font source captured at dispatch time so the worker resolves fonts by name.
+    font_provider: Arc<dyn FontProvider>,
 }
 
 struct TypingEditOverlayResult {
@@ -1212,6 +1221,8 @@ struct TypingVectorBaseRenderRequest {
     overlay_idx: usize,
     /// Render params built from the overlay's `render_data` with `raster_transform` already CLEARED.
     render_params: TextRenderParams,
+    /// Font source captured at dispatch time so the worker resolves fonts by name.
+    font_provider: Arc<dyn FontProvider>,
 }
 
 struct TypingShapeVariantPreviewTile {
@@ -1520,6 +1531,10 @@ pub(super) struct TypingTextOverlayLayer {
     export_rx: Option<TypingExportRenderState>,
     export_status: TypingExportUiStatus,
     edit_render_rx: Option<Receiver<Result<Option<TypingEditOverlayResult>, String>>>,
+    /// Font source handed to every tab-side render worker. Refreshed each frame from
+    /// the top panel's current font list (`refresh_font_provider`) and captured into
+    /// each render request so background threads resolve fonts by name.
+    font_provider: Arc<dyn FontProvider>,
     edit_render_latest_token: Arc<AtomicU64>,
     edit_render_next_token: u64,
     edit_render_data_dirty: bool,
@@ -1657,6 +1672,8 @@ impl Default for TypingTextOverlayLayer {
             export_rx: None,
             export_status: TypingExportUiStatus::Hidden,
             edit_render_rx: None,
+            // Empty provider until the first frame refreshes it from the top panel.
+            font_provider: Arc::new(FontContentSet::default()),
             edit_render_latest_token: Arc::new(AtomicU64::new(0)),
             edit_render_next_token: 0,
             edit_render_data_dirty: false,

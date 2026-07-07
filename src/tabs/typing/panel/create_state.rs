@@ -46,9 +46,11 @@ impl TypingCreatePanelState {
         } else {
             "Готово к рендеру".to_string()
         };
+        let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
         let mut state = Self {
             fonts_dir,
             fonts,
+            font_provider,
             font_groups,
             selected_font_group: None,
             use_system_fonts: effective_use_system_fonts,
@@ -157,6 +159,12 @@ impl TypingCreatePanelState {
         self.use_system_fonts
     }
 
+    /// Shared font source for renders built from this panel's current font list.
+    /// Cheap to clone (Arc); hand it to every background render worker.
+    pub(in crate::tabs::typing) fn font_provider(&self) -> Arc<dyn FontProvider> {
+        Arc::clone(&self.font_provider)
+    }
+
     pub(super) fn reset_text_input_focus_tracking(&mut self) {
         self.tracked_text_input_ids.clear();
     }
@@ -253,6 +261,9 @@ impl TypingCreatePanelState {
                         .clone()
                         .or_else(|| self.current_font_key());
                     self.fonts = result.fonts;
+                    // Rebuild the render font source from the new list so renders and
+                    // inline `<font=...>` tags resolve against the reloaded fonts.
+                    self.font_provider = Arc::new(TabFontProvider::from_fonts(&self.fonts));
                     self.font_groups = result.font_groups;
                     self.sync_selected_font_group();
                     self.selected_font_idx = previous_font_key

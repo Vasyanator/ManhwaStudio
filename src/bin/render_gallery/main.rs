@@ -26,7 +26,10 @@ Fully deterministic: no randomness, no time, fixed inputs. Uses the repo font
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use std::sync::Arc;
+
 use ms_text_render::render_text_to_image;
+use ms_text_render::{FontContent, FontContentSet, font_content_id};
 use ms_text_render::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage, TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams, TextShape,
@@ -40,11 +43,31 @@ struct Case {
     params: TextRenderParams,
 }
 
+/// Working name every case references its font by. Resolved through the
+/// `FontContentSet` built in `main`.
+const GALLERY_FONT_NAME: &str = "gallery-font";
+
 /// Absolute path to the harness font (Latin + Cyrillic coverage), resolved from
 /// the crate manifest dir so the bin works regardless of the current directory.
 fn font_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+}
+
+/// Builds the in-memory font source for the harness by reading the fixture font
+/// once and exposing it under `GALLERY_FONT_NAME`.
+fn build_font_set() -> Result<FontContentSet, String> {
+    let path = font_path();
+    let bytes = std::fs::read(&path)
+        .map_err(|err| format!("failed to read harness font {}: {err}", path.display()))?;
+    let content_id = font_content_id(&bytes);
+    Ok(FontContentSet::new(vec![FontContent {
+        name: GALLERY_FONT_NAME.to_string(),
+        original_name: GALLERY_FONT_NAME.to_string(),
+        data: Arc::new(bytes),
+        face_index: 0,
+        content_id,
+    }]))
 }
 
 /// Neutral baseline parameters shared by every case. Individual cases clone this
@@ -53,8 +76,7 @@ fn base_params() -> TextRenderParams {
     TextRenderParams {
         text: String::new(),
         text_color: [10, 10, 10, 255],
-        font_path: font_path(),
-        available_inline_fonts: Vec::new(),
+        font_name: GALLERY_FONT_NAME.to_string(),
         font_size_px: 48.0,
         line_spacing_px: 0.0,
         line_spacing_percent: 20.0,
@@ -395,6 +417,13 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let font_set = match build_font_set() {
+        Ok(set) => set,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut cases = all_cases();
     for case in &mut cases {
         case.params.anti_aliasing = aa_mode;
@@ -403,7 +432,7 @@ fn main() -> ExitCode {
     let mut failed = 0usize;
     for case in &cases {
         let path = outdir.join(format!("{}.png", case.name));
-        match render_text_to_image(&case.params, None) {
+        match render_text_to_image(&case.params, &font_set, None) {
             Ok(image) => match write_png(&path, &image) {
                 Ok(()) => {
                     ok += 1;

@@ -1174,7 +1174,7 @@ fn glyph_ink_profile_from_image(
 #[cfg(test)]
 mod tests {
     use super::{compute_vertical_column_positions, vertical_base_advance};
-    use crate::pipeline::render_text_to_image;
+    use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
         AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage,
         TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
@@ -1227,8 +1227,7 @@ mod tests {
         TextRenderParams {
             text: text.to_string(),
             text_color: [255, 255, 255, 255],
-            font_path: test_font_path(),
-            available_inline_fonts: Vec::new(),
+            font_name: "test-font".to_string(),
             font_size_px: 64.0,
             line_spacing_px: 0.0,
             line_spacing_percent: 100.0,
@@ -1268,8 +1267,23 @@ mod tests {
         }
     }
 
+    /// Builds a single-font provider that resolves `params.font_name` to the test
+    /// fixture bytes, so the render path never touches the filesystem itself.
+    fn font_provider(params: &TextRenderParams) -> FontContentSet {
+        let bytes = std::fs::read(test_font_path()).unwrap_or_default();
+        let content_id = font_content_id(&bytes);
+        FontContentSet::new(vec![FontContent {
+            name: params.font_name.clone(),
+            original_name: params.font_name.clone(),
+            data: std::sync::Arc::new(bytes),
+            face_index: params.selected_face_index,
+            content_id,
+        }])
+    }
+
     fn render(params: &TextRenderParams) -> RenderedTextImage {
-        render_text_to_image(params, None).expect("vertical render succeeds")
+        crate::pipeline::render_text_to_image(params, &font_provider(params), None)
+            .expect("vertical render succeeds")
     }
 
     /// Width/height of the non-transparent content, or `None` if fully empty.

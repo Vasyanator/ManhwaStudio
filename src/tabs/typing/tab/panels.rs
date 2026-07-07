@@ -546,6 +546,7 @@ impl TypingTextOverlayLayer {
             rotation_deg: overlay.angle_deg,
             render_params,
             render_data_json,
+            font_provider: Arc::clone(&self.font_provider),
         };
         self.start_edit_overlay_render_job(edit_request);
     }

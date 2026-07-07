@@ -442,6 +442,7 @@ impl TypingCreatePanelState {
         let job = PreviewRenderJob {
             token: self.latest_token,
             params,
+            fonts: self.font_provider(),
         };
         match self.request_tx.send(job) {
             Ok(()) => {
@@ -566,7 +567,6 @@ impl TypingCreatePanelState {
         let formula_layout = self.formula_layout_for_render();
         let drawn_lines_layout = self.drawn_lines_layout_for_render();
         let vector_lines_layout = self.vector_lines_layout.clone();
-        let available_inline_fonts = self.available_inline_fonts();
 
         Some(TextRenderParams {
             text,
@@ -576,8 +576,10 @@ impl TypingCreatePanelState {
                 self.text_color.b(),
                 self.text_color.a(),
             ],
-            font_path: font.path.clone(),
-            available_inline_fonts,
+            // The renderer resolves the main font by name through the provider
+            // handed to `render_text_to_image`; inline `<font=...>` tags resolve
+            // against the same provider. The name is the font label.
+            font_name: font.label.clone(),
             font_size_px: self.font_size_px.max(1.0),
             line_spacing_px: self.line_spacing.as_px_percent().0,
             line_spacing_percent: self.line_spacing.as_px_percent().1,
@@ -624,17 +626,6 @@ impl TypingCreatePanelState {
             effects_json: self.effects_json(),
             anti_aliasing: self.anti_aliasing,
         })
-    }
-
-    pub(super) fn available_inline_fonts(&self) -> Vec<InlineFontEntry> {
-        self.fonts
-            .iter()
-            .map(|font| InlineFontEntry {
-                label: font.label.clone(),
-                font_path: font.path.clone(),
-                face_index: font.faces.first().map(|face| face.face_index).unwrap_or(0),
-            })
-            .collect()
     }
 
     pub(super) fn sync_wrap_mode_constraints(&mut self) {

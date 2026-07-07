@@ -560,6 +560,13 @@ impl TypingTopPanelState {
         self.create_panel.editor_font_spec()
     }
 
+    /// Shared font source for tab-side renders, built from the create panel's font
+    /// list (the create and edit panels load the same fonts). Handed to the tab so
+    /// its background render workers resolve fonts by name.
+    pub(in crate::tabs::typing) fn font_provider(&self) -> Arc<dyn FontProvider> {
+        self.create_panel.font_provider()
+    }
+
     pub(in crate::tabs::typing) fn adjust_create_font_size_by_wheel_steps(&mut self, steps: i32) -> bool {
         if self.mode != TypingTopPanelMode::CreateText {
             return false;

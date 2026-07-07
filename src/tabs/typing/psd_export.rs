@@ -396,11 +396,15 @@ fn build_layer_text_data(overlay: &TypingExportOverlaySnapshot) -> LayerTextData
     // Имя шрифта для Photoshop. PS сопоставляет шрифт текстового слоя по его
     // PostScript-имени (OpenType name table id 6, напр. `ArialMT`). Цепочка
     // фолбэков (побеждает первый непустой):
-    //   1. реальное PostScript-имя (id 6), прочитанное из файла шрифта через fontdb;
+    //   1. реальное PostScript-имя (id 6), прочитанное из файла шрифта через fontdb
+    //      с УЧЁТОМ выбранного `selected_face_index` (иначе теряется начертание);
     //   2. имя семейства (id 1), если PostScript-имя недоступно;
-    //   3. последний `|`-сегмент `font_label` (в нём уже лежит PostScript-имя);
-    //   4. file stem пути шрифта;
-    //   5. `"MyriadPro-Regular"`.
+    //   3. сохранённое `font_original_name` — реальное имя из данных шрифта; нужно,
+    //      когда файла нет (будущие виртуальные шрифты), но это имя СЕМЕЙСТВА
+    //      представительного face, поэтому оно НИЖЕ путь-резолверов, а не выше их;
+    //   4. последний `|`-сегмент `font_label` (в нём уже лежит PostScript-имя);
+    //   5. file stem пути шрифта;
+    //   6. `"MyriadPro-Regular"`.
     let font_path = params.and_then(|p| p.get("font_path")).and_then(Value::as_str);
     let face_index = params
         .and_then(|p| p.get("selected_face_index"))
@@ -408,8 +412,14 @@ fn build_layer_text_data(overlay: &TypingExportOverlaySnapshot) -> LayerTextData
         .map(|v| v as usize)
         .unwrap_or(0);
 
+    let persisted_original_name = params
+        .and_then(|p| p.get("font_original_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned);
     let font_name = font_path
-        // 1. PostScript-имя из файла шрифта.
+        // 1. PostScript-имя из файла шрифта (с выбранным начертанием).
         .and_then(|path| resolve_font_postscript_name(path, face_index))
         // 2. имя семейства из файла шрифта.
         .or_else(|| {
@@ -417,7 +427,9 @@ fn build_layer_text_data(overlay: &TypingExportOverlaySnapshot) -> LayerTextData
                 resolve_font_family_name(path, face_index)
             })
         })
-        // 3. последний `|`-сегмент font_label (PostScript-имя в UI-метке).
+        // 3. сохранённое оригинальное имя (для виртуальных шрифтов / отсутствующего файла).
+        .or(persisted_original_name)
+        // 4. последний `|`-сегмент font_label (PostScript-имя в UI-метке).
         .or_else(|| {
             params
                 .and_then(|p| p.get("font_label"))
@@ -433,7 +445,7 @@ fn build_layer_text_data(overlay: &TypingExportOverlaySnapshot) -> LayerTextData
                         .to_string()
                 })
         })
-        // 4. file stem пути шрифта.
+        // 5. file stem пути шрифта.
         .or_else(|| {
             font_path.and_then(|raw| {
                 Path::new(raw)
@@ -442,7 +454,7 @@ fn build_layer_text_data(overlay: &TypingExportOverlaySnapshot) -> LayerTextData
                     .map(|s| s.to_string())
             })
         })
-        // 5. последний резерв.
+        // 6. последний резерв.
         .unwrap_or_else(|| "MyriadPro-Regular".to_string());
 
     let justification = match params

@@ -353,6 +353,7 @@ impl TypingTextOverlayLayer {
             center_page_px: editor.center_page_px,
             render_params,
             render_data_json,
+            font_provider: Arc::clone(&self.font_provider),
         };
         crate::trace_log!(
             cat::SYNC,

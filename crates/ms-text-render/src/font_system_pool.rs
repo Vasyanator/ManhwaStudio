@@ -24,10 +24,9 @@ Main responsibilities:
   a background thread before the first user render.
 
 Key structures:
-- `FileKey`: identity of a font file for dedup (path + length + mtime).
-- `FontFaceCache`: per-`FontSystem` map of already-loaded font files, plus the
-  pristine default-family names captured at system creation and a determinism
-  taint flag.
+- `FontFaceCache`: per-`FontSystem` map of already-loaded font content (keyed by
+  content id), plus the pristine default-family names captured at system creation
+  and a determinism taint flag.
 - `PooledFontSystem`: a `FontSystem` bundled with its `FontFaceCache`.
 
 Determinism guards (renderer requires byte-identical output for identical params
@@ -37,8 +36,8 @@ even on a reused pooled system):
   captures those names once so a render whose selected face has NO family name can
   RESTORE them instead of inheriting a prior render's family (see
   `font_registry::apply_default_families`).
-- Taint-and-drop: font matching is by family name. If two DIFFERENT files
-  (different `FileKey`) declare the same `(family, weight, style, stretch)`,
+- Taint-and-drop: font matching is by family name. If two DIFFERENT contents
+  (different content id) declare the same `(family, weight, style, stretch)`,
   cosmic-text may resolve `Family::Name` to the wrong (earlier-loaded) face —
   history-dependent. The loader marks the cache `tainted` on such a collision and
   `return_to_pool` DROPS a tainted system so it can never serve a future render.
@@ -54,18 +53,13 @@ must not panic anyway.
 */
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-// std::time here: `modified` comes from `std::fs` metadata (std SystemTime) and
-// there is no wall-clock `now()` call, so no web-time shim is needed.
-use std::time::UNIX_EPOCH;
 
 use cosmic_text::{FontSystem, fontdb};
 
 use super::font_registry::RegisteredFontFace;
 
-/// Maximum number of distinct font files a pooled `FontSystem` may accumulate
+/// Maximum number of distinct font contents a pooled `FontSystem` may accumulate
 /// before it is dropped instead of returned. Keeps a long-lived `FontSystem`
 /// from growing without bound as many different fonts are rendered.
 const MAX_CACHED_FILES: usize = 64;
@@ -73,59 +67,6 @@ const MAX_CACHED_FILES: usize = 64;
 /// Maximum number of `FontSystem` instances kept warm in the free list. Extra
 /// systems returned beyond this are dropped.
 const MAX_POOLED_SYSTEMS: usize = 12;
-
-/// Identity of a font file used to dedup loads into one `FontSystem`'s fontdb.
-///
-/// Derived from `fs::metadata` (cheap; no `fs::read` on a cache hit). If
-/// metadata is unavailable the key falls back to `(path, 0, None)`, which is
-/// still stable for a given path and simply forces a (correct) reload.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FileKey {
-    path: PathBuf,
-    len: u64,
-    /// Signed nanoseconds relative to the Unix epoch; `None` when the platform
-    /// or filesystem does not expose a modification time.
-    mtime_nanos: Option<i128>,
-}
-
-impl FileKey {
-    /// Builds a `FileKey` from the path's current metadata.
-    ///
-    /// Never fails: on any metadata error it falls back to keying by the path
-    /// alone (`len = 0`, `mtime = None`) so callers do not have to branch on IO
-    /// errors here — the actual read error, if any, surfaces at load time.
-    #[must_use]
-    pub fn from_path(path: &Path) -> Self {
-        // Canonicalize so that different spellings of the same file share one
-        // key; fall back to the given path when the file cannot be resolved.
-        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        match fs::metadata(path) {
-            Ok(meta) => Self {
-                path: canonical,
-                len: meta.len(),
-                mtime_nanos: metadata_mtime_nanos(&meta),
-            },
-            Err(_) => Self {
-                path: canonical,
-                len: 0,
-                mtime_nanos: None,
-            },
-        }
-    }
-}
-
-/// Extracts the modification time of `meta` as signed nanoseconds relative to
-/// the Unix epoch, or `None` if it is unavailable. Times before the epoch are
-/// represented as negative values.
-fn metadata_mtime_nanos(meta: &fs::Metadata) -> Option<i128> {
-    let modified = meta.modified().ok()?;
-    match modified.duration_since(UNIX_EPOCH) {
-        Ok(dur) => i128::try_from(dur.as_nanos()).ok(),
-        Err(err) => i128::try_from(err.duration().as_nanos())
-            .ok()
-            .map(|nanos| -nanos),
-    }
-}
 
 /// Snapshot of a `FontSystem`'s generic default-family names, captured once at
 /// system creation so a later render can restore the pristine matching state.
@@ -189,24 +130,24 @@ impl PristineDefaultFamilies {
     }
 }
 
-/// Cache of font files already loaded into ONE `FontSystem`'s fontdb, keyed by
-/// `FileKey`. Prevents re-adding duplicate faces when the `FontSystem` is reused
-/// across renders (the source of unbounded fontdb growth before pooling).
+/// Cache of font contents already loaded into ONE `FontSystem`'s fontdb, keyed
+/// by content id. Prevents re-adding duplicate faces when the `FontSystem` is
+/// reused across renders (the source of unbounded fontdb growth before pooling).
 ///
 /// Also carries two per-system determinism guards: the pristine default-family
 /// names captured at creation (`pristine`, restored on a no-family render) and a
-/// `tainted` flag set when two distinct files collide on one family name (a
+/// `tainted` flag set when two distinct contents collide on one family name (a
 /// tainted system is dropped rather than reused). See the file header.
 ///
 /// Travels with its owning `FontSystem` inside `PooledFontSystem`, so its
 /// entries always reflect exactly what that system's db has loaded.
 #[derive(Debug, Default)]
 pub struct FontFaceCache {
-    /// Font files already loaded, mapped to the fontdb IDs they produced.
-    files: HashMap<FileKey, Vec<fontdb::ID>>,
-    /// Resolved face metadata per `(file, face_index)` so a reused system does
-    /// not re-read face records from the db.
-    meta: HashMap<(FileKey, usize), RegisteredFontFace>,
+    /// Font contents already loaded, mapped to the fontdb IDs they produced.
+    files: HashMap<u64, Vec<fontdb::ID>>,
+    /// Resolved face metadata per `(content_id, face_index)` so a reused system
+    /// does not re-read face records from the db.
+    meta: HashMap<(u64, usize), RegisteredFontFace>,
     /// Generic default-family names captured at system creation. Empty for
     /// caches built with `new()` (throwaway systems); populated by `for_system`.
     pristine: PristineDefaultFamilies,
@@ -257,17 +198,17 @@ impl FontFaceCache {
         self.tainted = true;
     }
 
-    /// Reports whether a DIFFERENT already-loaded file declares the same
+    /// Reports whether a DIFFERENT already-loaded content declares the same
     /// `(family, weight, style, stretch)` as `new_face`, which would make
     /// `Family::Name` matching history-dependent on a reused system.
     ///
     /// Returns `false` when `new_face` has no family name: a nameless face is
     /// never selected by `Family::Name`, so it cannot collide. Compares against
-    /// stored metadata only (every loaded file has at least one meta entry).
+    /// stored metadata only (every loaded content has at least one meta entry).
     #[must_use]
     pub(crate) fn collides_with_other_file(
         &self,
-        new_key: &FileKey,
+        new_key: u64,
         new_face: &RegisteredFontFace,
     ) -> bool {
         let Some(new_family) = new_face.family_name.as_deref() else {
@@ -276,7 +217,7 @@ impl FontFaceCache {
         self.meta
             .iter()
             .any(|((existing_key, _), existing_face)| {
-                existing_key != new_key
+                *existing_key != new_key
                     && existing_face.family_name.as_deref() == Some(new_family)
                     && existing_face.weight == new_face.weight
                     && existing_face.style == new_face.style
@@ -284,42 +225,43 @@ impl FontFaceCache {
             })
     }
 
-    /// Number of distinct font files loaded through this cache. Used to bound
+    /// Number of distinct font contents loaded through this cache. Used to bound
     /// pooled-system growth and in tests to assert dedup.
     #[must_use]
     pub(crate) fn distinct_file_count(&self) -> usize {
         self.files.len()
     }
 
-    /// Returns the fontdb IDs previously loaded for `key`, if any.
+    /// Returns the fontdb IDs previously loaded for `content_id`, if any.
     #[must_use]
-    pub(crate) fn loaded_ids(&self, key: &FileKey) -> Option<&[fontdb::ID]> {
-        self.files.get(key).map(Vec::as_slice)
+    pub(crate) fn loaded_ids(&self, content_id: u64) -> Option<&[fontdb::ID]> {
+        self.files.get(&content_id).map(Vec::as_slice)
     }
 
-    /// Records the fontdb IDs produced by loading `key`'s file.
-    pub(crate) fn store_loaded(&mut self, key: FileKey, ids: Vec<fontdb::ID>) {
-        self.files.insert(key, ids);
+    /// Records the fontdb IDs produced by loading `content_id`'s bytes.
+    pub(crate) fn store_loaded(&mut self, content_id: u64, ids: Vec<fontdb::ID>) {
+        self.files.insert(content_id, ids);
     }
 
-    /// Returns cached face metadata for `(key, face_index)`, if resolved before.
+    /// Returns cached face metadata for `(content_id, face_index)`, if resolved
+    /// before.
     #[must_use]
     pub(crate) fn cached_meta(
         &self,
-        key: &FileKey,
+        content_id: u64,
         face_index: usize,
     ) -> Option<&RegisteredFontFace> {
-        self.meta.get(&(key.clone(), face_index))
+        self.meta.get(&(content_id, face_index))
     }
 
-    /// Stores resolved face metadata for `(key, face_index)`.
+    /// Stores resolved face metadata for `(content_id, face_index)`.
     pub(crate) fn store_meta(
         &mut self,
-        key: FileKey,
+        content_id: u64,
         face_index: usize,
         face: RegisteredFontFace,
     ) {
-        self.meta.insert((key, face_index), face);
+        self.meta.insert((content_id, face_index), face);
     }
 }
 
@@ -440,16 +382,31 @@ pub fn prewarm_font_system_pool() {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileKey, FontFaceCache, checkout, return_to_pool, should_requeue, with_leased_font_system,
+        FontFaceCache, checkout, return_to_pool, should_requeue, with_leased_font_system,
     };
-    use crate::font_registry::load_selected_font_from_path;
+    use crate::font_provider::{FontContent, font_content_id};
+    use crate::font_registry::{load_font_content, load_selected_font_from_path};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// Returns the path to a real font fixture so the test exercises actual
     /// fontdb loading, not a mock. Same fixture the pipeline tests use.
     fn test_font_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+    }
+
+    /// Builds a `FontContent` over the fixture bytes with an EXPLICIT `content_id`
+    /// so a test can model two distinct contents (e.g. two virtual fonts) that
+    /// declare the same family. `content_id` is the cache key the loader dedups on.
+    fn content_with_id(bytes: &Arc<Vec<u8>>, content_id: u64) -> FontContent {
+        FontContent {
+            name: "test-font".to_string(),
+            original_name: "test-font".to_string(),
+            data: Arc::clone(bytes),
+            face_index: 0,
+            content_id,
+        }
     }
 
     #[test]
@@ -493,14 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn file_key_is_stable_for_same_path() {
-        let font_path = test_font_path();
-        if !font_path.exists() {
-            return;
-        }
-        let a = FileKey::from_path(&font_path);
-        let b = FileKey::from_path(&font_path);
-        assert_eq!(a, b, "the same file must produce an equal key");
+    fn content_id_is_stable_for_same_bytes() {
+        // The load-cache key must be a pure function of the bytes: identical bytes
+        // share one id (dedup into a reused FontSystem once), different bytes get
+        // different ids. This is the content-id analog of the old FileKey identity.
+        let a = font_content_id(b"same font bytes");
+        let b = font_content_id(b"same font bytes");
+        let c = font_content_id(b"other font bytes");
+        assert_eq!(a, b, "identical bytes must produce an equal content id");
+        assert_ne!(a, c, "different bytes must produce different content ids");
     }
 
     #[test]
@@ -540,71 +498,61 @@ mod tests {
     }
 
     #[test]
-    fn two_files_same_family_taint_and_drop() {
-        // Two DIFFERENT files (different FileKey) declaring the SAME family name
-        // must taint the system so it is dropped instead of reused.
+    fn two_contents_same_family_taint_and_drop() {
+        // Two DIFFERENT contents (different content id) declaring the SAME family
+        // name must taint the system so it is dropped instead of reused. This is
+        // exactly the virtual-font case: two renamed contents backed by the same
+        // family. We give the same fixture bytes two distinct content ids so the
+        // loader treats them as separate loads (no dedup) that then collide on the
+        // shared family name.
         let font_path = test_font_path();
         if !font_path.exists() {
             eprintln!(
-                "skipping two_files_same_family_taint_and_drop: font not found at {}",
+                "skipping two_contents_same_family_taint_and_drop: font not found at {}",
                 font_path.display()
             );
             return;
         }
-
-        // Copy the fixture to a second, distinct path so the two loads produce
-        // different FileKeys but the same declared family name — the real-world
-        // collision this guard defends against.
-        let copy_path = std::env::temp_dir().join(format!(
-            "ms_text_render_taint_fixture_{}.ttf",
-            std::process::id()
-        ));
-        if let Err(err) = std::fs::copy(&font_path, &copy_path) {
-            eprintln!(
-                "skipping two_files_same_family_taint_and_drop: could not copy fixture to {}: {err}",
-                copy_path.display()
-            );
-            return;
-        }
+        let bytes = match std::fs::read(&font_path) {
+            Ok(bytes) => Arc::new(bytes),
+            Err(err) => {
+                eprintln!(
+                    "skipping two_contents_same_family_taint_and_drop: could not read fixture: {err}"
+                );
+                return;
+            }
+        };
 
         let mut system = cosmic_text::FontSystem::new();
         let mut cache = FontFaceCache::for_system(&system);
 
-        let first = load_selected_font_from_path(&mut system, &mut cache, &font_path, 0)
-            .expect("first font load should succeed");
+        // Distinct explicit content ids model two different (e.g. virtual) fonts.
+        let first = load_font_content(&mut system, &mut cache, &content_with_id(&bytes, 1), 0)
+            .expect("first content load should succeed");
         assert!(
             !cache.is_tainted(),
-            "loading the first distinct file must not taint the cache"
+            "loading the first distinct content must not taint the cache"
         );
         assert!(
             should_requeue(&cache),
-            "an untainted single-file cache must be requeuable"
+            "an untainted single-content cache must be requeuable"
         );
 
-        let second = load_selected_font_from_path(&mut system, &mut cache, &copy_path, 0)
-            .expect("second (copied) font load should succeed");
+        let second = load_font_content(&mut system, &mut cache, &content_with_id(&bytes, 2), 0)
+            .expect("second content load should succeed");
 
-        // Both files declare the same family name, so the second load collides.
+        // Both contents declare the same family name, so the second load collides.
         assert_eq!(
             first.family_name, second.family_name,
-            "the copied file must declare the same family as the original"
+            "the second content must declare the same family as the first"
         );
         assert!(
             cache.is_tainted(),
-            "a second distinct file with the same family name must taint the cache"
+            "a second distinct content with the same family name must taint the cache"
         );
         assert!(
             !should_requeue(&cache),
             "a tainted cache must be dropped by return_to_pool, not requeued"
         );
-
-        // Best-effort cleanup of the temp copy. A leftover file in the OS temp
-        // dir is harmless, so a removal error is only reported, not fatal.
-        if let Err(err) = std::fs::remove_file(&copy_path) {
-            eprintln!(
-                "two_files_same_family_taint_and_drop: could not remove temp copy {}: {err}",
-                copy_path.display()
-            );
-        }
     }
 }
