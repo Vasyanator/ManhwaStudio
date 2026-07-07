@@ -258,12 +258,27 @@ impl TypingCreatePanelState {
         font_path: &Path,
         face_index: usize,
         selected: bool,
+        coverage: &FontLanguageCoverage,
     ) -> bool {
         let prev_override = ui.style().override_font_id.clone();
         if let Some(family) = self.ensure_combo_font_family(ui.ctx(), font_path, face_index) {
             ui.style_mut().override_font_id = Some(egui::FontId::new(14.0, family));
         }
-        let clicked = ui.selectable_label(selected, label).clicked();
+        // Highlight fonts that do not fully support the program language.
+        let text = match coverage.support {
+            FontLanguageSupport::Full => egui::RichText::new(label),
+            FontLanguageSupport::Partial => {
+                egui::RichText::new(label).color(egui::Color32::from_rgb(240, 200, 60))
+            }
+            FontLanguageSupport::Unsupported => {
+                egui::RichText::new(label).color(egui::Color32::from_rgb(230, 96, 92))
+            }
+        };
+        let mut response = ui.selectable_label(selected, text);
+        if let Some(tooltip) = font_coverage_tooltip(coverage) {
+            response = response.on_hover_text(tooltip);
+        }
+        let clicked = response.clicked();
         ui.style_mut().override_font_id = prev_override;
         clicked
     }
@@ -285,6 +300,40 @@ impl TypingCreatePanelState {
             self.selected_face_idx = self.selected_face_idx.min(max_idx);
         } else {
             self.selected_face_idx = 0;
+        }
+    }
+}
+
+/// Build the hover tooltip for a font dropdown item, or `None` when the font
+/// fully supports the program language (no highlight, no tooltip).
+fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
+    match coverage.support {
+        FontLanguageSupport::Full => None,
+        FontLanguageSupport::Unsupported => Some(
+            "Шрифт не поддерживает кириллицу — систему письма русского языка. \
+             Текст этим шрифтом не отобразится и будет заменён другим шрифтом."
+                .to_string(),
+        ),
+        FontLanguageSupport::Partial => {
+            const MAX_SHOWN: usize = 15;
+            let shown: String = coverage
+                .missing
+                .iter()
+                .take(MAX_SHOWN)
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let extra = coverage.missing.len().saturating_sub(MAX_SHOWN);
+            let list = if extra > 0 {
+                format!("{shown} … (и ещё {extra})")
+            } else {
+                shown
+            };
+            Some(format!(
+                "Шрифт частично поддерживает русский язык. Не хватает символов: {list}."
+            ))
         }
     }
 }

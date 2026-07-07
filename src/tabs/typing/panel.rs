@@ -200,6 +200,8 @@ use ui_helpers::*;
 mod effect_parse;
 use effect_parse::*;
 mod effect_defaults;
+mod font_coverage;
+use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
 pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults_from_config};
@@ -618,6 +620,10 @@ struct FontEntry {
     /// группы» и базовое имя неоднозначно. `None` — уточнение не нужно.
     disambig: Option<String>,
     faces: Vec<FontFaceEntry>,
+    /// How well this font covers the program language's writing system, computed
+    /// once at load time from the representative face. Drives the red/yellow
+    /// highlight in the font dropdown.
+    coverage: FontLanguageCoverage,
 }
 
 #[derive(Clone)]
@@ -1236,6 +1242,7 @@ struct RawFontFile {
     group: Option<String>,
     content_hash: u64,
     faces: Vec<FontFaceEntry>,
+    coverage: FontLanguageCoverage,
 }
 
 #[cfg(test)]

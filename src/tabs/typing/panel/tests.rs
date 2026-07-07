@@ -96,6 +96,7 @@ paths change.
             group: group.map(ToOwned::to_owned),
             content_hash: hash,
             faces: default_single_face(),
+            coverage: FontLanguageCoverage::default(),
         }
     }
 

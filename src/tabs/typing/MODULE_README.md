@@ -245,6 +245,11 @@ saving, and export.
   - `inline_tags.rs`: inline-tag machine/opening/closing build + parse, offset/stretch/color/align tokens (free fns).
   - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
   - `fonts.rs`: font discovery/loading (dir + system), duplicate merge/disambiguation, group listing (free fns).
+    Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
+    representative face's bytes and cached on `FontEntry.coverage`; the dropdown never recomputes it.
+  - `font_coverage.rs`: pure classification of a font's support for the program language's writing
+    system (Cyrillic today) → `Full`/`Partial`/`Unsupported` via the swash charmap; drives the
+    red/yellow font-dropdown highlight + hover tooltip in `create_presets::draw_font_combo_option`.
   - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
   - `ui_helpers.rs`: font-family binding/matching, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns).
   - `effect_parse.rs`: `parse_effect_cards` (free fn).

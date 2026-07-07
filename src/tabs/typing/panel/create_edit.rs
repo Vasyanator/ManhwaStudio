@@ -207,7 +207,7 @@ impl TypingCreatePanelState {
                                                 .selected_text(selected_font_text)
                                                 .show_ui_with_wheel(ui, |ui| {
                                                     for idx in 0..self.fonts.len() {
-                                                        let (label, path, face_index) = {
+                                                        let (label, path, face_index, coverage) = {
                                                             let font = &self.fonts[idx];
                                                             (
                                                                 font.label.clone(),
@@ -216,6 +216,7 @@ impl TypingCreatePanelState {
                                                                     .first()
                                                                     .map(|face| face.face_index)
                                                                     .unwrap_or(0),
+                                                                font.coverage.clone(),
                                                             )
                                                         };
                                                         let selected = font_idx == idx;
@@ -225,6 +226,7 @@ impl TypingCreatePanelState {
                                                             path.as_path(),
                                                             face_index,
                                                             selected,
+                                                            &coverage,
                                                         ) {
                                                             font_idx = idx;
                                                         }

@@ -78,12 +78,18 @@ pub(super) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
                 .unwrap_or("font")
                 .to_string();
             let group = font_group_name_for_path(fonts_dir, &path);
+            let rep_face_index = faces.first().map(|face| face.face_index).unwrap_or(0);
+            let coverage = bytes.as_deref().map_or_else(
+                FontLanguageCoverage::default,
+                |data| super::font_coverage::classify_font_bytes(data, rep_face_index),
+            );
             RawFontFile {
                 path,
                 stem,
                 group,
                 content_hash,
                 faces,
+                coverage,
             }
         })
         .collect();
@@ -117,6 +123,7 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
         let label = rep.stem.clone();
         let faces = rep.faces.clone();
         let path = rep.path.clone();
+        let coverage = rep.coverage.clone();
         let alt_paths = cluster[1..].iter().map(|raw| raw.path.clone()).collect();
         // Объединение групп копий (без повторов, в стабильном порядке).
         let mut groups: Vec<Option<String>> = Vec::new();
@@ -132,6 +139,7 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             groups,
             disambig: None,
             faces,
+            coverage,
         });
     }
     entries
@@ -219,6 +227,9 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
     db.load_system_fonts();
 
     let mut by_path = HashMap::<PathBuf, Vec<FontFaceEntry>>::new();
+    // Track the fontdb id per (path, face_index) so the representative face's
+    // coverage can be read back via `db.with_face_data` (memory-mapped) below.
+    let mut ids_by_path: HashMap<PathBuf, Vec<(usize, fontdb::ID)>> = HashMap::new();
     for face in db.faces() {
         let path = match &face.source {
             fontdb::Source::File(path) => path.clone(),
@@ -235,6 +246,10 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             fontdb::Style::Oblique => "Oblique",
         };
         let face_index = face.index as usize;
+        ids_by_path
+            .entry(path.clone())
+            .or_default()
+            .push((face_index, face.id));
         by_path.entry(path).or_default().push(FontFaceEntry {
             label: format!(
                 "#{face_index} {family} | {style} | w{} | {}",
@@ -271,6 +286,20 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
         } else {
             base_label
         };
+        let rep_face_index = faces.first().map(|face| face.face_index).unwrap_or(0);
+        let coverage = ids_by_path
+            .get(&path)
+            .and_then(|ids| {
+                ids.iter()
+                    .find(|(idx, _)| *idx == rep_face_index)
+                    .map(|(_, id)| *id)
+            })
+            .and_then(|id| {
+                db.with_face_data(id, |data, index| {
+                    super::font_coverage::classify_font_bytes(data, index as usize)
+                })
+            })
+            .unwrap_or_default();
         entries.push(FontEntry {
             label,
             path,
@@ -278,6 +307,7 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             groups: vec![None],
             disambig: None,
             faces,
+            coverage,
         });
     }
 
