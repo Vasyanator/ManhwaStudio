@@ -38,10 +38,14 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
   via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
   `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
-  and the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
+  the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
   held on `SettingsTabState`, rendered via its `ui()`; a self-contained typing-panel widget that
   owns its own persistence to `TextTab.effect_defaults`, so settings needs no access to the private
-  effect model).
+  effect model), and the "Настройки шрифтов" block
+  (`crate::tabs::typing::FontSettingsEditorState`, same double-interface pattern): it lists the app's
+  fonts in three categories rendered in their own typefaces and imports/removes system fonts via the
+  runtime-global imported-fonts store, loading font lists off the GUI thread. Both blocks are wrapped
+  in collapsed `CollapsingHeader`s.
 - `ai_backend.rs`: AI backend pane UI for health display, process start/stop/restart/autostart,
   device/provider selection, max loaded models, and CUDA/ROCm diagnostics.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
@@ -79,5 +83,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
 - To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode), edit
   `typesetting.rs` and the matching persistence helper in `mod.rs`. Runtime globals for these
   live outside settings (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`).
+- To change the collapsed effect-defaults / font-settings blocks in the "Тайп" pane, edit their
+  widgets in `src/tabs/typing/panel/` (`effect_defaults.rs` / `font_settings.rs`); `typesetting.rs`
+  only wraps each `ui()` in a `CollapsingHeader`.
 - To change configurable shortcut UI or persistence, edit `hotkeys.rs` and coordinate with
   `src/input_manager_v2.rs`.

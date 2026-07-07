@@ -26,19 +26,16 @@ impl TypingTopPanelState {
         page_idx: usize,
         layout_editor_active: bool,
     ) {
+        // Pick up a settings-side font import/remove (revision-driven) and apply it live to
+        // both open panels before polling this frame's reload results.
+        self.create_panel.poll_font_settings_changes();
+        self.edit_panel.poll_font_settings_changes();
         self.create_panel.poll_font_reload_results();
         self.edit_panel.poll_font_reload_results();
         self.create_panel.reset_text_input_focus_tracking();
         self.edit_panel.reset_text_input_focus_tracking();
         if self.create_panel.fonts_reload_in_flight() || self.edit_panel.fonts_reload_in_flight() {
             ctx.request_repaint();
-        }
-        if let Some(use_system_fonts) = self
-            .create_panel
-            .take_use_system_fonts_toggle_request()
-            .or_else(|| self.edit_panel.take_use_system_fonts_toggle_request())
-        {
-            self.apply_use_system_fonts(use_system_fonts, true);
         }
         // Синхронизация выбранной группы шрифтов между панелями создания и
         // редактирования: запрос с любой панели применяется к обеим.
@@ -59,25 +56,6 @@ impl TypingTopPanelState {
         }
 
         self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx, layout_editor_active);
-    }
-
-    pub(super) fn apply_use_system_fonts(&mut self, use_system_fonts: bool, persist: bool) {
-        if self.use_system_fonts == use_system_fonts
-            && self.create_panel.use_system_fonts() == use_system_fonts
-            && self.edit_panel.use_system_fonts() == use_system_fonts
-        {
-            return;
-        }
-        self.use_system_fonts = use_system_fonts;
-        self.create_panel.set_use_system_fonts(use_system_fonts);
-        self.edit_panel.set_use_system_fonts(use_system_fonts);
-        if persist {
-            let _ = thread::Builder::new()
-                .name("typing-save-use-system-fonts".to_string())
-                .spawn(move || {
-                    let _ = save_text_tab_use_system_fonts(use_system_fonts);
-                });
-        }
     }
 
     pub(in crate::tabs::typing) fn set_panel_layout(&mut self, layout: TypingPanelLayout) {

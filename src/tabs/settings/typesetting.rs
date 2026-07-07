@@ -6,6 +6,9 @@ form iteration across the app.
 Main responsibilities:
 - Render and persist the app-wide hanging-punctuation list, applied live via
   `crate::text_punctuation`.
+- Host two collapsed self-contained typing-panel blocks: the per-effect-kind default
+  parameters editor (`EffectDefaultsEditorState`) and the font-settings block
+  (`FontSettingsEditorState`: font categories + system-font import/removal).
 
 Key types:
 - `SettingsTabState`
@@ -107,9 +110,26 @@ impl SettingsTabState {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        // Per-effect-kind default parameters. Self-contained typing-panel widget; it
-        // owns its own live-apply + background persistence to `TextTab.effect_defaults`.
-        self.effect_defaults_editor.ui(ui);
+        // Per-effect-kind default parameters, collapsed by default. Self-contained
+        // typing-panel widget; it owns its own live-apply + background persistence to
+        // `TextTab.effect_defaults`.
+        egui::CollapsingHeader::new("Стандартные параметры эффектов")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.effect_defaults_editor.ui(ui);
+            });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+        // Font-settings block, collapsed by default. Self-contained typing-panel widget;
+        // it loads the font category lists off-thread and drives the runtime-global
+        // imported-fonts store for system-font import/removal.
+        egui::CollapsingHeader::new("Настройки шрифтов")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.font_settings_editor.ui(ui);
+            });
     }
 
     /// Renders the "Поворот Ctrl+колесо" chooser: which rotation mechanism the typing

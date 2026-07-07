@@ -6,7 +6,8 @@ Free-function helpers extracted verbatim from panel.rs for TextTab preset
 persistence and text layout serde conversions.
 
 Main responsibilities:
-- load and save the TextTab system-fonts flag and legacy inline-tags flag;
+- load the TextTab legacy inline-tags flag;
+- load and save the TextTab imported-system-fonts path list;
 - load, default, and save the create presets and formula presets;
 - convert formula, drawn-lines, and vector-lines layouts to and from serde_json Value.
 
@@ -16,22 +17,6 @@ free fns are `pub(super)` so panel.rs and sibling submodules can call them.
 */
 
 use super::*;
-
-pub(super) fn load_text_tab_use_system_fonts() -> bool {
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return false;
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    payload
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .and_then(|text_tab| text_tab.get(TEXT_TAB_USE_SYSTEM_FONTS_KEY))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
 
 /// Читает настройку «использовать обычные inline-теги вместо машиночитаемых».
 /// По умолчанию `false` — панель пишет компактный `<m ...>`. Пока не подключено к UI.
@@ -581,40 +566,6 @@ pub(super) fn load_text_tab_formula_presets() -> HashMap<String, TypingFormulaPr
     out
 }
 
-pub(super) fn save_text_tab_use_system_fonts(enabled: bool) -> Result<(), String> {
-    let user_settings_file = config::user_config_path();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(&user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        TEXT_TAB_USE_SYSTEM_FONTS_KEY.to_string(),
-        Value::Bool(enabled),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
-}
-
 /// Loads the per-effect-kind default overrides from `TextTab.effect_defaults`.
 ///
 /// The returned map is keyed by the effect discriminator string (e.g. `"stroke"`,
@@ -682,6 +633,102 @@ pub(super) fn save_text_tab_effect_defaults(defaults: &HashMap<String, Value>) -
     text_tab_obj.insert(
         TEXT_TAB_EFFECT_DEFAULTS_KEY.to_string(),
         Value::Object(defaults_obj),
+    );
+    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
+/// Loads the user-imported system font FILE paths from `TextTab.imported_system_fonts`.
+///
+/// The stored value is an array of strings; each non-empty string element maps to a
+/// `PathBuf`. Non-string or empty elements are skipped. A missing key, unreadable file,
+/// or malformed JSON yields an empty vector — this never panics and never surfaces an
+/// error, mirroring `load_text_tab_effect_defaults`.
+pub(in crate::tabs::typing) fn load_text_tab_imported_system_fonts() -> Vec<PathBuf> {
+    load_imported_system_fonts_from(&config::user_config_path())
+}
+
+/// Path-parameterized core of `load_text_tab_imported_system_fonts`, split out so the
+/// read logic can be unit-tested against a temp file instead of the real user config.
+fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
+    let Ok(raw) = fs::read_to_string(user_settings_file) else {
+        return Vec::new();
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(array) = payload
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(crate::config::TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Persists the user-imported system font FILE paths to `TextTab.imported_system_fonts`
+/// (read-modify-write of `user_config.json`, mirroring `save_text_tab_effect_defaults`
+/// so sibling keys survive). Paths are stored as an array of strings via
+/// `path.to_string_lossy()`. Returns a human-readable error on I/O or serialization
+/// failure. Callers must invoke this off the GUI thread. Wired off-thread by
+/// `font_settings_store::persist_off_thread` (the store's add/remove mutators, driven by
+/// the settings font-settings UI).
+///
+/// Always compiled (including the test profile) so the real save API type-checks under
+/// tests. Under test its sole caller `persist_off_thread` early-returns before invoking it,
+/// so it is unreached there — hence `#[cfg_attr(test, allow(dead_code))]`. The
+/// read-modify-write recipe is unit-tested through `save_imported_system_fonts_to`.
+#[cfg_attr(test, allow(dead_code))]
+pub(in crate::tabs::typing) fn save_text_tab_imported_system_fonts(
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    save_imported_system_fonts_to(&config::user_config_path(), paths)
+}
+
+/// Path-parameterized core of `save_text_tab_imported_system_fonts`, split out so the
+/// read-modify-write recipe can be unit-tested against a temp file.
+fn save_imported_system_fonts_to(
+    user_settings_file: &Path,
+    paths: &[PathBuf],
+) -> Result<(), String> {
+    let mut root = if user_settings_file.exists() {
+        match fs::read_to_string(user_settings_file) {
+            Ok(raw) => {
+                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+            }
+            Err(_) => Value::Object(Map::new()),
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_obj = root.as_object_mut().expect("object ensured");
+    let mut text_tab_obj = root_obj
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let array = paths
+        .iter()
+        .map(|path| Value::String(path.to_string_lossy().to_string()))
+        .collect::<Vec<_>>();
+    text_tab_obj.insert(
+        crate::config::TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY.to_string(),
+        Value::Array(array),
     );
     root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
 
@@ -800,4 +847,82 @@ pub(super) fn save_text_tab_formula_presets(
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Returns a unique temp file path for a config round-trip test, so parallel tests
+    /// never share a file and the real user config is never touched.
+    fn unique_temp_config_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("ms_test_{tag}_{nanos}.json"))
+    }
+
+    #[test]
+    fn imported_system_fonts_round_trip_through_temp_config() {
+        let path = unique_temp_config_path("imported_fonts_roundtrip");
+        let fonts = vec![
+            PathBuf::from("/fonts/Roboto-Regular.ttf"),
+            PathBuf::from("/usr/share/fonts/NotoSans.otf"),
+        ];
+        save_imported_system_fonts_to(&path, &fonts).expect("save must succeed");
+        let loaded = load_imported_system_fonts_from(&path);
+        assert_eq!(loaded, fonts);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imported_system_fonts_missing_file_is_empty() {
+        let path = unique_temp_config_path("imported_fonts_missing");
+        // The file was never created, so loading must yield an empty list, not panic.
+        assert!(load_imported_system_fonts_from(&path).is_empty());
+    }
+
+    #[test]
+    fn imported_system_fonts_save_preserves_sibling_keys() {
+        let path = unique_temp_config_path("imported_fonts_siblings");
+        // Seed a config that already carries an unrelated TextTab key.
+        let seed = json!({ "TextTab": { "use_system_fonts": true } });
+        fs::write(&path, serde_json::to_string(&seed).expect("serialize seed"))
+            .expect("write seed");
+        save_imported_system_fonts_to(&path, &[PathBuf::from("/fonts/A.ttf")])
+            .expect("save must succeed");
+        let raw = fs::read_to_string(&path).expect("read back");
+        let value: Value = serde_json::from_str(&raw).expect("parse back");
+        assert_eq!(
+            value
+                .get("TextTab")
+                .and_then(|t| t.get("use_system_fonts"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "sibling key must survive the imported-fonts write"
+        );
+        assert_eq!(
+            load_imported_system_fonts_from(&path),
+            vec![PathBuf::from("/fonts/A.ttf")]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imported_system_fonts_skips_non_string_and_empty_elements() {
+        let path = unique_temp_config_path("imported_fonts_skip");
+        // Mixed array: one valid path, an empty string, and a non-string element.
+        let seed = json!({
+            "TextTab": { "imported_system_fonts": ["/fonts/A.ttf", "", 42] }
+        });
+        fs::write(&path, serde_json::to_string(&seed).expect("serialize seed"))
+            .expect("write seed");
+        assert_eq!(
+            load_imported_system_fonts_from(&path),
+            vec![PathBuf::from("/fonts/A.ttf")]
+        );
+        let _ = fs::remove_file(&path);
+    }
 }

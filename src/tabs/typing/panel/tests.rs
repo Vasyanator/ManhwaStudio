@@ -145,7 +145,7 @@ paths change.
 
     #[test]
     fn selecting_missing_overlay_font_sets_warning_and_clears_on_found() {
-        let mut state = TypingCreatePanelState::new(false, false);
+        let mut state = TypingCreatePanelState::new(false);
         state.fonts = merge_duplicate_fonts(vec![raw_font("/fonts/Доступный.ttf", None, 11)]);
         state.selected_font_idx = 0;
 
@@ -214,4 +214,47 @@ paths change.
         state.sync_selected_overlay_for_edit(None);
         state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(1)));
         assert_eq!(state.edit_panel.text_selection_char_range, None);
+    }
+
+    /// Unique temp path for an imported-fonts test so parallel tests never collide and the
+    /// real user config / fonts folder are never touched.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("ms_test_imported_fonts_{tag}_{nanos}"))
+    }
+
+    #[test]
+    fn load_imported_system_fonts_skips_missing_and_unparseable_files() {
+        let dir = unique_temp_dir("skip");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        // A file that exists but is not a valid font must be skipped, not turned into a fake
+        // entry; a path that does not exist at all must also be skipped.
+        let garbage = dir.join("not_a_font.ttf");
+        fs::write(&garbage, b"this is not a font").expect("write garbage file");
+        let missing = dir.join("does_not_exist.ttf");
+
+        let entries = load_imported_system_fonts(&[garbage.clone(), missing]);
+        assert_eq!(
+            entries.len(),
+            0,
+            "missing and unparseable imported paths must be skipped"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_fonts_with_no_imported_paths_matches_dir_only_loading() {
+        // On an empty fonts dir, `load_fonts` with no imported paths must equal the plain
+        // folder load (both empty) — the imported-paths merge is purely additive.
+        let dir = unique_temp_dir("empty");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let via_load_fonts = load_fonts(&dir, &[]);
+        let via_dir = load_fonts_from_dir(&dir);
+        assert!(via_load_fonts.is_empty());
+        assert_eq!(via_load_fonts.len(), via_dir.len());
+        let _ = fs::remove_dir_all(&dir);
     }

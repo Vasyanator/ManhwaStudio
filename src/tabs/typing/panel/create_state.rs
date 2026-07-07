@@ -9,8 +9,9 @@ management, and font-index lookup helpers.
 Main responsibilities:
 - construct the create-panel state and (re)load fonts and font groups;
 - track focused text inputs and eyedropper activation per frame;
-- manage the selected font group and pending toggle/group requests;
-- spawn and poll background font reloads;
+- manage the selected font group and pending group requests;
+- spawn and poll background font reloads (folder fonts + imported system-font paths),
+  picking up live settings-side import/remove via `poll_font_settings_changes`;
 - resolve fonts by key, index, path, or label and filter them by group.
 
 Notes:
@@ -22,13 +23,15 @@ module's types and imports.
 use super::*;
 
 impl TypingCreatePanelState {
-    pub(super) fn new(preview_enabled: bool, use_system_fonts: bool) -> Self {
+    pub(super) fn new(preview_enabled: bool) -> Self {
         let fonts_dir = resolve_fonts_dir();
-        let local_fonts = load_fonts_from_dir(&fonts_dir);
+        // Snapshot the runtime-global imported system-font paths (seeded at startup from
+        // config). The initial `fonts` list holds only the folder fonts; when there are
+        // imported paths an initial `spawn_font_reload` at the end merges them in off-thread.
+        let imported_system_fonts = super::font_settings_store::imported_system_fonts();
+        let imported_fonts_revision = super::font_settings_store::imported_fonts_revision();
+        let fonts = load_fonts_from_dir(&fonts_dir);
         let font_groups = load_font_groups(&fonts_dir);
-        let auto_enable_system_fonts = local_fonts.is_empty();
-        let effective_use_system_fonts = use_system_fonts || auto_enable_system_fonts;
-        let fonts = local_fonts;
         let presets_by_name = if preview_enabled {
             load_text_tab_create_presets()
         } else {
@@ -36,12 +39,7 @@ impl TypingCreatePanelState {
         };
         let formula_presets_by_name = load_text_tab_formula_presets();
         let (request_tx, result_rx) = spawn_preview_render_worker();
-        let status_line = if auto_enable_system_fonts {
-            format!(
-                "Локальные шрифты не найдены в {}, загружаю системные",
-                fonts_dir.display()
-            )
-        } else if fonts.is_empty() {
+        let status_line = if fonts.is_empty() {
             format!("Не найдено шрифтов в {}", fonts_dir.display())
         } else {
             "Готово к рендеру".to_string()
@@ -53,8 +51,8 @@ impl TypingCreatePanelState {
             font_provider,
             font_groups,
             selected_font_group: None,
-            use_system_fonts: effective_use_system_fonts,
-            pending_use_system_fonts_toggle_request: None,
+            imported_system_fonts,
+            imported_fonts_revision,
             pending_font_group_request: None,
             font_reload_rx: None,
             latest_font_reload_token: 0,
@@ -149,14 +147,12 @@ impl TypingCreatePanelState {
         state.active_font_key = state.current_font_key();
         state.sync_current_font_profile_memory();
         state.sync_selected_formula_preset_by_layout();
-        if state.use_system_fonts {
+        // Merge the imported system fonts into the list off the GUI thread; only spawn when
+        // there are any, so an empty imported list does not trigger a redundant reload.
+        if !state.imported_system_fonts.is_empty() {
             state.spawn_font_reload();
         }
         state
-    }
-
-    pub(super) fn use_system_fonts(&self) -> bool {
-        self.use_system_fonts
     }
 
     /// Shared font source for renders built from this panel's current font list.
@@ -196,16 +192,18 @@ impl TypingCreatePanelState {
             .any(EffectCard::eyedropper_consumed_primary_click_this_frame)
     }
 
-    pub(super) fn set_use_system_fonts(&mut self, use_system_fonts: bool) {
-        if self.use_system_fonts == use_system_fonts {
+    /// Picks up a settings-side import/remove of system fonts and applies it LIVE to this
+    /// open panel: when the store's revision advanced since the last check, refreshes the
+    /// snapshot of imported paths and spawns a background font reload so the new list takes
+    /// effect without reopening the panel. Cheap no-op when the revision is unchanged.
+    pub(super) fn poll_font_settings_changes(&mut self) {
+        let revision = super::font_settings_store::imported_fonts_revision();
+        if revision == self.imported_fonts_revision {
             return;
         }
-        self.use_system_fonts = use_system_fonts;
+        self.imported_fonts_revision = revision;
+        self.imported_system_fonts = super::font_settings_store::imported_system_fonts();
         self.spawn_font_reload();
-    }
-
-    pub(super) fn take_use_system_fonts_toggle_request(&mut self) -> Option<bool> {
-        self.pending_use_system_fonts_toggle_request.take()
     }
 
     pub(super) fn take_font_group_request(&mut self) -> Option<Option<String>> {
@@ -231,7 +229,7 @@ impl TypingCreatePanelState {
         self.latest_font_reload_token = self.latest_font_reload_token.wrapping_add(1);
         let token = self.latest_font_reload_token;
         let fonts_dir = self.fonts_dir.clone();
-        let use_system_fonts = self.use_system_fonts;
+        let imported = self.imported_system_fonts.clone();
         let (tx, rx) = mpsc::channel::<FontReloadResult>();
         self.font_reload_rx = Some(rx);
         self.fonts_reload_in_flight = true;
@@ -239,7 +237,7 @@ impl TypingCreatePanelState {
         let _ = thread::Builder::new()
             .name("typing-font-reload-worker".to_string())
             .spawn(move || {
-                let fonts = load_fonts(fonts_dir.as_path(), use_system_fonts);
+                let fonts = load_fonts(fonts_dir.as_path(), &imported);
                 let font_groups = load_font_groups(fonts_dir.as_path());
                 let _ = tx.send(FontReloadResult {
                     token,
@@ -277,11 +275,7 @@ impl TypingCreatePanelState {
                     self.clamp_face_index();
                     self.active_font_key = self.current_font_key();
                     self.status_line = if self.fonts.is_empty() {
-                        if self.use_system_fonts {
-                            "Не найдены ни локальные, ни системные шрифты".to_string()
-                        } else {
-                            format!("Не найдено шрифтов в {}", self.fonts_dir.display())
-                        }
+                        format!("Не найдено шрифтов в {}", self.fonts_dir.display())
                     } else {
                         "Готово к рендеру".to_string()
                     };

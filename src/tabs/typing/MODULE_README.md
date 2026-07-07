@@ -254,7 +254,10 @@ saving, and export.
   - `text_forms.rs`: char/byte range conversions, advanced-form range-row + sort + card (free fns).
   - `inline_tags.rs`: inline-tag machine/opening/closing build + parse, offset/stretch/color/align tokens (free fns).
   - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
-  - `fonts.rs`: font discovery/loading (dir + system), duplicate merge/disambiguation, group listing (free fns).
+  - `fonts.rs`: font discovery/loading — folder fonts PLUS imported system-font paths
+    (`load_fonts`/`load_imported_system_fonts`), duplicate merge/disambiguation, group listing
+    (free fns). `load_system_fonts` (whole-OS enumeration) is the catalog source for the
+    settings font-import picker (`font_settings.rs`), run off the GUI thread.
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
     representative face's bytes and cached on `FontEntry.coverage`; the dropdown never recomputes it.
     Discovery also records each font's `original_name` (real family/name of the representative face,
@@ -267,6 +270,23 @@ saving, and export.
     system (Cyrillic today) → `Full`/`Partial`/`Unsupported` via the swash charmap; drives the
     red/yellow font-dropdown highlight + hover tooltip in `create_presets::draw_font_combo_option`.
   - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
+    Also owns load/save of the `TextTab.imported_system_fonts` path list (read-modify-write of
+    `user_config.json`, preserving sibling keys).
+  - `font_settings_store.rs`: process-global store of the user-imported system font FILE paths
+    (`OnceLock<RwLock<Vec<PathBuf>>>` + a revision `AtomicU64`). Seeded at startup from
+    `TextTab.imported_system_fonts` (`seed_imported_system_fonts_from_config`); `add_/remove_`
+    mutators dedup by exact path (first-seen order), bump the revision, and persist off the GUI
+    thread via `presets_io::save_text_tab_imported_system_fonts`. Seeding does not bump the revision.
+    The create/edit panels watch the revision to reload their font list; the settings
+    font-settings widget drives the add/remove mutators.
+  - `font_settings.rs`: `FontSettingsEditorState`, the self-contained "Настройки шрифтов" widget
+    rendered by the settings "Тайп" pane (double-interface pattern, like `effect_defaults.rs`). Loads
+    the three font categories (folder / imported system / custom) off the GUI thread, reloading live
+    when the `font_settings_store` revision changes; draws each font's name in its own typeface
+    (registered into egui via the shared `combo_font_family_name` naming, one-time GUI-thread file read
+    per visible font like `create_presets::ensure_combo_font_family`); and hosts an in-app searchable,
+    row-virtualized picker over `load_system_fonts` to import a system font by path (add/remove route
+    through the store). Talks only to runtime globals + the font loaders, never to the live typing panel.
   - `ui_helpers.rs`: font-family binding/matching, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns).
   - `effect_parse.rs`: `parse_effect_cards` (free fn).
   - `effect_defaults.rs`: user-configurable DEFAULT parameters per effect kind. Owns a
@@ -387,8 +407,12 @@ saving, and export.
   and the newer `font_original_name` (real family/name). On read, the font NAME for the
   renderer is derived `font_label || font_family || font || font_path stem`; `font_path`
   is kept only for back-compat and PSD; PSD export prefers `font_original_name`.
-- Font discovery reads project/app font directories and can include system fonts when
-  `TextTab.use_system_fonts` is enabled in `user_config.json`.
+- Font discovery is CONFIG-DRIVEN: the font list is the project/app `fonts` folder PLUS the
+  user-curated imported system-font FILE paths. `TextTab.imported_system_fonts` persists those
+  paths (a JSON array of strings), owned at runtime by `panel/font_settings_store.rs`; the
+  create/edit panels snapshot them and reload the list live when the store changes. There is no
+  "use system fonts" flag — the whole-OS enumerator (`fonts::load_system_fonts`) is used only by
+  the settings font-import picker.
 - Shared state enters through `set_bubbles_model` and `set_overlays_model`; typing must
   not duplicate ownership of project bubbles or clean overlays.
 

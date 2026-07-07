@@ -6,11 +6,13 @@ Free-function helpers extracted verbatim from panel.rs for font discovery and
 loading.
 
 Main responsibilities:
-- discover and load fonts from the project fonts directory and, optionally, from
-  system fonts;
+- discover and load fonts from the project fonts directory PLUS a user-curated list
+  of imported system-font FILE paths (`load_fonts` / `load_imported_system_fonts`);
 - merge duplicate font files and assign disambiguating group labels;
 - list font groups, compute font-file content hashes, and recurse font-file
   directories.
+- `load_system_fonts` enumerates ALL OS-installed fonts; it is the catalog source
+  for the settings font-import picker (`panel/font_settings.rs`), run off-thread.
 
 Notes:
 Extracted verbatim from panel.rs. Free fns are pub(super) so panel.rs can use
@@ -39,22 +41,97 @@ pub(super) fn resolve_fonts_dir() -> PathBuf {
     PathBuf::from("fonts")
 }
 
-pub(super) fn load_fonts(fonts_dir: &Path, use_system_fonts: bool) -> Vec<FontEntry> {
+/// Builds the panel font list: all fonts from `fonts_dir` PLUS the user-curated
+/// imported system-font FILE paths in `imported_system_paths`.
+///
+/// The folder fonts (with their duplicate-merge and group disambiguation) come first;
+/// each imported path is appended as a single entry unless its file path already
+/// belongs to a folder entry (matched against that entry's `path` or `alt_paths`), so an
+/// imported copy of an already-present font is not listed twice. The merged list is
+/// sorted case-insensitively by label. An empty `imported_system_paths` yields the sorted
+/// folder fonts only.
+pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) -> Vec<FontEntry> {
     let mut entries = load_fonts_from_dir(fonts_dir);
-    if !use_system_fonts {
-        return entries;
-    }
 
+    // Paths already covered by a folder entry (its own path plus merged-duplicate
+    // `alt_paths`); an imported path matching any of these is skipped as a duplicate.
     let mut known_paths: HashSet<PathBuf> = entries
         .iter()
         .flat_map(|font| std::iter::once(font.path.clone()).chain(font.alt_paths.iter().cloned()))
         .collect();
-    for system_font in load_system_fonts() {
-        if known_paths.insert(system_font.path.clone()) {
-            entries.push(system_font);
+    for imported in load_imported_system_fonts(imported_system_paths) {
+        if known_paths.insert(imported.path.clone()) {
+            entries.push(imported);
         }
     }
     entries.sort_by_key(|font| font.label.to_lowercase());
+    entries
+}
+
+/// Builds one `FontEntry` per existing, readable, parseable path in `paths`.
+///
+/// Each entry is labeled `"{stem} [system]"` (duplicate labels get a ` (N)` suffix,
+/// mirroring `load_system_fonts`), carries the faces/coverage/original name read from the
+/// file bytes, an empty `alt_paths`, `groups = [None]`, and no `disambig`. A missing,
+/// unreadable, or unparseable path is skipped with a logged warning instead of producing a
+/// fake entry, so a stale/corrupt imported path never appears as a usable font.
+pub(super) fn load_imported_system_fonts(paths: &[PathBuf]) -> Vec<FontEntry> {
+    let mut used_labels: HashMap<String, usize> = HashMap::new();
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "typing: skipping imported system font, cannot read file. Path: {} Error: {err}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        // Reject a corrupt/unsupported file up front so it is skipped (not turned into a
+        // fake single-face entry). fontdb yields no ids for a file it cannot parse.
+        let mut probe_db = fontdb::Database::new();
+        let parsed_face_count =
+            probe_db.load_font_source(fontdb::Source::Binary(Arc::new(bytes.clone())));
+        if parsed_face_count.is_empty() {
+            crate::runtime_log::log_warn(format!(
+                "typing: skipping imported system font, cannot parse font file. Path: {}",
+                path.display()
+            ));
+            continue;
+        }
+
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("system font")
+            .to_string();
+        let base_label = format!("{stem} [system]");
+        let count = used_labels.entry(base_label.clone()).or_insert(0);
+        *count += 1;
+        let label = if *count > 1 {
+            format!("{base_label} ({count})")
+        } else {
+            base_label
+        };
+
+        let faces = font_faces_from_bytes(&bytes);
+        let rep_face_index = faces.first().map(|face| face.face_index).unwrap_or(0);
+        let coverage = super::font_coverage::classify_font_bytes(&bytes, rep_face_index);
+        let original_name =
+            font_original_name_from_bytes(&bytes, rep_face_index).unwrap_or_else(|| stem.clone());
+        entries.push(FontEntry {
+            label,
+            path: path.clone(),
+            alt_paths: Vec::new(),
+            groups: vec![None],
+            disambig: None,
+            faces,
+            coverage,
+            original_name,
+        });
+    }
     entries
 }
 
@@ -249,6 +326,11 @@ pub(super) fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
     groups
 }
 
+/// Enumerates ALL OS-installed fonts (one `FontEntry` per file) for the settings
+/// font-import picker, which lets the user pick individual system fonts to import.
+/// HEAVY (hundreds of faces via `fontdb::load_system_fonts`): callers must run it off
+/// the GUI thread. Regular font loading is config-driven (folder + imported paths); this
+/// bulk enumerator is only the picker's catalog source.
 pub(super) fn load_system_fonts() -> Vec<FontEntry> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();

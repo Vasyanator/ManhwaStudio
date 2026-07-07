@@ -32,8 +32,12 @@ mod tab;
 pub use panel::{TypingPanelLayout, TypingTopPanelState};
 // Editor widget for per-effect-kind default parameters, rendered by the settings pane.
 pub(crate) use panel::EffectDefaultsEditorState;
+// Editor widget for the settings "Настройки шрифтов" block (font categories + import).
+pub(crate) use panel::FontSettingsEditorState;
 // Startup seeding of the runtime-global effect-defaults store from user config.
 pub(crate) use panel::seed_effect_defaults_from_config;
+// Startup seeding of the runtime-global imported-system-fonts store from user config.
+pub(crate) use panel::seed_imported_system_fonts_from_config;
 pub use tab::TypingTabState;
 // Re-export the shared text-preview helper so other tabs (PS editor) reuse the same logic.
 pub(crate) use tab::text_preview_label;

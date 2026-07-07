@@ -78,9 +78,10 @@ FILE HEADER (tabs/typing/panel.rs)
     эффектов скрывается.
   - wheel-helpers (`cycle_wrapped_index`, scroll helpers): обслуживают
     переключение индексов и прокрутку панелей.
-  - чекбокс `Использовать системные шрифты`: общий для `Create/Edit`, состояние
-    хранится в `user_config.json` (`TextTab.use_system_fonts`), при пустой папке
-    `fonts` автоматически включается и подмешивает системные шрифты в список.
+  - загрузка шрифтов config-driven: список = папка `fonts` ПЛЮС пользовательский набор
+    импортированных путей к файлам системных шрифтов (`font_settings_store`). Панели
+    `Create/Edit` берут снимок путей при создании и подхватывают правки из настроек вживую
+    через `poll_font_settings_changes` (ревизия стора). Отдельного чекбокса больше нет.
   - `ComboBox` шрифтов (`Шрифт`) отображает каждый пункт с его собственной гарнитурой:
     UI-шрифт lazily регистрируется в `egui` по `(font_path, face_index)` и кэшируется.
   - Дубликаты шрифтов (одно имя файла в корне/разных группах): `merge_duplicate_fonts`
@@ -167,7 +168,6 @@ const EDIT_TEXT_FIELD_HEIGHT_PX: f32 = 170.0;
 const PREVIEW_TEXTURE_ID: &str = "typing-create-preview-texture";
 const DEFAULT_PREVIEW_TEXT: &str = "Текст будет выглядеть так";
 const DEFAULT_PREVIEW_WIDTH_PX: u32 = 300;
-const TEXT_TAB_USE_SYSTEM_FONTS_KEY: &str = "use_system_fonts";
 const TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY: &str = "use_legacy_inline_tags";
 const TEXT_TAB_CREATE_PRESETS_KEY: &str = "create_presets";
 const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
@@ -203,11 +203,20 @@ use ui_helpers::*;
 mod effect_parse;
 use effect_parse::*;
 mod effect_defaults;
+mod font_settings;
+mod font_settings_store;
 mod font_coverage;
 use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
 pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults_from_config};
+// Public editor widget for the settings "Настройки шрифтов" block (font categories +
+// system-font import), rendered from the settings pane.
+pub(crate) use font_settings::FontSettingsEditorState;
+// Startup seeding of the runtime-global imported-system-fonts store. The store's
+// `pub(in crate::tabs::typing)` mutators are reached by panel descendants via
+// `font_settings_store::…`.
+pub(crate) use font_settings_store::seed_imported_system_fonts_from_config;
 
 #[derive(Clone)]
 struct TypingCreatePreset {
@@ -392,7 +401,6 @@ pub enum TypingTopPanelMode {
 }
 
 pub struct TypingTopPanelState {
-    use_system_fonts: bool,
     collapsed: bool,
     mode: TypingTopPanelMode,
     vertical_panel: TypingFloatingPanelState,
@@ -514,13 +522,9 @@ pub(super) enum TypingCreateImageRequest {
 
 impl Default for TypingTopPanelState {
     fn default() -> Self {
-        let use_system_fonts = load_text_tab_use_system_fonts();
-        let create_panel = TypingCreatePanelState::new(true, use_system_fonts);
-        let edit_panel = TypingCreatePanelState::new(false, use_system_fonts);
-        let effective_use_system_fonts =
-            create_panel.use_system_fonts() || edit_panel.use_system_fonts();
+        let create_panel = TypingCreatePanelState::new(true);
+        let edit_panel = TypingCreatePanelState::new(false);
         Self {
-            use_system_fonts: effective_use_system_fonts,
             collapsed: false,
             mode: TypingTopPanelMode::CreateText,
             vertical_panel: TypingFloatingPanelState::default(),
@@ -1002,8 +1006,12 @@ struct TypingCreatePanelState {
     font_provider: Arc<dyn FontProvider>,
     font_groups: Vec<String>,
     selected_font_group: Option<String>,
-    use_system_fonts: bool,
-    pending_use_system_fonts_toggle_request: Option<bool>,
+    /// Snapshot of the user-imported system-font FILE paths (from
+    /// `font_settings_store`), merged with the folder fonts by `spawn_font_reload`.
+    imported_system_fonts: Vec<PathBuf>,
+    /// Last-seen `font_settings_store` revision; when it advances, `poll_font_settings_changes`
+    /// refreshes `imported_system_fonts` and reloads the font list live.
+    imported_fonts_revision: u64,
     /// Запрос смены группы шрифтов для синхронизации между панелями `create`/`edit`.
     /// Внешний `Some` — есть запрос; внутреннее значение — новая `selected_font_group`
     /// (`None` = «Все группы»).
@@ -1245,7 +1253,7 @@ struct TypingInlineTagToken {
 
 impl Default for TypingCreatePanelState {
     fn default() -> Self {
-        Self::new(true, load_text_tab_use_system_fonts())
+        Self::new(true)
     }
 }
 

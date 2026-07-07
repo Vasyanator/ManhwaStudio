@@ -198,6 +198,8 @@ fn run_main() -> anyhow::Result<()> {
     // Seed the typing tab's per-effect-kind default overrides so newly added effect
     // cards pick up the user's stored defaults from the first frame.
     tabs::typing::seed_effect_defaults_from_config();
+    // Seed the typing tab's user-imported system font list from user config.
+    tabs::typing::seed_imported_system_fonts_from_config();
     let user_settings = config::load_user_settings_for_startup()?;
 
     if cli.continue_update {

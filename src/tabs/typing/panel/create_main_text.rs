@@ -209,19 +209,6 @@ impl TypingCreatePanelState {
                 if self.selected_face_idx != prev_face_idx {
                     changed = true;
                 }
-
-                let mut requested_use_system_fonts = self.use_system_fonts;
-                let use_system_fonts_resp = ui.checkbox(
-                    &mut requested_use_system_fonts,
-                    "Использовать системные шрифты",
-                );
-                mark_hscroll_block_on_hover(
-                    &mut block_hscroll_by_hovered_param,
-                    &use_system_fonts_resp,
-                );
-                if use_system_fonts_resp.changed() {
-                    self.pending_use_system_fonts_toggle_request = Some(requested_use_system_fonts);
-                }
             });
 
             ui.add_space(4.0);

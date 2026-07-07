@@ -52,6 +52,9 @@ pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
 pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
+/// `TextTab` key holding the user-imported system font FILE paths (a JSON array of
+/// strings). Seeds the typing tab's imported-fonts store at startup.
+pub const TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY: &str = "imported_system_fonts";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiInstallType {
@@ -554,12 +557,12 @@ pub fn user_config_defaults() -> Value {
         },
         "CleaningTab": {},
         "TextTab": {
-            "use_system_fonts": false,
             "hanging_punctuation": crate::text_punctuation::DEFAULT_HANGING_PUNCTUATION,
             "rotation_ctrl_wheel_mode":
                 crate::tabs::typing::rotation_ctrl_wheel::DEFAULT_ROTATION_CTRL_WHEEL_MODE
                     .as_config_str(),
             "effect_defaults": {},
+            "imported_system_fonts": [],
             "formula_presets": {
                 "Дуга (мягкая)": {
                     "x_expr": "t * w",

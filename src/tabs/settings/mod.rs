@@ -119,6 +119,12 @@ pub struct SettingsTabState {
     /// public type; it reads/writes the runtime-global effect-defaults store and
     /// persists to `TextTab.effect_defaults` on its own background thread.
     effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState,
+    /// Editor for the "Настройки шрифтов" block, shown in the "Тайп" pane. Self-contained
+    /// typing-panel widget (same double-interface pattern): it loads the font category
+    /// lists off-thread, renders each font in its own typeface, and drives the
+    /// runtime-global imported-fonts store for system-font import/removal. Settings needs
+    /// no access to the private font model.
+    font_settings_editor: crate::tabs::typing::FontSettingsEditorState,
 }
 
 impl Default for SettingsTabState {
@@ -163,6 +169,7 @@ impl SettingsTabState {
             dragged_bubble_condition_node: None,
             hotkey_capture_command_id: None,
             effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
+            font_settings_editor: crate::tabs::typing::FontSettingsEditorState::new(),
         }
     }
 }
