@@ -98,6 +98,7 @@ translators = { version = "0.1.5", default-features = false, features = ["google
 genai = "0.6"
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 # Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
 # (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /

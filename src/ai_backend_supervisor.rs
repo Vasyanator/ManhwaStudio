@@ -20,9 +20,18 @@ Main types:
 - `AiBackendSupervisor`: owns the worker thread + probe thread; built once in `run_main`.
 
 Notes:
-- The backend speaks the framed multiplexed IPC protocol over the AF_UNIX socket
-  from `backend_ipc::backend_socket_path()`; the worker passes that path to
-  `ai_backend.py` via `--socket`.
+- The backend speaks the framed multiplexed IPC protocol over a per-platform
+  transport (see `backend_ipc::transport`):
+    * unix: AF_UNIX socket from `backend_ipc::backend_socket_path()`; the worker
+      launches `ai_backend.py` with `--socket <path>` and the client dials the
+      same path.
+    * windows: loopback WebSocket. The worker mints a random token and launches
+      the backend with `--transport ws --ws-port 0 --ws-token <token>`; the child
+      binds an ephemeral 127.0.0.1 port and prints exactly one
+      `MS_BACKEND_WS_PORT=<port>` line to stdout. The stdout reader parses that
+      line and publishes the endpoint via `backend_ipc::set_ws_endpoint(port,
+      token)`, which `current_backend_endpoint()` then hands to the client. The
+      token is never written to any log.
 - Process manager/status/output lines are mirrored into runtime file logs via
   `crate::runtime_log`.
 */
@@ -140,6 +149,60 @@ enum AiBackendOutputEvent {
     Stdout(String),
     Stderr(String),
     StreamError(&'static str, String),
+    /// The backend printed a `MS_BACKEND_WS_PORT=` line whose value did not parse
+    /// as a port. Carries the offending raw line (never the auth token) so the
+    /// worker can log a structured warning without aborting the process.
+    WsPortParseError(String),
+}
+
+/// Describes how the just-spawned backend is reached, computed once at the spawn
+/// site so the argv and the stdout-parsing hookup stay in sync.
+///
+/// The variants are platform-gated because the two supported targets use
+/// different transports: AF_UNIX on unix, loopback WebSocket on windows.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+enum BackendLaunch {
+    /// Launched with `--socket <socket_arg>`; the client dials the same AF_UNIX
+    /// path. No stdout port line is expected on this transport.
+    #[cfg(unix)]
+    Unix { socket_arg: String },
+    /// Launched with `--transport ws --ws-port 0 --ws-token <token>`; the client
+    /// dials the ephemeral port parsed from the child's `MS_BACKEND_WS_PORT=` line.
+    #[cfg(windows)]
+    Ws { token: String },
+}
+
+/// Result of scanning one backend stdout line for the loopback-WS port marker.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, PartialEq, Eq)]
+enum WsPortLine {
+    /// The line is not a `MS_BACKEND_WS_PORT=` marker line.
+    NotPortLine,
+    /// The marker is present but its value is not a valid `u16` port.
+    Malformed,
+    /// A valid loopback port parsed from the marker line.
+    Port(u16),
+}
+
+/// Parses one backend stdout line for the `MS_BACKEND_WS_PORT=<digits>` marker the
+/// Python backend prints exactly once when its loopback WebSocket server is
+/// listening.
+///
+/// Returns [`WsPortLine::NotPortLine`] for any line without the marker prefix,
+/// [`WsPortLine::Malformed`] when the marker is present but the value does not
+/// parse as a `u16`, and [`WsPortLine::Port`] with the parsed port otherwise.
+/// Uses checked `str::parse` (no lossy casts) and never panics.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_ws_port_line(line: &str) -> WsPortLine {
+    const MARKER: &str = "MS_BACKEND_WS_PORT=";
+    let Some(value) = line.strip_prefix(MARKER) else {
+        return WsPortLine::NotPortLine;
+    };
+    match value.trim().parse::<u16>() {
+        Ok(port) => WsPortLine::Port(port),
+        Err(_) => WsPortLine::Malformed,
+    }
 }
 
 /// Cloneable handle the launcher and studio settings UIs use to observe and drive
@@ -447,19 +510,46 @@ fn start_ai_backend_process(
     }
 
     let python = python_manager::resolve_python_executable(&app_dir)?;
-    // The backend listens on a fixed AF_UNIX socket (no free-port reservation).
-    // `--socket` is optional on the Python side and defaults to the same path;
-    // we pass it explicitly so a non-default build still agrees with the client.
-    let socket_path = backend_ipc::backend_socket_path();
-    let socket_arg = socket_path.to_string_lossy().to_string();
     let mut command = python_manager::build_python_command(&app_dir)?;
     command
         .current_dir(&app_dir)
         .env("PYTHONUNBUFFERED", "1")
         .arg("-u")
-        .arg("ai_backend.py")
-        .arg("--socket")
-        .arg(&socket_arg)
+        .arg("ai_backend.py");
+
+    // Transport differs by platform. Build the argv and remember how to reach the
+    // child in one place (`BackendLaunch`), so the stdout-parsing hookup below
+    // cannot drift from the arguments we actually passed.
+    #[cfg(unix)]
+    let launch = {
+        // The backend listens on a fixed AF_UNIX socket (no free-port reservation).
+        // `--socket` is optional on the Python side and defaults to the same path;
+        // we pass it explicitly so a non-default build still agrees with the client.
+        let socket_arg = backend_ipc::backend_socket_path()
+            .to_string_lossy()
+            .to_string();
+        command.arg("--socket").arg(&socket_arg);
+        BackendLaunch::Unix { socket_arg }
+    };
+    #[cfg(windows)]
+    let launch = {
+        // AF_UNIX is unreliable on windows here, so the backend serves the same
+        // framed protocol over a loopback WebSocket. Mint a fresh random token per
+        // launch; the child binds an ephemeral 127.0.0.1 port (`--ws-port 0`) and
+        // reports it back on stdout. The token authenticates the client handshake
+        // and is never logged.
+        let token = uuid::Uuid::new_v4().to_string();
+        command
+            .arg("--transport")
+            .arg("ws")
+            .arg("--ws-port")
+            .arg("0")
+            .arg("--ws-token")
+            .arg(&token);
+        BackendLaunch::Ws { token }
+    };
+
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -478,23 +568,38 @@ fn start_ai_backend_process(
     let stderr = spawned.stderr.take();
     *child = Some(spawned);
 
+    // Derive the stdout-reader token and a log-safe transport description from the
+    // single `launch` value. The token is paired with the parsed port on windows;
+    // the description NEVER contains the token.
+    let (ws_token, transport_desc): (Option<String>, String) = match &launch {
+        #[cfg(unix)]
+        BackendLaunch::Unix { socket_arg } => (None, format!("socket {socket_arg}")),
+        #[cfg(windows)]
+        BackendLaunch::Ws { token } => (
+            Some(token.clone()),
+            "transport ws (loopback, ephemeral port)".to_string(),
+        ),
+    };
+
     update_process_status(snapshot, true, format!("Backend запущен (PID {pid})."));
     append_process_log(
         snapshot,
         format!(
-            "[manager] Запуск ai_backend.py через '{}' (cwd '{}', pid {pid}, socket {socket_arg})",
+            "[manager] Запуск ai_backend.py через '{}' (cwd '{}', pid {pid}, {transport_desc})",
             python.display(),
             app_dir.display()
         ),
     );
 
     if let Some(stdout) = stdout {
-        spawn_backend_output_reader("stdout", stdout, output_tx.clone());
+        // Only the stdout reader watches for the WS port line; move the token in so
+        // it can publish the endpoint once the backend reports its port.
+        spawn_backend_output_reader("stdout", stdout, output_tx.clone(), ws_token);
     } else {
         append_process_log(snapshot, "[manager] stdout backend недоступен.".to_string());
     }
     if let Some(stderr) = stderr {
-        spawn_backend_output_reader("stderr", stderr, output_tx.clone());
+        spawn_backend_output_reader("stderr", stderr, output_tx.clone(), None);
     } else {
         append_process_log(snapshot, "[manager] stderr backend недоступен.".to_string());
     }
@@ -596,11 +701,22 @@ fn poll_backend_exit(
     }
 }
 
+/// Spawns a detached reader that forwards each line of a backend stream to the
+/// worker as an [`AiBackendOutputEvent`].
+///
+/// `ws_token` is `Some` only for the stdout reader on the loopback-WS (windows)
+/// launch: when set, each stdout line is scanned for the `MS_BACKEND_WS_PORT=`
+/// marker and, on a valid port, the endpoint is published via
+/// [`backend_ipc::set_ws_endpoint`] using this token. The token is captured by the
+/// reader closure and never sent through an event or written to a log; a malformed
+/// marker line yields a [`AiBackendOutputEvent::WsPortParseError`] and does not stop
+/// the reader. It is `None` for stderr and for the unix (`--socket`) launch.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_backend_output_reader<R: std::io::Read + Send + 'static>(
     stream_name: &'static str,
     stream: R,
     tx: Sender<AiBackendOutputEvent>,
+    ws_token: Option<String>,
 ) {
     let _ = thread::Builder::new()
         .name(format!("ai-backend-{stream_name}-reader"))
@@ -616,6 +732,25 @@ fn spawn_backend_output_reader<R: std::io::Read + Send + 'static>(
                             line_buf.pop();
                         }
                         let payload = String::from_utf8_lossy(&line_buf).into_owned();
+                        // On the WS launch, watch stdout for the one-shot port line
+                        // and publish the endpoint. `ws_token` is None on unix and
+                        // for stderr, so this branch never runs there.
+                        if let Some(token) = ws_token.as_ref() {
+                            match parse_ws_port_line(&payload) {
+                                WsPortLine::Port(port) => {
+                                    // `token` stays local to this closure; only the
+                                    // (non-secret) port is ever logged, by
+                                    // `set_ws_endpoint`.
+                                    backend_ipc::set_ws_endpoint(port, token.clone());
+                                }
+                                WsPortLine::Malformed => {
+                                    let _ = tx.send(AiBackendOutputEvent::WsPortParseError(
+                                        payload.clone(),
+                                    ));
+                                }
+                                WsPortLine::NotPortLine => {}
+                            }
+                        }
                         let event = if stream_name == "stderr" {
                             AiBackendOutputEvent::Stderr(payload)
                         } else {
@@ -652,6 +787,15 @@ fn drain_backend_output(
             }
             AiBackendOutputEvent::StreamError(stream, err) => {
                 append_process_log(snapshot, format!("[manager] Ошибка чтения {stream}: {err}"));
+            }
+            AiBackendOutputEvent::WsPortParseError(line) => {
+                // Structured warning (per logging policy) plus a UI-visible manager
+                // line. The backend keeps running; the client simply cannot connect
+                // until a valid port line arrives.
+                let warning =
+                    format!("Не удалось разобрать порт WS backend из строки stdout: {line}");
+                crate::runtime_log::log_warn(format!("[ai_backend_supervisor] {warning}"));
+                append_process_log(snapshot, format!("[manager] {warning}"));
             }
         }
     }
@@ -772,4 +916,39 @@ pub fn save_ai_backend_autostart(user_settings_file: &Path, enabled: bool) -> Re
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{WsPortLine, parse_ws_port_line};
+
+    /// A well-formed marker line yields the parsed port.
+    #[test]
+    fn parses_valid_ws_port_line() {
+        assert_eq!(parse_ws_port_line("MS_BACKEND_WS_PORT=54321"), WsPortLine::Port(54321));
+        // Ephemeral resolution never reports 0, but 0 is still a valid u16 and must
+        // not be treated as malformed.
+        assert_eq!(parse_ws_port_line("MS_BACKEND_WS_PORT=0"), WsPortLine::Port(0));
+    }
+
+    /// The marker with a non-numeric or out-of-range value is malformed, not a
+    /// silent 0 and not a panic.
+    #[test]
+    fn rejects_malformed_ws_port_line() {
+        assert_eq!(parse_ws_port_line("MS_BACKEND_WS_PORT="), WsPortLine::Malformed);
+        assert_eq!(parse_ws_port_line("MS_BACKEND_WS_PORT=abc"), WsPortLine::Malformed);
+        // 70000 > u16::MAX: checked parse rejects it instead of truncating.
+        assert_eq!(parse_ws_port_line("MS_BACKEND_WS_PORT=70000"), WsPortLine::Malformed);
+    }
+
+    /// Ordinary backend log lines without the marker are ignored.
+    #[test]
+    fn ignores_non_marker_lines() {
+        assert_eq!(parse_ws_port_line("hello world"), WsPortLine::NotPortLine);
+        // The marker must be a prefix; an embedded occurrence does not match.
+        assert_eq!(
+            parse_ws_port_line("info: MS_BACKEND_WS_PORT=8080"),
+            WsPortLine::NotPortLine
+        );
+    }
 }

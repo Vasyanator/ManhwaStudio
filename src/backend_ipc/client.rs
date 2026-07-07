@@ -221,7 +221,9 @@ mod inner {
     use super::CallError;
     use crate::backend_ipc::frame::{Frame, read_frame, write_frame};
     use crate::backend_ipc::protocol;
-    use crate::backend_ipc::transport::{BackendStream, backend_socket_path, connect_path};
+    use crate::backend_ipc::transport::{
+        BackendEndpoint, BackendStream, connect_endpoint, current_backend_endpoint,
+    };
 
     /// Default connect timeout for the v2 socket, matching the fail-fast intent of
     /// the legacy backend connect paths.
@@ -240,8 +242,8 @@ mod inner {
 /// Shared, reference-counted client state. Cloning a `BackendClient` clones this
 /// `Arc`, so the reader thread and every caller share one connection.
 struct Shared {
-    /// AF_UNIX path of the frame socket (the base backend socket path).
-    socket_path: std::path::PathBuf,
+    /// Transport endpoint of the frame connection (AF_UNIX path or loopback WS).
+    endpoint: BackendEndpoint,
     /// Write half of the connection. `None` until first connect / after death.
     write_half: Mutex<Option<BackendStream>>,
     /// Monotonic correlation-id source. Starts at 1 (0 is reserved for events).
@@ -289,19 +291,21 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
-    /// Connects to the frame socket ([`backend_socket_path`]) and performs the
-    /// `hello` handshake.
+    /// Connects to the frame transport ([`current_backend_endpoint`]) and performs
+    /// the `hello` handshake.
     ///
     /// Sends `hello{v}`, awaits the server `hello{v, backend_version}`, and errors
     /// on a protocol-version mismatch (a clean, fatal handshake failure — no
     /// requests are sent). On success a background reader thread is spawned.
     ///
     /// # Errors
-    /// Returns a human-readable error string on connect failure (backend not
+    /// Returns a human-readable error string if no endpoint is available (e.g. the
+    /// WS port has not been published on windows), on connect failure (backend not
     /// running), handshake I/O failure, or version mismatch.
     pub fn connect() -> Result<Self, String> {
+        let endpoint = current_backend_endpoint()?;
         let shared = Arc::new(Shared {
-            socket_path: backend_socket_path(),
+            endpoint,
             write_half: Mutex::new(None),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -323,8 +327,8 @@ impl BackendClient {
     fn establish(&self) -> Result<(), String> {
         // Connect with a fail-fast timeout. No read timeout on the connection: the
         // reader thread blocks on frames; writes get a modest timeout.
-        let stream = connect_path(
-            self.shared.socket_path.clone(),
+        let stream = connect_endpoint(
+            &self.shared.endpoint,
             DEFAULT_CONNECT_TIMEOUT,
             None,
             Some(Duration::from_secs(30)),
@@ -382,7 +386,7 @@ impl BackendClient {
 
         crate::runtime_log::log_info(format!(
             "[backend_ipc] v2 client connected to {} (gen {generation})",
-            self.shared.socket_path.display()
+            self.shared.endpoint
         ));
         Ok(())
     }
@@ -1106,11 +1110,12 @@ mod tests {
         }
     }
 
-    /// Connects a `BackendClient` directly to a test server path (bypassing the
-    /// production `backend_socket_path`).
-    fn connect_to(path: PathBuf) -> BackendClient {
+    /// Connects a `BackendClient` directly to a test server `endpoint` (bypassing
+    /// the production `current_backend_endpoint` selection), so tests can inject any
+    /// transport (Unix path or loopback WS).
+    fn connect_to(endpoint: BackendEndpoint) -> BackendClient {
         let shared = Arc::new(Shared {
-            socket_path: path,
+            endpoint,
             write_half: Mutex::new(None),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -1126,10 +1131,16 @@ mod tests {
         client
     }
 
+    /// Unix convenience over [`connect_to`]: wraps a socket `path` as a
+    /// [`BackendEndpoint::Unix`]. Used by the AF_UNIX test servers in this module.
+    fn connect_to_path(path: PathBuf) -> BackendClient {
+        connect_to(BackendEndpoint::Unix(path))
+    }
+
     #[test]
     fn hello_handshake_records_backend_version() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
         assert_eq!(client.backend_version().as_deref(), Some("9.9.9"));
         assert!(client.is_alive());
         drop(client);
@@ -1139,7 +1150,7 @@ mod tests {
     #[test]
     fn call_round_trip_echoes_blob() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         let (header, blob) = client
             .call(
@@ -1162,7 +1173,7 @@ mod tests {
     #[test]
     fn call_streaming_invokes_progress() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         let mut steps = Vec::new();
         let (header, blob) = client
@@ -1192,7 +1203,7 @@ mod tests {
     #[test]
     fn cancel_yields_interrupted() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         // The server waits for a cancel before answering test.cancel_me, so issue
         // the call from a worker thread and cancel it from the test thread.
@@ -1222,7 +1233,7 @@ mod tests {
     #[test]
     fn begin_call_handle_cancel_round_trip() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         // Begin the call (request is now in flight); the handle exposes its id.
         let handle = client
@@ -1255,7 +1266,7 @@ mod tests {
     #[test]
     fn handle_self_cancel_yields_interrupted() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         let handle = client
             .begin_call("test.cancel_me", json!({}), &[])
@@ -1281,7 +1292,7 @@ mod tests {
     #[test]
     fn multiplexes_two_concurrent_ids() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         let c1 = client.clone();
         let c2 = client.clone();
@@ -1308,7 +1319,7 @@ mod tests {
     #[test]
     fn streaming_progress_delivers_blob() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         let mut previews: Vec<Vec<u8>> = Vec::new();
         let (header, blob) = client
@@ -1341,7 +1352,7 @@ mod tests {
     #[test]
     fn timeout_then_interrupted_prefers_interrupted() {
         let server = TestServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         // A short timeout fires the cancel path; the server then delivers
         // `interrupted` ~30ms later, inside the 250ms grace window.
@@ -1458,7 +1469,7 @@ mod tests {
     #[test]
     fn reconnect_lock_single_reconnect() {
         let server = CountingServer::start();
-        let client = connect_to(server.path.clone());
+        let client = connect_to_path(server.path.clone());
 
         // Wait until the initial connection is accounted for.
         let deadline = web_time::Instant::now() + Duration::from_secs(2);
@@ -1627,7 +1638,7 @@ mod tests {
         };
 
         // (1) Real BackendClient hello handshake against the live socket.
-        let client = connect_to(socket_path.clone());
+        let client = connect_to_path(socket_path.clone());
         let version = client
             .backend_version()
             .expect("hello must populate backend_version");

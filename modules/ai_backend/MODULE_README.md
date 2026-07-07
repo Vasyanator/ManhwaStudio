@@ -122,14 +122,21 @@ the download contract.
 - The `health` IPC method and `TOPIC_HEALTH` event push must include `backend_version` from root
   `config.VERSION`; Rust uses it to warn when the backend package and Studio binary versions do not
   match.
-- The backend listens on a single AF_UNIX socket (the framed IPC transport; no HTTP server). The
-  default path is per-platform (`/tmp/manhwastudio_backend_socket` on posix,
-  `tempfile.gettempdir()/manhwastudio_backend_socket` on Windows) and must match the Rust side
-  byte-for-byte; `--socket PATH` overrides it and is optional. A single live instance is enforced
-  by stale-socket detection: a live peer on the path raises `FrameBackendInstanceError` (in
-  `ipc/frame_server.py`), a stale socket file is unlinked before bind. On posix the socket file is
-  `chmod 0o600` and it is unlinked on shutdown. AF_UNIX is required; a Python build without it
-  fails with a clear error (Windows 10 1803+ and a modern CPython are required).
+- The backend serves the framed IPC transport over one of two byte transports, selected by
+  `run_server(transport=...)` (`ai_backend.py --transport`, default `unix`); there is no HTTP
+  server:
+  - `unix` (default): a single AF_UNIX socket. The default path is per-platform
+    (`/tmp/manhwastudio_backend_socket` on posix, `tempfile.gettempdir()/manhwastudio_backend_socket`
+    on Windows) and must match the Rust side byte-for-byte; `--socket PATH` overrides it and is
+    optional. A single live instance is enforced by stale-socket detection: a live peer on the path
+    raises `FrameBackendInstanceError` (in `ipc/frame_server.py`), a stale socket file is unlinked
+    before bind. On posix the socket file is `chmod 0o600` and unlinked on shutdown. AF_UNIX is
+    required for this transport; a Python build without it fails with a clear error.
+  - `ws`: a token-authenticated WebSocket server (`ipc/frame_ws_server.py`) bound to
+    `--ws-host:--ws-port` (port 0 → ephemeral). The Rust client connects as
+    `ws://host:port/?token=<--ws-token>`; the server compares the token constant-time and rejects a
+    mismatch with HTTP 401. `--ws-token` is required for this transport. The actual bound port is
+    printed once as `MS_BACKEND_WS_PORT=<port>` for the Rust supervisor. Needs the `wsproto` package.
 
 ## Editing map
 - To change model root resolution, edit `config.py` and the affected service resolver.

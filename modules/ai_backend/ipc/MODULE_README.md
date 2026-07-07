@@ -2,19 +2,24 @@
 
 ## Purpose
 Python implementation of the framed, multiplexed, bidirectional IPC protocol between the Rust
-frontend (client) and the Python AI backend (server) over a single AF_UNIX domain socket. This
-package is the sole IPC transport; the legacy HTTP server has been removed.
+frontend (client) and the Python AI backend (server). The default byte transport is a single
+AF_UNIX domain socket (`frame_server.py`); a token-authenticated WebSocket transport
+(`frame_ws_server.py`) is an interchangeable fallback for environments without AF_UNIX. The legacy
+HTTP server has been removed.
 
 The authoritative wire specification is `PROTOCOL.md` in this directory.
 
 ## Architecture
 The package is layered: `framing` owns the wire codec, `events` owns server-push fan-out,
-`registry` owns the handler lookup table, `dispatcher` owns the per-connection read loop, and
-`frame_server` owns the AF_UNIX listener. Handlers live in the `handlers/` sub-package, one module
+`registry` owns the handler lookup table, `dispatcher` owns the per-connection read loop, and the
+listener layer has two interchangeable transports — `frame_server` (AF_UNIX, default) and
+`frame_ws_server` (WebSocket fallback). Both feed the SAME `serve_connection`/`Dispatcher`/handler
+stack; only the byte transport differs. Handlers live in the `handlers/` sub-package, one module
 per feature group, self-registering into `registry.METHOD_HANDLERS` at import time.
 
 ```
 frame_server.py          — AF_UNIX listener + worker pool + EventBus construction
+frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, same stack
     └── dispatcher.py    — per-connection read loop, hello handshake, cancel registry
         ├── framing.py   — [u32 BE header_len][header_json][u32 BE blob_len][blob] codec
         ├── events.py    — EventBus: fan-out event{id:0} frames to all live connections
@@ -101,6 +106,32 @@ single-instance safety (live peer → `FrameBackendInstanceError`, stale file �
 0o600`, and unlink-on-close. `run_frame_server(state, socket_path, stop_event, ...)` builds the
 shared `EventBus`, worker pool, and `HandlerContext`, then serves until `stop_event` is set.
 
+### `frame_ws_server.py` — `FrameWsServer`, `run_frame_ws_server`
+WebSocket fallback transport (Python is the WS server, Rust the WS client). `FrameWsServer`
+(`ThreadingMixIn + TCPServer`) binds `(ws_host, ws_port)` (port 0 → ephemeral). Requires `wsproto`
+(pure-Python; pulls `h11`). Per connection, `_WsStreamAdapter` drives a `wsproto` SERVER handshake:
+it extracts the `token` query param from the handshake target and `hmac.compare_digest`s it against
+`ws_token` — mismatch/missing → `RejectConnection` (HTTP 401), match → `AcceptConnection`. After the
+upgrade the adapter exposes the `read(n)`/`write(data)`/`flush()` duck-typed stream `framing.py`
+needs: inbound WS BINARY payloads are concatenated into ONE ordered byte stream (length prefixes
+delimit frames; one WS message == one frame is NOT assumed), PING→PONG, CLOSE/EOF → `read` returns
+`b""`. `serve_connection(..., sock=None)` is used (the raw TCP socket must not reach the event bus:
+a per-write `settimeout` would corrupt WS framing). `run_frame_ws_server(...)` mirrors
+`run_frame_server` but prints `MS_BACKEND_WS_PORT=<bound_port>` (flushed) for the Rust supervisor
+and has no AF_UNIX/unlink/chmod handling.
+
+Outbound concurrency model: each connection runs ONE dedicated writer thread that is the sole
+caller of `WSConnection.send` + `socket.sendall` after the handshake; response/progress/event
+frames (`write`), PONG replies, and the CLOSE echo are all ENQUEUED onto a bounded per-connection
+queue instead of being sent inline. This keeps the socket single-writer (no interleaved WS frames).
+The read thread's `receive_data`/`events` still shares the one non-thread-safe `WSConnection` with
+the writer's `send`, so a small `_ws_lock` guards every `WSConnection` access; it is held only
+around the non-blocking encode/parse, never across a blocking `recv`/`sendall`. Slow/dead-client
+isolation (the AF_UNIX path gets from `EventSink`'s socket timeout) is provided here by the bounded
+queue: a `write`/enqueue that stays blocked on a full queue past `_OUTBOUND_PUT_TIMEOUT_S` (2 s,
+matching `events._PUBLISH_WRITE_TIMEOUT_S`) tears the connection down and raises `BrokenPipeError`,
+so a wedged peer can never stall the publisher for everyone else.
+
 ### `handlers/`
 One module per feature group; each calls `registry.register(METHOD_X, handler_fn)` at module level
 so the act of importing the package wires everything. The shared touch-point for adding a new group
@@ -125,6 +156,7 @@ is a single import line in `handlers/__init__.py`.
 - Event bus fan-out behavior or slow-client isolation: `events.py`.
 - Handshake, cancel registry, in-flight cap, or progress emitter wiring: `dispatcher.py`.
 - AF_UNIX listener, single-instance safety, or worker pool: `frame_server.py`.
+- WebSocket transport, handshake token check, or WS byte-stream adapter: `frame_ws_server.py`.
 - Handler for an existing feature group: the matching `handlers/<group>.py`.
 - New feature group: create `handlers/<group>.py`, add one import line to `handlers/__init__.py`,
   and add the new method to `PROTOCOL.md §5`.

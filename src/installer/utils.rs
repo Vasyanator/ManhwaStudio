@@ -73,6 +73,11 @@ const BASE_DEPENDENCIES: &[&str] = &[
     "requests",
     "selenium",
     "transformers",
+    // Backs the loopback-WebSocket fallback transport used when AF_UNIX is
+    // unavailable (Windows). Kept unconditional: wsproto is a tiny pure-Python
+    // package, so installing it everywhere avoids a Windows-only branch that would
+    // otherwise have to stay in sync with the runtime transport selection.
+    "wsproto",
 ];
 const TORCH_DEPENDENCIES: &[&str] = &[
     "certifi",

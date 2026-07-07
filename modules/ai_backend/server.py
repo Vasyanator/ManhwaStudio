@@ -13,11 +13,16 @@ Main responsibilities:
 - expose the backend version metadata for Rust-side compatibility checks.
 
 Transport:
-The backend listens on a single AF_UNIX domain socket (not TCP) and speaks the
-framed, multiplexed IPC protocol (see `ipc/frame_server.py` and `ipc/PROTOCOL.md`).
-`run_server(socket_path=...)` runs the frame server on that base path in the
-foreground, enforcing a single live instance via stale-socket detection and
-unlinking the socket file on shutdown. AF_UNIX works on Linux and Windows 10 1803+.
+The backend speaks the framed, multiplexed IPC protocol over one of two byte
+transports, selected by `run_server(transport=...)`:
+- `"unix"` (default): a single AF_UNIX domain socket via `ipc/frame_server.py`,
+  enforcing a single live instance via stale-socket detection and unlinking the
+  socket file on shutdown. AF_UNIX works on Linux and Windows 10 1803+.
+- `"ws"`: a token-authenticated WebSocket server via `ipc/frame_ws_server.py`
+  (Python is the WS server, Rust the WS client), used where AF_UNIX is
+  unavailable. See `ipc/frame_ws_server.py` and `ipc/PROTOCOL.md`.
+Both transports run the SAME dispatcher/handler stack; only the byte transport
+differs.
 """
 
 from __future__ import annotations
@@ -167,25 +172,31 @@ def run_server(
     socket_path: Path | str,
     warmup_mangaocr: bool = False,
     app_version: str,
+    transport: str = "unix",
+    ws_host: str = "127.0.0.1",
+    ws_port: int = 0,
+    ws_token: str | None = None,
 ) -> None:
-    """Build all AI services and serve the framed IPC protocol over an AF_UNIX socket.
+    """Build all AI services and serve the framed IPC protocol over the chosen transport.
 
-    `socket_path` is the base AF_UNIX path to bind (the single, sole IPC
-    transport). A live backend already on that path raises
-    `FrameBackendInstanceError`; a stale socket file is replaced. The frame
-    server enforces single-instance ownership and `chmod 0o600` on the socket,
-    runs in the foreground until interrupted, then unlinks the socket file.
+    `transport` selects the byte transport for the SAME framed, multiplexed IPC
+    protocol:
 
-    Raises RuntimeError on a Python build without AF_UNIX support.
+    - `"unix"` (default): bind the AF_UNIX socket at `socket_path` via
+      `run_frame_server`. A live backend already on that path raises
+      `FrameBackendInstanceError`; a stale socket file is replaced. The frame
+      server enforces single-instance ownership and `chmod 0o600` on the socket,
+      runs in the foreground until interrupted, then unlinks the socket file.
+      Raises RuntimeError on a Python build without AF_UNIX support.
+    - `"ws"`: serve the WebSocket fallback transport via `run_frame_ws_server`,
+      bound to `(ws_host, ws_port)` (`ws_port == 0` picks an ephemeral port). The
+      handshake requires the `token` query param to equal `ws_token`
+      (constant-time); `ws_token` must be provided. The actual bound port is
+      printed as `MS_BACKEND_WS_PORT=<port>` for the Rust supervisor.
+
+    Raises ValueError for an unknown `transport` value or a `"ws"` transport with
+    no `ws_token`.
     """
-    # AF_UNIX is required on every supported platform; fail loudly on a Python
-    # build that lacks it instead of an obscure AttributeError at bind time.
-    if not hasattr(socket, "AF_UNIX"):
-        raise RuntimeError(
-            "This Windows build of Python lacks AF_UNIX support; "
-            "Windows 10 1803+ with a modern CPython is required."
-        )
-    socket_path_str = os.fspath(socket_path)
     model_manager = LoadedModelManager()
     onnx_runtime_factory = RuntimeFactory(model_manager)
     ai_device_service = AiDeviceService(model_manager)
@@ -226,13 +237,12 @@ def run_server(
     stop_event = threading.Event()
 
     # --- framed IPC protocol -----------------------------------------------
-    # The single AF_UNIX socket runs the framed, multiplexed protocol. The frame
-    # server owns the event bus; the health worker publishes snapshots to it so
-    # clients receive health pushes instead of polling. Request routing lives in
-    # `ipc/handlers/`, which reach the AppState services directly via the handler
-    # context.
+    # The framed, multiplexed protocol runs over the transport selected by
+    # `transport`. The frame server owns the event bus; the health worker
+    # publishes snapshots to it so clients receive health pushes instead of
+    # polling. Request routing lives in `ipc/handlers/`, which reach the AppState
+    # services directly via the handler context — identical for both transports.
     from .ipc.events import EventBus
-    from .ipc.frame_server import run_frame_server
 
     event_bus = EventBus()
 
@@ -245,16 +255,52 @@ def run_server(
     if warmup_mangaocr:
         threading.Thread(target=_warmup_safe, args=(state,), daemon=True).start()
 
-    print(f"[AI Backend] Running framed IPC on unix socket {socket_path_str}")
     try:
-        run_frame_server(
-            state,
-            socket_path_str,
-            stop_event,
-            backend_version=state.app_version,
-            get_health_snapshot=lambda: _get_health_snapshot(state),
-            events=event_bus,
-        )
+        if transport == "unix":
+            # AF_UNIX is required for the unix transport; fail loudly on a Python
+            # build that lacks it instead of an obscure AttributeError at bind
+            # time. This guard only applies to the unix branch — the WS transport
+            # never touches AF_UNIX.
+            if not hasattr(socket, "AF_UNIX"):
+                raise RuntimeError(
+                    "This Windows build of Python lacks AF_UNIX support; "
+                    "Windows 10 1803+ with a modern CPython is required."
+                )
+            from .ipc.frame_server import run_frame_server
+
+            socket_path_str = os.fspath(socket_path)
+            print(f"[AI Backend] Running framed IPC on unix socket {socket_path_str}")
+            run_frame_server(
+                state,
+                socket_path_str,
+                stop_event,
+                backend_version=state.app_version,
+                get_health_snapshot=lambda: _get_health_snapshot(state),
+                events=event_bus,
+            )
+        elif transport == "ws":
+            if not ws_token:
+                raise ValueError(
+                    "transport='ws' requires a non-empty --ws-token; refusing to "
+                    "serve an unauthenticated WebSocket transport."
+                )
+            from .ipc.frame_ws_server import run_frame_ws_server
+
+            print(f"[AI Backend] Running framed IPC on ws://{ws_host}:{ws_port}")
+            run_frame_ws_server(
+                state,
+                ws_host,
+                ws_port,
+                ws_token,
+                stop_event,
+                backend_version=state.app_version,
+                get_health_snapshot=lambda: _get_health_snapshot(state),
+                events=event_bus,
+            )
+        else:
+            raise ValueError(
+                f"Unknown IPC transport {transport!r}; expected 'unix' or 'ws'."
+            )
     except KeyboardInterrupt:
         print("\n[AI Backend] Stopping...")
     finally:
