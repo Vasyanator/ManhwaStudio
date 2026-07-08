@@ -257,11 +257,16 @@ fn apply_health_fields(
 ) -> bool {
     let checked_at = Instant::now();
     crate::ai_backend_capabilities::set_torch_available(fields.is_torch_available);
+    crate::ai_backend_capabilities::set_backend_available(Some(fields.connected));
 
     let mut guard = match snapshot.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
+    // Capture the previous connection state before overwriting it so we can detect
+    // a disconnect->reconnect transition and force a fresh device re-enumeration
+    // (a restarted backend may have different capabilities).
+    let was_connected = guard.connected;
     guard.connected = fields.connected;
     guard.details = fields.details;
     guard.checked_at = Some(checked_at);
@@ -272,7 +277,21 @@ fn apply_health_fields(
     guard.ocr_paddle_ready = fields.ocr_paddle_ready;
     guard.ocr_paddle_vl_ready = fields.ocr_paddle_vl_ready;
     guard.ocr_surya_ready = fields.ocr_surya_ready;
-    fields.connected && (guard.device_checked_at.is_none() || guard.available_devices.is_empty())
+    // Backend onnxruntime reachability: available only while connected AND a
+    // provider list has been enumerated. The retained list is not cleared on
+    // disconnect, so on reconnect this restores immediately from the last-known
+    // providers; the reconnect-triggered device refresh below then re-enumerates
+    // and corrects it if the restarted backend lost onnxruntime. The native ORT
+    // slot is independent (driven by the route-inputs refresh) and untouched here.
+    let backend_ort = fields.connected && !guard.available_onnx_providers.is_empty();
+    crate::ai_backend_capabilities::set_backend_ort_available(Some(backend_ort));
+    // Refresh device info on the first connect (no prior enumeration) and on every
+    // reconnect (false->true), so device/onnx capabilities never go stale after a
+    // backend restart.
+    fields.connected
+        && (!was_connected
+            || guard.device_checked_at.is_none()
+            || guard.available_devices.is_empty())
 }
 
 /// Folds a health `Value` (pulled response OR pushed event header) into the shared
@@ -1011,6 +1030,12 @@ fn apply_device_state_snapshot(
     snapshot.torch_device_needs_selection = device_state.torch_device_needs_selection;
     snapshot.selected_onnx_provider = Some(device_state.selected_onnx_provider.clone());
     snapshot.available_onnx_providers = device_state.available_onnx_providers.clone();
+    // Providers are enumerated by the backend via onnxruntime, so a non-empty list
+    // is authoritative that the backend's onnxruntime works (CPUExecutionProvider is
+    // always present when onnxruntime imports; empty => not-yet-queried or broken).
+    crate::ai_backend_capabilities::set_backend_ort_available(Some(
+        !device_state.available_onnx_providers.is_empty(),
+    ));
     snapshot.selected_onnx_device_id = Some(device_state.selected_onnx_device_id.clone());
     snapshot.onnx_device_options = device_state.onnx_device_options.clone();
     snapshot.onnx_devices_by_provider = device_state.onnx_devices_by_provider.clone();
@@ -1224,10 +1249,12 @@ mod tests {
     #[test]
     fn applies_full_health_event_to_snapshot() {
         let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
-        // Pre-seed device_checked_at so apply_health_fields reports no refresh need;
-        // we assert the returned flag separately below.
+        // Pre-seed a steady-state connected snapshot with device info already
+        // enumerated: apply_health_fields must then report no refresh need (this is
+        // not a disconnect->reconnect transition). We assert the returned flag below.
         {
             let mut g = snapshot.lock().unwrap();
+            g.connected = true;
             g.device_checked_at = Some(web_time::Instant::now());
             g.available_devices = vec!["cpu".to_string()];
         }
@@ -1275,6 +1302,25 @@ mod tests {
         let event = json!({ "is_torch_available": true, "ocr": {} });
         let refresh = apply_health_fields(&snapshot, parse_health_payload(&event));
         assert!(refresh, "first connect should request a device refresh");
+    }
+
+    /// A disconnect->reconnect transition re-requests a device refresh even when
+    /// device info was previously enumerated, so a restarted backend's capabilities
+    /// (and the derived onnx availability) are re-read rather than left stale.
+    #[test]
+    fn reconnect_requests_device_refresh() {
+        let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
+        // Simulate a prior connect that enumerated devices, then a disconnect
+        // (connected=false) that retained the stale device list.
+        {
+            let mut g = snapshot.lock().unwrap();
+            g.connected = false;
+            g.device_checked_at = Some(web_time::Instant::now());
+            g.available_devices = vec!["cpu".to_string()];
+        }
+        let event = json!({ "is_torch_available": true, "ocr": {} });
+        let refresh = apply_health_fields(&snapshot, parse_health_payload(&event));
+        assert!(refresh, "reconnect should re-request a device refresh");
     }
 
     /// The warming-up snapshot carries no `ocr` block: it must still mark the

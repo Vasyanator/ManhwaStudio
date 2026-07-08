@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
 // `Read::read_to_string` is only used by the native dictionary downloader below.
+use ms_thread as thread;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
 use std::ops::Range;
@@ -41,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
-use ms_thread as thread;
 use web_time::Duration;
 use zspell::Dictionary;
 
@@ -306,7 +306,7 @@ fn build_spellcheck_galley(
     let tokens = collect_word_tokens(text);
     let statuses = statuses_for_tokens(ui, &tokens);
     let mut cursor = 0usize;
-    for (token, status) in tokens.iter().zip(statuses.into_iter()) {
+    for (token, status) in tokens.iter().zip(statuses) {
         if cursor < token.range.start {
             push_section(&mut job, cursor..token.range.start, default_format.clone());
         }

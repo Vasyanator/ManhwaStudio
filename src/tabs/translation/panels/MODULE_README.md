@@ -32,7 +32,16 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   applies them to the recognized result. Wider engines
   (PaddleOCR-VL) live on a second engine row to keep the side panel from widening; PaddleOCR-VL
   shows no language/model controls (only an optional writing-system restriction: auto / korean /
-  chinese / japanese) and is disabled when PyTorch is unavailable.
+  chinese / japanese). The five runtime engine-selection buttons are `AiButton`s gated on a
+  per-engine `AiRequirement` (`engine_button_requirement`, permissive on an unknown capability so a
+  not-yet-probed native ONNX runtime does not lock selection out); each shows a runtime marker badge
+  (`engine_marker`: Torch / ONNX / Torch/ONNX). AiApi is network-only and stays a plain ungated
+  `selectable_value` (still disabled under `--no-ai` by the outer `add_enabled_ui` in `tab.rs`).
+  Cascade: `selected_mode_requirement` (model-aware; MangaOCR `base_torch` needs Torch, its ONNX
+  exports need onnxruntime) gates both the selected engine's options interface and the load button —
+  when the requirement is known-unavailable, both are disabled and the requirement's
+  `disabled_reason` is shown. The panel reads capabilities from the process-global `AiCaps::current`,
+  not from parameters.
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
   actions, and line/mask edit mode toggles.

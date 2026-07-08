@@ -267,15 +267,20 @@ impl AiBackendSupervisor {
     /// Starts the supervisor. When `ai_enabled`, spawns the process worker
     /// (auto-starting the backend if the persisted autostart toggle is on) and the
     /// health/device probe. When disabled (`--no-ai`), everything stays inert.
+    ///
+    /// Also primes the process-global AI capability hints (backend / torch /
+    /// onnxruntime) with the same policy: `None` (unknown until the first honest
+    /// signal — health snapshot for backend/torch/backend-ORT, route-inputs refresh
+    /// for native-ORT) when `ai_enabled`, or forced `Some(false)` under `--no-ai`.
     pub fn start(ai_enabled: bool) -> Self {
-        // Prime the global torch-capability hint exactly as the studio used to do
-        // at construction: unknown until the first health snapshot, or forced
-        // unavailable under --no-ai.
-        crate::ai_backend_capabilities::set_torch_available(if ai_enabled {
-            None
-        } else {
-            Some(false)
-        });
+        // Prime the global capability hints exactly as the studio used to do at
+        // construction: unknown until the first honest signal, or forced
+        // unavailable under --no-ai (which gates every AI capability off).
+        let primed = if ai_enabled { None } else { Some(false) };
+        crate::ai_backend_capabilities::set_torch_available(primed);
+        crate::ai_backend_capabilities::set_backend_available(primed);
+        crate::ai_backend_capabilities::set_backend_ort_available(primed);
+        crate::ai_backend_capabilities::set_native_ort_available(primed);
 
         let user_settings_file = config::user_config_path();
         let auto_start = load_ai_backend_autostart(&user_settings_file);

@@ -154,7 +154,7 @@ where
 /// по ровности (меньшая неравномерность раньше), затем по цене разрывов,
 /// пиковости и числу переносов.
 pub(super) fn sort_advanced_forms(forms: &mut [TextForm]) {
-    forms.sort_by(|a, b| a.max_width.cmp(&b.max_width));
+    forms.sort_by_key(|a| a.max_width);
     let mut i = 0;
     while i < forms.len() {
         let run_min = forms[i].max_width;
@@ -168,7 +168,10 @@ pub(super) fn sort_advanced_forms(forms: &mut [TextForm]) {
                 .then(a.unevenness_pct.cmp(&b.unevenness_pct))
                 .then(a.break_cost.cmp(&b.break_cost))
                 .then(a.max_width.cmp(&b.max_width))
-                .then(a.peakiness_pct(PeakBase::Min).cmp(&b.peakiness_pct(PeakBase::Min)))
+                .then(
+                    a.peakiness_pct(PeakBase::Min)
+                        .cmp(&b.peakiness_pct(PeakBase::Min)),
+                )
                 .then(a.word_break_count.cmp(&b.word_break_count))
         });
         i = j;

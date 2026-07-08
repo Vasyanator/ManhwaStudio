@@ -10,6 +10,12 @@ Main function:
 - `draw_ocr_panel`: renders OCR controls and last OCR preview.
 
 UI specifics:
+- Runtime engine-selection buttons are `AiButton`s gated on a per-engine
+  `AiRequirement` (optimistic while the capability is unknown) with a runtime
+  marker badge; AiApi stays a plain ungated selectable. The selected engine's
+  options interface and the load button are disabled together when the selected
+  engine+model requirement is known-unavailable. Capabilities are read from the
+  process-global `AiCaps::current`, not passed in.
 - EasyOCR selected languages are shown as removable rows with full names.
 - EasyOCR/PaddleOCR model dropdown options are alphabetically sorted by title.
 - AI API controls keep API key text transient and emit controller actions for
@@ -26,7 +32,7 @@ use crate::tabs::translation::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
     PADDLEOCR_MAIN_LANGUAGES,
 };
-use crate::widgets::WheelComboBox;
+use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox};
 
 const PYTORCH_UNAVAILABLE_HINT: &str = "PyTorch не установлен";
 const OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE: f32 = 300.0;
@@ -202,14 +208,104 @@ pub struct OcrPanelActions {
     pub refresh_ai_api_metadata: bool,
 }
 
+/// AiRequirement gating the engine-SELECTION button (permissive: MangaOCR is
+/// usable if EITHER torch or onnx is available, so the user can then pick a
+/// runnable model). `None` for AiApi (network-only, no local runtime).
+fn engine_button_requirement(engine: OcrEngine) -> Option<AiRequirement> {
+    match engine {
+        OcrEngine::MangaOcr => Some(AiRequirement::TorchOrOnnx),
+        OcrEngine::EasyOcr => Some(AiRequirement::Torch),
+        OcrEngine::PaddleOcr => Some(AiRequirement::Onnx),
+        OcrEngine::PaddleVl => Some(AiRequirement::Torch),
+        OcrEngine::Surya => Some(AiRequirement::Torch),
+        OcrEngine::AiApi => None,
+    }
+}
+
+/// AiRequirement of the currently-selected engine+model combo (model-aware),
+/// used to gate the engine's options interface and the load button. `None` for
+/// AiApi (network-only).
+fn selected_mode_requirement(options: &OcrPanelOptions) -> Option<AiRequirement> {
+    match options.engine {
+        // MangaOCR runs on the runtime of its selected model: the `base_torch`
+        // export needs PyTorch, the ONNX exports need onnxruntime.
+        OcrEngine::MangaOcr => {
+            if options
+                .manga_model
+                .trim()
+                .eq_ignore_ascii_case("base_torch")
+            {
+                Some(AiRequirement::Torch)
+            } else {
+                Some(AiRequirement::Onnx)
+            }
+        }
+        OcrEngine::EasyOcr => Some(AiRequirement::Torch),
+        OcrEngine::PaddleOcr => Some(AiRequirement::Onnx),
+        OcrEngine::PaddleVl => Some(AiRequirement::Torch),
+        OcrEngine::Surya => Some(AiRequirement::Torch),
+        OcrEngine::AiApi => None,
+    }
+}
+
+/// Short runtime marker badge for an engine ("Torch"/"ONNX"/"Torch/ONNX"), or
+/// `None` when the engine has no local-runtime dependency (AiApi).
+fn engine_marker(engine: OcrEngine) -> Option<&'static str> {
+    match engine {
+        OcrEngine::MangaOcr => Some("Torch/ONNX"),
+        OcrEngine::EasyOcr => Some("Torch"),
+        OcrEngine::PaddleOcr => Some("ONNX"),
+        OcrEngine::PaddleVl => Some("Torch"),
+        OcrEngine::Surya => Some("Torch"),
+        OcrEngine::AiApi => None,
+    }
+}
+
+/// Renders one runtime-OCR engine selection button via [`AiButton`], strictly gated
+/// on the engine's `requirement` (a known-unavailable OR not-yet-known capability
+/// disables it). Native ORT reports as "armed" before its first load, so strict
+/// gating does not lock native engines out. Applies the engine's runtime marker
+/// badge and its descriptive `hover`. Returns `true` when the click selected this
+/// engine.
+fn engine_select_button(
+    ui: &mut egui::Ui,
+    selected: &mut OcrEngine,
+    engine: OcrEngine,
+    requirement: AiRequirement,
+    label: &str,
+    hover: &str,
+) -> bool {
+    let is_selected = *selected == engine;
+    // Frameless (like `selectable_value`): transparent at rest, highlighted only on
+    // hover/selection — no resting background box, matching the AI API entry.
+    let mut btn = AiButton::new(label, requirement)
+        .selected(is_selected)
+        .frame(false);
+    if let Some(marker) = engine_marker(engine) {
+        btn = btn.marker(marker);
+    }
+    let response = btn.draw(ui).response.on_hover_text(hover);
+    if response.clicked() {
+        *selected = engine;
+        return true;
+    }
+    false
+}
+
+/// Renders the OCR settings panel and returns the emitted [`OcrPanelActions`].
+///
+/// Runtime AI capabilities (backend/torch/onnx) are read from the process-global
+/// snapshot via [`AiCaps::current`], so no backend/torch state is passed in. Engine
+/// selection buttons gate on a per-engine [`AiRequirement`] (optimistic while the
+/// capability is unknown); the selected engine's options interface and the load
+/// button are disabled together when the selected engine+model requirement is
+/// known-unavailable. AiApi stays ungated (network-only).
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_ocr_panel(
     ui: &mut egui::Ui,
     state: OcrLoadState,
     options: &mut OcrPanelOptions,
-    backend_unavailable: bool,
-    torch_available: Option<bool>,
     last_error: Option<&str>,
     last_result: Option<&OcrRecognizeResult>,
     quick_selection_shortcut: Option<&str>,
@@ -218,185 +314,203 @@ pub fn draw_ocr_panel(
     advanced_selection_active: bool,
 ) -> OcrPanelActions {
     let mut actions = OcrPanelActions::default();
-    let torch_available = torch_available.unwrap_or(true);
-    let torch_mode_unavailable = selected_ocr_mode_requires_torch(options) && !torch_available;
+    let caps = AiCaps::current();
+    // Strict gating: the selected engine's interface and load button are enabled
+    // only when its runtime requirement is satisfied. Native ORT reports as "armed"
+    // before its first load, so native engines are not locked out; a backend-routed
+    // engine with the backend down (or torch unavailable) correctly disables.
+    let selected_engine_enabled =
+        selected_mode_requirement(options).is_none_or(|req| req.satisfied(&caps));
     ui.heading("Настройки распознавания текста");
     ui.label("Движок:");
+    // Runtime engines gate their selection button on a per-engine AiRequirement
+    // (optimistic while unknown); AiApi is network-only and stays a plain
+    // selectable_value so it works with the backend offline (the outer
+    // `add_enabled_ui(ai_enabled, ...)` in tab.rs still disables it under --no-ai).
     ui.horizontal_wrapped(|ui| {
-        let resp = ui.selectable_value(
-            &mut options.engine,
-            OcrEngine::MangaOcr,
-            "MangaOCR",
-        ).on_hover_text("Идеален для японского в манге.\nНе требует параметра 'Столбцы справа налево'");
-
-        actions.options_changed |= resp.changed();
-
-        actions.options_changed |= disabled_ocr_engine_choice(
-            ui,
-            &mut options.engine,
-            OcrEngine::EasyOcr,
-            "EasyOCR",
-            torch_available,
-            "Быстрее чем Paddle и поддерживает несколько языков сразу.\nХорошо справляется с английским, но для Китайского и Корейского менее точен.",
-        );
-
-        actions.options_changed |= ui
-            .selectable_value(&mut options.engine, OcrEngine::PaddleOcr, "PaddleOCR")
-            .on_hover_text("Более медленный и продвинутый движок.\nХорош для Китайского, Корейского и горизонтального Японского.")
-            .changed();
-
-        actions.options_changed |= disabled_ocr_engine_choice(
-            ui,
-            &mut options.engine,
-            OcrEngine::Surya,
-            "Surya",
-            torch_available,
-            "Самый жирный и продвинутый OCR, соответственно самый медленный.\nНе требует выбора языка, поддерживает 90 языков из коробки.",
-        );
-
+        if let Some(req) = engine_button_requirement(OcrEngine::MangaOcr) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::MangaOcr,
+                req,
+                "MangaOCR",
+                "Идеален для японского в манге.\nНе требует параметра 'Столбцы справа налево'",
+            );
+        }
+        if let Some(req) = engine_button_requirement(OcrEngine::EasyOcr) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::EasyOcr,
+                req,
+                "EasyOCR",
+                "Быстрее чем Paddle и поддерживает несколько языков сразу.\nХорошо справляется с английским, но для Китайского и Корейского менее точен.",
+            );
+        }
+        if let Some(req) = engine_button_requirement(OcrEngine::PaddleOcr) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::PaddleOcr,
+                req,
+                "PaddleOCR",
+                "Более медленный и продвинутый движок.\nХорош для Китайского, Корейского и горизонтального Японского.",
+            );
+        }
+        if let Some(req) = engine_button_requirement(OcrEngine::Surya) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::Surya,
+                req,
+                "Surya",
+                "Самый жирный и продвинутый OCR, соответственно самый медленный.\nНе требует выбора языка, поддерживает 90 языков из коробки.",
+            );
+        }
         actions.options_changed |= ui
             .selectable_value(&mut options.engine, OcrEngine::AiApi, "AI API")
             .on_hover_text("Мультимодальные облачные модели через genai. API key хранится в системном хранилище секретов.")
             .changed();
-
     });
     // Second engine row keeps wider engines off the first line so the side panel
     // does not grow horizontally when a new engine is added.
     ui.horizontal_wrapped(|ui| {
-        actions.options_changed |= disabled_ocr_engine_choice(
-            ui,
-            &mut options.engine,
-            OcrEngine::PaddleVl,
-            "PaddleOCR-VL",
-            torch_available,
-            "Vision-language OCR (Transformers).\nНе требует детекта текста и выбора языка, распознаёт текст сразу из изображения.",
-        );
-    });
-    match options.engine {
-        OcrEngine::MangaOcr => {
-            normalize_selected_manga_model(options);
-            ui.label("Модель MangaOCR");
-            WheelComboBox::from_id_salt("translation_ocr_manga_model")
-                .selected_text(selected_manga_model_label(options))
-                .show_ui(ui, |ui| {
-                    actions.options_changed |= ui
-                        .selectable_value(
-                            &mut options.manga_model,
-                            "base_onnx".to_string(),
-                            "Базовая (onnx)",
-                        )
-                        .changed();
-                    actions.options_changed |= ui
-                        .selectable_value(
-                            &mut options.manga_model,
-                            "2025_onnx".to_string(),
-                            "2025 (onnx)",
-                        )
-                        .changed();
-                    actions.options_changed |= disabled_manga_model_choice(
-                        ui,
-                        &mut options.manga_model,
-                        "base_torch",
-                        "Базовая (PyTorch)",
-                        torch_available,
-                    );
-                });
+        if let Some(req) = engine_button_requirement(OcrEngine::PaddleVl) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::PaddleVl,
+                req,
+                "PaddleOCR-VL",
+                "Vision-language OCR (Transformers).\nНе требует детекта текста и выбора языка, распознаёт текст сразу из изображения.",
+            );
         }
-        OcrEngine::PaddleOcr => {
-            let show_all_changed = ui
-                .checkbox(&mut options.paddle_show_full_langs, "Показывать все модели")
-                .changed();
-            actions.options_changed |= show_all_changed;
-            if show_all_changed {
-                normalize_selected_paddle_lang(options);
-            }
-            normalize_selected_paddle_lang(options);
-            let available_langs =
-                sorted_language_options(paddle_language_options(options.paddle_show_full_langs));
-            let selected_lang = selected_paddle_language_label(options, &available_langs);
-            WheelComboBox::from_label("Модель PaddleOCR")
-                .selected_text(selected_lang)
-                .show_ui(ui, |ui| {
-                    for (code, title) in &available_langs {
+    });
+    ui.add_enabled_ui(selected_engine_enabled, |ui| {
+        match options.engine {
+            OcrEngine::MangaOcr => {
+                normalize_selected_manga_model(options);
+                ui.label("Модель MangaOCR");
+                WheelComboBox::from_id_salt("translation_ocr_manga_model")
+                    .selected_text(selected_manga_model_label(options))
+                    .show_ui(ui, |ui| {
                         actions.options_changed |= ui
                             .selectable_value(
-                                &mut options.paddle_lang,
-                                (*code).to_string(),
-                                format!("{title} ({code})"),
+                                &mut options.manga_model,
+                                "base_onnx".to_string(),
+                                "Базовая (onnx)",
                             )
                             .changed();
-                    }
-                });
-        }
-        OcrEngine::EasyOcr => {
-            let show_all_changed = ui
-                .checkbox(&mut options.easy_show_full_langs, "Показывать все языки")
-                .changed();
-            actions.options_changed |= show_all_changed;
-            if show_all_changed {
-                normalize_easy_lang_to_add(options);
+                        actions.options_changed |= ui
+                            .selectable_value(
+                                &mut options.manga_model,
+                                "2025_onnx".to_string(),
+                                "2025 (onnx)",
+                            )
+                            .changed();
+                        actions.options_changed |= disabled_manga_model_choice(
+                            ui,
+                            &mut options.manga_model,
+                            "base_torch",
+                            "Базовая (PyTorch)",
+                            // Strict: the torch model is usable only when PyTorch is
+                            // known-available (torch runs solely on the backend).
+                            AiRequirement::Torch.satisfied(&caps),
+                        );
+                    });
             }
-            normalize_easy_lang_to_add(options);
-            let available_langs =
-                sorted_language_options(easy_language_options(options.easy_show_full_langs));
-            let selected_lang = selected_easy_language_label(options, &available_langs);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Язык:");
-                WheelComboBox::from_id_salt("translation_ocr_easy_lang_to_add")
+            OcrEngine::PaddleOcr => {
+                let show_all_changed = ui
+                    .checkbox(&mut options.paddle_show_full_langs, "Показывать все модели")
+                    .changed();
+                actions.options_changed |= show_all_changed;
+                if show_all_changed {
+                    normalize_selected_paddle_lang(options);
+                }
+                normalize_selected_paddle_lang(options);
+                let available_langs = sorted_language_options(paddle_language_options(
+                    options.paddle_show_full_langs,
+                ));
+                let selected_lang = selected_paddle_language_label(options, &available_langs);
+                WheelComboBox::from_label("Модель PaddleOCR")
                     .selected_text(selected_lang)
                     .show_ui(ui, |ui| {
                         for (code, title) in &available_langs {
                             actions.options_changed |= ui
                                 .selectable_value(
-                                    &mut options.easy_lang_to_add,
+                                    &mut options.paddle_lang,
                                     (*code).to_string(),
                                     format!("{title} ({code})"),
                                 )
                                 .changed();
                         }
                     });
-                if ui.button("Добавить").clicked() {
-                    actions.options_changed |= append_selected_easy_lang(options);
+            }
+            OcrEngine::EasyOcr => {
+                let show_all_changed = ui
+                    .checkbox(&mut options.easy_show_full_langs, "Показывать все языки")
+                    .changed();
+                actions.options_changed |= show_all_changed;
+                if show_all_changed {
+                    normalize_easy_lang_to_add(options);
                 }
-            });
-            actions.options_changed |= draw_easy_selected_langs(ui, options);
-        }
-        OcrEngine::PaddleVl => {
-            // PaddleOCR-VL auto-detects script; an optional hard-restriction mode
-            // constrains decoding to one writing system to curb hallucination on
-            // messy/handwritten text (no separate language model is selected).
-            normalize_paddle_vl_script(options);
-            WheelComboBox::from_label("Ограничение письменности")
-                .selected_text(paddle_vl_script_label(&options.paddle_vl_script))
-                .show_ui(ui, |ui| {
-                    for (key, label) in PADDLE_VL_SCRIPTS {
-                        actions.options_changed |= ui
-                            .selectable_value(
-                                &mut options.paddle_vl_script,
-                                (*key).to_string(),
-                                *label,
-                            )
-                            .changed();
+                normalize_easy_lang_to_add(options);
+                let available_langs =
+                    sorted_language_options(easy_language_options(options.easy_show_full_langs));
+                let selected_lang = selected_easy_language_label(options, &available_langs);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Язык:");
+                    WheelComboBox::from_id_salt("translation_ocr_easy_lang_to_add")
+                        .selected_text(selected_lang)
+                        .show_ui(ui, |ui| {
+                            for (code, title) in &available_langs {
+                                actions.options_changed |= ui
+                                    .selectable_value(
+                                        &mut options.easy_lang_to_add,
+                                        (*code).to_string(),
+                                        format!("{title} ({code})"),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if ui.button("Добавить").clicked() {
+                        actions.options_changed |= append_selected_easy_lang(options);
                     }
                 });
-            if options.paddle_vl_script != "auto" {
-                ui.small(
+                actions.options_changed |= draw_easy_selected_langs(ui, options);
+            }
+            OcrEngine::PaddleVl => {
+                // PaddleOCR-VL auto-detects script; an optional hard-restriction mode
+                // constrains decoding to one writing system to curb hallucination on
+                // messy/handwritten text (no separate language model is selected).
+                normalize_paddle_vl_script(options);
+                WheelComboBox::from_label("Ограничение письменности")
+                    .selected_text(paddle_vl_script_label(&options.paddle_vl_script))
+                    .show_ui(ui, |ui| {
+                        for (key, label) in PADDLE_VL_SCRIPTS {
+                            actions.options_changed |= ui
+                                .selectable_value(
+                                    &mut options.paddle_vl_script,
+                                    (*key).to_string(),
+                                    *label,
+                                )
+                                .changed();
+                        }
+                    });
+                if options.paddle_vl_script != "auto" {
+                    ui.small(
                     "Жёсткий режим: модель выдаёт только выбранную письменность, цифры и знаки.",
                 );
+                }
+            }
+            // Surya auto-detects language and needs no selection UI here.
+            OcrEngine::Surya => {}
+            OcrEngine::AiApi => {
+                draw_ai_api_options(ui, options, &mut actions);
             }
         }
-        // Surya auto-detects language and needs no selection UI here.
-        OcrEngine::Surya => {}
-        OcrEngine::AiApi => {
-            draw_ai_api_options(ui, options, &mut actions);
-        }
-    }
-    if torch_mode_unavailable {
-        ui.colored_label(
-            egui::Color32::from_rgb(240, 102, 102),
-            PYTORCH_UNAVAILABLE_HINT,
-        );
-    }
+    });
     ui.separator();
 
     let (status_color, status_text) = match state {
@@ -476,22 +590,25 @@ pub fn draw_ocr_panel(
     };
     ui.horizontal_wrapped(|ui| {
         let button = ui.add_enabled(
-            !state.is_busy() && !backend_unavailable && !torch_mode_unavailable,
+            !state.is_busy() && selected_engine_enabled,
             egui::Button::new(button_label),
         );
+        // Surface the requirement's disabled reason on hover and as a colored hint,
+        // both derived from the same `selected_mode_requirement` used to gate it.
+        let disabled_reason = if selected_engine_enabled {
+            None
+        } else {
+            selected_mode_requirement(options).map(|req| req.disabled_reason(&caps))
+        };
+        let button = match disabled_reason {
+            Some(reason) => button.on_disabled_hover_text(reason),
+            None => button,
+        };
         if button.clicked() {
             actions.request_load = true;
         }
-        if backend_unavailable {
-            ui.colored_label(
-                egui::Color32::from_rgb(240, 102, 102),
-                "ИИ бэкенд недоступен",
-            );
-        } else if torch_mode_unavailable {
-            ui.colored_label(
-                egui::Color32::from_rgb(240, 102, 102),
-                PYTORCH_UNAVAILABLE_HINT,
-            );
+        if let Some(reason) = disabled_reason {
+            ui.colored_label(egui::Color32::from_rgb(240, 102, 102), reason);
         }
     });
 
@@ -703,33 +820,6 @@ fn ai_api_options_max_height(ui: &egui::Ui) -> f32 {
     (ui.ctx().content_rect().height() * 0.7 - OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE).max(140.0)
 }
 
-fn disabled_ocr_engine_choice(
-    ui: &mut egui::Ui,
-    selected_engine: &mut OcrEngine,
-    engine: OcrEngine,
-    label: &str,
-    torch_available: bool,
-    hover_text: &str,
-) -> bool {
-    let selected = *selected_engine == engine;
-    let response = ui
-        .add_enabled(torch_available, egui::Button::new(label).selected(selected))
-        .on_hover_text(hover_text);
-    let response = if torch_available {
-        response
-    } else {
-        response.on_disabled_hover_text(
-            egui::RichText::new(PYTORCH_UNAVAILABLE_HINT)
-                .color(egui::Color32::from_rgb(240, 102, 102)),
-        )
-    };
-    if response.clicked() {
-        *selected_engine = engine;
-        return true;
-    }
-    false
-}
-
 fn compact_middle(text: &str, max_chars: usize) -> String {
     let chars = text.chars().collect::<Vec<_>>();
     if chars.len() <= max_chars || max_chars < 8 {
@@ -744,16 +834,19 @@ fn compact_middle(text: &str, max_chars: usize) -> String {
     format!("{start}...{end}")
 }
 
+/// Renders the `base_torch` MangaOCR model button, disabled when PyTorch is not
+/// usable. `torch_usable` should be permissive on an unknown torch capability so
+/// the button disables only when PyTorch is known-unavailable.
 fn disabled_manga_model_choice(
     ui: &mut egui::Ui,
     selected_model: &mut String,
     model_key: &str,
     label: &str,
-    torch_available: bool,
+    torch_usable: bool,
 ) -> bool {
     let selected = selected_model == model_key;
-    let response = ui.add_enabled(torch_available, egui::Button::new(label).selected(selected));
-    let response = if torch_available {
+    let response = ui.add_enabled(torch_usable, egui::Button::new(label).selected(selected));
+    let response = if torch_usable {
         response
     } else {
         response.on_disabled_hover_text(
@@ -766,17 +859,6 @@ fn disabled_manga_model_choice(
         return true;
     }
     false
-}
-
-fn selected_ocr_mode_requires_torch(options: &OcrPanelOptions) -> bool {
-    match options.engine {
-        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
-        OcrEngine::MangaOcr => options
-            .manga_model
-            .trim()
-            .eq_ignore_ascii_case("base_torch"),
-        OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
-    }
 }
 
 // PaddleOCR-VL writing-system restriction modes: (wire key, UI label). `auto`
@@ -1009,7 +1091,54 @@ fn parse_lang_codes(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OcrPanelOptions, parse_replacement_targets};
+    use super::{
+        AiRequirement, OcrEngine, OcrPanelOptions, engine_button_requirement,
+        parse_replacement_targets, selected_mode_requirement,
+    };
+
+    #[test]
+    fn selected_mode_requirement_is_model_aware() {
+        let torch = OcrPanelOptions {
+            engine: OcrEngine::MangaOcr,
+            manga_model: "base_torch".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_mode_requirement(&torch),
+            Some(AiRequirement::Torch)
+        );
+
+        let onnx = OcrPanelOptions {
+            engine: OcrEngine::MangaOcr,
+            manga_model: "base_onnx".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(selected_mode_requirement(&onnx), Some(AiRequirement::Onnx));
+
+        let paddle = OcrPanelOptions {
+            engine: OcrEngine::PaddleOcr,
+            ..Default::default()
+        };
+        assert_eq!(
+            selected_mode_requirement(&paddle),
+            Some(AiRequirement::Onnx)
+        );
+
+        let ai_api = OcrPanelOptions {
+            engine: OcrEngine::AiApi,
+            ..Default::default()
+        };
+        assert_eq!(selected_mode_requirement(&ai_api), None);
+    }
+
+    #[test]
+    fn engine_button_requirement_is_permissive_for_manga() {
+        assert_eq!(
+            engine_button_requirement(OcrEngine::MangaOcr),
+            Some(AiRequirement::TorchOrOnnx)
+        );
+        assert_eq!(engine_button_requirement(OcrEngine::AiApi), None);
+    }
 
     #[test]
     fn parses_quoted_comma_separated_targets() {

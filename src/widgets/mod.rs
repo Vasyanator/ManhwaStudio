@@ -22,7 +22,11 @@ FILE HEADER (widgets/mod.rs)
     умеет брать цвет из пикселя текущего viewport через screenshot-события egui.
   - `MarkedScrollArea`: вертикальный скролл с разметкой бара (типизированные/
     свободные пометки под ползунком) и жёлобом элементов слева от бара.
+  - `AiButton`: an AI-tool launch button that gates its own availability on the
+    process-global capability signals (backend/torch/onnxruntime) and paints an
+    optional corner marker badge with the painter only.
 */
+mod ai_button;
 mod autocomplete_line;
 mod editable_combo_box;
 mod marked_scroll;
@@ -35,6 +39,8 @@ mod wheel_input_guard;
 mod wheel_slider;
 mod wheel_spin_box;
 
+#[allow(unused_imports)]
+pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement};
 #[allow(unused_imports)]
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]

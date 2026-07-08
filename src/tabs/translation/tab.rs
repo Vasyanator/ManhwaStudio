@@ -1209,6 +1209,16 @@ impl TranslationTabState {
         if stale {
             self.ocr_route_inputs_cached = crate::tabs::translation::ocr::read_ocr_route_inputs();
             self.ocr_route_inputs_checked_at = Some(now);
+            // Publish native onnxruntime availability for UI gating. Native ORT is
+            // "armed" — considered available even before its dylib loads — when the
+            // effective runtime is Native and the SIGILL load guard is Safe. When
+            // ORT routes through the backend (runtime Backend, or native guard
+            // Suspect), native is not the ORT path, so this slot is false and ORT
+            // availability falls to the backend slot (backend connected + providers).
+            let (runtime, guard) = self.ocr_route_inputs_cached;
+            let native_armed = runtime == crate::config::AiRuntime::Native
+                && guard == crate::config::OrtLoadDecision::Safe;
+            crate::ai_backend_capabilities::set_native_ort_available(Some(native_armed));
         }
     }
 
@@ -1279,7 +1289,6 @@ impl TranslationTabState {
                     self.sync_ocr_states_from_backend_health_snapshot();
                 }
                 let backend_unavailable = requires_backend && self.ai_backend_unavailable();
-                let torch_available = self.ai_backend_torch_available();
                 let quick_selection_active = self.ocr_quick_selection_mode_active();
                 let advanced_selection_active = self.ocr_advanced_selection_mode_active();
                 let actions = ui
@@ -1288,8 +1297,6 @@ impl TranslationTabState {
                             ui,
                             self.ocr_state_for_engine(self.ocr_panel_options.engine),
                             &mut self.ocr_panel_options,
-                            backend_unavailable,
-                            torch_available,
                             self.ocr_controller.last_error(),
                             self.ocr_controller.last_result(),
                             self.hotkey_hints.ocr_quick_selection_mode.as_deref(),

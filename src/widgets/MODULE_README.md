@@ -16,6 +16,10 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 
 ## Files and submodules
 - `mod.rs`: public export surface for reusable widgets.
+- `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities
+  (`ai_backend_capabilities`: backend/torch/onnxruntime) via `AiCaps::current()`. The
+  optional marker badge is painter-only and must never allocate a second interactive
+  rect (that would carve a hole in the button hitbox).
 - `text_edit_plus.rs`: multiline text editor with per-range text color and ordered rounded
   background highlights.
 - `spellchecked_line.rs`: multiline text editor with asynchronous Hunspell-compatible

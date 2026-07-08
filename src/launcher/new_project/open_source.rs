@@ -22,6 +22,7 @@ main thread to keep the launcher responsive.
 
 use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
 use image::{DynamicImage, ImageFormat, ImageReader};
+use ms_thread as thread;
 #[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use std::cmp::Ordering;
@@ -32,7 +33,6 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
-use ms_thread as thread;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 const IMAGE_SIGNATURE_BYTES: usize = 32;
@@ -1238,10 +1238,9 @@ fn parse_resource_like_name(stem: &str) -> Option<usize> {
     let lowercase = stem.to_ascii_lowercase();
     let rest = if let Some(rest) = lowercase.strip_prefix("resource") {
         rest
-    } else if let Some(rest) = lowercase.strip_prefix("resouce") {
-        rest
     } else {
-        return None;
+        // Tolerate the common "resouce" misspelling; `?` returns None when neither prefix matches.
+        lowercase.strip_prefix("resouce")?
     };
     if rest.is_empty() {
         return Some(0);

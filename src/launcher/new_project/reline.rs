@@ -27,13 +27,13 @@ use crate::backend_ipc::{self, CallError};
 use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
 use crate::tabs::translation::backend_health::{AI_BACKEND_OFFLINE_ERROR, check_ai_backend_health};
 use image::{ImageFormat, RgbaImage};
+use ms_thread as thread;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use ms_thread as thread;
 use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Reline runs over the v2 framed transport. Endpoint labels are kept only for
@@ -391,7 +391,7 @@ fn parse_reline_models(header: &Value) -> Vec<RelineModelCatalogEntry> {
                 .collect()
         })
         .unwrap_or_default();
-    models.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    models.sort_by_key(|left| left.name.to_lowercase());
     models
 }
 

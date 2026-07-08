@@ -82,6 +82,7 @@ use crate::tabs::typing::TypingTabState;
 use crate::tabs::wiki::WikiTabState;
 use eframe::egui;
 use egui::{Align2, ColorImage, TextureOptions};
+use ms_thread::{self as thread, JoinHandle};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -90,7 +91,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use ms_thread::{self as thread, JoinHandle};
 use web_time::{Duration, Instant};
 
 const DECODE_TILE_SIDE: u32 = 2048;
@@ -1412,15 +1412,13 @@ impl MangaApp {
                     }
                 }
             }
-            AppTab::PsEditor => {
-                // Entering the PS editor: sync page + clean overlay + camera from the canvas world.
-                if self.prev_view_tab != Some(AppTab::PsEditor) {
-                    let zoom = self.shared_canvas_viewport.zoom;
-                    let page = self.shared_page_idx;
-                    let center = self.shared_page_center;
-                    self.ps_editor_tab
-                        .sync_view_from_canvas(&self.project, page, zoom, center);
-                }
+            // Entering the PS editor: sync page + clean overlay + camera from the canvas world.
+            AppTab::PsEditor if self.prev_view_tab != Some(AppTab::PsEditor) => {
+                let zoom = self.shared_canvas_viewport.zoom;
+                let page = self.shared_page_idx;
+                let center = self.shared_page_center;
+                self.ps_editor_tab
+                    .sync_view_from_canvas(&self.project, page, zoom, center);
             }
             _ => {}
         }
@@ -2834,7 +2832,7 @@ fn decode_idx_within_window(idx: usize, progress: usize) -> bool {
     idx < progress.saturating_add(DECODE_AHEAD_WINDOW)
 }
 
-fn decode_page(idx: usize, path: &PathBuf, cache_page_rgba: bool) -> Result<DecodedPage, String> {
+fn decode_page(idx: usize, path: &Path, cache_page_rgba: bool) -> Result<DecodedPage, String> {
     let rgba = decode_image_rgba(idx, path)?;
     let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 {
@@ -3006,7 +3004,7 @@ fn spawn_page_cache_loader_thread(
     });
 }
 
-fn decode_overlay(idx: usize, path: &PathBuf) -> Result<PreparedOverlay, String> {
+fn decode_overlay(idx: usize, path: &Path) -> Result<PreparedOverlay, String> {
     let image = decode_image_rgba(idx, path)?;
     let size = [image.width() as usize, image.height() as usize];
     Ok(PreparedOverlay {
@@ -3015,12 +3013,12 @@ fn decode_overlay(idx: usize, path: &PathBuf) -> Result<PreparedOverlay, String>
     })
 }
 
-fn decode_page_rgba(idx: usize, path: &PathBuf) -> Result<image::RgbaImage, String> {
+fn decode_page_rgba(idx: usize, path: &Path) -> Result<image::RgbaImage, String> {
     decode_image_rgba(idx, path)
 }
 
-fn decode_image_rgba(idx: usize, path: &PathBuf) -> Result<image::RgbaImage, String> {
-    match try_decode_image_rgba_with_ffmpeg(path.as_path()) {
+fn decode_image_rgba(idx: usize, path: &Path) -> Result<image::RgbaImage, String> {
+    match try_decode_image_rgba_with_ffmpeg(path) {
         Ok(Some(decoded)) => return Ok(decoded),
         Ok(None) => {}
         Err(err) => {
