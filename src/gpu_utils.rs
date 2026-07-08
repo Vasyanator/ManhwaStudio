@@ -10,7 +10,9 @@ Main responsibilities:
 - inspect Linux driver/ROCm installation state;
 - resolve AMD GPU architecture / LLVM target and validate ROCm 7.2 support;
 - detect likely DirectML-capable accelerators on Windows;
-- probe for the system CUDA 12.x / cuDNN 9.x runtime the onnxruntime GPU build needs.
+- probe for the system CUDA 12.x / cuDNN 9.x runtime the onnxruntime GPU build needs;
+- probe for a WebGPU-capable GPU (Dawn D3D12/Vulkan/Metal) for the WebGPU provider;
+- enumerate the WebGPU GPU adapters (per-OS, index = Dawn `device_id`) for adapter picking.
 
 Key structures:
 - RuntimeVersion
@@ -19,6 +21,7 @@ Key structures:
 - RocmInstallationStatus
 - RocmSupportValidation
 - DirectMlAccelerator
+- WebGpuAdapter
 - CudaRuntimeStatus
 
 Key functions:
@@ -30,6 +33,11 @@ Key functions:
 - validate_rocm_7_2_support_linux()
 - detect_directml_accelerators_windows()
 - probe_cuda_runtime() / native_cuda_runtime_available()
+- native_cuda_build_available() (per-build CUDA-major gate: cuda12 vs cuda13)
+- native_openvino_runtime_available() (Intel-device gate; Windows also needs a system
+  OpenVINO runtime library — the Linux wheel bundles it, the Windows wheel does not)
+- native_webgpu_runtime_available()
+- detect_webgpu_adapters()
 
 Notes:
 Detection intentionally uses short-lived system commands and filesystem probes.
@@ -111,6 +119,18 @@ pub struct RocmSupportValidation {
 pub struct DirectMlAccelerator {
     pub name: String,
     pub vendor: Option<GpuVendor>,
+}
+
+/// A GPU adapter selectable by the native WebGPU execution provider.
+///
+/// The Vec position of an adapter in [`detect_webgpu_adapters`]'s result IS the WebGPU
+/// `device_id`: WebGPU runs through Dawn, and Dawn enumerates adapters with the same
+/// per-OS backend this module uses (DXGI/D3D12 on Windows, Vulkan on Linux), so the
+/// index aligns with `ort::ep::WebGPU::with_device_id`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WebGpuAdapter {
+    /// Human-readable adapter name (e.g. `"AMD Radeon RX 7900 XT"`).
+    pub name: String,
 }
 
 /// Result of the system CUDA/cuDNN probe used to gate the native CUDA execution
@@ -486,22 +506,292 @@ pub fn native_cuda_runtime_available() -> bool {
     probe_cuda_runtime().available
 }
 
+/// Whether the native WebGPU execution provider can plausibly load on this system.
+///
+/// WebGPU runs through Dawn, which targets a native GPU API per platform: D3D12 on
+/// Windows, Vulkan on Linux, Metal on macOS. This is a lightweight capability
+/// HEURISTIC, not a guarantee — the real backstop is `error_on_failure()` at EP
+/// registration time in `ms-onnx`, so a machine that passes this probe but still fails
+/// to register the EP surfaces a load error and the native runtime falls back to CPU /
+/// the backend.
+///
+/// Heuristic per platform:
+/// - Windows: a DX12-capable adapter exists — reuses [`has_directml_accelerator_windows`]
+///   as a proxy, since a DirectML/DX12 adapter means Dawn's D3D12 backend can initialize.
+/// - Linux: a Vulkan loader (`libvulkan.so.1` / `libvulkan.so`) is on the library
+///   search path AND a DRM GPU device node (`/dev/dri`) is present.
+/// - macOS: always true (Metal is available on every supported macOS).
+///
+/// Pure detection: it spawns short-lived system commands and reads a few directories,
+/// so callers MUST run it off the GUI thread. On the web (wasm) build the
+/// filesystem/command primitives report nothing, so it degrades to `false`.
+#[must_use]
+pub fn native_webgpu_runtime_available() -> bool {
+    if cfg!(target_os = "macos") {
+        // Metal is always available on supported macOS; Dawn defaults to it there.
+        return true;
+    }
+    if cfg!(target_os = "windows") {
+        // A DX12/DirectML-capable adapter implies Dawn's D3D12 backend can start.
+        return has_directml_accelerator_windows();
+    }
+    // Linux (and any other unix): Dawn uses the Vulkan backend, which needs both a
+    // Vulkan loader and an actual GPU device node.
+    has_vulkan_loader() && linux_gpu_device_present()
+}
+
+/// Enumerates the GPU adapters selectable by the native WebGPU execution provider, in
+/// the order that matches Dawn's `device_id` indexing.
+///
+/// The returned Vec's position IS the WebGPU `device_id`: the enumeration uses the same
+/// native backend Dawn uses per-OS, so the indices line up with
+/// `ort::ep::WebGPU::with_device_id`:
+/// - Windows: DXGI adapters via [`detect_directml_accelerators_windows`] — DXGI adapter
+///   order matches Dawn's D3D12 adapter order.
+/// - Linux (and other unix): Vulkan physical devices via `vulkaninfo --summary`; the
+///   Vulkan enumeration order is the order Dawn's Vulkan backend sees. If `vulkaninfo`
+///   is absent or its output is unparseable, returns an EMPTY Vec (the caller then
+///   offers a single default adapter) — adapters are never fabricated.
+/// - macOS: EMPTY. A single Metal GPU is the common case and the caller offers a default
+///   adapter; enumerating multiple Metal GPUs is out of scope.
+///
+/// This is a best-effort HEURISTIC: the real backstop remains `error_on_failure()` at EP
+/// registration time in `ms-onnx`. Pure detection that spawns a short-lived system
+/// command, so callers MUST run it off the GUI thread. On the web (wasm) build the
+/// command primitive reports nothing, so it degrades to empty.
+#[must_use]
+pub fn detect_webgpu_adapters() -> Vec<WebGpuAdapter> {
+    if cfg!(target_os = "windows") {
+        // Dawn's D3D12 backend enumerates DXGI adapters in the same order DXGI reports
+        // them, which is exactly what `detect_directml_accelerators_windows` returns.
+        return detect_directml_accelerators_windows()
+            .into_iter()
+            .map(|adapter| WebGpuAdapter { name: adapter.name })
+            .collect();
+    }
+    if cfg!(target_os = "macos") {
+        // Single Metal GPU is the common case; the caller supplies a default adapter.
+        return Vec::new();
+    }
+    // Linux (and other unix): Dawn uses the Vulkan backend. Enumerate Vulkan physical
+    // devices via vulkaninfo; their enumeration order is Dawn's `device_id` order.
+    command_output("vulkaninfo", &["--summary"])
+        .map(|output| {
+            parse_vulkaninfo_devices(&output)
+                .into_iter()
+                .map(|name| WebGpuAdapter { name })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses `vulkaninfo --summary` output into the ordered list of Vulkan physical-device
+/// names.
+///
+/// Reads each `GPUn:` summary block and extracts its `deviceName = <name>` value,
+/// preserving enumeration order (GPU0, GPU1, …) — the same order Dawn's Vulkan backend
+/// sees, so the Vec position is the WebGPU `device_id`. Defensive: unrecognized or
+/// malformed lines are skipped and contribute no entry rather than a fabricated name.
+fn parse_vulkaninfo_devices(text: &str) -> Vec<String> {
+    let mut devices = Vec::new();
+    let mut in_gpu_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // A summary device-block header: "GPU0:", "GPU1:", ... The digits are the Vulkan
+        // physical-device index, so blocks arrive in enumeration order.
+        if let Some(rest) = trimmed.strip_prefix("GPU")
+            && let Some(colon) = rest.find(':')
+            && !rest[..colon].is_empty()
+            && rest[..colon].chars().all(|ch| ch.is_ascii_digit())
+        {
+            in_gpu_block = true;
+            continue;
+        }
+        // The first `deviceName = ...` line inside a block names that GPU.
+        if in_gpu_block
+            && let Some(value) = trimmed.strip_prefix("deviceName")
+            && let Some(eq) = value.find('=')
+        {
+            let name = value[eq + 1..].trim();
+            if !name.is_empty() {
+                devices.push(name.to_string());
+            }
+            in_gpu_block = false;
+        }
+    }
+    devices
+}
+
+/// Whether a Vulkan loader (`libvulkan.so.1` / `libvulkan.so`) is present on the
+/// dynamic-library search path — the loader Dawn's Vulkan backend needs on Linux.
+///
+/// Reuses [`library_search_dirs`] (which includes the standard distro lib dirs where
+/// the loader lives, e.g. `/usr/lib/x86_64-linux-gnu`). A directory that cannot be
+/// read is harmless (the scan finds nothing there).
+fn has_vulkan_loader() -> bool {
+    library_search_dirs().iter().any(|dir| {
+        scan_dir_for_library(dir, |name| {
+            let lower = name.to_ascii_lowercase();
+            lower == "libvulkan.so.1" || lower == "libvulkan.so"
+        })
+    })
+}
+
+/// Whether a DRM GPU device node directory (`/dev/dri`) exists — a GPU-present proxy
+/// on Linux. Always false off Linux (and on wasm, where there is no such path).
+fn linux_gpu_device_present() -> bool {
+    Path::new("/dev/dri").is_dir()
+}
+
 /// Whether a CUDA 12.x `cudart` runtime library is present on the library path.
 ///
-/// Matches `libcudart.so.12*` on Linux and `cudart64_12*.dll` on Windows; onnxruntime
-/// 1.20.1 GPU is built for the CUDA 12 runtime, so an older/newer major will not load.
+/// Matches `libcudart.so.12*` on Linux and `cudart64_12*.dll` on Windows; the CUDA 12
+/// onnxruntime build links the CUDA 12 runtime, so an older/newer major will not load.
 fn has_cuda12_runtime_library() -> bool {
+    has_cuda_runtime_library_major(12)
+}
+
+/// Whether a `cudart` runtime library of CUDA major `major` is present on the library
+/// search path.
+///
+/// Matches `libcudart.so.<major>*` on Linux and `cudart64_<major>*.dll` on Windows.
+/// Each onnxruntime CUDA build links exactly one CUDA major (12 or 13); a mismatched
+/// major cannot satisfy it, so the two builds are gated independently. Used by
+/// [`native_cuda_build_available`].
+fn has_cuda_runtime_library_major(major: u32) -> bool {
     let windows = cfg!(target_os = "windows");
+    // `libcudart.so.12` vs `libcudart.so.13` are distinct prefixes; the only ambiguity
+    // would be a 1.x major against 12/13, which onnxruntime does not ship, so a plain
+    // prefix match is unambiguous for the supported CUDA majors.
+    let win_prefix = format!("cudart64_{major}");
+    let nix_prefix = format!("libcudart.so.{major}");
     library_search_dirs().iter().any(|dir| {
         scan_dir_for_library(dir, |name| {
             let lower = name.to_ascii_lowercase();
             if windows {
-                lower.starts_with("cudart64_12") && lower.ends_with(".dll")
+                lower.starts_with(&win_prefix) && lower.ends_with(".dll")
             } else {
-                lower.starts_with("libcudart.so.12")
+                lower.starts_with(&nix_prefix)
             }
         })
     })
+}
+
+/// The CUDA major version an onnxruntime CUDA build links against.
+///
+/// `"cuda12"` → `Some(12)`, `"cuda13"` → `Some(13)`; any other slug (a non-CUDA build)
+/// → `None`. Pure and testable; the single place that maps a CUDA build slug to its
+/// runtime major.
+#[must_use]
+fn cuda_major_for_build(build: &str) -> Option<u32> {
+    match build {
+        "cuda12" => Some(12),
+        "cuda13" => Some(13),
+        _ => None,
+    }
+}
+
+/// Whether the native CUDA execution provider for build `build` can plausibly load on
+/// this system.
+///
+/// `build` must be a CUDA build slug (`"cuda12"` / `"cuda13"`); availability requires an
+/// NVIDIA GPU, a `cudart` runtime of that build's CUDA major (12 vs 13, checked
+/// independently so `cuda12` is available iff a CUDA 12.x runtime exists and `cuda13`
+/// iff CUDA 13.x exists), and a cuDNN 9.x library (both onnxruntime CUDA 12 and CUDA 13
+/// builds link cuDNN 9). A non-CUDA slug returns `false` — this gate is CUDA-specific.
+///
+/// Pure detection over short-lived system commands and directory scans, so callers MUST
+/// run it off the GUI thread. On the web (wasm) build the probes report nothing, so it
+/// returns `false`.
+#[must_use]
+pub fn native_cuda_build_available(build: &str) -> bool {
+    let Some(major) = cuda_major_for_build(build) else {
+        return false;
+    };
+    detect_nvidia_gpu() && has_cuda_runtime_library_major(major) && has_cudnn9_library()
+}
+
+/// Whether `text` names an Intel GPU/accelerator (case-insensitive).
+///
+/// Matches the Intel vendor string and Intel GPU product families (Arc, Iris,
+/// UHD/HD Graphics all carry "intel" in the controller name, and standalone Arc/Iris
+/// brand names). Used only after the caller has narrowed the text to GPU/display
+/// controller lines (Linux) or Win32_VideoController names (Windows), so it need not
+/// re-check the device class. Pure and testable.
+#[must_use]
+fn text_has_intel_gpu(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("intel") || lower.contains("iris") || lower.contains(" arc ")
+}
+
+/// Whether an Intel GPU/iGPU is present on Linux (via an `lspci` display-controller
+/// line matching Intel). Always false off Linux (and on wasm, where `lspci` is stubbed).
+///
+/// Narrows `lspci` to VGA/display/3D controller lines BEFORE the Intel match so an Intel
+/// chipset/host-bridge on an AMD/NVIDIA machine is not mistaken for an Intel GPU.
+fn detect_intel_gpu_linux() -> bool {
+    command_output("lspci", &[]).is_some_and(|output| {
+        output.lines().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.contains("vga compatible controller")
+                || lower.contains("display controller")
+                || lower.contains("3d controller"))
+                && text_has_intel_gpu(&lower)
+        })
+    })
+}
+
+/// Whether an Intel GPU is present on Windows (via a Win32_VideoController name matching
+/// Intel). Always false off Windows (and on wasm).
+fn detect_intel_gpu_windows() -> bool {
+    windows_video_controller_output()
+        .as_deref()
+        .is_some_and(|output| output.lines().any(text_has_intel_gpu))
+}
+
+/// Whether a system OpenVINO runtime library (`openvino.dll` / `openvino_c*.dll`) is on
+/// the Windows library search path.
+///
+/// The Windows OpenVINO wheel does NOT bundle the runtime, so this system library must
+/// be present for the OpenVINO EP to load. Reuses [`library_search_dirs`] /
+/// [`scan_dir_for_library`], matching the base and C-API loader DLLs.
+fn has_openvino_runtime_library_windows() -> bool {
+    library_search_dirs().iter().any(|dir| {
+        scan_dir_for_library(dir, |name| {
+            let lower = name.to_ascii_lowercase();
+            lower.starts_with("openvino") && lower.ends_with(".dll")
+        })
+    })
+}
+
+/// Whether the native OpenVINO execution provider can plausibly load on this system.
+///
+/// Availability is asymmetric by platform because the OpenVINO PYTHON WHEEL bundles the
+/// runtime on Linux but NOT on Windows:
+/// - Linux: available iff an Intel GPU/iGPU is present (a DRM device node `/dev/dri`
+///   plus an Intel display controller in `lspci`). The bundled runtime means no system
+///   OpenVINO SDK is required.
+/// - Windows: available iff an Intel device is present AND a system OpenVINO runtime
+///   library (`openvino.dll` / `openvino_c*.dll`) is findable on the library search
+///   path (because the Windows wheel bundles no runtime).
+/// - macOS / other: `false` — the OpenVINO builds are x86_64 Windows/Linux only.
+///
+/// Pure detection over short-lived system commands and directory scans, so callers MUST
+/// run it off the GUI thread. On the web (wasm) build the probes report nothing, so it
+/// returns `false`.
+#[must_use]
+pub fn native_openvino_runtime_available() -> bool {
+    if cfg!(target_os = "linux") {
+        // The Linux wheel bundles the OpenVINO runtime, so availability reduces to an
+        // Intel device being present.
+        return linux_gpu_device_present() && detect_intel_gpu_linux();
+    }
+    if cfg!(target_os = "windows") {
+        // The Windows wheel does NOT bundle the runtime: a system OpenVINO library must
+        // ALSO be on the search path.
+        return detect_intel_gpu_windows() && has_openvino_runtime_library_windows();
+    }
+    false
 }
 
 /// Whether a cuDNN 9.x library is present on the library path.
@@ -945,6 +1235,139 @@ mod tests {
         assert!(!status.details.is_empty());
         // The convenience gate mirrors the struct field.
         assert_eq!(native_cuda_runtime_available(), status.available);
+    }
+
+    #[test]
+    fn native_webgpu_runtime_available_is_non_panicking_and_matches_platform() {
+        // The probe must never panic. On macOS it is unconditionally true; elsewhere it
+        // is a heuristic over the environment, so we only assert it agrees with its own
+        // building blocks rather than a fixed value (which is host-dependent).
+        let available = native_webgpu_runtime_available();
+        if cfg!(target_os = "macos") {
+            assert!(available, "macOS always has Metal");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(available, has_directml_accelerator_windows());
+        } else {
+            assert_eq!(available, has_vulkan_loader() && linux_gpu_device_present());
+        }
+    }
+
+    #[test]
+    fn parse_vulkaninfo_devices_extracts_ordered_names() {
+        // A captured `vulkaninfo --summary` shape with two physical devices; the parser
+        // must return their deviceName values in enumeration order (GPU0 then GPU1).
+        let sample = "\
+==========
+VULKANINFO
+==========
+
+Vulkan Instance Version: 1.3.280
+
+
+Instance Extensions: count = 24
+-------------------------------
+\tVK_KHR_device_group_creation           : extension revision 1
+
+Devices:
+========
+GPU0:
+\tapiVersion         = 1.3.280
+\tdriverVersion      = 23.2.1
+\tvendorID           = 0x1002
+\tdeviceID           = 0x73df
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName         = AMD Radeon RX 6700 XT (RADV NAVI22)
+GPU1:
+\tapiVersion         = 1.3.280
+\tdriverVersion      = 0.0.1
+\tvendorID           = 0x10005
+\tdeviceID           = 0x0000
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_CPU
+\tdeviceName         = llvmpipe (LLVM 15.0.7, 256 bits)
+";
+        let devices = parse_vulkaninfo_devices(sample);
+        assert_eq!(
+            devices,
+            vec![
+                "AMD Radeon RX 6700 XT (RADV NAVI22)".to_string(),
+                "llvmpipe (LLVM 15.0.7, 256 bits)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_vulkaninfo_devices_returns_empty_on_unrelated_output() {
+        // Output without any `GPUn:`/`deviceName` blocks must yield no fabricated names.
+        assert!(parse_vulkaninfo_devices("command not found").is_empty());
+        assert!(parse_vulkaninfo_devices("").is_empty());
+    }
+
+    #[test]
+    fn detect_webgpu_adapters_is_non_panicking() {
+        // Enumeration must never panic on any host; on wasm/macOS it is simply empty.
+        let _ = detect_webgpu_adapters();
+    }
+
+    #[test]
+    fn cuda_major_for_build_maps_only_cuda_builds() {
+        assert_eq!(cuda_major_for_build("cuda12"), Some(12));
+        assert_eq!(cuda_major_for_build("cuda13"), Some(13));
+        // Non-CUDA and unknown slugs have no CUDA major.
+        assert_eq!(cuda_major_for_build("cpu"), None);
+        assert_eq!(cuda_major_for_build("openvino"), None);
+        assert_eq!(cuda_major_for_build("webgpu"), None);
+        assert_eq!(cuda_major_for_build("nope"), None);
+    }
+
+    #[test]
+    fn native_cuda_build_available_is_non_panicking_and_slug_scoped() {
+        // A non-CUDA slug is never CUDA-available regardless of the host hardware.
+        assert!(!native_cuda_build_available("cpu"));
+        assert!(!native_cuda_build_available("openvino"));
+        assert!(!native_cuda_build_available("unknown"));
+        // The CUDA slugs must not panic; their result is host-dependent, so we only
+        // assert it agrees with the underlying detected facts.
+        for slug in ["cuda12", "cuda13"] {
+            let major = cuda_major_for_build(slug).expect("cuda slug has a major");
+            let expected = detect_nvidia_gpu()
+                && has_cuda_runtime_library_major(major)
+                && has_cudnn9_library();
+            assert_eq!(native_cuda_build_available(slug), expected, "{slug}");
+        }
+    }
+
+    #[test]
+    fn text_has_intel_gpu_matches_intel_families_only() {
+        assert!(text_has_intel_gpu(
+            "VGA compatible controller: Intel Corporation UHD Graphics 630"
+        ));
+        assert!(text_has_intel_gpu("Intel(R) Iris(R) Xe Graphics"));
+        assert!(text_has_intel_gpu("Intel Arc A770"));
+        assert!(text_has_intel_gpu("my arc gpu")); // standalone Arc brand
+        // Non-Intel controllers must not match.
+        assert!(!text_has_intel_gpu(
+            "VGA compatible controller: NVIDIA Corporation GA104"
+        ));
+        assert!(!text_has_intel_gpu("AMD Radeon RX 7900 XT"));
+        // "architecture" must not trip the bare-Arc heuristic (no surrounding spaces).
+        assert!(!text_has_intel_gpu("modern gpu architecture"));
+    }
+
+    #[test]
+    fn native_openvino_runtime_available_is_non_panicking_and_matches_platform() {
+        // Must never panic on any host. The result is host-dependent; assert it agrees
+        // with its own building blocks per platform (and is false off Windows/Linux).
+        let available = native_openvino_runtime_available();
+        if cfg!(target_os = "linux") {
+            assert_eq!(available, linux_gpu_device_present() && detect_intel_gpu_linux());
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(
+                available,
+                detect_intel_gpu_windows() && has_openvino_runtime_library_windows()
+            );
+        } else {
+            assert!(!available, "OpenVINO builds are x86_64 Windows/Linux only");
+        }
     }
 
     #[test]

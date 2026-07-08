@@ -25,7 +25,7 @@ Run manually with, e.g.:
 
 use std::path::PathBuf;
 
-use ms_onnx::{ExecutionProvider, MangaOcrEngine, OrtRuntime};
+use ms_onnx::{ExecutionProvider, MangaOcrEngine, NativeDeviceSelection, OrtRuntime};
 
 /// Reads a required environment variable or skips the test with a clear message.
 fn required_env(key: &str) -> Option<String> {
@@ -56,7 +56,11 @@ fn manga_ocr_recognizes_real_image() {
     let decoder = model_dir.join("decoder_model.onnx");
     let vocab = model_dir.join("vocab.txt");
 
-    let runtime = OrtRuntime::load(std::path::Path::new(&dylib), ExecutionProvider::Cpu, None)
+    let runtime = OrtRuntime::load(
+        std::path::Path::new(&dylib),
+        ExecutionProvider::Cpu,
+        NativeDeviceSelection::Default,
+    )
         .expect("onnxruntime dylib must load");
     runtime.warmup().expect("ort environment must initialize");
 

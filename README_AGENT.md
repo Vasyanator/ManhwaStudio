@@ -397,30 +397,40 @@ original, and a bbox relative to the sent image) and the model returns
   (encoder+decoder инференс MangaOCR) и PaddleOCR (`PaddleDetector` — детекция + glyph-mask,
   `PaddleRecognizer`, `PaddleOcrEngine` — полный detect→recognize).
 - **`src/onnx_runtime`** — ленивый загрузчик: probe/скачивание/verify/extract официального
-  onnxruntime dylib в `data_dir()/onnxruntime/<provider>/<ver>/` (worker-thread only), `ORT_VERSION`.
-  Manifest (`ort_manifest.json`) ключуется `(os,arch,provider)`; запись держит primary `dylib_member`
-  и `extra_members` (несколько DLL в один каталог). CPU — GitHub-релизы; **DirectML** (Windows) —
+  onnxruntime dylib в `data_dir()/onnxruntime/<provider>/<ver>/` (worker-thread only). Версия —
+  ПО-ЗАПИСИ, не глобальная (`provider_version(provider)`), `ORT_VERSION` — только legacy-default.
+  Manifest (`ort_manifest.json`) ключуется `(os,arch,provider)`; запись держит собственный `version`,
+  primary `dylib_member`, `extra_members` (несколько DLL в один каталог) и `additional_sources`
+  (доп. архивы в тот же каталог). CPU — GitHub-релизы; **DirectML** (Windows) —
   DLL из PyPI-wheel `onnxruntime-directml` (`onnxruntime.dll`+`DirectML.dll`+`onnxruntime_providers_shared.dll`
   рядом); **CoreML** (macOS) — тот же osx-архив, что CPU (EP встроен); **CUDA** (Windows/Linux) —
   официальный onnxruntime GPU-build (провайдер-либы `onnxruntime_providers_cuda`+`_shared` рядом с
-  primary), зависит от СИСТЕМНЫХ CUDA 12.x/cuDNN 9.x (не бандлится); CUDA-хэши намеренно `null`
-  (архивы сотни МБ) → logged-unverified путь, removal condition в MODULE_README.
+  primary), зависит от СИСТЕМНЫХ CUDA 12.x/cuDNN 9.x (не бандлится); **WebGPU** (Windows/Linux/macOS) —
+  wheel `onnxruntime-webgpu` **1.27.0** (Dawn D3D12/Vulkan/Metal, статически слинкован в основную либу;
+  Windows-wheel дополнительно даёт `dxil.dll`+`dxcompiler.dll`) — отдельный GPU-бэкенд, НЕ считается
+  байт-идентичным CPU. CPU/DirectML/CUDA/CoreML остаются на **1.20.1**. CUDA/WebGPU-хэши для GPU-архивов
+  могут быть `null` (архивы сотни МБ) → logged-unverified путь, removal condition в MODULE_README.
 - **`src/native_runtime`** — процесс-глобальный ленивый менеджер: держит один `OrtRuntime`, ОДИН
   общий `PaddleDetector` (always-resident, шарится detector-оп и всеми PaddleOCR-языками через
   `ms_onnx::paddle_recognize`) и LRU-ограниченный кэш движков (`MangaOcrEngine` Base/2025 +
   per-lang `PaddleRecognizer`), ёмкость = `General.ai_max_loaded_models` (читается один раз,
   clamp ≥1, default 3; LRU-eviction по least-recently-used, детектор не считается). Провайдер +
   индекс адаптера читаются один раз из ЕДИНОЙ ONNX-настройки `General.ai_onnx_provider` (ORT-токен
-  `CPUExecutionProvider`/`DmlExecutionProvider`/`CUDAExecutionProvider`/`CoreMLExecutionProvider`) +
-  `General.ai_onnx_device_id` — ТЕ ЖЕ ключи, что использует Python-бэкенд, поэтому один выбор
-  управляет обоими рантаймами (`native_runtime::execution_provider_from_ort_token` мапит токен →
-  `ms_onnx::ExecutionProvider`; неизвестный/`not-selected` → CPU) — и фиксируются на процесс
+  `CPUExecutionProvider`/`DmlExecutionProvider`/`CUDAExecutionProvider`/`CoreMLExecutionProvider`/
+  `WebGpuExecutionProvider`) + `General.ai_onnx_device_id` — ТЕ ЖЕ ключи, что использует Python-бэкенд,
+  поэтому один выбор управляет обоими рантаймами (`native_runtime::execution_provider_from_ort_token`
+  мапит токен → `ms_onnx::ExecutionProvider`; неизвестный/`not-selected` → CPU) — и фиксируются на процесс
   (недоступный для ОС провайдер → лог + fallback на CPU). При выборе CUDA системный
   probe CUDA 12.x/cuDNN 9.x (`gpu_utils::native_cuda_runtime_available`, вне GUI) решает: доступно →
   CUDA, иначе → DirectML (Windows с DirectML-адаптером) или CPU (лог, не неверный результат, не
-  hard-fail). `run_guarded` разделяет SIGILL-guard-последовательность между manga/paddle/detector;
-  `native_load_scope_key()` отдаёт scope `provider[:device]@version` (используется роутерами OCR/
-  детекции и кнопкой сброса).
+  hard-fail). При выборе WebGPU лёгкий probe (`gpu_utils::native_webgpu_runtime_available`, вне GUI:
+  Windows — DX12/DirectML-адаптер, Linux — Vulkan-loader + `/dev/dri`, macOS — Metal всегда) решает:
+  доступно → WebGPU, иначе → CPU; реальный backstop — `error_on_failure` при регистрации EP.
+  `run_guarded` разделяет SIGILL-guard-последовательность между manga/paddle/detector;
+  `native_load_scope_key()` отдаёт scope `provider[:device]@version`, где version — ФАКТИЧЕСКАЯ версия
+  провайдера (`onnx_runtime::provider_version`, например `webgpu@1.27.0` против `cpu@1.20.1`), так что
+  SIGILL на одном провайдере/версии не блокирует другой (используется роутерами OCR/детекции и кнопкой
+  сброса).
   Вызывается из НЕСКОЛЬКИХ worker-потоков (OCR, text-detector, cleaning-tools), никогда из GUI.
   Глобальный STATE-лок только на O(1) state; load/inference — без него. Все PaddleOCR detector-оп
   (detect + recognize, шарят единственный резидентный `PaddleDetector`) сериализованы через
@@ -430,7 +440,8 @@ original, and a bbox relative to the sent image) and the model returns
   локального native-набора и провайдеров, о которых сообщил бэкенд. Native-набор строится ОФФЛАЙН из
   ОС + `gpu_utils` (CPU везде; DirectML на Windows — доступен при наличии адаптера, устройства =
   `detect_directml_accelerators_windows()`; CoreML на macOS; CUDA на не-macOS — доступен при
-  `native_cuda_runtime_available()`); к нему при подключённом бэкенде добавляются его
+  `native_cuda_runtime_available()`; **WebGPU** на всех трёх десктоп-ОС — доступен при
+  `native_webgpu_runtime_available()`, label «WebGPU (GPU)»); к нему при подключённом бэкенде добавляются его
   `available_onnx_providers` (dedup по ORT-токену, CPU один раз). Backend-only провайдеры без native EP
   (например `MIGraphXExecutionProvider`/ROCm на AMD) остаются в списке и ВЫБИРАЕМЫ — это чинит регрессию,
   когда AMD/ROCm-пользователь не мог выбрать MIGraphX. Каждый пункт помечается по АКТИВНОМУ рантайму

@@ -22,8 +22,17 @@ pub const TEXT_MAIN: Color32 = Color32::from_rgb(237, 237, 237);
 pub const TEXT_MUTED: Color32 = Color32::from_rgba_premultiplied(237, 237, 237, 178);
 pub const TEXT_FAINT: Color32 = Color32::from_rgba_premultiplied(237, 237, 237, 140);
 pub const BUTTON_FILL: Color32 = Color32::from_rgba_premultiplied(55, 55, 55, 15);
-pub const BUTTON_HOVERED: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 25);
-pub const BUTTON_PRESSED: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 36);
+/// Hover fill for plain (non-`launcher_button`) buttons and combo boxes.
+///
+/// The launcher style never highlights with white: a white-alpha overlay reads
+/// as an additive glow (a "white flash") on the dark card. This is a neutral,
+/// slightly-lightened card tone (opaque) that lifts the widget subtly instead.
+pub const BUTTON_HOVERED: Color32 = Color32::from_rgba_premultiplied(44, 44, 52, 236);
+/// Pressed/active fill for plain buttons and combo boxes; neutral, never white.
+///
+/// A touch lighter than `BUTTON_HOVERED` so a press reads as a further lift,
+/// staying within the neutral `COMBO_HOVERED`/`COMBO_PRESSED` family.
+pub const BUTTON_PRESSED: Color32 = Color32::from_rgba_premultiplied(52, 52, 60, 244);
 pub const BUTTON_STROKE: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 31);
 pub const BUTTON_HOVER_EXPANSION: f32 = 2.0;
 pub const COMBO_FILL: Color32 = Color32::from_rgba_premultiplied(24, 24, 28, 224);
@@ -74,7 +83,13 @@ pub fn configure_context(ctx: &Context) {
     style.visuals.widgets.hovered.expansion = BUTTON_HOVER_EXPANSION;
     style.visuals.widgets.active.expansion = BUTTON_HOVER_EXPANSION;
     style.visuals.widgets.open.expansion = BUTTON_HOVER_EXPANSION;
-    style.visuals.window_fill = Color32::TRANSPARENT;
+    // Combo/menu/tooltip popups fill with `Frame::popup(style)`, which uses
+    // `visuals.window_fill`. Keep it opaque so dropdowns (e.g. the shared AI
+    // backend panel, which does not apply `combo_popup_style`) render as a solid
+    // dark panel instead of a see-through frame, with a subtle launcher stroke.
+    // `panel_fill` stays transparent so the launcher's own background stays visible.
+    style.visuals.window_fill = COMBO_POPUP_FILL;
+    style.visuals.window_stroke = Stroke::new(1.0, CARD_STROKE);
     style.visuals.panel_fill = Color32::TRANSPARENT;
     style.visuals.window_corner_radius = CornerRadius::same(18);
     style.visuals.menu_corner_radius = CornerRadius::same(12);

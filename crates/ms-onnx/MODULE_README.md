@@ -25,11 +25,21 @@ these `ort` entry points:
   onnxruntime code.
 - `OrtRuntime::build_session(model_path)` — builds a session with all graph
   optimizations and applies the committed execution provider: CPU registers
-  nothing (byte-identical to the historical CPU-only builder); DirectML/CoreML/CUDA
-  register their EP with `error_on_failure()` (no silent CPU fallback). For
-  DirectML/CUDA it applies the runtime's `device_id` (adapter index) via
-  `with_device_id(id)` when it is `Some`; `None` keeps the EP default
-  (`default()`), i.e. adapter 0. CoreML/CPU ignore the device index.
+  nothing (byte-identical to the historical CPU-only builder);
+  DirectML/CoreML/CUDA/WebGPU/OpenVINO/TensorRT register their EP with
+  `error_on_failure()` (no silent CPU fallback at EP-registration time). Device
+  selection is carried by `NativeDeviceSelection`: index-based EPs
+  (DirectML/CUDA/TensorRT/WebGPU) read `Index(id)` and pass it via
+  `with_device_id(id)`, falling back to the EP `default()` (adapter 0) otherwise;
+  OpenVINO reads `OpenVinoDeviceType(s)` (a device-TYPE string like
+  `"CPU"`/`"GPU"`/`"GPU.0"`/`"NPU"`/`"HETERO:..."`) and passes it via
+  `with_device_type(s)`, otherwise letting OpenVINO pick its own default device.
+  CoreML/CPU ignore the selection. TensorRT is registered alone: onnxruntime still
+  falls back per-node to CPU for ops TensorRT cannot run (not an EP failure).
+  WebGPU/OpenVINO/TensorRT are distinct backends (different GPU/accelerator
+  kernels); their numeric output is NOT asserted byte-equal to the CPU reference —
+  each is treated as a separate backend, and only CPU stays byte-identical to the
+  historical builder.
 
 Load/warmup are split so the app can dlopen early (`load`) and later force real
 environment initialization on a controlled thread (`warmup`), where an
@@ -37,10 +47,12 @@ unsupported-CPU SIGILL would surface.
 
 ## Files and submodules
 - `src/lib.rs`: the crate root public surface — `ExecutionProvider` (`id` /
-  `is_available_on_current_platform`), `OrtError`, `OrtRuntime` (`load` / `warmup` /
-  `provider` / `device_id` / `build_session`) — plus re-exports of `MangaOcrEngine`, the PaddleOCR
-  types, and the free `paddle_recognize` pipeline function. Edit here for
-  runtime/error-surface changes and execution-provider registration.
+  `is_available_on_current_platform`), `NativeDeviceSelection`
+  (`Default`/`Index`/`OpenVinoDeviceType` + `index()`), `OrtError`, `OrtRuntime`
+  (`load` / `warmup` / `provider` / `device` / `device_id` / `build_session`) — plus
+  re-exports of `MangaOcrEngine`, the PaddleOCR types, and the free
+  `paddle_recognize` pipeline function. Edit here for runtime/error-surface changes
+  and execution-provider registration.
 - `src/manga_ocr/`: the native MangaOCR engine (`MangaOcrEngine`) — preprocess,
   tokenizer, beam search, and post-process. See its `MODULE_README.md`. This is a
   faithful port of `modules/ai_backend/manga_ocr_service.py`.
@@ -63,11 +75,12 @@ unsupported-CPU SIGILL would surface.
   add `download-binaries`/`copy-dylibs` (they fetch or copy a binary at build time)
   or a linking feature — that would break the runtime-resolved-dylib contract. Do
   NOT add ndarray/tokio/config deps. **Do NOT add the per-EP cargo features**
-  (`directml`/`coreml`/`cuda`): `ort::ep::*` registration is gated on
-  `any(feature = "load-dynamic", feature = "<ep>")`, so load-dynamic already
-  satisfies it; adding an `<ep>` feature pulls `ort-sys/<ep>`, which conflicts with
-  load-dynamic's `disable-linking`. The `ExecutionProvider` types compile on all
-  targets; platform gating happens in `OrtRuntime::load`, not `build_session`.
+  (`directml`/`coreml`/`cuda`/`webgpu`/`openvino`/`tensorrt`): `ort::ep::*`
+  registration is gated on `any(feature = "load-dynamic", feature = "<ep>")` (WebGPU
+  also on `target_arch = "wasm32"`), so load-dynamic already satisfies it; adding an
+  `<ep>` feature pulls `ort-sys/<ep>`, which conflicts with load-dynamic's
+  `disable-linking`. The `ExecutionProvider` types compile on all targets; platform
+  gating happens in `OrtRuntime::load`, not `build_session`.
 - **Extra dep:** `imageproc` 0.25-compatible (0.27) — pure Rust, used only by the
   PaddleOCR path (contours, min-area-rect, perspective warp). No OpenCV/Clipper.
 - **No panics on bad input.** `load` maps a missing file to
@@ -76,12 +89,19 @@ unsupported-CPU SIGILL would surface.
   `OrtError::UnsupportedProvider`. `warmup` maps env-creation failure to
   `OrtError::WarmupFailed`. No `.unwrap()`/`.expect()` in these paths.
 - **`ExecutionProvider::id`** returns a stable lowercase id
-  (`cpu`/`directml`/`coreml`/`cuda`) used by higher layers for per-provider config
-  scoping. Keep these values stable.
+  (`cpu`/`directml`/`coreml`/`cuda`/`webgpu`/`openvino`/`tensorrt`) used by higher
+  layers for per-provider config scoping. Keep these values stable.
 - **Provider platform gating:** DirectML = Windows only, Core ML = macOS only,
-  CUDA = not macOS, CPU = everywhere. `ExecutionProvider::is_available_on_current_platform`
-  exposes this predicate publicly so higher layers query availability without
-  duplicating the `cfg(target_os)` logic; `OrtRuntime::load` uses it to gate.
+  CUDA = not macOS, WebGPU = Windows/Linux/macOS (Dawn), OpenVINO = x86_64
+  Windows/Linux (Intel device + OpenVINO runtime: self-contained on the Linux
+  wheel, system SDK on Windows), TensorRT = Windows/Linux (mirrors CUDA; bundled in
+  the CUDA "gpu" build, needs the NVIDIA/CUDA stack), CPU = everywhere.
+  `ExecutionProvider::is_available_on_current_platform` exposes this predicate
+  publicly so higher layers query availability without duplicating the
+  `cfg(target_os)` logic; `OrtRuntime::load` uses it to gate. Note: rc.12's own
+  `ort::ep::WebGPU::supported_by_platform` excludes macOS, but that only controls
+  ort's log verbosity — registration still works on macOS with a WebGPU-capable
+  dylib, so this crate reports macOS as available.
 - **Global-singleton caveat:** ort's environment options are process-global.
   Only the first `load` commits its options; later loads reuse them (logged). A
   second `load` with a *different* dylib does not replace the first environment.
@@ -93,10 +113,12 @@ unsupported-CPU SIGILL would surface.
   platform-gating arm, and a `build_session` registration arm — all three matches
   are exhaustive, no `_`).
 - To change how sessions apply the provider, edit `OrtRuntime::build_session`.
-- The accelerator adapter index is threaded through `OrtRuntime` as `device_id`
-  (`Option<i32>`, set at `load`, read back via `device_id()`); to change which
-  providers honor it or how it is passed to the EP, edit the DirectML/CUDA arms of
-  `build_session`.
+- The accelerator selection is threaded through `OrtRuntime` as `device`
+  (`NativeDeviceSelection`, set at `load`, read back via `device()`; `device_id()`
+  is a convenience projecting only `Index(id)` to `Some(id)`). To change which
+  providers honor it or how it is passed to the EP, edit the
+  DirectML/CUDA/TensorRT/WebGPU (numeric `Index`) or OpenVINO (`OpenVinoDeviceType`
+  string) arms of `build_session`.
 - To change MangaOCR inference (preprocess/generation/decode/post-process), edit
   `src/manga_ocr/` (see its `MODULE_README.md`).
 - To change PaddleOCR detection/recognition, edit `src/paddle_ocr/` (see its

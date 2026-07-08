@@ -30,7 +30,9 @@ source size equals the image size). It never fabricates expected OCR values.
 
 use std::path::{Path, PathBuf};
 
-use ms_onnx::{ExecutionProvider, OrtRuntime, PaddleDetector, PaddleOcrEngine};
+use ms_onnx::{
+    ExecutionProvider, NativeDeviceSelection, OrtRuntime, PaddleDetector, PaddleOcrEngine,
+};
 
 /// Reads a required environment variable or skips the test with a clear message.
 fn required_env(key: &str) -> Option<String> {
@@ -62,7 +64,8 @@ fn paddle_ocr_detects_and_recognizes_real_image() {
         return;
     };
 
-    let runtime = OrtRuntime::load(Path::new(&dylib), ExecutionProvider::Cpu, None)
+    let runtime =
+        OrtRuntime::load(Path::new(&dylib), ExecutionProvider::Cpu, NativeDeviceSelection::Default)
         .expect("onnxruntime dylib must load");
     runtime.warmup().expect("warmup must succeed");
 

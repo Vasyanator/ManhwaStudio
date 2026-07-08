@@ -71,7 +71,15 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   construction, hidden-window/UTF-8 setup, shell activation snippets, and managed spawning for
   long-lived Python children that should be killed with the Rust parent on Windows.
 - `gpu_utils.rs`: shared GPU/accelerator capability probes used by installer and launcher/runtime
-  settings. Call it from workers, not from frame drawing.
+  settings. Call it from workers, not from frame drawing. Includes `detect_webgpu_adapters`, which
+  enumerates the WebGPU GPU adapters per-OS with Dawn's backend (DXGI/Windows, Vulkan/Linux,
+  empty/default on macOS) so the returned index is the Dawn `device_id`; the Vulkan path parses
+  `vulkaninfo --summary` (pure `parse_vulkaninfo_devices`) and returns empty — never fabricated
+  adapters — when the tool is missing/unparseable. Also gates the build-aware native runtime:
+  `native_cuda_build_available(build)` (per CUDA-major: `cuda12` iff a CUDA 12.x runtime, `cuda13`
+  iff CUDA 13.x, plus cuDNN 9) and `native_openvino_runtime_available()` (Intel-device gate;
+  ASYMMETRIC — Linux needs only an Intel GPU because the wheel bundles the OpenVINO runtime, Windows
+  ALSO needs a system `openvino*.dll` on the library path because its wheel does not bundle it).
 - logging/tracing live in the `ms-log` crate (`crates/ms-log`), re-exported as
   `crate::runtime_log` / `crate::trace` (+ `trace_log!` / `trace_scope!` macros) from `main.rs`.
   Text utilities (`text_punctuation`, `segmentation`) live in `ms-text-util`, and the typing text
@@ -99,17 +107,29 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `ms_onnx::paddle_recognize`), and an LRU-bounded engine cache (`MangaOcrEngine` Base/2025 +
   per-language `PaddleRecognizer`) keyed by `NativeModelId`, capacity = `General.ai_max_loaded_models`
   (read once, clamped to ≥1, default 3; the shared detector is not counted, LRU evicts the
-  least-recently-used engine). The execution provider + adapter index are read once from the UNIFIED
-  ONNX keys `General.ai_onnx_provider` (ORT token, mapped by `execution_provider_from_ort_token`) +
-  `General.ai_onnx_device_id` — the same keys the Python backend uses, so one selection drives both
-  (impossible-for-OS → CPU fallback, fixed per process). When CUDA is selected, a system CUDA
-  12.x/cuDNN 9.x probe (`gpu_utils::native_cuda_runtime_available`) gates it: available → CUDA,
-  otherwise DirectML (Windows) or CPU, logged, never a wrong result. The adapter index is passed to
-  `OrtRuntime::load` and folded into the per-`provider[:device]@version` SIGILL crash-guard scope
-  (`run_guarded` shares the fsync'd attempt-before-dlopen / succeeded-after-first-inference /
-  graceful-reset sequence across ops). `recognize_manga`, `recognize_paddle`, `detect_paddle`,
-  `execution_provider_from_ort_token`, `native_load_scope_key`, and `reset_load_latch` are the public
-  surface (the guard/scope helpers are worker-thread only — they do disk I/O + a CUDA probe).
+  least-recently-used engine). The (build, execution provider, device) triple is resolved once from
+  the UNIFIED ONNX keys `General.ai_onnx_build` (an `onnx_runtime::builds` catalog slug picking the
+  dylib/version; unset/unknown → `default_build_for_current_os()`) + `General.ai_onnx_provider` (ORT
+  token, mapped by `execution_provider_from_ort_token`, validated to belong to the build's EP set else
+  the build's headline EP) + `General.ai_onnx_device_id` (per-EP: numeric adapter index for
+  DirectML/CUDA/TensorRT/WebGPU, an OpenVINO device-TYPE string for OpenVINO, else `Default`) — the
+  same keys the Python backend uses, fixed per process. `decide_selection` (pure) applies the
+  availability fallback using the `gpu_utils` probes off the GUI thread: a CUDA build with no matching
+  CUDA-major runtime, an OpenVINO build with no Intel device/runtime, a WebGPU EP with no capable GPU,
+  an EP unsupported on this OS, or an informational build with no EP → the `cpu` build + CPU EP,
+  logged, never a wrong result (the real backstop for a genuine registration failure is
+  `error_on_failure` at EP load time). The build is passed to `resolve_or_download_ort_dylib(build)`
+  and folded into the `{build}:{provider}[:{device}]@{version}` SIGILL crash-guard scope, where
+  `version` is the build's ACTUAL onnxruntime version (`onnx_runtime::build_version`) so a crash on one
+  build cannot block another — including two builds sharing a version (cpu/coreml/webgpu are all
+  1.27.0). `ORT_DYLIB_COMMITTED` (set after the first successful `OrtRuntime::load`, NEVER reset —
+  mirrors ort's un-swappable process-global environment) is the hot-swap-vs-restart signal:
+  `reset_load_latch` clears the attempt/success latch + cached runtime/engines for a SAME-build retry
+  but leaves it set; a DIFFERENT build needs an app restart. `run_guarded` shares the fsync'd
+  attempt-before-dlopen / succeeded-after-first-inference / graceful-reset sequence across ops.
+  `recognize_manga`, `recognize_paddle`, `detect_paddle`, `execution_provider_from_ort_token`,
+  `native_load_scope_key`, `ort_dylib_committed`, `active_build`, and `reset_load_latch` are the public
+  surface (the guard/scope helpers are worker-thread only — they do disk I/O + hardware probes).
 - `input_manager_v2.rs`: keyboard shortcut and modifier-only hotkey registry, user overrides, and
   command lookup.
 - `bubble_status.rs`: configurable bubble status rules, condition evaluation, and border painting
@@ -201,11 +221,35 @@ prompts instead of blocking the GUI thread.
   unified `General.ai_onnx_provider`/`ai_onnx_device_id` (shared with the backend); OCR routing lives
   in `tabs/translation/ocr.rs::ocr_route`, detection routing in
   `tabs/translation/text_detector.rs::detector_native_route`.
-- ONNX provider/device selection UI (shared Settings + launcher panel): `ai_backend_panel.rs`. The
-  provider list is the UNION of the local-native set (`gpu_utils` probes) and the backend-reported
-  `available_onnx_providers` (deduped by ORT token), labelled per active `General.ai_runtime`, so
-  backend-only providers (e.g. MIGraphX/ROCm) stay selectable for backend ONNX while native falls back
-  to CPU for them. See `build_onnx_provider_options` (pure/tested) and `provider_runtime_state`.
+- ONNX selection UI (shared Settings + launcher panel): `ai_backend_panel.rs`. The section is
+  RUNTIME-BRANCHED on `General.ai_runtime`:
+  - Native → the BUILD-based selection (Билд → EP → Устройство). The "Билд" combo lists the
+    `onnx_runtime::builds` catalog grouped by availability — Базовые (available Basic), Специфичные
+    (available Specific), Недоступные (everything unavailable + the informational QNN, which is
+    display-only/non-selectable; other unavailable builds stay selectable for a forced download). The
+    EP combo comes from `builds::build_execution_providers(build)` (token via `ep_ort_token`,
+    round-tripping through `execution_provider_from_ort_token`); the device combo adapts per EP
+    (DirectML/WebGPU adapter indices, CUDA/TensorRT `GPU 0`, CPU/CoreML default, OpenVINO device-TYPE
+    strings `CPU`/`GPU`/`NPU` written verbatim to `ai_onnx_device_id`). The selected build persists via
+    `settings::save_onnx_build` (`General.ai_onnx_build`); the EP/device via `save_onnx_provider_device`.
+    An AVAILABLE build's dylib auto-downloads via `resolve_or_download_ort_dylib(build)` off-thread; the
+    build-action button is a PURE decision `ort_build_action(committed, active_build, selected, present)`
+    → {Retry | LoadOtherBuild | RestartNote}: not-committed + present → same-build "Повторить попытку
+    ORT"; not-committed + absent (or forced unavailable) → "Загрузить другую сборку ort" (download +
+    `reset_load_latch`); committed + different `native_runtime::active_build()` → "Перезапустите
+    программу" (the process-global ort dylib can't hot-swap). Per-build catalog grouping, EP labels, and
+    the button decision are pure + unit-tested; build availability + dylib presence are probed off-thread
+    (`start_onnx_caps_probe` extended with cuda12/cuda13/openvino flags; `ensure_build_presence_probe`).
+  - Backend (or runtime not yet known) → the UNIFIED provider/device combos: the UNION of the
+    local-native set (`gpu_utils` probes) and the backend-reported `available_onnx_providers` (deduped by
+    ORT token), labelled per runtime, so backend-only providers (e.g. MIGraphX/ROCm) stay selectable.
+    See `build_onnx_provider_options` (pure/tested) and `provider_runtime_state`.
+  The WebGPU device combo is populated from real GPU adapters enumerated per-OS by the SAME backend Dawn
+  uses (DXGI on Windows via `detect_directml_accelerators_windows`, Vulkan on Linux via
+  `vulkaninfo --summary`, Metal/default on macOS), so the device id = adapter index = Dawn `device_id`
+  passed to `WebGPU::with_device_id`; enumeration runs off-thread in `start_onnx_caps_probe`. This
+  index→adapter alignment is best-effort (the backstop is `error_on_failure` at EP registration), and
+  an empty adapter list falls back to a single default device.
 - Chapter filesystem shape, project load/save contracts, page discovery, staged unsaved paths, or
   legacy bubble format migration: `project.rs`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,

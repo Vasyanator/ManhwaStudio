@@ -69,6 +69,14 @@ pub const GENERAL_AI_ONNX_PROVIDER_KEY: &str = "ai_onnx_provider";
 /// shared by the backend and the native path. Read by
 /// [`ai_onnx_device_id_from_user_settings`].
 pub const GENERAL_AI_ONNX_DEVICE_ID_KEY: &str = "ai_onnx_device_id";
+/// `General` key holding the selected ONNX Runtime BUILD slug (e.g. `"cuda13"`,
+/// `"openvino"`, `"webgpu"`), the `slug` of an `onnx_runtime::builds` catalog row. A
+/// build is a concrete onnxruntime binary of a specific version exposing a specific
+/// execution-provider set; the native path resolves the dylib for this build and
+/// validates the selected provider belongs to it. Read by
+/// [`ai_onnx_build_from_user_settings`]; kept as a plain string so `config` stays free
+/// of an `onnx_runtime` dependency (the caller applies the per-OS default).
+pub const GENERAL_AI_ONNX_BUILD_KEY: &str = "ai_onnx_build";
 /// `General` boolean marking the ONNX provider as an explicit user choice, matching
 /// the Python backend's `ai_onnx_provider_configured` flag so an offline selection is
 /// honored once the backend starts.
@@ -189,6 +197,24 @@ pub fn ai_onnx_provider_token_from_user_settings(cfg: &Value) -> Option<String> 
     cfg.get("General")
         .and_then(Value::as_object)
         .and_then(|general| general.get(GENERAL_AI_ONNX_PROVIDER_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("not-selected"))
+        .map(str::to_string)
+}
+
+/// Reads the selected ONNX Runtime build slug from `General.ai_onnx_build`.
+///
+/// Returns the trimmed build slug (e.g. `"cuda13"`) or `None` when the key is absent,
+/// empty, non-string, or the `"not-selected"` sentinel. On `None` the caller applies
+/// `onnx_runtime::builds::default_build_for_current_os()`; the slug is validated
+/// against the build catalog by `native_runtime`. Kept slug-agnostic here so `config`
+/// stays free of an `onnx_runtime` dependency.
+#[must_use]
+pub fn ai_onnx_build_from_user_settings(cfg: &Value) -> Option<String> {
+    cfg.get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_AI_ONNX_BUILD_KEY))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("not-selected"))
@@ -731,6 +757,7 @@ pub fn user_config_defaults() -> Value {
             "ai_device": "not-selected",
             "ai_onnx_provider": "not-selected",
             "ai_onnx_device_id": "not-selected",
+            "ai_onnx_build": "not-selected",
             "ai_max_loaded_models": 3,
             "ai_install_type": AiInstallType::None.as_str(),
             "ai_runtime": AiRuntime::Backend.as_key(),
@@ -1141,6 +1168,34 @@ mod tests {
             )
             .as_deref(),
             Some("DmlExecutionProvider")
+        );
+    }
+
+    #[test]
+    fn ai_onnx_build_reads_and_filters() {
+        // Absent / empty / not-selected -> None (caller applies the per-OS default).
+        assert_eq!(ai_onnx_build_from_user_settings(&json!({})), None);
+        assert_eq!(
+            ai_onnx_build_from_user_settings(&json!({"General": {}})),
+            None
+        );
+        assert_eq!(
+            ai_onnx_build_from_user_settings(
+                &json!({"General": {"ai_onnx_build": "not-selected"}})
+            ),
+            None
+        );
+        assert_eq!(
+            ai_onnx_build_from_user_settings(&json!({"General": {"ai_onnx_build": "  "}})),
+            None
+        );
+        // A stored slug is trimmed and returned verbatim.
+        assert_eq!(
+            ai_onnx_build_from_user_settings(
+                &json!({"General": {"ai_onnx_build": " cuda13 "}})
+            )
+            .as_deref(),
+            Some("cuda13")
         );
     }
 

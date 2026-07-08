@@ -32,6 +32,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   and the ONNX Runtime SIGILL load-guard: `save_ai_runtime` (writes `General.ai_runtime`),
   `save_onnx_provider_device` (writes `General.ai_onnx_provider`/`ai_onnx_device_id` + the
   `*_configured` flags, the SAME keys the backend uses, so one selection drives both runtimes),
+  `save_onnx_build` (writes `General.ai_onnx_build`, the native-only build slug picking the onnxruntime
+  binary; wired to the "Билд" selector),
   `save_max_loaded_models` (writes `General.ai_max_loaded_models` as an integer), and
   `mark_ort_load_attempted` / `mark_ort_load_succeeded` / `reset_ort_load_guard` (mutate
   `General.ort_load_state[scope]`, where `scope` is `provider[:device]@version`). The three guard writers fsync the file after writing so the
@@ -65,14 +67,20 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   device/provider selection, max loaded models, and CUDA/ROCm diagnostics. It forwards to the shared
   `crate::ai_backend_panel::draw_ai_backend_panel`, which also hosts: the "ONNX-инференс" runtime
   selector (backend Python / native ONNX, persisted to `General.ai_runtime`; Torch always runs on the
-  backend); the OFFLINE-capable ONNX provider/device combos + model-limit slider, populated from local
-  OS/`gpu_utils` capability probes (not the backend snapshot) so they work with the backend OFF —
-  selecting persists the unified keys via `save_onnx_provider_device` / `save_max_loaded_models`
-  off-thread AND, when connected, pushes `device.set`; the onnxruntime auto-download progress bar
-  (when native is active, via `onnx_runtime::resolve_or_download_ort_dylib` on a worker thread); and
-  the "Повторить попытку ORT" control (`reset_ort_load_guard` for the effective `provider[:device]`
-  scope + `native_runtime::reset_load_latch`). The PyTorch device combo stays backend-gated. All ONNX
-  native bits are desktop-only (`#[cfg(not(wasm32))]`); config/caps are read once off the GUI thread
+  backend); the OFFLINE-capable ONNX selection, RUNTIME-BRANCHED — under Native the BUILD-based combos
+  (Билд → EP → Устройство): the "Билд" combo lists the `onnx_runtime::builds` catalog grouped by
+  availability (Базовые/Специфичные/Недоступные, QNN display-only), the EP combo comes from the selected
+  build, and the device combo adapts per EP (incl. OpenVINO device-type strings); an available build's
+  dylib auto-downloads and the build-action button is Retry / "Загрузить другую сборку ort" (force
+  download + `reset_load_latch`) / "Перезапустите программу" per `native_runtime::ort_dylib_committed()`
+  + `active_build()` (a committed dylib can't hot-swap). Under Backend the UNIFIED provider/device combos.
+  The model-limit slider is shared. Selecting persists the unified keys via `save_onnx_build` /
+  `save_onnx_provider_device` / `save_max_loaded_models` off-thread AND, when connected, pushes
+  `device.set`; the onnxruntime auto-download progress bar renders via
+  `onnx_runtime::resolve_or_download_ort_dylib(build)` on a worker thread; the same-build "Повторить
+  попытку ORT" retry calls `reset_ort_load_guard` for the effective `provider[:device]` scope +
+  `native_runtime::reset_load_latch`. The PyTorch device combo stays backend-gated. All ONNX native bits
+  are desktop-only (`#[cfg(not(wasm32))]`); config/caps/dylib-presence are read once off the GUI thread
   into the panel's scratch state. On wasm the ONNX combos remain backend-driven.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
   `user_config.json` override persistence.

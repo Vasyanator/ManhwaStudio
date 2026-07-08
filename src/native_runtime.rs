@@ -12,20 +12,35 @@ capacity-bounded LRU keyed by `NativeModelId`. Turns a crop/page image into
 recognized text or detected regions without going through the Python backend.
 Selected via `General.ai_runtime = "native"`.
 
-Execution provider:
-The provider + adapter index are read once from the UNIFIED ONNX selection
-(`General.ai_onnx_provider` ORT token + `General.ai_onnx_device_id`) — the SAME keys
-the Python backend uses, so one selection drives both runtimes — and cached for the
-process (the ort environment + dylib are process-global singletons committed once
-and not swappable without an app restart). An impossible provider for the current OS
-(e.g. DirectML on Linux) logs a notice and falls back to CPU. When `Cuda` is
-selected, a system CUDA 12.x / cuDNN 9.x probe (`gpu_utils::native_cuda_runtime_available`)
-runs BEFORE any load; if the runtime is missing, it falls back to DirectML (Windows,
-when a DirectML accelerator exists) or CPU — never a wrong result, never a hard
-failure. A genuine CUDA registration failure at load time surfaces as an OrtLoad
-error and callers fall back to the Python backend with a log. The SIGILL guard scope
-includes the provider id AND the adapter index, so a failed accelerator attempt
-never blocks a working CPU config or a different, healthy adapter.
+Build-aware execution-provider selection:
+The (build, execution provider, device) triple is resolved once from the UNIFIED ONNX
+selection (`General.ai_onnx_build` slug + `General.ai_onnx_provider` ORT token +
+`General.ai_onnx_device_id`) — the same keys the Python backend uses — and cached for
+the process (the ort environment + dylib are process-global singletons committed once
+and not swappable without an app restart). The BUILD (an `onnx_runtime::builds` catalog
+slug, e.g. `cuda13`/`openvino`/`cpu`) picks the onnxruntime dylib/version; it defaults
+to `default_build_for_current_os()` when unset/unknown. The EP is validated to belong to
+that build's EP set (else the build's headline EP). The device is per-EP: a numeric
+adapter index for DirectML/CUDA/TensorRT/WebGPU, an OpenVINO device-TYPE string for
+OpenVINO, `Default` otherwise. Availability fallback (`decide_selection`, reusing the
+`gpu_utils` probes off the GUI thread): a CUDA build with no matching CUDA-major runtime
+(`native_cuda_build_available`), an OpenVINO build with no Intel device/runtime
+(`native_openvino_runtime_available`), a WebGPU EP with no capable GPU
+(`native_webgpu_runtime_available`), an EP unsupported on this OS, or an informational
+build with no runnable EP all fall back to the `cpu` build + CPU EP with a logged notice
+— never a wrong result. A genuine accelerator registration failure at load time still
+surfaces as an OrtLoad error and callers fall back to the Python backend with a log. The
+SIGILL guard scope is `{build}:{provider}[:{device}]@{version}` where `version` is the
+build's ACTUAL onnxruntime version (`onnx_runtime::build_version`), so a failed attempt
+never blocks a different build/provider/adapter — including two builds that share a
+version (cpu/coreml/webgpu are all 1.27.0).
+
+Hot-swap vs restart:
+`ORT_DYLIB_COMMITTED` is set true after the FIRST successful `OrtRuntime::load` and NEVER
+reset (mirrors ort's un-swappable process-global `G_ORT_LIB`). `reset_load_latch` clears
+the attempt/success latch + cached runtime/engines for a SAME-build retry (hot-swap) but
+leaves `ORT_DYLIB_COMMITTED` set; a DIFFERENT build needs an app restart. The panel reads
+`ort_dylib_committed()`/`active_build()` to choose between the two.
 
 Engine LRU:
 Capacity comes from `General.ai_max_loaded_models` (read once; clamped to at least 1;
@@ -47,8 +62,10 @@ Key items:
   recognizer).
 - detect_paddle         : native PaddleOCR text-detector entry point (shared detector).
 - execution_provider_from_ort_token : maps a shared ORT provider token -> ExecutionProvider.
-- native_load_scope_key : the effective provider:device@version SIGILL-guard scope key.
-- reset_load_latch      : clears the in-process ORT load latch + cached runtime/engines.
+- native_load_scope_key : the effective {build}:{provider}[:{device}]@{version} SIGILL-guard key.
+- ort_dylib_committed / active_build : the hot-swap-vs-restart signal + committed build slug.
+- reset_load_latch      : clears the in-process ORT load latch + cached runtime/engines
+  (leaves ORT_DYLIB_COMMITTED set — a same-build hot-swap only).
 
 SIGILL crash-guard:
 The onnxruntime library can abort the process with an uncatchable SIGILL on CPUs
@@ -84,8 +101,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use ms_onnx::{
-    ExecutionProvider, MangaOcrEngine, OrtError, OrtRuntime, PaddleDetection, PaddleDetector,
-    PaddleRecognizer,
+    ExecutionProvider, MangaOcrEngine, NativeDeviceSelection, OrtError, OrtRuntime,
+    PaddleDetection, PaddleDetector, PaddleRecognizer,
 };
 
 use crate::ai_models;
@@ -174,16 +191,19 @@ pub enum NativeRuntimeError {
     EngineUnavailable,
 }
 
-/// The effective native execution provider + accelerator adapter index for this
-/// process, resolved once from the unified ONNX selection and cached.
+/// The effective native (build, execution provider, device) triple for this process,
+/// resolved once from the unified ONNX selection and cached.
 ///
-/// `provider` never exceeds what the current OS supports (fallbacks applied);
-/// `device_id` is the DirectML/CUDA adapter index (`None` = the provider's default
-/// device, and always `None` for CPU/CoreML which ignore it).
-#[derive(Debug, Clone, Copy)]
+/// `build` is a stable `onnx_runtime::builds` catalog slug (the dylib to load; e.g.
+/// `"cuda13"`, `"openvino"`, `"cpu"`). `provider` always belongs to that build's EP set
+/// and never exceeds what the current OS supports (fallbacks applied). `device` is the
+/// per-EP accelerator selection (numeric index for DirectML/CUDA/TensorRT/WebGPU, a
+/// device-TYPE string for OpenVINO, `Default` for CPU/CoreML or when unset).
+#[derive(Debug, Clone)]
 struct ProviderSelection {
+    build: &'static str,
     provider: ExecutionProvider,
-    device_id: Option<i32>,
+    device: NativeDeviceSelection,
 }
 
 /// Process-global cache of the effective provider selection (the ort environment is
@@ -192,158 +212,375 @@ static SELECTED_PROVIDER: OnceLock<ProviderSelection> = OnceLock::new();
 
 /// The effective provider selection for this process (computed once, then cached).
 fn native_selection() -> ProviderSelection {
-    *SELECTED_PROVIDER.get_or_init(compute_native_selection)
+    SELECTED_PROVIDER
+        .get_or_init(compute_native_selection)
+        .clone()
 }
+
+/// Whether the onnxruntime dylib has been committed process-globally by a first
+/// successful [`OrtRuntime::load`]. Set once and NEVER reset (not even by
+/// [`reset_load_latch`]): it mirrors ort's un-swappable process-global `G_ORT_LIB`
+/// `OnceLock` — once a dylib is committed, the ort environment is pinned to it, so
+/// switching to a DIFFERENT build requires an app restart. The panel reads it via
+/// [`ort_dylib_committed`] to decide between a hot-swap (same build, `reset_load_latch`)
+/// and a "restart required" hint (different build).
+static ORT_DYLIB_COMMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Maps a shared ORT execution-provider TOKEN (as stored by BOTH the Python backend
 /// and the native path under `General.ai_onnx_provider`) to an [`ExecutionProvider`].
 ///
 /// Recognizes the exact tokens the backend writes: `CPUExecutionProvider`,
-/// `DmlExecutionProvider`, `CUDAExecutionProvider`, `CoreMLExecutionProvider`. Any
-/// unknown, absent, or `"not-selected"` token maps to [`ExecutionProvider::Cpu`] —
-/// the only universally available provider — so a stray config never picks a GPU the
-/// machine cannot run.
+/// `DmlExecutionProvider`, `CUDAExecutionProvider`, `CoreMLExecutionProvider`,
+/// `WebGpuExecutionProvider` (matching `ort::ep::WebGPU::name()`),
+/// `OpenVINOExecutionProvider`, and `TensorrtExecutionProvider`. Any unknown,
+/// absent, or `"not-selected"` token maps to [`ExecutionProvider::Cpu`] — the only
+/// universally available provider — so a stray config never picks a GPU the machine
+/// cannot run.
 #[must_use]
 pub fn execution_provider_from_ort_token(token: &str) -> ExecutionProvider {
     match token.trim() {
         "DmlExecutionProvider" => ExecutionProvider::DirectMl,
         "CUDAExecutionProvider" => ExecutionProvider::Cuda,
         "CoreMLExecutionProvider" => ExecutionProvider::CoreMl,
+        "WebGpuExecutionProvider" => ExecutionProvider::WebGpu,
+        "OpenVINOExecutionProvider" => ExecutionProvider::OpenVino,
+        "TensorrtExecutionProvider" => ExecutionProvider::TensorRt,
         // "CPUExecutionProvider", "not-selected", and any unknown token -> CPU.
         _ => ExecutionProvider::Cpu,
     }
 }
 
-/// Computes the effective provider selection from the unified ONNX config keys
-/// (`General.ai_onnx_provider` token + `General.ai_onnx_device_id`) plus the CUDA
-/// probe. See [`ProviderSelection`].
+/// Computes the effective (build, provider, device) selection from the unified ONNX
+/// config keys (`General.ai_onnx_build` + `General.ai_onnx_provider` token +
+/// `General.ai_onnx_device_id`) plus the per-build hardware probes. See
+/// [`ProviderSelection`].
 ///
-/// A provider impossible on this OS falls back to CPU; a `Cuda` selection without a
-/// system CUDA 12.x/cuDNN 9.x runtime falls back to DirectML (Windows with a DirectML
-/// adapter) or CPU. The adapter index is kept only for accelerator providers
-/// (DirectML/CUDA) and dropped for CPU/CoreML. Changing the selection takes effect
-/// only after an app restart.
+/// Resolution order:
+/// 1. `build` = the configured build slug validated against the catalog, else the
+///    per-OS default ([`default_build_for_current_os`]).
+/// 2. `provider` = the configured EP token, validated to belong to that build's EP set;
+///    otherwise the build's headline (first) EP ([`resolve_ep_for_build`]).
+/// 3. Availability fallback: a CUDA build with no matching CUDA-major runtime, an
+///    OpenVINO build with no Intel device/runtime, a WebGPU EP with no capable GPU, an
+///    EP unsupported on this OS, or an informational build with no runnable EP falls
+///    back to the `"cpu"` build + CPU EP with a logged notice — never a wrong result.
+/// 4. `device` = the per-EP accelerator selection built from `ai_onnx_device_id`
+///    ([`device_selection_for`]).
+///
+/// [`default_build_for_current_os`]: onnx_runtime::builds::default_build_for_current_os
+/// Changing the selection takes effect only after an app restart (the ort dylib is
+/// committed once; see [`ORT_DYLIB_COMMITTED`]).
 fn compute_native_selection() -> ProviderSelection {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or_else(|err| {
         runtime_log::log_warn(format!(
-            "[native-runtime] could not read user config for the native provider ({err}); using CPU."
+            "[native-runtime] could not read user config for the native selection ({err}); using CPU."
         ));
         serde_json::Value::Null
     });
-    let token = config::ai_onnx_provider_token_from_user_settings(&cfg);
-    let device_id = config::ai_onnx_device_id_from_user_settings(&cfg)
-        .and_then(|value| value.trim().parse::<i32>().ok());
-    let requested = execution_provider_from_ort_token(token.as_deref().unwrap_or("CPUExecutionProvider"));
 
-    if !provider_supported_on_platform(requested) {
-        runtime_log::log_warn(format!(
-            "[native-runtime] configured native provider '{}' is not available on this OS; \
-             falling back to CPU.",
-            requested.id()
-        ));
-        return ProviderSelection {
-            provider: ExecutionProvider::Cpu,
-            device_id: None,
-        };
-    }
+    let build = resolve_build_slug(&cfg);
+    let requested_ep = config::ai_onnx_provider_token_from_user_settings(&cfg)
+        .as_deref()
+        .map(execution_provider_from_ort_token);
+    let ep = resolve_ep_for_build(build, requested_ep);
 
-    let provider = match requested {
-        ExecutionProvider::Cuda => resolve_effective_cuda_provider(),
-        provider @ (ExecutionProvider::Cpu
-        | ExecutionProvider::DirectMl
-        | ExecutionProvider::CoreMl) => provider,
+    // Probe only what the current (build, EP) actually needs, so a CPU/DirectML config
+    // never runs nvidia-smi/lspci. Each probe runs off the GUI thread (worker only).
+    let cuda_available =
+        matches!(build, "cuda12" | "cuda13") && gpu_utils::native_cuda_build_available(build);
+    let openvino_available =
+        build == "openvino" && gpu_utils::native_openvino_runtime_available();
+    let webgpu_available =
+        ep == ExecutionProvider::WebGpu && gpu_utils::native_webgpu_runtime_available();
+
+    let outcome = decide_selection(
+        build,
+        ep,
+        onnx_runtime::builds::build_execution_providers(build).is_empty(),
+        cuda_available,
+        openvino_available,
+        webgpu_available,
+        provider_supported_on_platform(ep),
+    );
+    let (build, ep) = match outcome {
+        SelectionOutcome::Keep => (build, ep),
+        SelectionOutcome::CpuFallback(reason) => {
+            runtime_log::log_warn(format!(
+                "[native-runtime] build '{build}' / provider '{}' unavailable ({}); \
+                 falling back to the CPU build. A restart is needed to retry the \
+                 selected build once its hardware/runtime is present.",
+                ep.id(),
+                reason.as_str()
+            ));
+            ("cpu", ExecutionProvider::Cpu)
+        }
     };
-    // The adapter index only applies to DirectML/CUDA; CPU/CoreML ignore it, so drop
-    // it there to keep the guard scope clean (`cpu@ver`, not `cpu:0@ver`).
-    let device_id = match provider {
-        ExecutionProvider::DirectMl | ExecutionProvider::Cuda => device_id,
-        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => None,
-    };
+
+    let device_id_raw = config::ai_onnx_device_id_from_user_settings(&cfg);
+    let device = device_selection_for(ep, device_id_raw.as_deref());
+
     runtime_log::log_info(format!(
-        "[native-runtime] native execution provider = '{}' device_id={device_id:?}.",
-        provider.id()
+        "[native-runtime] native selection: build='{build}' provider='{}' device={device:?}.",
+        ep.id()
     ));
-    ProviderSelection { provider, device_id }
-}
-
-/// Resolves the effective provider when the user selected CUDA.
-///
-/// Runs the system CUDA 12.x / cuDNN 9.x probe off the (worker) thread; if the
-/// runtime is missing, falls back to DirectML on Windows (when a DirectML accelerator
-/// is present) or to CPU, so OCR still works instead of hard-failing.
-fn resolve_effective_cuda_provider() -> ExecutionProvider {
-    let cuda_available = gpu_utils::native_cuda_runtime_available();
-    let has_directml = cfg!(target_os = "windows") && gpu_utils::has_directml_accelerator_windows();
-    let effective = resolve_cuda_fallback(cuda_available, has_directml, cfg!(target_os = "windows"));
-    match effective {
-        ExecutionProvider::Cuda => runtime_log::log_info(
-            "[native-runtime] system CUDA 12.x + cuDNN 9.x detected; using the CUDA provider.",
-        ),
-        ExecutionProvider::DirectMl => runtime_log::log_warn(
-            "[native-runtime] CUDA selected but system CUDA 12.x/cuDNN 9.x not detected; \
-             falling back to DirectML.",
-        ),
-        ExecutionProvider::Cpu => runtime_log::log_warn(
-            "[native-runtime] CUDA selected but system CUDA 12.x/cuDNN 9.x not detected; \
-             falling back to CPU.",
-        ),
-        // `resolve_cuda_fallback` never returns CoreML; kept for exhaustiveness.
-        ExecutionProvider::CoreMl => runtime_log::log_warn(
-            "[native-runtime] unexpected CoreML fallback for CUDA; proceeding as-is.",
-        ),
+    ProviderSelection {
+        build,
+        provider: ep,
+        device,
     }
-    effective
 }
 
-/// Chooses the effective provider when CUDA was requested (pure, testable).
+/// Resolves the ONNX Runtime build slug for this process.
 ///
-/// Returns [`ExecutionProvider::Cuda`] when the system CUDA runtime is available;
-/// otherwise [`ExecutionProvider::DirectMl`] on Windows with a DirectML accelerator,
-/// or [`ExecutionProvider::Cpu`] as the always-available last resort. The
-/// environment facts are passed in so the decision can be unit-tested without touching
-/// the real system.
-fn resolve_cuda_fallback(
-    cuda_available: bool,
-    has_directml: bool,
-    is_windows: bool,
-) -> ExecutionProvider {
-    if cuda_available {
+/// Returns the configured `General.ai_onnx_build` slug when it names a real catalog
+/// build; otherwise (unset, sentinel, or an unknown slug) the per-OS default
+/// `onnx_runtime::builds::default_build_for_current_os()`. The returned slug is always a
+/// `&'static str` from the catalog.
+fn resolve_build_slug(cfg: &serde_json::Value) -> &'static str {
+    match config::ai_onnx_build_from_user_settings(cfg) {
+        Some(slug) => match onnx_runtime::builds::build_by_slug(&slug) {
+            Some(build) => build.slug,
+            None => {
+                runtime_log::log_warn(format!(
+                    "[native-runtime] configured ONNX build '{slug}' is not in the catalog; \
+                     using the per-OS default."
+                ));
+                onnx_runtime::builds::default_build_for_current_os()
+            }
+        },
+        None => onnx_runtime::builds::default_build_for_current_os(),
+    }
+}
+
+/// Resolves the execution provider to run WITHIN `build`.
+///
+/// Enforces the "EP must belong to the loaded build" contract: returns `requested` only
+/// when it is in the build's ordered EP set; otherwise the build's headline (first) EP.
+/// A build with an empty EP set (an informational entry such as `qnn`) yields
+/// [`ExecutionProvider::Cpu`] — the availability fallback then swaps to the CPU build.
+fn resolve_ep_for_build(build: &str, requested: Option<ExecutionProvider>) -> ExecutionProvider {
+    let eps = onnx_runtime::builds::build_execution_providers(build);
+    if let Some(req) = requested
+        && eps.contains(&req)
+    {
+        return req;
+    }
+    eps.first().copied().unwrap_or(ExecutionProvider::Cpu)
+}
+
+/// Builds the [`NativeDeviceSelection`] for `ep` from the raw `ai_onnx_device_id` value.
+///
+/// - OpenVINO: the id is a device-TYPE string (`"CPU"`/`"GPU"`/`"GPU.0"`/`"NPU"`) →
+///   [`NativeDeviceSelection::OpenVinoDeviceType`]; absent/empty → `Default`.
+/// - Index-based EPs (`Cuda`/`TensorRt`/`DirectMl`/`WebGpu`): the id parses to an `i32`
+///   adapter index → [`NativeDeviceSelection::Index`]; absent/unparseable → `Default`.
+/// - `Cpu`/`CoreMl`: the id is ignored → `Default`.
+fn device_selection_for(ep: ExecutionProvider, device_id: Option<&str>) -> NativeDeviceSelection {
+    match ep {
+        ExecutionProvider::OpenVino => {
+            match device_id.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(device_type) => {
+                    NativeDeviceSelection::OpenVinoDeviceType(device_type.to_string())
+                }
+                None => NativeDeviceSelection::Default,
+            }
+        }
         ExecutionProvider::Cuda
-    } else if is_windows && has_directml {
-        ExecutionProvider::DirectMl
-    } else {
-        ExecutionProvider::Cpu
+        | ExecutionProvider::TensorRt
+        | ExecutionProvider::DirectMl
+        | ExecutionProvider::WebGpu => {
+            match device_id.and_then(|value| value.trim().parse::<i32>().ok()) {
+                Some(index) => NativeDeviceSelection::Index(index),
+                None => NativeDeviceSelection::Default,
+            }
+        }
+        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => NativeDeviceSelection::Default,
     }
 }
 
-/// The SIGILL load-guard scope key for the effective native provider + adapter of
-/// this process (`provider[:device]@version`).
+/// Why a resolved (build, EP) selection was downgraded to the CPU build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackReason {
+    /// The build has no runnable EP set (an informational catalog entry, e.g. `qnn`).
+    NoRunnableProvider,
+    /// A CUDA build was selected but no matching CUDA-major runtime is present.
+    CudaRuntimeMissing,
+    /// An OpenVINO build was selected but no Intel device/runtime is present.
+    OpenVinoRuntimeMissing,
+    /// A WebGPU EP was selected but no WebGPU-capable GPU/loader is present.
+    WebGpuUnavailable,
+    /// The EP cannot run on the OS this binary targets.
+    UnsupportedOnPlatform,
+}
+
+impl FallbackReason {
+    /// A short English reason for the log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRunnableProvider => "build has no runnable execution provider",
+            Self::CudaRuntimeMissing => "matching CUDA runtime not detected",
+            Self::OpenVinoRuntimeMissing => "Intel device / OpenVINO runtime not detected",
+            Self::WebGpuUnavailable => "no WebGPU-capable GPU detected",
+            Self::UnsupportedOnPlatform => "provider unsupported on this OS",
+        }
+    }
+}
+
+/// The resolution outcome for a (build, EP) selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionOutcome {
+    /// Keep the resolved (build, EP).
+    Keep,
+    /// Downgrade to the `"cpu"` build + CPU EP for the carried reason.
+    CpuFallback(FallbackReason),
+}
+
+/// Pure decision for whether a (build, EP) selection is runnable or must fall back to
+/// the CPU build.
+///
+/// The environment facts are passed in so the decision is unit-testable without touching
+/// the real system:
+/// - `build_ep_set_empty`: the build has no EP (informational entry).
+/// - `cuda_build_available`: consulted only for `"cuda12"`/`"cuda13"` builds.
+/// - `openvino_available`: consulted only for the `"openvino"` build.
+/// - `webgpu_available`: consulted only when `ep == WebGpu`.
+/// - `ep_platform_supported`: whether `ep` runs on this OS.
+///
+/// Returns [`SelectionOutcome::Keep`] when the selection is runnable, else a
+/// [`SelectionOutcome::CpuFallback`] carrying the first failing reason.
+fn decide_selection(
+    build: &str,
+    ep: ExecutionProvider,
+    build_ep_set_empty: bool,
+    cuda_build_available: bool,
+    openvino_available: bool,
+    webgpu_available: bool,
+    ep_platform_supported: bool,
+) -> SelectionOutcome {
+    if build_ep_set_empty {
+        return SelectionOutcome::CpuFallback(FallbackReason::NoRunnableProvider);
+    }
+    match build {
+        "cuda12" | "cuda13" if !cuda_build_available => {
+            return SelectionOutcome::CpuFallback(FallbackReason::CudaRuntimeMissing);
+        }
+        "openvino" if !openvino_available => {
+            return SelectionOutcome::CpuFallback(FallbackReason::OpenVinoRuntimeMissing);
+        }
+        _ => {}
+    }
+    if ep == ExecutionProvider::WebGpu && !webgpu_available {
+        return SelectionOutcome::CpuFallback(FallbackReason::WebGpuUnavailable);
+    }
+    if !ep_platform_supported {
+        return SelectionOutcome::CpuFallback(FallbackReason::UnsupportedOnPlatform);
+    }
+    SelectionOutcome::Keep
+}
+
+/// The SIGILL load-guard scope key for the effective native (build, provider, device)
+/// of this process (`{build}:{provider}[:{device}]@{version}`).
 ///
 /// Used by the OCR/detector routers AND the "Повторить попытку ORT" reset control to
-/// scope the guard to exactly the provider/adapter this module will load, so the
-/// pre-check guard read, the load-time marker, and the reset all agree. Reads the
-/// cached selection (first call resolves it, which does disk I/O + a CUDA probe);
-/// call off the GUI thread.
+/// scope the guard to exactly the build/provider/adapter this module will load, so the
+/// pre-check guard read, the load-time marker, and the reset all agree. Including the
+/// BUILD distinguishes two builds that share an onnxruntime version (e.g. `cpu`,
+/// `coreml`, and `webgpu` are all 1.27.0), so a SIGILL loading one never blocks another.
+/// Reads the cached selection (first call resolves it, which does disk I/O + hardware
+/// probes); call off the GUI thread.
 #[must_use]
 pub fn native_load_scope_key() -> String {
     let selection = native_selection();
-    config::ort_load_scope_key(
-        selection.provider.id(),
-        selection.device_id,
-        onnx_runtime::ORT_VERSION,
+    native_scope_key(
+        selection.build,
+        selection.provider,
+        &selection.device,
+        &build_scope_version(selection.build),
     )
+}
+
+/// The onnxruntime version to embed in a build's guard scope: the build's manifest
+/// version, or [`onnx_runtime::ORT_VERSION`] when the build has no entry on this
+/// platform.
+fn build_scope_version(build: &str) -> String {
+    onnx_runtime::build_version(build).unwrap_or_else(|| onnx_runtime::ORT_VERSION.to_string())
+}
+
+/// Formats the SIGILL guard scope key `{build}:{provider}[:{device}]@{version}`.
+///
+/// The device segment is present only for a specific accelerator: a numeric index for
+/// index-based EPs, or the device-TYPE string for OpenVINO (folded into the provider
+/// segment so two OpenVINO device types get distinct guards). `Default` omits it. Reuses
+/// [`config::ort_load_scope_key`] for the `[:index]@version` tail so the version/index
+/// formatting stays in one place.
+fn native_scope_key(
+    build: &str,
+    provider: ExecutionProvider,
+    device: &NativeDeviceSelection,
+    version: &str,
+) -> String {
+    match device {
+        NativeDeviceSelection::OpenVinoDeviceType(device_type) => config::ort_load_scope_key(
+            &format!("{build}:{}:{device_type}", provider.id()),
+            None,
+            version,
+        ),
+        NativeDeviceSelection::Index(index) => {
+            config::ort_load_scope_key(&format!("{build}:{}", provider.id()), Some(*index), version)
+        }
+        NativeDeviceSelection::Default => {
+            config::ort_load_scope_key(&format!("{build}:{}", provider.id()), None, version)
+        }
+    }
+}
+
+/// Whether the onnxruntime dylib has been committed process-globally by a first
+/// successful load. When `true`, selecting a DIFFERENT build requires an app restart
+/// (the ort environment is pinned); a SAME-build retry can still hot-swap via
+/// [`reset_load_latch`]. Read by the AI backend panel.
+// Consumed by the AI-backend-panel build picker (next task); no in-tree caller yet.
+#[allow(dead_code)]
+#[must_use]
+pub fn ort_dylib_committed() -> bool {
+    ORT_DYLIB_COMMITTED.load(Ordering::SeqCst)
+}
+
+/// The build slug of the committed runtime, or `None` if no dylib has been committed
+/// this process yet.
+///
+/// Returns the cached selection's build once [`ort_dylib_committed`] holds, so the panel
+/// can compare the currently-selected build against the one actually loaded and show a
+/// "restart required" hint when they differ.
+// Consumed by the AI-backend-panel build picker (next task); no in-tree caller yet.
+#[allow(dead_code)]
+#[must_use]
+pub fn active_build() -> Option<String> {
+    if ort_dylib_committed() {
+        Some(native_selection().build.to_string())
+    } else {
+        None
+    }
 }
 
 /// Whether `provider` can run on the OS this binary was built for.
 ///
 /// Mirrors `ms_onnx::ExecutionProvider`'s platform gating: DirectML is Windows-only,
-/// Core ML is macOS-only, CUDA is unavailable on macOS, and CPU is always available.
+/// Core ML is macOS-only, CUDA is unavailable on macOS, WebGPU runs on all three
+/// desktop targets (Dawn D3D12/Vulkan/Metal), OpenVINO is x86_64 Windows/Linux,
+/// TensorRT is Windows/Linux (mirrors CUDA), and CPU is always available.
 fn provider_supported_on_platform(provider: ExecutionProvider) -> bool {
     match provider {
         ExecutionProvider::Cpu => true,
         ExecutionProvider::DirectMl => cfg!(target_os = "windows"),
         ExecutionProvider::CoreMl => cfg!(target_os = "macos"),
         ExecutionProvider::Cuda => !cfg!(target_os = "macos"),
+        ExecutionProvider::WebGpu => {
+            cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+        }
+        ExecutionProvider::OpenVino => {
+            cfg!(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))
+        }
+        ExecutionProvider::TensorRt => cfg!(any(target_os = "windows", target_os = "linux")),
     }
 }
 
@@ -701,7 +938,15 @@ fn run_guarded<T>(
     let selection = native_selection();
     let provider = selection.provider;
     let cfg_path = config::user_config_path();
-    let scope = config::ort_load_scope_key(provider.id(), selection.device_id, onnx_runtime::ORT_VERSION);
+    // Use the same build-aware scope key `native_load_scope_key()` produces so the
+    // OCR/detector routers' pre-check, this load-time marker, and the reset all agree
+    // (`{build}:{provider}[:{device}]@{version}`).
+    let scope = native_scope_key(
+        selection.build,
+        provider,
+        &selection.device,
+        &build_scope_version(selection.build),
+    );
 
     // Enter the in-flight region for the WHOLE guarded op (load + inference). The
     // SIGILL can arrive during the dlopen/load as well as the first inference, and
@@ -714,7 +959,14 @@ fn run_guarded<T>(
     let in_flight = InFlightGuard::enter();
 
     // 1. Ensure the process-global ORT runtime is loaded (SIGILL-guarded).
-    let ort = match ensure_ort_runtime(provider, selection.device_id, &cfg_path, &scope, progress) {
+    let ort = match ensure_ort_runtime(
+        selection.build,
+        provider,
+        &selection.device,
+        &cfg_path,
+        &scope,
+        progress,
+    ) {
         Ok(ort) => ort,
         Err(err) => {
             // A graceful failure means the process survived (not a SIGILL); clear the
@@ -755,10 +1007,16 @@ fn run_guarded<T>(
 /// so the next OCR call re-attempts loading from scratch.
 ///
 /// Used together with `settings::reset_ort_load_guard` by the "Повторить попытку ORT"
-/// control so a retry does not require restarting the app. Dropping the cached
-/// `OrtRuntime` does not un-commit the process-global ort environment; a subsequent
-/// load reuses it, which is expected.
+/// control so a SAME-build retry does not require restarting the app. Dropping the
+/// cached `OrtRuntime` does not un-commit the process-global ort environment; a
+/// subsequent load reuses it, which is expected — hence [`ORT_DYLIB_COMMITTED`] is
+/// deliberately NOT cleared here (a different build still needs an app restart, mirroring
+/// ort's un-swappable `G_ORT_LIB`). Only the attempt/success latch and cached
+/// runtime/engines are reset so the same build can be re-attempted.
 pub fn reset_load_latch() {
+    // NOTE: ORT_DYLIB_COMMITTED is intentionally left set (see the doc comment): the ort
+    // dylib/environment cannot be un-committed, so a hot-swap is only valid for the same
+    // build; a different build requires an app restart.
     ATTEMPT_MARKED.store(false, Ordering::SeqCst);
     SUCCEEDED_MARKED.store(false, Ordering::SeqCst);
     let mut state = lock_state();
@@ -776,8 +1034,9 @@ pub fn reset_load_latch() {
 /// Suspect scope. The heavy work (download, dlopen) runs with the global lock
 /// released; the lock is taken only to read/store the cached handle.
 fn ensure_ort_runtime(
+    build: &str,
     provider: ExecutionProvider,
-    device_id: Option<i32>,
+    device: &NativeDeviceSelection,
     cfg_path: &std::path::Path,
     scope: &str,
     progress: &mut dyn FnMut(OrtDownloadProgress),
@@ -807,8 +1066,10 @@ fn ensure_ort_runtime(
         });
     }
 
-    // Resolve/download the onnxruntime dylib (blocking; worker-thread only).
-    let dylib = resolve_or_download_ort_dylib(provider, progress)?;
+    // Resolve/download the onnxruntime dylib for the SELECTED build (blocking;
+    // worker-thread only). The build slug keys both the manifest lookup and the
+    // per-build cache directory.
+    let dylib = resolve_or_download_ort_dylib(build, progress)?;
 
     // Persist the aborted-attempt marker (fsync'd) BEFORE the dlopen so a SIGILL
     // during load or first inference leaves a Suspect marker for the next launch.
@@ -816,11 +1077,16 @@ fn ensure_ort_runtime(
     ATTEMPT_MARKED.store(true, Ordering::SeqCst);
 
     runtime_log::log_info(format!(
-        "[native-runtime] loading ONNX Runtime for provider '{}' device_id={device_id:?} from {}",
+        "[native-runtime] loading ONNX Runtime build '{build}' provider '{}' device={device:?} from {}",
         provider.id(),
         dylib.display()
     ));
-    let ort = OrtRuntime::load(&dylib, provider, device_id).map_err(NativeRuntimeError::OrtLoad)?;
+    let ort =
+        OrtRuntime::load(&dylib, provider, device.clone()).map_err(NativeRuntimeError::OrtLoad)?;
+    // The ort dylib + environment are now committed process-globally and cannot be
+    // swapped without an app restart. Record it (once, never reset) so the panel can
+    // tell a same-build hot-swap from a different-build "restart required".
+    ORT_DYLIB_COMMITTED.store(true, Ordering::SeqCst);
     let ort = Arc::new(ort);
 
     // Store it, preferring any handle another caller committed in the meantime.
@@ -1261,6 +1527,19 @@ mod tests {
             execution_provider_from_ort_token("CoreMLExecutionProvider"),
             ExecutionProvider::CoreMl
         );
+        // The exact token `ort::ep::WebGPU::name()` emits.
+        assert_eq!(
+            execution_provider_from_ort_token("WebGpuExecutionProvider"),
+            ExecutionProvider::WebGpu
+        );
+        assert_eq!(
+            execution_provider_from_ort_token("OpenVINOExecutionProvider"),
+            ExecutionProvider::OpenVino
+        );
+        assert_eq!(
+            execution_provider_from_ort_token("TensorrtExecutionProvider"),
+            ExecutionProvider::TensorRt
+        );
         // Whitespace is trimmed.
         assert_eq!(
             execution_provider_from_ort_token(" DmlExecutionProvider "),
@@ -1283,35 +1562,204 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cuda_fallback_prefers_cuda_then_directml_then_cpu() {
-        // CUDA available -> CUDA regardless of platform/DirectML.
+    fn webgpu_is_supported_on_desktop_targets() {
+        // WebGPU runs on all three desktop targets via Dawn; both GNU check targets
+        // (linux, windows) must report it supported.
+        assert!(provider_supported_on_platform(ExecutionProvider::WebGpu));
+    }
+
+    #[test]
+    fn resolve_ep_for_build_validates_against_the_build_set() {
+        // A requested EP that belongs to the build is honored.
         assert_eq!(
-            resolve_cuda_fallback(true, false, false),
+            resolve_ep_for_build("cuda13", Some(ExecutionProvider::TensorRt)),
+            ExecutionProvider::TensorRt
+        );
+        assert_eq!(
+            resolve_ep_for_build("cuda13", Some(ExecutionProvider::Cpu)),
+            ExecutionProvider::Cpu
+        );
+        // A requested EP NOT in the build falls back to the build's headline (first) EP.
+        assert_eq!(
+            resolve_ep_for_build("cuda13", Some(ExecutionProvider::WebGpu)),
             ExecutionProvider::Cuda
         );
         assert_eq!(
-            resolve_cuda_fallback(true, true, true),
-            ExecutionProvider::Cuda
+            resolve_ep_for_build("openvino", Some(ExecutionProvider::Cuda)),
+            ExecutionProvider::OpenVino
         );
-        // CUDA missing on Windows with a DirectML accelerator -> DirectML.
+        // No requested EP -> the build's headline EP.
         assert_eq!(
-            resolve_cuda_fallback(false, true, true),
-            ExecutionProvider::DirectMl
+            resolve_ep_for_build("webgpu", None),
+            ExecutionProvider::WebGpu
         );
-        // CUDA missing on Windows without a DirectML accelerator -> CPU.
+        // An empty/unknown build EP set -> CPU (the availability fallback then swaps the
+        // build to "cpu").
         assert_eq!(
-            resolve_cuda_fallback(false, false, true),
-            ExecutionProvider::Cpu
-        );
-        // CUDA missing on non-Windows (e.g. Linux) -> CPU (DirectML is Windows-only).
-        assert_eq!(
-            resolve_cuda_fallback(false, true, false),
+            resolve_ep_for_build("qnn", Some(ExecutionProvider::Cuda)),
             ExecutionProvider::Cpu
         );
         assert_eq!(
-            resolve_cuda_fallback(false, false, false),
+            resolve_ep_for_build("nonsense", None),
             ExecutionProvider::Cpu
         );
+    }
+
+    #[test]
+    fn device_selection_for_maps_per_ep() {
+        // OpenVINO reads a device-TYPE string.
+        assert_eq!(
+            device_selection_for(ExecutionProvider::OpenVino, Some("GPU.0")),
+            NativeDeviceSelection::OpenVinoDeviceType("GPU.0".to_string())
+        );
+        assert_eq!(
+            device_selection_for(ExecutionProvider::OpenVino, Some("  ")),
+            NativeDeviceSelection::Default
+        );
+        assert_eq!(
+            device_selection_for(ExecutionProvider::OpenVino, None),
+            NativeDeviceSelection::Default
+        );
+        // Index-based EPs parse an i32 adapter index.
+        for ep in [
+            ExecutionProvider::Cuda,
+            ExecutionProvider::TensorRt,
+            ExecutionProvider::DirectMl,
+            ExecutionProvider::WebGpu,
+        ] {
+            assert_eq!(
+                device_selection_for(ep, Some(" 1 ")),
+                NativeDeviceSelection::Index(1),
+                "{ep:?}"
+            );
+            // Unparseable / absent -> Default.
+            assert_eq!(
+                device_selection_for(ep, Some("GPU")),
+                NativeDeviceSelection::Default,
+                "{ep:?}"
+            );
+            assert_eq!(
+                device_selection_for(ep, None),
+                NativeDeviceSelection::Default,
+                "{ep:?}"
+            );
+        }
+        // CPU / CoreML ignore the id entirely.
+        assert_eq!(
+            device_selection_for(ExecutionProvider::Cpu, Some("3")),
+            NativeDeviceSelection::Default
+        );
+        assert_eq!(
+            device_selection_for(ExecutionProvider::CoreMl, Some("3")),
+            NativeDeviceSelection::Default
+        );
+    }
+
+    #[test]
+    fn decide_selection_keeps_runnable_and_falls_back_otherwise() {
+        // A healthy CUDA build with its runtime present is kept.
+        assert_eq!(
+            decide_selection("cuda13", ExecutionProvider::Cuda, false, true, false, false, true),
+            SelectionOutcome::Keep
+        );
+        // A CUDA build without the matching CUDA runtime -> CPU fallback.
+        assert_eq!(
+            decide_selection("cuda13", ExecutionProvider::Cuda, false, false, false, false, true),
+            SelectionOutcome::CpuFallback(FallbackReason::CudaRuntimeMissing)
+        );
+        // An OpenVINO build without an Intel device/runtime -> CPU fallback.
+        assert_eq!(
+            decide_selection("openvino", ExecutionProvider::OpenVino, false, false, false, false, true),
+            SelectionOutcome::CpuFallback(FallbackReason::OpenVinoRuntimeMissing)
+        );
+        // A WebGPU EP with no capable GPU -> CPU fallback.
+        assert_eq!(
+            decide_selection("webgpu", ExecutionProvider::WebGpu, false, false, false, false, true),
+            SelectionOutcome::CpuFallback(FallbackReason::WebGpuUnavailable)
+        );
+        // A WebGPU EP WITH a capable GPU is kept.
+        assert_eq!(
+            decide_selection("webgpu", ExecutionProvider::WebGpu, false, false, false, true, true),
+            SelectionOutcome::Keep
+        );
+        // An informational build with no EP -> CPU fallback (checked first).
+        assert_eq!(
+            decide_selection("qnn", ExecutionProvider::Cpu, true, false, false, false, true),
+            SelectionOutcome::CpuFallback(FallbackReason::NoRunnableProvider)
+        );
+        // An EP unsupported on this OS -> CPU fallback.
+        assert_eq!(
+            decide_selection("directml", ExecutionProvider::DirectMl, false, false, false, false, false),
+            SelectionOutcome::CpuFallback(FallbackReason::UnsupportedOnPlatform)
+        );
+        // A plain CPU build is always kept.
+        assert_eq!(
+            decide_selection("cpu", ExecutionProvider::Cpu, false, false, false, false, true),
+            SelectionOutcome::Keep
+        );
+    }
+
+    #[test]
+    fn native_scope_key_includes_build_provider_device_and_version() {
+        // Default device: `{build}:{provider}@{version}`.
+        assert_eq!(
+            native_scope_key("cpu", ExecutionProvider::Cpu, &NativeDeviceSelection::Default, "1.27.0"),
+            "cpu:cpu@1.27.0"
+        );
+        // Index device: `{build}:{provider}:{index}@{version}`.
+        assert_eq!(
+            native_scope_key(
+                "cuda13",
+                ExecutionProvider::Cuda,
+                &NativeDeviceSelection::Index(0),
+                "1.27.0"
+            ),
+            "cuda13:cuda:0@1.27.0"
+        );
+        // OpenVINO device type: folded into the provider segment.
+        assert_eq!(
+            native_scope_key(
+                "openvino",
+                ExecutionProvider::OpenVino,
+                &NativeDeviceSelection::OpenVinoDeviceType("GPU.0".to_string()),
+                "1.24.1"
+            ),
+            "openvino:openvino:GPU.0@1.24.1"
+        );
+        // Two builds sharing an onnxruntime version (webgpu & cpu are both 1.27.0) get
+        // DISTINCT scopes because the build is in the key.
+        let webgpu = native_scope_key(
+            "webgpu",
+            ExecutionProvider::WebGpu,
+            &NativeDeviceSelection::Default,
+            "1.27.0",
+        );
+        let cpu = native_scope_key(
+            "cpu",
+            ExecutionProvider::Cpu,
+            &NativeDeviceSelection::Default,
+            "1.27.0",
+        );
+        assert_ne!(webgpu, cpu);
+        assert!(webgpu.starts_with("webgpu:"));
+    }
+
+    #[test]
+    fn build_scope_version_reports_per_build_version() {
+        // On the linux x86_64 check host these builds have manifest entries.
+        assert_eq!(build_scope_version("cpu"), "1.27.0");
+        assert_eq!(build_scope_version("webgpu"), "1.27.0");
+        assert_eq!(build_scope_version("cuda12"), "1.24.1");
+        // A build with no entry on this platform (directml is Windows-only) falls back to
+        // ORT_VERSION rather than panicking.
+        assert_eq!(build_scope_version("directml"), onnx_runtime::ORT_VERSION);
+    }
+
+    #[test]
+    fn ort_dylib_committed_and_active_build_are_consistent() {
+        // No test loads a real ORT dylib (that needs a download), so the flag stays
+        // false in the test binary; regardless, active_build() is Some iff committed.
+        assert_eq!(active_build().is_some(), ort_dylib_committed());
     }
 
     #[test]

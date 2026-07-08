@@ -8,8 +8,11 @@ onnxruntime shared library is resolved at RUNTIME from a caller-supplied path an
 is never linked or downloaded at build time.
 
 Key types:
-- ExecutionProvider : the inference backend to request (CPU/DirectML/CoreML/CUDA)
-- OrtError          : typed error surface for load/warmup and inference failures
+- ExecutionProvider     : the inference backend to request
+  (CPU/DirectML/CoreML/CUDA/WebGPU/OpenVINO/TensorRT)
+- NativeDeviceSelection : accelerator selection (default / numeric index /
+  OpenVINO device-type string) applied to the EP when a session is built
+- OrtError              : typed error surface for load/warmup and inference failures
 - OrtRuntime        : a loaded, dylib-backed ort environment handle
 - MangaOcrEngine    : native MangaOCR encoder+decoder inference (see `manga_ocr`)
 - PaddleOcrEngine   : native PaddleOCR detection+recognition (see `paddle_ocr`)
@@ -65,14 +68,31 @@ pub enum ExecutionProvider {
     CoreMl,
     /// NVIDIA CUDA GPU backend; Linux and Windows.
     Cuda,
+    /// WebGPU GPU backend via Dawn (D3D12 on Windows, Vulkan on Linux, Metal on
+    /// macOS); a distinct cross-vendor GPU backend registered through ort's
+    /// standard append path.
+    WebGpu,
+    /// Intel OpenVINO backend (x86_64 Windows/Linux). Targets Intel CPUs, iGPUs,
+    /// dGPUs, and NPUs and needs an Intel device plus the OpenVINO runtime
+    /// available to onnxruntime (self-contained in the Linux OpenVINO wheel; a
+    /// system OpenVINO SDK on Windows). Its device is selected by a device-TYPE
+    /// string (`"CPU"`/`"GPU"`/`"GPU.0"`/`"NPU"`/`"HETERO:..."`), not a numeric
+    /// index — see [`NativeDeviceSelection::OpenVinoDeviceType`].
+    OpenVino,
+    /// NVIDIA TensorRT backend (Windows/Linux). Bundled in the CUDA ("gpu") build
+    /// and needs the same NVIDIA/CUDA stack as [`ExecutionProvider::Cuda`].
+    /// onnxruntime falls back per-node to CPU for TensorRT-unsupported ops. Its
+    /// adapter is selected by a numeric device id
+    /// ([`NativeDeviceSelection::Index`]).
+    TensorRt,
 }
 
 impl ExecutionProvider {
     /// Stable, lowercase identifier for this provider.
     ///
     /// Used as a scoping key for per-provider configuration; the returned values
-    /// (`"cpu"`, `"directml"`, `"coreml"`, `"cuda"`) are part of the crate's
-    /// contract and must not change.
+    /// (`"cpu"`, `"directml"`, `"coreml"`, `"cuda"`, `"webgpu"`, `"openvino"`,
+    /// `"tensorrt"`) are part of the crate's contract and must not change.
     #[must_use]
     pub fn id(self) -> &'static str {
         match self {
@@ -80,16 +100,37 @@ impl ExecutionProvider {
             ExecutionProvider::DirectMl => "directml",
             ExecutionProvider::CoreMl => "coreml",
             ExecutionProvider::Cuda => "cuda",
+            ExecutionProvider::WebGpu => "webgpu",
+            ExecutionProvider::OpenVino => "openvino",
+            ExecutionProvider::TensorRt => "tensorrt",
         }
     }
 
     /// Whether this provider can run on the platform this binary was built for.
     ///
     /// `DirectML` is Windows-only, Core ML is macOS-only, and CUDA is unavailable
-    /// on macOS; the CPU provider is always available. Higher layers use this to
-    /// query provider availability without duplicating the `cfg(target_os)` logic
-    /// (e.g. to decide which providers to offer). The result reflects the target
-    /// this binary was compiled for, evaluated at compile time.
+    /// on macOS; the CPU provider is always available. WebGPU runs on all three
+    /// desktop targets via Dawn (D3D12/Vulkan/Metal), so it is available on
+    /// Windows, Linux, and macOS. Higher layers use this to query provider
+    /// availability without duplicating the `cfg(target_os)` logic (e.g. to decide
+    /// which providers to offer). The result reflects the target this binary was
+    /// compiled for, evaluated at compile time.
+    ///
+    /// Note: rc.12's own `ort::ep::WebGPU::supported_by_platform` returns `false`
+    /// on macOS (it only counts Windows/Linux/wasm), but that predicate merely
+    /// governs ort's internal log verbosity — EP registration still goes through
+    /// the standard append path and works on macOS given a WebGPU-capable dylib.
+    /// This crate therefore reports macOS as available rather than mirroring ort's
+    /// log-only predicate.
+    ///
+    /// OpenVINO is limited to x86_64 Windows/Linux (mirroring ort's own
+    /// `OpenVINO::supported_by_platform`) and additionally requires an Intel device
+    /// plus the OpenVINO runtime reachable by onnxruntime (self-contained in the
+    /// Linux OpenVINO wheel; a system OpenVINO SDK on Windows) — availability here
+    /// only reflects the build target, not the presence of Intel hardware/runtime.
+    /// TensorRT mirrors CUDA (Windows/Linux, not macOS): it is bundled in the CUDA
+    /// ("gpu") build and needs the NVIDIA/CUDA stack; this predicate does not probe
+    /// for a working NVIDIA driver.
     #[must_use]
     pub fn is_available_on_current_platform(self) -> bool {
         match self {
@@ -97,6 +138,57 @@ impl ExecutionProvider {
             ExecutionProvider::DirectMl => cfg!(target_os = "windows"),
             ExecutionProvider::CoreMl => cfg!(target_os = "macos"),
             ExecutionProvider::Cuda => !cfg!(target_os = "macos"),
+            ExecutionProvider::WebGpu => {
+                cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+            }
+            ExecutionProvider::OpenVino => {
+                cfg!(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))
+            }
+            ExecutionProvider::TensorRt => {
+                cfg!(any(target_os = "windows", target_os = "linux"))
+            }
+        }
+    }
+}
+
+/// Accelerator selection applied to the execution provider when a session is built.
+///
+/// Different EPs identify a device differently, so this enum carries the shapes the
+/// crate supports rather than a single `i32`:
+/// - [`NativeDeviceSelection::Default`] — no explicit device; the EP picks its own
+///   default (adapter 0 for index-based EPs, OpenVINO's own default device).
+/// - [`NativeDeviceSelection::Index`] — a numeric adapter index, used by
+///   DirectML/CUDA/TensorRT/WebGPU via `with_device_id(i32)`.
+/// - [`NativeDeviceSelection::OpenVinoDeviceType`] — an OpenVINO device-TYPE string
+///   (`"CPU"`/`"GPU"`/`"GPU.0"`/`"NPU"`/`"HETERO:..."`), used only by OpenVINO via
+///   `with_device_type(&str)`.
+///
+/// Each `build_session` arm applies only the variant meaningful for its provider and
+/// ignores the others (e.g. CUDA ignores `OpenVinoDeviceType`; OpenVINO ignores
+/// `Index`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NativeDeviceSelection {
+    /// The execution provider's own default device (no explicit selection).
+    #[default]
+    Default,
+    /// A numeric accelerator adapter index (DirectML/CUDA/TensorRT/WebGPU).
+    Index(i32),
+    /// An OpenVINO device-TYPE string (e.g. `"GPU.0"`, `"NPU"`, `"HETERO:GPU,CPU"`).
+    OpenVinoDeviceType(String),
+}
+
+impl NativeDeviceSelection {
+    /// The numeric adapter index if this selection is [`NativeDeviceSelection::Index`],
+    /// otherwise `None`.
+    ///
+    /// Convenience for index-based providers (DirectML/CUDA/TensorRT/WebGPU); it
+    /// intentionally maps both [`NativeDeviceSelection::Default`] and
+    /// [`NativeDeviceSelection::OpenVinoDeviceType`] to `None` (no numeric adapter).
+    #[must_use]
+    pub fn index(&self) -> Option<i32> {
+        match self {
+            NativeDeviceSelection::Index(id) => Some(*id),
+            NativeDeviceSelection::Default | NativeDeviceSelection::OpenVinoDeviceType(_) => None,
         }
     }
 }
@@ -189,11 +281,13 @@ pub struct OrtRuntime {
     dylib_path: PathBuf,
     /// Execution provider this runtime was loaded for; applied to sessions later.
     provider: ExecutionProvider,
-    /// Accelerator adapter index applied to the EP when it is registered.
+    /// Accelerator selection applied to the EP when it is registered.
     ///
-    /// Meaningful only for DirectML/CUDA; ignored by CPU/CoreML. `None` requests
-    /// the provider's default device (adapter 0).
-    device_id: Option<i32>,
+    /// Meaningful only for the index-based EPs (DirectML/CUDA/TensorRT/WebGPU, which
+    /// read [`NativeDeviceSelection::Index`]) and OpenVINO (which reads
+    /// [`NativeDeviceSelection::OpenVinoDeviceType`]); ignored by CPU/CoreML.
+    /// [`NativeDeviceSelection::Default`] requests each provider's default device.
+    device: NativeDeviceSelection,
 }
 
 impl OrtRuntime {
@@ -205,11 +299,13 @@ impl OrtRuntime {
     /// in [`OrtRuntime::warmup`]. This never panics on a missing or invalid library:
     /// every failure is mapped to an [`OrtError`].
     ///
-    /// `device_id` is the accelerator adapter index applied to the execution
-    /// provider when the session is built (see [`OrtRuntime::build_session`]). It is
-    /// honored only by DirectML/CUDA and ignored by CPU/CoreML; `None` selects the
-    /// provider's default device (adapter 0). The value is stored on the returned
-    /// runtime and does not affect dylib loading here.
+    /// `device` selects the accelerator applied to the execution provider when the
+    /// session is built (see [`OrtRuntime::build_session`]). It is honored only by
+    /// the index-based EPs (DirectML/CUDA/TensorRT/WebGPU, via
+    /// [`NativeDeviceSelection::Index`]) and OpenVINO (via
+    /// [`NativeDeviceSelection::OpenVinoDeviceType`]); it is ignored by CPU/CoreML.
+    /// [`NativeDeviceSelection::Default`] selects each provider's default device. The
+    /// value is stored on the returned runtime and does not affect dylib loading here.
     ///
     /// # Errors
     /// - [`OrtError::UnsupportedProvider`] if `provider` cannot run on this platform.
@@ -219,7 +315,7 @@ impl OrtRuntime {
     pub fn load(
         dylib_path: &Path,
         provider: ExecutionProvider,
-        device_id: Option<i32>,
+        device: NativeDeviceSelection,
     ) -> Result<Self, OrtError> {
         ms_log::trace_log!(
             cat::STARTUP,
@@ -264,7 +360,7 @@ impl OrtRuntime {
         Ok(OrtRuntime {
             dylib_path: dylib_path.to_path_buf(),
             provider,
-            device_id,
+            device,
         })
     }
 
@@ -274,24 +370,33 @@ impl OrtRuntime {
         self.provider
     }
 
-    /// Accelerator adapter index this runtime applies to DirectML/CUDA sessions.
+    /// Accelerator selection this runtime applies when building sessions.
     ///
-    /// `None` means the provider's default device (adapter 0); the value is ignored
-    /// for the CPU and CoreML providers.
+    /// [`NativeDeviceSelection::Default`] means each provider's default device; the
+    /// value is ignored for the CPU and CoreML providers.
+    #[must_use]
+    pub fn device(&self) -> &NativeDeviceSelection {
+        &self.device
+    }
+
+    /// Convenience: the numeric adapter index for index-based providers, or `None`.
+    ///
+    /// Equivalent to `self.device().index()`; returns `None` for
+    /// [`NativeDeviceSelection::Default`] and [`NativeDeviceSelection::OpenVinoDeviceType`].
     #[must_use]
     pub fn device_id(&self) -> Option<i32> {
-        self.device_id
+        self.device.index()
     }
 
     /// Test-only constructor building an `OrtRuntime` handle without touching a
-    /// dylib, so accessor contracts (`provider`/`device_id`) can be asserted
+    /// dylib, so accessor contracts (`provider`/`device`) can be asserted
     /// deterministically without a real onnxruntime binary.
     #[cfg(test)]
-    fn for_test(provider: ExecutionProvider, device_id: Option<i32>) -> Self {
+    fn for_test(provider: ExecutionProvider, device: NativeDeviceSelection) -> Self {
         OrtRuntime {
             dylib_path: PathBuf::from("/test/only/no-dylib"),
             provider,
-            device_id,
+            device,
         }
     }
 
@@ -305,21 +410,33 @@ impl OrtRuntime {
     ///   Runtime uses its built-in CPU backend (byte-identical to the historical
     ///   MangaOCR session builder).
     /// - [`ExecutionProvider::DirectMl`] / [`ExecutionProvider::CoreMl`] /
-    ///   [`ExecutionProvider::Cuda`] register the matching EP with
-    ///   `error_on_failure()`, so a broken GPU setup surfaces as an
-    ///   [`OrtError::SessionBuild`] instead of silently falling back to CPU.
+    ///   [`ExecutionProvider::Cuda`] / [`ExecutionProvider::WebGpu`] /
+    ///   [`ExecutionProvider::OpenVino`] / [`ExecutionProvider::TensorRt`] register
+    ///   the matching EP with `error_on_failure()`, so a broken GPU/accelerator
+    ///   setup surfaces as an [`OrtError::SessionBuild`] instead of silently falling
+    ///   back to CPU. (TensorRT is registered alone; onnxruntime still falls back
+    ///   per-node to CPU for ops TensorRT cannot run — that is not an EP failure.)
     ///
-    /// The runtime's [`OrtRuntime::device_id`] selects the accelerator adapter for
-    /// DirectML/CUDA: when `Some(id)`, it is passed via `with_device_id(id)` (an
-    /// `i32` adapter index) so the EP targets that specific adapter; when `None`,
-    /// the EP is registered with `default()` (adapter 0 / the provider's default
-    /// device-selection path). CoreML and CPU ignore the device index.
+    /// The runtime's [`OrtRuntime::device`] selects the accelerator:
+    /// - DirectML/CUDA/TensorRT/WebGPU read [`NativeDeviceSelection::Index`]: when
+    ///   present, the `i32` adapter index is passed via `with_device_id(id)`;
+    ///   otherwise the EP is registered with `default()` (adapter 0 / the provider's
+    ///   default device-selection path).
+    /// - OpenVINO reads [`NativeDeviceSelection::OpenVinoDeviceType`]: when present,
+    ///   the device-TYPE string is passed via `with_device_type(s)`; otherwise
+    ///   OpenVINO chooses its own default device.
+    /// - CoreML and CPU ignore the device selection entirely.
     ///
-    /// The EP registration wrappers (`ort::ep::*ExecutionProvider`) are available
-    /// under the `load-dynamic` cargo feature alone; the per-EP cargo features
-    /// (`directml`/`coreml`/`cuda`) are intentionally NOT enabled (they conflict
-    /// with load-dynamic's `disable-linking`). The provider was already gated to
-    /// the current platform by [`OrtRuntime::load`], so no re-check is done here.
+    /// WebGPU additionally pins the Dawn backend to the platform's native GPU API
+    /// (D3D12 on Windows, Vulkan on Linux); on macOS no backend is set and Dawn
+    /// defaults to Metal (rc.12 exposes no `Metal` `DawnBackendType` variant).
+    ///
+    /// The EP registration wrappers (`ort::ep::*`) are available under the
+    /// `load-dynamic` cargo feature alone; the per-EP cargo features
+    /// (`directml`/`coreml`/`cuda`/`openvino`/`tensorrt`) are intentionally NOT
+    /// enabled (they conflict with load-dynamic's `disable-linking`). The provider
+    /// was already gated to the current platform by [`OrtRuntime::load`], so no
+    /// re-check is done here.
     ///
     /// # Errors
     /// [`OrtError::SessionBuild`] if the builder cannot be created, the execution
@@ -339,55 +456,111 @@ impl OrtRuntime {
                 reason: e.to_string(),
             })?;
 
-        // Exhaustive match: adding a provider variant must force a decision here.
-        let mut builder = match self.provider {
-            // CPU: register nothing — identical to the historical CPU-only builder.
-            ExecutionProvider::Cpu => builder,
-            ExecutionProvider::DirectMl => {
-                // `with_device_id` selects a specific adapter via the `_DML` append
-                // path; `default()` alone keeps the `_DML2` device-filter path, so
-                // only set the id when the caller requested a concrete adapter.
-                let ep = match self.device_id {
-                    Some(id) => ort::ep::DirectMLExecutionProvider::default()
-                        .with_device_id(id)
-                        .build()
-                        .error_on_failure(),
-                    None => ort::ep::DirectMLExecutionProvider::default().build().error_on_failure(),
-                };
+        // Register the committed provider (if any) and commit the session. CPU
+        // registers nothing, keeping the historical CPU-only builder byte-identical.
+        let mut builder = builder;
+        if let Some(ep) = self.execution_provider_dispatch() {
+            builder =
                 builder.with_execution_providers([ep]).map_err(|e| OrtError::SessionBuild {
                     path: model_path.to_path_buf(),
                     reason: e.to_string(),
-                })?
-            }
-            ExecutionProvider::CoreMl => builder
-                .with_execution_providers([
-                    ort::ep::CoreMLExecutionProvider::default().build().error_on_failure(),
-                ])
-                .map_err(|e| OrtError::SessionBuild {
-                    path: model_path.to_path_buf(),
-                    reason: e.to_string(),
-                })?,
-            ExecutionProvider::Cuda => {
-                // CUDA takes the adapter as its `device_id` provider option; leave it
-                // unset (`default()`) to fall back to onnxruntime's default device 0.
-                let ep = match self.device_id {
-                    Some(id) => ort::ep::CUDAExecutionProvider::default()
-                        .with_device_id(id)
-                        .build()
-                        .error_on_failure(),
-                    None => ort::ep::CUDAExecutionProvider::default().build().error_on_failure(),
-                };
-                builder.with_execution_providers([ep]).map_err(|e| OrtError::SessionBuild {
-                    path: model_path.to_path_buf(),
-                    reason: e.to_string(),
-                })?
-            }
-        };
+                })?;
+        }
 
         builder.commit_from_file(model_path).map_err(|e| OrtError::SessionBuild {
             path: model_path.to_path_buf(),
             reason: e.to_string(),
         })
+    }
+
+    /// Builds the ort execution-provider dispatch for this runtime's provider.
+    ///
+    /// Returns `None` for [`ExecutionProvider::Cpu`] (no EP is registered, so ONNX
+    /// Runtime uses its built-in CPU backend). For every other provider it returns
+    /// the matching `ort::ep::*` dispatch with `error_on_failure()` set and the
+    /// runtime's [`NativeDeviceSelection`] applied per the provider's device model
+    /// (numeric `Index` for DirectML/CUDA/TensorRT/WebGPU, device-TYPE string for
+    /// OpenVINO). See [`OrtRuntime::build_session`] for the full contract. The match
+    /// is exhaustive: a new provider variant must force a decision here.
+    fn execution_provider_dispatch(&self) -> Option<ort::ep::ExecutionProviderDispatch> {
+        match self.provider {
+            ExecutionProvider::Cpu => None,
+            ExecutionProvider::DirectMl => {
+                // `with_device_id` selects a specific adapter via the `_DML` append
+                // path; `default()` alone keeps the `_DML2` device-filter path, so
+                // only set the id when the caller requested a concrete adapter.
+                Some(match self.device.index() {
+                    Some(id) => ort::ep::DirectMLExecutionProvider::default()
+                        .with_device_id(id)
+                        .build()
+                        .error_on_failure(),
+                    None => ort::ep::DirectMLExecutionProvider::default().build().error_on_failure(),
+                })
+            }
+            ExecutionProvider::CoreMl => {
+                Some(ort::ep::CoreMLExecutionProvider::default().build().error_on_failure())
+            }
+            ExecutionProvider::Cuda => {
+                // CUDA takes the adapter as its `device_id` provider option; leave it
+                // unset (`default()`) to fall back to onnxruntime's default device 0.
+                Some(match self.device.index() {
+                    Some(id) => ort::ep::CUDAExecutionProvider::default()
+                        .with_device_id(id)
+                        .build()
+                        .error_on_failure(),
+                    None => ort::ep::CUDAExecutionProvider::default().build().error_on_failure(),
+                })
+            }
+            ExecutionProvider::TensorRt => {
+                // TensorRT takes the adapter as its `device_id` provider option; leave
+                // it unset (`default()`) to fall back to onnxruntime's default device.
+                // Registered alone: onnxruntime falls back per-node to CPU for ops
+                // TensorRT does not support (that is not an EP-registration failure).
+                Some(match self.device.index() {
+                    Some(id) => ort::ep::TensorRT::default()
+                        .with_device_id(id)
+                        .build()
+                        .error_on_failure(),
+                    None => ort::ep::TensorRT::default().build().error_on_failure(),
+                })
+            }
+            ExecutionProvider::OpenVino => {
+                // OpenVINO selects its device by a device-TYPE string, not a numeric
+                // index; apply it only when the caller provided one, otherwise leave
+                // OpenVINO to choose its own default device.
+                Some(match &self.device {
+                    NativeDeviceSelection::OpenVinoDeviceType(device_type) => {
+                        ort::ep::OpenVINO::default()
+                            .with_device_type(device_type)
+                            .build()
+                            .error_on_failure()
+                    }
+                    NativeDeviceSelection::Default | NativeDeviceSelection::Index(_) => {
+                        ort::ep::OpenVINO::default().build().error_on_failure()
+                    }
+                })
+            }
+            ExecutionProvider::WebGpu => {
+                let mut ep = ort::ep::WebGPUExecutionProvider::default();
+                // WebGPU takes the adapter as its `deviceId` provider option; leave
+                // it unset (`default()`) to fall back to the default adapter.
+                if let Some(id) = self.device.index() {
+                    ep = ep.with_device_id(id);
+                }
+                // Pin the Dawn backend to the platform's native GPU API. On macOS no
+                // backend is set: rc.12's `DawnBackendType` has only `Vulkan`/`D3D12`
+                // (no `Metal`), and Dawn defaults to Metal there.
+                #[cfg(target_os = "windows")]
+                {
+                    ep = ep.with_dawn_backend_type(ort::ep::webgpu::DawnBackendType::D3D12);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    ep = ep.with_dawn_backend_type(ort::ep::webgpu::DawnBackendType::Vulkan);
+                }
+                Some(ep.build().error_on_failure())
+            }
+        }
     }
 
     /// Forces ONNX Runtime environment initialization, executing real onnxruntime code.
@@ -423,7 +596,8 @@ mod tests {
         // A path that cannot exist on either check target. `load` must map this to
         // a typed error and never panic, and must not require a real onnxruntime.
         let missing = Path::new("/nonexistent/ms-onnx/does-not-exist/libonnxruntime.so");
-        let result = OrtRuntime::load(missing, ExecutionProvider::Cpu, None);
+        let result =
+            OrtRuntime::load(missing, ExecutionProvider::Cpu, NativeDeviceSelection::Default);
         assert!(matches!(result, Err(OrtError::LibraryNotFound(_))));
     }
 
@@ -434,27 +608,51 @@ mod tests {
         // is needed. Both check targets (linux-gnu, windows-gnu) are non-macOS.
         let any = Path::new("libonnxruntime.so");
         assert!(matches!(
-            OrtRuntime::load(any, ExecutionProvider::CoreMl, None),
+            OrtRuntime::load(any, ExecutionProvider::CoreMl, NativeDeviceSelection::Default),
             Err(OrtError::UnsupportedProvider("coreml"))
         ));
     }
 
     #[test]
-    fn device_id_accessor_round_trips_stored_value() {
-        // The accessor must return exactly what was stored, including `None`
-        // (default device) and a concrete adapter index, independent of provider.
-        assert_eq!(
-            OrtRuntime::for_test(ExecutionProvider::Cpu, None).device_id(),
-            None
-        );
-        assert_eq!(
-            OrtRuntime::for_test(ExecutionProvider::Cuda, Some(2)).device_id(),
-            Some(2)
-        );
-        let dml = OrtRuntime::for_test(ExecutionProvider::DirectMl, Some(-1));
+    fn device_accessor_round_trips_stored_selection() {
+        // `device()` must return exactly what was stored for every variant, and the
+        // `device_id()` convenience must project only `Index` to a numeric adapter.
+        let cpu = OrtRuntime::for_test(ExecutionProvider::Cpu, NativeDeviceSelection::Default);
+        assert_eq!(cpu.device(), &NativeDeviceSelection::Default);
+        assert_eq!(cpu.device_id(), None);
+
+        let cuda =
+            OrtRuntime::for_test(ExecutionProvider::Cuda, NativeDeviceSelection::Index(2));
+        assert_eq!(cuda.device(), &NativeDeviceSelection::Index(2));
+        assert_eq!(cuda.device_id(), Some(2));
+
         // A negative index is stored verbatim (interpretation is the EP's concern).
+        let dml = OrtRuntime::for_test(ExecutionProvider::DirectMl, NativeDeviceSelection::Index(-1));
         assert_eq!(dml.device_id(), Some(-1));
         assert_eq!(dml.provider(), ExecutionProvider::DirectMl);
+
+        // OpenVINO's device-type string round-trips through `device()` and does NOT
+        // project to a numeric adapter id.
+        let ov = OrtRuntime::for_test(
+            ExecutionProvider::OpenVino,
+            NativeDeviceSelection::OpenVinoDeviceType("GPU.0".to_string()),
+        );
+        assert_eq!(
+            ov.device(),
+            &NativeDeviceSelection::OpenVinoDeviceType("GPU.0".to_string())
+        );
+        assert_eq!(ov.device_id(), None);
+    }
+
+    #[test]
+    fn tensorrt_round_trips_numeric_index() {
+        // TensorRT is an index-based provider: its adapter selection projects through
+        // the `device_id()` convenience like DirectML/CUDA.
+        let trt =
+            OrtRuntime::for_test(ExecutionProvider::TensorRt, NativeDeviceSelection::Index(1));
+        assert_eq!(trt.device(), &NativeDeviceSelection::Index(1));
+        assert_eq!(trt.device_id(), Some(1));
+        assert_eq!(trt.provider(), ExecutionProvider::TensorRt);
     }
 
     #[test]
@@ -463,6 +661,9 @@ mod tests {
         assert_eq!(ExecutionProvider::DirectMl.id(), "directml");
         assert_eq!(ExecutionProvider::CoreMl.id(), "coreml");
         assert_eq!(ExecutionProvider::Cuda.id(), "cuda");
+        assert_eq!(ExecutionProvider::WebGpu.id(), "webgpu");
+        assert_eq!(ExecutionProvider::OpenVino.id(), "openvino");
+        assert_eq!(ExecutionProvider::TensorRt.id(), "tensorrt");
     }
 
     #[test]
@@ -475,8 +676,8 @@ mod tests {
     fn provider_availability_matches_current_target() {
         // The predicate reflects the compile-time target. Assert each provider
         // against this build's `cfg(target_os)` so both GNU check targets are
-        // covered (Windows: DirectML on, CoreML off, CUDA on; Linux: DirectML
-        // off, CoreML off, CUDA on).
+        // covered (Windows: DirectML on, CoreML off, CUDA on, WebGPU on; Linux:
+        // DirectML off, CoreML off, CUDA on, WebGPU on).
         assert_eq!(
             ExecutionProvider::DirectMl.is_available_on_current_platform(),
             cfg!(target_os = "windows")
@@ -489,5 +690,34 @@ mod tests {
             ExecutionProvider::Cuda.is_available_on_current_platform(),
             !cfg!(target_os = "macos")
         );
+        // WebGPU runs on all three desktop targets via Dawn.
+        assert_eq!(
+            ExecutionProvider::WebGpu.is_available_on_current_platform(),
+            cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"))
+        );
+        // OpenVINO: x86_64 Windows/Linux only (mirrors ort's own predicate).
+        assert_eq!(
+            ExecutionProvider::OpenVino.is_available_on_current_platform(),
+            cfg!(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))
+        );
+        // TensorRT: Windows/Linux, not macOS (mirrors CUDA).
+        assert_eq!(
+            ExecutionProvider::TensorRt.is_available_on_current_platform(),
+            cfg!(any(target_os = "windows", target_os = "linux"))
+        );
+    }
+
+    #[test]
+    fn native_device_selection_index_projection() {
+        // The `index()` helper projects only `Index`; `Default` and
+        // `OpenVinoDeviceType` carry no numeric adapter.
+        assert_eq!(NativeDeviceSelection::Default.index(), None);
+        assert_eq!(NativeDeviceSelection::Index(3).index(), Some(3));
+        assert_eq!(
+            NativeDeviceSelection::OpenVinoDeviceType("NPU".to_string()).index(),
+            None
+        );
+        // The default is `Default` (no explicit device).
+        assert_eq!(NativeDeviceSelection::default(), NativeDeviceSelection::Default);
     }
 }

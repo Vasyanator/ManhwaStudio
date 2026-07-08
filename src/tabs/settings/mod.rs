@@ -764,6 +764,40 @@ pub fn save_onnx_provider_device(
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
+/// Persists the selected ONNX Runtime BUILD slug under `General.ai_onnx_build` in
+/// `user_config.json`.
+///
+/// `build_slug` is a stable slug from the `onnx_runtime::builds` catalog (e.g. `"cpu"`,
+/// `"cuda13"`). It selects which onnxruntime binary the native runtime downloads/loads;
+/// the native path validates it against the catalog on load (unknown → per-OS default).
+/// Re-reads the file fresh, inserts only this key, and rewrites the whole file
+/// (mirroring [`save_ai_runtime`]). No fsync: an ordinary preference. Synchronous disk
+/// I/O: do not call from the GUI thread.
+// Wired into the "Билд" selector in `ai_backend_panel` (native runtime only).
+pub fn save_onnx_build(user_settings_file: &Path, build_slug: &str) -> Result<(), String> {
+    let _write_guard = lock_user_config_write();
+    let mut root = read_user_config_root(user_settings_file)?;
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err("Не удалось подготовить корень user_config.json.".to_string());
+    };
+    let mut general_obj = root_obj
+        .get("General")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    general_obj.insert(
+        config::GENERAL_AI_ONNX_BUILD_KEY.to_string(),
+        Value::String(build_slug.to_string()),
+    );
+    root_obj.insert("General".to_string(), Value::Object(general_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
 /// Persists the maximum-loaded-models limit under `General.ai_max_loaded_models` in
 /// `user_config.json`.
 ///

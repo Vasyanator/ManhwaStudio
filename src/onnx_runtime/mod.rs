@@ -19,10 +19,15 @@ Key functions:
 - resolve_or_download_ort_dylib: probe or download+verify+extract, worker-thread only
 
 Notes:
-Downloads and disk I/O are blocking; `resolve_or_download_ort_dylib` MUST run on a
-worker thread, never on the GUI thread. This module owns dylib RESOLUTION only; it
-never links, initializes, or runs onnxruntime — that is `ms-onnx`'s job, and it
-consumes the path returned here. Storage lives under `config::data_dir()`.
+The onnxruntime version is per manifest ENTRY, not global: the resolved cache dir
+and versioned library name come from the looked-up entry's `version` (WebGPU on
+1.27.0 coexists with the 1.20.1 providers). An entry may pull extra libraries from
+`additional_sources` (extra archives) into the same cache directory; the primary
+and every additional source share one download+verify+extract path. Downloads and
+disk I/O are blocking; `resolve_or_download_ort_dylib` MUST run on a worker thread,
+never on the GUI thread. This module owns dylib RESOLUTION only; it never links,
+initializes, or runs onnxruntime — that is `ms-onnx`'s job, and it consumes the
+path returned here. Storage lives under `config::data_dir()`.
 */
 
 use std::collections::{HashMap, HashSet};
@@ -38,9 +43,17 @@ use zip::ZipArchive;
 use crate::config;
 use crate::runtime_log;
 
+pub mod builds;
 mod manifest;
 
-pub use manifest::ORT_VERSION;
+// Build-catalog + manifest surface consumed by `native_runtime` (the guard-scope key
+// and the resolve call site) and, in the next task, by the AI backend panel's build
+// picker. `build_version` is the build-keyed primary; `provider_version` is the
+// back-compat shim mapping a provider to its default build. The allow suppresses the
+// unused-import warning only until the build-selection UI consumes `build_version`
+// directly.
+#[allow(unused_imports)]
+pub use manifest::{ORT_VERSION, build_version, provider_version};
 
 /// Read buffer size for streaming the archive download to disk.
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
@@ -60,18 +73,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// style) via `#[error]`; the wrapped strings add diagnostic context for logs.
 #[derive(Debug, thiserror::Error)]
 pub enum OrtRuntimeError {
-    /// No manifest row exists for this platform/provider (e.g. an unshipped GPU
-    /// provider). This is a hard error, never a silent CPU substitution.
+    /// No manifest row exists for this platform/build (e.g. a GPU build not shipped
+    /// on this OS). This is a hard error, never a silent CPU substitution.
     #[error(
-        "Для платформы {os}/{arch} и провайдера «{provider}» нет записи о библиотеке ONNX Runtime."
+        "Для платформы {os}/{arch} и сборки «{build}» нет записи о библиотеке ONNX Runtime."
     )]
     NoManifestEntry {
         /// Normalized OS key that was looked up.
         os: &'static str,
         /// Normalized architecture key that was looked up.
         arch: &'static str,
-        /// Provider id that was looked up.
-        provider: &'static str,
+        /// Build slug that was looked up.
+        build: String,
     },
 
     /// The archive could not be downloaded (network/transport/HTTP status).
@@ -131,25 +144,29 @@ pub struct OrtDownloadProgress {
     pub stage: OrtDownloadStage,
 }
 
-/// Portable per-provider, per-version cache directory for the onnxruntime library.
+/// Portable per-build, per-version cache directory for the onnxruntime library.
 ///
-/// Pure path construction: `data_dir()/onnxruntime/<provider_id>/<ort_version>/`.
-/// Creates nothing on disk.
+/// Pure path construction: `data_dir()/onnxruntime/<build_slug>/<ort_version>/`.
+/// Scoping by BUILD SLUG (not provider id) keeps builds that share a provider but
+/// differ by version — e.g. `cuda12` (1.24.1) and `cuda13` (1.27.0) — in separate
+/// cache directories. Creates nothing on disk.
 #[must_use]
-pub fn ort_dylib_dir(provider_id: &str, ort_version: &str) -> PathBuf {
+pub fn ort_dylib_dir(build_slug: &str, ort_version: &str) -> PathBuf {
     config::data_dir()
         .join("onnxruntime")
-        .join(provider_id)
+        .join(build_slug)
         .join(ort_version)
 }
 
-/// Resolves the onnxruntime library path for `provider`, downloading it on first use.
+/// Resolves the onnxruntime library path for BUILD `build`, downloading it on first use.
 ///
-/// Probes [`ort_dylib_dir`] for an already-extracted library and returns its path
-/// immediately (no network) if present. Otherwise it looks up the manifest entry
-/// for the current platform/provider, downloads the official archive, verifies its
-/// SHA256 (mismatch is a hard error — the bad file is deleted), extracts the
-/// loadable library into the cache directory, and returns the primary dylib path.
+/// `build` is a stable build slug from the [`builds`] catalog (e.g. `"cpu"`,
+/// `"cuda13"`, `"openvino"`). Probes [`ort_dylib_dir`] for an already-extracted
+/// library and returns its path immediately (no network) if present. Otherwise it
+/// looks up the manifest entry for the current platform and this build, downloads the
+/// official archive, verifies its SHA256 (mismatch is a hard error — the bad file is
+/// deleted), extracts the loadable library into the cache directory, and returns the
+/// primary dylib path.
 ///
 /// `progress` is invoked with stage/byte updates (throttled during download). It
 /// is called on the calling (worker) thread.
@@ -159,22 +176,44 @@ pub fn ort_dylib_dir(provider_id: &str, ort_version: &str) -> PathBuf {
 /// never from the GUI thread.
 ///
 /// # Errors
-/// - [`OrtRuntimeError::NoManifestEntry`] if no archive is pinned for this platform/provider.
+/// - [`OrtRuntimeError::NoManifestEntry`] if no archive is pinned for this platform/build.
 /// - [`OrtRuntimeError::Download`] on network/HTTP failure.
 /// - [`OrtRuntimeError::ChecksumMismatch`] if the archive fails SHA256 verification.
 /// - [`OrtRuntimeError::Extraction`] / [`OrtRuntimeError::DylibNotFoundInArchive`] on unpack failure.
 /// - [`OrtRuntimeError::Io`] on filesystem failure.
 pub fn resolve_or_download_ort_dylib(
-    provider: ms_onnx::ExecutionProvider,
+    build: &str,
     progress: &mut dyn FnMut(OrtDownloadProgress),
 ) -> Result<PathBuf, OrtRuntimeError> {
-    let provider_id = provider.id();
-    let dir = ort_dylib_dir(provider_id, ORT_VERSION);
-    let primary_name = expected_primary_dylib_filename(ORT_VERSION);
+    // The version is per-entry, so the manifest lookup must run BEFORE computing the
+    // cache dir and probing: each build resolves under its own version. The lookup is
+    // an in-memory scan (no network), and a cached library can only exist after a
+    // successful download (which requires an entry), so probing after the lookup never
+    // regresses the offline fast path.
+    let (os, arch) = manifest::current_platform();
+    let entry = manifest::lookup_build(os, arch, build).ok_or_else(|| {
+        OrtRuntimeError::NoManifestEntry {
+            os,
+            arch,
+            build: build.to_string(),
+        }
+    })?;
+
+    let provider_id = entry.provider.as_str();
+    let version = entry.version.as_str();
+    // Cache is scoped by BUILD SLUG so builds sharing a provider (cuda12 / cuda13) do
+    // not collide.
+    let dir = ort_dylib_dir(build, version);
+    let primary_name = expected_primary_dylib_filename(version);
     let primary_path = dir.join(&primary_name);
 
     emit(progress, OrtDownloadStage::Probing, 0, None);
-    if primary_path.is_file() {
+    // Fast path: skip the download only when EVERY expected member (primary +
+    // extras + every additional-source member) is already on disk. A partial cache
+    // (e.g. a prior run that failed before extracting an additional source) must
+    // fall through and re-fetch, so a missing sidecar is never silently ignored.
+    let expected_members = expected_member_paths(&dir, &primary_name, entry)?;
+    if expected_members.iter().all(|path| path.is_file()) {
         runtime_log::log_info(format!(
             "[onnx-runtime] found cached library for provider '{provider_id}' at {}",
             primary_path.display()
@@ -182,13 +221,6 @@ pub fn resolve_or_download_ort_dylib(
         emit(progress, OrtDownloadStage::Done, 0, None);
         return Ok(primary_path);
     }
-
-    let (os, arch) = manifest::current_platform();
-    let entry = manifest::lookup(os, arch, provider_id).ok_or(OrtRuntimeError::NoManifestEntry {
-        os,
-        arch,
-        provider: provider_id,
-    })?;
 
     fs::create_dir_all(&dir).map_err(|err| {
         OrtRuntimeError::Io(format!(
@@ -204,21 +236,24 @@ pub fn resolve_or_download_ort_dylib(
         ))
     })?;
 
-    let archive_name = archive_file_name(&entry.url);
-    let archive_path = download_dir.join(&archive_name);
-    let partial_path = download_dir.join(format!("{archive_name}.part"));
+    // Primary source: the onnxruntime archive itself. Its `dylib_member` is renamed
+    // to the version-scoped `primary_name`; `extra_members` keep their filenames.
+    let mut primary_wanted: HashMap<String, PathBuf> = HashMap::new();
+    primary_wanted.insert(entry.dylib_member.clone(), dir.join(&primary_name));
+    add_flattened_members(&mut primary_wanted, &entry.extra_members, &dir)?;
 
     runtime_log::log_info(format!(
-        "[onnx-runtime] downloading ONNX Runtime {ORT_VERSION} for provider '{provider_id}' from {}",
+        "[onnx-runtime] downloading ONNX Runtime {version} for provider '{provider_id}' from {}",
         entry.url
     ));
-    download_to(&entry.url, &partial_path, &archive_path, progress)?;
-
-    emit(progress, OrtDownloadStage::Verifying, 0, None);
-    verify_or_report_hash(entry, &archive_path)?;
-
-    emit(progress, OrtDownloadStage::Extracting, 0, None);
-    extract_members(&archive_path, entry, &dir, &primary_name)?;
+    fetch_source(
+        &entry.url,
+        &entry.sha256,
+        entry.archive,
+        &primary_wanted,
+        &download_dir,
+        progress,
+    )?;
 
     if !primary_path.is_file() {
         return Err(OrtRuntimeError::DylibNotFoundInArchive(
@@ -226,13 +261,23 @@ pub fn resolve_or_download_ort_dylib(
         ));
     }
 
-    // The archive is no longer needed once the library is extracted; a cleanup
-    // failure is non-fatal (the cache directory still holds a working library).
-    if let Err(err) = fs::remove_file(&archive_path) {
-        runtime_log::log_warn(format!(
-            "[onnx-runtime] failed to remove archive '{}': {err}",
-            archive_path.display()
+    // Additional sources: extra archives (e.g. sidecar runtime DLLs) extracted into
+    // the SAME cache directory via the exact same fetch path as the primary source.
+    for source in &entry.additional_sources {
+        let mut wanted: HashMap<String, PathBuf> = HashMap::new();
+        add_flattened_members(&mut wanted, &source.members, &dir)?;
+        runtime_log::log_info(format!(
+            "[onnx-runtime] downloading additional source for provider '{provider_id}' from {}",
+            source.url
         ));
+        fetch_source(
+            &source.url,
+            &source.sha256,
+            source.archive,
+            &wanted,
+            &download_dir,
+            progress,
+        )?;
     }
 
     runtime_log::log_info(format!(
@@ -243,14 +288,113 @@ pub fn resolve_or_download_ort_dylib(
     Ok(primary_path)
 }
 
+/// The on-disk paths of every library an entry is expected to place in `dir`.
+///
+/// Includes the primary library (as `primary_name`) plus each `extra_members` and
+/// `additional_sources` member, flattened to its filename. Used by the probe fast
+/// path to require a COMPLETE cache before skipping the download.
+///
+/// # Errors
+/// [`OrtRuntimeError::Extraction`] if any member path has no filename component.
+fn expected_member_paths(
+    dir: &Path,
+    primary_name: &str,
+    entry: &manifest::ManifestEntry,
+) -> Result<Vec<PathBuf>, OrtRuntimeError> {
+    let mut paths = vec![dir.join(primary_name)];
+    for member in &entry.extra_members {
+        paths.push(dir.join(member_file_name(member)?));
+    }
+    for source in &entry.additional_sources {
+        for member in &source.members {
+            paths.push(dir.join(member_file_name(member)?));
+        }
+    }
+    Ok(paths)
+}
+
+/// Inserts each `members` archive path into `wanted`, flattened to its filename in
+/// `dir` (so archive-path traversal is impossible).
+///
+/// # Errors
+/// [`OrtRuntimeError::Extraction`] if a member path has no filename component.
+fn add_flattened_members(
+    wanted: &mut HashMap<String, PathBuf>,
+    members: &[String],
+    dir: &Path,
+) -> Result<(), OrtRuntimeError> {
+    for member in members {
+        wanted.insert(member.clone(), dir.join(member_file_name(member)?));
+    }
+    Ok(())
+}
+
+/// The trailing filename of an archive-internal member path.
+///
+/// # Errors
+/// [`OrtRuntimeError::Extraction`] if `member` has no filename component.
+fn member_file_name(member: &str) -> Result<PathBuf, OrtRuntimeError> {
+    Path::new(member)
+        .file_name()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            OrtRuntimeError::Extraction(format!("некорректный путь элемента архива '{member}'"))
+        })
+}
+
+/// Downloads, verifies, and extracts one source archive into the cache directory.
+///
+/// Shared by the primary source and every additional source: streams `url` to a
+/// `.part` file, atomically renames it, verifies (or logs) its SHA256, extracts
+/// exactly the members in `wanted`, and removes the archive. `wanted` maps each
+/// archive-internal member path to its destination path in the cache directory.
+///
+/// # Errors
+/// - [`OrtRuntimeError::Download`] on network/HTTP failure.
+/// - [`OrtRuntimeError::ChecksumMismatch`] if a pinned SHA256 fails to match.
+/// - [`OrtRuntimeError::Extraction`] / [`OrtRuntimeError::DylibNotFoundInArchive`]
+///   if the archive cannot be unpacked or a wanted member is absent.
+/// - [`OrtRuntimeError::Io`] on filesystem failure.
+fn fetch_source(
+    url: &str,
+    sha256: &Option<String>,
+    archive: manifest::ArchiveKind,
+    wanted: &HashMap<String, PathBuf>,
+    download_dir: &Path,
+    progress: &mut dyn FnMut(OrtDownloadProgress),
+) -> Result<(), OrtRuntimeError> {
+    let archive_name = archive_file_name(url);
+    let archive_path = download_dir.join(&archive_name);
+    let partial_path = download_dir.join(format!("{archive_name}.part"));
+
+    download_to(url, &partial_path, &archive_path, progress)?;
+
+    emit(progress, OrtDownloadStage::Verifying, 0, None);
+    verify_or_report_hash(url, sha256, &archive_path)?;
+
+    emit(progress, OrtDownloadStage::Extracting, 0, None);
+    extract_wanted(&archive_path, archive, wanted)?;
+
+    // The archive is no longer needed once its libraries are extracted; a cleanup
+    // failure is non-fatal (the cache directory still holds the extracted files).
+    if let Err(err) = fs::remove_file(&archive_path) {
+        runtime_log::log_warn(format!(
+            "[onnx-runtime] failed to remove archive '{}': {err}",
+            archive_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Verifies the downloaded archive against its pinned hash, or — when no hash is
 /// pinned — logs a clear "integrity NOT verified" warning plus the actual digest
 /// so a maintainer can pin it. A mismatch deletes the file and aborts.
 fn verify_or_report_hash(
-    entry: &manifest::ManifestEntry,
+    url: &str,
+    sha256: &Option<String>,
     archive_path: &Path,
 ) -> Result<(), OrtRuntimeError> {
-    match &entry.sha256 {
+    match sha256 {
         Some(expected) => {
             if let Err(err) = manifest::verify_sha256_file(archive_path, expected) {
                 // Corrupt/tampered download: never proceed to extraction. Delete the
@@ -280,10 +424,9 @@ fn verify_or_report_hash(
             // condition for this gap; see MODULE_README).
             let actual = manifest::sha256_hex_of_file(archive_path)?;
             runtime_log::log_warn(format!(
-                "[onnx-runtime] integrity NOT verified for '{}' (no pinned SHA256). \
+                "[onnx-runtime] integrity NOT verified for '{url}' (no pinned SHA256). \
                  Downloaded archive SHA256 = {actual}. Pin this value in \
-                 src/onnx_runtime/ort_manifest.json to enable verification.",
-                entry.url
+                 src/onnx_runtime/ort_manifest.json to enable verification."
             ));
             Ok(())
         }
@@ -410,32 +553,23 @@ fn download_error(url: &str, err: ureq::Error) -> OrtRuntimeError {
     }
 }
 
-/// Extracts the primary library (renamed to `primary_out_name`) and every
-/// `extra_members` library from `archive_path` into `out_dir`.
+/// Extracts exactly the `wanted` members from `archive_path` into their mapped
+/// destination paths.
 ///
-/// Only the explicitly listed archive members are unpacked (so, e.g., the 300 MB
-/// Windows `.pdb` is never touched). Members are flattened to a controlled
-/// filename inside `out_dir`, so archive-path traversal is impossible; symlink and
-/// directory entries matching a member path are skipped in favor of the real file.
-fn extract_members(
+/// `wanted` maps each archive-internal member path to its destination path (already
+/// flattened to a controlled filename inside the cache directory, so archive-path
+/// traversal is impossible). Only the listed members are unpacked (so, e.g., the
+/// 300 MB Windows `.pdb` is never touched). Symlink and directory entries matching a
+/// member path are skipped in favor of the real file. Every wanted member must be
+/// present, or [`OrtRuntimeError::DylibNotFoundInArchive`] names the first missing one.
+fn extract_wanted(
     archive_path: &Path,
-    entry: &manifest::ManifestEntry,
-    out_dir: &Path,
-    primary_out_name: &str,
+    archive: manifest::ArchiveKind,
+    wanted: &HashMap<String, PathBuf>,
 ) -> Result<(), OrtRuntimeError> {
-    // Map archive-internal member path -> destination path in the cache dir.
-    let mut wanted: HashMap<String, PathBuf> = HashMap::new();
-    wanted.insert(entry.dylib_member.clone(), out_dir.join(primary_out_name));
-    for member in &entry.extra_members {
-        let file_name = Path::new(member).file_name().ok_or_else(|| {
-            OrtRuntimeError::Extraction(format!("некорректный путь элемента архива '{member}'"))
-        })?;
-        wanted.insert(member.clone(), out_dir.join(file_name));
-    }
-
     let mut found: HashSet<String> = HashSet::new();
 
-    match entry.archive {
+    match archive {
         manifest::ArchiveKind::Zip => {
             let file = File::open(archive_path).map_err(|err| {
                 OrtRuntimeError::Extraction(format!(
@@ -467,7 +601,7 @@ fn extract_members(
                     archive_path.display()
                 ))
             })?;
-            extract_tar_members(GzDecoder::new(file), &wanted, &mut found)?;
+            extract_tar_members(GzDecoder::new(file), wanted, &mut found)?;
         }
         manifest::ArchiveKind::TarZst => {
             let file = File::open(archive_path).map_err(|err| {
@@ -479,7 +613,7 @@ fn extract_members(
             let decoder = zstd::stream::read::Decoder::new(file).map_err(|err| {
                 OrtRuntimeError::Extraction(format!("не удалось открыть zstd-декодер: {err}"))
             })?;
-            extract_tar_members(decoder, &wanted, &mut found)?;
+            extract_tar_members(decoder, wanted, &mut found)?;
         }
     }
 
@@ -512,15 +646,21 @@ fn extract_tar_members<R: Read>(
         let path = entry.path().map_err(|err| {
             OrtRuntimeError::Extraction(format!("некорректный путь tar-элемента: {err}"))
         })?;
-        let key = path.to_string_lossy().replace('\\', "/");
-        if let Some(out_path) = wanted.get(key.as_str()) {
+        // Normalize separators and strip a leading `./`. GNU-tar-packed archives store
+        // members as `./onnxruntime-.../lib/...` (the onnxruntime 1.27.0 macOS archives
+        // do this; 1.20.1 did not), and the manifest `dylib_member`/`extra_members`
+        // paths are written without the `./` prefix. Stripping it here lets one clean
+        // manifest path match both archive styles.
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let key = normalized.strip_prefix("./").unwrap_or(&normalized);
+        if let Some(out_path) = wanted.get(key) {
             // Only the real regular file is wanted; the archive's `.so`/`.dylib`
             // symlinks point at it and are intentionally ignored.
             if !entry.header().entry_type().is_file() {
                 continue;
             }
             write_stream(&mut entry, out_path)?;
-            found.insert(key);
+            found.insert(key.to_string());
         }
     }
     Ok(())
@@ -633,22 +773,120 @@ mod tests {
     }
 
     #[test]
-    fn missing_provider_entry_yields_typed_error_without_network() {
-        // DirectML has no Linux archive (it is a Windows-only provider); on the
-        // Linux test host its resolution must fail with a typed no-entry error
-        // before any network access, and must not panic. (The cache dir for
-        // `directml` does not exist in a clean tree, so the probe misses and the
-        // lookup runs.) CUDA now resolves on Windows/Linux — that entry is asserted
-        // in the manifest tests.
-        let mut progress = |_p: OrtDownloadProgress| {};
-        let result =
-            resolve_or_download_ort_dylib(ms_onnx::ExecutionProvider::DirectMl, &mut progress);
+    fn member_file_name_flattens_and_rejects_empty() {
+        assert_eq!(
+            member_file_name("onnxruntime/capi/dxil.dll").expect("has filename"),
+            PathBuf::from("dxil.dll")
+        );
+        // A root path has no filename component (a trailing slash, by contrast, is
+        // stripped by `Path`, so `"bin/x64/"` would still yield `"x64"`).
         assert!(matches!(
-            result,
-            Err(OrtRuntimeError::NoManifestEntry {
-                provider: "directml",
-                ..
-            })
+            member_file_name("/"),
+            Err(OrtRuntimeError::Extraction(_))
+        ));
+    }
+
+    #[test]
+    fn expected_member_paths_covers_primary_extras_and_additional_sources() {
+        // Deserialize a multi-source entry and confirm the fast-path probe demands
+        // every library filename (primary + extras + additional-source members).
+        let json = r#"{
+            "os": "windows", "arch": "x86_64", "provider": "example", "build": "example",
+            "version": "9.9.9",
+            "url": "https://example/primary.zip",
+            "sha256": null,
+            "archive": "zip",
+            "dylib_member": "lib/primary.dll",
+            "extra_members": ["lib/side.dll"],
+            "additional_sources": [
+                { "url": "https://example/extra.zip", "sha256": null,
+                  "archive": "zip", "members": ["bin/x64/dxil.dll"] }
+            ]
+        }"#;
+        let entry: manifest::ManifestEntry =
+            serde_json::from_str(json).expect("entry parses");
+        let dir = Path::new("/cache");
+        let paths = expected_member_paths(dir, "primary.dll", &entry).expect("paths");
+        let names: HashSet<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            HashSet::from([
+                "primary.dll".to_string(),
+                "side.dll".to_string(),
+                "dxil.dll".to_string(),
+            ])
+        );
+        assert!(paths.iter().all(|p| p.starts_with(dir)));
+    }
+
+    #[test]
+    fn extract_wanted_pulls_only_listed_members_from_a_zip() {
+        use std::io::Write;
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        let base = std::env::temp_dir().join(format!("ort_extract_test_{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create test dir");
+        let zip_path = base.join("fixture.zip");
+
+        // Build a zip with three members; only two are wanted.
+        {
+            let file = File::create(&zip_path).expect("create zip");
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, body) in [
+                ("capi/onnxruntime.dll", b"primary".as_slice()),
+                ("capi/dxil.dll", b"dxil".as_slice()),
+                ("capi/ignored.txt", b"skip".as_slice()),
+            ] {
+                zip.start_file(name, opts).expect("start file");
+                zip.write_all(body).expect("write member");
+            }
+            zip.finish().expect("finish zip");
+        }
+
+        let out_dir = base.join("out");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        let mut wanted: HashMap<String, PathBuf> = HashMap::new();
+        wanted.insert(
+            "capi/onnxruntime.dll".to_string(),
+            out_dir.join("onnxruntime.dll"),
+        );
+        wanted.insert("capi/dxil.dll".to_string(), out_dir.join("dxil.dll"));
+
+        extract_wanted(&zip_path, manifest::ArchiveKind::Zip, &wanted).expect("extract");
+
+        assert_eq!(std::fs::read(out_dir.join("onnxruntime.dll")).unwrap(), b"primary");
+        assert_eq!(std::fs::read(out_dir.join("dxil.dll")).unwrap(), b"dxil");
+        // The unlisted member must NOT be extracted.
+        assert!(!out_dir.join("ignored.txt").exists());
+
+        // A wanted member absent from the archive is a hard error.
+        let mut missing: HashMap<String, PathBuf> = HashMap::new();
+        missing.insert("capi/absent.dll".to_string(), out_dir.join("absent.dll"));
+        assert!(matches!(
+            extract_wanted(&zip_path, manifest::ArchiveKind::Zip, &missing),
+            Err(OrtRuntimeError::DylibNotFoundInArchive(_))
+        ));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn missing_build_entry_yields_typed_error_without_network() {
+        // The `directml` build has no Linux archive (Windows-only); on the Linux test
+        // host its resolution must fail with a typed no-entry error before any network
+        // access, and must not panic. (The cache dir for `directml` does not exist in a
+        // clean tree, so the probe misses and the lookup runs.) The CUDA builds resolve
+        // on Windows/Linux — asserted in the manifest tests.
+        let mut progress = |_p: OrtDownloadProgress| {};
+        let result = resolve_or_download_ort_dylib("directml", &mut progress);
+        assert!(matches!(
+            &result,
+            Err(OrtRuntimeError::NoManifestEntry { build, .. }) if build == "directml"
         ));
     }
 }
