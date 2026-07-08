@@ -1255,6 +1255,12 @@ impl TranslationTabState {
         canvas: &mut CanvasView,
         project: &ProjectData,
     ) {
+        // Keep the native-ORT capability fresh for EVERY panel (not just OCR): the
+        // detector panel also gates algorithm buttons on onnx availability, so the
+        // native-armed signal must be published regardless of which panel is active.
+        // Throttled internally, so this is a cheap no-op most frames.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh_ocr_route_inputs_cache();
         match self.active_panel {
             TranslationPanel::Bubbles => {
                 let mut panel_ctx = BubblesPanelContext {
@@ -1459,7 +1465,6 @@ impl TranslationTabState {
                 let can_save =
                     !self.text_detector_results.is_empty() && !self.text_detection_storage_busy;
                 let ocr_busy = self.textdetector_ocr_is_running();
-                let torch_available = self.ai_backend_torch_available();
                 let actions = draw_text_detector_panel(
                     ui,
                     &mut self.text_detector_options,
@@ -1470,7 +1475,6 @@ impl TranslationTabState {
                     ocr_busy,
                     has_pages,
                     can_detect,
-                    torch_available,
                     can_ocr_current,
                     can_ocr_all,
                     can_save,

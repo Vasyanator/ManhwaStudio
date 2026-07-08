@@ -10,6 +10,9 @@ Main types:
 
 Flow:
 - `draw_text_detector_panel`: renders status, options and action buttons.
+- Algorithm selection uses frameless [`AiButton`] toggles (one per algorithm, wrapped
+  ~3 per row) that self-gate on each algorithm's runtime capability and show a runtime
+  marker; `Classic` has no runtime dependency and is a plain selectable.
 - AI mode advanced params keep CTD-specific quality/runtime knobs; shared mask
   dilation lives in the common section with other detector-wide options; device selection
   is configured globally in `Настройки -> ИИ бэкенд`.
@@ -17,9 +20,7 @@ Flow:
   детектора и режима редактирования маски.
 */
 
-use crate::widgets::{WheelComboBox, WheelSpinBox};
-
-const PYTORCH_UNAVAILABLE_HINT: &str = "PyTorch не установлен";
+use crate::widgets::{AiButton, AiRequirement, WheelSpinBox};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum TextDetectorAlgorithm {
@@ -29,6 +30,14 @@ pub enum TextDetectorAlgorithm {
     Ai,
     Surya,
 }
+
+/// Selectable detector algorithms in display order (wrapped ~3 per row).
+const DETECTOR_ALGORITHMS: [TextDetectorAlgorithm; 4] = [
+    TextDetectorAlgorithm::Classic,
+    TextDetectorAlgorithm::PaddleOcr,
+    TextDetectorAlgorithm::Ai,
+    TextDetectorAlgorithm::Surya,
+];
 
 impl TextDetectorAlgorithm {
     pub fn key(self) -> &'static str {
@@ -48,6 +57,77 @@ impl TextDetectorAlgorithm {
             TextDetectorAlgorithm::Surya => "Surya",
         }
     }
+}
+
+/// Runtime capability an algorithm's selection button gates on, or `None` when it
+/// has no local-runtime dependency (`Classic` is a pure local heuristic).
+/// `PaddleOCR` runs on onnxruntime (native or backend); `ComicTextDetector` and
+/// `Surya` run on PyTorch in the backend.
+fn algorithm_requirement(algorithm: TextDetectorAlgorithm) -> Option<AiRequirement> {
+    match algorithm {
+        TextDetectorAlgorithm::Classic => None,
+        TextDetectorAlgorithm::PaddleOcr => Some(AiRequirement::Onnx),
+        TextDetectorAlgorithm::Ai => Some(AiRequirement::Torch),
+        TextDetectorAlgorithm::Surya => Some(AiRequirement::Torch),
+    }
+}
+
+/// Short runtime marker badge for an algorithm ("Torch"/"ONNX"), or `None` for the
+/// dependency-free `Classic` algorithm.
+fn algorithm_marker(algorithm: TextDetectorAlgorithm) -> Option<&'static str> {
+    match algorithm {
+        TextDetectorAlgorithm::Classic => None,
+        TextDetectorAlgorithm::PaddleOcr => Some("ONNX"),
+        TextDetectorAlgorithm::Ai => Some("Torch"),
+        TextDetectorAlgorithm::Surya => Some("Torch"),
+    }
+}
+
+/// Descriptive hover text for an algorithm (moved off the removed "Алгоритм:" label
+/// onto each button).
+fn algorithm_hover(algorithm: TextDetectorAlgorithm) -> &'static str {
+    match algorithm {
+        TextDetectorAlgorithm::Classic => "Классический: быстрый локальный эвристический поиск.",
+        TextDetectorAlgorithm::PaddleOcr => {
+            "PaddleOCR: Paddle det-модель на onnxruntime с точной маской текста."
+        }
+        TextDetectorAlgorithm::Ai => {
+            "ComicTextDetector: CTD backend, медленнее, но часто лучше группирует сложные блоки."
+        }
+        TextDetectorAlgorithm::Surya => {
+            "Surya: low-level Surya detector через PyTorch backend, строит строки и бинарную маску из heatmap."
+        }
+    }
+}
+
+/// Renders one detector-algorithm selection button. Runtime algorithms use a
+/// frameless [`AiButton`] that self-gates on [`algorithm_requirement`] and shows a
+/// runtime marker; `Classic` (no requirement) is a plain frameless selectable.
+/// Returns `true` when the click selected this algorithm.
+fn algorithm_select_button(
+    ui: &mut egui::Ui,
+    selected: &mut TextDetectorAlgorithm,
+    algorithm: TextDetectorAlgorithm,
+) -> bool {
+    let is_selected = *selected == algorithm;
+    let response = match algorithm_requirement(algorithm) {
+        Some(requirement) => {
+            let mut btn = AiButton::new(algorithm.title(), requirement)
+                .selected(is_selected)
+                .frame(false);
+            if let Some(marker) = algorithm_marker(algorithm) {
+                btn = btn.marker(marker);
+            }
+            btn.draw(ui).response
+        }
+        None => ui.selectable_label(is_selected, algorithm.title()),
+    };
+    let response = response.on_hover_text(algorithm_hover(algorithm));
+    if response.clicked() {
+        *selected = algorithm;
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +188,6 @@ pub fn draw_text_detector_panel(
     ocr_busy: bool,
     has_pages: bool,
     can_detect: bool,
-    torch_available: Option<bool>,
     can_ocr_current: bool,
     can_ocr_all: bool,
     can_save: bool,
@@ -116,7 +195,6 @@ pub fn draw_text_detector_panel(
     edit_mask_mode: bool,
 ) -> TextDetectorPanelActions {
     let mut actions = TextDetectorPanelActions::default();
-    let torch_mode_available = torch_available.unwrap_or(true);
 
     ui.heading("Массовый детектор текста");
     ui.colored_label(status_color, status_text);
@@ -127,74 +205,17 @@ pub fn draw_text_detector_panel(
     }
     ui.separator();
 
-    ui.horizontal(|ui| {
-        ui.label("Алгоритм:").on_hover_text("Классический: быстрый локальный эвристический поиск.\nPaddleOCR: Python backend с Paddle det-моделью и точной маской текста.\nИИ: CTD backend, более медленный, но часто лучше группирует сложные блоки."
-            .to_owned()
-            + "\nSurya: low-level Surya detector через PyTorch backend, строит строки и бинарную маску из heatmap."
-            );
-        WheelComboBox::from_id_salt("translation_text_detector_algorithm")
-            .selected_text(options.algorithm.title())
-            .show_ui(ui, |ui| {
-                actions.options_changed |= ui
-                    .selectable_value(
-                        &mut options.algorithm,
-                        TextDetectorAlgorithm::Classic,
-                        TextDetectorAlgorithm::Classic.title(),
-                    )
-                    .changed();
-                actions.options_changed |= ui
-                    .selectable_value(
-                        &mut options.algorithm,
-                        TextDetectorAlgorithm::PaddleOcr,
-                        TextDetectorAlgorithm::PaddleOcr.title(),
-                    )
-                    .changed();
-                let response = ui.add_enabled(
-                    torch_mode_available,
-                    egui::Button::new(TextDetectorAlgorithm::Ai.title())
-                        .selected(options.algorithm == TextDetectorAlgorithm::Ai),
-                );
-                let response = if torch_mode_available {
-                    response
-                } else {
-                    response.on_disabled_hover_text(
-                        egui::RichText::new(PYTORCH_UNAVAILABLE_HINT)
-                            .color(egui::Color32::from_rgb(240, 102, 102)),
-                    )
-                };
-                if response.clicked() {
-                    options.algorithm = TextDetectorAlgorithm::Ai;
-                    actions.options_changed = true;
-                }
-                let response = ui.add_enabled(
-                    torch_mode_available,
-                    egui::Button::new(TextDetectorAlgorithm::Surya.title())
-                        .selected(options.algorithm == TextDetectorAlgorithm::Surya),
-                );
-                let response = if torch_mode_available {
-                    response
-                } else {
-                    response.on_disabled_hover_text(
-                        egui::RichText::new(PYTORCH_UNAVAILABLE_HINT)
-                            .color(egui::Color32::from_rgb(240, 102, 102)),
-                    )
-                };
-                if response.clicked() {
-                    options.algorithm = TextDetectorAlgorithm::Surya;
-                    actions.options_changed = true;
-                }
-            });
+    // Algorithm selector: frameless self-gating toggle buttons (no "Алгоритм:"
+    // label so ~3 fit per row). Each runtime algorithm shows its marker and disables
+    // with its reason when unavailable; the currently-selected disabled algorithm's
+    // action is additionally covered by the `can_detect` hint below.
+    ui.horizontal_wrapped(|ui| {
+        for algorithm in DETECTOR_ALGORITHMS {
+            if algorithm_select_button(ui, &mut options.algorithm, algorithm) {
+                actions.options_changed = true;
+            }
+        }
     });
-    if matches!(
-        options.algorithm,
-        TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya
-    ) && !torch_mode_available
-    {
-        ui.colored_label(
-            egui::Color32::from_rgb(240, 102, 102),
-            PYTORCH_UNAVAILABLE_HINT,
-        );
-    }
 
     actions.options_changed |= ui
         .checkbox(&mut options.draw_lines, "Показывать найденные блоки")
@@ -401,4 +422,59 @@ pub fn draw_text_detector_panel(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AiRequirement, DETECTOR_ALGORITHMS, TextDetectorAlgorithm, algorithm_marker,
+        algorithm_requirement,
+    };
+
+    #[test]
+    fn algorithm_requirements_match_runtime() {
+        assert_eq!(algorithm_requirement(TextDetectorAlgorithm::Classic), None);
+        assert_eq!(
+            algorithm_requirement(TextDetectorAlgorithm::PaddleOcr),
+            Some(AiRequirement::Onnx)
+        );
+        assert_eq!(
+            algorithm_requirement(TextDetectorAlgorithm::Ai),
+            Some(AiRequirement::Torch)
+        );
+        assert_eq!(
+            algorithm_requirement(TextDetectorAlgorithm::Surya),
+            Some(AiRequirement::Torch)
+        );
+    }
+
+    #[test]
+    fn algorithm_markers_present_only_for_runtime_algorithms() {
+        assert_eq!(algorithm_marker(TextDetectorAlgorithm::Classic), None);
+        assert_eq!(
+            algorithm_marker(TextDetectorAlgorithm::PaddleOcr),
+            Some("ONNX")
+        );
+        assert_eq!(algorithm_marker(TextDetectorAlgorithm::Ai), Some("Torch"));
+        assert_eq!(algorithm_marker(TextDetectorAlgorithm::Surya), Some("Torch"));
+    }
+
+    #[test]
+    fn every_algorithm_is_listed_once() {
+        assert_eq!(DETECTOR_ALGORITHMS.len(), 4);
+        for algorithm in [
+            TextDetectorAlgorithm::Classic,
+            TextDetectorAlgorithm::PaddleOcr,
+            TextDetectorAlgorithm::Ai,
+            TextDetectorAlgorithm::Surya,
+        ] {
+            assert_eq!(
+                DETECTOR_ALGORITHMS
+                    .iter()
+                    .filter(|&&a| a == algorithm)
+                    .count(),
+                1
+            );
+        }
+    }
 }
