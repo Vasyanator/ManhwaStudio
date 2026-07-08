@@ -51,7 +51,7 @@ use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::ProjectData;
 use crate::tabs::translation::backend_health::AiBackendHealthSnapshot;
-use crate::widgets::{WheelComboBox, WheelSlider};
+use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Pos2, Rect};
 use std::collections::VecDeque;
@@ -107,7 +107,6 @@ const AUTOCLEAN_BOX_INK_LIMIT: f32 = 0.45;
 /// Объединять компоненты текста, чьи пиксели в пределах стольких пикселей.
 const AUTOCLEAN_CLUSTER_SLACK: usize = 4;
 const SAVE_HINT_TEXT: &str = "Сохранение...";
-const PYTORCH_UNAVAILABLE_HINT: &str = "PyTorch не установлен";
 const FLOATING_PANEL_MARGIN: f32 = 12.0;
 /// Дополнительный отступ панели инструментов от правого края вьюпорта, чтобы
 /// плавающее окно не перекрывало вертикальный скроллбар холста.
@@ -543,9 +542,12 @@ impl CleaningTabState {
     }
 
     fn tool_available(&self, idx: usize) -> bool {
-        self.tools
-            .get(idx)
-            .is_some_and(|tool| !tool.pytorch_required() || self.ai_backend_torch_available())
+        // PyTorch tools gate on the process-global Torch capability (strict), the
+        // same signal their `AiButton` selection buttons use, so the active-tool
+        // auto-switch and the button enabled state stay in agreement.
+        self.tools.get(idx).is_some_and(|tool| {
+            !tool.pytorch_required() || AiRequirement::Torch.satisfied(&AiCaps::current())
+        })
     }
 
     fn first_available_tool_idx(&self) -> Option<usize> {
@@ -754,20 +756,25 @@ impl CleaningTabState {
                     let Some(label) = self.tool_labels.get(idx) else {
                         continue;
                     };
-                    let is_available = self.tool_available(idx);
-                    let response = ui.add_enabled(
-                        is_available,
-                        egui::Button::new(label.as_str()).selected(*activate_tool_idx == idx),
-                    );
-                    let response = if is_available {
-                        response
+                    let is_selected = *activate_tool_idx == idx;
+                    let requires_pytorch =
+                        self.tools.get(idx).is_some_and(|tool| tool.pytorch_required());
+                    // AI tools use a self-gating `AiButton` (Torch requirement, framed
+                    // to match the plain tool buttons) with a "Torch" runtime marker;
+                    // it disables itself and shows the reason when Torch is
+                    // unavailable. Non-AI tools stay plain always-enabled buttons.
+                    let clicked = if requires_pytorch {
+                        AiButton::new(label.as_str(), AiRequirement::Torch)
+                            .selected(is_selected)
+                            .marker("Torch")
+                            .draw(ui)
+                            .response
+                            .clicked()
                     } else {
-                        response.on_disabled_hover_text(
-                            egui::RichText::new(PYTORCH_UNAVAILABLE_HINT)
-                                .color(egui::Color32::from_rgb(240, 102, 102)),
-                        )
+                        ui.add(egui::Button::new(label.as_str()).selected(is_selected))
+                            .clicked()
                     };
-                    if response.clicked() {
+                    if clicked {
                         *activate_tool_idx = idx;
                     }
                 }
