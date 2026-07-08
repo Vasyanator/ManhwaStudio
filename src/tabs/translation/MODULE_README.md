@@ -41,6 +41,40 @@ the OCR panel so the side panel stays narrow.
 AI API OCR bypasses the Python backend and uses Rust `genai` from the OCR worker thread; provider
 API keys must be read/written through the OS credential store and never persisted to project or
 user JSON settings.
+The native ONNX Runtime OCR path (MangaOCR + PaddleOCR) is selected in `ocr.rs` by the pure
+`ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope SIGILL
+guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
+routes to `NativeManga`, and PaddleOCR routes to `NativePaddle` (any language); every other case
+(other engines, torch-only model, Suspect guard, backend runtime) routes to the Python backend. On
+the native route the OCR worker decodes the crop to RGBA and calls
+`crate::native_runtime::recognize_manga` / `recognize_paddle` (desktop-only), assembling lines/text
+with the same `join_newlines`/`reflect_strings` rules as the backend (Paddle's lines are joined with
+`\n` first). The guard scope uses `native_runtime::native_load_scope_key()` (provider[:device]) so the
+pre-check matches the provider/adapter that will actually load. Native PaddleOCR text detection is selected in `text_detector.rs`
+by `detector_native_route` (native runtime + non-Suspect guard): `detect_page_paddle_ocr` and the
+inline `detect_paddle_mask_for_image` call `native_runtime::detect_paddle` and build the same
+`TextDetectorPageResult`/mask the backend produces (xyxy blocks sorted y1,x1 truncated to 2500;
+glyph mask normalized to 0/255, oversized masks over `MAX_MASK_PIXELS` rejected → backend fallback).
+A native error (OCR or detection) is always logged. On the OCR recognize dispatch it falls back to
+the backend ONLY when the backend is up; when the backend is offline the native path is the only
+path, so `run_recognize_command` surfaces the real native error (`Нативный ONNX: <reason>` from
+`NativeRuntimeError`) instead of the misleading "backend offline" string
+(`try_native_ocr` → `NativeOcrOutcome`, `native_failure_should_surface`). These paths are compiled
+out on the web build.
+Native OCR/detection run WITHOUT the Python backend: BOTH the controller readiness gate AND the UI
+trigger gate are route-aware. `ocr.rs::warmup_ocr_engine` and `text_detector.rs::run_detect_batch`
+skip `ensure_v2_backend_ready` (and the backend warmup) when the active route is native — the
+in-process runtime/model load lazily on first use and the controller reaches `Ready` with the
+backend offline. The UI trigger gate `ocr::ocr_requires_backend(engine, model, runtime, guard)` is
+the single source of truth for "does this OCR selection need the backend?": native ONNX routes
+return `false`, backend routes and `AiApi` (over `genai`) preserve their historical behavior;
+`tab.rs::ocr_requires_backend_runtime` calls it, reading the runtime+guard from a per-tab cache
+refreshed at most every `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks on disk I/O.
+Every OCR trigger (drag-box, advanced/quick recognize, the load button, the proactive health check)
+consults it, so a native selection dispatches with the backend offline. Only backend routes warm
+the backend and probe backend health. The native→backend fallback still applies when native
+inference fails AND the backend is up (the fallback path re-checks readiness itself); native no
+longer requires the backend to run.
 AI API MT also bypasses the Python backend. Plain untranslated text batches are sent grouped by
 character and require flat JSON responses containing every bubble ID. When the "existing translation
 in context" option is on, a scope translation also includes already-translated replicas as ordered

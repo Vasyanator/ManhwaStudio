@@ -32,6 +32,12 @@ Backend helpers (v2 framed IPC):
 use crate::backend_ipc::{self, CallError};
 use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
 use crate::{ai_models, config};
+// Native ONNX Runtime PaddleOCR text detector (desktop-only: the native runtime
+// depends on `ms-onnx`/`ort`, which are not part of the web build).
+#[cfg(not(target_arch = "wasm32"))]
+use crate::native_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::onnx_runtime::OrtDownloadProgress;
 use eframe::egui;
 use image::imageops::FilterType;
 use image::{ColorType, ImageEncoder};
@@ -324,13 +330,14 @@ fn run_detect_batch(
 ) {
     let total = pages.len();
     let _ = evt_tx.send(WorkerEvent::DetectStarted { total, replace });
-    if matches!(
-        &mode,
-        TextDetectorRunMode::AiCtd(_)
-            | TextDetectorRunMode::PaddleOcr(_)
-            | TextDetectorRunMode::Surya(_)
-    ) && let Err(error) = ensure_v2_backend_ready()
-    {
+    // Backend readiness gate — route-aware for PaddleOCR. AiCtd and Surya have no
+    // native path and always need the Python backend; classic detection is fully
+    // local. PaddleOCR skips the backend when the native ONNX Runtime route is active
+    // (native detection loads lazily and runs without the backend). This is what lets
+    // native PaddleOCR detection run with the backend offline; a per-page native
+    // failure still falls back to the backend via `detect_page_paddle_ocr` when the
+    // backend IS up (that path re-checks readiness itself).
+    if detector_mode_needs_backend(&mode) && let Err(error) = ensure_v2_backend_ready() {
         let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
         return;
     }
@@ -367,6 +374,36 @@ fn run_detect_batch(
         total_blocks,
         failed_pages,
     });
+}
+
+/// Whether a detector mode needs the Python backend warmed at batch start.
+///
+/// `Classic` is fully local. `AiCtd`/`Surya` have no native path and always need the
+/// backend. `PaddleOcr` needs the backend only when the native ONNX Runtime route is
+/// NOT active — under the native route detection loads lazily and runs without the
+/// backend. On the web build there is no native runtime, so PaddleOCR always needs
+/// the backend. Worker-thread only (reads the route off disk on desktop).
+fn detector_mode_needs_backend(mode: &TextDetectorRunMode) -> bool {
+    match mode {
+        TextDetectorRunMode::Classic => false,
+        TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => true,
+        TextDetectorRunMode::PaddleOcr(_) => paddle_detection_needs_backend(),
+    }
+}
+
+/// Whether PaddleOCR text detection currently needs the Python backend.
+///
+/// `false` when the native route is active (desktop, native runtime + Safe guard);
+/// always `true` on the web build, which has no native runtime.
+fn paddle_detection_needs_backend() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        current_detector_route() == DetectorRoute::Backend
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        true
+    }
 }
 
 fn ensure_detector_models_for_mode(
@@ -500,10 +537,201 @@ fn detect_page_classic(path: &PathBuf) -> Result<TextDetectorPageResult, String>
     })
 }
 
+/// Where a native PaddleOCR text-detection attempt should run.
+///
+/// Target-neutral so the decision helper is unit-testable on every build.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectorRoute {
+    /// Run natively via the in-process ONNX Runtime PaddleOCR detector.
+    Native,
+    /// Run through the Python backend (the historical path).
+    Backend,
+}
+
+/// Pure routing decision for a native PaddleOCR text-detection attempt.
+///
+/// Returns [`DetectorRoute::Native`] only when the user selected the native AI
+/// runtime AND the per-scope SIGILL load guard is not `Suspect`; every other case
+/// routes to [`DetectorRoute::Backend`]. Mirrors `ocr::ocr_route` for detection.
+#[cfg(not(target_arch = "wasm32"))]
+fn detector_native_route(
+    runtime: config::AiRuntime,
+    guard: config::OrtLoadDecision,
+) -> DetectorRoute {
+    if runtime == config::AiRuntime::Native && guard == config::OrtLoadDecision::Safe {
+        DetectorRoute::Native
+    } else {
+        DetectorRoute::Backend
+    }
+}
+
+/// Reads the native runtime selection + SIGILL guard (scoped to the effective
+/// native provider) fresh off disk and returns the detection route. Worker-thread
+/// only (disk I/O). Returns [`DetectorRoute::Backend`] when config cannot be read.
+#[cfg(not(target_arch = "wasm32"))]
+fn current_detector_route() -> DetectorRoute {
+    let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
+    let runtime = config::AiRuntime::from_user_settings(&cfg);
+    let scope = native_runtime::native_load_scope_key();
+    let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
+    detector_native_route(runtime, decision)
+}
+
+/// Attempts native PaddleOCR detection of `path`, decoding the page to RGBA.
+///
+/// Returns `Some(Ok/Err)` only when the native route applies (so the caller uses
+/// the native outcome) or native inference failed after being attempted. Returns
+/// `None` when the route is not native (the caller should use the backend). On a
+/// native failure it returns `None` too, so the caller falls back to the backend
+/// and the user still gets a result (the failure is logged, never hidden).
+#[cfg(not(target_arch = "wasm32"))]
+fn try_native_paddle_detect_page(path: &Path) -> Option<TextDetectorPageResult> {
+    if current_detector_route() == DetectorRoute::Backend {
+        return None;
+    }
+    let image = match image::open(path) {
+        Ok(img) => img.to_rgba8(),
+        Err(err) => {
+            crate::runtime_log::log_error(format!(
+                "[text-detector] native Paddle: failed to open {} ({err}); using backend",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let mut progress = |_snapshot: OrtDownloadProgress| {};
+    match native_runtime::detect_paddle(&image, &mut progress) {
+        Ok(detection) => match paddle_detection_to_page_result(detection) {
+            Ok(result) => Some(result),
+            Err(err) => {
+                // Oversized mask (or similar) rejected: fall back to the backend so
+                // the user still gets a result; the reason is logged, never hidden.
+                crate::runtime_log::log_error(format!(
+                    "[text-detector] native Paddle result for {} rejected, falling back to backend: {err}",
+                    path.display()
+                ));
+                None
+            }
+        },
+        Err(err) => {
+            crate::runtime_log::log_error(format!(
+                "[text-detector] native Paddle detection failed for {}, falling back to backend: {err}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
+/// Builds a [`TextDetectorPageResult`] from a native [`PaddleDetection`], matching
+/// the shape the backend `parse_v2_text_detector_response` produces: xyxy blocks
+/// sorted (y1, x1, y2, x2) and truncated to 2500, plus the glyph mask normalized
+/// to 0/255 at source size.
+#[cfg(not(target_arch = "wasm32"))]
+fn paddle_detection_to_page_result(
+    detection: ms_onnx::PaddleDetection,
+) -> Result<TextDetectorPageResult, String> {
+    let (src_w, src_h) = detection.source_size;
+    let mut blocks: Vec<TextDetectorRect> = detection
+        .blocks
+        .into_iter()
+        .filter_map(|b| TextDetectorRect::from_xyxy(b[0], b[1], b[2], b[3]))
+        .collect();
+    blocks.sort_by(|a, b| {
+        a.y1.total_cmp(&b.y1)
+            .then_with(|| a.x1.total_cmp(&b.x1))
+            .then_with(|| a.y2.total_cmp(&b.y2))
+            .then_with(|| a.x2.total_cmp(&b.x2))
+    });
+    if blocks.len() > 2500 {
+        blocks.truncate(2500);
+    }
+    let (mask_size, mask_alpha) = glyph_mask_into_alpha(detection.glyph_mask)?;
+    Ok(TextDetectorPageResult {
+        source_size: [src_w, src_h],
+        blocks,
+        mask_size,
+        mask_alpha,
+    })
+}
+
+/// Consumes a PaddleOCR glyph mask into `([w, h], alpha)` with each pixel
+/// normalized to 0/255 (matching the backend `parse_mask_alpha_from_blob` output).
+///
+/// # Errors
+/// Returns an error when the mask exceeds [`MAX_MASK_PIXELS`], mirroring the backend
+/// path's oversized-mask guard so the native and backend paths have equal
+/// robustness. The caller treats the error as a backend fallback.
+#[cfg(not(target_arch = "wasm32"))]
+fn glyph_mask_into_alpha(mask: image::GrayImage) -> Result<([u32; 2], Vec<u8>), String> {
+    let (w, h) = mask.dimensions();
+    if w == 0 || h == 0 {
+        return Ok(([0, 0], Vec::new()));
+    }
+    // Same oversized-mask bound the backend path applies (see
+    // `parse_mask_alpha_from_blob`): reject pathological masks with a typed error
+    // instead of normalizing an unbounded buffer.
+    let pixels = (w as usize).saturating_mul(h as usize);
+    if pixels > MAX_MASK_PIXELS {
+        return Err(format!(
+            "Нативный детектор текста: размер маски слишком большой ({w}x{h})"
+        ));
+    }
+    let mut alpha = mask.into_raw();
+    for px in &mut alpha {
+        *px = if *px == 0 { 0 } else { 255 };
+    }
+    Ok(([w, h], alpha))
+}
+
+/// Attempts native PaddleOCR detection on an in-memory `image`, returning only the
+/// glyph mask as `([w, h], alpha)` (the caller applies dilation).
+///
+/// Returns `None` when the native route does not apply or native detection failed
+/// (logged), so the caller falls back to the backend. Worker-thread only.
+#[cfg(not(target_arch = "wasm32"))]
+fn try_native_paddle_mask_for_image(image: &egui::ColorImage) -> Option<([u32; 2], Vec<u8>)> {
+    if current_detector_route() == DetectorRoute::Backend {
+        return None;
+    }
+    let width = u32::try_from(image.size[0]).ok()?;
+    let height = u32::try_from(image.size[1]).ok()?;
+    let raw: Vec<u8> = image.pixels.iter().flat_map(|px| px.to_array()).collect();
+    let rgba = image::RgbaImage::from_raw(width, height, raw)?;
+
+    let mut progress = |_snapshot: OrtDownloadProgress| {};
+    match native_runtime::detect_paddle(&rgba, &mut progress) {
+        Ok(detection) => match glyph_mask_into_alpha(detection.glyph_mask) {
+            Ok(mask) => Some(mask),
+            Err(err) => {
+                // Oversized mask rejected: fall back to the backend (logged).
+                crate::runtime_log::log_error(format!(
+                    "[text-detector] native Paddle mask rejected, falling back to backend: {err}"
+                ));
+                None
+            }
+        },
+        Err(err) => {
+            crate::runtime_log::log_error(format!(
+                "[text-detector] native Paddle mask detection failed, falling back to backend: {err}"
+            ));
+            None
+        }
+    }
+}
+
 fn detect_page_paddle_ocr(
     path: &Path,
     _options: &TextDetectorPaddleOcrOptions,
 ) -> Result<TextDetectorPageResult, String> {
+    // Native ONNX Runtime route first. When it applies and succeeds we return the
+    // native result without touching IPC; otherwise we fall through to the backend.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(result) = try_native_paddle_detect_page(path) {
+        return Ok(result);
+    }
+
     ai_models::ensure_paddle_ocr_detector(&config::models_dir())?;
     // Send the on-disk path as a header field; blob is empty.
     let header_fields = json!({
@@ -592,6 +820,15 @@ pub(crate) fn detect_paddle_mask_for_image(
 ) -> Result<([u32; 2], Vec<u8>), String> {
     if image.size[0] == 0 || image.size[1] == 0 {
         return Ok(([0, 0], Vec::new()));
+    }
+
+    // Native ONNX Runtime route first (when selected + guard Safe). On success we
+    // produce the same ([w,h], alpha) the backend path returns; on native failure
+    // we log and fall through to the backend so the user still gets a mask.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some((mask_size, mut mask_alpha)) = try_native_paddle_mask_for_image(image) {
+        dilate_mask_alpha(&mut mask_alpha, mask_size, options.mask_dilate_size);
+        return Ok((mask_size, mask_alpha));
     }
 
     ai_models::ensure_paddle_ocr_detector(&config::models_dir())?;
@@ -1284,6 +1521,58 @@ mod tests {
         let header_fields = json!({});
         assert!(header_fields.get("page_path").is_none());
         assert!(header_fields.get("params").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // detector_native_route — native PaddleOCR detection routing
+    // -------------------------------------------------------------------------
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn detector_route_native_only_for_native_runtime_and_safe_guard() {
+        use crate::config::{AiRuntime, OrtLoadDecision};
+        // Native runtime + Safe guard -> Native.
+        assert_eq!(
+            detector_native_route(AiRuntime::Native, OrtLoadDecision::Safe),
+            DetectorRoute::Native
+        );
+        // Suspect guard disables the native path.
+        assert_eq!(
+            detector_native_route(AiRuntime::Native, OrtLoadDecision::Suspect),
+            DetectorRoute::Backend
+        );
+        // Backend runtime always routes to the backend.
+        assert_eq!(
+            detector_native_route(AiRuntime::Backend, OrtLoadDecision::Safe),
+            DetectorRoute::Backend
+        );
+        assert_eq!(
+            detector_native_route(AiRuntime::Backend, OrtLoadDecision::Suspect),
+            DetectorRoute::Backend
+        );
+    }
+
+    /// A native glyph mask must be normalized to 0/255 and carry the source size.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn glyph_mask_into_alpha_normalizes_and_sizes() {
+        use image::{GrayImage, Luma};
+        let mut mask = GrayImage::from_pixel(2, 1, Luma([0]));
+        mask.put_pixel(1, 0, Luma([7])); // non-zero -> 255
+        let (size, alpha) = glyph_mask_into_alpha(mask).expect("in-bounds mask");
+        assert_eq!(size, [2, 1]);
+        assert_eq!(alpha, vec![0u8, 255u8]);
+    }
+
+    /// An empty (0x0) mask normalizes to an empty result, never an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn glyph_mask_into_alpha_empty_is_ok() {
+        use image::GrayImage;
+        let mask = GrayImage::new(0, 0);
+        let (size, alpha) = glyph_mask_into_alpha(mask).expect("empty mask");
+        assert_eq!(size, [0, 0]);
+        assert!(alpha.is_empty());
     }
 
     // -------------------------------------------------------------------------

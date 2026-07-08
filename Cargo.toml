@@ -4,7 +4,7 @@ version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/puffin_egui"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/puffin_egui"]
 
 [features]
 active-logs = []
@@ -99,6 +99,16 @@ genai = "0.6"
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
+# dylib). Native-only: onnxruntime is a native shared library.
+ms-onnx = { path = "crates/ms-onnx" }
+# Used by the app-managed onnxruntime dylib downloader (later task) to verify
+# archive checksums.
+sha2 = "0.10"
+# Typed public errors for the native onnxruntime loader (`src/onnx_runtime`).
+# Already in the workspace tree (ms-onnx/ms-storage pin v2), so no new build cost;
+# native-only because the loader itself is native-only.
+thiserror = "2"
 
 # Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
 # (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /

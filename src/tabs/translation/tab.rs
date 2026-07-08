@@ -273,6 +273,12 @@ const TEXT_DETECTOR_STATUS_WARN: Color32 = Color32::from_rgb(247, 201, 72);
 const TEXT_DETECTOR_STATUS_ERR: Color32 = Color32::from_rgb(240, 102, 102);
 const TEXT_DETECTOR_OCR_RETRY_DELAY_SECS: f64 = 3.0;
 const OCR_HEALTH_CHECK_THROTTLE_SECS: f64 = 0.5;
+/// Minimum interval between disk reads of the native-runtime routing inputs
+/// (selected `AiRuntime` + SIGILL load guard) that back the route-aware OCR
+/// readiness gate. The gate runs every frame, so the read is cached and refreshed
+/// no more than this often to keep the GUI thread off the disk. Desktop-only.
+#[cfg(not(target_arch = "wasm32"))]
+const OCR_ROUTE_INPUTS_CACHE_TTL: web_time::Duration = web_time::Duration::from_millis(500);
 const FOOTER_CHARACTER_AUTOCOMPLETE_MAX: usize = 7;
 const CHARACTER_NAMES_WATCH_CHECK_SECS: f64 = 1.0;
 const RECENT_CHARACTER_HISTORY_LIMIT: usize = 6;
@@ -515,6 +521,15 @@ pub struct TranslationTabState {
     ocr_loading_engine: Option<OcrEngine>,
     ocr_last_panel_engine: Option<OcrEngine>,
     ocr_last_health_check_request_s: f64,
+    /// Cached native-runtime routing inputs (selected `AiRuntime` + provider-scoped
+    /// SIGILL load guard) that drive the route-aware "does OCR need the Python
+    /// backend?" gate. Read from disk lazily and refreshed at most every
+    /// `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks the GUI
+    /// thread on disk I/O. Desktop-only: the native runtime is compiled out on web.
+    #[cfg(not(target_arch = "wasm32"))]
+    ocr_route_inputs_cached: (crate::config::AiRuntime, crate::config::OrtLoadDecision),
+    #[cfg(not(target_arch = "wasm32"))]
+    ocr_route_inputs_checked_at: Option<web_time::Instant>,
     mt_controller: TranslationMtController,
     mt_panel_options: MtPanelOptions,
     text_detector_controller: TranslationTextDetectorController,
@@ -755,6 +770,16 @@ impl TranslationTabState {
             ocr_loading_engine: None,
             ocr_last_panel_engine: None,
             ocr_last_health_check_request_s: -10_000.0,
+            // Safe defaults (Backend runtime, Safe guard) until the first lazy
+            // refresh reads the real values off disk; `None` forces that refresh on
+            // first use so the very first gate decision is accurate.
+            #[cfg(not(target_arch = "wasm32"))]
+            ocr_route_inputs_cached: (
+                crate::config::AiRuntime::Backend,
+                crate::config::OrtLoadDecision::Safe,
+            ),
+            #[cfg(not(target_arch = "wasm32"))]
+            ocr_route_inputs_checked_at: None,
             mt_controller: TranslationMtController::default(),
             mt_panel_options: MtPanelOptions::default(),
             text_detector_controller: TranslationTextDetectorController::default(),
@@ -1142,6 +1167,51 @@ impl TranslationTabState {
         snapshot.checked_at.is_some() && !snapshot.connected
     }
 
+    /// Route-aware gate: does the currently selected OCR engine/model need the
+    /// Python backend to run?
+    ///
+    /// This is the single decision every OCR trigger and the load button consult so
+    /// a native ONNX route (MangaOCR ONNX / PaddleOCR under the native runtime with a
+    /// non-`Suspect` guard) is NOT blocked behind backend health, while every
+    /// backend-routed engine/model stays gated exactly as before. Backend-routed
+    /// selections behave byte-identically to the previous
+    /// `options.engine.requires_backend()` check. Reads the runtime + guard from a
+    /// short-lived cache (see `refresh_ocr_route_inputs_cache`) so this frequently
+    /// called gate never blocks the GUI thread on disk I/O.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ocr_requires_backend_runtime(&mut self) -> bool {
+        self.refresh_ocr_route_inputs_cache();
+        let (runtime, guard) = self.ocr_route_inputs_cached;
+        crate::tabs::translation::ocr::ocr_requires_backend(
+            self.ocr_panel_options.engine,
+            &self.ocr_panel_options.manga_model,
+            runtime,
+            guard,
+        )
+    }
+
+    /// Web build has no native runtime, so OCR always routes to the backend; this
+    /// preserves the historical `engine.requires_backend()` behavior verbatim.
+    #[cfg(target_arch = "wasm32")]
+    fn ocr_requires_backend_runtime(&mut self) -> bool {
+        self.ocr_panel_options.engine.requires_backend()
+    }
+
+    /// Refreshes the cached native-runtime routing inputs from disk at most once per
+    /// `OCR_ROUTE_INPUTS_CACHE_TTL`. Cheap no-op inside the throttle window, so the
+    /// per-frame route-aware gate can call it freely without per-frame disk reads.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refresh_ocr_route_inputs_cache(&mut self) {
+        let now = web_time::Instant::now();
+        let stale = self
+            .ocr_route_inputs_checked_at
+            .is_none_or(|checked| now.duration_since(checked) >= OCR_ROUTE_INPUTS_CACHE_TTL);
+        if stale {
+            self.ocr_route_inputs_cached = crate::tabs::translation::ocr::read_ocr_route_inputs();
+            self.ocr_route_inputs_checked_at = Some(now);
+        }
+    }
+
     fn ai_backend_torch_available(&self) -> Option<bool> {
         self.ai_backend_health_snapshot()
             .is_torch_available
@@ -1201,13 +1271,14 @@ impl TranslationTabState {
             TranslationPanel::Ocr => {
                 let selected_engine_before = self.ocr_panel_options.engine;
                 let force_health_check = self.ocr_last_panel_engine != Some(selected_engine_before);
-                if ocr_engine_requires_backend_runtime(&self.ocr_panel_options) {
+                // Route-aware: a native ONNX selection needs no backend, so we do
+                // NOT probe backend health or mark it unavailable for it.
+                let requires_backend = self.ocr_requires_backend_runtime();
+                if requires_backend {
                     self.request_ai_backend_health_check(ctx, force_health_check);
                     self.sync_ocr_states_from_backend_health_snapshot();
                 }
-                let backend_unavailable =
-                    ocr_engine_requires_backend_runtime(&self.ocr_panel_options)
-                        && self.ai_backend_unavailable();
+                let backend_unavailable = requires_backend && self.ai_backend_unavailable();
                 let torch_available = self.ai_backend_torch_available();
                 let quick_selection_active = self.ocr_quick_selection_mode_active();
                 let advanced_selection_active = self.ocr_advanced_selection_mode_active();
@@ -1232,7 +1303,7 @@ impl TranslationTabState {
                     if actions.options_changed {
                         self.ocr_settings_dirty = true;
                         if selected_engine_before != self.ocr_panel_options.engine
-                            && ocr_engine_requires_backend_runtime(&self.ocr_panel_options)
+                            && self.ocr_requires_backend_runtime()
                         {
                             self.request_ai_backend_health_check(ctx, true);
                             self.sync_ocr_states_from_backend_health_snapshot();
@@ -4670,9 +4741,7 @@ impl TranslationTabState {
                     );
                     return;
                 }
-                if ocr_engine_requires_backend_runtime(&self.ocr_panel_options)
-                    && self.ai_backend_unavailable()
-                {
+                if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
                     self.push_toast(
                         ctx,
                         "ИИ бэкенд недоступен".to_string(),
@@ -4729,9 +4798,7 @@ impl TranslationTabState {
                     );
                     return;
                 }
-                if ocr_engine_requires_backend_runtime(&self.ocr_panel_options)
-                    && self.ai_backend_unavailable()
-                {
+                if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
                     self.push_toast(
                         ctx,
                         "ИИ бэкенд недоступен".to_string(),
@@ -4815,9 +4882,7 @@ impl TranslationTabState {
             );
             return;
         }
-        if ocr_engine_requires_backend_runtime(&self.ocr_panel_options)
-            && self.ai_backend_unavailable()
-        {
+        if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
             self.push_toast(
                 ctx,
                 "ИИ бэкенд недоступен".to_string(),
@@ -7458,10 +7523,6 @@ fn parse_single_ocr_lang_setting(value: Option<&Value>) -> Option<String> {
     } else {
         Some(first.to_string())
     }
-}
-
-fn ocr_engine_requires_backend_runtime(options: &OcrPanelOptions) -> bool {
-    options.engine.requires_backend()
 }
 
 fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions {

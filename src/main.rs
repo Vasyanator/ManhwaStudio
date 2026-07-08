@@ -50,6 +50,21 @@ mod installer;
 mod launcher;
 mod memory_manager;
 mod models;
+// Phase 1 native ONNX Runtime OCR manager: lazily loads the ONNX Runtime + native
+// MangaOCR engine (via `ms-onnx`) behind the SIGILL crash-guard and serves the
+// `General.ai_runtime = "native"` OCR path. Native-only (depends on `ms-onnx`/
+// `ort`), so gated off wasm like its dependencies.
+#[cfg(not(target_arch = "wasm32"))]
+mod native_runtime;
+// Native ONNX Runtime loader (resolves/downloads the onnxruntime dylib for
+// `ms-onnx`). Its public API is consumed by `native_runtime` + the OCR router.
+// Native-only (ureq/sha2/ms-onnx are not part of the wasm build), so gated off
+// wasm like its deps. `allow(dead_code)`: a few items are kept for completeness
+// and are not yet consumed (the `OrtDownloadProgress` byte counters, the
+// `sha256_hex` helper, the manifest version field).
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod onnx_runtime;
 mod paste_image;
 mod project;
 mod python_manager;

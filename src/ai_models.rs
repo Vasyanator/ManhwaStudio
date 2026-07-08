@@ -140,11 +140,41 @@ pub fn ensure_paddle_ocr_detector_with_reporter(
     Ok(models_root.join(PADDLE_DET_ONNX))
 }
 
+/// Local paths of the PaddleOCR model files for one language: the shared detector
+/// model, the per-language recognizer, and its character dictionary.
+///
+/// Returned by [`ensure_paddle_ocr_full_paths_with_reporter`] so native callers can
+/// build a `PaddleOcrEngine` without re-deriving the on-disk layout.
+#[derive(Debug, Clone)]
+pub struct PaddleOcrModelPaths {
+    /// Shared DB text-detection model (`det.onnx`).
+    pub det: PathBuf,
+    /// Per-language recognizer model (`rec.onnx`).
+    pub rec: PathBuf,
+    /// Per-language character dictionary (`dict.txt`).
+    pub dict: PathBuf,
+}
+
 pub fn ensure_paddle_ocr_full_with_reporter(
     models_root: &Path,
     model_key: &str,
-    mut reporter: ModelDownloadReporter<'_>,
+    reporter: ModelDownloadReporter<'_>,
 ) -> Result<(), String> {
+    ensure_paddle_ocr_full_paths_with_reporter(models_root, model_key, reporter).map(|_| ())
+}
+
+/// Ensures every PaddleOCR file for `model_key` (shared detector + per-language
+/// recognizer + dictionary) is present locally, downloading missing ones, and
+/// returns their resolved on-disk paths.
+///
+/// `model_key` is a PaddleOCR language key (see [`PADDLE_LANGUAGES`] / the alias
+/// map in `paddle_language_spec`); unknown keys resolve to the default language
+/// rather than failing. Must be called from a worker/background thread.
+pub fn ensure_paddle_ocr_full_paths_with_reporter(
+    models_root: &Path,
+    model_key: &str,
+    mut reporter: ModelDownloadReporter<'_>,
+) -> Result<PaddleOcrModelPaths, String> {
     ensure_remote_files(
         models_root,
         &[PADDLE_DET_CONFIG, PADDLE_DET_ONNX],
@@ -159,7 +189,12 @@ pub fn ensure_paddle_ocr_full_with_reporter(
         models_root,
         &[&rec_config, &rec_dict, &rec_model],
         &mut reporter,
-    )
+    )?;
+    Ok(PaddleOcrModelPaths {
+        det: models_root.join(PADDLE_DET_ONNX),
+        rec: models_root.join(&rec_model),
+        dict: models_root.join(&rec_dict),
+    })
 }
 
 pub fn ensure_manga_ocr_onnx_with_reporter(

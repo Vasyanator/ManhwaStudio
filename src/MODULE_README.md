@@ -90,6 +90,26 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `General.ai_install_type`.
 - `ai_models.rs`: app-managed AI model catalog, lazy Hugging Face file resolution, direct model
   downloads into `ManhwaStudio_AI_Models`, and typed local path helpers for Rust callers.
+- `onnx_runtime/`: native-only (`#[cfg(not(wasm32))]`) app-layer loader that resolves/downloads the
+  official onnxruntime dynamic library for `ms-onnx` (probe/download/verify/extract, `ORT_VERSION`).
+  Worker-thread only. See `onnx_runtime/MODULE_README.md`.
+- `native_runtime.rs`: native-only (`#[cfg(not(wasm32))]`) process-global lazy manager for the
+  in-process ONNX Runtime path (`General.ai_runtime = "native"`). Owns one `OrtRuntime`, ONE
+  always-resident shared `PaddleDetector` (used by the detector op and every PaddleOCR language via
+  `ms_onnx::paddle_recognize`), and an LRU-bounded engine cache (`MangaOcrEngine` Base/2025 +
+  per-language `PaddleRecognizer`) keyed by `NativeModelId`, capacity = `General.ai_max_loaded_models`
+  (read once, clamped to ≥1, default 3; the shared detector is not counted, LRU evicts the
+  least-recently-used engine). The execution provider + adapter index are read once from the UNIFIED
+  ONNX keys `General.ai_onnx_provider` (ORT token, mapped by `execution_provider_from_ort_token`) +
+  `General.ai_onnx_device_id` — the same keys the Python backend uses, so one selection drives both
+  (impossible-for-OS → CPU fallback, fixed per process). When CUDA is selected, a system CUDA
+  12.x/cuDNN 9.x probe (`gpu_utils::native_cuda_runtime_available`) gates it: available → CUDA,
+  otherwise DirectML (Windows) or CPU, logged, never a wrong result. The adapter index is passed to
+  `OrtRuntime::load` and folded into the per-`provider[:device]@version` SIGILL crash-guard scope
+  (`run_guarded` shares the fsync'd attempt-before-dlopen / succeeded-after-first-inference /
+  graceful-reset sequence across ops). `recognize_manga`, `recognize_paddle`, `detect_paddle`,
+  `execution_provider_from_ort_token`, `native_load_scope_key`, and `reset_load_latch` are the public
+  surface (the guard/scope helpers are worker-thread only — they do disk I/O + a CUDA probe).
 - `input_manager_v2.rs`: keyboard shortcut and modifier-only hotkey registry, user overrides, and
   command lookup.
 - `bubble_status.rs`: configurable bubble status rules, condition evaluation, and border painting
@@ -175,6 +195,17 @@ prompts instead of blocking the GUI thread.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
 - AI install-type detection from installed Python packages: `ai_install_probe.rs`.
 - App-managed AI model coverage, Hugging Face paths, or lazy download behavior: `ai_models.rs`.
+- Native ONNX Runtime path (MangaOCR + PaddleOCR OCR, PaddleOCR text detection; runtime/engine
+  loading, provider selection, SIGILL crash-guard), or the onnxruntime dylib resolver/downloader:
+  `native_runtime.rs` and `onnx_runtime/`. Runtime via `General.ai_runtime`, provider/device via the
+  unified `General.ai_onnx_provider`/`ai_onnx_device_id` (shared with the backend); OCR routing lives
+  in `tabs/translation/ocr.rs::ocr_route`, detection routing in
+  `tabs/translation/text_detector.rs::detector_native_route`.
+- ONNX provider/device selection UI (shared Settings + launcher panel): `ai_backend_panel.rs`. The
+  provider list is the UNION of the local-native set (`gpu_utils` probes) and the backend-reported
+  `available_onnx_providers` (deduped by ORT token), labelled per active `General.ai_runtime`, so
+  backend-only providers (e.g. MIGraphX/ROCm) stay selectable for backend ONNX while native falls back
+  to CPU for them. See `build_onnx_provider_options` (pure/tested) and `provider_runtime_state`.
 - Chapter filesystem shape, project load/save contracts, page discovery, staged unsaved paths, or
   legacy bubble format migration: `project.rs`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,

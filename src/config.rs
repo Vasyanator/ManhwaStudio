@@ -11,6 +11,10 @@ Main items:
 - `JsonConfig`: load/merge/save wrapper for JSON configs with default backfilling.
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
+- `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
+- `OrtLoadGuard` / `OrtLoadDecision` / `ort_load_decision` / `ort_load_scope_key` /
+  `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
+  decision logic (state persisted under `General.ort_load_state`).
 - `MemoryProfile`: persisted global image-cache memory policy recorded under `General`.
 - `load_user_config`: canonical entry-point for `user_config.json` with persistence.
 - `load_raw_user_settings_for_startup`: startup-safe read before default backfilling.
@@ -49,6 +53,38 @@ pub const PROJECT_SETTINGS_FILE: &str = "settings.json";
 pub const USER_CONFIG_FILE: &str = "user_config.json";
 pub const GENERAL_PROJECTS_DIR_KEY: &str = "projects_dir";
 pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
+/// `General` key selecting which AI runtime the app drives: the external Python
+/// backend process (`"backend"`) or the in-process native ONNX Runtime path
+/// (`"native"`). Parsed by [`AiRuntime::from_user_settings`].
+// Phase 0 config plumbing; the runtime selector reads it in Phase 1 (not yet wired).
+#[allow(dead_code)]
+pub const GENERAL_AI_RUNTIME_KEY: &str = "ai_runtime";
+/// `General` key holding the ORT execution-provider TOKEN shared by the Python
+/// backend AND the native in-process ONNX path (e.g. `"CPUExecutionProvider"` /
+/// `"DmlExecutionProvider"` / `"CUDAExecutionProvider"` / `"CoreMLExecutionProvider"`).
+/// Read by [`ai_onnx_provider_token_from_user_settings`]; the native path maps the
+/// token to `ms_onnx::ExecutionProvider` in `native_runtime`.
+pub const GENERAL_AI_ONNX_PROVIDER_KEY: &str = "ai_onnx_provider";
+/// `General` key holding the ONNX accelerator adapter index (a string like `"0"`),
+/// shared by the backend and the native path. Read by
+/// [`ai_onnx_device_id_from_user_settings`].
+pub const GENERAL_AI_ONNX_DEVICE_ID_KEY: &str = "ai_onnx_device_id";
+/// `General` boolean marking the ONNX provider as an explicit user choice, matching
+/// the Python backend's `ai_onnx_provider_configured` flag so an offline selection is
+/// honored once the backend starts.
+pub const GENERAL_AI_ONNX_PROVIDER_CONFIGURED_KEY: &str = "ai_onnx_provider_configured";
+/// `General` boolean marking the ONNX device id as an explicit user choice, matching
+/// the Python backend's `ai_onnx_device_id_configured` flag.
+pub const GENERAL_AI_ONNX_DEVICE_ID_CONFIGURED_KEY: &str = "ai_onnx_device_id_configured";
+/// `General` key holding the maximum number of simultaneously resident AI models
+/// (used by BOTH the backend LRU and the native engine LRU). Read by
+/// [`ai_max_loaded_models_from_user_settings`].
+pub const GENERAL_AI_MAX_LOADED_MODELS_KEY: &str = "ai_max_loaded_models";
+/// `General` key holding the per-scope ONNX Runtime SIGILL load-guard map (a JSON
+/// object; entries keyed by [`ort_load_scope_key`]). Read by [`read_ort_load_guard`].
+// Phase 0 config plumbing; the ORT load path reads/writes it in Phase 1 (not yet wired).
+#[allow(dead_code)]
+pub const GENERAL_ORT_LOAD_STATE_KEY: &str = "ort_load_state";
 pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
@@ -88,6 +124,213 @@ impl AiInstallType {
                 _ => Self::None,
             })
             .unwrap_or(Self::None)
+    }
+}
+
+/// Which AI runtime the application drives, persisted under
+/// `General.ai_runtime` in `user_config.json`.
+///
+/// `Backend` routes inference through the external Python `ai_backend.py`
+/// process (the historical default). `Native` uses the in-process ONNX Runtime
+/// path (`crate`-native, loaded lazily). Unknown or missing values resolve to
+/// `Backend` so an unrecognized config never silently enables native loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiRuntime {
+    Backend,
+    // The native ONNX path is selectable only once Phase 1 wires the runtime
+    // switch; the variant exists now for the persisted-config contract.
+    #[allow(dead_code)]
+    Native,
+}
+
+impl AiRuntime {
+    /// Config token stored under `General.ai_runtime`.
+    ///
+    /// Stable string contract: `Backend` -> `"backend"`, `Native` -> `"native"`.
+    #[must_use]
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Backend => "backend",
+            Self::Native => "native",
+        }
+    }
+
+    /// Reads `General.ai_runtime` from a raw user-settings tree.
+    ///
+    /// Returns `Backend` when the key is absent, non-string, or holds an
+    /// unrecognized token, so an invalid config never enables the native path.
+    // Consumed by the Phase 1 runtime selector; unused in non-test code until then.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn from_user_settings(cfg: &Value) -> Self {
+        cfg.get("General")
+            .and_then(Value::as_object)
+            .and_then(|general| general.get(GENERAL_AI_RUNTIME_KEY))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|value| match value {
+                "native" => Self::Native,
+                // Any other token (including "backend" and unknown values)
+                // falls back to the safe default.
+                _ => Self::Backend,
+            })
+            .unwrap_or(Self::Backend)
+    }
+}
+
+/// Reads the shared ONNX execution-provider TOKEN from `General.ai_onnx_provider`.
+///
+/// Returns the trimmed ORT token (e.g. `"DmlExecutionProvider"`) or `None` when the
+/// key is absent, empty, non-string, or the `"not-selected"` sentinel. The token is
+/// mapped to `ms_onnx::ExecutionProvider` by `native_runtime`; the backend uses the
+/// same key, so one selection drives both runtimes.
+#[must_use]
+pub fn ai_onnx_provider_token_from_user_settings(cfg: &Value) -> Option<String> {
+    cfg.get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_AI_ONNX_PROVIDER_KEY))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("not-selected"))
+        .map(str::to_string)
+}
+
+/// Reads the ONNX accelerator adapter index from `General.ai_onnx_device_id`.
+///
+/// Accepts either a JSON string (the backend stores `str(device_id)`) or a JSON
+/// number and returns the trimmed value as a string, or `None` when absent, empty,
+/// or the `"not-selected"` sentinel. The native path parses it to an `i32` adapter
+/// index; the UI keeps it as an option id.
+#[must_use]
+pub fn ai_onnx_device_id_from_user_settings(cfg: &Value) -> Option<String> {
+    cfg.get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_AI_ONNX_DEVICE_ID_KEY))
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+        })
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("not-selected"))
+}
+
+/// Reads `General.ai_max_loaded_models` as a UI-clamped model limit (1..=10).
+///
+/// Accepts a JSON number or numeric string (the backend stores it as a string) and
+/// clamps to `1..=10`; anything absent, non-numeric (e.g. `"not-selected"`), or out
+/// of range resolves to `3`, matching the config default and the backend/native
+/// LRU defaults.
+#[must_use]
+pub fn ai_max_loaded_models_from_user_settings(cfg: &Value) -> u32 {
+    cfg.get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_AI_MAX_LOADED_MODELS_KEY))
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+        })
+        .and_then(|value| u32::try_from(value).ok())
+        .map(|value| value.clamp(1, 10))
+        .unwrap_or(3)
+}
+
+/// Persisted per-scope state of an ONNX Runtime dynamic-library load attempt,
+/// used to survive an uncatchable SIGILL on CPUs lacking required instructions.
+///
+/// The pair is written to disk BEFORE the load (`attempted = true`,
+/// `succeeded = false`) and flipped to `succeeded = true` only after the load
+/// returns normally. A crash between those two writes leaves `attempted &&
+/// !succeeded` on disk, which the next launch reads to avoid re-triggering the
+/// fault. Missing entries default to both fields `false`.
+// Phase 0 model for the SIGILL guard; constructed by the Phase 1 ORT load path.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrtLoadGuard {
+    /// A load was started for this scope and the flag was flushed before the load.
+    pub attempted: bool,
+    /// The load returned normally after `attempted` was set.
+    pub succeeded: bool,
+}
+
+/// Decision derived from an [`OrtLoadGuard`] about whether it is safe to touch
+/// the ONNX Runtime library for the corresponding scope on this launch.
+// Phase 0 decision type; the Phase 1 ORT load path branches on it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrtLoadDecision {
+    /// No aborted attempt recorded: loading ORT for this scope is allowed.
+    Safe,
+    /// A previous attempt started but never confirmed success (likely crashed
+    /// the process): do NOT touch ORT for this scope.
+    Suspect,
+}
+
+/// Pure decision for whether ONNX Runtime is safe to load for a given scope.
+///
+/// Returns [`OrtLoadDecision::Suspect`] iff `attempted && !succeeded` (a prior
+/// load began but never confirmed success, so it most likely aborted the
+/// process via SIGILL); otherwise [`OrtLoadDecision::Safe`].
+// Pure logic invoked by the Phase 1 ORT load path; unused in non-test code until then.
+#[allow(dead_code)]
+#[must_use]
+pub fn ort_load_decision(guard: OrtLoadGuard) -> OrtLoadDecision {
+    match (guard.attempted, guard.succeeded) {
+        (true, false) => OrtLoadDecision::Suspect,
+        (false, false) | (false, true) | (true, true) => OrtLoadDecision::Safe,
+    }
+}
+
+/// Builds the load-guard scope key for a provider + adapter index + onnxruntime
+/// version.
+///
+/// Format is `"{provider_id}@{ort_version}"` when `device_id` is `None` (e.g.
+/// `"cpu@1.20.1"`) and `"{provider_id}:{device_id}@{ort_version}"` when a specific
+/// accelerator adapter is targeted (e.g. `"directml:1@1.20.1"`). Scoping by provider
+/// AND device prevents a failed accelerator attempt (a specific CUDA/DirectML
+/// adapter) from blocking a working CPU path or a different, healthy adapter;
+/// scoping by onnxruntime version auto-resets the guard when the library is
+/// upgraded. `provider_id` is the `ms_onnx::ExecutionProvider::id` string, accepted
+/// as `&str` to keep `config` free of an `ms-onnx` dependency.
+#[must_use]
+pub fn ort_load_scope_key(provider_id: &str, device_id: Option<i32>, ort_version: &str) -> String {
+    match device_id {
+        Some(device_id) => format!("{provider_id}:{device_id}@{ort_version}"),
+        None => format!("{provider_id}@{ort_version}"),
+    }
+}
+
+/// Reads the [`OrtLoadGuard`] for `scope_key` from `General.ort_load_state`.
+///
+/// A missing map, missing entry, or non-boolean fields default to `false`, so an
+/// absent or malformed entry reads as "no attempt recorded" ([`OrtLoadGuard`]
+/// with both fields `false`).
+// Read by the Phase 1 launch-time guard check; unused in non-test code until then.
+#[allow(dead_code)]
+#[must_use]
+pub fn read_ort_load_guard(cfg: &Value, scope_key: &str) -> OrtLoadGuard {
+    let entry = cfg
+        .get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_ORT_LOAD_STATE_KEY))
+        .and_then(Value::as_object)
+        .and_then(|state| state.get(scope_key))
+        .and_then(Value::as_object);
+    let Some(entry) = entry else {
+        return OrtLoadGuard {
+            attempted: false,
+            succeeded: false,
+        };
+    };
+    let read_bool = |field: &str| {
+        entry
+            .get(field)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
+    OrtLoadGuard {
+        attempted: read_bool("attempted"),
+        succeeded: read_bool("succeeded"),
     }
 }
 
@@ -490,6 +733,8 @@ pub fn user_config_defaults() -> Value {
             "ai_onnx_device_id": "not-selected",
             "ai_max_loaded_models": 3,
             "ai_install_type": AiInstallType::None.as_str(),
+            "ai_runtime": AiRuntime::Backend.as_key(),
+            "ort_load_state": {},
             "memory_profile": MemoryProfile::default().as_config_str(),
             "typing_panel_layout": "vertical",
             "enabled_tabs": {
@@ -830,6 +1075,238 @@ mod tests {
         assert!(user_settings_has_ai_install_type(
             &json!({"General": {"ai_install_type": "Base"}})
         ));
+    }
+
+    #[test]
+    fn ai_runtime_parses_user_settings_values() {
+        // Missing key -> safe default.
+        assert_eq!(AiRuntime::from_user_settings(&json!({})), AiRuntime::Backend);
+        assert_eq!(
+            AiRuntime::from_user_settings(&json!({"General": {}})),
+            AiRuntime::Backend
+        );
+        // Explicit values.
+        assert_eq!(
+            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "backend"}})),
+            AiRuntime::Backend
+        );
+        assert_eq!(
+            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "native"}})),
+            AiRuntime::Native
+        );
+        // Whitespace is trimmed.
+        assert_eq!(
+            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": " native "}})),
+            AiRuntime::Native
+        );
+        // Unknown token -> safe default.
+        assert_eq!(
+            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "onnx"}})),
+            AiRuntime::Backend
+        );
+    }
+
+    #[test]
+    fn ai_runtime_as_key_round_trips() {
+        assert_eq!(AiRuntime::Backend.as_key(), "backend");
+        assert_eq!(AiRuntime::Native.as_key(), "native");
+        for runtime in [AiRuntime::Backend, AiRuntime::Native] {
+            assert_eq!(
+                AiRuntime::from_user_settings(
+                    &json!({"General": {"ai_runtime": runtime.as_key()}})
+                ),
+                runtime
+            );
+        }
+    }
+
+    #[test]
+    fn ai_onnx_provider_token_reads_and_filters() {
+        // Absent / empty / not-selected -> None.
+        assert_eq!(ai_onnx_provider_token_from_user_settings(&json!({})), None);
+        assert_eq!(
+            ai_onnx_provider_token_from_user_settings(&json!({"General": {}})),
+            None
+        );
+        assert_eq!(
+            ai_onnx_provider_token_from_user_settings(
+                &json!({"General": {"ai_onnx_provider": "not-selected"}})
+            ),
+            None
+        );
+        // A real token is trimmed and returned verbatim.
+        assert_eq!(
+            ai_onnx_provider_token_from_user_settings(
+                &json!({"General": {"ai_onnx_provider": " DmlExecutionProvider "}})
+            )
+            .as_deref(),
+            Some("DmlExecutionProvider")
+        );
+    }
+
+    #[test]
+    fn ai_onnx_device_id_reads_string_or_number() {
+        assert_eq!(ai_onnx_device_id_from_user_settings(&json!({})), None);
+        assert_eq!(
+            ai_onnx_device_id_from_user_settings(
+                &json!({"General": {"ai_onnx_device_id": "not-selected"}})
+            ),
+            None
+        );
+        assert_eq!(
+            ai_onnx_device_id_from_user_settings(&json!({"General": {"ai_onnx_device_id": " 1 "}}))
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            ai_onnx_device_id_from_user_settings(&json!({"General": {"ai_onnx_device_id": 2}}))
+                .as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn ai_max_loaded_models_clamps_and_defaults() {
+        assert_eq!(ai_max_loaded_models_from_user_settings(&json!({})), 3);
+        assert_eq!(
+            ai_max_loaded_models_from_user_settings(
+                &json!({"General": {"ai_max_loaded_models": "not-selected"}})
+            ),
+            3
+        );
+        assert_eq!(
+            ai_max_loaded_models_from_user_settings(
+                &json!({"General": {"ai_max_loaded_models": 0}})
+            ),
+            1
+        );
+        assert_eq!(
+            ai_max_loaded_models_from_user_settings(
+                &json!({"General": {"ai_max_loaded_models": 99}})
+            ),
+            10
+        );
+        assert_eq!(
+            ai_max_loaded_models_from_user_settings(
+                &json!({"General": {"ai_max_loaded_models": "5"}})
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn ort_load_decision_truth_table() {
+        // Suspect only when a load was attempted but never confirmed.
+        assert_eq!(
+            ort_load_decision(OrtLoadGuard {
+                attempted: false,
+                succeeded: false
+            }),
+            OrtLoadDecision::Safe
+        );
+        assert_eq!(
+            ort_load_decision(OrtLoadGuard {
+                attempted: false,
+                succeeded: true
+            }),
+            OrtLoadDecision::Safe
+        );
+        assert_eq!(
+            ort_load_decision(OrtLoadGuard {
+                attempted: true,
+                succeeded: true
+            }),
+            OrtLoadDecision::Safe
+        );
+        assert_eq!(
+            ort_load_decision(OrtLoadGuard {
+                attempted: true,
+                succeeded: false
+            }),
+            OrtLoadDecision::Suspect
+        );
+    }
+
+    #[test]
+    fn ort_load_scope_key_formats_provider_device_and_version() {
+        // No adapter index -> provider-only scope.
+        assert_eq!(ort_load_scope_key("cpu", None, "1.20.1"), "cpu@1.20.1");
+        assert_eq!(ort_load_scope_key("cuda", None, "1.20.1"), "cuda@1.20.1");
+        // A specific adapter index is folded into the scope so a bad adapter does
+        // not block a different, healthy one.
+        assert_eq!(
+            ort_load_scope_key("directml", Some(1), "1.19.0"),
+            "directml:1@1.19.0"
+        );
+        assert_eq!(
+            ort_load_scope_key("cuda", Some(0), "1.20.1"),
+            "cuda:0@1.20.1"
+        );
+    }
+
+    #[test]
+    fn read_ort_load_guard_handles_missing_partial_and_full_entries() {
+        let scope = "cpu@1.20.1";
+        // Missing map entirely.
+        assert_eq!(
+            read_ort_load_guard(&json!({}), scope),
+            OrtLoadGuard {
+                attempted: false,
+                succeeded: false
+            }
+        );
+        // Map present but scope missing.
+        assert_eq!(
+            read_ort_load_guard(&json!({"General": {"ort_load_state": {}}}), scope),
+            OrtLoadGuard {
+                attempted: false,
+                succeeded: false
+            }
+        );
+        // Partial entry: only `attempted` present.
+        assert_eq!(
+            read_ort_load_guard(
+                &json!({"General": {"ort_load_state": {scope: {"attempted": true}}}}),
+                scope
+            ),
+            OrtLoadGuard {
+                attempted: true,
+                succeeded: false
+            }
+        );
+        // Full entry.
+        assert_eq!(
+            read_ort_load_guard(
+                &json!({"General": {"ort_load_state": {scope: {"attempted": true, "succeeded": true}}}}),
+                scope
+            ),
+            OrtLoadGuard {
+                attempted: true,
+                succeeded: true
+            }
+        );
+        // Non-boolean fields fall back to false.
+        assert_eq!(
+            read_ort_load_guard(
+                &json!({"General": {"ort_load_state": {scope: {"attempted": "yes", "succeeded": 1}}}}),
+                scope
+            ),
+            OrtLoadGuard {
+                attempted: false,
+                succeeded: false
+            }
+        );
+        // A different scope is unaffected by an entry for another scope.
+        assert_eq!(
+            read_ort_load_guard(
+                &json!({"General": {"ort_load_state": {"cuda@1.20.1": {"attempted": true}}}}),
+                scope
+            ),
+            OrtLoadGuard {
+                attempted: false,
+                succeeded: false
+            }
+        );
     }
 
     // macOS-only: the bundle detection and its data-root redirect are gated

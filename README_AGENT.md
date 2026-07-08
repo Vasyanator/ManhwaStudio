@@ -387,6 +387,91 @@ original, and a bbox relative to the sent image) and the model returns
 
 ---
 
+## Нативный ONNX-рантайм (native OCR path)
+
+Помимо Python backend есть in-process нативный ONNX-путь, выбираемый через
+`General.ai_runtime` (`backend` по умолчанию / `native`):
+
+- **`ms-onnx`** (`crates/ms-onnx`) — обёртка над `ort` (load-dynamic): `OrtRuntime::load`
+  (dlopen + commit процесс-глобального ort-env, EP по `ExecutionProvider`), `MangaOcrEngine`
+  (encoder+decoder инференс MangaOCR) и PaddleOCR (`PaddleDetector` — детекция + glyph-mask,
+  `PaddleRecognizer`, `PaddleOcrEngine` — полный detect→recognize).
+- **`src/onnx_runtime`** — ленивый загрузчик: probe/скачивание/verify/extract официального
+  onnxruntime dylib в `data_dir()/onnxruntime/<provider>/<ver>/` (worker-thread only), `ORT_VERSION`.
+  Manifest (`ort_manifest.json`) ключуется `(os,arch,provider)`; запись держит primary `dylib_member`
+  и `extra_members` (несколько DLL в один каталог). CPU — GitHub-релизы; **DirectML** (Windows) —
+  DLL из PyPI-wheel `onnxruntime-directml` (`onnxruntime.dll`+`DirectML.dll`+`onnxruntime_providers_shared.dll`
+  рядом); **CoreML** (macOS) — тот же osx-архив, что CPU (EP встроен); **CUDA** (Windows/Linux) —
+  официальный onnxruntime GPU-build (провайдер-либы `onnxruntime_providers_cuda`+`_shared` рядом с
+  primary), зависит от СИСТЕМНЫХ CUDA 12.x/cuDNN 9.x (не бандлится); CUDA-хэши намеренно `null`
+  (архивы сотни МБ) → logged-unverified путь, removal condition в MODULE_README.
+- **`src/native_runtime`** — процесс-глобальный ленивый менеджер: держит один `OrtRuntime`, ОДИН
+  общий `PaddleDetector` (always-resident, шарится detector-оп и всеми PaddleOCR-языками через
+  `ms_onnx::paddle_recognize`) и LRU-ограниченный кэш движков (`MangaOcrEngine` Base/2025 +
+  per-lang `PaddleRecognizer`), ёмкость = `General.ai_max_loaded_models` (читается один раз,
+  clamp ≥1, default 3; LRU-eviction по least-recently-used, детектор не считается). Провайдер +
+  индекс адаптера читаются один раз из ЕДИНОЙ ONNX-настройки `General.ai_onnx_provider` (ORT-токен
+  `CPUExecutionProvider`/`DmlExecutionProvider`/`CUDAExecutionProvider`/`CoreMLExecutionProvider`) +
+  `General.ai_onnx_device_id` — ТЕ ЖЕ ключи, что использует Python-бэкенд, поэтому один выбор
+  управляет обоими рантаймами (`native_runtime::execution_provider_from_ort_token` мапит токен →
+  `ms_onnx::ExecutionProvider`; неизвестный/`not-selected` → CPU) — и фиксируются на процесс
+  (недоступный для ОС провайдер → лог + fallback на CPU). При выборе CUDA системный
+  probe CUDA 12.x/cuDNN 9.x (`gpu_utils::native_cuda_runtime_available`, вне GUI) решает: доступно →
+  CUDA, иначе → DirectML (Windows с DirectML-адаптером) или CPU (лог, не неверный результат, не
+  hard-fail). `run_guarded` разделяет SIGILL-guard-последовательность между manga/paddle/detector;
+  `native_load_scope_key()` отдаёт scope `provider[:device]@version` (используется роутерами OCR/
+  детекции и кнопкой сброса).
+  Вызывается из НЕСКОЛЬКИХ worker-потоков (OCR, text-detector, cleaning-tools), никогда из GUI.
+  Глобальный STATE-лок только на O(1) state; load/inference — без него. Все PaddleOCR detector-оп
+  (detect + recognize, шарят единственный резидентный `PaddleDetector`) сериализованы через
+  `PADDLE_OP_LOCK`: второй вызов БЛОКИРУЕТСЯ на первом, а не находит детектор `take()`нутым (что
+  давало ложный fallback на backend) и не строит дублирующую сессию.
+- **Выбор провайдера/устройства в UI** (`ai_backend_panel`): список ONNX-провайдеров — это ОБЪЕДИНЕНИЕ
+  локального native-набора и провайдеров, о которых сообщил бэкенд. Native-набор строится ОФФЛАЙН из
+  ОС + `gpu_utils` (CPU везде; DirectML на Windows — доступен при наличии адаптера, устройства =
+  `detect_directml_accelerators_windows()`; CoreML на macOS; CUDA на не-macOS — доступен при
+  `native_cuda_runtime_available()`); к нему при подключённом бэкенде добавляются его
+  `available_onnx_providers` (dedup по ORT-токену, CPU один раз). Backend-only провайдеры без native EP
+  (например `MIGraphXExecutionProvider`/ROCm на AMD) остаются в списке и ВЫБИРАЕМЫ — это чинит регрессию,
+  когда AMD/ROCm-пользователь не мог выбрать MIGraphX. Каждый пункт помечается по АКТИВНОМУ рантайму
+  (`General.ai_runtime`): при Native — usable только native-capable + локально доступные, иначе
+  `(недоступно)`, а backend-only — `(только ИИ-бэкенд)` (native откатывается на CPU); при Backend —
+  usable, если бэкенд подключён и сообщил провайдер, оффлайн показывается только native-набор. Устройства:
+  для native-capable — локальный probe, для backend-only — `onnx_devices_by_provider[token]` (fallback
+  `onnx_device_options`). Комбобоксы работают БЕЗ поднятого backend: выбор пишется в
+  `General.ai_onnx_provider`/`ai_onnx_device_id` (+ `*_configured`) через
+  `settings::save_onnx_provider_device` off-thread (нативный путь читает это при загрузке), а если
+  backend поднят — дополнительно шлётся `device.set`. Лимит моделей (`ai_max_loaded_models`) тоже
+  редактируется оффлайн (`settings::save_max_loaded_models`). PyTorch-устройство остаётся
+  backend-gated (Torch всегда на бэкенде). Авто-скачивание dylib onnxruntime в фоне
+  (`onnx_runtime::resolve_or_download_ort_dylib`) идёт только при Native и только для native-capable +
+  доступного провайдера; для backend-only (MIGraphX) и недоступного — не скачивается.
+- **SIGILL crash-guard** (per `provider[:device]@version`): состояние в `General.ort_load_state`. Перед первым
+  dlopen пишется fsync'd маркер `attempted` (`settings::mark_ort_load_attempted`); `succeeded`
+  ставится только после ПЕРВОГО успешного инференса. Крах во время load или первого инференса
+  оставляет `succeeded=false` → следующий запуск читает scope как `Suspect` и не трогает ORT
+  (fallback на backend). Graceful-ошибка (процесс выжил → это не SIGILL) сбрасывает маркер, НО
+  только когда процесс-глобальный in-flight-счётчик (`native_runtime::IN_FLIGHT`) вернулся к 0 —
+  иначе другой guarded-оп ещё может SIGILL'нуть, и маркер должен остаться. Все `save_*`/маркер-
+  writer'ы `user_config.json` сериализованы `settings::USER_CONFIG_WRITE_LOCK` (RMW не теряет
+  `attempted`-маркер под гонкой); маркер-write ещё fsync'ает родительский каталог при первом создании
+  файла (Unix).
+- **Роутинг**: OCR — `tabs/translation/ocr.rs::ocr_route` (чистая функция): Native при
+  `ai_runtime==native` И guard не `Suspect` И (движок MangaOCR с ONNX-вариантом `base_onnx`/`2025_onnx`,
+  НЕ `base_torch` → `NativeManga`; ЛИБО движок PaddleOCR → `NativePaddle`, любой язык). Детекция —
+  `tabs/translation/text_detector.rs::detector_native_route`: Native при `ai_runtime==native` И guard
+  не `Suspect` для PaddleOCR-детекции (`detect_page_paddle_ocr` и inline `detect_paddle_mask_for_image`).
+  Нативно покрыты: OCR MangaOCR+PaddleOCR и детекция текста PaddleOCR; прочие операции — Python backend.
+  При любой ошибке нативного пути — явный лог и fallback на backend (пользователь получает результат).
+- **Без Python backend при `ai_runtime==native`**: warmup/readiness-гейт роут-осведомлён. Для нативного
+  роута OCR (`ocr.rs::warmup_ocr_engine`) и детекции PaddleOCR (`text_detector.rs::run_detect_batch`)
+  Python backend НЕ поднимается — рантайм/модель грузятся лениво при первом использовании, состояние
+  сразу переходит в Ready. Backend требуется только для backend-роутов. Контракт native→backend
+  сохранён: при ошибке нативного инференса fallback идёт на backend, ЕСЛИ он поднят (fallback-путь сам
+  перепроверяет готовность), но native больше не требует поднятого backend, чтобы работать.
+
+---
+
 ## Runtime log (`src/runtime_log.rs`)
 
 - Ротация: `last.log` → `previous.log` при старте.

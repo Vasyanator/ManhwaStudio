@@ -9,7 +9,8 @@ Main responsibilities:
 - detect CUDA, ROCm, and NVIDIA Compute Capability versions;
 - inspect Linux driver/ROCm installation state;
 - resolve AMD GPU architecture / LLVM target and validate ROCm 7.2 support;
-- detect likely DirectML-capable accelerators on Windows.
+- detect likely DirectML-capable accelerators on Windows;
+- probe for the system CUDA 12.x / cuDNN 9.x runtime the onnxruntime GPU build needs.
 
 Key structures:
 - RuntimeVersion
@@ -18,6 +19,7 @@ Key structures:
 - RocmInstallationStatus
 - RocmSupportValidation
 - DirectMlAccelerator
+- CudaRuntimeStatus
 
 Key functions:
 - detect_nvidia_gpu()
@@ -27,6 +29,7 @@ Key functions:
 - detect_rocm_runtime_version()
 - validate_rocm_7_2_support_linux()
 - detect_directml_accelerators_windows()
+- probe_cuda_runtime() / native_cuda_runtime_available()
 
 Notes:
 Detection intentionally uses short-lived system commands and filesystem probes.
@@ -43,7 +46,7 @@ system-information tab is cross-platform), but the single command primitive
 use std::fmt::Display;
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::process::{Command, Stdio};
 
@@ -108,6 +111,30 @@ pub struct RocmSupportValidation {
 pub struct DirectMlAccelerator {
     pub name: String,
     pub vendor: Option<GpuVendor>,
+}
+
+/// Result of the system CUDA/cuDNN probe used to gate the native CUDA execution
+/// provider.
+///
+/// The onnxruntime 1.20.1 GPU build links against CUDA 12.x and cuDNN 9.x, and it
+/// does NOT bundle them: the app downloads only the onnxruntime GPU dylibs and
+/// relies on a system CUDA/cuDNN install. [`available`](Self::available) is the
+/// gate: an NVIDIA GPU plus a CUDA 12.x runtime plus a cuDNN 9.x library must all be
+/// present, otherwise the CUDA EP would fail to register.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaRuntimeStatus {
+    /// An NVIDIA GPU was detected on the system.
+    pub nvidia_gpu: bool,
+    /// A CUDA 12.x runtime library (`libcudart.so.12*` / `cudart64_12.dll`) was
+    /// found on the dynamic-library search path.
+    pub cuda12_runtime: bool,
+    /// A cuDNN 9.x library (`libcudnn.so.9*` / `cudnn64_9.dll`) was found on the
+    /// dynamic-library search path.
+    pub cudnn9_runtime: bool,
+    /// Whether the native CUDA provider can plausibly load: all three flags hold.
+    pub available: bool,
+    /// Short human-readable Russian summary for the settings UI.
+    pub details: String,
 }
 
 pub const ROCM_7_2_SUPPORTED_LLVM_TARGETS: &[&str] = &[
@@ -408,6 +435,146 @@ pub fn detect_directml_accelerators_windows() -> Vec<DirectMlAccelerator> {
 #[must_use]
 pub fn has_directml_accelerator_windows() -> bool {
     !detect_directml_accelerators_windows().is_empty()
+}
+
+/// Probes the system for the CUDA 12.x + cuDNN 9.x runtime the onnxruntime GPU
+/// build needs, returning a [`CudaRuntimeStatus`].
+///
+/// Combines an NVIDIA GPU check ([`detect_nvidia_gpu`]) with a scan of the
+/// dynamic-library search path for a CUDA 12.x `cudart` library and a cuDNN 9.x
+/// library. Pure detection: it spawns short-lived system commands and reads a few
+/// directories, so callers MUST run it off the GUI thread. On the web (wasm) build,
+/// filesystem/command primitives report nothing, so it reports "unavailable".
+#[must_use]
+pub fn probe_cuda_runtime() -> CudaRuntimeStatus {
+    let nvidia_gpu = detect_nvidia_gpu();
+    let cuda12_runtime = has_cuda12_runtime_library();
+    let cudnn9_runtime = has_cudnn9_library();
+    let available = nvidia_gpu && cuda12_runtime && cudnn9_runtime;
+
+    let details = if available {
+        "Обнаружены видеокарта NVIDIA, CUDA 12.x и cuDNN 9.x.".to_string()
+    } else {
+        let mut missing = Vec::new();
+        if !nvidia_gpu {
+            missing.push("видеокарта NVIDIA");
+        }
+        if !cuda12_runtime {
+            missing.push("библиотека CUDA 12.x (cudart)");
+        }
+        if !cudnn9_runtime {
+            missing.push("библиотека cuDNN 9.x");
+        }
+        format!("Не найдено: {}.", missing.join(", "))
+    };
+
+    CudaRuntimeStatus {
+        nvidia_gpu,
+        cuda12_runtime,
+        cudnn9_runtime,
+        available,
+        details,
+    }
+}
+
+/// Whether the native CUDA execution provider can plausibly load on this system.
+///
+/// Convenience gate over [`probe_cuda_runtime`]; see [`CudaRuntimeStatus::available`].
+/// Must be called off the GUI thread.
+#[must_use]
+pub fn native_cuda_runtime_available() -> bool {
+    probe_cuda_runtime().available
+}
+
+/// Whether a CUDA 12.x `cudart` runtime library is present on the library path.
+///
+/// Matches `libcudart.so.12*` on Linux and `cudart64_12*.dll` on Windows; onnxruntime
+/// 1.20.1 GPU is built for the CUDA 12 runtime, so an older/newer major will not load.
+fn has_cuda12_runtime_library() -> bool {
+    let windows = cfg!(target_os = "windows");
+    library_search_dirs().iter().any(|dir| {
+        scan_dir_for_library(dir, |name| {
+            let lower = name.to_ascii_lowercase();
+            if windows {
+                lower.starts_with("cudart64_12") && lower.ends_with(".dll")
+            } else {
+                lower.starts_with("libcudart.so.12")
+            }
+        })
+    })
+}
+
+/// Whether a cuDNN 9.x library is present on the library path.
+///
+/// Matches `libcudnn.so.9*` on Linux and `cudnn64_9*.dll` on Windows; onnxruntime
+/// 1.20.1 GPU is built against cuDNN 9.
+fn has_cudnn9_library() -> bool {
+    let windows = cfg!(target_os = "windows");
+    library_search_dirs().iter().any(|dir| {
+        scan_dir_for_library(dir, |name| {
+            let lower = name.to_ascii_lowercase();
+            if windows {
+                lower.starts_with("cudnn64_9") && lower.ends_with(".dll")
+            } else {
+                lower.starts_with("libcudnn.so.9")
+            }
+        })
+    })
+}
+
+/// The directories to scan for CUDA/cuDNN shared libraries.
+///
+/// Starts from the platform dynamic-loader search variable (`LD_LIBRARY_PATH` on
+/// Linux, `PATH` on Windows), then adds the standard toolkit/library locations
+/// (`/usr/local/cuda*/lib64`, distro lib dirs, or `%CUDA_PATH%\bin`). Non-existent
+/// directories are harmless — the scan simply finds nothing in them.
+fn library_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    let env_key = if cfg!(target_os = "windows") {
+        "PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
+    if let Some(paths) = std::env::var_os(env_key) {
+        dirs.extend(std::env::split_paths(&paths));
+    }
+
+    if cfg!(target_os = "windows") {
+        // The CUDA toolkit `bin` directory holds cudart64_12.dll / cudnn64_9.dll.
+        if let Some(cuda_path) = std::env::var_os("CUDA_PATH") {
+            dirs.push(Path::new(&cuda_path).join("bin"));
+        }
+    } else {
+        for dir in [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/lib",
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda-12/lib64",
+            "/opt/cuda/lib64",
+        ] {
+            dirs.push(PathBuf::from(dir));
+        }
+        if let Some(cuda_home) =
+            std::env::var_os("CUDA_HOME").or_else(|| std::env::var_os("CUDA_PATH"))
+        {
+            dirs.push(Path::new(&cuda_home).join("lib64"));
+        }
+    }
+
+    dirs
+}
+
+/// Returns true if `dir` contains at least one entry whose file name satisfies
+/// `matches`. A directory that cannot be read (missing/permission) yields false.
+fn scan_dir_for_library<F: Fn(&str) -> bool>(dir: &Path, matches: F) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.file_name().to_str().is_some_and(&matches))
 }
 
 /// Detect the Apple Silicon / Mac GPU description (macOS only).
@@ -761,3 +928,30 @@ fn apply_windows_no_window(command: &mut Command) {
 // means it must be excluded from wasm too (there is no `Command` type there).
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 fn apply_windows_no_window(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_cuda_runtime_is_internally_consistent() {
+        // The probe must never panic and its `available` gate must be exactly the
+        // conjunction of the three detected flags, regardless of the host.
+        let status = probe_cuda_runtime();
+        assert_eq!(
+            status.available,
+            status.nvidia_gpu && status.cuda12_runtime && status.cudnn9_runtime
+        );
+        assert!(!status.details.is_empty());
+        // The convenience gate mirrors the struct field.
+        assert_eq!(native_cuda_runtime_available(), status.available);
+    }
+
+    #[test]
+    fn library_search_dirs_is_non_panicking() {
+        // Reading missing directories must be harmless; the scan just finds nothing.
+        for dir in library_search_dirs() {
+            let _ = scan_dir_for_library(&dir, |_name| false);
+        }
+    }
+}

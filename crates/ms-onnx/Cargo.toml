@@ -1,0 +1,33 @@
+[package]
+name = "ms-onnx"
+version = "0.1.0"
+edition = "2024"
+
+# Native ONNX Runtime inference infrastructure for ManhwaStudio.
+#
+# Pure, GUI-free inference layer over the `ort` ONNX Runtime bindings in
+# load-dynamic mode: the onnxruntime shared library is resolved at RUNTIME from a
+# caller-supplied path, never linked or downloaded at build time. The crate owns
+# no application config, paths, or download logic — the caller passes in the
+# dylib path and the execution provider.
+[dependencies]
+# `ort` pinned to 2.0.0-rc.12 in load-dynamic mode. `default-features = false`
+# drops the build-time binary download/link (`download-binaries`, `copy-dylibs`)
+# and the ndarray/tracing extras; the `load-dynamic` feature sets
+# `ort-sys/disable-linking` and makes `ort::init_from(path)` dlopen the
+# onnxruntime library at runtime.
+# `api-18` is the LOWEST api level ort rc.12 compiles at: its built-in EP modules
+# unconditionally reference `OrtApi` fields gated behind `api-18` (e.g. VitisAI),
+# so a lower level fails to build. This sets `ort_sys::ORT_API_VERSION = 18`, i.e.
+# the runtime onnxruntime dylib must be ONNX Runtime >= 1.18.x (an older dylib is
+# rejected by ort's version check; a newer one only warns).
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-18"] }
+ms-log = { path = "../ms-log" }
+# Matches the root crate's image version; used by the Phase 1 inference
+# pre/post-processing that this foundation crate is being set up for.
+image = { version = "0.25", default-features = true }
+# Pure-Rust image geometry/morphology used by the native PaddleOCR path
+# (contours, minimum-area rectangle, perspective warp). Pairs with the workspace
+# `image` 0.25.x and cross-compiles to windows-gnu/macos/linux. No OpenCV/Clipper.
+imageproc = "0.27"
+thiserror = "2"

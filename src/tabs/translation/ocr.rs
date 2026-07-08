@@ -25,6 +25,12 @@
 use crate::backend_ipc::{self, CallError, CallHandle};
 use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
 use crate::{ai_models, config};
+// Native ONNX Runtime OCR path (Phase 1: MangaOCR only). Desktop-only: the native
+// runtime + ORT loader depend on `ms-onnx`/`ort`, which are not part of the web build.
+#[cfg(not(target_arch = "wasm32"))]
+use crate::native_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 // AI API OCR (`genai`) is native-only: the crate is not compiled for wasm. The
 // worker command/event enums and the controller stay target-neutral; only the
 // bodies that call `genai`/`tokio`/`ureq`/`keyring` are gated below.
@@ -616,9 +622,39 @@ fn warmup_ocr_engine(
     evt_tx: &Sender<WorkerEvent>,
 ) -> Result<(), String> {
     if engine == OcrEngine::AiApi {
-        validate_ai_api_options(options)
-    } else {
-        warmup_backend_ocr_engine(engine, options, evt_tx)
+        return validate_ai_api_options(options);
+    }
+
+    // Route-aware readiness gate. When the active route is the native ONNX Runtime,
+    // the Python backend is NOT required: native inference lazy-loads the runtime +
+    // model on the first recognize (download progress is surfaced then). Reaching
+    // `Ready` here without warming the backend is exactly what lets native OCR run
+    // fully offline. A later native inference error still falls back to the backend
+    // *if it is up* — that fallback path re-checks backend readiness on its own, so
+    // the native->backend contract is preserved without forcing the backend up now.
+    // Desktop-only: the native runtime is compiled out on the web build.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !ocr_route_needs_backend_warmup(current_ocr_route(engine, &options.manga_model)) {
+        crate::runtime_log::log_info(
+            "[ocr] native AI runtime route active; skipping Python backend warmup \
+             (native OCR loads lazily on first recognize).",
+        );
+        return Ok(());
+    }
+
+    warmup_backend_ocr_engine(engine, options, evt_tx)
+}
+
+/// Whether an OCR route requires warming the Python backend at load time.
+///
+/// Only [`OcrRoute::Backend`] needs the backend; the native routes lazy-load the
+/// in-process ONNX Runtime on first recognize and therefore reach `Ready` without
+/// the backend. Pure so the warmup decision is unit-testable.
+#[cfg(not(target_arch = "wasm32"))]
+fn ocr_route_needs_backend_warmup(route: OcrRoute) -> bool {
+    match route {
+        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle => false,
+        OcrRoute::Backend => true,
     }
 }
 
@@ -789,6 +825,293 @@ enum RecognizeOutcome {
     Superseded,
 }
 
+/// Where an OCR recognize request should run.
+///
+/// Kept target-neutral (its `NativeManga` variant carries the app-managed model
+/// enum, not the native-only runtime type) so the decision helper is unit-testable
+/// on every build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcrRoute {
+    /// Run MangaOCR natively via the in-process ONNX Runtime (given export).
+    NativeManga(ai_models::MangaOcrOnnxModel),
+    /// Run PaddleOCR natively via the in-process ONNX Runtime (language from the
+    /// request options).
+    NativePaddle,
+    /// Run through the Python backend (the historical path).
+    Backend,
+}
+
+/// Pure routing decision for an OCR recognize request.
+///
+/// Routes to a native variant only when the user selected the native AI runtime
+/// AND the per-scope SIGILL load-guard is not `Suspect`. Under those conditions:
+/// MangaOCR routes to [`OcrRoute::NativeManga`] iff `manga_model_key` maps to an
+/// ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path);
+/// PaddleOCR always routes to [`OcrRoute::NativePaddle`] (every paddle language has
+/// a native path). Every other engine, and every non-native/Suspect case, routes
+/// to [`OcrRoute::Backend`], so an unrecognized or torch-only selection never
+/// silently takes the native path.
+fn ocr_route(
+    runtime: config::AiRuntime,
+    engine: OcrEngine,
+    manga_model_key: &str,
+    guard: config::OrtLoadDecision,
+) -> OcrRoute {
+    // Native requires the native runtime and a non-Suspect load guard.
+    if runtime != config::AiRuntime::Native || guard != config::OrtLoadDecision::Safe {
+        return OcrRoute::Backend;
+    }
+    match engine {
+        OcrEngine::MangaOcr => match ai_models::manga_ocr_model_from_key(manga_model_key) {
+            // Torch-only (`base_torch`) or unknown keys map to `None` -> backend.
+            Some(variant) => OcrRoute::NativeManga(variant),
+            None => OcrRoute::Backend,
+        },
+        OcrEngine::PaddleOcr => OcrRoute::NativePaddle,
+        // These engines have no native path yet; they use the Python backend.
+        OcrEngine::EasyOcr
+        | OcrEngine::PaddleVl
+        | OcrEngine::Surya
+        | OcrEngine::AiApi => OcrRoute::Backend,
+    }
+}
+
+/// Route-aware decision for whether the Python backend is required to run the
+/// selected OCR engine/model under `runtime` and the SIGILL load `guard`.
+///
+/// This is the single source of truth the UI readiness gates consult. It reuses
+/// [`ocr_route`] so it can never disagree with the actual dispatch: a native
+/// route (MangaOCR ONNX or PaddleOCR under the native runtime with a non-`Suspect`
+/// guard) needs NO backend and returns `false`; every backend-routed engine/model
+/// returns `true`. `AiApi` is special-cased to `false` because it runs over `genai`
+/// and never touches the backend socket (its `ocr_route` value is `Backend` only
+/// because `OcrRoute` has no AI-API variant). A `Suspect` guard falls back to the
+/// backend, so it correctly reports the backend as required. Pure and testable.
+pub(crate) fn ocr_requires_backend(
+    engine: OcrEngine,
+    manga_model_key: &str,
+    runtime: config::AiRuntime,
+    guard: config::OrtLoadDecision,
+) -> bool {
+    // Engines that never use the backend socket (AiApi over `genai`) never require
+    // it, regardless of runtime/guard.
+    if !engine.requires_backend() {
+        return false;
+    }
+    match ocr_route(runtime, engine, manga_model_key, guard) {
+        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle => false,
+        OcrRoute::Backend => true,
+    }
+}
+
+/// Reads the native-routing inputs (selected AI runtime + provider-scoped SIGILL
+/// load guard) fresh off disk.
+///
+/// Kept as one helper so [`current_ocr_route`] and the UI-side readiness gate read
+/// the exact same inputs. Involves disk I/O; callers must not invoke it on the
+/// GUI thread's hot path without their own caching. Desktop-only: the native
+/// runtime is compiled out on the web build.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_ocr_route_inputs() -> (config::AiRuntime, config::OrtLoadDecision) {
+    let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
+    let runtime = config::AiRuntime::from_user_settings(&cfg);
+    let scope = native_runtime::native_load_scope_key();
+    let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
+    (runtime, decision)
+}
+
+/// Assembles an [`OcrRecognizeResult`] from a single native MangaOCR string,
+/// applying `join_newlines`/`reflect_strings` exactly like the backend path: split
+/// on newlines and drop blank lines; reverse line order when `reflect_strings`;
+/// join with `"\n"` (or `" "`) per `join_newlines`, then trim.
+#[cfg(not(target_arch = "wasm32"))]
+fn assemble_native_ocr_result(
+    text: &str,
+    join_newlines: bool,
+    reflect_strings: bool,
+) -> OcrRecognizeResult {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if reflect_strings {
+        lines.reverse();
+    }
+    let separator = if join_newlines { "\n" } else { " " };
+    let text = lines.join(separator).trim().to_string();
+    OcrRecognizeResult { lines, text }
+}
+
+/// Logs the native->backend fallback once per process (for the case where the
+/// native runtime is selected but the current engine/model has no native path).
+#[cfg(not(target_arch = "wasm32"))]
+fn log_native_fallback_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::runtime_log::log_info(
+            "[ocr] native AI runtime selected but the current OCR engine/model has no native path \
+             (native covers MangaOCR ONNX + PaddleOCR); using the Python backend.",
+        );
+    }
+}
+
+/// Reads the selected AI runtime + SIGILL load guard fresh off disk (worker thread;
+/// disk I/O ok) and returns the OCR route for `engine`/`manga_model_key`.
+///
+/// The guard is scoped to the effective native provider so the pre-check matches the
+/// provider `native_runtime` will actually load. Shared by [`try_native_ocr`] (which
+/// dispatches on it) and the load-time warmup (which uses it to skip the backend
+/// warmup when the route is native), so both agree on the routing decision.
+/// Mirrors `text_detector::current_detector_route`.
+#[cfg(not(target_arch = "wasm32"))]
+fn current_ocr_route(engine: OcrEngine, manga_model_key: &str) -> OcrRoute {
+    let (runtime, decision) = read_ocr_route_inputs();
+    ocr_route(runtime, engine, manga_model_key, decision)
+}
+
+/// Whether the native AI runtime is currently selected (independent of whether the
+/// active engine/model has a native path). Worker-thread only (disk I/O). Used to
+/// decide whether a `Backend` route for a native-runtime user warrants the
+/// "no native path, using backend" log.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_ai_runtime_selected() -> bool {
+    let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
+    config::AiRuntime::from_user_settings(&cfg) == config::AiRuntime::Native
+}
+
+/// Outcome of an attempted native ONNX Runtime OCR recognize.
+///
+/// Distinguishes "this op has no native path, use the backend" from "the native
+/// path was taken and failed" so the dispatcher can surface the real native error
+/// when the backend cannot serve as a fallback. `Failed` carries the user-facing
+/// (Russian) message derived from [`native_runtime::NativeRuntimeError`].
+#[cfg(not(target_arch = "wasm32"))]
+enum NativeOcrOutcome {
+    /// Not a native route (unsupported engine, torch-only model, Suspect guard, or
+    /// backend runtime): the request should use the Python backend.
+    NotNative,
+    /// Native recognition succeeded; publish this result.
+    Ok(OcrRecognizeResult),
+    /// The native route was taken but failed. The string is the user-facing error.
+    Failed(String),
+}
+
+/// Attempts the native ONNX Runtime OCR path (MangaOCR or PaddleOCR) for `request`.
+///
+/// Returns [`NativeOcrOutcome::Ok`] on success, [`NativeOcrOutcome::NotNative`]
+/// when the request has no native path (so the backend handles it), and
+/// [`NativeOcrOutcome::Failed`] when the native route was taken but crop decode or
+/// inference failed. The caller decides whether a `Failed` outcome falls back to
+/// the backend (if it is up) or is surfaced to the user (if the backend is offline).
+/// Failures are always logged with diagnostic context, never hidden. Runs on the
+/// OCR worker thread (blocking download/inference).
+#[cfg(not(target_arch = "wasm32"))]
+fn try_native_ocr(
+    request: &OcrRecognizeRequest,
+    page_cache: &mut PageImageCache,
+    evt_tx: &Sender<WorkerEvent>,
+) -> NativeOcrOutcome {
+    let route = current_ocr_route(request.engine, &request.options.manga_model);
+    if route == OcrRoute::Backend {
+        // Native selected but this op has no native path (unsupported engine,
+        // torch-only model, or Suspect guard): use the backend and log once so
+        // the fallback is visible without spamming per request.
+        if native_ai_runtime_selected() {
+            log_native_fallback_once();
+        }
+        return NativeOcrOutcome::NotNative;
+    }
+
+    // Decode the crop to RGBA for the native engine. A crop failure on a native
+    // route is a real failure (the backend cannot fix a bad crop/source), so it is
+    // surfaced when the backend is offline rather than masked as "backend offline".
+    let rgba = match crop_image(request, page_cache) {
+        Ok(image) => image.to_rgba8(),
+        Err(err) => {
+            crate::runtime_log::log_error(format!("[ocr] native OCR crop decode failed: {err}"));
+            return NativeOcrOutcome::Failed(format!(
+                "Нативный ONNX: не удалось подготовить изображение для распознавания. {err}"
+            ));
+        }
+    };
+
+    // Adapt ORT dylib/model download progress to the OCR download-state event so
+    // the UI shows activity while the runtime/model is fetched on first use.
+    let mut reported = false;
+    let mut progress = |snapshot: OrtDownloadProgress| {
+        if !reported
+            && matches!(
+                snapshot.stage,
+                OrtDownloadStage::Downloading
+                    | OrtDownloadStage::Verifying
+                    | OrtDownloadStage::Extracting
+            )
+        {
+            reported = true;
+            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
+        }
+    };
+
+    // Run the native op. PaddleOCR returns lines already; join them so the shared
+    // `assemble_native_ocr_result` applies the same join/reflect logic as MangaOCR.
+    let native_result: Result<String, native_runtime::NativeRuntimeError> = match route {
+        OcrRoute::NativeManga(variant) => {
+            native_runtime::recognize_manga(variant, &rgba, &mut progress)
+        }
+        OcrRoute::NativePaddle => {
+            native_runtime::recognize_paddle(&request.options.paddle_lang, &rgba, &mut progress)
+                .map(|lines| lines.join("\n"))
+        }
+        // `Backend` is handled above; unreachable here but matched exhaustively.
+        OcrRoute::Backend => return NativeOcrOutcome::NotNative,
+    };
+
+    match native_result {
+        Ok(text) => NativeOcrOutcome::Ok(assemble_native_ocr_result(
+            &text,
+            request.join_newlines,
+            request.reflect_strings,
+        )),
+        Err(err) => {
+            // Log with the fallback framing for diagnostics; a Suspect guard never
+            // reaches here (it routes to Backend). The user-facing message keeps the
+            // native runtime's own Russian text so an offline-backend user sees the
+            // real reason instead of "backend offline".
+            let engine_label = native_ocr_engine_label(route);
+            crate::runtime_log::log_error(format!(
+                "[ocr] native {engine_label} failed (falls back to the Python backend if it is up): {err}"
+            ));
+            NativeOcrOutcome::Failed(format!("Нативный ONNX: {err}"))
+        }
+    }
+}
+
+/// Human-readable engine label for a native OCR route, for log context.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_ocr_engine_label(route: OcrRoute) -> &'static str {
+    match route {
+        OcrRoute::NativeManga(_) => "MangaOCR",
+        OcrRoute::NativePaddle => "PaddleOCR",
+        OcrRoute::Backend => "OCR",
+    }
+}
+
+/// Pure decision: given a native recognize failure, should the worker surface the
+/// native error to the user, or fall back to the Python backend?
+///
+/// Returns `true` (surface the native error) exactly when the backend is NOT
+/// available — the native path is then the only path, so masking its failure as
+/// "backend offline" would hide the real cause. When the backend IS available the
+/// contract is preserved: the worker falls back to the backend (`false`). Pure so
+/// the dispatch decision is unit-testable without a live backend.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_failure_should_surface(backend_available: bool) -> bool {
+    !backend_available
+}
+
 /// Handles one `Recognize` command, including real cancellation: while the
 /// backend call is in flight, the worker keeps draining `cmd_rx`. If a newer
 /// `Recognize` arrives it cancels the in-flight request (the backend replies
@@ -814,6 +1137,30 @@ fn run_recognize_command(
                 result
             });
             return publish_recognize(request_id, result, evt_tx);
+        }
+
+        // Native ONNX Runtime route (MangaOCR + PaddleOCR). On success we publish
+        // the native result. On a native failure we preserve the fallback contract
+        // ONLY when the backend is up; when the backend is offline we surface the
+        // real native error instead of falling through to the misleading
+        // "backend offline" message. A non-native op falls through to the backend.
+        // Desktop-only: the native runtime is compiled out on the web build.
+        #[cfg(not(target_arch = "wasm32"))]
+        match try_native_ocr(&request, page_cache, evt_tx) {
+            NativeOcrOutcome::Ok(mut result) => {
+                apply_char_replacements(&mut result, &request.char_replacements);
+                return publish_recognize(request_id, Ok(result), evt_tx);
+            }
+            NativeOcrOutcome::Failed(native_error) => {
+                // Only path is native when the backend is down: surface its error.
+                if native_failure_should_surface(ensure_v2_backend_ready().is_ok()) {
+                    return publish_recognize(request_id, Err(native_error), evt_tx);
+                }
+                // Backend is up: fall through to the backend recognize below.
+            }
+            NativeOcrOutcome::NotNative => {
+                // No native path: fall through to the backend recognize below.
+            }
         }
 
         match run_backend_recognize(&request, page_cache, cmd_rx) {
@@ -1557,11 +1904,14 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::{
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
-        OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements, interpret_call_result,
-        is_likely_multimodal_model, model_iden_for_ai_api_service, ocr_header_fields,
-        parse_ocr_response,
+        OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
+        assemble_native_ocr_result, interpret_call_result, is_likely_multimodal_model,
+        model_iden_for_ai_api_service, native_failure_should_surface, ocr_header_fields,
+        ocr_requires_backend, ocr_route, ocr_route_needs_backend_warmup, parse_ocr_response,
     };
+    use crate::ai_models::MangaOcrOnnxModel;
     use crate::backend_ipc::protocol;
+    use crate::config::{AiRuntime, OrtLoadDecision};
     use genai::adapter::AdapterKind;
     use serde_json::{Value, json};
 
@@ -1779,5 +2129,295 @@ mod tests {
         assert!(is_likely_multimodal_model("claude-3-5-haiku-latest"));
         assert!(is_likely_multimodal_model("google/gemini-2.0-flash-001"));
         assert!(!is_likely_multimodal_model("text-embedding-3-small"));
+    }
+
+    #[test]
+    fn ocr_route_native_manga_for_manga_onnx_safe_guard() {
+        // Native runtime + MangaOCR + ONNX variant + Safe guard -> NativeManga.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::MangaOcr,
+                "base_onnx",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::NativeManga(MangaOcrOnnxModel::Base)
+        );
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::MangaOcr,
+                "2025_onnx",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::NativeManga(MangaOcrOnnxModel::Model2025)
+        );
+    }
+
+    #[test]
+    fn ocr_route_native_paddle_for_paddle_engine_safe_guard() {
+        // Native runtime + PaddleOCR + Safe guard -> NativePaddle, for any language.
+        // The manga_model_key is irrelevant for the Paddle route.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::PaddleOcr,
+                "base_onnx",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::NativePaddle
+        );
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::PaddleOcr,
+                "",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::NativePaddle
+        );
+    }
+
+    #[test]
+    fn ocr_route_backend_when_paddle_guard_suspect() {
+        // A Suspect guard disables the native Paddle path.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::PaddleOcr,
+                "korean_v5",
+                OrtLoadDecision::Suspect
+            ),
+            OcrRoute::Backend
+        );
+    }
+
+    #[test]
+    fn ocr_route_backend_when_model_has_no_native_path() {
+        // Torch-only MangaOCR model -> backend even with native runtime + Safe guard.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::MangaOcr,
+                "base_torch",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::Backend
+        );
+        // Unknown model key -> backend.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::MangaOcr,
+                "definitely-not-a-model",
+                OrtLoadDecision::Safe
+            ),
+            OcrRoute::Backend
+        );
+    }
+
+    #[test]
+    fn ocr_route_backend_when_guard_suspect() {
+        // A Suspect guard disables the native path even for an ONNX MangaOCR model.
+        assert_eq!(
+            ocr_route(
+                AiRuntime::Native,
+                OcrEngine::MangaOcr,
+                "base_onnx",
+                OrtLoadDecision::Suspect
+            ),
+            OcrRoute::Backend
+        );
+    }
+
+    #[test]
+    fn ocr_route_backend_for_engines_without_native_path() {
+        // Native runtime + Safe guard, but these engines have no native path
+        // (MangaOCR and PaddleOCR are the natively-supported OCR engines).
+        for engine in [
+            OcrEngine::EasyOcr,
+            OcrEngine::PaddleVl,
+            OcrEngine::Surya,
+            OcrEngine::AiApi,
+        ] {
+            assert_eq!(
+                ocr_route(AiRuntime::Native, engine, "base_onnx", OrtLoadDecision::Safe),
+                OcrRoute::Backend,
+                "engine {engine:?} must route to backend"
+            );
+        }
+    }
+
+    #[test]
+    fn ocr_route_backend_when_runtime_is_backend() {
+        // Backend runtime always routes to the backend regardless of engine/model/guard.
+        for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
+            assert_eq!(
+                ocr_route(AiRuntime::Backend, OcrEngine::MangaOcr, "base_onnx", guard),
+                OcrRoute::Backend
+            );
+            assert_eq!(
+                ocr_route(AiRuntime::Backend, OcrEngine::MangaOcr, "2025_onnx", guard),
+                OcrRoute::Backend
+            );
+        }
+    }
+
+    #[test]
+    fn native_routes_skip_backend_warmup_backend_route_needs_it() {
+        // The native routes lazy-load in-process on first recognize, so warmup must
+        // NOT require the Python backend for them (this is what makes native OCR work
+        // offline). Only the Backend route warms the backend.
+        assert!(!ocr_route_needs_backend_warmup(OcrRoute::NativeManga(
+            MangaOcrOnnxModel::Base
+        )));
+        assert!(!ocr_route_needs_backend_warmup(OcrRoute::NativeManga(
+            MangaOcrOnnxModel::Model2025
+        )));
+        assert!(!ocr_route_needs_backend_warmup(OcrRoute::NativePaddle));
+        assert!(ocr_route_needs_backend_warmup(OcrRoute::Backend));
+    }
+
+    #[test]
+    fn ocr_requires_backend_backend_runtime_matches_engine_contract() {
+        // With the (default) backend runtime, the decision is byte-identical to the
+        // historical `engine.requires_backend()`: every backend engine requires it,
+        // AiApi never does — for either guard state.
+        for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
+            for engine in [
+                OcrEngine::MangaOcr,
+                OcrEngine::EasyOcr,
+                OcrEngine::PaddleOcr,
+                OcrEngine::PaddleVl,
+                OcrEngine::Surya,
+                OcrEngine::AiApi,
+            ] {
+                assert_eq!(
+                    ocr_requires_backend(engine, "base_onnx", AiRuntime::Backend, guard),
+                    engine.requires_backend(),
+                    "engine {engine:?} guard {guard:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ocr_requires_backend_native_manga_onnx_safe_guard_is_false() {
+        // Native runtime + MangaOCR ONNX export + Safe guard -> in-process, no backend.
+        for model in ["base_onnx", "2025_onnx"] {
+            assert!(!ocr_requires_backend(
+                OcrEngine::MangaOcr,
+                model,
+                AiRuntime::Native,
+                OrtLoadDecision::Safe
+            ));
+        }
+    }
+
+    #[test]
+    fn ocr_requires_backend_native_paddle_safe_guard_is_false() {
+        assert!(!ocr_requires_backend(
+            OcrEngine::PaddleOcr,
+            "base_onnx",
+            AiRuntime::Native,
+            OrtLoadDecision::Safe
+        ));
+    }
+
+    #[test]
+    fn ocr_requires_backend_native_torch_model_is_true() {
+        // `base_torch` has no native export, so even under the native runtime the op
+        // routes to the backend and therefore still requires it.
+        assert!(ocr_requires_backend(
+            OcrEngine::MangaOcr,
+            "base_torch",
+            AiRuntime::Native,
+            OrtLoadDecision::Safe
+        ));
+    }
+
+    #[test]
+    fn ocr_requires_backend_native_guard_suspect_is_true() {
+        // A Suspect guard disables the native path -> the op falls back to the backend,
+        // so the backend IS required (otherwise the user would be stuck with no path).
+        assert!(ocr_requires_backend(
+            OcrEngine::MangaOcr,
+            "base_onnx",
+            AiRuntime::Native,
+            OrtLoadDecision::Suspect
+        ));
+        assert!(ocr_requires_backend(
+            OcrEngine::PaddleOcr,
+            "base_onnx",
+            AiRuntime::Native,
+            OrtLoadDecision::Suspect
+        ));
+    }
+
+    #[test]
+    fn ocr_requires_backend_native_engines_without_native_path_are_true() {
+        // EasyOCR/PaddleVL/Surya have no native path; they require the backend even
+        // under the native runtime with a Safe guard.
+        for engine in [OcrEngine::EasyOcr, OcrEngine::PaddleVl, OcrEngine::Surya] {
+            assert!(
+                ocr_requires_backend(engine, "base_onnx", AiRuntime::Native, OrtLoadDecision::Safe),
+                "engine {engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ocr_requires_backend_ai_api_never_requires_backend() {
+        // AiApi runs over `genai`; it never requires the Python backend, on any runtime.
+        for runtime in [AiRuntime::Backend, AiRuntime::Native] {
+            assert!(!ocr_requires_backend(
+                OcrEngine::AiApi,
+                "base_onnx",
+                runtime,
+                OrtLoadDecision::Safe
+            ));
+        }
+    }
+
+    #[test]
+    fn native_failure_surfaces_only_when_backend_offline() {
+        // Native failed + backend up  -> fall back to backend (do not surface).
+        assert!(!native_failure_should_surface(true));
+        // Native failed + backend down -> surface the real native error to the user.
+        assert!(native_failure_should_surface(false));
+    }
+
+    #[test]
+    fn assemble_native_result_single_line_is_identity() {
+        // A one-line MangaOCR string: lines=[text], text=trimmed, join/reflect no-op.
+        for join in [true, false] {
+            for reflect in [true, false] {
+                let result = assemble_native_ocr_result("  こんにちは  ", join, reflect);
+                assert_eq!(result.lines, vec!["こんにちは".to_string()]);
+                assert_eq!(result.text, "こんにちは");
+            }
+        }
+    }
+
+    #[test]
+    fn assemble_native_result_splits_and_joins_lines() {
+        // Blank lines are stripped; join controls the separator.
+        let joined = assemble_native_ocr_result("a\n\nb\n", true, false);
+        assert_eq!(joined.lines, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(joined.text, "a\nb");
+
+        let spaced = assemble_native_ocr_result("a\n\nb\n", false, false);
+        assert_eq!(spaced.lines, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(spaced.text, "a b");
+    }
+
+    #[test]
+    fn assemble_native_result_reflect_reverses_line_order() {
+        let result = assemble_native_ocr_result("first\nsecond\nthird", true, true);
+        assert_eq!(
+            result.lines,
+            vec!["third".to_string(), "second".to_string(), "first".to_string()]
+        );
+        assert_eq!(result.text, "third\nsecond\nfirst");
     }
 }
