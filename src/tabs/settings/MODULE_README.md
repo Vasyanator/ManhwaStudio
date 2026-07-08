@@ -29,7 +29,9 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   projects-dir/typing-layout persistence helpers, and the coalesced canvas settings save worker.
   (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
   Also hosts the `user_config.json` writers for the AI runtime selector, the unified ONNX selection,
-  and the ONNX Runtime SIGILL load-guard: `save_ai_runtime` (writes `General.ai_runtime`),
+  and the ONNX Runtime SIGILL load-guard: `save_ai_runtime` (writes `General.ai_runtime` and sets
+  `General.ai_runtime_configured=true`, marking the runtime as an explicit user choice so the native
+  default no longer applies),
   `save_onnx_provider_device` (writes `General.ai_onnx_provider`/`ai_onnx_device_id` + the
   `*_configured` flags, the SAME keys the backend uses, so one selection drives both runtimes),
   `save_onnx_build` (writes `General.ai_onnx_build`, the native-only build slug picking the onnxruntime

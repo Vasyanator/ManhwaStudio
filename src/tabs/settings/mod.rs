@@ -678,9 +678,12 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
 /// Persists the selected AI runtime under `General.ai_runtime` in
 /// `user_config.json`.
 ///
-/// Re-reads the file fresh, inserts only the `ai_runtime` key, and rewrites the
-/// whole file (mirroring [`save_memory_profile`]). No fsync: this is an ordinary
-/// preference with no crash-durability requirement. Safe to call from a
+/// Re-reads the file fresh, inserts the `ai_runtime` token, and rewrites the whole
+/// file (mirroring [`save_memory_profile`]). Also sets the
+/// `ai_runtime_configured` boolean to `true`, recording that the runtime is now an
+/// EXPLICIT user choice so [`config::AiRuntime::from_user_settings`] honors the
+/// stored token instead of applying the native default. No fsync: this is an
+/// ordinary preference with no crash-durability requirement. Safe to call from a
 /// background thread; the caller must not invoke it on the GUI thread since it
 /// does synchronous disk I/O.
 // Wired into the AI runtime selector in `ai_backend_panel`.
@@ -701,6 +704,12 @@ pub fn save_ai_runtime(
     general_obj.insert(
         config::GENERAL_AI_RUNTIME_KEY.to_string(),
         Value::String(runtime.as_key().to_string()),
+    );
+    // Mark the runtime as an explicit user decision so the effective-runtime
+    // resolver stops applying the native default and honors this token.
+    general_obj.insert(
+        config::GENERAL_AI_RUNTIME_CONFIGURED_KEY.to_string(),
+        Value::Bool(true),
     );
     root_obj.insert("General".to_string(), Value::Object(general_obj));
 

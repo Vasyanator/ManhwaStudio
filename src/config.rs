@@ -55,10 +55,15 @@ pub const GENERAL_PROJECTS_DIR_KEY: &str = "projects_dir";
 pub const GENERAL_AI_INSTALL_TYPE_KEY: &str = "ai_install_type";
 /// `General` key selecting which AI runtime the app drives: the external Python
 /// backend process (`"backend"`) or the in-process native ONNX Runtime path
-/// (`"native"`). Parsed by [`AiRuntime::from_user_settings`].
-// Phase 0 config plumbing; the runtime selector reads it in Phase 1 (not yet wired).
-#[allow(dead_code)]
+/// (`"native"`). Parsed by [`AiRuntime::from_user_settings`], but only honored when
+/// [`GENERAL_AI_RUNTIME_CONFIGURED_KEY`] marks it as an explicit user choice.
 pub const GENERAL_AI_RUNTIME_KEY: &str = "ai_runtime";
+/// `General` boolean marking [`GENERAL_AI_RUNTIME_KEY`] as an explicit user choice,
+/// mirroring the ONNX `*_configured` flags. Set to `true` by [`save_ai_runtime`]
+/// when the user picks a runtime via the AI-backend switch. When absent or not
+/// `true`, [`AiRuntime::from_user_settings`] treats the stored `ai_runtime` token as
+/// a pre-flag default (not a decision) and applies the native default instead.
+pub const GENERAL_AI_RUNTIME_CONFIGURED_KEY: &str = "ai_runtime_configured";
 /// `General` key holding the ORT execution-provider TOKEN shared by the Python
 /// backend AND the native in-process ONNX path (e.g. `"CPUExecutionProvider"` /
 /// `"DmlExecutionProvider"` / `"CUDAExecutionProvider"` / `"CoreMLExecutionProvider"`).
@@ -135,19 +140,17 @@ impl AiInstallType {
     }
 }
 
-/// Which AI runtime the application drives, persisted under
-/// `General.ai_runtime` in `user_config.json`.
+/// Which AI runtime the application drives, persisted under `General.ai_runtime`
+/// in `user_config.json`.
 ///
-/// `Backend` routes inference through the external Python `ai_backend.py`
-/// process (the historical default). `Native` uses the in-process ONNX Runtime
-/// path (`crate`-native, loaded lazily). Unknown or missing values resolve to
-/// `Backend` so an unrecognized config never silently enables native loading.
+/// `Backend` routes inference through the external Python `ai_backend.py` process.
+/// `Native` uses the in-process ONNX Runtime path (`crate`-native, loaded lazily
+/// behind the SIGILL load guard). `Native` is the default runtime; `Backend`
+/// applies only when the user explicitly selects it via the AI-backend switch. See
+/// [`AiRuntime::from_user_settings`] for the effective-runtime contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiRuntime {
     Backend,
-    // The native ONNX path is selectable only once Phase 1 wires the runtime
-    // switch; the variant exists now for the persisted-config contract.
-    #[allow(dead_code)]
     Native,
 }
 
@@ -163,26 +166,55 @@ impl AiRuntime {
         }
     }
 
-    /// Reads `General.ai_runtime` from a raw user-settings tree.
+    /// Resolves the EFFECTIVE AI runtime from a raw user-settings tree.
     ///
-    /// Returns `Backend` when the key is absent, non-string, or holds an
-    /// unrecognized token, so an invalid config never enables the native path.
-    // Consumed by the Phase 1 runtime selector; unused in non-test code until then.
-    #[allow(dead_code)]
+    /// The native ONNX path is the default. `Backend` is returned only when the
+    /// user made an EXPLICIT choice, recorded by [`save_ai_runtime`] via the
+    /// `General.ai_runtime_configured` boolean:
+    ///
+    /// - `ai_runtime_configured` missing or not `true`: return [`AiRuntime::Native`],
+    ///   IGNORING any stored `ai_runtime` token. Such a config either is a fresh
+    ///   install or predates explicit runtime tracking, so its stored token is a
+    ///   default rather than a user decision. This migrates both fresh installs and
+    ///   upgraders to the native default in a single step.
+    /// - `ai_runtime_configured == true`: honor the stored `ai_runtime` token
+    ///   (`"native"` -> `Native`, `"backend"` -> `Backend`, whitespace trimmed). A
+    ///   missing or unparseable token while configured is `true` falls back to the
+    ///   native default.
+    ///
+    /// Panic-free and allocation-light: reads borrowed JSON without cloning. This
+    /// resolves the DEFAULT selection only; the native path still falls back to the
+    /// backend through the separate SIGILL load guard when native loading is unsafe.
     #[must_use]
     pub fn from_user_settings(cfg: &Value) -> Self {
-        cfg.get("General")
-            .and_then(Value::as_object)
+        let general = cfg.get("General").and_then(Value::as_object);
+        let configured = general
+            .and_then(|general| general.get(GENERAL_AI_RUNTIME_CONFIGURED_KEY))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !configured {
+            // No explicit choice recorded: apply the native default regardless of any
+            // stored token (fresh install or pre-flag upgrade).
+            return Self::Native;
+        }
+        general
             .and_then(|general| general.get(GENERAL_AI_RUNTIME_KEY))
             .and_then(Value::as_str)
             .map(str::trim)
-            .map(|value| match value {
-                "native" => Self::Native,
-                // Any other token (including "backend" and unknown values)
-                // falls back to the safe default.
-                _ => Self::Backend,
-            })
-            .unwrap_or(Self::Backend)
+            .map(parse_ai_runtime_token)
+            // Explicit choice but missing/unparseable token: fall back to native.
+            .unwrap_or(Self::Native)
+    }
+}
+
+/// Maps a trimmed `General.ai_runtime` token to a runtime.
+///
+/// Recognizes `"backend"`; every other token (including `"native"` and unknown
+/// values) resolves to the native default.
+fn parse_ai_runtime_token(token: &str) -> AiRuntime {
+    match token {
+        "backend" => AiRuntime::Backend,
+        _ => AiRuntime::Native,
     }
 }
 
@@ -760,7 +792,8 @@ pub fn user_config_defaults() -> Value {
             "ai_onnx_build": "not-selected",
             "ai_max_loaded_models": 3,
             "ai_install_type": AiInstallType::None.as_str(),
-            "ai_runtime": AiRuntime::Backend.as_key(),
+            "ai_runtime": AiRuntime::Native.as_key(),
+            "ai_runtime_configured": false,
             "ort_load_state": {},
             "memory_profile": MemoryProfile::default().as_config_str(),
             "typing_panel_layout": "vertical",
@@ -1105,30 +1138,56 @@ mod tests {
     }
 
     #[test]
-    fn ai_runtime_parses_user_settings_values() {
-        // Missing key -> safe default.
-        assert_eq!(AiRuntime::from_user_settings(&json!({})), AiRuntime::Backend);
+    fn ai_runtime_resolves_effective_runtime() {
+        // Fresh install: empty tree and JSON null both default to native.
+        assert_eq!(AiRuntime::from_user_settings(&json!({})), AiRuntime::Native);
         assert_eq!(
-            AiRuntime::from_user_settings(&json!({"General": {}})),
-            AiRuntime::Backend
+            AiRuntime::from_user_settings(&Value::Null),
+            AiRuntime::Native
         );
-        // Explicit values.
+        // Upgrade migration: a pre-flag config's stored "backend" token is ignored.
         assert_eq!(
             AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "backend"}})),
+            AiRuntime::Native
+        );
+        // Explicit-choice flag false: stored token ignored, native default applies.
+        assert_eq!(
+            AiRuntime::from_user_settings(
+                &json!({"General": {"ai_runtime_configured": false, "ai_runtime": "backend"}})
+            ),
+            AiRuntime::Native
+        );
+        // Explicit choice of the Python backend is respected.
+        assert_eq!(
+            AiRuntime::from_user_settings(
+                &json!({"General": {"ai_runtime_configured": true, "ai_runtime": "backend"}})
+            ),
             AiRuntime::Backend
         );
+        // Explicit choice of the native runtime is respected.
         assert_eq!(
-            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "native"}})),
+            AiRuntime::from_user_settings(
+                &json!({"General": {"ai_runtime_configured": true, "ai_runtime": "native"}})
+            ),
             AiRuntime::Native
         );
-        // Whitespace is trimmed.
+        // Explicit flag but missing token: documented fallback to native.
         assert_eq!(
-            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": " native "}})),
+            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime_configured": true}})),
             AiRuntime::Native
         );
-        // Unknown token -> safe default.
+        // Explicit flag but garbage token: documented fallback to native.
         assert_eq!(
-            AiRuntime::from_user_settings(&json!({"General": {"ai_runtime": "onnx"}})),
+            AiRuntime::from_user_settings(
+                &json!({"General": {"ai_runtime_configured": true, "ai_runtime": "onnx"}})
+            ),
+            AiRuntime::Native
+        );
+        // Whitespace is trimmed around an explicit token.
+        assert_eq!(
+            AiRuntime::from_user_settings(
+                &json!({"General": {"ai_runtime_configured": true, "ai_runtime": " backend "}})
+            ),
             AiRuntime::Backend
         );
     }
@@ -1137,11 +1196,15 @@ mod tests {
     fn ai_runtime_as_key_round_trips() {
         assert_eq!(AiRuntime::Backend.as_key(), "backend");
         assert_eq!(AiRuntime::Native.as_key(), "native");
+        // An explicit choice (configured=true) round-trips through the stored token.
         for runtime in [AiRuntime::Backend, AiRuntime::Native] {
             assert_eq!(
-                AiRuntime::from_user_settings(
-                    &json!({"General": {"ai_runtime": runtime.as_key()}})
-                ),
+                AiRuntime::from_user_settings(&json!({
+                    "General": {
+                        "ai_runtime_configured": true,
+                        "ai_runtime": runtime.as_key(),
+                    }
+                })),
                 runtime
             );
         }

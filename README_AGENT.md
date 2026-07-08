@@ -390,7 +390,12 @@ original, and a bbox relative to the sent image) and the model returns
 ## Нативный ONNX-рантайм (native OCR path)
 
 Помимо Python backend есть in-process нативный ONNX-путь, выбираемый через
-`General.ai_runtime` (`backend` по умолчанию / `native`):
+`General.ai_runtime` (`native` по умолчанию / `backend`). Эффективный рантайм
+резолвит `AiRuntime::from_user_settings`: native применяется всегда, кроме случая,
+когда пользователь ЯВНО выбрал backend через переключатель (это фиксируется флагом
+`General.ai_runtime_configured=true`, который пишет `save_ai_runtime`). Конфиги без
+этого флага (свежая установка или апгрейд) мигрируют на native, игнорируя старый
+хранимый токен. Гейтинг по SIGILL-guard — отдельный слой (см. ниже):
 
 - **`ms-onnx`** (`crates/ms-onnx`) — обёртка над `ort` (load-dynamic): `OrtRuntime::load`
   (dlopen + commit процесс-глобального ort-env, EP по `ExecutionProvider`), `MangaOcrEngine`
