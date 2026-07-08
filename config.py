@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import json
 from typing import Any, Dict, Optional
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 
 
 def _default_documents_dir() -> Optional[Path]:
