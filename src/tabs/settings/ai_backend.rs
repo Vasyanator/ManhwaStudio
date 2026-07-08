@@ -11,7 +11,18 @@ use super::SettingsTabState;
 use crate::ai_backend_panel::draw_ai_backend_panel;
 
 impl SettingsTabState {
+    /// Renders the studio AI backend pane inside a vertical scroll area.
+    ///
+    /// The panel is taller than the settings tab viewport, so it is wrapped in a
+    /// `ScrollArea` (like the launcher settings page) to keep every control
+    /// reachable. `auto_shrink` is disabled on both axes so the scroll area fills
+    /// the available space instead of collapsing to the content size.
     pub(super) fn draw_ai_backend(&mut self, ui: &mut egui::Ui) {
-        draw_ai_backend_panel(ui, &self.ai_backend_handle, &mut self.ai_backend_panel);
+        egui::ScrollArea::vertical()
+            .id_salt("settings_ai_backend_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                draw_ai_backend_panel(ui, &self.ai_backend_handle, &mut self.ai_backend_panel);
+            });
     }
 }

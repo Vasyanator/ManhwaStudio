@@ -1,0 +1,219 @@
+{
+  "ort_version": "1.20.1",
+  "entries": [
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "cpu",
+      "build": "cpu",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz",
+      "sha256": "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f",
+      "archive": "tar_gz",
+      "dylib_member": "onnxruntime-linux-x64-1.27.0/lib/libonnxruntime.so.1.27.0",
+      "extra_members": []
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "cpu",
+      "build": "cpu",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip",
+      "sha256": "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc",
+      "archive": "zip",
+      "dylib_member": "onnxruntime-win-x64-1.27.0/lib/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime-win-x64-1.27.0/lib/onnxruntime_providers_shared.dll"
+      ]
+    },
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "provider": "cpu",
+      "build": "cpu",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz",
+      "sha256": "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+      "archive": "tar_gz",
+      "dylib_member": "onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime.1.27.0.dylib",
+      "extra_members": []
+    },
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "provider": "coreml",
+      "build": "coreml",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz",
+      "sha256": "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+      "archive": "tar_gz",
+      "dylib_member": "onnxruntime-osx-arm64-1.27.0/lib/libonnxruntime.1.27.0.dylib",
+      "extra_members": []
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "directml",
+      "build": "directml",
+      "version": "1.24.4",
+      "url": "https://files.pythonhosted.org/packages/88/ea/33814eb0ec96775eda4c1d30b0d86e91d7d2cd0d84c66d3915aef0e06fa3/onnxruntime_directml-1.24.4-cp312-cp312-win_amd64.whl",
+      "sha256": "f2ecb68b7b7b259d2ef3112ae760149f9b5a1e7c0fbb73d539da6250a648a614",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime/capi/DirectML.dll",
+        "onnxruntime/capi/onnxruntime_providers_shared.dll"
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "webgpu",
+      "build": "webgpu",
+      "version": "1.27.0",
+      "url": "https://files.pythonhosted.org/packages/df/28/016260c51c877ba5b3eba823b43107e894659e73e0ecf250eb07e801e3c2/onnxruntime_webgpu-1.27.0-cp312-cp312-win_amd64.whl",
+      "sha256": "7ef99275b13e8cb9584bd0db7a6f00ebf76095601eeccf7d34749b89ee991c19",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime/capi/dxil.dll",
+        "onnxruntime/capi/dxcompiler.dll",
+        "onnxruntime/capi/onnxruntime_providers_shared.dll"
+      ],
+      "additional_sources": []
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "webgpu",
+      "build": "webgpu",
+      "version": "1.27.0",
+      "url": "https://files.pythonhosted.org/packages/24/11/6cd5f840be97819cbd172bacc1868726ab5fa54ceaaa79508c5a64e61233/onnxruntime_webgpu-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "fe5e49e00ad71bc667316d57670bfbf525438783d4a3468e0d337314ec985cbe",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/libonnxruntime.so.1.27.0",
+      "extra_members": [
+        "onnxruntime/capi/libonnxruntime_providers_shared.so"
+      ],
+      "additional_sources": []
+    },
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "provider": "webgpu",
+      "build": "webgpu",
+      "version": "1.27.0",
+      "url": "https://files.pythonhosted.org/packages/b4/1f/be670672fa0dc367fd28113b5e410a6e71cb6ee66c188ed1a8eb1439c941/onnxruntime_webgpu-1.27.0-cp312-cp312-macosx_14_0_arm64.whl",
+      "sha256": "8e6c43281318283a31977ebe752e7b0454db9b2dc42c768ac88641952357196a",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/libonnxruntime.1.27.0.dylib",
+      "extra_members": [],
+      "additional_sources": []
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "cuda",
+      "build": "cuda13",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-gpu_cuda13-1.27.0.zip",
+      "sha256": null,
+      "archive": "zip",
+      "dylib_member": "onnxruntime-win-x64-gpu_cuda13-1.27.0/lib/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime-win-x64-gpu_cuda13-1.27.0/lib/onnxruntime_providers_cuda.dll",
+        "onnxruntime-win-x64-gpu_cuda13-1.27.0/lib/onnxruntime_providers_tensorrt.dll",
+        "onnxruntime-win-x64-gpu_cuda13-1.27.0/lib/onnxruntime_providers_shared.dll"
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "cuda",
+      "build": "cuda13",
+      "version": "1.27.0",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-gpu_cuda13-1.27.0.tgz",
+      "sha256": null,
+      "archive": "tar_gz",
+      "dylib_member": "onnxruntime-linux-x64-gpu_cuda13-1.27.0/lib/libonnxruntime.so.1.27.0",
+      "extra_members": [
+        "onnxruntime-linux-x64-gpu_cuda13-1.27.0/lib/libonnxruntime_providers_cuda.so",
+        "onnxruntime-linux-x64-gpu_cuda13-1.27.0/lib/libonnxruntime_providers_tensorrt.so",
+        "onnxruntime-linux-x64-gpu_cuda13-1.27.0/lib/libonnxruntime_providers_shared.so"
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "cuda",
+      "build": "cuda12",
+      "version": "1.24.1",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-win-x64-gpu-1.24.1.zip",
+      "sha256": null,
+      "archive": "zip",
+      "dylib_member": "onnxruntime-win-x64-gpu-1.24.1/lib/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime-win-x64-gpu-1.24.1/lib/onnxruntime_providers_cuda.dll",
+        "onnxruntime-win-x64-gpu-1.24.1/lib/onnxruntime_providers_tensorrt.dll",
+        "onnxruntime-win-x64-gpu-1.24.1/lib/onnxruntime_providers_shared.dll"
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "cuda",
+      "build": "cuda12",
+      "version": "1.24.1",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-linux-x64-gpu-1.24.1.tgz",
+      "sha256": null,
+      "archive": "tar_gz",
+      "dylib_member": "onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime.so.1.24.1",
+      "extra_members": [
+        "onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime_providers_cuda.so",
+        "onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime_providers_tensorrt.so",
+        "onnxruntime-linux-x64-gpu-1.24.1/lib/libonnxruntime_providers_shared.so"
+      ]
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "provider": "openvino",
+      "build": "openvino",
+      "version": "1.24.1",
+      "url": "https://files.pythonhosted.org/packages/59/37/d301f2c68b19a9485ed5db3047e0fb52478f3e73eb08c7d2a7c61be7cc1c/onnxruntime_openvino-1.24.1-cp312-cp312-win_amd64.whl",
+      "sha256": "f186335a9c9b255633275290da7521d3d4d14c7773fee3127bfa040234d3fa5a",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/onnxruntime.dll",
+      "extra_members": [
+        "onnxruntime/capi/onnxruntime_providers_openvino.dll",
+        "onnxruntime/capi/onnxruntime_providers_shared.dll"
+      ]
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "provider": "openvino",
+      "build": "openvino",
+      "version": "1.24.1",
+      "url": "https://files.pythonhosted.org/packages/50/cf/17ba72de2df0fcba349937d2788f154397bbc2d1a2d67772a97e26f6bc5f/onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl",
+      "sha256": "d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe35150e",
+      "archive": "zip",
+      "dylib_member": "onnxruntime/capi/libonnxruntime.so.1.24.1",
+      "extra_members": [
+        "onnxruntime/capi/libonnxruntime_providers_openvino.so",
+        "onnxruntime/capi/libonnxruntime_providers_shared.so",
+        "onnxruntime/capi/libopenvino.so.2541",
+        "onnxruntime/capi/libopenvino_c.so.2541",
+        "onnxruntime/capi/libopenvino_onnx_frontend.so.2541",
+        "onnxruntime/capi/libopenvino_auto_plugin.so",
+        "onnxruntime/capi/libopenvino_hetero_plugin.so",
+        "onnxruntime/capi/libopenvino_intel_cpu_plugin.so",
+        "onnxruntime/capi/libopenvino_intel_gpu_plugin.so",
+        "onnxruntime/capi/libopenvino_intel_npu_plugin.so",
+        "onnxruntime/capi/libtbb.so.12",
+        "onnxruntime/capi/libtbbmalloc.so"
+      ]
+    }
+  ]
+}
