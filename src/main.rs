@@ -43,6 +43,7 @@ mod backend_ipc;
 mod bubble_status;
 mod canvas;
 mod config;
+mod general_settings_panel;
 pub mod gpu_utils;
 mod input_manager_v2;
 mod input_util;

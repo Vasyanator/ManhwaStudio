@@ -1,27 +1,23 @@
 /*
 FILE OVERVIEW: src/tabs/settings/general.rs
-General settings pane UI for the settings tab.
+Thin studio wrapper for the General settings pane.
 
 Main responsibilities:
-- Render general settings that still affect runtime state.
-- Render and persist projects directory.
-
-Key types:
-- `SettingsTabState`
+- Enforce the studio-only vertical typing-panel layout (persisted off the GUI thread).
+- Delegate the projects-directory editor and the global memory-profile combo to the
+  shared `crate::general_settings_panel` widget (the same widget the launcher renders),
+  then apply the studio-only runtime effect (memory profile -> `MemoryManager`) from the
+  returned outcome.
 
 Key functions:
 - `SettingsTabState::draw_general`
 
 Notes:
-- Persistence is delegated to background threads to avoid blocking the GUI thread.
+- The projects-dir save and memory-profile persistence are handled synchronously inside
+  the shared widget; only the typing-panel-layout write is offloaded here.
 */
 
-use super::{
-    SettingsTabState, normalize_projects_dir_value, save_memory_profile, save_projects_dir,
-    save_typing_panel_layout,
-};
-use crate::config;
-use crate::memory_manager::MemoryProfile;
+use super::{SettingsTabState, save_typing_panel_layout};
 use crate::runtime_log;
 use crate::tabs::typing::TypingPanelLayout;
 use ms_thread as thread;
@@ -29,6 +25,10 @@ use ms_thread as thread;
 impl SettingsTabState {
     pub(super) fn draw_general(&mut self, ui: &mut egui::Ui) {
         ui.heading("Общие настройки");
+
+        // Studio-only: the "Текст" tab panel is locked to the vertical layout. The
+        // launcher has no typing tab, so this enforcement stays in the studio wrapper
+        // rather than the shared widget. Persist off the GUI thread when it changes.
         if self.typing_panel_layout != TypingPanelLayout::Vertical {
             self.typing_panel_layout = TypingPanelLayout::Vertical;
             self.pending_typing_panel_layout = Some(TypingPanelLayout::Vertical);
@@ -54,90 +54,17 @@ impl SettingsTabState {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label("Использование памяти:");
-        ui.small("Применяется сразу к общей политике кэшей изображений.");
 
-        let mut selected_profile = self.memory_profile;
-        egui::ComboBox::from_id_salt("settings_memory_profile")
-            .selected_text(selected_profile.display_name_ru())
-            .show_ui(ui, |ui| {
-                for profile in MemoryProfile::ALL {
-                    ui.selectable_value(&mut selected_profile, profile, profile.display_name_ru());
-                }
-            });
-
-        if selected_profile != self.memory_profile {
-            self.memory_profile = selected_profile;
-            self.apply_memory_profile_to_runtime(selected_profile);
-            let path = self.user_settings_file.clone();
-            if let Err(err) = thread::Builder::new()
-                .name("settings-memory-profile-save".to_string())
-                .spawn(move || {
-                    if let Err(err) = save_memory_profile(&path, selected_profile) {
-                        runtime_log::log_error(format!(
-                            "[settings] failed to persist memory profile '{}' to {}; error={err}",
-                            selected_profile.as_config_str(),
-                            path.display()
-                        ));
-                    }
-                })
-            {
-                runtime_log::log_error(format!(
-                    "[settings] failed to start memory profile save thread; error={err}"
-                ));
-            }
+        // Shared widget: projects directory + memory profile (identical to the launcher).
+        let outcome = crate::general_settings_panel::draw_general_settings_panel(
+            ui,
+            &mut self.general_settings_panel,
+        );
+        // Studio runtime effect: apply a changed memory profile to the shared
+        // `MemoryManager` and cache owners. The saved projects dir needs no studio
+        // runtime effect here.
+        if let Some(profile) = outcome.memory_profile_changed {
+            self.apply_memory_profile_to_runtime(profile);
         }
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label("Папка с проектами:");
-        ui.small("Используется базовым Rust-лаунчером при выборе тайтла и главы.");
-
-        let mut should_save_projects_dir = false;
-        ui.horizontal_wrapped(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.projects_dir_input)
-                    .font(egui::FontId::new(14.0, egui::FontFamily::Monospace))
-                    .desired_width(520.0)
-                    .hint_text(config::default_projects_root().to_string_lossy()),
-            );
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                should_save_projects_dir = true;
-            }
-            let current_projects_dir = normalize_projects_dir_value(&self.projects_dir_input);
-            if ui
-                .add_enabled(
-                    current_projects_dir != self.saved_projects_dir,
-                    egui::Button::new("Сохранить"),
-                )
-                .clicked()
-            {
-                should_save_projects_dir = true;
-            }
-        });
-
-        if should_save_projects_dir {
-            let normalized = normalize_projects_dir_value(&self.projects_dir_input);
-            self.projects_dir_input = normalized.clone();
-            self.saved_projects_dir = normalized.clone();
-            let path = self.user_settings_file.clone();
-            if let Err(err) = thread::Builder::new()
-                .name("settings-projects-dir-save".to_string())
-                .spawn(move || {
-                    if let Err(err) = save_projects_dir(&path, &normalized) {
-                        runtime_log::log_error(format!(
-                            "[settings] failed to persist projects directory to {}; error={err}",
-                            path.display()
-                        ));
-                    }
-                })
-            {
-                runtime_log::log_error(format!(
-                    "[settings] failed to start projects directory save thread; error={err}"
-                ));
-            }
-        }
-        ui.small("Если поле пустое, автоматически используется путь по умолчанию.");
     }
 }

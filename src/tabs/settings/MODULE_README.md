@@ -26,7 +26,9 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
 
 ## Files and submodules
 - `mod.rs`: `SettingsTabState`, pane routing, canvas settings binding, the shared `AiBackendHandle`,
-  projects-dir/typing-layout persistence helpers, and the coalesced canvas settings save worker.
+  typing-layout persistence helper, and the coalesced canvas settings save worker. (The
+  projects-dir + memory-profile editing/persistence moved to the shared
+  `crate::general_settings_panel` widget; the `user_config.json` write lock moved to `config`.)
   (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
   Also hosts the `user_config.json` writers for the AI runtime selector, the unified ONNX selection,
   and the ONNX Runtime SIGILL load-guard: `save_ai_runtime` (writes `General.ai_runtime` and sets
@@ -42,13 +44,18 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   aborted-attempt marker survives an uncatchable SIGILL during onnxruntime load (and the marker write
   also fsyncs the parent directory on a first-ever create, Unix-only); all are synchronous
   read-modify-write helpers meant to run off the GUI thread. ALL `user_config.json` RMW writers in
-  this module (`save_*` + `write_ort_load_state`) serialize on the process-wide `USER_CONFIG_WRITE_LOCK`
-  so concurrent background/GUI-thread savers cannot interleave read/write and lose an update (which
-  could drop the just-written `attempted:true` SIGILL marker or clobber settings). `save_ai_runtime` is wired to the
+  this module (`save_*` + `write_ort_load_state`) serialize on the process-wide write lock, now
+  `config::lock_user_config_write()` (moved to `config` so the shared general-settings widget serializes
+  on the same lock), so concurrent background/GUI-thread savers cannot interleave read/write and lose an
+  update (which could drop the just-written `attempted:true` SIGILL marker or clobber settings).
+  `save_ai_runtime` is wired to the
   "Рантайм ИИ" selector in `ai_backend_panel`; the guard writers are wired to `native_runtime`'s ORT
   load path and the "Повторить попытку ORT" reset control.
-- `general.rs`: general pane UI, including global memory profile, projects directory, and the
-  current typing panel layout persistence behavior.
+- `general.rs`: thin studio wrapper for the general pane. Enforces the studio-only vertical
+  typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then delegates the
+  projects-directory editor and global memory-profile combo to the shared
+  `crate::general_settings_panel` widget and applies the memory-profile runtime effect from its
+  outcome. Projects-dir + memory-profile persistence live inside that shared widget, not here.
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
 - `typesetting.rs`: "Тайп" pane for text-typesetting options: the app-wide
@@ -114,8 +121,10 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `mod.rs`.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit
   `ai_backend.rs` and the worker functions in `mod.rs`.
-- To change projects directory or general user settings, edit `general.rs` and the matching
-  persistence helper in `mod.rs`.
+- To change the projects directory or the memory profile, edit the shared
+  `crate::general_settings_panel` widget (used by both the studio pane and the launcher); the studio
+  `general.rs` is only a thin wrapper that adds the typing-panel-layout enforcement and applies the
+  memory-profile runtime effect.
 - To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode), edit
   `typesetting.rs` and the matching persistence helper in `mod.rs`. Runtime globals for these
   live outside settings (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`).

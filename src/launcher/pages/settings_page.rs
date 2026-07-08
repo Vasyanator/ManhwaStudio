@@ -146,9 +146,10 @@ enum SettingsTab {
 
 pub struct SettingsPageState {
     active_tab: SettingsTab,
-    projects_dir_input: String,
-    saved_projects_dir: String,
-    status: SettingsStatus,
+    /// Shared general-settings widget state (projects directory + memory profile),
+    /// the same widget the studio settings tab renders. See
+    /// `crate::general_settings_panel`.
+    general_settings_panel: crate::general_settings_panel::GeneralSettingsPanelState,
     // Native Python-environment console; no OS shell on web.
     #[cfg(not(target_arch = "wasm32"))]
     python_console: PythonConsoleState,
@@ -174,13 +175,6 @@ pub struct SettingsPageState {
 enum LogKind {
     Current,
     Previous,
-}
-
-enum SettingsStatus {
-    Idle,
-    Info(String),
-    Success(String),
-    Error(String),
 }
 
 #[derive(Debug, Default)]
@@ -289,12 +283,13 @@ impl SettingsPageState {
         ai_backend: AiBackendHandle,
         #[cfg(feature = "tutorial")] tutorial_progress: TutorialProgressHandle,
     ) -> Self {
-        let projects_dir = normalize_projects_dir_value(&projects_root.to_string_lossy());
+        // Seed the shared widget from the passed root so the page opens clean.
+        let mut general_settings_panel =
+            crate::general_settings_panel::GeneralSettingsPanelState::new();
+        general_settings_panel.set_projects_root(&projects_root.to_string_lossy());
         Self {
             active_tab: SettingsTab::General,
-            projects_dir_input: projects_dir.clone(),
-            saved_projects_dir: projects_dir,
-            status: SettingsStatus::Idle,
+            general_settings_panel,
             #[cfg(not(target_arch = "wasm32"))]
             python_console: PythonConsoleState::default(),
             ai_probe: AiComputationsProbeState::default(),
@@ -311,9 +306,8 @@ impl SettingsPageState {
     }
 
     pub fn set_projects_root(&mut self, projects_root: PathBuf) {
-        let normalized = normalize_projects_dir_value(&projects_root.to_string_lossy());
-        self.projects_dir_input = normalized.clone();
-        self.saved_projects_dir = normalized;
+        self.general_settings_panel
+            .set_projects_root(&projects_root.to_string_lossy());
     }
 
     /// Terminates and resets the Python-environment console.
@@ -364,7 +358,18 @@ impl SettingsPageState {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.active_tab {
-                            SettingsTab::General => self.show_general_tab(ui, &mut action),
+                            SettingsTab::General => {
+                                let outcome =
+                                    crate::general_settings_panel::draw_general_settings_panel(
+                                        ui,
+                                        &mut self.general_settings_panel,
+                                    );
+                                if let Some(root) = outcome.projects_dir_saved {
+                                    action = Some(PageNavAction::ProjectsRootChanged(root));
+                                }
+                                // The launcher has no MemoryManager; the memory profile is
+                                // already persisted by the shared widget.
+                            }
                             SettingsTab::SystemInfo => self.show_system_info_tab(ui),
                             SettingsTab::AiComputations => {
                                 if let Some(tab_action) = self.show_ai_computations_tab(ui) {
@@ -403,58 +408,6 @@ impl SettingsPageState {
         self.show_save_log_popup(ui, save_log_button_rect);
 
         action
-    }
-
-    /// Opens the OS folder picker and stores the chosen projects root in the
-    /// input field.
-    ///
-    /// Native only. The web twin reports that folder picking is unavailable
-    /// (web storage has no OS directories; Phase 5 defines the web flow).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_projects_dir(&mut self) {
-        let current = normalize_projects_dir_value(&self.projects_dir_input);
-        let start_dir = if Path::new(&current).is_dir() {
-            PathBuf::from(current)
-        } else {
-            config::default_projects_root()
-        };
-        let Some(selected_dir) = FileDialog::new().set_directory(start_dir).pick_folder() else {
-            return;
-        };
-
-        self.projects_dir_input = normalize_projects_dir_value(&selected_dir.to_string_lossy());
-        self.status =
-            SettingsStatus::Info("Папка выбрана. Нажмите «Сохранить папку проектов».".to_string());
-    }
-
-    /// Web twin of `pick_projects_dir`: no OS folder dialog on web.
-    #[cfg(target_arch = "wasm32")]
-    fn pick_projects_dir(&mut self) {
-        self.status = SettingsStatus::Info(
-            "Выбор папки недоступен в веб-версии.".to_string(),
-        );
-    }
-
-    fn save_projects_root(&mut self) -> Result<PathBuf, String> {
-        let normalized = normalize_projects_dir_value(&self.projects_dir_input);
-        persist_projects_root(&normalized).map_err(|err| {
-            runtime_log::log_error(format!(
-                "[launcher-settings] failed to save projects root '{}': {err:#}",
-                normalized
-            ));
-            format!("Не удалось сохранить папку проектов: {err}")
-        })?;
-
-        self.projects_dir_input = normalized.clone();
-        self.saved_projects_dir = normalized.clone();
-        self.status = SettingsStatus::Success("Папка проектов сохранена.".to_string());
-        Ok(PathBuf::from(normalized))
-    }
-
-    fn clear_success_status(&mut self) {
-        if matches!(self.status, SettingsStatus::Success(_)) {
-            self.status = SettingsStatus::Idle;
-        }
     }
 
     fn show_tab_bar(&mut self, ui: &mut Ui) -> egui::Rect {
@@ -681,9 +634,7 @@ impl SettingsPageState {
     /// Web twin of `save_log_file`: no OS save dialog or filesystem on web.
     #[cfg(target_arch = "wasm32")]
     fn save_log_file(&mut self, _kind: LogKind) {
-        self.status = SettingsStatus::Error(
-            "Сохранение лога недоступно в веб-версии.".to_string(),
-        );
+        runtime_log::log_error("Сохранение лога недоступно в веб-версии.".to_string());
     }
 
     fn show_system_info_tab(&mut self, ui: &mut Ui) {
@@ -908,55 +859,6 @@ impl SettingsPageState {
                 egui::Label::new(theme::status(label, theme::TEXT_MUTED)),
             );
             ui.label(theme::status(value, theme::TEXT_MAIN));
-        });
-    }
-
-    fn show_general_tab(&mut self, ui: &mut Ui, action: &mut Option<PageNavAction>) {
-        ui.label(theme::status("Папка с проектами:", theme::TEXT_MUTED));
-        ui.horizontal(|ui| {
-            let input_width = (ui.available_width() - 112.0).max(260.0);
-            let response = ui.add_sized(
-                [input_width, ui.spacing().interact_size.y.max(34.0)],
-                egui::TextEdit::singleline(&mut self.projects_dir_input)
-                    .hint_text("Выберите папку с проектами"),
-            );
-            if response.changed() {
-                self.clear_success_status();
-            }
-            if theme::launcher_button(ui, "Обзор", egui::vec2(100.0, 34.0), true).clicked() {
-                self.pick_projects_dir();
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.label(theme::footer(
-            "Используется страницами «Открыть главу», «Импорт главы», «Экспорт главы», а также окнами «Новый проект» и PSD-импорт.",
-        ));
-
-        ui.add_space(8.0);
-        self.show_status(ui);
-
-        ui.add_space(18.0);
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            let normalized_input = normalize_projects_dir_value(&self.projects_dir_input);
-            let changed = normalized_input != self.saved_projects_dir;
-            if theme::launcher_button(
-                ui,
-                "Сохранить папку проектов",
-                egui::vec2(220.0, 36.0),
-                changed,
-            )
-            .clicked()
-            {
-                match self.save_projects_root() {
-                    Ok(projects_root) => {
-                        *action = Some(PageNavAction::ProjectsRootChanged(projects_root));
-                    }
-                    Err(err) => {
-                        self.status = SettingsStatus::Error(err);
-                    }
-                }
-            }
         });
     }
 
@@ -1591,25 +1493,6 @@ impl SettingsPageState {
         }
     }
 
-    fn show_status(&self, ui: &mut Ui) {
-        match &self.status {
-            SettingsStatus::Idle => {
-                ui.label(theme::status(
-                    "Изменения применяются сразу после сохранения.",
-                    theme::TEXT_MUTED,
-                ));
-            }
-            SettingsStatus::Info(message) => {
-                ui.label(theme::status(message, theme::TEXT_MUTED));
-            }
-            SettingsStatus::Success(message) => {
-                ui.label(theme::status(message, theme::STATUS_SUCCESS));
-            }
-            SettingsStatus::Error(message) => {
-                ui.label(theme::status(message, STATUS_ERROR));
-            }
-        }
-    }
 }
 
 // Only needed to tear down the native Python console; no drop work on web.
@@ -1768,25 +1651,6 @@ impl PythonConsoleRuntime {
         }
         self.terminated = true;
     }
-}
-
-fn normalize_projects_dir_value(raw_value: &str) -> String {
-    let trimmed = raw_value.trim();
-    if trimmed.is_empty() {
-        return config::default_projects_root()
-            .to_string_lossy()
-            .into_owned();
-    }
-    PathBuf::from(trimmed).to_string_lossy().into_owned()
-}
-
-fn persist_projects_root(projects_dir: &str) -> anyhow::Result<()> {
-    let mut cfg = config::load_user_config()?;
-    cfg.set_path(
-        &["General", config::GENERAL_PROJECTS_DIR_KEY],
-        Value::String(projects_dir.to_string()),
-    )?;
-    Ok(())
 }
 
 // Only invoked from the native Torch-upgrade completion path.

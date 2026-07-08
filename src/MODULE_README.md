@@ -213,6 +213,10 @@ prompts instead of blocking the GUI thread.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
+- General settings editor (projects directory + global memory profile) shared by the studio settings
+  tab AND the launcher settings page: `general_settings_panel.rs`. Per-UI `GeneralSettingsPanelState`
+  + a returned `GeneralSettingsOutcome`; synchronous persistence to `user_config.json` serialized on
+  `config::lock_user_config_write()`.
 - AI install-type detection from installed Python packages: `ai_install_probe.rs`.
 - App-managed AI model coverage, Hugging Face paths, or lazy download behavior: `ai_models.rs`.
 - Native ONNX Runtime path (MangaOCR + PaddleOCR OCR, PaddleOCR text detection; runtime/engine

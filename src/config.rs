@@ -28,6 +28,7 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 #[allow(dead_code)]
 pub const VERSION: &str = "2.11.1";
@@ -1018,6 +1019,29 @@ pub fn project_config_defaults() -> Value {
             "target_lang": "ru"
         }
     })
+}
+
+/// Process-wide lock serializing every `user_config.json` read-modify-write across
+/// the whole crate.
+///
+/// The various full-file writers (settings-tab `save_*` helpers, the ORT SIGILL
+/// load-guard writers, and the shared general-settings widget) re-read the file,
+/// mutate one key, then rewrite the whole file. Without serialization, two
+/// concurrent writers (background threads and GUI-thread savers) can interleave
+/// their read/write and lose an update — dropping the just-written SIGILL
+/// `attempted:true` marker (weakening the crash guard) or clobbering user settings.
+/// The static stays private to `config`; every writer serializes through
+/// [`lock_user_config_write`].
+static USER_CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Acquires [`USER_CONFIG_WRITE_LOCK`], recovering from poisoning (a prior panic
+/// while holding it leaves the `()` payload usable). Hold the returned guard across
+/// the whole read-modify-write (and any fsync) of `user_config.json`.
+pub(crate) fn lock_user_config_write() -> MutexGuard<'static, ()> {
+    USER_CONFIG_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 pub fn load_user_config() -> Result<JsonConfig> {

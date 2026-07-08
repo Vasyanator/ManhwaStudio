@@ -42,10 +42,9 @@ use crate::widgets::{
 };
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
 
@@ -90,9 +89,10 @@ pub struct SettingsTabState {
     typing_panel_layout: TypingPanelLayout,
     pending_typing_panel_layout: Option<TypingPanelLayout>,
     memory_manager: Arc<MemoryManager>,
-    memory_profile: MemoryProfile,
-    projects_dir_input: String,
-    saved_projects_dir: String,
+    /// Shared general-settings widget state (projects directory + memory profile),
+    /// the same widget the launcher settings page renders. See
+    /// `crate::general_settings_panel`.
+    general_settings_panel: crate::general_settings_panel::GeneralSettingsPanelState,
     hanging_punctuation_input: String,
     saved_hanging_punctuation: String,
     project_settings_file: PathBuf,
@@ -137,9 +137,9 @@ impl SettingsTabState {
     pub fn new(ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
         let user_settings_file = config::user_config_path();
         let typing_panel_layout = load_typing_panel_layout(&user_settings_file);
-        let memory_profile = load_memory_profile(&user_settings_file);
-        memory_manager.set_profile(memory_profile);
-        let projects_dir = load_projects_dir(&user_settings_file);
+        let general_settings_panel =
+            crate::general_settings_panel::GeneralSettingsPanelState::new();
+        memory_manager.set_profile(general_settings_panel.memory_profile);
         // Триггерит ленивую загрузку набора из конфига и даёт текущее значение.
         let hanging_punctuation = crate::text_punctuation::hanging_punctuation_string();
 
@@ -149,9 +149,7 @@ impl SettingsTabState {
             typing_panel_layout,
             pending_typing_panel_layout: Some(typing_panel_layout),
             memory_manager,
-            memory_profile,
-            projects_dir_input: projects_dir.clone(),
-            saved_projects_dir: projects_dir,
+            general_settings_panel,
             hanging_punctuation_input: hanging_punctuation.clone(),
             saved_hanging_punctuation: hanging_punctuation,
             project_settings_file: PathBuf::new(),
@@ -207,7 +205,7 @@ impl SettingsTabState {
         self.spellcheck_words_revision_seen = current_spellcheck_words_revision();
         self.bubbles_model = Some(bubbles_model);
         self.clean_overlays_model = Some(clean_overlays_model);
-        self.apply_memory_profile_to_runtime(self.memory_profile);
+        self.apply_memory_profile_to_runtime(self.general_settings_panel.memory_profile);
         self.canvas_settings_runtime = Some(spawn_canvas_settings_save_worker(
             self.user_settings_file.clone(),
             project_settings_file,
@@ -446,82 +444,11 @@ pub(super) fn load_typing_panel_layout(user_settings_file: &Path) -> TypingPanel
         .unwrap_or(TypingPanelLayout::Vertical)
 }
 
-pub(super) fn load_memory_profile(user_settings_file: &Path) -> MemoryProfile {
-    let raw = match fs::read_to_string(user_settings_file) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == ErrorKind::NotFound => return MemoryProfile::default(),
-        Err(err) => {
-            runtime_log::log_error(format!(
-                "[settings] failed to read memory profile from {}; error={err}",
-                user_settings_file.display()
-            ));
-            return MemoryProfile::default();
-        }
-    };
-    let payload = match serde_json::from_str::<Value>(&raw) {
-        Ok(payload) => payload,
-        Err(err) => {
-            runtime_log::log_error(format!(
-                "[settings] failed to parse memory profile config {}; error={err}",
-                user_settings_file.display()
-            ));
-            return MemoryProfile::default();
-        }
-    };
-    payload
-        .get("General")
-        .and_then(Value::as_object)
-        .and_then(|general| general.get(config::GENERAL_MEMORY_PROFILE_KEY))
-        .and_then(Value::as_str)
-        .and_then(MemoryProfile::from_config_str)
-        .or_else(|| {
-            payload
-                .get("Canvas")
-                .and_then(Value::as_object)
-                .and_then(|canvas| canvas.get("cache_pages"))
-                .and_then(Value::as_bool)
-                .map(|enabled| {
-                    if enabled {
-                        MemoryProfile::Medium
-                    } else {
-                        MemoryProfile::Low
-                    }
-                })
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn load_projects_dir(user_settings_file: &Path) -> String {
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return config::default_projects_root()
-            .to_string_lossy()
-            .into_owned();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
-        return config::default_projects_root()
-            .to_string_lossy()
-            .into_owned();
-    };
-    config::projects_root_from_user_settings(&payload)
-        .to_string_lossy()
-        .into_owned()
-}
-
-pub(super) fn normalize_projects_dir_value(raw_value: &str) -> String {
-    let trimmed = raw_value.trim();
-    if trimmed.is_empty() {
-        return config::default_projects_root()
-            .to_string_lossy()
-            .into_owned();
-    }
-    PathBuf::from(trimmed).to_string_lossy().into_owned()
-}
-
 pub(super) fn save_typing_panel_layout(
     user_settings_file: &Path,
     layout: TypingPanelLayout,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = if user_settings_file.exists() {
         match fs::read_to_string(user_settings_file) {
             Ok(raw) => {
@@ -554,58 +481,11 @@ pub(super) fn save_typing_panel_layout(
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
-pub(super) fn save_memory_profile(
-    user_settings_file: &Path,
-    profile: MemoryProfile,
-) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(|err| {
-                format!(
-                    "Не удалось разобрать {}: {err}",
-                    user_settings_file.display()
-                )
-            })?,
-            Err(err) => {
-                return Err(format!(
-                    "Не удалось прочитать {}: {err}",
-                    user_settings_file.display()
-                ));
-            }
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
-    };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        config::GENERAL_MEMORY_PROFILE_KEY.to_string(),
-        Value::String(profile.as_config_str().to_string()),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
-}
-
 pub(super) fn save_hanging_punctuation(
     user_settings_file: &Path,
     punctuation: &str,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = if user_settings_file.exists() {
         match fs::read_to_string(user_settings_file) {
             Ok(raw) => {
@@ -642,7 +522,7 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
     user_settings_file: &Path,
     mode: crate::tabs::typing::rotation_ctrl_wheel::RotationCtrlWheelMode,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = if user_settings_file.exists() {
         match fs::read_to_string(user_settings_file) {
             Ok(raw) => {
@@ -679,7 +559,7 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
 /// `user_config.json`.
 ///
 /// Re-reads the file fresh, inserts the `ai_runtime` token, and rewrites the whole
-/// file (mirroring [`save_memory_profile`]). Also sets the
+/// file (like the other `General` writers in this module). Also sets the
 /// `ai_runtime_configured` boolean to `true`, recording that the runtime is now an
 /// EXPLICIT user choice so [`config::AiRuntime::from_user_settings`] honors the
 /// stored token instead of applying the native default. No fsync: this is an
@@ -691,7 +571,7 @@ pub fn save_ai_runtime(
     user_settings_file: &Path,
     runtime: config::AiRuntime,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
         return Err("Не удалось подготовить корень user_config.json.".to_string());
@@ -738,7 +618,7 @@ pub fn save_onnx_provider_device(
     provider_token: &str,
     device_id: &str,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
         return Err("Не удалось подготовить корень user_config.json.".to_string());
@@ -784,7 +664,7 @@ pub fn save_onnx_provider_device(
 /// I/O: do not call from the GUI thread.
 // Wired into the "Билд" selector in `ai_backend_panel` (native runtime only).
 pub fn save_onnx_build(user_settings_file: &Path, build_slug: &str) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
         return Err("Не удалось подготовить корень user_config.json.".to_string());
@@ -820,7 +700,7 @@ pub fn save_max_loaded_models(
     user_settings_file: &Path,
     max_loaded_models: u32,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
         return Err("Не удалось подготовить корень user_config.json.".to_string());
@@ -901,26 +781,6 @@ pub fn reset_ort_load_guard(
     write_ort_load_state(user_settings_file, scope_key, None)
 }
 
-/// Process-wide lock serializing every `user_config.json` read-modify-write in this
-/// module.
-///
-/// All the `save_*` full-file writers and `write_ort_load_state` re-read the file,
-/// mutate one key, then truncate-and-rewrite the whole file. Without serialization,
-/// two concurrent writers (background threads and GUI-thread savers) can interleave
-/// their read/write and lose an update — dropping the just-written SIGILL
-/// `attempted:true` marker (weakening the crash guard) or clobbering user settings.
-static USER_CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-/// Acquires [`USER_CONFIG_WRITE_LOCK`], recovering from poisoning (a prior panic
-/// while holding it leaves the `()` payload usable). Hold the returned guard across
-/// the whole read-modify-write (and fsync) of `user_config.json`.
-fn lock_user_config_write() -> MutexGuard<'static, ()> {
-    USER_CONFIG_WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Reads `user_config.json` fresh into a JSON object root, tolerating a missing
 /// or non-object file by returning an empty object.
 ///
@@ -962,7 +822,7 @@ fn write_ort_load_state(
     scope_key: &str,
     entry: Option<config::OrtLoadGuard>,
 ) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
+    let _write_guard = config::lock_user_config_write();
     // Whether the config file already existed decides if a parent-directory fsync is
     // also needed for durability (a fresh create adds a new directory entry that an
     // in-place overwrite never touches). Captured under the write lock so it reflects
@@ -1081,43 +941,6 @@ fn fsync_parent_dir_best_effort(path: &Path) {
         // No portable directory fsync on Windows via std; see the doc comment.
         let _ = path;
     }
-}
-
-pub(super) fn save_projects_dir(
-    user_settings_file: &Path,
-    projects_dir: &str,
-) -> Result<(), String> {
-    let _write_guard = lock_user_config_write();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(
-        config::GENERAL_PROJECTS_DIR_KEY.to_string(),
-        Value::String(projects_dir.to_string()),
-    );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]

@@ -27,9 +27,12 @@ state arrives.
   extraction into the projects root, safe path validation, and optional open-after-import action.
 - `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and
   `tar + zstd` archive creation for `.mschapter` export.
-- `settings_page.rs`: launcher settings tabs, projects-root persistence, system CPU/RAM/GPU probes,
+- `settings_page.rs`: launcher settings tabs, system CPU/RAM/GPU probes,
   AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
-  flow, and a background-driven Python environment console.
+  flow, and a background-driven Python environment console. The projects-root editor (and now the
+  global memory profile) are rendered via the shared `crate::general_settings_panel` widget; the
+  `ProjectsRootChanged` invariant is unchanged — a saved projects root is still emitted as
+  `PageNavAction::ProjectsRootChanged`.
 
 ## Contracts and invariants
 - Page UI must stay responsive. Do not perform project scans, archive traversal, compression,
