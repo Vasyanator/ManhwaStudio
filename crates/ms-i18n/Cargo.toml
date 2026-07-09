@@ -1,0 +1,13 @@
+[package]
+name = "ms-i18n"
+version = "0.1.0"
+edition = "2024"
+
+# Localization catalog + lookup layer for ManhwaStudio. GUI-free, config-free:
+# locale JSON is embedded via `include_str!`, and the active catalog is swapped
+# behind an `ArcSwap` so the hot `t!` lookup is wait-free and allocation-free.
+# No egui / tokio / image dependency by design.
+[dependencies]
+serde_json = "1"
+arc-swap = "1"
+thiserror = "2"

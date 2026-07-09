@@ -38,6 +38,18 @@ pub fn start() {
     if crate::storage::install(Arc::new(ms_storage::MemStorage::new())).is_err() {
         console_error("storage backend was already installed");
     }
+    // There is no editable `locale/` folder in the browser, so the on-disk locale
+    // layer (`locale_store`) is compiled out on wasm; install the embedded catalog
+    // for the default UI locale directly. `"ru"` is a valid tag by construction, so
+    // the parse only errors on a build bug; both failure paths are logged.
+    match ms_i18n::LocaleTag::parse("ru") {
+        Ok(tag) => {
+            if let Err(err) = ms_i18n::set_locale(&tag) {
+                console_error(&format!("failed to install embedded locale: {err}"));
+            }
+        }
+        Err(err) => console_error(&format!("failed to build default locale tag: {err}")),
+    }
     if let Err(err) = seed_test_chapter() {
         console_error(&format!("failed to seed demo chapter: {err}"));
     }

@@ -1,52 +1,78 @@
-# segmentation
+# Module: crates/ms-text-util/src/segmentation
 
-Сегментатор текста вкладки «Текст»: режет абзац на блоки и описывает, как соединять
-соседние блоки на одной строке и при переносе на новую. Языко-нейтральное ядро
-отделено от языковых правил, чтобы новые языки добавлялись одним подмодулем.
+## Purpose
+Text-tab segmenter: cuts a paragraph into blocks (`Block`) and describes the
+junction (`Joint`) between adjacent blocks — how to join them on one line and how
+to hyphenate/wrap at a break. The language-neutral core is separated from the
+per-language rules so a new typesetting language is a self-contained submodule.
 
-## Файлы
+## Architecture
+The engine is selected by the process-global typesetting language
+(`crate::language::text_language`, seeded by the app). Each `ScriptGroup` has one
+`impl Segmenter`:
 
-- `base.rs` — язык-нейтральное API:
-  - `Block { text, joint, unit_count }` — блок текста плюс стык к следующему;
-  - `Joint { same_line, wrap_suffix, break_cost, word_break, conservatism }` —
-    «группа» стыка: что вставлять между блоками на одной строке (`same_line`) и что
-    дописывать в хвост головной строки при переносе (`wrap_suffix`). Конструкторы-
-    группы: `Joint::space` (пробел / ничего), `Joint::soft_hyphen` (ничего / дефис),
-    `Joint::hard_hyphen` («Рао-кун», дефис уже в тексте), `Joint::glue` (конец);
-    билдер `with_conservatism` помечает стык категорией консервативности;
-  - standalone dash/hyphen tokens between words are attached to the previous segment so a line
-    break adjacent to the sign can place it only at the previous line end, never at the next line
-    start;
-  - NBSP (`U+00A0`) is treated as visible non-breaking whitespace: it counts as text but does not
-    split tokenizer segments or create a wrap boundary;
-  - `Conservatism` (`Safe` < `Relaxed` < `Bold` < `Reckless`) — насколько вольным
-    надо быть, чтобы разрыв в стыке считался допустимым (обычный пробел → `Safe`,
-    отрыв предлога/частицы/«число + единица» → выше);
-  - `BindingMode` — как поступать со связанными служебными словами: `Glue`
-    (склеивать в один блок — горизонтальный врапер) или `Annotate` (оставлять
-    отдельными блоками с категорией стыка — перечисление форм, «один граф — фильтр»);
-  - трейт `Segmenter` с языковыми хуками (`binding_conservatism`, `hyphenate_word`,
-    `hyphen_cost`, `is_hard_hyphen_boundary`) и общими методами по умолчанию
-    (`segment`, `build_segments`, `soft_hyphenate_overlong`, `split_segment_into_parts`);
-  - общие хелперы `count_layout_units`, `build_line_text_and_units`.
-- `ru.rs` — русская реализация `Segmenter` (`RussianSegmenter`): словари переноса
-  (`HyphenationDictionaries`), категории связывания (`binding_conservatism`:
-  однобуквенный предлог/«число + единица» → `Reckless`, короткий предлог/частица →
-  `Bold`, длинный предлог/сокращение → `Relaxed`, обычная пара слов → `Safe`),
-  словарный мягкий перенос и **безопасные границы** переноса.
-  Правило ь/ъ/й: их нельзя оставлять в начале новой строки (справа от разрыва), но
-  переносить *после* них можно — «силь-нее», «подъ-езд», «май-ка».
-- `mod.rs` — реэкспорты + `with_default_segmenter` (пока всегда русский сегментатор).
+- `ScriptGroup::CyrillicSlavic` → `cyrillic_slavic` (ru/uk/be/sr)
+- `ScriptGroup::LatinSlavic`    → `latin_slavic` (pl/cs/sk/sl/hr)
+- `ScriptGroup::Romance`        → `romance` (es/fr/pt)
+- `ScriptGroup::English`        → `english` (en)
 
-## Кто использует
+`with_default_segmenter` dispatches on the global language and caches the built
+segmenter per language in a thread-local. Dictionaries are cached separately
+(`HyphenationDictionaries::for_language`), so a segmenter build is a cheap `Rc`
+clone and switching languages does not reload TeX patterns.
 
-- `render_next::wrap::forms` — перечисление дискретных форм текста (блоки + `Joint`);
-- `render_next::wrap::horizontal` — DP-подбор переносов поверх готовых блоков;
-- `render_next::wrap::hyphenation` — runtime словарный/аварийный перенос
-  переиспользует русские безопасные границы;
-- `render_next::pipeline` — пред-перенос длинных слов (`soft_hyphenate_overlong`).
+## Files and submodules
+- `base.rs`: language-neutral API — `Block`, `Joint` (junction groups: `space`,
+  `soft_hyphen`, `hard_hyphen`, `glue` + `with_conservatism`), `Conservatism`
+  (`Safe` < `Relaxed` < `Bold` < `Reckless`), `BindingMode` (`Glue`/`Annotate`),
+  the `Segmenter` trait (hooks `binding_conservatism`, `hyphenate_word`,
+  `hyphen_cost`, `is_hard_hyphen_boundary`; default `segment`/`build_segments`/
+  `soft_hyphenate_overlong`/`split_segment_into_parts`), and the shared
+  `count_layout_units` / `build_line_text_and_units`.
+- `dictionaries.rs`: `HyphenationDictionaries` — per-language TeX dictionary
+  bundle (primary + one opposite-script fallback). `for_language(TextLanguage)`
+  returns a thread-local-cached `Rc`. `breaks_for_word` returns group-sanitized
+  break offsets; for Russian it reproduces the old `russian`→`EnglishUS` order.
+- `cyrillic_slavic.rs`: `CyrillicSlavicSegmenter`. Owns the historical Russian
+  rules (ь/ъ/й line-start rule, one-letter/syllable rules, preposition/particle/
+  abbreviation/number-unit binding, `sanitize_breaks`, safe boundaries). Russian
+  output is byte-identical to the pre-refactor renderer (golden regression tests).
+- `latin_common.rs`: shared Latin-script break helpers (sanitize, split validity,
+  emergency boundary, `avoid_emergency_split`, `maybe_soft_hyphenate_word`,
+  `hyphen_cost`). The "break only strictly between two letters" rule is what keeps
+  a break away from an apostrophe (French `l'homme`) or opening punctuation
+  (Spanish `¿ ¡`).
+- `romance.rs` / `english.rs` / `latin_slavic.rs`: thin group segmenters over
+  `latin_common`. Binding is `Safe` everywhere (no service-word gluing yet).
+- `rules.rs`: group-dispatched break-boundary façade consumed by the renderer's
+  runtime wrap (`dictionary_split_is_valid`, `emergency_boundary_is_safe`,
+  `avoid_emergency_split`). Dispatches on the process-global language's group.
+- `mod.rs`: module wiring, re-exports, `with_default_segmenter` + per-language
+  cache.
 
-## Расширение
+## Contracts and invariants
+- Config-free: no submodule reads config. The app seeds the selected language via
+  `crate::language::set_text_language` at startup (default `Ru`).
+- Russian is a hard bit-identical contract (golden tests in `cyrillic_slavic`).
+- `rules::*` read the process-global language; the renderer builds
+  `HyphenationDictionaries::for_language(text_language())` so the dictionaries and
+  the boundary rules always agree on the language during a render.
+- **Known limitation — Polish/Czech repeated hyphen (not implemented, not faked):**
+  Polish/Czech require the hyphen to be repeated at the START of the next line
+  after a hyphenated break. `Joint` can only append to the head line
+  (`wrap_suffix`); there is no tail-line prefix. Latin-Slavic therefore hyphenates
+  like the other Latin groups (hyphen at line end only). Removal condition: add a
+  `wrap_prefix` field to `base::Joint`, thread it through
+  `base::build_line_text_and_units` and every `ms-text-render` wrap consumer, then
+  set it to `"-"` for pl/cs soft-hyphen joints in `latin_slavic`.
 
-Новый язык = новый подмодуль с `impl base::Segmenter`. Затем подключить его выбор в
-`with_default_segmenter` (в перспективе — по языку проекта/оверлея).
+## Editing map
+- To change Russian/Cyrillic-Slavic behavior, see `cyrillic_slavic.rs` (guard the
+  golden tests).
+- To change shared Latin break behavior, see `latin_common.rs`.
+- To add a typesetting language: add the variant + group + tag in
+  `crate::language`, add its embedded dictionary in `dictionaries.rs`
+  (`embedded_language`), and route it in `mod::build_segmenter` and `rules`. If it
+  needs a new group, add the `ScriptGroup` arm at every dispatch site (no
+  catch-all arms).
+- To change what the renderer's wrap treats as a valid break, see `rules.rs`.

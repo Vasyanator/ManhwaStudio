@@ -5,9 +5,11 @@ Purpose:
 Runtime-перенос строк горизонтального wrap-ядра: по ширине строки выбирает точку
 словарного или аварийного разрыва длинного блока.
 
-Языковые детали (словари, безопасные границы переноса, классы букв) живут в
-`ms_text_util::segmentation::ru`; здесь — только выбор позиции разрыва с
-учётом измеренной ширины строки.
+Языковые детали (словари, безопасные границы переноса, классы букв) вынесены за
+трейт/фасад сегментатора: словарные точки берутся из `HyphenationDictionaries`
+(язык выбирается процесс-глобально), а валидность разрыва — через
+`ms_text_util::segmentation::rules` (диспетчеризация по группе языка). Здесь —
+только выбор позиции разрыва с учётом измеренной ширины строки.
 
 Source:
 - `find_dictionary_split_index`
@@ -19,9 +21,8 @@ use super::horizontal::WrapScoringContext;
 use ms_text_util::segmentation::HyphenationDictionaries;
 use ms_text_util::segmentation::base::SOFT_HYPHEN;
 use ms_text_util::segmentation::count_layout_units;
-use ms_text_util::segmentation::ru::{
-    contains_cyrillic, count_alpha_chars, count_vowels_visible, is_safe_hyphen_boundary_at,
-    should_avoid_emergency_split,
+use ms_text_util::segmentation::rules::{
+    avoid_emergency_split, dictionary_split_is_valid, emergency_boundary_is_safe,
 };
 use ms_text_util::text_punctuation::is_hanging_punctuation;
 
@@ -35,14 +36,9 @@ pub(super) fn find_dictionary_split_index(
 ) -> Option<usize> {
     let mut best_fit: Option<(usize, f32, f32)> = None;
     let mut best_overflow: Option<(usize, f32, f32)> = None;
-    let text_is_cyrillic = contains_cyrillic(text);
     for idx in dicts.breaks_for_word(text) {
-        if count_alpha_chars(&text[..idx]) < 2 || count_alpha_chars(&text[idx..]) < 2 {
-            continue;
-        }
-        if text_is_cyrillic
-            && (count_vowels_visible(&text[..idx]) < 1 || count_vowels_visible(&text[idx..]) < 1)
-        {
+        // Language-group rule: enough letters (and, for Cyrillic, a vowel) each side.
+        if !dictionary_split_is_valid(text, idx) {
             continue;
         }
         let line_units = count_layout_units(&text[..idx], hanging_punctuation);
@@ -84,12 +80,11 @@ pub(super) fn find_emergency_split_index(
     max_units: usize,
     hanging_punctuation: bool,
 ) -> Option<usize> {
-    if should_avoid_emergency_split(text) {
+    if avoid_emergency_split(text) {
         return None;
     }
     let mut units = 0usize;
     let mut split_at = None;
-    let text_is_cyrillic = contains_cyrillic(text);
     for (idx, ch) in text.char_indices() {
         if ch != SOFT_HYPHEN && (!hanging_punctuation || !is_hanging_punctuation(ch)) {
             units = units.saturating_add(1);
@@ -98,15 +93,8 @@ pub(super) fn find_emergency_split_index(
         if units > max_units {
             break;
         }
-        if next_idx < text.len()
-            && is_safe_hyphen_boundary_at(text, next_idx)
-            && count_alpha_chars(&text[..next_idx]) >= 2
-            && count_alpha_chars(&text[next_idx..]) >= 2
-            && (!text_is_cyrillic
-                || (count_vowels_visible(&text[..next_idx]) >= 1
-                    && count_vowels_visible(&text[next_idx..]) >= 1))
-            && count_vowels_visible(&text[next_idx..]) >= 1
-        {
+        // Language-group rule decides whether this boundary may carry an emergency break.
+        if next_idx < text.len() && emergency_boundary_is_safe(text, next_idx) {
             split_at = Some(next_idx);
         }
     }

@@ -87,6 +87,7 @@ use super::wrap::{
     build_vertical_layout_text, needs_hyphenation_dicts, reshape_text_for_shape,
     should_prehyphenate_overlong, word_break_policy,
 };
+use ms_text_util::language::text_language;
 use ms_text_util::segmentation::with_default_segmenter;
 use cosmic_text::{
     Align, Attrs, AttrsOwned, Buffer, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping,
@@ -237,8 +238,10 @@ fn build_layout_text_for_shape_params(
     extra_line_spacing_px: f32,
     preserve_edge_spaces: bool,
 ) -> LayoutTextResult {
-    let hyphen_dicts =
-        needs_hyphenation_dicts(shape_params.text_wrap_mode).then(HyphenationDictionaries::new);
+    // Dictionary bundle for the process-global typesetting language; thread-local
+    // cached so this hot prepass path does not reload TeX patterns per render.
+    let hyphen_dicts = needs_hyphenation_dicts(shape_params.text_wrap_mode)
+        .then(|| HyphenationDictionaries::for_language(text_language()));
     let shaped_text = if should_prehyphenate_overlong(shape_params.text_wrap_mode) {
         with_default_segmenter(|seg| seg.soft_hyphenate_overlong(source_text))
     } else {
@@ -254,7 +257,7 @@ fn build_layout_text_for_shape_params(
             line_height_px: base_line_height_px,
             base_width_px: shape_params.width_px.max(1) as f32,
             wrap_mode: shape_params.text_wrap_mode,
-            hyphen_dicts: hyphen_dicts.as_ref(),
+            hyphen_dicts: hyphen_dicts.as_deref(),
             word_break_policy: word_break_policy(shape_params.text_wrap_mode),
             shape: params.text_shape,
             min_width_percent: shape_params.shape_min_width_percent,
@@ -270,7 +273,7 @@ fn build_layout_text_for_shape_params(
                 font_size_px,
                 extra_line_spacing_px,
                 wrap_mode: shape_params.text_wrap_mode,
-                hyphen_dicts: hyphen_dicts.as_ref(),
+                hyphen_dicts: hyphen_dicts.as_deref(),
                 word_break_policy: word_break_policy(shape_params.text_wrap_mode),
                 shape: params.text_shape,
                 min_width_percent: shape_params.shape_min_width_percent,

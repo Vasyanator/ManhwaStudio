@@ -207,6 +207,7 @@ mod font_settings;
 mod font_settings_store;
 mod font_coverage;
 use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
+use ms_text_util::language::{TextLanguage, text_language};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
 pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults_from_config};
@@ -441,6 +442,13 @@ pub struct TypingTopPanelState {
     auto_typing_debug_visuals: bool,
     auto_typing_extra_downward_shift_percent: f32,
     strict_pixel_movement: bool,
+    /// Typesetting language the cached font coverage (`FontEntry.coverage`) was
+    /// computed against. Font coverage is cached at load time, so a runtime change
+    /// of `ms_text_util::language::text_language()` would leave it stale; `draw`
+    /// compares this against the current language and reloads both font lists when
+    /// they differ (see `facade.rs`). Seeded from the current language so the first
+    /// frame never triggers a spurious reload.
+    coverage_language: TextLanguage,
 }
 
 #[derive(Clone, Default)]
@@ -560,6 +568,7 @@ impl Default for TypingTopPanelState {
             auto_typing_debug_visuals: false,
             auto_typing_extra_downward_shift_percent: 0.0,
             strict_pixel_movement: true,
+            coverage_language: text_language(),
         }
     }
 }

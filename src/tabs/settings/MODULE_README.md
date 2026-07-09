@@ -53,9 +53,14 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   load path and the "Повторить попытку ORT" reset control.
 - `general.rs`: thin studio wrapper for the general pane. Enforces the studio-only vertical
   typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then delegates the
-  projects-directory editor and global memory-profile combo to the shared
+  projects-directory editor, global memory-profile combo, and the UI-language selector to the shared
   `crate::general_settings_panel` widget and applies the memory-profile runtime effect from its
-  outcome. Projects-dir + memory-profile persistence live inside that shared widget, not here.
+  outcome. Projects-dir + memory-profile + UI-language persistence live inside that shared widget,
+  not here. The UI-language selector (a `WheelComboBox`) lists the locales found in the on-disk
+  `locale/` folder — scanned ONCE at widget construction, never per frame — each shown by its
+  `_meta.name`; changing it persists `General.ui_language` (synchronously, like the memory-profile
+  write) and live-installs that locale's catalog via `crate::locale_store::install_ui_locale`
+  (no restart).
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
 - `typesetting.rs`: "Тайп" pane for text-typesetting options: the app-wide
@@ -64,6 +69,13 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
   via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
   `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
+  the typesetting-language selector — two `WheelComboBox`es (`ScriptGroup` then the concrete
+  `TextLanguage` within it; changing the group selects that group's first language) — applied live
+  via `ms_text_util::language::set_text_language` (the typing tab's `panel/facade.rs` observes
+  `text_language()` each frame and re-runs font-coverage classification off-thread) and persisted as
+  `TextTab.text_language` (the `lang.tag()`) through `save_text_language` in `mod.rs` on a background
+  thread; the process-global atomic is the single source of truth, so no selection state is stored on
+  `SettingsTabState`,
   the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
   held on `SettingsTabState`, rendered via its `ui()`; a self-contained typing-panel widget that
   owns its own persistence to `TextTab.effect_defaults`, so settings needs no access to the private
@@ -121,13 +133,16 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `mod.rs`.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit
   `ai_backend.rs` and the worker functions in `mod.rs`.
-- To change the projects directory or the memory profile, edit the shared
+- To change the projects directory, the memory profile, or the UI-interface language, edit the shared
   `crate::general_settings_panel` widget (used by both the studio pane and the launcher); the studio
   `general.rs` is only a thin wrapper that adds the typing-panel-layout enforcement and applies the
-  memory-profile runtime effect.
-- To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode), edit
-  `typesetting.rs` and the matching persistence helper in `mod.rs`. Runtime globals for these
-  live outside settings (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`).
+  memory-profile runtime effect. The UI-language list is scanned from `locale/` once at construction;
+  installation goes through `crate::locale_store::install_ui_locale`.
+- To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode, typesetting
+  language), edit `typesetting.rs` and the matching persistence helper in `mod.rs`
+  (`save_text_language` for the language). Runtime globals for these live outside settings
+  (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`,
+  `ms_text_util::language`).
 - To change the collapsed effect-defaults / font-settings blocks in the "Тайп" pane, edit their
   widgets in `src/tabs/typing/panel/` (`effect_defaults.rs` / `font_settings.rs`); `typesetting.rs`
   only wraps each `ui()` in a `CollapsingHeader`.

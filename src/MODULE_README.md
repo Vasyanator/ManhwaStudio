@@ -132,6 +132,20 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   surface (the guard/scope helpers are worker-thread only — they do disk I/O + hardware probes).
 - `input_manager_v2.rs`: keyboard shortcut and modifier-only hotkey registry, user overrides, and
   command lookup.
+- `locale_store.rs`: native-only (`#[cfg(not(wasm32))]`) on-disk layer for the UI localization
+  catalog. Unpacks the `ms-i18n` embedded catalogs into an editable `config::data_dir()/locale`
+  folder and reconciles each file on every launch (verbatim on absence; add only missing keys on
+  presence, from the embedded catalog for embedded locales and from `en.json` for custom-language
+  files; never overwrite or delete user values; `_meta` reserved). `General.ui_language` holds a raw
+  OPEN tag string resolved to an `ms_i18n::LocaleTag`, so ANY `locale/<tag>.json` (custom languages
+  included) loads; missing keys fall back to English and a tag with no hand-written CLDR plural rules
+  uses English plural rules (reported once at install via `ms_i18n::plural_rules_for_tag`). ENGLISH is
+  the reference: every error path (absent/invalid tag; a tag with neither disk file nor embedded
+  catalog; a corrupt file) installs English, NOT Russian — Russian is only the shipped default config
+  value. The reconcile core (`reconcile_locale_map`) is a pure function over two JSON maps; an
+  unwritable `locale/` folder or a corrupt file is a logged, bounded degradation to the embedded/English
+  catalog, never fatal (a corrupt file is left byte-for-byte intact). On wasm the module is compiled out
+  and `web_entry.rs` installs the embedded catalog directly.
 - `bubble_status.rs`: configurable bubble status rules, condition evaluation, and border painting
   helpers.
 - `paste_image.rs`: clipboard/image paste helpers used by UI workflows.
@@ -210,6 +224,9 @@ prompts instead of blocking the GUI thread.
   `config.rs`.
 - Memory profile, pressure thresholds, budgets, or cache eviction ordering policy:
   `memory_manager.rs`.
+- UI localization on disk (editable `locale/` folder, embedded-catalog reconcile, active UI-language
+  install at startup): `locale_store.rs`. The in-memory catalog/lookup layer is the `ms-i18n` crate;
+  the UI language is `General.ui_language`.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.

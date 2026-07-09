@@ -49,6 +49,11 @@ mod input_manager_v2;
 mod input_util;
 mod installer;
 mod launcher;
+// On-disk editable UI locale catalog layer (unpack + reconcile embedded catalogs
+// into `data_dir()/locale`). Native-only: there is no folder next to an executable
+// on wasm, where the embedded catalog is installed directly (see `web_entry.rs`).
+#[cfg(not(target_arch = "wasm32"))]
+mod locale_store;
 mod memory_manager;
 mod models;
 // Phase 1 native ONNX Runtime OCR manager: lazily loads the ONNX Runtime + native
@@ -92,6 +97,11 @@ pub use ms_log::{runtime_log, trace, trace_log, trace_scope};
 // keeps `crate::text_punctuation::…` valid across the binary. The crate no longer
 // reads user config itself; `seed_hanging_punctuation_from_config` seeds it at startup.
 pub use ms_text_util::text_punctuation;
+
+// Typesetting-language model + process-global selection live in `ms-text-util`.
+// The crate is config-free; `seed_text_language_from_config` seeds the user's
+// choice at startup, mirroring `seed_hanging_punctuation_from_config`.
+pub use ms_text_util::language;
 
 // Native-only startup imports. All of these feed the native launcher/installer/
 // update-check flow (`eframe::run_native`, `rfd`, `ureq`, `clap` CLI, native
@@ -210,13 +220,21 @@ fn run_main() -> anyhow::Result<()> {
     runtime_log::log_info("starting main application flow");
     auto_detect_missing_ai_install_type_for_startup();
     seed_hanging_punctuation_from_config();
+    seed_text_language_from_config();
     seed_rotation_ctrl_wheel_from_config();
     // Seed the typing tab's per-effect-kind default overrides so newly added effect
     // cards pick up the user's stored defaults from the first frame.
     tabs::typing::seed_effect_defaults_from_config();
     // Seed the typing tab's user-imported system font list from user config.
     tabs::typing::seed_imported_system_fonts_from_config();
+    // Unpack/reconcile the editable on-disk locale catalog before settings load.
+    // Best-effort and pre-window: an unwritable `locale/` folder degrades to the
+    // embedded catalog without failing startup (see `locale_store` failure policy).
+    locale_store::reconcile_disk_catalog();
     let user_settings = config::load_user_settings_for_startup()?;
+    // Install the active UI locale from disk (or the embedded catalog on failure),
+    // now that `General.ui_language` is available in the loaded settings.
+    locale_store::install_ui_locale(&user_settings);
 
     if cli.continue_update {
         init_runtime_logging();
@@ -364,6 +382,31 @@ fn seed_hanging_punctuation_from_config() {
         .filter(|text| text.chars().any(|ch| !ch.is_whitespace()))
     {
         text_punctuation::set_hanging_punctuation(text);
+    }
+}
+
+/// Seeds the config-free `ms_text_util::language` typesetting language from user
+/// config at startup. The util crate defaults to `TextLanguage::Ru` (preserving
+/// the historical Russian-only behavior); here the app (which owns config)
+/// overrides it with the `TextTab.text_language` tag when present and recognized.
+/// An absent or unrecognized tag keeps `Ru` and logs a warning — never a panic.
+#[cfg(not(target_arch = "wasm32"))]
+fn seed_text_language_from_config() {
+    let Ok(cfg) = config::load_user_config() else {
+        return;
+    };
+    let Some(raw) = cfg
+        .get_path(&["TextTab", config::TEXT_TAB_TEXT_LANGUAGE_KEY])
+        .and_then(serde_json::Value::as_str)
+    else {
+        // Key absent (older config): keep the default, no warning needed.
+        return;
+    };
+    match language::TextLanguage::from_tag(raw.trim()) {
+        Some(text_language) => language::set_text_language(text_language),
+        None => runtime_log::log_warn(format!(
+            "[startup] unrecognized TextTab.text_language {raw:?}; keeping default 'ru'"
+        )),
     }
 }
 

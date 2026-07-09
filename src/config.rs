@@ -100,8 +100,16 @@ pub const GENERAL_AI_MAX_LOADED_MODELS_KEY: &str = "ai_max_loaded_models";
 #[allow(dead_code)]
 pub const GENERAL_ORT_LOAD_STATE_KEY: &str = "ort_load_state";
 pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
+/// `General.ui_language`: the interface language tag (an `ms_i18n::LocaleTag`, or
+/// a custom on-disk locale tag). Read at startup by `locale_store::install_ui_locale`
+/// and written by the shared general-settings widget's UI-language selector.
+pub const GENERAL_UI_LANGUAGE_KEY: &str = "ui_language";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
+/// `TextTab` key holding the selected typesetting language as a BCP-47-style tag
+/// (e.g. `"ru"`). Selects the hyphenation/segmentation engine; seeds
+/// `ms_text_util::language` at startup. Default `"ru"` preserves prior behavior.
+pub const TEXT_TAB_TEXT_LANGUAGE_KEY: &str = "text_language";
 /// `TextTab` key holding the user-imported system font FILE paths (a JSON array of
 /// strings). Seeds the typing tab's imported-fonts store at startup.
 pub const TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY: &str = "imported_system_fonts";
@@ -785,6 +793,7 @@ pub fn user_config_defaults() -> Value {
         "General": {
             "theme": "dark",
             "style": "default",
+            "ui_language": "ru",
             "projects_dir": default_projects_root.to_string_lossy().to_string(),
             "ai_backend_autostart": true,
             "ai_device": "not-selected",
@@ -864,6 +873,7 @@ pub fn user_config_defaults() -> Value {
         "CleaningTab": {},
         "TextTab": {
             "hanging_punctuation": crate::text_punctuation::DEFAULT_HANGING_PUNCTUATION,
+            "text_language": ms_text_util::language::TextLanguage::Ru.tag(),
             "rotation_ctrl_wheel_mode":
                 crate::tabs::typing::rotation_ctrl_wheel::DEFAULT_ROTATION_CTRL_WHEEL_MODE
                     .as_config_str(),

@@ -305,15 +305,24 @@ impl TypingCreatePanelState {
 }
 
 /// Build the hover tooltip for a font dropdown item, or `None` when the font
-/// fully supports the program language (no highlight, no tooltip).
+/// fully supports the selected typesetting language (no highlight, no tooltip).
+///
+/// The writing-system name and language name are derived from the currently
+/// selected `TextLanguage` (`ms_text_util::language::text_language()`), so the
+/// wording is factually correct for any typesetting language, not just Russian.
+/// This matches the language `coverage` was classified against: `facade.rs`
+/// reloads coverage whenever the typesetting language changes.
 fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
+    let language = ms_text_util::language::text_language();
+    let language_name = language.display_name();
+    let script_name = language.group().script_display_name();
     match coverage.support {
         FontLanguageSupport::Full => None,
-        FontLanguageSupport::Unsupported => Some(
-            "Шрифт не поддерживает кириллицу — систему письма русского языка. \
-             Текст этим шрифтом не отобразится и будет заменён другим шрифтом."
-                .to_string(),
-        ),
+        FontLanguageSupport::Unsupported => Some(format!(
+            "Шрифт не поддерживает нужную систему письма ({script_name}) для языка \
+             «{language_name}». Текст этим шрифтом не отобразится и будет заменён другим \
+             шрифтом."
+        )),
         FontLanguageSupport::Partial => {
             const MAX_SHOWN: usize = 15;
             let shown: String = coverage
@@ -332,7 +341,7 @@ fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
                 shown
             };
             Some(format!(
-                "Шрифт частично поддерживает русский язык. Не хватает символов: {list}."
+                "Шрифт частично поддерживает язык «{language_name}». Не хватает символов: {list}."
             ))
         }
     }

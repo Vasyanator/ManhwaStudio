@@ -555,6 +555,47 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
+/// Persists the selected typesetting language tag under `TextTab.text_language`.
+///
+/// `tag` must be a stable `TextLanguage` tag (`ms_text_util::language::TextLanguage::tag`).
+/// Serialized on the process-wide `config::lock_user_config_write()` so a
+/// background/GUI-thread saver never clobbers the ORT load-guard marker; a
+/// targeted read-modify-write preserves every unrelated key. Meant to run off the
+/// GUI thread (spawned from the "Тайп" pane). Returns a user-facing error string.
+pub(super) fn save_text_language(user_settings_file: &Path, tag: &str) -> Result<(), String> {
+    let _write_guard = config::lock_user_config_write();
+    let mut root = if user_settings_file.exists() {
+        match fs::read_to_string(user_settings_file) {
+            Ok(raw) => {
+                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
+            }
+            Err(_) => Value::Object(Map::new()),
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    let root_obj = root.as_object_mut().expect("object ensured");
+    let mut text_tab_obj = root_obj
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    text_tab_obj.insert(
+        config::TEXT_TAB_TEXT_LANGUAGE_KEY.to_string(),
+        Value::String(tag.to_string()),
+    );
+    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
 /// Persists the selected AI runtime under `General.ai_runtime` in
 /// `user_config.json`.
 ///

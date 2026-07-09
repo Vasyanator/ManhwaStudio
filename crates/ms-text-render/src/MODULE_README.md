@@ -274,7 +274,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 
 ## External Dependencies
 - `cosmic-text` provides font database, shaping, layout runs, and swash cache access.
-- `hyphenation` provides embedded Russian and English hyphenation dictionaries.
+- `hyphenation` provides the embedded per-language hyphenation dictionaries; the
+  language is chosen by `ms_text_util::language::text_language`, and break
+  boundary rules come from `ms_text_util::segmentation::rules` (group-dispatched).
 - `image` provides RGBA/gray image containers and blur operations used by effects and
   drawn-line layout.
 - `serde_json` is used only inside the effects parser; renderer callers pass effects as

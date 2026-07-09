@@ -259,16 +259,22 @@ saving, and export.
     (free fns). `load_system_fonts` (whole-OS enumeration) is the catalog source for the
     settings font-import picker (`font_settings.rs`), run off the GUI thread.
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
-    representative face's bytes and cached on `FontEntry.coverage`; the dropdown never recomputes it.
+    representative face's bytes against the current TYPESETTING language and cached on
+    `FontEntry.coverage`; the dropdown never recomputes it. A runtime language change makes the cache
+    stale, so `TypingTopPanelState::draw` compares `ms_text_util::language::text_language()` against a
+    stored `coverage_language` and re-runs `spawn_font_reload` on both panels when it differs.
     Discovery also records each font's `original_name` (real family/name of the representative face,
     fallback post_script_name then file stem) for PSD export and future virtual fonts.
   - `font_provider.rs`: `TabFontProvider`, the app-side `render_next::FontProvider`. Maps a normalized
     working name (font label) to a font, reads bytes lazily OUTSIDE its lock and caches
     `Arc<Vec<u8>>` + content id, and carries each font's `original_name` to the renderer. Built from the
     panel's font list; shared (`Arc`) with background render threads.
-  - `font_coverage.rs`: pure classification of a font's support for the program language's writing
-    system (Cyrillic today) → `Full`/`Partial`/`Unsupported` via the swash charmap; drives the
-    red/yellow font-dropdown highlight + hover tooltip in `create_presets::draw_font_combo_option`.
+  - `font_coverage.rs`: pure classification of a font's support for the selected TYPESETTING language
+    (`ms_text_util::language::text_language()`, independent of the UI language) → `Full`/`Partial`/
+    `Unsupported` via the swash charmap. Script base alphabet comes from the language's `ScriptGroup`
+    (Cyrillic or Latin), language-specific letters + typography from the concrete `TextLanguage`.
+    Drives the red/yellow font-dropdown highlight + hover tooltip in
+    `create_presets::draw_font_combo_option`. See `panel/MODULE_README.md` for the coverage/cache contract.
   - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
     Also owns load/save of the `TextTab.imported_system_fonts` path list (read-modify-write of
     `user_config.json`, preserving sibling keys).

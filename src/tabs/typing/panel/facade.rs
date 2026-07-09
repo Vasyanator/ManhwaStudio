@@ -26,6 +26,16 @@ impl TypingTopPanelState {
         page_idx: usize,
         layout_editor_active: bool,
     ) {
+        // Cached font coverage (`FontEntry.coverage`) is computed at load time against the
+        // then-current typesetting language. If the user has since changed the language, that
+        // cache is stale, so reload both font lists off-thread to recompute coverage. The
+        // atomic load is cheap; the reload only fires on an actual language change.
+        let current_language = text_language();
+        if current_language != self.coverage_language {
+            self.coverage_language = current_language;
+            self.create_panel.spawn_font_reload();
+            self.edit_panel.spawn_font_reload();
+        }
         // Pick up a settings-side font import/remove (revision-driven) and apply it live to
         // both open panels before polling this frame's reload results.
         self.create_panel.poll_font_settings_changes();
