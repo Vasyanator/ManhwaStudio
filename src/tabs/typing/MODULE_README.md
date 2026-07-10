@@ -8,6 +8,25 @@ auto-typing, import/export, and the floating panels used to create or edit text.
 The module is a tab-level integration layer. It must keep long rendering, file I/O,
 image decoding, export, mask filling, and auto-detection work off the GUI thread.
 
+## Terminology
+The two kinds of on-page objects have a stable naming convention that this document,
+the code, and the user use slightly differently — they refer to the SAME things:
+
+- **Text layer** (RU «текстовый слой») is the current user/UI-facing name for an
+  editable text object. Historically these were called **text overlays**, and that
+  is still the canonical name throughout this module's code and doc comments
+  (`TypingTextOverlayLayer`, `TypingOverlayRuntime`, `self.overlays`, "text overlay"
+  in comments). Treat "text overlay" and "text layer" as SYNONYMS: when the user says
+  «текстовый слой», they mean an overlay. Image overlays are the same object kind
+  carrying an image instead of text. The code name is not being renamed; only the
+  user-facing wording moved from "overlay" to "layer".
+- **Raster layer** (RU «растровый слой», `TypingRasterLayer`) is an imported/painted
+  raster image layer. This name is the same in code, docs, and user speech — NOT an
+  overlay (see "External images are raster layers, not overlays" below).
+
+At the UI level the «Слои» (Layers) panel lists text layers, image layers, and raster
+layers together as one unified, band-Z ordered list.
+
 ## Architecture
 `TypingTabState` in `tab.rs` owns the tab runtime and implements the canvas extension
 through `TypingHooks`. The canvas remains the common viewer/input surface; typing adds

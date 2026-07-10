@@ -246,7 +246,16 @@ prompts instead of blocking the GUI thread.
   the studio settings tab AND the launcher settings page: `general_settings_panel.rs`. Per-UI
   `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to
   `user_config.json` serialized on `config::lock_user_config_write()`, except the typesetting
-  language, which is written off-thread through `tabs::settings::save_text_language`.
+  language, which is written off-thread through `tabs::settings::save_text_language`. The shared
+  typesetting-language selector itself is the public `general_settings_panel::draw_text_language_setting(ui, id_salt)`,
+  called by both this widget and the studio "Тайп" pane (`tabs/settings/typesetting.rs`).
+- Menu-level shared layer for the two settings surfaces (launcher settings page + studio settings
+  tab): `settings_shared.rs`. Holds the section registry (`SettingsSectionId`, `SettingsSurface`,
+  `SettingsSectionDescriptor`, `SECTIONS`, `sections_for`, `title_key` — the existing per-surface
+  localization keys) and `SharedSettingsPanels`, which owns the three shared double-interface panel
+  states (General / AiBackend / Tutorials) and renders them via `draw`. It does NOT own the
+  `AiBackendHandle` (passed to `draw` by reference) and does NOT merge the two per-surface state
+  containers; each surface keeps its exclusive sections and renders them itself.
 - AI install-type detection from installed Python packages: `ai_install_probe.rs`.
 - App-managed AI model coverage, Hugging Face paths, or lazy download behavior: `ai_models.rs`.
 - Native ONNX Runtime path (MangaOCR + PaddleOCR OCR, PaddleOCR text detection; runtime/engine

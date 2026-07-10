@@ -29,10 +29,15 @@ state arrives.
   `tar + zstd` archive creation for `.mschapter` export.
 - `settings_page.rs`: launcher settings tabs, system CPU/RAM/GPU probes,
   AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
-  flow, and a background-driven Python environment console. The projects-root editor (and now the
-  global memory profile) are rendered via the shared `crate::general_settings_panel` widget; the
-  `ProjectsRootChanged` invariant is unchanged — a saved projects root is still emitted as
-  `PageNavAction::ProjectsRootChanged`.
+  flow, and a background-driven Python environment console. The tab set, ordering, tab labels, and
+  the shared General/AiBackend/Tutorials sections come from the shared section registry
+  (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab bar iterates
+  `sections_for(SettingsSurface::Launcher)`, and the three shared "double-interface" panels are owned
+  as one `SharedSettingsPanels`. The dynamic TorchUpgrade hide/relabel logic is applied inline in the
+  tab bar. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
+  keep their local renderers here. The `ProjectsRootChanged` invariant is unchanged — a saved
+  projects root is still emitted as `PageNavAction::ProjectsRootChanged` (mapped from the shared
+  General section's outcome).
 
 ## Contracts and invariants
 - Page UI must stay responsive. Do not perform project scans, archive traversal, compression,

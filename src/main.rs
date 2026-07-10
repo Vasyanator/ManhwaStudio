@@ -84,6 +84,11 @@ mod paste_image;
 mod project;
 mod python_manager;
 mod screen_capture;
+// Menu-level shared layer for the two settings surfaces (launcher settings page +
+// studio settings tab): the section registry (`SettingsSectionId`/`sections_for`/
+// `title_key`) and the `SharedSettingsPanels` container that owns the three shared
+// double-interface panels (General/AiBackend/Tutorials).
+mod settings_shared;
 mod storage;
 mod tabs;
 #[cfg(target_arch = "wasm32")]

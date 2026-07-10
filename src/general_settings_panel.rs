@@ -34,6 +34,9 @@ Key items:
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + memory-profile
   combo + UI-language selector + typesetting-language selector.
+- `draw_text_language_setting`: the shared typesetting-language selector (script group +
+  language combos), also called by the studio "Тайп" pane; takes a per-call-site
+  `id_salt` prefix so the two rendered instances keep distinct egui ids.
 */
 
 use crate::i18n_resolve::resolve_key;
@@ -307,22 +310,27 @@ pub fn draw_general_settings_panel(
 
     ui.separator();
 
-    draw_text_language_setting(ui);
+    draw_text_language_setting(ui, "settings.general.text_language");
 
     outcome
 }
 
 /// Renders the typesetting-language selector: a `ScriptGroup` combo followed by the
-/// concrete `TextLanguage` combo within that group. Mirrors the "Тайп" settings
-/// pane's selector so the choice is also reachable from the launcher.
+/// concrete `TextLanguage` combo within that group. Shared by BOTH the studio "Тайп"
+/// settings pane and this general-settings widget, so the choice is reachable from the
+/// studio Тайп pane and from the launcher/studio general widget.
+///
+/// `id_salt` is a per-call-site egui id prefix (`"<prefix>.script_group"` /
+/// `"<prefix>.language"`) so two rendered instances never collide; pass a distinct,
+/// stable prefix per call site.
 ///
 /// Holds no state: the process-global `ms_text_util::language::text_language()` is
-/// the single source of truth, so this widget and the "Тайп" pane always show the
-/// same value. Selecting a group switches to that group's first language. A change
-/// applies live (the typing tab's `facade.rs` observes `text_language()` each frame
-/// and re-runs font-coverage classification off-thread) and persists
-/// `TextTab.text_language` on a background thread.
-fn draw_text_language_setting(ui: &mut egui::Ui) {
+/// the single source of truth, so every instance shows the same value. Selecting a
+/// group switches to that group's first language. A change applies live (the typing
+/// tab's `facade.rs` observes `text_language()` each frame and re-runs font-coverage
+/// classification off-thread) and persists `TextTab.text_language` on a background
+/// thread via [`persist_text_language`].
+pub fn draw_text_language_setting(ui: &mut egui::Ui, id_salt: &str) {
     ui.label(t!("settings.typesetting.text_language_label"));
     ui.small(t!("settings.typesetting.text_language_hint"));
 
@@ -333,7 +341,7 @@ fn draw_text_language_setting(ui: &mut egui::Ui) {
     let mut selected_group = current_group;
     ui.horizontal_wrapped(|ui| {
         WheelComboBox::from_label(t!("settings.typesetting.script_group_label"))
-            .id_salt("settings.general.text_language_script_group")
+            .id_salt(format!("{id_salt}.script_group"))
             .selected_text(resolve_key(current_group.name_key()))
             .show_ui(ui, |ui| {
                 for group in ScriptGroup::all() {
@@ -351,7 +359,7 @@ fn draw_text_language_setting(ui: &mut egui::Ui) {
     };
     ui.horizontal_wrapped(|ui| {
         WheelComboBox::from_label(t!("settings.typesetting.language_label"))
-            .id_salt("settings.general.text_language_language")
+            .id_salt(format!("{id_salt}.language"))
             .selected_text(resolve_key(selected_language.name_key()))
             .show_ui(ui, |ui| {
                 for language in selected_group.languages() {

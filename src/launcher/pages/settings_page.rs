@@ -19,9 +19,15 @@ Main responsibilities:
 Notes:
 Config edits stay synchronous because they are tiny, but the Python environment console runs in
 background worker threads so the launcher UI never blocks on shell I/O.
+
+The tab set, ordering, tab labels, and the shared General/AiBackend/Tutorials sections come from the
+shared section registry (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab
+bar iterates `sections_for(SettingsSurface::Launcher)`, and the shared panels are owned as one
+`SharedSettingsPanels`. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/
+PythonEnvironment) keep their local renderers here; the dynamic TorchUpgrade hide/relabel logic is
+applied inline in the tab bar.
 */
 
-use crate::ai_backend_panel::AiBackendPanelState;
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::ai_install_probe::{
     AiComputationsReport, AiPackageProbe, detect_ai_install_type_from_report,
@@ -50,6 +56,9 @@ use crate::installer::install::{
 use crate::installer::utils;
 use crate::launcher::pages::base::{self, PageNavAction};
 use crate::launcher::theme;
+use crate::settings_shared::{
+    SettingsSectionId, SettingsSurface, SharedSettingsPanels, sections_for, title_key,
+};
 #[cfg(feature = "tutorial")]
 use crate::tutorial::TutorialProgressHandle;
 // Used only by the native Python-environment console (shell spawning); gated to
@@ -132,24 +141,15 @@ struct PythonConsoleState {
     attempted_start: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsTab {
-    General,
-    SystemInfo,
-    AiComputations,
-    AiBackend,
-    TorchUpgrade,
-    PythonEnvironment,
-    #[cfg(feature = "tutorial")]
-    Tutorials,
-}
-
 pub struct SettingsPageState {
-    active_tab: SettingsTab,
-    /// Shared general-settings widget state (projects directory + memory profile),
-    /// the same widget the studio settings tab renders. See
-    /// `crate::general_settings_panel`.
-    general_settings_panel: crate::general_settings_panel::GeneralSettingsPanelState,
+    /// Currently selected settings section. Sourced from the shared section
+    /// registry (`crate::settings_shared`); only sections listed for
+    /// `SettingsSurface::Launcher` can ever be active here.
+    active_tab: SettingsSectionId,
+    /// The three shared "double-interface" panel states (General / AiBackend /
+    /// Tutorials), owned as ONE instance so the launcher renders exactly the same
+    /// widgets as the studio settings tab. See `crate::settings_shared`.
+    shared: SharedSettingsPanels,
     // Native Python-environment console; no OS shell on web.
     #[cfg(not(target_arch = "wasm32"))]
     python_console: PythonConsoleState,
@@ -160,15 +160,10 @@ pub struct SettingsPageState {
     #[cfg(not(target_arch = "wasm32"))]
     torch_upgrade: TorchUpgradeState,
     log_popup_open: bool,
-    /// Shared app-global backend handle + this page's panel scratch state, so the
-    /// launcher exposes the same backend controls as the studio settings tab.
+    /// Shared app-global backend handle, passed by reference into the shared
+    /// `AiBackend` panel each frame so the launcher exposes the same backend
+    /// controls as the studio settings tab.
     ai_backend: AiBackendHandle,
-    ai_backend_panel: AiBackendPanelState,
-    /// Shared with the launcher's `TutorialController`, so resetting a tutorial
-    /// here re-arms its autoplay on the main page. Gated behind the `tutorial`
-    /// feature (off by default).
-    #[cfg(feature = "tutorial")]
-    tutorial_progress: TutorialProgressHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,13 +278,16 @@ impl SettingsPageState {
         ai_backend: AiBackendHandle,
         #[cfg(feature = "tutorial")] tutorial_progress: TutorialProgressHandle,
     ) -> Self {
-        // Seed the shared widget from the passed root so the page opens clean.
-        let mut general_settings_panel =
-            crate::general_settings_panel::GeneralSettingsPanelState::new();
-        general_settings_panel.set_projects_root(&projects_root.to_string_lossy());
+        // Build the shared panel container, then seed its General widget from the
+        // passed root so the page opens clean.
+        let mut shared = SharedSettingsPanels::new(
+            #[cfg(feature = "tutorial")]
+            tutorial_progress,
+        );
+        shared.set_projects_root(&projects_root.to_string_lossy());
         Self {
-            active_tab: SettingsTab::General,
-            general_settings_panel,
+            active_tab: SettingsSectionId::General,
+            shared,
             #[cfg(not(target_arch = "wasm32"))]
             python_console: PythonConsoleState::default(),
             ai_probe: AiComputationsProbeState::default(),
@@ -299,14 +297,11 @@ impl SettingsPageState {
             torch_upgrade: TorchUpgradeState::default(),
             log_popup_open: false,
             ai_backend,
-            ai_backend_panel: AiBackendPanelState::default(),
-            #[cfg(feature = "tutorial")]
-            tutorial_progress,
         }
     }
 
     pub fn set_projects_root(&mut self, projects_root: PathBuf) {
-        self.general_settings_panel
+        self.shared
             .set_projects_root(&projects_root.to_string_lossy());
     }
 
@@ -332,9 +327,9 @@ impl SettingsPageState {
     pub fn set_ai_install_type(&mut self, ai_install_type: config::AiInstallType) {
         self.ai_install_type = ai_install_type;
         if ai_install_type == config::AiInstallType::None
-            && self.active_tab == SettingsTab::TorchUpgrade
+            && self.active_tab == SettingsSectionId::TorchUpgrade
         {
-            self.active_tab = SettingsTab::General;
+            self.active_tab = SettingsSectionId::General;
         }
     }
 
@@ -358,44 +353,64 @@ impl SettingsPageState {
                     ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.active_tab {
-                            SettingsTab::General => {
-                                let outcome =
-                                    crate::general_settings_panel::draw_general_settings_panel(
-                                        ui,
-                                        &mut self.general_settings_panel,
-                                    );
+                            // Shared sections render through the shared panel container.
+                            // `Tutorials` produces no launcher outcome; `General` may
+                            // report a saved projects root.
+                            #[cfg(feature = "tutorial")]
+                            id @ (SettingsSectionId::General
+                            | SettingsSectionId::AiBackend
+                            | SettingsSectionId::Tutorials) => {
+                                let outcome = self.shared.draw(
+                                    id,
+                                    ui,
+                                    SettingsSurface::Launcher,
+                                    &self.ai_backend,
+                                );
                                 if let Some(root) = outcome.projects_dir_saved {
                                     action = Some(PageNavAction::ProjectsRootChanged(root));
                                 }
                                 // The launcher has no MemoryManager; the memory profile is
-                                // already persisted by the shared widget.
+                                // already persisted by the shared widget, so
+                                // `outcome.memory_profile_changed` is intentionally ignored.
                             }
-                            SettingsTab::SystemInfo => self.show_system_info_tab(ui),
-                            SettingsTab::AiComputations => {
+                            #[cfg(not(feature = "tutorial"))]
+                            id @ (SettingsSectionId::General | SettingsSectionId::AiBackend) => {
+                                let outcome = self.shared.draw(
+                                    id,
+                                    ui,
+                                    SettingsSurface::Launcher,
+                                    &self.ai_backend,
+                                );
+                                if let Some(root) = outcome.projects_dir_saved {
+                                    action = Some(PageNavAction::ProjectsRootChanged(root));
+                                }
+                                // The launcher has no MemoryManager; the memory profile is
+                                // already persisted by the shared widget, so
+                                // `outcome.memory_profile_changed` is intentionally ignored.
+                            }
+                            SettingsSectionId::SystemInfo => self.show_system_info_tab(ui),
+                            SettingsSectionId::AiComputations => {
                                 if let Some(tab_action) = self.show_ai_computations_tab(ui) {
                                     action = Some(tab_action);
                                 }
                             }
-                            SettingsTab::TorchUpgrade => {
+                            SettingsSectionId::TorchUpgrade => {
                                 if let Some(tab_action) = self.show_torch_upgrade_tab(ui) {
                                     action = Some(tab_action);
                                 }
                             }
-                            SettingsTab::AiBackend => {
-                                crate::ai_backend_panel::draw_ai_backend_panel(
-                                    ui,
-                                    &self.ai_backend,
-                                    &mut self.ai_backend_panel,
-                                );
-                            }
-                            SettingsTab::PythonEnvironment => {
+                            SettingsSectionId::PythonEnvironment => {
                                 self.show_python_environment_tab(ui);
                             }
-                            #[cfg(feature = "tutorial")]
-                            SettingsTab::Tutorials => {
-                                crate::tutorial::draw_tutorials_pane(
-                                    ui,
-                                    &self.tutorial_progress,
+                            // Studio-only sections are never listed for the launcher
+                            // surface, so `active_tab` can never hold one; render nothing.
+                            SettingsSectionId::CanvasRibbon
+                            | SettingsSectionId::Typesetting
+                            | SettingsSectionId::Hotkeys => {
+                                debug_assert!(
+                                    false,
+                                    "launcher settings active_tab holds studio-only section {:?}",
+                                    self.active_tab
                                 );
                             }
                         });
@@ -413,26 +428,36 @@ impl SettingsPageState {
     fn show_tab_bar(&mut self, ui: &mut Ui) -> egui::Rect {
         let mut save_log_rect = egui::Rect::NOTHING;
         ui.horizontal_wrapped(|ui| {
-            self.show_tab_button(ui, SettingsTab::General, t!("launcher.settings.tab_general"));
-            self.show_tab_button(ui, SettingsTab::SystemInfo, t!("launcher.settings.tab_system_info"));
-            self.show_tab_button(ui, SettingsTab::AiComputations, t!("launcher.settings.tab_ai_compute"));
-            self.show_tab_button(ui, SettingsTab::AiBackend, t!("launcher.settings.tab_ai_backend"));
-            match self.ai_install_type {
-                config::AiInstallType::Base => self.show_tab_button_highlighted(
-                    ui,
-                    SettingsTab::TorchUpgrade,
-                    t!("launcher.settings.upgrade_to_full_button"),
-                ),
-                config::AiInstallType::Full => self.show_tab_button(
-                    ui,
-                    SettingsTab::TorchUpgrade,
-                    t!("launcher.settings.install_other_pytorch_button"),
-                ),
-                config::AiInstallType::None => {}
+            // Build the tab bar from the shared section registry (single source of
+            // truth for which sections the launcher shows and in what order).
+            for descriptor in sections_for(SettingsSurface::Launcher) {
+                let id = descriptor.id;
+                if id == SettingsSectionId::TorchUpgrade {
+                    // The Torch-upgrade tab is dynamic: hidden when no AI is
+                    // installed, and relabeled + highlighted by install type.
+                    match self.ai_install_type {
+                        config::AiInstallType::Base => self.show_tab_button_highlighted(
+                            ui,
+                            id,
+                            t!("launcher.settings.upgrade_to_full_button"),
+                        ),
+                        config::AiInstallType::Full => self.show_tab_button(
+                            ui,
+                            id,
+                            t!("launcher.settings.install_other_pytorch_button"),
+                        ),
+                        config::AiInstallType::None => {}
+                    }
+                } else {
+                    // All other sections use their static per-surface title key,
+                    // resolved to the active locale at runtime (`t!` needs a literal).
+                    let label = crate::i18n_resolve::resolve_key(title_key(
+                        id,
+                        SettingsSurface::Launcher,
+                    ));
+                    self.show_tab_button(ui, id, label);
+                }
             }
-            self.show_tab_button(ui, SettingsTab::PythonEnvironment, t!("launcher.settings.tab_python_env"));
-            #[cfg(feature = "tutorial")]
-            self.show_tab_button(ui, SettingsTab::Tutorials, t!("launcher.settings.tab_tutorial"));
 
             let response = show_two_line_button(
                 ui,
@@ -449,15 +474,21 @@ impl SettingsPageState {
         save_log_rect
     }
 
-    fn show_tab_button(&mut self, ui: &mut Ui, tab: SettingsTab, label: &str) {
+    fn show_tab_button(&mut self, ui: &mut Ui, tab: SettingsSectionId, label: &str) {
         self.show_tab_button_impl(ui, tab, label, false);
     }
 
-    fn show_tab_button_highlighted(&mut self, ui: &mut Ui, tab: SettingsTab, label: &str) {
+    fn show_tab_button_highlighted(&mut self, ui: &mut Ui, tab: SettingsSectionId, label: &str) {
         self.show_tab_button_impl(ui, tab, label, true);
     }
 
-    fn show_tab_button_impl(&mut self, ui: &mut Ui, tab: SettingsTab, label: &str, warning: bool) {
+    fn show_tab_button_impl(
+        &mut self,
+        ui: &mut Ui,
+        tab: SettingsSectionId,
+        label: &str,
+        warning: bool,
+    ) {
         let selected = self.active_tab == tab;
         let fill = if selected {
             TAB_ACTIVE_FILL

@@ -15,9 +15,12 @@ Key functions:
 Notes:
 - The projects-dir save and memory-profile persistence are handled synchronously inside
   the shared widget; only the typing-panel-layout write is offloaded here.
+- The shared General section is rendered through `SharedSettingsPanels::draw` (owned by
+  `SettingsTabState`), not by calling the widget directly, so the studio embeds one
+  shared-panel container.
 */
 
-use super::{SettingsTabState, save_typing_panel_layout};
+use super::{SettingsSectionId, SettingsSurface, SettingsTabState, save_typing_panel_layout};
 use crate::runtime_log;
 use crate::tabs::typing::TypingPanelLayout;
 use ms_thread as thread;
@@ -55,10 +58,13 @@ impl SettingsTabState {
         ui.separator();
         ui.add_space(8.0);
 
-        // Shared widget: projects directory + memory profile (identical to the launcher).
-        let outcome = crate::general_settings_panel::draw_general_settings_panel(
+        // Shared section: projects directory + memory profile + languages (identical to
+        // the launcher), rendered through the shared-panel container.
+        let outcome = self.shared.draw(
+            SettingsSectionId::General,
             ui,
-            &mut self.general_settings_panel,
+            SettingsSurface::Studio,
+            &self.ai_backend_handle,
         );
         // Studio runtime effect: apply a changed memory profile to the shared
         // `MemoryManager` and cache owners. The saved projects dir needs no studio

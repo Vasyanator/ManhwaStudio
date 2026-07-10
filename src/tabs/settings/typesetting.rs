@@ -21,17 +21,12 @@ Notes:
   the live set is updated synchronously so new renders pick up the change immediately.
 */
 
-use super::{
-    SettingsTabState, save_hanging_punctuation, save_rotation_ctrl_wheel_mode, save_text_language,
-};
+use super::{SettingsTabState, save_hanging_punctuation, save_rotation_ctrl_wheel_mode};
 use crate::tabs::typing::rotation_ctrl_wheel::{
     RotationCtrlWheelMode, rotation_ctrl_wheel_mode, set_rotation_ctrl_wheel_mode,
 };
-use crate::i18n_resolve::resolve_key;
 use crate::runtime_log;
 use crate::text_punctuation;
-use crate::widgets::WheelComboBox;
-use ms_text_util::language::{ScriptGroup, set_text_language, text_language};
 use ms_thread as thread;
 
 impl SettingsTabState {
@@ -49,7 +44,12 @@ impl SettingsTabState {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        self.draw_text_language_setting(ui);
+        // Shared typesetting-language selector (same widget the general-settings panel
+        // renders); the id-salt prefix keeps this instance's egui ids distinct.
+        crate::general_settings_panel::draw_text_language_setting(
+            ui,
+            "settings.typesetting.text_language",
+        );
 
         ui.add_space(10.0);
         ui.separator();
@@ -138,83 +138,6 @@ impl SettingsTabState {
             .show(ui, |ui| {
                 self.font_settings_editor.ui(ui);
             });
-    }
-
-    /// Renders the typesetting-language selector: a `ScriptGroup` combo followed by
-    /// the concrete `TextLanguage` combo within that group.
-    ///
-    /// Selecting a group switches to that group's first language. Both selections
-    /// apply live via `ms_text_util::language::set_text_language` (the typing tab's
-    /// `facade.rs` observes `text_language()` each frame and re-runs font-coverage
-    /// classification off-thread) and persist `TextTab.text_language` (as
-    /// `lang.tag()`) on a background thread. The current language is the single
-    /// source of truth (the process-global atomic), so no selection state is stored
-    /// on `SettingsTabState`.
-    fn draw_text_language_setting(&self, ui: &mut egui::Ui) {
-        ui.label(t!("settings.typesetting.text_language_label"));
-        ui.small(
-            t!("settings.typesetting.text_language_hint"),
-        );
-
-        let current = text_language();
-        let current_group = current.group();
-
-        // Group combo: selecting a different group switches to that group's first
-        // language.
-        let mut selected_group = current_group;
-        ui.horizontal_wrapped(|ui| {
-            WheelComboBox::from_label(t!("settings.typesetting.script_group_label")).id_salt("settings.typesetting.script_group_label")
-                .selected_text(resolve_key(current_group.name_key()))
-                .show_ui(ui, |ui| {
-                    for group in ScriptGroup::all() {
-                        ui.selectable_value(&mut selected_group, group, resolve_key(group.name_key()));
-                    }
-                });
-        });
-
-        // Language combo lists only the (possibly new) group's languages. When the
-        // group changed this frame, offer that group's first language as selected.
-        let mut selected_language = if selected_group == current_group {
-            current
-        } else {
-            selected_group.first_language()
-        };
-        ui.horizontal_wrapped(|ui| {
-            WheelComboBox::from_label(t!("settings.typesetting.language_label")).id_salt("settings.typesetting.language_label")
-                .selected_text(resolve_key(selected_language.name_key()))
-                .show_ui(ui, |ui| {
-                    for language in selected_group.languages() {
-                        ui.selectable_value(
-                            &mut selected_language,
-                            *language,
-                            resolve_key(language.name_key()),
-                        );
-                    }
-                });
-        });
-
-        if selected_language != current {
-            // Apply live first so the change takes effect even if the disk write
-            // fails; the typing tab picks it up next frame and recomputes coverage.
-            set_text_language(selected_language);
-            let path = self.user_settings_file.clone();
-            let tag = selected_language.tag().to_string();
-            if let Err(err) = thread::Builder::new()
-                .name("settings-text-language-save".to_string())
-                .spawn(move || {
-                    if let Err(err) = save_text_language(&path, &tag) {
-                        runtime_log::log_error(format!(
-                            "[settings] failed to persist text language to {}; error={err}",
-                            path.display()
-                        ));
-                    }
-                })
-            {
-                runtime_log::log_error(format!(
-                    "[settings] failed to start text language save thread; error={err}"
-                ));
-            }
-        }
     }
 
     /// Renders the "Поворот Ctrl+колесо" chooser: which rotation mechanism the typing

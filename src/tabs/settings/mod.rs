@@ -3,27 +3,30 @@ FILE OVERVIEW: src/tabs/settings/mod.rs
 Settings tab state and shared runtime for settings subpanes.
 
 Main types:
-- `SettingsPane`: active settings subsection (`General`, `CanvasRibbon`, `Typesetting`,
-  `AiBackend`, `Hotkeys`).
-- `SettingsTabState`: pane state + the shared `AiBackendHandle` it renders the AI
-  backend pane against, plus the user-facing memory profile binding to `MemoryManager`.
+- `SettingsTabState`: active-section state + the shared `AiBackendHandle` it renders
+  the shared panels against, the `SharedSettingsPanels` container that owns the three
+  cross-surface panel states (General / AiBackend / Tutorials), and the user-facing
+  memory profile binding to `MemoryManager`.
+
+Section identity is the cross-surface `crate::settings_shared::SettingsSectionId`; the
+tab bar and studio section order come from `settings_shared::sections_for(Studio)` and
+labels from `settings_shared::title_key(id, Studio)`.
 
 Flow:
-- `draw`: renders pane switcher and delegates UI to submodules.
-- The AI backend pane forwards to the shared `crate::ai_backend_panel` widget over
-  the app-global supervisor handle; the backend process/probe lifecycle itself lives
-  in `crate::ai_backend_supervisor` (owned by `run_main`, not by this tab).
+- `draw`: renders the section switcher (from the shared registry) and dispatches. The
+  shared sections (General / AiBackend / Tutorials) are rendered through
+  `self.shared.draw(...)`; studio-only sections use this module's local renderers.
+- The shared panels forward to the shared `crate::general_settings_panel` /
+  `crate::ai_backend_panel` / `crate::tutorial` widgets over the app-global supervisor
+  handle; the backend process/probe lifecycle itself lives in
+  `crate::ai_backend_supervisor` (owned by `run_main`, not by this tab).
 */
 
-mod ai_backend;
 mod canvas_ribbon;
 mod general;
 mod hotkeys;
 mod typesetting;
-#[cfg(feature = "tutorial")]
-mod tutorials;
 
-use crate::ai_backend_panel::AiBackendPanelState;
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::bubble_status::BubbleStatusCondition;
 use crate::canvas::{save_canvas_settings_to_project_file, save_canvas_settings_to_user_file};
@@ -34,6 +37,7 @@ use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{ComicType, save_comic_type_to_project_file};
 use crate::runtime_log;
+use crate::settings_shared::{SettingsSectionId, SettingsSurface, SharedSettingsPanels};
 use crate::tabs::typing::TypingPanelLayout;
 use crate::widgets::{
     current_spellcheck_words_revision, load_custom_spellcheck_words, load_project_spellcheck_words,
@@ -71,28 +75,22 @@ pub(super) struct CanvasSettingsSaveRequest {
     pub(super) project_spellcheck_words: String,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum SettingsPane {
-    General,
-    CanvasRibbon,
-    Typesetting,
-    AiBackend,
-    Hotkeys,
-    #[cfg(feature = "tutorial")]
-    Tutorials,
-}
-
 #[derive(Debug)]
 pub struct SettingsTabState {
-    active_pane: SettingsPane,
+    /// The currently displayed settings section (studio subset of the cross-surface
+    /// `SettingsSectionId`). Only ids listed for `SettingsSurface::Studio` are ever
+    /// set here; launcher-only ids are unreachable.
+    active_pane: SettingsSectionId,
     user_settings_file: PathBuf,
     typing_panel_layout: TypingPanelLayout,
     pending_typing_panel_layout: Option<TypingPanelLayout>,
     memory_manager: Arc<MemoryManager>,
-    /// Shared general-settings widget state (projects directory + memory profile),
-    /// the same widget the launcher settings page renders. See
-    /// `crate::general_settings_panel`.
-    general_settings_panel: crate::general_settings_panel::GeneralSettingsPanelState,
+    /// Container owning the three cross-surface "double-interface" panel states
+    /// (General / AiBackend / Tutorials), the same states the launcher settings page
+    /// embeds. See `crate::settings_shared::SharedSettingsPanels`. The `AiBackendHandle`
+    /// is NOT owned here; it is passed into `shared.draw` by reference from
+    /// `ai_backend_handle`.
+    shared: SharedSettingsPanels,
     hanging_punctuation_input: String,
     saved_hanging_punctuation: String,
     project_settings_file: PathBuf,
@@ -104,13 +102,6 @@ pub struct SettingsTabState {
     project_spellcheck_custom_words: String,
     spellcheck_words_revision_seen: u64,
     ai_backend_handle: AiBackendHandle,
-    ai_backend_panel: AiBackendPanelState,
-    /// Progress model behind the shared "Обучение" pane. Loaded here since the
-    /// studio has no tutorial controller yet; resets persist to config and take
-    /// effect on the next launcher run (or future studio tutorials). Gated behind
-    /// the `tutorial` feature (off by default).
-    #[cfg(feature = "tutorial")]
-    tutorial_progress: crate::tutorial::TutorialProgressHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
     hotkey_capture_command_id: Option<String>,
     /// Editor for per-effect-kind default parameters, shown in the "Тайп" pane.
@@ -137,19 +128,23 @@ impl SettingsTabState {
     pub fn new(ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
         let user_settings_file = config::user_config_path();
         let typing_panel_layout = load_typing_panel_layout(&user_settings_file);
-        let general_settings_panel =
-            crate::general_settings_panel::GeneralSettingsPanelState::new();
-        memory_manager.set_profile(general_settings_panel.memory_profile);
+        let shared = SharedSettingsPanels::new(
+            #[cfg(feature = "tutorial")]
+            crate::tutorial::shared_progress(),
+        );
+        // Seed the runtime memory profile from the shared general panel (loaded from
+        // config), the same value the shared widget starts with.
+        memory_manager.set_profile(shared.memory_profile());
         // Триггерит ленивую загрузку набора из конфига и даёт текущее значение.
         let hanging_punctuation = crate::text_punctuation::hanging_punctuation_string();
 
         Self {
-            active_pane: SettingsPane::General,
+            active_pane: SettingsSectionId::General,
             user_settings_file,
             typing_panel_layout,
             pending_typing_panel_layout: Some(typing_panel_layout),
             memory_manager,
-            general_settings_panel,
+            shared,
             hanging_punctuation_input: hanging_punctuation.clone(),
             saved_hanging_punctuation: hanging_punctuation,
             project_settings_file: PathBuf::new(),
@@ -161,9 +156,6 @@ impl SettingsTabState {
             project_spellcheck_custom_words: String::new(),
             spellcheck_words_revision_seen: current_spellcheck_words_revision(),
             ai_backend_handle,
-            ai_backend_panel: AiBackendPanelState::default(),
-            #[cfg(feature = "tutorial")]
-            tutorial_progress: crate::tutorial::shared_progress(),
             dragged_bubble_condition_node: None,
             hotkey_capture_command_id: None,
             effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
@@ -205,7 +197,7 @@ impl SettingsTabState {
         self.spellcheck_words_revision_seen = current_spellcheck_words_revision();
         self.bubbles_model = Some(bubbles_model);
         self.clean_overlays_model = Some(clean_overlays_model);
-        self.apply_memory_profile_to_runtime(self.general_settings_panel.memory_profile);
+        self.apply_memory_profile_to_runtime(self.shared.memory_profile());
         self.canvas_settings_runtime = Some(spawn_canvas_settings_save_worker(
             self.user_settings_file.clone(),
             project_settings_file,
@@ -220,44 +212,67 @@ impl SettingsTabState {
         let process_running = self.ai_backend_handle.process_snapshot().running();
         ui.heading(t!("settings.nav.title"));
         ui.horizontal_wrapped(|ui| {
-            let selected = self.active_pane == SettingsPane::General;
-            if ui.selectable_label(selected, t!("settings.nav.general")).clicked() {
-                self.active_pane = SettingsPane::General;
-            }
-            let selected = self.active_pane == SettingsPane::CanvasRibbon;
-            if ui.selectable_label(selected, t!("settings.nav.canvas_ribbon")).clicked() {
-                self.active_pane = SettingsPane::CanvasRibbon;
-            }
-            let selected = self.active_pane == SettingsPane::Typesetting;
-            if ui.selectable_label(selected, t!("settings.nav.typesetting")).clicked() {
-                self.active_pane = SettingsPane::Typesetting;
-            }
-            let selected = self.active_pane == SettingsPane::AiBackend;
-            if ui.selectable_label(selected, t!("settings.nav.ai_backend")).clicked() {
-                self.active_pane = SettingsPane::AiBackend;
-            }
-            let selected = self.active_pane == SettingsPane::Hotkeys;
-            if ui.selectable_label(selected, t!("settings.nav.hotkeys")).clicked() {
-                self.active_pane = SettingsPane::Hotkeys;
-            }
-            #[cfg(feature = "tutorial")]
-            {
-                let selected = self.active_pane == SettingsPane::Tutorials;
-                if ui.selectable_label(selected, t!("settings.nav.tutorials")).clicked() {
-                    self.active_pane = SettingsPane::Tutorials;
+            // Section list + order come from the shared registry (studio subset). The
+            // label is the surface-specific localization key resolved at runtime, since
+            // the key is dynamic (`title_key` is not a `t!` literal).
+            for descriptor in crate::settings_shared::sections_for(SettingsSurface::Studio) {
+                let id = descriptor.id;
+                let key = crate::settings_shared::title_key(id, SettingsSurface::Studio);
+                let label = ms_i18n::lookup(key).unwrap_or(key);
+                if ui.selectable_label(self.active_pane == id, label).clicked() {
+                    self.active_pane = id;
                 }
             }
         });
         ui.separator();
 
         match self.active_pane {
-            SettingsPane::General => self.draw_general(ui),
-            SettingsPane::CanvasRibbon => self.draw_canvas_ribbon(ui),
-            SettingsPane::Typesetting => self.draw_typesetting(ui),
-            SettingsPane::AiBackend => self.draw_ai_backend(ui),
-            SettingsPane::Hotkeys => self.draw_hotkeys(ui, hotkeys_v2),
+            SettingsSectionId::General => self.draw_general(ui),
+            SettingsSectionId::CanvasRibbon => self.draw_canvas_ribbon(ui),
+            SettingsSectionId::Typesetting => self.draw_typesetting(ui),
+            SettingsSectionId::AiBackend => {
+                // Studio wraps the shared AI backend panel in a scroll area (it is
+                // taller than the settings viewport, like the launcher settings page);
+                // `auto_shrink` off so it fills the available space. The section is
+                // shared and produces no studio runtime outcome, so its result is
+                // intentionally discarded.
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_ai_backend_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let _ = self.shared.draw(
+                            SettingsSectionId::AiBackend,
+                            ui,
+                            SettingsSurface::Studio,
+                            &self.ai_backend_handle,
+                        );
+                    });
+            }
+            SettingsSectionId::Hotkeys => self.draw_hotkeys(ui, hotkeys_v2),
             #[cfg(feature = "tutorial")]
-            SettingsPane::Tutorials => self.draw_tutorials(ui),
+            SettingsSectionId::Tutorials => {
+                // Shared tutorials pane; no studio runtime outcome to apply.
+                let _ = self.shared.draw(
+                    SettingsSectionId::Tutorials,
+                    ui,
+                    SettingsSurface::Studio,
+                    &self.ai_backend_handle,
+                );
+            }
+            // Launcher-only sections can never be the studio's active pane: the tab bar
+            // only offers `sections_for(Studio)`, and `active_pane` is only ever set to
+            // one of those ids. Kept exhaustive (no `_ =>`) so a new section forces a
+            // decision here.
+            SettingsSectionId::SystemInfo
+            | SettingsSectionId::AiComputations
+            | SettingsSectionId::TorchUpgrade
+            | SettingsSectionId::PythonEnvironment => {
+                debug_assert!(
+                    false,
+                    "studio settings active_pane is a launcher-only section: {:?}",
+                    self.active_pane
+                );
+            }
         }
 
         let repaint_after = if process_running {

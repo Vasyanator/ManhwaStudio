@@ -6,10 +6,18 @@ launcher settings, global memory profile, shared canvas/ribbon behavior, AI back
 controls, and hotkey overrides.
 
 ## Architecture
-`SettingsTabState` in `mod.rs` owns pane selection, shared settings snapshots, the hot-applicable
-`MemoryManager` binding, and bindings to shared models. The AI backend pane no longer owns the
-backend process: it holds a cloned `AiBackendHandle` and renders the shared widget from
-`crate::ai_backend_panel`. Pane files render focused UI sections through methods on
+`SettingsTabState` in `mod.rs` owns the active-section id, shared settings snapshots, the
+hot-applicable `MemoryManager` binding, and bindings to shared models. Section identity, the
+studio section list, and the tab-bar order come from the cross-surface registry
+`crate::settings_shared` (`SettingsSectionId`, `sections_for(Studio)`, `title_key(id, Studio)`),
+so the launcher and studio share one source of truth for section metadata.
+
+The three cross-surface "double-interface" sections (General / AiBackend / Tutorials) are owned by
+a single `crate::settings_shared::SharedSettingsPanels` embedded on `SettingsTabState` and rendered
+via `shared.draw(id, ui, Studio, &ai_backend_handle)`; the studio-only sections
+(CanvasRibbon / Typesetting / Hotkeys) render through this module's own methods. The AI backend
+section no longer owns the backend process: `SettingsTabState` holds a cloned `AiBackendHandle`,
+passed by reference into `shared.draw`. Pane files render focused UI sections through methods on
 `SettingsTabState`.
 
 Settings writes are offloaded to worker threads or a coalescing save worker. The GUI thread updates
@@ -25,9 +33,12 @@ IPC protocol over the AF_UNIX socket at `backend_ipc::backend_socket_path()`; th
 that path to Python with `--socket`. There is no free-port reservation and no HTTP server.
 
 ## Files and submodules
-- `mod.rs`: `SettingsTabState`, pane routing, canvas settings binding, the shared `AiBackendHandle`,
-  typing-layout persistence helper, and the coalesced canvas settings save worker. (The
-  projects-dir + memory-profile editing/persistence moved to the shared
+- `mod.rs`: `SettingsTabState`, section routing (over `settings_shared::sections_for(Studio)`),
+  canvas settings binding, the shared `AiBackendHandle`, the `SharedSettingsPanels` container for
+  the General / AiBackend / Tutorials sections, typing-layout persistence helper, and the coalesced
+  canvas settings save worker. The AiBackend and Tutorials sections are rendered inline in `draw` via
+  `shared.draw(...)` (AiBackend inside the scroll area); the General section goes through `general.rs`.
+  (The projects-dir + memory-profile editing/persistence moved to the shared
   `crate::general_settings_panel` widget; the `user_config.json` write lock moved to `config`.)
   (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
   Also hosts the `user_config.json` writers for the AI runtime selector, the unified ONNX selection,
@@ -51,12 +62,13 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `save_ai_runtime` is wired to the
   "Рантайм ИИ" selector in `ai_backend_panel`; the guard writers are wired to `native_runtime`'s ORT
   load path and the "Повторить попытку ORT" reset control.
-- `general.rs`: thin studio wrapper for the general pane. Enforces the studio-only vertical
-  typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then delegates the
-  projects-directory editor, global memory-profile combo, and the UI-language selector to the shared
-  `crate::general_settings_panel` widget and applies the memory-profile runtime effect from its
-  outcome. Projects-dir + memory-profile + UI-language persistence live inside that shared widget,
-  not here. The UI-language selector (a `WheelComboBox`) lists the locales found in the on-disk
+- `general.rs`: thin studio wrapper for the general section. Enforces the studio-only vertical
+  typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then renders the shared
+  General section through `SettingsTabState.shared.draw(General, ..)` (projects-directory editor,
+  global memory-profile combo, UI-language selector, typesetting-language selector) and applies the
+  memory-profile runtime effect from its outcome. Projects-dir + memory-profile + UI-language
+  persistence live inside the shared `crate::general_settings_panel` widget, not here. The
+  UI-language selector (a `WheelComboBox`) lists the locales found in the on-disk
   `locale/` folder — scanned ONCE at widget construction, never per frame — each shown by its
   `_meta.name`; changing it persists `General.ui_language` (synchronously, like the memory-profile
   write) and live-installs that locale's catalog via `crate::locale_store::install_ui_locale`
@@ -72,13 +84,16 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
   via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
   `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
-  the typesetting-language selector — two `WheelComboBox`es (`ScriptGroup` then the concrete
-  `TextLanguage` within it; changing the group selects that group's first language) — applied live
-  via `ms_text_util::language::set_text_language` (the typing tab's `panel/facade.rs` observes
-  `text_language()` each frame and re-runs font-coverage classification off-thread) and persisted as
-  `TextTab.text_language` (the `lang.tag()`) through `save_text_language` in `mod.rs` on a background
-  thread; the process-global atomic is the single source of truth, so no selection state is stored on
-  `SettingsTabState`,
+  the typesetting-language selector — the SHARED
+  `crate::general_settings_panel::draw_text_language_setting(ui, id_salt)` function (two
+  `WheelComboBox`es: `ScriptGroup` then the concrete `TextLanguage` within it; changing the group
+  selects that group's first language), the SAME selector the general-settings widget renders. It
+  applies live via `ms_text_util::language::set_text_language` (the typing tab's `panel/facade.rs`
+  observes `text_language()` each frame and re-runs font-coverage classification off-thread) and
+  persists `TextTab.text_language` (the `lang.tag()`) through `save_text_language` in `mod.rs` on a
+  background thread; the process-global atomic is the single source of truth, so no selection state is
+  stored on `SettingsTabState`. `typesetting.rs` passes the id-salt prefix
+  `"settings.typesetting.text_language"` so its egui ids stay distinct from the general widget's,
   the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
   held on `SettingsTabState`, rendered via its `ui()`; a self-contained typing-panel widget that
   owns its own persistence to `TextTab.effect_defaults`, so settings needs no access to the private
@@ -87,32 +102,19 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   fonts in three categories rendered in their own typefaces and imports/removes system fonts via the
   runtime-global imported-fonts store, loading font lists off the GUI thread. Both blocks are wrapped
   in collapsed `CollapsingHeader`s.
-- `ai_backend.rs`: AI backend pane UI for health display, process start/stop/restart/autostart,
-  device/provider selection, max loaded models, and CUDA/ROCm diagnostics. It forwards to the shared
-  `crate::ai_backend_panel::draw_ai_backend_panel`, which also hosts: the "ONNX-инференс" runtime
-  selector (backend Python / native ONNX, persisted to `General.ai_runtime`; Torch always runs on the
-  backend); the OFFLINE-capable ONNX selection, RUNTIME-BRANCHED — under Native the BUILD-based combos
-  (Билд → EP → Устройство): the "Билд" combo lists the `onnx_runtime::builds` catalog grouped by
-  availability (Базовые/Специфичные/Недоступные, QNN display-only), the EP combo comes from the selected
-  build, and the device combo adapts per EP (incl. OpenVINO device-type strings); an available build's
-  dylib auto-downloads and the build-action button is Retry / "Загрузить другую сборку ort" (force
-  download + `reset_load_latch`) / "Перезапустите программу" per `native_runtime::ort_dylib_committed()`
-  + `active_build()` (a committed dylib can't hot-swap). Under Backend the UNIFIED provider/device combos.
-  The model-limit slider is shared. Selecting persists the unified keys via `save_onnx_build` /
-  `save_onnx_provider_device` / `save_max_loaded_models` off-thread AND, when connected, pushes
-  `device.set`; the onnxruntime auto-download progress bar renders via
-  `onnx_runtime::resolve_or_download_ort_dylib(build)` on a worker thread; the same-build "Повторить
-  попытку ORT" retry calls `reset_ort_load_guard` for the effective `provider[:device]` scope +
-  `native_runtime::reset_load_latch`. The PyTorch device combo stays backend-gated. All ONNX native bits
-  are desktop-only (`#[cfg(not(wasm32))]`); config/caps/dylib-presence are read once off the GUI thread
-  into the panel's scratch state. On wasm the ONNX combos remain backend-driven.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
   `user_config.json` override persistence.
-- `tutorials.rs`: thin "Обучение" pane that delegates to the surface-agnostic
-  `crate::tutorial::draw_tutorials_pane` (same double-interface pattern as `ai_backend.rs`), so the
-  studio and launcher expose the identical tutorial-replay UI. Operates on `SettingsTabState`'s own
-  `tutorial_progress` handle (loaded here; the studio has no tutorial controller yet, so resets
-  persist to config and take effect on the next launcher run / future studio tutorials).
+
+The AI backend and tutorials sections have no studio-local file: they are rendered inline in
+`mod.rs::draw` through `SharedSettingsPanels::draw`, which forwards to the shared
+`crate::ai_backend_panel::draw_ai_backend_panel` and `crate::tutorial::draw_tutorials_pane`. The
+`SharedSettingsPanels` container (in `crate::settings_shared`) owns the panel scratch state and the
+tutorial progress handle; the studio passes its `AiBackendHandle` in by reference. The AI backend
+panel hosts the "ONNX-инференс" runtime selector, the OFFLINE-capable RUNTIME-BRANCHED ONNX
+selection (Native build/EP/device combos vs Backend unified provider/device combos), and the shared
+model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_build` /
+`save_onnx_provider_device` / `save_max_loaded_models`) and the ORT load-guard writers live in
+`mod.rs`.
 
 ## Contracts and invariants
 - Do not block the GUI thread with file writes, Python process work, backend probes, or command
@@ -138,12 +140,15 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   id does not follow the translated text (`docs/i18n_exclusions.md` §C).
 
 ## Editing map
-- To add or rename a settings pane, update `SettingsPane`, pane switcher/routing in `mod.rs`, and
-  add a focused pane file if it grows beyond trivial UI.
+- To add or rename a settings section, edit the registry `crate::settings_shared`
+  (`SettingsSectionId`, `SECTIONS`, `title_key`), then the dispatch `match` in `mod.rs::draw`
+  (exhaustive, no `_ =>`), and add a focused renderer if it grows beyond trivial UI. The tab bar and
+  order come from `sections_for(Studio)`; do not hand-list sections in `mod.rs`.
 - To change shared canvas/ribbon settings, edit `canvas_ribbon.rs` and the save/apply helpers in
   `mod.rs`.
-- To change AI backend process controls, process logs, autostart, or device/probe commands, edit
-  `ai_backend.rs` and the worker functions in `mod.rs`.
+- To change AI backend process controls, process logs, autostart, or device/probe commands, edit the
+  shared `crate::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
+  renders it inline in `mod.rs::draw` (scroll area + `shared.draw(AiBackend, ..)`).
 - To change the projects directory, the memory profile, or the UI-interface language, edit the shared
   `crate::general_settings_panel` widget (used by both the studio pane and the launcher); the studio
   `general.rs` is only a thin wrapper that adds the typing-panel-layout enforcement and applies the
