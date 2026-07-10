@@ -1334,6 +1334,21 @@ struct TypingOverlayRuntime {
     last_texture_used_frame: u64,
 }
 
+impl TypingOverlayRuntime {
+    /// Builds the shared-doc affine placement (`TransformRec`) from this runtime's live
+    /// center/rotation/scale. `angle_deg` is stored in degrees on the runtime and converted to
+    /// radians for the doc. Single source of truth for the runtime→doc transform mapping, shared by
+    /// the placement autosave and the text edit-render doc route.
+    fn transform_rec(&self) -> crate::models::layer_model::manifest::TransformRec {
+        crate::models::layer_model::manifest::TransformRec {
+            cx: self.center_page_px[0],
+            cy: self.center_page_px[1],
+            rotation: self.angle_deg.to_radians(),
+            scale: self.user_scale,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct TypingExportOverlaySnapshot {
     pub(super) page_idx: usize,

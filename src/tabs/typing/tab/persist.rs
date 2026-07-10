@@ -95,12 +95,7 @@ impl TypingTextOverlayLayer {
                 continue;
             }
             pages_with_text.insert(overlay.page_idx);
-            let transform = crate::models::layer_model::manifest::TransformRec {
-                cx: overlay.center_page_px[0],
-                cy: overlay.center_page_px[1],
-                rotation: overlay.angle_deg.to_radians(),
-                scale: overlay.user_scale,
-            };
+            let transform = overlay.transform_rec();
             let deform = overlay.deform_mesh.as_ref().map(|m| {
                 crate::models::layer_model::manifest::DeformRec {
                     cols: m.cols,

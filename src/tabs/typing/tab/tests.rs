@@ -1442,3 +1442,34 @@
             Pos2::new(5.0, 5.0)
         ));
     }
+
+    #[test]
+    fn overlay_transform_rec_maps_runtime_placement_to_doc() {
+        // Contract guard for the single source of truth used by BOTH the placement autosave and the
+        // text edit-render doc route. The runtime stores rotation in DEGREES; the doc `TransformRec`
+        // stores it in RADIANS. If this mapping drifts (e.g. someone drops `to_radians`), the top
+        // rotation/scale sliders snap back after an edit re-render, because `sync_from_doc` reads the
+        // doc transform back into the runtime. 90° must round-trip to exactly π/2 radians.
+        let overlay = text_runtime_from_doc_node(
+            "t0",
+            0,
+            [12.5, 34.0],
+            2.0,
+            90.0,
+            None,
+            false,
+            0,
+            None,
+            [4, 3],
+            vec![0u8; 4 * 3 * 4],
+        );
+        let transform = overlay.transform_rec();
+        assert_eq!(transform.cx, 12.5, "cx passes through unchanged");
+        assert_eq!(transform.cy, 34.0, "cy passes through unchanged");
+        assert_eq!(transform.scale, 2.0, "scale passes through unchanged");
+        assert!(
+            (transform.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-6,
+            "90 deg maps to π/2 rad, got {}",
+            transform.rotation
+        );
+    }

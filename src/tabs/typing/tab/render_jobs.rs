@@ -722,8 +722,18 @@ impl TypingTextOverlayLayer {
             let render_data = result.render_data_json.clone();
             let image =
                 ColorImage::from_rgba_unmultiplied(result.size_px, result.rgba.as_slice());
+            // The edit-render carries the placement fields the panel edited via the top transform
+            // sliders (rotation, scale). `set_text_render` writes only pixels + render_data and leaves
+            // the doc node's transform untouched, so we must also push the fresh transform in the SAME
+            // doc mutation. Otherwise the version bump triggers `maybe_reproject_from_doc_version` →
+            // `sync_from_doc`, which reads the STALE `node.transform.rotation`/`scale` back into the
+            // runtime, snapping the slider back the frame after the render lands. The autosave path
+            // (`request_overlay_placement_save`) cannot cover this: it is suppressed while the render is
+            // in flight and would race the reproject even after.
+            let transform = overlay.transform_rec();
             self.route_to_doc(page_idx, move |doc| {
                 doc.set_text_render(page_idx, &uid, render_data, image);
+                doc.set_transform(page_idx, &uid, transform);
             });
         }
         // A vector-transform re-render (settle/reset) just changed the overlay's baked pixels and warp;
