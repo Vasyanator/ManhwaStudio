@@ -907,3 +907,326 @@ impl TypingTextOverlayLayer {
         }
     }
 }
+
+/// Max pages applied per frame by [`TypingTextOverlayLayer::drive_page_preload`]. Applying a decoded
+/// page projects it (`sync_from_doc`: RGBA clones + texture-upload queueing), which is bounded work,
+/// so a small constant keeps any single frame from stalling while the preload still makes steady
+/// progress. Decode itself is off-thread and unaffected by this cap.
+const TYPING_PRELOAD_APPLY_BATCH: usize = 4;
+
+/// Async, non-blocking "preload all pages" primitive (Phase 1 of the whole-project residency work).
+///
+/// Whole-project operations (export to folder/PSD, project save) need EVERY page resident, but the
+/// typing tab loads per-page layer data lazily (only visited pages). A synchronous residency loop
+/// would block the GUI thread (forbidden, CLAUDE.md §5), so this pre-pass decodes the missing pages
+/// off the GUI thread (`LayerDoc::decode_page_payload`, a `Send` pure fn) and applies the ready
+/// payloads on the GUI thread in bounded batches through the SAME memoized load path a lazy visit
+/// uses — so it never clobbers an already-resident page's unsaved edits and never resurrects a
+/// session deletion.
+// Phase 2 wires these into the export path: the export trigger in `TypingTabState::draw` defers a
+// to-folder/PSD export behind `begin_preload_all_pages` when `!all_pages_loaded`, shows a
+// `preload_all_pages_progress` indicator while `preload_all_pages_active`, and runs the export once the
+// preload drains. The per-frame driver (`drive_page_preload`) is called every frame from
+// `TypingTabState::draw`. (Project-save integration is still a later phase but uses the same primitive.)
+impl TypingTextOverlayLayer {
+    /// True iff every page in `project.pages` is already fully resident here: present in
+    /// `raster_layers_by_page` (this tab's projection) AND in the shared doc's loaded pages. Cheap,
+    /// no I/O (one brief doc lock + `HashMap` lookups). Returns false when no doc is wired (nothing
+    /// can be resident in the doc sense).
+    #[must_use]
+    pub fn all_pages_loaded(&self, project: &ProjectData) -> bool {
+        let indices: Vec<usize> = project.pages.iter().map(|p| p.idx).collect();
+        self.all_page_indices_resident(&indices)
+    }
+
+    /// Residency check for an explicit page-index set (the testable core of [`Self::all_pages_loaded`]):
+    /// true iff every index is present in `raster_layers_by_page` AND in the doc's loaded pages. A
+    /// missing/unwired doc yields false. Takes one brief doc lock; no I/O.
+    #[must_use]
+    pub(super) fn all_page_indices_resident(&self, page_indices: &[usize]) -> bool {
+        let Some(doc) = self.layer_doc.as_ref() else {
+            return false;
+        };
+        let Ok(guard) = doc.lock() else {
+            return false;
+        };
+        page_indices.iter().all(|idx| {
+            self.raster_layers_by_page.contains_key(idx) && guard.page(*idx).is_some()
+        })
+    }
+
+    /// Starts (or no-ops) an async preload of every not-yet-resident page. Idempotent: a no-op if a
+    /// preload is already running or every page is already resident. Otherwise it spawns ONE worker
+    /// that decodes the missing pages off the GUI thread and streams the payloads; the GUI thread
+    /// applies them via [`Self::drive_page_preload`]. Resident pages are left untouched (they are not
+    /// targets, and the apply path is memoized), so unsaved edits and session deletions survive.
+    ///
+    /// No-op with a logged warning when no shared doc or no layers dir is wired (nothing to insert
+    /// into / decode from).
+    pub fn begin_preload_all_pages(&mut self, project: &ProjectData) {
+        if self.preload_all_state.is_some() {
+            return; // already running (idempotent)
+        }
+        let Some(doc) = self.layer_doc.clone() else {
+            crate::runtime_log::log_warn(
+                "[typing] preload all pages: no shared layer document wired; skipping",
+            );
+            return;
+        };
+        let Some(primary) = self.layers_primary_dir.clone() else {
+            crate::runtime_log::log_warn(
+                "[typing] preload all pages: no layers directory wired yet; skipping",
+            );
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+
+        // Target = every page NOT yet fully resident (projected here AND loaded in the doc). Computed
+        // under a single doc lock. Already-resident pages are excluded, so the pass never re-decodes
+        // or re-applies them (which also protects their in-memory edits).
+        let targets: Vec<usize> = {
+            let Ok(guard) = doc.lock() else {
+                crate::runtime_log::log_warn(
+                    "[typing] preload all pages: layer document lock poisoned; skipping",
+                );
+                return;
+            };
+            project
+                .pages
+                .iter()
+                .map(|p| p.idx)
+                .filter(|idx| {
+                    !(self.raster_layers_by_page.contains_key(idx) && guard.page(*idx).is_some())
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return; // already all resident
+        }
+
+        // Page paths for the worker's page-size map. The absolute-ribbon legacy migration inside
+        // `decode_page_payload` recovers a chapter-wide scale from EVERY page's aspect, so the worker
+        // builds the FULL chapter map (mirrors the initial loader's `load_typing_page_sizes`).
+        let page_paths: Vec<(usize, PathBuf)> = project
+            .pages
+            .iter()
+            .map(|page| (page.idx, page.path.clone()))
+            .collect();
+
+        let total = targets.len();
+        crate::trace_log!(
+            cat::PERSIST,
+            "preload_all_pages begin targets={} total_pages={}",
+            total,
+            project.pages.len()
+        );
+        let targets_for_thread = targets.clone();
+        let (tx, rx) = mpsc::channel::<TypingPreloadPageResponse>();
+        thread::spawn(move || {
+            // Full chapter page-size map (header-only reads) built OFF the GUI thread.
+            let page_sizes = load_typing_page_sizes(&page_paths);
+            for page in targets_for_thread {
+                // Pure, lock-free decode (disk I/O + PNG decode + legacy migration). The GUI thread
+                // inserts it through the memoized path, so a page that became resident meanwhile is
+                // discarded rather than clobbered.
+                let result = crate::models::layer_model::layer_doc::LayerDoc::decode_page_payload(
+                    page,
+                    &primary,
+                    fallback.as_deref(),
+                    &page_sizes,
+                );
+                if tx.send((page, result)).is_err() {
+                    break; // receiver dropped (tab reset / project switch)
+                }
+            }
+        });
+
+        self.preload_all_progress = (0, total);
+        self.preload_all_state = Some(TypingPreloadAllState {
+            rx,
+            remaining: targets.into_iter().collect(),
+            total,
+            decode_errors: 0,
+        });
+    }
+
+    /// True while a preload pass is running (pages still pending apply). Cheap flag read.
+    #[must_use]
+    pub fn preload_all_pages_active(&self) -> bool {
+        self.preload_all_state.is_some()
+    }
+
+    /// `(done, total)` for a progress label: `total` is the number of pages that needed loading when
+    /// the current preload began, `done` is how many have since been applied. Refreshed each frame by
+    /// [`Self::drive_page_preload`]; `(0, 0)` when no preload has run. Cheap getter (no doc lock).
+    #[must_use]
+    pub fn preload_all_pages_progress(&self) -> (usize, usize) {
+        self.preload_all_progress
+    }
+
+    /// Stores a to-folder/PSD export deferred until the whole-project preload finishes (Phase 2).
+    /// Overwrites any previously pending request. The caller is expected to have started the preload
+    /// (`begin_preload_all_pages`) so the gate can later become ready.
+    pub(super) fn set_pending_export(&mut self, pending: PendingTypingExport) {
+        self.pending_export_after_preload = Some(pending);
+    }
+
+    /// True while an export is deferred behind the whole-project preload. Cheap flag read; used to
+    /// drive the "preparing pages N/M" indicator.
+    #[must_use]
+    pub(super) fn has_pending_export(&self) -> bool {
+        self.pending_export_after_preload.is_some()
+    }
+
+    /// Takes the deferred export IFF the whole-project preload PASS has fully drained
+    /// (`!preload_all_pages_active`). Returns `None` (leaving the request pending) while the pass is
+    /// still running. The caller then captures the mask snapshot and dispatches
+    /// `request_export_to_folder`.
+    ///
+    /// Gating on pass COMPLETION rather than full residency (`all_pages_loaded`) is deliberate and
+    /// required for correctness: a page whose decode genuinely fails (corrupt `layers.json`/
+    /// `page_*.json`, or a worker panic that drops the sender) is dropped from the pass and NEVER
+    /// becomes resident, so a residency gate would hang the export forever. The export tolerates a
+    /// non-resident page — its in-function residency pass skips a page it cannot project and
+    /// `build_export_overlay_snapshots` omits it — so dispatching once the pass drains is safe. The
+    /// caller separately gates on `TypingMaskLayer::masks_loaded` (masks always complete, so no hang).
+    #[must_use]
+    pub(super) fn take_pending_export_if_ready(
+        &mut self,
+        _project: &ProjectData,
+    ) -> Option<PendingTypingExport> {
+        if !self.has_pending_export() {
+            return None;
+        }
+        if self.preload_all_pages_active() {
+            return None; // preload pass still running; keep waiting until it drains
+        }
+        self.pending_export_after_preload.take()
+    }
+
+    /// Per-frame driver of the async preload: polls the decode channel and APPLIES up to
+    /// [`TYPING_PRELOAD_APPLY_BATCH`] ready pages this frame on the GUI thread. Each apply moves the
+    /// decoded payload into the doc via the MEMOIZED [`LayerDoc::insert_decoded_page`] (an
+    /// already-resident page discards the stale payload, so unsaved edits and session deletions are
+    /// never clobbered / resurrected) and then finalizes this tab's projection with `sync_from_doc`
+    /// (bands/rasters/overlays), exactly like a lazy `ensure_raster_layers_for_page` visit.
+    ///
+    /// The user's raster/overlay SELECTION is snapshotted and restored around the apply loop
+    /// (projecting non-current pages resolves `pending_select_raster_uid`), so a background preload
+    /// never changes what the user has selected. Returns true while the pass is still active (the
+    /// caller should keep requesting repaints so decode results keep draining).
+    pub fn drive_page_preload(&mut self) -> bool {
+        if self.preload_all_state.is_none() {
+            return false;
+        }
+        let Some(doc) = self.layer_doc.clone() else {
+            // Doc vanished (should not happen mid-session); abandon the pass rather than spin.
+            self.preload_all_state = None;
+            return false;
+        };
+
+        // Snapshot the selection so projecting non-current pages (which resolves any
+        // `pending_select_raster_uid`) cannot change what the user has selected. Mirrors the
+        // export path's save/restore around its projection loop.
+        let saved_selected_raster = self.selected_raster_idx;
+        let saved_selected_raster_page = self.selected_raster_page;
+        let saved_selected_overlay = self.selected_overlay_idx;
+        let saved_pending_select = self.pending_select_raster_uid.clone();
+
+        let mut applied = 0usize;
+        let mut disconnected = false;
+        while applied < TYPING_PRELOAD_APPLY_BATCH {
+            let message = {
+                let Some(state) = self.preload_all_state.as_ref() else {
+                    break;
+                };
+                match state.rx.try_recv() {
+                    Ok(msg) => Some(msg),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        None
+                    }
+                }
+            };
+            let Some((page_idx, result)) = message else {
+                break;
+            };
+            match result {
+                Ok(payload) => {
+                    if let Ok(mut guard) = doc.lock() {
+                        // Memoized: discards the payload if the page is already resident (its live
+                        // in-memory edits/deletions win); otherwise moves it in and bumps the version.
+                        guard.insert_decoded_page(page_idx, payload);
+                        // Finalize this tab's per-page projection from the (now resident) doc page.
+                        self.sync_from_doc(page_idx, &guard);
+                    } else {
+                        crate::runtime_log::log_warn(format!(
+                            "[typing] preload apply page {page_idx}: layer document lock poisoned"
+                        ));
+                    }
+                }
+                Err(err) => {
+                    // Decode failed for this page: log the detailed cause and drop it from the
+                    // remaining set so the pass still completes (a residency gate would hang here).
+                    // The page stays unresident; its committed on-disk data is used as-is and it will
+                    // lazy-load when visited. An aggregated one-time warning is emitted on completion.
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] preload decode page {page_idx} failed: {err}"
+                    ));
+                    if let Some(state) = self.preload_all_state.as_mut() {
+                        state.decode_errors = state.decode_errors.saturating_add(1);
+                    }
+                }
+            }
+            if let Some(state) = self.preload_all_state.as_mut() {
+                state.remaining.remove(&page_idx);
+            }
+            applied += 1;
+        }
+
+        // Restore the user's selection (the preload is side-effect-free w.r.t. selection).
+        self.selected_raster_idx = saved_selected_raster;
+        self.selected_raster_page = saved_selected_raster_page;
+        self.selected_overlay_idx = saved_selected_overlay;
+        self.pending_select_raster_uid = saved_pending_select;
+
+        // Refresh progress and detect completion.
+        let complete = match self.preload_all_state.as_ref() {
+            Some(state) => {
+                self.preload_all_progress =
+                    (state.total.saturating_sub(state.remaining.len()), state.total);
+                // Done when every target has been applied. `disconnected` is a safety net: if the
+                // worker died early (never sent every target), the closed channel still completes the
+                // pass instead of leaving it stuck forever.
+                state.remaining.is_empty() || disconnected
+            }
+            None => true,
+        };
+        if complete {
+            if let Some(state) = self.preload_all_state.take() {
+                // Freeze the final progress at total/total so a label reads complete on the last frame.
+                self.preload_all_progress = (state.total, state.total);
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "preload_all_pages complete total={} remaining={} decode_errors={}",
+                    state.total,
+                    state.remaining.len(),
+                    state.decode_errors
+                );
+                // One-time aggregated warning: if any page failed to decode, the deferred export/save
+                // proceeds WITHOUT those pages (gated on pass completion, not full residency). Surface
+                // it once here instead of proceeding silently; per-page detail was already logged above.
+                if state.decode_errors > 0 {
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] preload all pages: {} of {} page(s) failed to decode; the export/save \
+                         will proceed without them (their committed on-disk data is used as-is)",
+                        state.decode_errors, state.total
+                    ));
+                }
+            }
+            return false;
+        }
+        true
+    }
+}

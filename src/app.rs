@@ -215,6 +215,20 @@ pub struct MangaApp {
     save_to_project_status: Option<(String, f64)>,
     /// Which action should happen after a successful "save then close" flow.
     pending_save_completion_action: Option<PendingCloseAction>,
+    /// A project save requested while the typing tab's whole-project LAYER preload was still
+    /// incomplete, deferred until the preload PASS drains. While true, `start_save_to_project` has
+    /// NOT run yet: `request_save_to_project` started the async preload (`begin_preload_all_pages`)
+    /// and `drive_pending_save_preload` advances it each frame (regardless of the active tab, since
+    /// the typing tab only drives its own preload when it is drawn) then dispatches the real save
+    /// once the pass drains (`!preload_all_pages_active`). Gating on pass COMPLETION rather than full
+    /// residency is required so a page that genuinely fails to decode (and never becomes resident)
+    /// cannot hang the save forever (Finding 1); every page that DID load has its lazy legacy→v3 text
+    /// migration baked into the committed `layers.json` (see `flush_text_layers`), and a decode-failed
+    /// page keeps its committed text verbatim. Masks and клин are intentionally NOT gated (no save-time
+    /// correctness effect — masks are copied verbatim from the committed store, клин edits are
+    /// dirty-flushed synchronously). Also feeds `save_busy`, which suppresses concurrent export
+    /// dispatch (Finding 2).
+    pending_save_after_preload: bool,
     /// Which exit dialog variant is currently shown.
     exit_dialog: Option<ExitDialogKind>,
     /// In-flight unsaved cleanup that must complete before the app is allowed to close.
@@ -676,6 +690,7 @@ impl MangaApp {
             save_to_project_rx: None,
             save_to_project_status: None,
             pending_save_completion_action: None,
+            pending_save_after_preload: false,
             exit_dialog: None,
             pending_exit_cleanup: None,
             has_unsaved_changes_cached,
@@ -720,6 +735,76 @@ impl MangaApp {
             return;
         }
         self.has_unsaved_changes_cached = self.project.paths.unsaved_dir.exists();
+    }
+
+    /// Entry point for every "save to project" trigger (the toolbar button and both exit-dialog
+    /// "save chapter" buttons). Gates the save behind the whole-project layer preload so every page
+    /// that can load has its lazy legacy→v3 text migration baked into the committed `layers.json`.
+    ///
+    /// Fast path: when every page is already resident (`all_pages_loaded`), it runs
+    /// `start_save_to_project` immediately (no behavior change from before). Otherwise it DEFERS:
+    /// it starts the async, non-blocking preload (`begin_preload_all_pages`) and sets
+    /// `pending_save_after_preload`; `drive_pending_save_preload`, called every frame, advances the
+    /// preload and dispatches the real save once the PASS drains (not full residency — a page that
+    /// fails to decode never becomes resident, so a residency gate would hang; its committed text is
+    /// preserved verbatim). A save already running or already pending on the preload is a no-op
+    /// (idempotent trigger).
+    ///
+    /// Only LAYER residency is gated: masks are copied verbatim from the committed `text_images/` by
+    /// the merge (no in-memory mask data is consumed), and клин edits are captured synchronously via
+    /// `take_dirty_save_snapshots`, so gating on the mask loader or the клин loader would have no
+    /// save-time correctness effect (CLAUDE.md §14).
+    fn request_save_to_project(&mut self) {
+        match save_trigger_decision(
+            self.save_to_project_rx.is_some(),
+            self.pending_save_after_preload,
+            self.typing_tab.all_pages_loaded(&self.project),
+        ) {
+            SaveGateDecision::Ignore => {}
+            SaveGateDecision::SaveNow => self.start_save_to_project(),
+            SaveGateDecision::Defer => {
+                // Start the whole-project layer preload (idempotent; wires the typing loader dirs if
+                // the tab was never visited) and remember the intent. `drive_pending_save_preload`
+                // completes it from the frame loop regardless of which tab is active.
+                self.typing_tab.begin_preload_all_pages(&self.project);
+                self.pending_save_after_preload = true;
+                let (done, total) = self.typing_tab.preload_all_pages_progress();
+                self.save_to_project_status = Some((
+                    tf!("app.save.preparing_pages", done = done, total = total),
+                    0.0,
+                ));
+            }
+        }
+    }
+
+    /// Per-frame driver for a save deferred behind the whole-project layer preload. Advances the
+    /// preload (the typing tab drives its own preload only while it is the active tab, so the save
+    /// path must drive it here to stay correct on any tab), keeps repainting so the decode results
+    /// drain, and dispatches the real `start_save_to_project` once the preload PASS has drained
+    /// (`deferred_save_ready`, NOT full residency — see that fn for why). No-op unless
+    /// `pending_save_after_preload`.
+    fn drive_pending_save_preload(&mut self, ctx: &egui::Context) {
+        if !self.pending_save_after_preload {
+            return;
+        }
+        // Advance the preload from the frame loop (independent of the active tab) and keep the frame
+        // loop alive so decode results keep draining to completion.
+        self.typing_tab.drive_page_preload();
+        ctx.request_repaint();
+        if deferred_save_ready(self.typing_tab.preload_all_pages_active()) {
+            // The preload PASS has drained (every page that could decode is resident): run the real
+            // save now. `flush_text_layers` flushes every resident page, so the merge is authoritative
+            // for them and the committed `layers.json` becomes v3-complete. A page that genuinely
+            // failed to decode never became resident; the merge keeps its committed text verbatim
+            // (it is simply absent from `owned_text_pages`), so the save stays correct without hanging.
+            self.pending_save_after_preload = false;
+            self.start_save_to_project();
+        } else {
+            // Still preparing: refresh the "Подготовка страниц N/M" status.
+            let (done, total) = self.typing_tab.preload_all_pages_progress();
+            self.save_to_project_status =
+                Some((tf!("app.save.preparing_pages", done = done, total = total), 0.0));
+        }
     }
 
     /// Snapshot dirty overlay pages, save them in a background thread, then merge the
@@ -939,7 +1024,7 @@ impl MangaApp {
                                 close_dialog = true;
                             }
                             if ui.button(t!("app.exit.save_chapter_button")).clicked() {
-                                self.start_save_to_project();
+                                self.request_save_to_project();
                                 // Wait for the save to complete before we exit.
                                 // We set a flag so the next poll triggers the close.
                                 close_dialog = true;
@@ -966,7 +1051,7 @@ impl MangaApp {
                             if ui.button(t!("app.exit.save_chapter_button")).clicked() {
                                 self.pending_save_completion_action =
                                     Some(PendingCloseAction::ReturnToLauncher);
-                                self.start_save_to_project();
+                                self.request_save_to_project();
                                 close_dialog = true;
                                 handled = true;
                             }
@@ -2189,12 +2274,12 @@ impl MangaApp {
                         self.finalize_close(ui.ctx(), PendingCloseAction::ReturnToLauncher);
                     }
                 }
-                let save_busy = self.save_to_project_rx.is_some();
+                let save_busy = self.save_to_project_rx.is_some() || self.pending_save_after_preload;
                 if ui
                     .add_enabled(!save_busy, egui::Button::new(t!("app.menu.save_project_button")))
                     .clicked()
                 {
-                    self.start_save_to_project();
+                    self.request_save_to_project();
                 }
                 if let Some((status, _)) = &self.save_to_project_status {
                     ui.label(status.as_str());
@@ -2274,6 +2359,10 @@ impl eframe::App for MangaApp {
 
         // Poll active "save to project" job and expire old status messages (show for 5 s).
         let now = ctx.input(|i| i.time);
+        // Advance a save deferred behind the whole-project layer preload (started by
+        // `request_save_to_project` when not every page was resident). Runs every frame regardless of
+        // the active tab and dispatches the real save once every page is resident.
+        self.drive_pending_save_preload(ctx);
         let save_completed_this_frame = self.poll_save_to_project(now);
         self.poll_pending_exit_cleanup(ctx, now);
         self.refresh_unsaved_changes_cache(now);
@@ -2423,10 +2512,15 @@ impl eframe::App for MangaApp {
                     total_pages: self.project.pages.len(),
                     load_errors_count: self.load_errors.len(),
                 };
+                // Export is mutually exclusive with a project save (Finding 2): the save may be pending
+                // on the whole-project preload or already running. Push it into the typing tab before
+                // draw so both the export trigger and the deferred-export gate can suppress dispatch.
+                let save_busy = self.save_to_project_rx.is_some() || self.pending_save_after_preload;
                 let project = &self.project;
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
                 let typing = &mut self.typing_tab;
+                typing.set_save_busy(save_busy);
                 egui::CentralPanel::default().show(ui, |ui| {
                     typing.draw(ctx, ui, project, page_infos, textures, status);
                 });
@@ -2547,6 +2641,56 @@ impl eframe::App for MangaApp {
         }
         runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
     }
+}
+
+/// Decision for a project-save trigger given the current preload/save state — the pure core of
+/// [`MangaApp::request_save_to_project`], extracted so the gate transition is unit-testable without
+/// constructing a full `MangaApp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveGateDecision {
+    /// A save is already running, or one is already pending on the preload — ignore the trigger.
+    Ignore,
+    /// Every page is resident — run the save immediately (fast path, unchanged behavior).
+    SaveNow,
+    /// Not every page is resident — start/continue the whole-project layer preload and keep the
+    /// save pending until it drains.
+    Defer,
+}
+
+/// Pure gate for a project-save TRIGGER. Save is deferred behind a full whole-project layer preload
+/// so every page's lazy legacy→v3 text migration bakes into the committed `layers.json`. `Ignore`
+/// keeps the trigger idempotent (a running or already-pending save is not restarted).
+#[must_use]
+fn save_trigger_decision(
+    save_in_flight: bool,
+    pending_after_preload: bool,
+    all_pages_loaded: bool,
+) -> SaveGateDecision {
+    if save_in_flight || pending_after_preload {
+        SaveGateDecision::Ignore
+    } else if all_pages_loaded {
+        SaveGateDecision::SaveNow
+    } else {
+        SaveGateDecision::Defer
+    }
+}
+
+/// Pure gate for the per-frame deferred-save driver ([`MangaApp::drive_pending_save_preload`]): true
+/// iff the deferred save should now be dispatched — the whole-project preload PASS has fully drained
+/// (`!preload_active`).
+///
+/// It gates on pass COMPLETION, NOT on full residency (`all_pages_loaded`), and this is required for
+/// correctness: a page whose decode genuinely fails (corrupt on-disk layer data, or a worker panic
+/// that drops the sender) is dropped from the pass and NEVER becomes resident, so a residency gate
+/// would leave the save deferred forever (permanent spinner, disabled "Save project", no retry, exit
+/// via save unable to close). Dispatching after the pass drains is safe: the unsaved→committed merge
+/// preserves a non-resident page's committed text verbatim (it is simply absent from
+/// `owned_text_pages`), so nothing is lost. The pending flag is set only on the deferred path (when
+/// `!all_pages_loaded`), and `begin_preload_all_pages` makes `preload_active` true that same frame
+/// when pages need loading, so the gate still waits for the worker to drain before dispatching.
+#[must_use]
+fn deferred_save_ready(preload_active: bool) -> bool {
+    !preload_active
 }
 
 fn ai_backend_version_warning_message(studio_version: &str, backend_version: &str) -> String {
@@ -3239,10 +3383,69 @@ fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODE_AHEAD_WINDOW, ai_backend_version_warning_message, decode_idx_within_window,
+        DECODE_AHEAD_WINDOW, SaveGateDecision, ai_backend_version_warning_message,
+        decode_idx_within_window, deferred_save_ready, save_trigger_decision,
         should_seed_page_cache_on_initial_load,
     };
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
+
+    #[test]
+    fn save_trigger_defers_until_all_pages_loaded_then_saves() {
+        // Not all pages resident and nothing in flight → defer behind the preload.
+        assert_eq!(
+            save_trigger_decision(false, false, false),
+            SaveGateDecision::Defer
+        );
+        // Every page resident → run the save immediately (fast path).
+        assert_eq!(
+            save_trigger_decision(false, false, true),
+            SaveGateDecision::SaveNow
+        );
+        // A save already running is never restarted, regardless of residency.
+        assert_eq!(
+            save_trigger_decision(true, false, true),
+            SaveGateDecision::Ignore
+        );
+        assert_eq!(
+            save_trigger_decision(true, false, false),
+            SaveGateDecision::Ignore
+        );
+        // A save already pending on the preload is idempotent (a second click is ignored).
+        assert_eq!(
+            save_trigger_decision(false, true, false),
+            SaveGateDecision::Ignore
+        );
+        assert_eq!(
+            save_trigger_decision(false, true, true),
+            SaveGateDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn deferred_save_dispatches_when_preload_pass_drains() {
+        // Dispatches once the preload PASS has drained (worker inactive), regardless of full
+        // residency — the give-up path (a page that failed to decode never becomes resident) must
+        // still reach dispatch, not hang.
+        assert!(deferred_save_ready(false));
+        // While the worker is still applying pages, keep waiting one more frame.
+        assert!(!deferred_save_ready(true));
+    }
+
+    #[test]
+    fn deferred_save_does_not_hang_on_decode_error_giving_up() {
+        // FINDING 1 regression guard: a page that genuinely fails to decode is dropped from the pass
+        // WITHOUT becoming resident, so `all_pages_loaded` would stay false forever. The gate keys on
+        // pass completion (`!preload_active`), so once the worker finishes draining — even with a
+        // failed page still non-resident — the deferred save dispatches instead of hanging.
+        let all_pages_loaded_after_giveup = false; // the failed page never became resident
+        let preload_active_after_drain = false; // the worker finished the pass
+        // Old residency-based gate would have returned false here (hang); the new gate dispatches.
+        assert!(deferred_save_ready(preload_active_after_drain));
+        assert!(
+            !all_pages_loaded_after_giveup,
+            "precondition: not every page is resident after giving up on a decode failure"
+        );
+    }
 
     #[test]
     fn formats_ai_backend_version_warning() {

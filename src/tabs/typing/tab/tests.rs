@@ -1554,3 +1554,218 @@
             transform.rotation
         );
     }
+
+    #[test]
+    fn all_page_indices_resident_transitions() {
+        // The deterministic residency core of `all_pages_loaded`: a page counts as resident only when
+        // it is BOTH projected here (`raster_layers_by_page` key) AND loaded in the shared doc.
+        use crate::models::layer_model::layer_doc::{DecodedPagePayload, LayerDoc};
+        use std::sync::{Arc, Mutex};
+
+        let mut layer = TypingTextOverlayLayer::default();
+        // No doc wired → nothing can be resident.
+        assert!(!layer.all_page_indices_resident(&[0, 1]));
+
+        let doc = Arc::new(Mutex::new(LayerDoc::new()));
+        layer.set_layer_doc(Arc::clone(&doc));
+        // Doc wired but no pages loaded → still false.
+        assert!(!layer.all_page_indices_resident(&[0, 1]));
+
+        // Make page 0 fully resident: loaded in the doc AND projected here.
+        doc.lock()
+            .unwrap()
+            .insert_decoded_page(0, DecodedPagePayload { nodes: Vec::new(), groups: Vec::new() });
+        layer.raster_layers_by_page.insert(0, Vec::new());
+        assert!(layer.all_page_indices_resident(&[0]));
+        assert!(!layer.all_page_indices_resident(&[0, 1]), "page 1 not resident yet");
+
+        // A page loaded in the doc but NOT projected here does not count (this tab has not synced it).
+        doc.lock()
+            .unwrap()
+            .insert_decoded_page(1, DecodedPagePayload { nodes: Vec::new(), groups: Vec::new() });
+        assert!(
+            !layer.all_page_indices_resident(&[0, 1]),
+            "doc-resident but not projected here → not loaded for this tab"
+        );
+
+        // Project page 1 too → both resident.
+        layer.raster_layers_by_page.insert(1, Vec::new());
+        assert!(layer.all_page_indices_resident(&[0, 1]));
+    }
+
+    #[test]
+    fn preload_apply_preserves_edits_and_deletions() {
+        // The guarantee the preloader's apply path relies on: applying a freshly decoded (stale) page
+        // through the MEMOIZED `insert_decoded_page` must NOT clobber a resident page's unsaved
+        // in-memory edit and must NOT resurrect a node deleted this session. This is exactly the step
+        // `drive_page_preload` performs for each decoded payload.
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::manifest::TransformRec;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_preload_apply_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two text overlays on page 0, persisted to disk (uid "ta" at cx=10, "tb" at cx=30).
+        let mut payloads = Vec::new();
+        for (uid, cx) in [("ta", 10.0_f32), ("tb", 30.0_f32)] {
+            let img = ColorImage::filled([4, 3], Color32::GREEN);
+            let file = persist::write_text_image(&dir, 0, uid, &img).unwrap();
+            payloads.push(persist::TextPayloadOut {
+                uid: uid.into(),
+                name: uid.into(),
+                z: if uid == "ta" { 1 } else { 2 },
+                layer_idx: 0,
+                pinned: true,
+                visible: true,
+                opacity: 1.0,
+                group_uid: None,
+                pinned_by_group: false,
+                payload_uid: uid.into(),
+                render_data: json!({ "text": uid }),
+                transform: TransformRec { cx, cy: 20.0, rotation: 0.0, scale: 1.0 },
+                deform: None,
+                rendered_file: Some(file),
+                mask_clip: None,
+            });
+        }
+        persist::write_page_text_payload(&dir, None, 0, &payloads).unwrap();
+
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+        assert!(doc.node(0, "ta").is_some());
+        assert!(doc.node(0, "tb").is_some());
+
+        // Session edits held ONLY in memory: move "ta", delete "tb" (never flushed to disk).
+        doc.set_transform(
+            0,
+            "ta",
+            TransformRec { cx: 999.0, cy: 20.0, rotation: 0.0, scale: 1.0 },
+        );
+        assert!(doc.remove_node(0, "tb"));
+
+        // A STALE decode from disk (still carries "ta"@10 and the deleted "tb"), like a preload payload
+        // that finished decoding before the edits. `decode_page_payload` is the exact off-thread fn the
+        // preload worker runs; `insert_decoded_page` is the exact memoized apply the driver runs.
+        let stale = LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).unwrap();
+        doc.insert_decoded_page(0, stale);
+
+        let ta = doc.node(0, "ta").expect("ta still resident");
+        assert_eq!(
+            ta.transform.cx, 999.0,
+            "unsaved in-memory edit survives the stale preload apply (not clobbered back to disk cx=10)"
+        );
+        assert!(
+            doc.node(0, "tb").is_none(),
+            "session deletion is not resurrected by the stale preload apply"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_overlay_snapshot_is_empty_before_residency_and_populated_after() {
+        // Phase 2 ORDERING FIX (the latent export bug): a migrated/v3 chapter's text overlays for a
+        // never-visited page are materialized into `self.overlays` only when the page becomes resident
+        // (`sync_from_doc`). Building the export overlay snapshot BEFORE that (the old bug) yields an
+        // EMPTY snapshot for the page → text silently dropped from PNG/PSD. After the residency pass /
+        // whole-project preload materializes the page, the SAME snapshot builder includes its text. This
+        // is the deterministic core of the fix; the async export dispatch itself (thread + egui ctx) is
+        // GUI-coupled and exercised only through the live drive point (documented in MODULE_README).
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_export_order_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A migrated chapter: page 0 has an inline v3 text node with a real rendered PNG, no text_info.json.
+        let img = ColorImage::filled([4, 3], Color32::GREEN);
+        let file = persist::write_text_image(&dir, 0, "ta", &img).unwrap();
+        let payload = persist::TextPayloadOut {
+            uid: "ta".into(),
+            name: "ta".into(),
+            z: 1,
+            layer_idx: 0,
+            pinned: true,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            pinned_by_group: false,
+            payload_uid: "ta".into(),
+            render_data: json!({ "text": "ta" }),
+            transform: crate::models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 20.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            deform: None,
+            rendered_file: Some(file),
+            mask_clip: None,
+        };
+        persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
+
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+
+        // Migrated-chapter state: the page is loaded in the doc but NOT yet projected into this tab, so
+        // `self.overlays` is empty — exactly the pre-preload state of a never-visited page.
+        let mut layer = TypingTextOverlayLayer::default();
+        assert!(layer.overlays.is_empty());
+        assert!(
+            layer.build_export_overlay_snapshots().is_empty(),
+            "BUG REPRO: snapshotting before residency drops the page's text (empty snapshot)"
+        );
+
+        // The residency pass (`ensure_raster_layers_for_page` -> `sync_from_doc`, or a preload apply)
+        // materializes the doc's text node into `self.overlays`.
+        layer.sync_from_doc(0, &doc);
+        assert_eq!(layer.overlays.len(), 1, "text node materialized after residency");
+
+        // FIX: the same snapshot builder, run AFTER residency, now includes the page's text.
+        let snapshot = layer.build_export_overlay_snapshots();
+        let page0 = snapshot.get(&0).expect("page 0 present in the export snapshot after residency");
+        assert_eq!(page0.len(), 1, "the materialized text overlay is in the export snapshot");
+        assert_eq!(page0[0].uid, "ta");
+        assert_eq!(page0[0].center_page_px, [10.0, 20.0]);
+        assert_eq!(page0[0].size_px, [4, 3]);
+        assert_eq!(page0[0].source_rgba.len(), 4 * 3 * 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_dispatch_gate_pass_completion_masks_and_mutual_exclusion() {
+        // The pure export dispatch gate (`export_dispatch_ready`) is the testable core of
+        // `run_pending_export_if_ready`. It gates on preload-pass COMPLETION (not residency), the mask
+        // loader, and mutual exclusion with save.
+
+        // FINDING 1: once the preload pass has drained, the export dispatches even though a page that
+        // failed to decode is still NOT resident — no residency term appears in the gate, so it cannot
+        // hang on the give-up path. Masks ready, no save busy.
+        assert!(
+            export_dispatch_ready(false, true, false),
+            "pass drained + masks ready + no save → dispatch (no residency requirement → no hang)"
+        );
+
+        // Still waiting while the preload pass is applying pages.
+        assert!(!export_dispatch_ready(true, true, false));
+
+        // Masks not yet loaded → keep waiting (an empty mask snapshot would drop clip masks).
+        assert!(!export_dispatch_ready(false, false, false));
+
+        // FINDING 2: a project save is pending/in-flight → export must NOT dispatch, even when the
+        // preload pass has drained and masks are ready (they share the preloader / doc / staging state).
+        assert!(!export_dispatch_ready(false, true, true));
+        // Every gate unmet at once stays blocked.
+        assert!(!export_dispatch_ready(true, false, true));
+    }

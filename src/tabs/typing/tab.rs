@@ -343,6 +343,20 @@ pub struct TypingTabState {
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
     /// shared with the PS tab. `None` until `set_layer_doc` is called by app.rs.
     layer_doc: Option<std::sync::Arc<std::sync::Mutex<crate::models::layer_model::layer_doc::LayerDoc>>>,
+    /// True while a project save is pending on the whole-project preload or already in flight (state
+    /// owned by `MangaApp`, pushed in via `set_save_busy` before each `draw`). Makes export mutually
+    /// exclusive with save (Finding 2): while set, a new export trigger is deferred and no deferred
+    /// export dispatches.
+    save_busy: bool,
+}
+
+/// A to-folder/PSD export deferred until the whole-project page preload completes (Phase 2). Carries
+/// only the destination directory and format; the clip-mask snapshot is captured when the export
+/// actually runs, not when it is deferred, so it reflects the final mask state.
+#[derive(Debug, Clone)]
+struct PendingTypingExport {
+    output_dir: PathBuf,
+    export_format: TypingExportFormat,
 }
 
 impl Default for TypingTabState {
@@ -356,6 +370,7 @@ impl Default for TypingTabState {
             top_panel: TypingTopPanelState::default(),
             mask_layer: TypingMaskLayer::default(),
             layer_doc: None,
+            save_busy: false,
         }
     }
 }
@@ -439,6 +454,108 @@ impl TypingTabState {
         self.canvas.source_pixel_inspection_active()
     }
 
+    /// True iff every page's LAYER data is resident (the whole-project preload has fully drained).
+    /// The App-side project-save gate consults this to decide the fast path vs. deferral.
+    #[must_use]
+    pub fn all_pages_loaded(&self, project: &ProjectData) -> bool {
+        self.text_overlays.all_pages_loaded(project)
+    }
+
+    /// Starts (or no-ops) the async, non-blocking whole-project layer preload for `project`. Wires
+    /// the typing loader dirs first (`ensure_loader_started`, idempotent) so the preload can start
+    /// even if the typing tab was never drawn/visited this session — the App-side save gate calls
+    /// this from any tab. Idempotent: a no-op if a preload is already running or every page is
+    /// resident.
+    pub fn begin_preload_all_pages(&mut self, project: &ProjectData) {
+        // The preload reads the wired `layers_primary_dir`, which `ensure_loader_started` sets on
+        // first project load. On an already-loaded tab this is a guarded no-op.
+        self.text_overlays.ensure_loader_started(project);
+        self.text_overlays.begin_preload_all_pages(project);
+    }
+
+    /// Advances the async whole-project layer preload by one frame (applies decoded pages in bounded
+    /// batches). Returns true while the preload is still active. Exposed so the App-side save gate can
+    /// drive it from the frame loop when the typing tab is not the active tab (its own `draw` drives
+    /// the preload only while Typing is drawn).
+    pub fn drive_page_preload(&mut self) -> bool {
+        self.text_overlays.drive_page_preload()
+    }
+
+    /// True while a whole-project layer preload is running (pages still pending apply).
+    #[must_use]
+    pub fn preload_all_pages_active(&self) -> bool {
+        self.text_overlays.preload_all_pages_active()
+    }
+
+    /// `(done, total)` progress of the current whole-project layer preload for a status label;
+    /// `(0, 0)` when no preload has run.
+    #[must_use]
+    pub fn preload_all_pages_progress(&self) -> (usize, usize) {
+        self.text_overlays.preload_all_pages_progress()
+    }
+
+    /// Runs a deferred to-folder/PSD export once the async whole-project preload PASS has drained
+    /// (Phase 2) AND the whole-chapter clip-mask loader has drained (Phase 3), UNLESS a project save is
+    /// pending/in-flight (`save_busy`, Finding 2 mutual exclusion).
+    ///
+    /// No-op unless an export is pending. The dispatch gate is [`export_dispatch_ready`]:
+    /// - `!preload_active` — the layer preload pass has fully drained. It gates on pass COMPLETION, NOT
+    ///   full residency: a page whose decode genuinely fails never becomes resident, so a residency gate
+    ///   would hang the export forever (Finding 1). The export tolerates a non-resident page (its
+    ///   in-function residency pass skips it and `build_export_overlay_snapshots` omits it).
+    /// - `masks_ready` — the clip-mask loader has drained. An unfinished mask store yields an EMPTY
+    ///   `export_masks_snapshot`, silently dropping every page's clip masks, and there is no per-page
+    ///   disk fallback for masks at export time. The loader is fast and always completes, so no hang.
+    /// - `!save_busy` — no project save is pending or running. Export and save share the preloader and
+    ///   both mutate doc/staging state, so dispatching an export during a save would race the save's
+    ///   text flush / staging merge. The save always completes, so the export is not starved.
+    ///
+    /// While any gate is unmet a repaint is requested so the frame loop advances instead of
+    /// idle-stalling with an export pending. Once ready it consumes `pending_export_after_preload` via
+    /// `take_pending_export_if_ready` and dispatches `request_export_to_folder`.
+    ///
+    /// The clip-mask snapshot is captured HERE, at the real run point, not when the export was deferred:
+    /// the mask store is whole-chapter/eager (loaded in full at chapter open, independent of page
+    /// visitation and of the page preload), so capturing it now reflects the latest mask edits without
+    /// racing the preload.
+    fn run_pending_export_if_ready(
+        &mut self,
+        ctx: &egui::Context,
+        project: &ProjectData,
+        save_busy: bool,
+    ) {
+        if !self.text_overlays.has_pending_export() {
+            return; // nothing deferred
+        }
+        let preload_active = self.text_overlays.preload_all_pages_active();
+        let masks_ready = self.mask_layer.masks_loaded(project);
+        if !export_dispatch_ready(preload_active, masks_ready, save_busy) {
+            // Keep the frame loop alive so the preload/mask loader drain and any in-flight save clears.
+            ctx.request_repaint();
+            return;
+        }
+        let Some(pending) = self.text_overlays.take_pending_export_if_ready(project) else {
+            return; // pass not fully drained yet (defensive; the gate above already checked it)
+        };
+        let mask_snapshot = self.mask_layer.export_masks_snapshot();
+        self.text_overlays.request_export_to_folder(
+            ctx,
+            project,
+            mask_snapshot,
+            pending.output_dir,
+            pending.export_format,
+        );
+    }
+
+    /// Records whether a project save is pending on the whole-project preload or already in flight
+    /// (state owned by `MangaApp`). Must be called by the App before `draw` each frame. It makes
+    /// export mutually exclusive with save (Finding 2): while set, a new export trigger is deferred and
+    /// no deferred export dispatches. Kept as a setter (not a `draw` argument) to keep `draw`'s public
+    /// signature within the argument-count budget.
+    pub fn set_save_busy(&mut self, save_busy: bool) {
+        self.save_busy = save_busy;
+    }
+
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
@@ -448,6 +565,7 @@ impl TypingTabState {
         texture_cache: &mut HashMap<usize, PageTexture>,
         status: CanvasUiStatus,
     ) {
+        let save_busy = self.save_busy;
         let _frame_span = crate::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
         let canvas_rect = ui.max_rect();
         self.text_overlays.set_page_count(project.pages.len());
@@ -460,6 +578,14 @@ impl TypingTabState {
         let mut needs_repaint = false;
         needs_repaint |= self.text_overlays.poll_loader();
         needs_repaint |= self.text_overlays.poll_migration();
+        // Advance any async whole-project page preload (started by later phases via
+        // `begin_preload_all_pages`): applies decoded pages in bounded batches and keeps repainting
+        // while active so it drains to completion.
+        needs_repaint |= self.text_overlays.drive_page_preload();
+        // If an export was deferred behind the whole-project preload (Phase 2), run it now that the
+        // preload pass has drained (and masks are ready and no save is busy). Checked right after
+        // `drive_page_preload` so a completion this frame is picked up immediately.
+        self.run_pending_export_if_ready(ctx, project, save_busy);
         needs_repaint |= self.text_overlays.poll_create_overlay_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_create_raster_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_raster_effects_jobs(ctx);
@@ -504,6 +630,7 @@ impl TypingTabState {
             mask_layer,
             pending_create_text_from_bubble: None,
             page_overlay_occluders: HashMap::new(),
+            save_busy,
         };
         hooks.text_overlays.begin_canvas_frame();
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
@@ -710,6 +837,10 @@ struct TypingHooks<'a> {
     mask_layer: &'a mut TypingMaskLayer,
     pending_create_text_from_bubble: Option<BubbleCreateTextRequest>,
     page_overlay_occluders: HashMap<usize, Vec<[Pos2; 4]>>,
+    /// True while a project save is pending/in flight (Finding 2). A new export trigger is deferred
+    /// (never dispatched inline) while this holds, so export and save cannot mutate shared doc/staging
+    /// state concurrently.
+    save_busy: bool,
 }
 
 impl CanvasHooks for TypingHooks<'_> {
@@ -791,8 +922,20 @@ impl CanvasHooks for TypingHooks<'_> {
             .sync_clean_overlays_visible_from_canvas(canvas.clean_overlays_visible());
         self.top_panel
             .set_export_default_dir(project.project_dir.clone());
-        self.top_panel
-            .sync_export_status(self.text_overlays.export_status_for_ui());
+        // While an export is deferred behind the whole-project preload, surface a non-blocking
+        // "preparing pages N/M" indicator in the same panel slot the export progress uses. Tracked by
+        // `has_pending_export` (NOT `preload_all_pages_active`): the pass can drain — including the
+        // give-up-on-decode-error path — while the export is still pending (waiting on masks or on a
+        // busy save), and the indicator must stay visible until the export actually dispatches, not
+        // vanish the moment the preload pass ends. After the pass drains, progress is frozen at
+        // total/total, so the indicator reads complete during that brief tail.
+        let export_ui_status = if self.text_overlays.has_pending_export() {
+            let (done, total) = self.text_overlays.preload_all_pages_progress();
+            TypingExportUiStatus::Preparing { done, total }
+        } else {
+            self.text_overlays.export_status_for_ui()
+        };
+        self.top_panel.sync_export_status(export_ui_status);
         if let Some(request) = self.pending_create_text_from_bubble.take()
             && let Some(page_rect) = canvas.page_scene_rect(request.page_idx)
         {
@@ -852,14 +995,54 @@ impl CanvasHooks for TypingHooks<'_> {
             );
         }
         if let Some((export_dir, export_format)) = self.top_panel.take_export_to_folder_request() {
-            let mask_snapshot = self.mask_layer.export_masks_snapshot();
-            self.text_overlays.request_export_to_folder(
-                ctx,
-                project,
-                mask_snapshot,
-                export_dir,
-                export_format,
-            );
+            let layers_ready = self.text_overlays.all_pages_loaded(project);
+            let masks_ready = self.mask_layer.masks_loaded(project);
+            // Fast path ONLY when everything the composite reads is ready AND no save is busy: layers
+            // resident, whole-chapter clip-mask store loaded, and no project save pending/in-flight
+            // (Finding 2 — export and save share the preloader and mutate doc/staging state). Otherwise
+            // the export is DEFERRED to `run_pending_export_if_ready`, which re-gates on all three.
+            if layers_ready && masks_ready && !self.save_busy {
+                let mask_snapshot = self.mask_layer.export_masks_snapshot();
+                self.text_overlays.request_export_to_folder(
+                    ctx,
+                    project,
+                    mask_snapshot,
+                    export_dir,
+                    export_format,
+                );
+            } else {
+                // Something the composite reads is not ready, or a save is busy. Migrated/v3 pages
+                // materialize their text overlays only on load (so exporting now would silently drop
+                // their text), the clip-mask loader may still be draining (a partial mask snapshot would
+                // drop clip masks), and a concurrent save would race. Kick off the async whole-project
+                // layer preload only when layers are the blocker; the mask loader is already started
+                // each frame in `draw` and always completes.
+                if !layers_ready {
+                    self.text_overlays.begin_preload_all_pages(project);
+                }
+                // Defer whenever a deferred gate CAN eventually become ready: layers already resident
+                // (only masks/save remain — both always clear), the layer preload started, or a save is
+                // busy (it always completes, then the deferred export dispatches). Otherwise (layers are
+                // the blocker, the preload could not start — no doc / no layers dir — AND no save is
+                // busy) fall back to a best-effort immediate export rather than hanging on a
+                // never-completing layer gate; its in-function residency pass materializes whatever it
+                // can, and masks are captured as-is (the pre-existing no-doc degenerate behavior).
+                if layers_ready || self.text_overlays.preload_all_pages_active() || self.save_busy {
+                    self.text_overlays.set_pending_export(PendingTypingExport {
+                        output_dir: export_dir,
+                        export_format,
+                    });
+                } else {
+                    let mask_snapshot = self.mask_layer.export_masks_snapshot();
+                    self.text_overlays.request_export_to_folder(
+                        ctx,
+                        project,
+                        mask_snapshot,
+                        export_dir,
+                        export_format,
+                    );
+                }
+            }
         }
         if self.top_panel.take_round_text_positions_request() {
             self.text_overlays.round_all_overlay_positions_to_pixels();
@@ -967,6 +1150,20 @@ impl CanvasHooks for TypingHooks<'_> {
 struct BubbleCreateTextRequest {
     page_idx: usize,
     rect_coords: RectCoords,
+}
+
+/// Pure dispatch gate for a deferred to-folder/PSD export — the testable core of
+/// [`TypingTabState::run_pending_export_if_ready`]. True iff the export may dispatch NOW:
+/// - `!preload_active`: the whole-project layer preload PASS has drained. Gates on pass COMPLETION,
+///   not full residency, so a page that genuinely failed to decode (and never became resident) does
+///   not hang the export forever (Finding 1). The export tolerates a non-resident page.
+/// - `masks_ready`: the whole-chapter clip-mask loader has drained (a partial mask snapshot would
+///   silently drop clip masks; there is no per-page disk fallback at export time). Always completes.
+/// - `!save_busy`: no project save is pending/in-flight (Finding 2 — export and save share the
+///   preloader and mutate doc/staging state, so they must not run concurrently). Always clears.
+#[must_use]
+fn export_dispatch_ready(preload_active: bool, masks_ready: bool, save_busy: bool) -> bool {
+    !preload_active && masks_ready && !save_busy
 }
 
 fn bubble_rect_coords(bubble: &Bubble) -> Option<RectCoords> {
@@ -1526,6 +1723,34 @@ struct TypingVectorTransformDragState {
 
 type TypingOverlayLoadResponse = (PathBuf, Result<Vec<TypingOverlayDecoded>, String>);
 
+/// One decoded-page message from the async "preload all pages" worker:
+/// `(page_idx, decoded-payload-or-error)`. The worker runs `LayerDoc::decode_page_payload` (a
+/// `Send`, lock-free pure fn) off the GUI thread for each not-yet-resident page and streams the
+/// results; the GUI thread applies them in bounded batches (`drive_page_preload`).
+type TypingPreloadPageResponse =
+    (usize, Result<crate::models::layer_model::layer_doc::DecodedPagePayload, String>);
+
+/// In-flight state of an async "preload all pages" pass (Phase 1 of the whole-project residency
+/// primitive). Decode happens off the GUI thread; the GUI thread applies ready pages in bounded
+/// batches through the memoized doc path, so an already-resident page's unsaved edits/deletions are
+/// never clobbered.
+struct TypingPreloadAllState {
+    /// Streams `(page_idx, DecodedPagePayload | error)` from the decode worker, one per target page.
+    rx: Receiver<TypingPreloadPageResponse>,
+    /// Target pages not yet applied. Seeded with every page that was NOT resident when the preload
+    /// began; a page is removed once its message has been applied (or its decode errored). The pass
+    /// completes when this is empty.
+    remaining: HashSet<usize>,
+    /// Number of pages that needed loading when the preload began (`remaining.len()` at start). The
+    /// progress denominator; `done = total - remaining.len()`.
+    total: usize,
+    /// Count of pages whose decode genuinely FAILED during this pass (corrupt on-disk layer data or a
+    /// worker panic that dropped the sender). Such pages are dropped from `remaining` without becoming
+    /// resident; a non-zero count triggers one aggregated warning when the pass completes so the
+    /// deferred export/save proceeds loudly, not silently (their committed on-disk data is used as-is).
+    decode_errors: usize,
+}
+
 /// Eager-migration request payload captured at chapter open:
 /// `(committed_layers_dir, legacy_text_images_dir, unsaved_layers_dir, page_paths)`,
 /// where `page_paths` is a list of `(page_idx, page_path)`.
@@ -1676,6 +1901,19 @@ pub(super) struct TypingTextOverlayLayer {
     /// Clamped to `>= LAYERS_PANEL_MIN_WIDTH` (the width at which a text preview shows exactly 5 chars).
     /// Wider → text rows show more preview chars before the trailing dots (min 5).
     layers_panel_width: f32,
+    /// In-flight async "preload all pages" pass (Phase 1 whole-project residency primitive). `Some`
+    /// while a preload is running; cleared on completion. Decode runs off the GUI thread; the per-frame
+    /// `drive_page_preload` applies ready pages in bounded batches through the memoized doc path.
+    preload_all_state: Option<TypingPreloadAllState>,
+    /// Last computed `(done, total)` of the active/most-recent preload, refreshed each frame by
+    /// `drive_page_preload` so `preload_all_pages_progress` is a cheap getter (no doc lock).
+    preload_all_progress: (usize, usize),
+    /// Export request deferred until the async whole-project page preload finishes (Phase 2). Set when a
+    /// to-folder/PSD export is requested while not every page is resident: the preload is started and
+    /// this holds the destination + format until `take_pending_export_if_ready` consumes it. `None` when
+    /// no export is pending. The clip-mask snapshot is intentionally NOT stored here — it is captured at
+    /// the actual run point (`TypingTabState::run_pending_export_if_ready`), so it reflects final state.
+    pending_export_after_preload: Option<PendingTypingExport>,
 }
 
 impl Default for TypingTextOverlayLayer {
@@ -1755,6 +1993,9 @@ impl Default for TypingTextOverlayLayer {
             migration_rx: None,
             pending_migration: None,
             layers_panel_width: LAYERS_PANEL_DEFAULT_WIDTH,
+            preload_all_state: None,
+            preload_all_progress: (0, 0),
+            pending_export_after_preload: None,
         }
     }
 }

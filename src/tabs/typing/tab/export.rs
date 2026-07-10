@@ -504,31 +504,17 @@ impl TypingTextOverlayLayer {
         changed
     }
 
-    pub(super) fn request_export_to_folder(
-        &mut self,
-        ctx: &egui::Context,
-        project: &ProjectData,
-        masks_snapshot: HashMap<usize, TypingMaskExportPage>,
-        output_dir: PathBuf,
-        export_format: TypingExportFormat,
-    ) {
-        if self.export_rx.is_some() {
-            self.set_create_error(ctx, t!("typing.export.already_running_error"));
-            return;
-        }
-        if project.pages.is_empty() {
-            self.set_create_error(ctx, t!("typing.export.no_pages_error"));
-            return;
-        }
-        crate::trace_log!(
-            cat::PERSIST,
-            "export dispatch pages={} format={:?} output_dir={}",
-            project.pages.len(),
-            export_format,
-            output_dir.display()
-        );
-        let clean_overlays_model = self.clean_overlays_model.clone();
-
+    /// Builds the per-page text/image overlay export snapshot from the CURRENT `self.overlays`, keyed by
+    /// page and sorted bottom-to-top by unified band-Z (the on-screen draw order). Skips overlays with a
+    /// zero dimension or an RGBA buffer whose length does not match `w*h*4`.
+    ///
+    /// Contract: the caller MUST have made every export page resident first (the Phase 2 preload gate or
+    /// the in-function residency pass), because a page's text overlays for migrated/v3 chapters are
+    /// materialized into `self.overlays` only on load. Snapshotting before that silently drops their text.
+    /// Kept as a small pure helper so the ordering fix is unit-testable without driving the async export.
+    pub(super) fn build_export_overlay_snapshots(
+        &self,
+    ) -> HashMap<usize, Vec<TypingExportOverlaySnapshot>> {
         let mut overlays_by_page = HashMap::<usize, Vec<TypingExportOverlaySnapshot>>::new();
         for overlay in &self.overlays {
             if overlay.size_px[0] == 0 || overlay.size_px[1] == 0 {
@@ -555,11 +541,53 @@ impl TypingTextOverlayLayer {
                 },
             );
         }
-
         // Bottom-to-top by the UNIFIED manual band-Z (same as the on-screen draw order), so the export
         // stacks text exactly as shown. (Was the old layer_idx + page-Y auto-order.)
         for (page, overlays) in overlays_by_page.iter_mut() {
             overlays.sort_by_key(|o| self.overlay_band_z(*page, &o.uid, o.layer_idx));
+        }
+        overlays_by_page
+    }
+
+    pub(super) fn request_export_to_folder(
+        &mut self,
+        ctx: &egui::Context,
+        project: &ProjectData,
+        masks_snapshot: HashMap<usize, TypingMaskExportPage>,
+        output_dir: PathBuf,
+        export_format: TypingExportFormat,
+    ) {
+        if self.export_rx.is_some() {
+            self.set_create_error(ctx, t!("typing.export.already_running_error"));
+            return;
+        }
+        if project.pages.is_empty() {
+            self.set_create_error(ctx, t!("typing.export.no_pages_error"));
+            return;
+        }
+        crate::trace_log!(
+            cat::PERSIST,
+            "export dispatch pages={} format={:?} output_dir={}",
+            project.pages.len(),
+            export_format,
+            output_dir.display()
+        );
+        let clean_overlays_model = self.clean_overlays_model.clone();
+
+        // Phase 2 gate: the export trigger defers dispatch until the async whole-project preload PASS
+        // drains, so by here the overlay/raster snapshots are built from materialized state for every
+        // page that could load. This matters for migrated/v3 chapters: their text overlays for
+        // never-visited pages are materialized only during load (`sync_from_doc`), so building the
+        // overlay snapshot before the pages were resident silently dropped their text. A page can still
+        // be non-resident here for a benign reason (the no-doc best-effort fallback, or a page whose
+        // decode genuinely failed — the pass gives up on it to avoid hanging), so this is a diagnostic
+        // guard, not a hard precondition — the in-function residency pass below materializes whatever it
+        // can and a still-missing page is simply omitted from the export.
+        if !self.all_pages_loaded(project) {
+            crate::runtime_log::log_warn(
+                "[typing] export: not all pages resident at dispatch; relying on the in-function \
+                 residency pass to materialize overlays before snapshotting",
+            );
         }
 
         // Snapshot the on-screen PS raster layers PER PAGE from the doc projection, so the export
@@ -605,6 +633,12 @@ impl TypingTextOverlayLayer {
         self.selected_raster_page = saved_selected_raster_page;
         self.selected_overlay_idx = saved_selected_overlay;
         self.pending_select_raster_uid = saved_pending_select;
+
+        // Build the text/image overlay snapshot AFTER the residency pass above (ordering fix): the pass
+        // (`ensure_raster_layers_for_page` -> `sync_from_doc`) MATERIALIZES the doc's text nodes for
+        // never-visited pages into `self.overlays`, so snapshotting here — not before the pass — captures
+        // every page's text. Building it earlier dropped text for migrated/v3 pages the user never opened.
+        let mut overlays_by_page = self.build_export_overlay_snapshots();
 
         let jobs = project
             .pages

@@ -21,6 +21,8 @@ FILE HEADER (tabs/typing/mask.rs)
   - `clip_overlay_rgba_if_needed`: бинарное обрезание RGBA-текста по маске страницы.
   - `export_masks_snapshot`: отдаёт снимок масок (по страницам) для фонового экспорта
     финальных изображений без доступа к внутреннему mutable-состоянию слоя.
+  - `masks_loaded`: готовность all-pages маски (загрузчик всей главы завершён) — гейт
+    для whole-project экспорта/сохранения, чтобы снимок масок не был неполным.
 */
 use crate::trace::cat;
 use crate::memory_manager::{
@@ -680,6 +682,28 @@ impl TypingMaskLayer {
         self.masks
             .get(&page_idx)
             .map(|mask| [mask.width, mask.height])
+    }
+
+    /// True iff the whole-chapter clip-mask eager loader has FINISHED for `project` — every
+    /// `mask_page_*.png` under `text_images/` is decoded into `masks`, so `export_masks_snapshot`
+    /// is COMPLETE.
+    ///
+    /// Whole-project export/save must gate on this: the loader (`ensure_loader_started`) reads the
+    /// whole chapter in one worker, and until it drains `masks` is empty/partial, so a snapshot taken
+    /// early silently drops the clip masks of every not-yet-loaded page (there is no per-page disk
+    /// fallback at export time). Returns false before the loader starts and while it runs; becomes true
+    /// once `poll_loader` receives the result — even an empty or errored load — so callers never hang.
+    /// Cheap field reads, no I/O or locks.
+    #[must_use]
+    pub fn masks_loaded(&self, project: &ProjectData) -> bool {
+        self.masks_loaded_for_dir(&project.project_dir)
+    }
+
+    /// Testable core of [`Self::masks_loaded`]: the loader is done for `project_dir` iff no load is in
+    /// flight (`loading_rx` cleared) AND the last completed load was for this exact chapter directory.
+    #[must_use]
+    fn masks_loaded_for_dir(&self, project_dir: &Path) -> bool {
+        self.loading_rx.is_none() && self.loaded_project_dir.as_deref() == Some(project_dir)
     }
 
     pub fn export_masks_snapshot(&self) -> HashMap<usize, TypingMaskExportPage> {
@@ -1540,4 +1564,35 @@ fn parse_mask_page_idx(file_name: &str) -> Option<usize> {
 
 fn mask_file_name_for_page(page_idx: usize) -> String {
     format!("{MASK_FILE_PREFIX}{page_idx}{MASK_FILE_SUFFIX}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole-chapter mask loader readiness gate (`masks_loaded_for_dir`) is the deterministic core
+    /// used by the whole-project export/save gate. It must report NOT-ready before the loader starts,
+    /// while a load is in flight, and for a different chapter, and READY only after the load for the
+    /// current chapter has drained.
+    #[test]
+    fn masks_loaded_is_false_until_loader_finishes_for_the_chapter() {
+        let mut layer = TypingMaskLayer::default();
+        let dir = PathBuf::from("/chapter/a");
+
+        // Fresh layer: no load attempted yet → not ready.
+        assert!(!layer.masks_loaded_for_dir(&dir));
+
+        // Load in flight for this chapter (rx still present) → not ready even if a dir is recorded.
+        let (_tx, rx) = mpsc::channel::<TypingMaskLoadResponse>();
+        layer.loading_rx = Some(rx);
+        layer.loaded_project_dir = Some(dir.clone());
+        assert!(!layer.masks_loaded_for_dir(&dir));
+
+        // Load completed for this chapter (rx drained by `poll_loader`) → ready.
+        layer.loading_rx = None;
+        assert!(layer.masks_loaded_for_dir(&dir));
+
+        // Completed, but the recorded chapter is a DIFFERENT one → not ready for `dir`.
+        assert!(!layer.masks_loaded_for_dir(&PathBuf::from("/chapter/b")));
+    }
 }

@@ -500,6 +500,25 @@ impl TypingCreatePanelState {
             if self.preview_enabled {
                 match export_status {
                     TypingExportUiStatus::Hidden => {}
+                    TypingExportUiStatus::Preparing { done, total } => {
+                        // Non-blocking "preparing pages" indicator while the whole-project preload
+                        // runs before a deferred export (Phase 2). Same slot/shape as Running.
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tf!("typing.export.preparing_pages_status", done = done, total = total));
+                        });
+                        let progress = if *total == 0 {
+                            0.0
+                        } else {
+                            (*done as f32 / *total as f32).clamp(0.0, 1.0)
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(ui.available_width())
+                                .show_percentage(),
+                        );
+                    }
                     TypingExportUiStatus::Running { done, total } => {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {

@@ -177,7 +177,14 @@ The main data flow is:
    in `text_images/`, and serialized back to `text_info.json`.
 6. Export workers compose page source, shared clean overlay snapshots, text/image
    overlays, deform meshes, and optional typing masks into final page images
-   (`flatten_typing_export_page_rgba`, shared by PNG and PSD). PS **raster layers are composited from an
+   (`flatten_typing_export_page_rgba`, shared by PNG and PSD). Export is GATED on full residency
+   (Phase 2): the trigger defers dispatch behind the whole-project preload (see the preload contract
+   below) so EVERY page's text is materialized before snapshotting. ORDERING: `request_export_to_folder`
+   builds the text/image overlay snapshot (`build_export_overlay_snapshots`) AFTER the raster residency
+   pass (`ensure_raster_layers_for_page` -> `sync_from_doc`), not before — building it earlier silently
+   dropped the text of migrated/v3 pages the user never visited (their overlays materialize into
+   `self.overlays` only on load). The `rasters_by_page` snapshot is built from the same fully-materialized
+   projection. PS **raster layers are composited from an
    on-screen SNAPSHOT** (`TypingExportRasterSnapshot` taken from `raster_layers_by_page` at export time,
    carrying the post-effects display RGBA + transform/deform + band-Z), so the bake matches the canvas
    exactly; it falls back to a disk read of `layers.json` only when the job carries no snapshot. (A pure
@@ -212,7 +219,9 @@ saving, and export.
   fields directly; moved methods/free-fns are `pub(super)` (or `pub(in crate::tabs::typing)`
   when a typing-level sibling like `panel.rs`/`psd_export.rs` calls them).
 - `tab/` submodules (each an `impl TypingTextOverlayLayer` method group and/or free-fn slab):
-  - `doc_layers.rs`: shared `LayerDoc` sync, unified band-Z ordering, raster-layer projection.
+  - `doc_layers.rs`: shared `LayerDoc` sync, unified band-Z ordering, raster-layer projection, and the
+    async whole-project page **preloader** (`all_pages_loaded` / `begin_preload_all_pages` /
+    `preload_all_pages_active` / `preload_all_pages_progress` / `drive_page_preload`).
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
@@ -389,8 +398,13 @@ saving, and export.
   double-warp), and the plain baked PNG is hidden for that overlay
   (`vector_transform_preview_active`). On settle/reset the sharp re-render swaps `source_rgba` and the
   base is invalidated so it re-derives on the next drag.
-- Mask data is binary alpha (`0` or `255`). Mask files live in `text_images/` and are
-  page-indexed independently from overlay PNGs.
+- Mask data is binary alpha (`0` or `255`). Mask files live in the COMMITTED `text_images/` (not the
+  `_unsaved` staging dir) and are page-indexed independently from overlay PNGs; `mask.rs` writes them
+  directly there on panel close, so mask edits persist immediately and unvisited pages' masks stay on
+  disk untouched — project-save (`copy_dir_overwrite_except`) needs no mask handling. The whole-chapter
+  eager loader (`ensure_loader_started`) loads every `mask_page_*.png` at chapter open into `masks`;
+  `masks_loaded(project)` reports its completion and gates whole-project export/save so
+  `export_masks_snapshot` is never partial.
 - Clipping applies only when the overlay enables `mask_clip_enabled`; export and live
   rendering must use the same mask sampling semantics.
 - Auto-typing depends on `CleanOverlaysModel::cached_page_rgba` plus the current clean
@@ -412,6 +426,100 @@ saving, and export.
   units in helper APIs.
 - Overlay RGBA buffers must match `width * height * 4`; mask buffers must match
   `width * height`. Public helpers should reject invalid sizes instead of panicking.
+- Whole-project async page preload (`doc_layers.rs`, Phase 1): per-page layer data loads LAZILY (only
+  visited pages), so whole-project operations (export, save) that need EVERY page resident use the
+  async preloader instead of a synchronous residency loop (which would block the GUI thread).
+  `begin_preload_all_pages` spawns ONE worker that decodes each not-yet-resident page off the GUI
+  thread via `LayerDoc::decode_page_payload` (a `Send` pure fn) and streams the payloads;
+  `drive_page_preload` (called every frame from `TypingTabState::draw`) applies up to
+  `TYPING_PRELOAD_APPLY_BATCH` (4) payloads per frame on the GUI thread. Apply goes through the
+  MEMOIZED `LayerDoc::insert_decoded_page` (an already-resident page discards the stale payload) then
+  `sync_from_doc`, so a preload NEVER clobbers a resident page's unsaved edits and NEVER resurrects a
+  session deletion. The user's raster/overlay selection is saved/restored around the apply loop
+  (mirroring `export.rs`), since projecting resolves pending selects. `all_pages_loaded` is the cheap
+  residency predicate (projected here AND in the doc); `preload_all_pages_active` /
+  `preload_all_pages_progress` (`done`/`total`) provide the data for a "Подготовка страниц N/M"
+  indicator. GATING PRINCIPLE (Finding 1 — no hang): both the export and save gates dispatch on preload
+  PASS COMPLETION (`!preload_all_pages_active`), NOT on full residency (`all_pages_loaded`). A page whose
+  decode genuinely fails (corrupt `layers.json`/`page_*.json`, or a worker panic that drops the sender)
+  is dropped from the pass and NEVER becomes resident, so a residency gate would leave the deferred
+  operation stuck forever (permanent spinner, disabled "Save project", no retry, exit-via-save unable to
+  close). Both consumers tolerate a non-resident page (export skips/omits it; save keeps its committed
+  text verbatim), so dispatching once the pass drains is safe. `drive_page_preload` counts genuine decode
+  errors and logs one aggregated warning on completion (plus per-page detail) so the operation proceeds
+  loudly, not silently. EXPORT is wired to this preloader (Phase 2): the export trigger in
+  `draw_canvas_overlay_top_left` (`tab.rs`) runs `request_export_to_folder` immediately only when every
+  page is resident AND masks are loaded AND no save is busy; otherwise it starts `begin_preload_all_pages`
+  (when layers are the blocker), stores a `pending_export_after_preload` (dir + format only) on
+  `TypingTextOverlayLayer`, and shows the `TypingExportUiStatus::Preparing` indicator. That indicator is
+  gated on `has_pending_export()` ALONE (not `preload_all_pages_active`), so it stays visible until the
+  export actually dispatches — it must not vanish when the pass drains on the give-up path while the
+  export is still waiting on masks or on a busy save (progress freezes at total/total during that tail).
+  Each frame `TypingTabState::run_pending_export_if_ready` (right after `drive_page_preload`) dispatches
+  once the pure gate `export_dispatch_ready(preload_active, masks_ready, save_busy)` holds
+  (`!preload_active && masks_ready && !save_busy`), consuming the request via `take_pending_export_if_ready`
+  (which only re-checks `!preload_active`). The clip-mask snapshot is captured AT THAT run point (not when
+  deferred): the mask store is whole-chapter/eager (`mask.rs` loads all `mask_page_*.png` at chapter open,
+  independent of page visitation and of the preload), so capturing after preload reflects the latest mask
+  edits and cannot race the preload. If the preload cannot start (no doc / no layers dir) AND no save is
+  busy, the trigger runs the export immediately as a best effort rather than hanging.
+  EXPORT also gates on the CLIP-MASK loader (Phase 3, the `masks_ready` term): `TypingMaskLayer::masks_loaded(project)`
+  (the whole-chapter mask loader has drained for THIS chapter). The mask store has NO per-page disk
+  fallback at export time, so a snapshot taken while the (fast, always-completing) loader is still running
+  silently drops the clip masks of every not-yet-loaded page; `run_pending_export_if_ready` requests a
+  repaint while waiting so the frame loop drains the loader instead of idle-stalling. КЛИН (cleaned base)
+  is deliberately NOT gated for export: `export::load_clean_overlay_snapshot_for_export` already falls
+  back to a disk read (`clean_layers/{stem}.png`) when the in-memory `CleanOverlaysModel` is not resident,
+  so the composite is correct regardless of the App-side eager overlay loader — adding клин gating to
+  export would have no correctness effect.
+  EXPORT⇄SAVE MUTUAL EXCLUSION (Finding 2): export and project-save share the SAME preloader and both
+  mutate shared doc/staging state (save's text flush → staging merge; export reads doc/overlays), so they
+  must never dispatch in the same window. `MangaApp` passes `save_busy` (= `save_to_project_rx.is_some() ||
+  pending_save_after_preload`) into `TypingTabState::draw`; while it holds, a new export trigger is DEFERRED
+  (never dispatched inline) and `run_pending_export_if_ready` withholds dispatch (the `!save_busy` term).
+  Save always completes, so the export is not starved; a save trigger does not consult export state, so
+  save is prioritized (the more stateful op) without deadlock. PROJECT-SAVE (Phase 4, `app.rs`) gates on
+  LAYERS ONLY — NOT masks, NOT
+  клин: the save merge copies the committed `text_images/` verbatim (`copy_dir_overwrite_except`), so no
+  in-memory mask data is consumed (unvisited pages' masks stay on disk), and клин edits are captured
+  synchronously by `take_dirty_save_snapshots` while unedited `clean_layers/` PNGs are copied verbatim —
+  so gating save on the mask loader or the клин `overlay_loader_finished` flag would have NO save-time
+  correctness effect (CLAUDE.md §14). LAYER residency is what matters for save quality: only a resident
+  page is in
+  `LayerDoc::resident_pages()`, so `TypingTabState::flush_text_layers` flushes it and marks it OWNED,
+  making the unsaved→committed merge authoritative for it (v3-complete inline text incl. deletions);
+  an unvisited or decode-failed page's committed text is preserved as-is (v3-incomplete but never lost).
+  The save
+  TRIGGER (`MangaApp::request_save_to_project`, all three call sites: toolbar + both exit-dialog "save
+  chapter" buttons) runs the save immediately when `all_pages_loaded`, else DEFERS: it starts
+  `TypingTabState::begin_preload_all_pages` and sets `MangaApp::pending_save_after_preload`.
+  `MangaApp::drive_pending_save_preload` (called every frame from `update`, BEFORE the tab-draw and
+  independent of the active tab — the typing tab drives its own preload only while it is drawn) advances
+  the preload, shows a "Подготовка страниц N/M" status (`app.save.preparing_pages`), and dispatches the
+  real `start_save_to_project` once the preload PASS drains (`deferred_save_ready(preload_active) =
+  !preload_active`). When the typing tab is the active tab AND a save is pending, `drive_page_preload`
+  runs twice per frame (once from `drive_pending_save_preload`, once from `TypingTabState::draw`), so up
+  to 8 pages apply that frame instead of 4 (Finding 3): benign and bounded — the apply is idempotent and
+  a completed pass makes the second call a no-op — so it is left as-is. Save-on-exit uses
+  the SAME deferral: the exit-dialog "save chapter" path keeps the app alive (frames keep pumping) until
+  the deferred save completes and then closes — `on_exit` only drains the layer saver and never triggers
+  a save, so there is no synchronous full-load and no hang. The pure gate cores are unit-tested: in
+  `app.rs` `save_trigger_decision`, `deferred_save_ready` (incl. `deferred_save_does_not_hang_on_decode_error_giving_up`
+  — the Finding 1 give-up path dispatches instead of hanging); in `tab.rs`
+  `export_dispatch_ready` (`export_dispatch_gate_pass_completion_masks_and_mutual_exclusion` — proves the
+  export gate carries NO residency term so the give-up path cannot hang, waits on masks, and is blocked
+  while a save is busy — Findings 1 + 2). Testing note: the deterministic cores are unit-tested (`all_page_indices_resident`
+  transitions; the memoized apply preserving edits + deletions; the Phase-2 ordering fix —
+  `export_overlay_snapshot_is_empty_before_residency_and_populated_after` proves `build_export_overlay_snapshots`
+  drops an unvisited page's text before `sync_from_doc` and includes it after; the Phase-3 mask gate —
+  `masks_loaded_is_false_until_loader_finishes_for_the_chapter` in `mask.rs` proves `masks_loaded_for_dir`
+  is not-ready until the chapter's mask load drains). The full async drive
+  (worker thread + channel + batched apply) and the GUI export-deferral gate transition (needs an
+  `egui::Context`, a live worker, and multi-frame polling) are exercised only through the GUI drive
+  point and are not unit-tested, because they are GUI-coupled; the risky invariants — no-clobber/
+  no-resurrect on apply, snapshot-after-materialization, and the mask-loader gate — are covered directly
+  against `insert_decoded_page`, `build_export_overlay_snapshots`, and `masks_loaded_for_dir`, the exact
+  steps the driver and export perform.
 - Any new executable runtime logic in this module needs focused tests or an explicit
   documented reason if testing is not currently practical.
 - UI strings are localized through `ms-i18n` (`t!`/`tf!`, keys under `typing.*`), NOT

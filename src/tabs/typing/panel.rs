@@ -471,6 +471,12 @@ pub struct TypingTopPanelState {
 pub(super) enum TypingExportUiStatus {
     #[default]
     Hidden,
+    /// Whole-project page preload running before a deferred export (Phase 2): `done`/`total` come from
+    /// `TypingTextOverlayLayer::preload_all_pages_progress`. Shown in the same panel slot as `Running`.
+    Preparing {
+        done: usize,
+        total: usize,
+    },
     Running {
         done: usize,
         total: usize,
