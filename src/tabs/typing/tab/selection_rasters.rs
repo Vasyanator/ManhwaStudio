@@ -37,21 +37,31 @@ impl TypingTextOverlayLayer {
         self.drag_has_changes = false;
         self.shape_variant_preview = None;
         self.selected_raster_idx = None;
+        self.selected_raster_page = None;
         self.transform_mode_raster_idx = None;
         self.raster_drag_state = None;
         self.raster_drag_has_changes = false;
     }
 
-    /// Selects a raster layer for the current page, clearing any overlay selection (one selection at
-    /// a time across the two layer kinds). Selecting a DIFFERENT raster exits raster transform mode.
-    pub(super) fn select_raster(&mut self, raster_idx: usize) {
-        if self.selected_raster_idx != Some(raster_idx) {
-            crate::trace_log!(cat::TYPING, "select_raster raster_idx={}", raster_idx);
+    /// Selects the raster at `raster_idx` on `page_idx`, clearing any overlay selection (one selection
+    /// at a time across the two layer kinds). Selecting a DIFFERENT raster exits raster transform mode.
+    /// `selected_raster_page` is set alongside `selected_raster_idx` so per-page shortcut handlers can
+    /// tell which page the selection lives on.
+    pub(super) fn select_raster(&mut self, page_idx: usize, raster_idx: usize) {
+        if self.selected_raster_idx != Some(raster_idx) || self.selected_raster_page != Some(page_idx)
+        {
+            crate::trace_log!(
+                cat::TYPING,
+                "select_raster page_idx={} raster_idx={}",
+                page_idx,
+                raster_idx
+            );
         }
         if self.transform_mode_raster_idx != Some(raster_idx) {
             self.transform_mode_raster_idx = None;
         }
         self.selected_raster_idx = Some(raster_idx);
+        self.selected_raster_page = Some(page_idx);
         self.selected_overlay_idx = None;
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
@@ -255,9 +265,17 @@ impl TypingTextOverlayLayer {
         }
         self.raster_texture_generations
             .retain(|(p, u), _| !(*p == page_idx && *u == uid));
-        // Fix the selection / transform-mode / drag indices (shift down past the removed one).
-        shift_index_after_remove(&mut self.selected_raster_idx, raster_idx);
-        shift_index_after_remove(&mut self.transform_mode_raster_idx, raster_idx);
+        // Fix the selection / transform-mode / drag indices (shift down past the removed one). The
+        // selection/transform indices are positions into THIS page's list, so only shift them when the
+        // selection belongs to `page_idx`; shifting against another page's removal would corrupt them.
+        // Keep `selected_raster_page` in lock-step: a shift that empties the index clears the page too.
+        if self.selected_raster_page == Some(page_idx) {
+            shift_index_after_remove(&mut self.selected_raster_idx, raster_idx);
+            shift_index_after_remove(&mut self.transform_mode_raster_idx, raster_idx);
+            if self.selected_raster_idx.is_none() {
+                self.selected_raster_page = None;
+            }
+        }
         if let Some(mut state) = self.raster_drag_state.take() {
             if state.page_idx == page_idx && state.raster_idx == raster_idx {
                 self.raster_drag_state = None;
@@ -511,6 +529,8 @@ impl TypingTextOverlayLayer {
     }
 
     /// Scale the selected raster with the `-` / `=` / `0` keys (parity with the overlay shortcut).
+    /// Guards on `selected_raster_page == Some(page_idx)` so, on a multi-page canvas, the keys only
+    /// scale the raster on the page that owns the selection (this runs once per visible page).
     pub(super) fn try_scale_selected_raster_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
         if ui.ctx().egui_wants_keyboard_input() {
             return;
@@ -518,6 +538,9 @@ impl TypingTextOverlayLayer {
         let Some(idx) = self.selected_raster_idx else {
             return;
         };
+        if self.selected_raster_page != Some(page_idx) {
+            return;
+        }
         let (increase, decrease, reset) = ui.ctx().input_mut(|input| {
             (
                 input.consume_key(egui::Modifiers::NONE, egui::Key::Equals)
@@ -550,6 +573,79 @@ impl TypingTextOverlayLayer {
         }
         let (uid, transform) = (layer.uid.clone(), layer.transform);
         self.persist_raster_transform(page_idx, &uid, transform);
+        ui.ctx().request_repaint();
+    }
+
+    /// Ctrl/Cmd+wheel rotation of the selected RASTER layer by ±2° per notch (parity with the text-
+    /// overlay Ctrl+wheel rotate `try_rotate_selected_overlay_by_ctrl_wheel`).
+    ///
+    /// Raster layers (imported rasters, rasterized text, cutouts) have NO vector rotation, so this
+    /// ALWAYS applies the ordinary affine `transform.rotation` regardless of the app-wide
+    /// `RotationCtrlWheelMode` — it never re-renders glyph outlines (mirrors the overlay handler's
+    /// `Raster` branch). The delta is added in RADIANS with the SAME sign and WITHOUT normalization as
+    /// the raster mouse drag-rotate (`apply_raster_drag` `Rotate`), so wheel and drag stay consistent.
+    ///
+    /// No-op unless a raster on `page_idx` is selected AND that selection BELONGS to `page_idx`
+    /// (`selected_raster_page`), it is not in perspective transform mode, and Ctrl/Cmd is held with a
+    /// non-zero wheel notch. The page guard is essential: `draw_page_overlays` runs once per visible
+    /// page and this reads the RAW (summed) wheel delta, so without it one notch would rotate the same
+    /// index on every simultaneously-visible page. The `selected_*` selections are mutually exclusive,
+    /// so this and the overlay handler never both fire for one event. The change routes through the
+    /// shared doc and DEFERS the disk write off the GUI thread via `persist_raster_transform_deferred`.
+    pub(super) fn try_rotate_selected_raster_by_ctrl_wheel(
+        &mut self,
+        ui: &mut egui::Ui,
+        page_idx: usize,
+    ) {
+        let Some(idx) = self.selected_raster_idx else {
+            return;
+        };
+        // Only rotate the raster whose selection lives on THIS page (per-page invocation guard).
+        if self.selected_raster_page != Some(page_idx) {
+            return;
+        }
+        if self.transform_mode_raster_idx == Some(idx) {
+            return;
+        }
+
+        let (ctrl_or_command, scroll_delta_y) = ui.ctx().input(|input| {
+            (
+                input.modifiers.ctrl || input.modifiers.command,
+                // Raw wheel: this rotation is Ctrl-gated, and egui zeroes `smooth_scroll_delta`
+                // while Ctrl/Cmd is held.
+                crate::input_util::raw_wheel_delta(input).y,
+            )
+        });
+        if !ctrl_or_command {
+            return;
+        }
+        let Some(delta_rad) = ctrl_wheel_raster_rotation_step_rad(scroll_delta_y) else {
+            return;
+        };
+
+        let Some(layer) = self
+            .raster_layers_by_page
+            .get_mut(&page_idx)
+            .and_then(|v| v.get_mut(idx))
+        else {
+            return;
+        };
+
+        // Zero the wheel delta so the Ctrl-gated raw notch does not also scroll the page (egui
+        // already zeroes the smooth delta while Ctrl/Cmd is held, but the raw notch remains).
+        ui.ctx().input_mut(|input| {
+            input.smooth_scroll_delta = Vec2::ZERO;
+        });
+
+        layer.transform.rotation += delta_rad;
+        let (uid, transform) = (layer.uid.clone(), layer.transform);
+        crate::trace_log!(
+            cat::TYPING,
+            "ctrl_wheel rotate raster idx={} rotation_rad={}",
+            idx,
+            transform.rotation
+        );
+        self.persist_raster_transform_deferred(page_idx, &uid, transform);
         ui.ctx().request_repaint();
     }
 
@@ -622,6 +718,40 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// Like [`persist_raster_transform`] but DEFERS the disk write to the shared doc's coalescing
+    /// background saver (off the GUI thread) instead of a synchronous manifest rewrite. Used by the
+    /// Ctrl+wheel rotation, whose rapid per-notch events must not block the GUI thread with file I/O
+    /// per event (CLAUDE.md §5). The in-memory doc is updated LIVE (so the transform is visible
+    /// immediately and the PS tab re-projects), and only the disk persist is deferred and coalesced.
+    ///
+    /// This is the async counterpart of `persist_current_page_rasters`' synchronous `flush_page`: a
+    /// transform-only change marks no pixels dirty, so the enqueued job re-encodes no PNGs.
+    /// `enqueue_page_save` itself falls back to a synchronous `flush_page` when no saver is enabled.
+    pub(super) fn persist_raster_transform_deferred(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        transform: crate::models::layer_model::manifest::TransformRec,
+    ) {
+        let Some(dir) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        // Live in-memory update: bumps the doc version (PS tab re-projects) and re-projects this page.
+        let uid_owned = uid.to_string();
+        self.route_to_doc(page_idx, |doc| doc.set_transform(page_idx, &uid_owned, transform));
+        // Defer the disk write to the doc's coalescing background saver.
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return;
+        };
+        if let Err(err) = guard.enqueue_page_save(page_idx, &dir, fallback.as_deref()) {
+            crate::runtime_log::log_warn(format!("[typing] defer raster transform save: {err}"));
+        }
+    }
+
     /// Flushes the doc page's RASTER nodes to disk (whole-page `save_page_rasters`), used after a
     /// raster mask-clip toggle (routed through the doc) so the flag survives a reload / save-to-project.
     /// `save_page_rasters` carries each raster's `mask_clip`. No-op if the doc/page is not resident.
@@ -688,11 +818,17 @@ impl TypingTextOverlayLayer {
             .raster_layers_by_page
             .get(&page_idx)
             .map_or(0, |v| v.len());
-        if self.selected_raster_idx.is_some_and(|i| i >= count) {
-            self.selected_raster_idx = None;
-        }
-        if self.transform_mode_raster_idx.is_some_and(|i| i >= count) {
-            self.transform_mode_raster_idx = None;
+        // Only the page that OWNS the current raster selection may bounds-clear it: this runs once per
+        // visible page and the same index exists on every page, so an unguarded clear could drop a
+        // selection that is valid on its own page just because another visible page has fewer rasters.
+        if self.selected_raster_page == Some(page_idx) {
+            if self.selected_raster_idx.is_some_and(|i| i >= count) {
+                self.selected_raster_idx = None;
+                self.selected_raster_page = None;
+            }
+            if self.transform_mode_raster_idx.is_some_and(|i| i >= count) {
+                self.transform_mode_raster_idx = None;
+            }
         }
         if self
             .raster_drag_state
@@ -873,6 +1009,7 @@ impl TypingTextOverlayLayer {
                     if primary_clicked && self.selected_overlay_idx != Some(overlay_idx) {
                         self.selected_overlay_idx = Some(overlay_idx);
                         self.selected_raster_idx = None;
+                        self.selected_raster_page = None;
                         self.transform_mode_raster_idx = None;
                     }
                 }
@@ -1019,12 +1156,12 @@ impl TypingTextOverlayLayer {
                         sense,
                     );
                     if resp.clicked() {
-                        self.select_raster(idx);
+                        self.select_raster(page_idx, idx);
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                     // Right-click selects the raster (mirror the overlay menu), then opens the menu.
                     if resp.secondary_clicked() {
-                        self.select_raster(idx);
+                        self.select_raster(page_idx, idx);
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                     if resp.drag_started()
@@ -1041,7 +1178,7 @@ impl TypingTextOverlayLayer {
                             idx,
                             self.selected_raster_idx
                         );
-                        self.select_raster(idx);
+                        self.select_raster(page_idx, idx);
                         self.raster_drag_state = Some(TypingRasterDragState {
                             page_idx,
                             raster_idx: idx,
@@ -1087,6 +1224,7 @@ impl TypingTextOverlayLayer {
             }) && !crate::input_util::pointer_over_floating_area(ui.ctx());
             if clicked_empty {
                 self.selected_raster_idx = None;
+                self.selected_raster_page = None;
                 self.transform_mode_raster_idx = None;
             }
         }
@@ -1404,9 +1542,10 @@ impl TypingTextOverlayLayer {
     /// affine `transform.cx/cy` move (clamped to the page, snapped to whole pixels when
     /// `strict_pixel_movement`). The change is routed to the shared doc and persisted to disk.
     ///
-    /// Gated on `selected_raster_idx`, which is mutually exclusive with `selected_overlay_idx`, so this
-    /// only consumes the arrow keys when a raster is selected (the overlay nudge, called first, returns
-    /// before consuming keys when no overlay is selected).
+    /// Gated on `selected_raster_idx` (mutually exclusive with `selected_overlay_idx`, so it only
+    /// consumes the arrow keys when a raster is selected; the overlay nudge, called first, returns
+    /// before consuming keys when no overlay is selected) AND on `selected_raster_page == Some(page_idx)`
+    /// so, since this runs once per visible page, only the raster on the owning page is nudged.
     pub(super) fn try_move_selected_raster_by_arrow_shortcuts(
         &mut self,
         ui: &mut egui::Ui,
@@ -1423,6 +1562,10 @@ impl TypingTextOverlayLayer {
         let Some(selected_idx) = self.selected_raster_idx else {
             return;
         };
+        // Only nudge the raster on the page that OWNS the selection (this runs once per visible page).
+        if self.selected_raster_page != Some(page_idx) {
+            return;
+        }
         let has_layer = self
             .raster_layers_by_page
             .get(&page_idx)

@@ -339,6 +339,7 @@ impl TypingTextOverlayLayer {
             && let Some(idx) = layers.iter().position(|l| l.uid == uid)
         {
             self.selected_raster_idx = Some(idx);
+            self.selected_raster_page = Some(page_idx);
             self.selected_overlay_idx = None;
             self.pending_select_raster_uid = None;
         }
@@ -399,8 +400,12 @@ impl TypingTextOverlayLayer {
             .get(&page_idx)
             .map(|layers| layers.iter().map(|l| l.uid.clone()).collect())
             .unwrap_or_default();
+        // Only capture the selected raster's uid when the selection BELONGS to this page; otherwise
+        // `prev_raster_uids` (this page's list) would resolve the wrong uid for a selection on another
+        // page and the remap below would retarget the selection to a stranger raster.
         let selected_raster_uid = self
             .selected_raster_idx
+            .filter(|_| self.selected_raster_page == Some(page_idx))
             .and_then(|i| prev_raster_uids.get(i).cloned());
         let transform_raster_uid = self
             .transform_mode_raster_idx
@@ -471,7 +476,18 @@ impl TypingTextOverlayLayer {
         // touch a field when we resolved a uid for THIS page above (so a selection on another page, or a
         // freshly-set index, is left alone). A uid that's gone (deleted) clears the field.
         if let Some(uid) = &selected_raster_uid {
-            self.selected_raster_idx = rasters.iter().position(|l| &l.uid == uid);
+            // The selection belonged to THIS page (guarded at capture). Re-resolve its index; a gone
+            // uid clears both the index and the page so the pair stays in lock-step.
+            match rasters.iter().position(|l| &l.uid == uid) {
+                Some(new_idx) => {
+                    self.selected_raster_idx = Some(new_idx);
+                    self.selected_raster_page = Some(page_idx);
+                }
+                None => {
+                    self.selected_raster_idx = None;
+                    self.selected_raster_page = None;
+                }
+            }
         }
         if let Some(uid) = &transform_raster_uid {
             self.transform_mode_raster_idx = rasters.iter().position(|l| &l.uid == uid);
@@ -609,6 +625,7 @@ impl TypingTextOverlayLayer {
                 .and_then(|ls| ls.iter().position(|l| l.uid == uid))
         {
             self.selected_raster_idx = Some(idx);
+            self.selected_raster_page = Some(page_idx);
             self.selected_overlay_idx = None;
             self.pending_select_raster_uid = None;
         }

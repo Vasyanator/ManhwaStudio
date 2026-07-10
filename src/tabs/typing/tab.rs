@@ -121,7 +121,7 @@ use ms_thread as thread;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 mod geometry;
-use geometry::{lerp, normalize_angle_deg, normalize_angle_rad};
+use geometry::{ctrl_wheel_raster_rotation_step_rad, lerp, normalize_angle_deg, normalize_angle_rad};
 mod export;
 pub(super) use export::*;
 mod codec;
@@ -1643,9 +1643,15 @@ pub(super) struct TypingTextOverlayLayer {
     pending_raster_effects: Option<(usize, String, Value, f32, f32)>,
     /// After a raster is created, select it once the page's raster cache reloads: (page, uid).
     pending_select_raster_uid: Option<(usize, String)>,
-    /// The selected raster on the current page (index into `raster_layers_by_page[page]`), mutually
-    /// exclusive with `selected_overlay_idx`.
+    /// The selected raster's index into `raster_layers_by_page[page]`, mutually exclusive with
+    /// `selected_overlay_idx`. Ambiguous on its own because the same index exists on every page, so it
+    /// is ALWAYS paired with `selected_raster_page`: keep the two in lock-step (set/clear together).
     selected_raster_idx: Option<usize>,
+    /// The page the current raster selection belongs to (`Some` iff `selected_raster_idx` is `Some`).
+    /// Since `draw_page_overlays` runs once per visible page, per-page shortcut handlers (Ctrl+wheel
+    /// rotate, `-`/`=`/`0` scale, arrow nudge) MUST guard on `selected_raster_page == Some(page_idx)`
+    /// so one gesture only affects the raster on its own page, not the same index on other pages.
+    selected_raster_page: Option<usize>,
     /// Active raster move/rotate/mesh drag, if any.
     raster_drag_state: Option<TypingRasterDragState>,
     /// True while a raster drag has produced an unsaved transform change.
@@ -1741,6 +1747,7 @@ impl Default for TypingTextOverlayLayer {
             pending_raster_effects: None,
             pending_select_raster_uid: None,
             selected_raster_idx: None,
+            selected_raster_page: None,
             raster_drag_state: None,
             raster_drag_has_changes: false,
             layer_doc: None,

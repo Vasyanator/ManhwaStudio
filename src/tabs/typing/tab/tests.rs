@@ -484,6 +484,7 @@
 
         // Select r0 (bottom), enter transform mode on it, and start a drag tracking it.
         layer.selected_raster_idx = Some(r0_pos);
+        layer.selected_raster_page = Some(0);
         layer.transform_mode_raster_idx = Some(r0_pos);
         layer.raster_drag_state = Some(TypingRasterDragState {
             page_idx: 0,
@@ -516,9 +517,89 @@
 
         // A deleted raster clears the trackers instead of pointing at a neighbour.
         layer.selected_raster_idx = Some(r0_new);
+        layer.selected_raster_page = Some(0);
         assert!(doc.remove_node(0, "r0"));
         layer.sync_from_doc(0, &doc);
         assert_eq!(layer.selected_raster_idx, None, "selection cleared when its raster is gone");
+        assert_eq!(
+            layer.selected_raster_page, None,
+            "selection page cleared in lock-step when its raster is gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn select_raster_sets_page_and_clear_resets_it_in_lockstep() {
+        // The Ctrl+wheel / scale / arrow-nudge shortcuts run once per visible page and guard on
+        // `selected_raster_page == Some(page_idx)`, so `select_raster` MUST record the page and every
+        // deselect MUST clear both fields together (else one gesture rotates the same index on every
+        // page). This locks the invariant without the GUI-coupled wheel handler.
+        let mut layer = TypingTextOverlayLayer::default();
+        assert_eq!(layer.selected_raster_idx, None);
+        assert_eq!(layer.selected_raster_page, None);
+
+        layer.select_raster(7, 2);
+        assert_eq!(layer.selected_raster_idx, Some(2));
+        assert_eq!(layer.selected_raster_page, Some(7), "select_raster records the page");
+
+        // Re-selecting on a different page moves the page in lock-step.
+        layer.select_raster(4, 1);
+        assert_eq!(layer.selected_raster_idx, Some(1));
+        assert_eq!(layer.selected_raster_page, Some(4));
+
+        layer.clear_selection();
+        assert_eq!(layer.selected_raster_idx, None);
+        assert_eq!(
+            layer.selected_raster_page, None,
+            "clear_selection resets the page alongside the index"
+        );
+    }
+
+    #[test]
+    fn remove_raster_clears_page_when_it_empties_the_selected_index() {
+        // Deleting the currently-selected raster: `shift_index_after_remove` sets
+        // `selected_raster_idx = None` when the removed index equals the selection, and
+        // `selected_raster_page` MUST follow (lock-step, per the `tab.rs` invariant). Guarded on the
+        // selection's page so an index on another page is never shifted against this page's removal.
+        use crate::models::layer_model::layer_doc::LayerDoc;
+        use crate::models::layer_model::persist;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!("typ_rrm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tf = crate::models::layer_model::manifest::TransformRec {
+            cx: 1.0,
+            cy: 1.0,
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        let pic = ColorImage::filled([2, 2], Color32::WHITE);
+        persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf, &pic).unwrap();
+        persist::add_page_raster(&dir, None, 0, "r1", "Top", true, 1.0, tf, &pic).unwrap();
+
+        let mut doc = LayerDoc::new();
+        let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+        page_sizes.insert(0, [100, 100]);
+        doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+
+        let mut layer = TypingTextOverlayLayer::default();
+        layer.sync_from_doc(0, &doc);
+        assert_eq!(layer.raster_layers_by_page[&0].len(), 2);
+
+        // Select the raster at index 1 on page 0, then delete that exact raster.
+        layer.select_raster(0, 1);
+        assert_eq!(layer.selected_raster_idx, Some(1));
+        assert_eq!(layer.selected_raster_page, Some(0));
+        layer.remove_raster(0, 1);
+        assert_eq!(
+            layer.selected_raster_idx, None,
+            "removing the selected raster empties the index"
+        );
+        assert_eq!(
+            layer.selected_raster_page, None,
+            "and the page is cleared in lock-step"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

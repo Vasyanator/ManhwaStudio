@@ -571,6 +571,7 @@ impl TypingTextOverlayLayer {
         // and would mutate the user's current selection. Triggering an export must NOT change selection,
         // so snapshot and restore it around the projection loop.
         let saved_selected_raster = self.selected_raster_idx;
+        let saved_selected_raster_page = self.selected_raster_page;
         let saved_selected_overlay = self.selected_overlay_idx;
         let saved_pending_select = self.pending_select_raster_uid.clone();
 
@@ -601,6 +602,7 @@ impl TypingTextOverlayLayer {
 
         // Restore the selection the projection loop may have changed (export is side-effect-free).
         self.selected_raster_idx = saved_selected_raster;
+        self.selected_raster_page = saved_selected_raster_page;
         self.selected_overlay_idx = saved_selected_overlay;
         self.pending_select_raster_uid = saved_pending_select;
 

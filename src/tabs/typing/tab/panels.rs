@@ -275,10 +275,11 @@ impl TypingTextOverlayLayer {
         if let Some(idx) = select_overlay {
             self.selected_overlay_idx = Some(idx);
             self.selected_raster_idx = None;
+            self.selected_raster_page = None;
             self.transform_mode_raster_idx = None;
         }
         if let Some(idx) = select_raster {
-            self.select_raster(idx);
+            self.select_raster(page_idx, idx);
         }
         // Apply at most one Z change per frame, routing by row kind. Both move helpers route through the
         // shared doc band reorder, so text and rasters interleave correctly. ⬆ raises one step, ⬇ lowers.

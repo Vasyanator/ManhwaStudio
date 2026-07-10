@@ -71,6 +71,7 @@ impl TypingTextOverlayLayer {
         // interaction runs before the raster pass below; `select_raster` clears overlays directly).
         if self.selected_overlay_idx.is_some() {
             self.selected_raster_idx = None;
+            self.selected_raster_page = None;
             self.transform_mode_raster_idx = None;
         }
         if mask_panel_open {
@@ -135,6 +136,7 @@ impl TypingTextOverlayLayer {
                 auto_typing_settings,
             );
             self.try_rotate_selected_overlay_by_ctrl_wheel(ui, page_idx, image_rect, zoom);
+            self.try_rotate_selected_raster_by_ctrl_wheel(ui, page_idx);
             self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
             self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
             self.try_move_selected_overlay_by_arrow_shortcuts(

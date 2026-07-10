@@ -62,7 +62,17 @@ The main data flow is:
    layers** interleaved with the overlays by band Z (`TypingRasterLayer` / `ensure_raster_layers_for_page`
    via `layer_model::persist::load_page_rasters`). Rasters are now **editable** in this tab, not
    read-only: `interact_page_rasters` adds canvas select + move/rotate drag (parity with overlays;
-   scale via `-`/`=`/`0`, arrow-key pixel nudge via `try_move_selected_raster_by_arrow_shortcuts`).
+   scale via `-`/`=`/`0`, arrow-key pixel nudge via `try_move_selected_raster_by_arrow_shortcuts`,
+   Ctrl/Cmd+wheel ordinary rotation via `try_rotate_selected_raster_by_ctrl_wheel` — rasters have no
+   vector rotation, so it always rotates `transform.rotation` regardless of `RotationCtrlWheelMode`).
+   The raster selection is `selected_raster_idx` PLUS `selected_raster_page` (kept in lock-step: set
+   together in `select_raster`, cleared together everywhere). The page pairing is REQUIRED because
+   `draw_page_overlays` runs once per visible page — the per-page shortcut handlers (rotate/scale/nudge)
+   guard on `selected_raster_page == Some(page_idx)` so one gesture only affects the raster on its own
+   page, not the same bare index on other simultaneously-visible pages. The Ctrl+wheel rotate DEFERS its
+   disk write off the GUI thread via `persist_raster_transform_deferred` (routes the transform to the
+   doc live, then `doc.enqueue_page_save` — the coalescing background saver) instead of a per-notch
+   synchronous manifest rewrite.
    Selecting a raster opens the **same right-side edit panel that image
    overlays use** (scale + rotation + the effects cards, no text params): `selected_item_for_edit`
    builds an `Image`-kind `TypingSelectedOverlayForEdit` carrying a `TypingEditTarget::Raster{page,uid}`,
@@ -312,7 +322,9 @@ saving, and export.
 - `rotation_ctrl_wheel.rs`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,
   default Vector) selecting how the Ctrl+wheel gesture rotates a selected overlay. Config-free;
   seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
-  read by the Ctrl+wheel handler in `tab/selection_rasters.rs`. `pub mod` so settings can reach it.
+  read by the overlay Ctrl+wheel handler in `tab/selection_rasters.rs`. `pub mod` so settings can
+  reach it. Only text-overlay rotation consults the mode; raster Ctrl+wheel rotation
+  (`try_rotate_selected_raster_by_ctrl_wheel`) ignores it and always uses ordinary rotation.
 - `render_next`: text rendering subsystem, now the `ms-text-render` crate re-exported as
   `render_next` (via `mod.rs`). Its public contract is `render_next::types::*` plus
   `render_next::render_text_to_image`; callers in this directory should treat its layout,
