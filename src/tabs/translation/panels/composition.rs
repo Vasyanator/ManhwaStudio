@@ -15,10 +15,26 @@ use std::path::{Path, PathBuf};
 const LIMIT_MIN: usize = 100;
 const LIMIT_MAX: usize = 100_000;
 const LIMIT_DEFAULT: usize = 700;
-const NO_ITEMS_TEXT: &str = "(нет реплик для компоновки)";
-const EMPTY_TEMPLATE_TEXT: &str = "(шаблон MiniJinja пуст)";
-const UNKNOWN_CHARACTER: &str = "(неизвестный персонаж)";
-const NARRATOR_CHARACTER: &str = "(рассказчик)";
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn no_items_text() -> &'static str {
+    t!("translation.composition.no_replicas")
+}
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn empty_template_text() -> &'static str {
+    t!("translation.composition.template_empty")
+}
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn unknown_character_text() -> &'static str {
+    t!("translation.composition.unknown_character")
+}
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn narrator_character_text() -> &'static str {
+    t!("translation.composition.narrator")
+}
 // Only used by the native file-save picker (`select_export_path`), which is
 // compiled out on wasm.
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,24 +42,11 @@ const DEFAULT_EXPORT_NAME: &str = "composition_export";
 const COMPOSED_TEXT_ROWS: usize = 12;
 const TEMPLATE_ROWS: usize = 6;
 const VARS_ROWS: usize = 6;
-const VARS_INFO_TEXT: &str = "bubbles - список всех пузырей\n\n\
-Поля bubble:\n\
-id - уникальный ID пузыря\n\
-img_idx - индекс страницы\n\
-img_u - X-координата пузыря на странице (0..1)\n\
-img_v - Y-координата пузыря на странице (0..1)\n\
-side - сторона страницы (left/right)\n\
-text - перевод пузыря\n\
-original_text - исходный текст\n\
-translation_status - статус перевода\n\
-is_known_character - известный персонаж (true/false)\n\
-character_name - имя персонажа\n\
-clarification - уточнение\n\
-bubble_order - порядок реплики внутри страницы\n\n\
-Пример:\n\
-{% for bubble in bubbles %}\n\
-{{ bubble.id }} | {{ bubble.img_idx }} | {{ bubble.bubble_order }} | {{ bubble.original_text }} | {{ bubble.text }}\n\
-{% endfor %}";
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn vars_info_text() -> &'static str {
+    t!("translation.composition.variables_help")
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum CompositionSortMethod {
@@ -62,8 +65,8 @@ impl CompositionSortMethod {
 
     pub fn title(self) -> &'static str {
         match self {
-            CompositionSortMethod::Height => "[По высоте]",
-            CompositionSortMethod::Order => "[По номеру реплики]",
+            CompositionSortMethod::Height => t!("translation.composition.sort_by_height"),
+            CompositionSortMethod::Order => t!("translation.composition.sort_by_replica_number"),
         }
     }
 
@@ -179,7 +182,7 @@ impl Default for CompositionPanelState {
     fn default() -> Self {
         Self {
             tab: CompositionTab::Text,
-            composed_text: NO_ITEMS_TEXT.to_string(),
+            composed_text: no_items_text().to_string(),
             notice: None,
         }
     }
@@ -218,13 +221,13 @@ pub fn draw_composition_panel(
 
     ui.horizontal(|ui| {
         if ui
-            .selectable_label(state.tab == CompositionTab::Text, "Текст")
+            .selectable_label(state.tab == CompositionTab::Text, t!("translation.composition.text_tab"))
             .clicked()
         {
             state.tab = CompositionTab::Text;
         }
         if ui
-            .selectable_label(state.tab == CompositionTab::Params, "Параметры")
+            .selectable_label(state.tab == CompositionTab::Params, t!("translation.composition.params_tab"))
             .clicked()
         {
             state.tab = CompositionTab::Params;
@@ -267,10 +270,10 @@ fn draw_text_tab(
     actions: &mut CompositionPanelActions,
 ) {
     ui.horizontal(|ui| {
-        ui.label("Сортировка:");
+        ui.label(t!("translation.composition.sort_label"));
         if ui
             .button("⇆")
-            .on_hover_text("Переключить режим сортировки")
+            .on_hover_text(t!("translation.composition.toggle_sort_tooltip"))
             .clicked()
         {
             options.sort_method = if options.sort_method == CompositionSortMethod::Height {
@@ -289,29 +292,29 @@ fn draw_text_tab(
         "composition_text_output",
         &state.composed_text,
         COMPOSED_TEXT_ROWS,
-        "Скомпонованные реплики появятся здесь...",
+        t!("translation.composition.output_placeholder"),
     );
 
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Скопировать").clicked() {
+        if ui.button(t!("translation.composition.copy_output_button")).clicked() {
             ui.ctx().copy_text(state.composed_text.clone());
-            state.set_info("Текст скопирован в буфер обмена.");
+            state.set_info(t!("translation.composition.text_copied_status"));
         }
-        if ui.button("Обновить").clicked() {
+        if ui.button(t!("translation.common.refresh_button")).clicked() {
             actions.request_rebuild = true;
         }
-        if ui.button("Экспорт в txt").clicked() {
+        if ui.button(t!("translation.composition.export_txt_button")).clicked() {
             match export_txt(project, &state.composed_text) {
-                Ok(Some(path)) => state.set_info(format!("TXT сохранён: {}", path.display())),
+                Ok(Some(path)) => state.set_info(tf!("translation.composition.txt_saved_status", path = path.display())),
                 Ok(None) => {}
-                Err(err) => state.set_error(format!("Не удалось сохранить TXT: {err}")),
+                Err(err) => state.set_error(tf!("translation.composition.txt_save_error", err = err)),
             }
         }
-        if ui.button("Экспорт в docx").clicked() {
+        if ui.button(t!("translation.composition.export_docx_button")).clicked() {
             match export_docx(project, &state.composed_text) {
-                Ok(Some(path)) => state.set_info(format!("DOCX сохранён: {}", path.display())),
+                Ok(Some(path)) => state.set_info(tf!("translation.composition.docx_saved_status", path = path.display())),
                 Ok(None) => {}
-                Err(err) => state.set_error(format!("Не удалось сохранить DOCX: {err}")),
+                Err(err) => state.set_error(tf!("translation.composition.docx_save_error", err = err)),
             }
         }
     });
@@ -337,19 +340,19 @@ fn draw_params_tab(
 
     ui.add_enabled_ui(!use_jinja, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Реплики:");
+            ui.label(t!("translation.composition.replicas_label"));
             changed |= ui
                 .selectable_value(
                     &mut options.source_mode,
                     CompositionSourceMode::Original,
-                    "Оригинал",
+                    t!("translation.common.original_label"),
                 )
                 .changed();
             changed |= ui
                 .selectable_value(
                     &mut options.source_mode,
                     CompositionSourceMode::Translation,
-                    "Перевод",
+                    t!("translation.common.translation_label"),
                 )
                 .changed();
         });
@@ -360,20 +363,20 @@ fn draw_params_tab(
                 changed |= ui
                     .checkbox(
                         &mut options.ignore_translated_lines,
-                        "Игнорировать переведённые строки",
+                        t!("translation.composition.ignore_translated_label"),
                     )
                     .changed();
             },
         );
 
         ui.horizontal(|ui| {
-            ui.label("Замена \\n:");
+            ui.label(t!("translation.composition.newline_replace_label"));
             changed |= ui.checkbox(&mut options.nl_replace_enabled, "").changed();
             ui.add_enabled_ui(options.nl_replace_enabled, |ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut options.nl_replace)
                         .desired_width(f32::INFINITY)
-                        .hint_text("пробел"),
+                        .hint_text(t!("translation.composition.space_value")),
                 );
                 if resp.changed() {
                     truncate_chars(&mut options.nl_replace, 8);
@@ -383,7 +386,7 @@ fn draw_params_tab(
         });
 
         ui.horizontal(|ui| {
-            ui.label("Оборачивать реплики в:");
+            ui.label(t!("translation.composition.wrap_replicas_label"));
             changed |= ui.checkbox(&mut options.wrap_with_enabled, "").changed();
             ui.add_enabled_ui(options.wrap_with_enabled, |ui| {
                 let resp = ui.add(
@@ -400,7 +403,7 @@ fn draw_params_tab(
         });
 
         ui.horizontal(|ui| {
-            ui.label("Префикс реплики:");
+            ui.label(t!("translation.composition.replica_prefix_label"));
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut options.replica_prefix)
@@ -410,7 +413,7 @@ fn draw_params_tab(
         });
 
         ui.horizontal(|ui| {
-            ui.label("Лимит символов:");
+            ui.label(t!("translation.composition.char_limit_label"));
             changed |= ui.checkbox(&mut options.limit_enabled, "").changed();
             ui.add_enabled_ui(options.limit_enabled, |ui| {
                 let mut limit = options.limit as i64;
@@ -429,27 +432,27 @@ fn draw_params_tab(
         changed |= ui
             .checkbox(
                 &mut options.use_character_names,
-                "Использовать имена персонажей",
+                t!("translation.common.use_character_names_label"),
             )
             .changed();
         changed |= ui
             .checkbox(
                 &mut options.merge_same_character,
-                "Объединять реплики одного персонажа",
+                t!("translation.composition.merge_same_character_label"),
             )
             .changed();
         changed |= ui
             .checkbox(
                 &mut options.include_image_bubbles,
-                "Включать перевод из ImageBubble",
+                t!("translation.composition.include_imagebubble_label"),
             )
             .on_hover_text(
-                "Для каждой области текста: «Перевод» (плюс « - Описание», если включены имена персонажей).",
+                t!("translation.composition.imagebubble_area_hint"),
             )
             .changed();
 
         ui.horizontal(|ui| {
-            ui.label("Между репликами одного персонажа:");
+            ui.label(t!("translation.composition.between_same_character_label"));
             ui.add_enabled_ui(options.merge_same_character, |ui| {
                 changed |= ui
                     .add(
@@ -461,7 +464,7 @@ fn draw_params_tab(
         });
 
         ui.horizontal(|ui| {
-            ui.label("Между репликами:");
+            ui.label(t!("translation.composition.between_replicas_label"));
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut options.sep_between)
@@ -474,18 +477,18 @@ fn draw_params_tab(
     ui.separator();
     ui.heading("MiniJinja");
     changed |= ui
-        .checkbox(&mut options.jinja2_enabled, "Использовать MiniJinja-шаблон")
+        .checkbox(&mut options.jinja2_enabled, t!("translation.composition.use_minijinja_label"))
         .changed();
 
     ui.horizontal(|ui| {
-        ui.label("Доступные переменные:");
-        if ui.button("Копировать").clicked() {
-            ui.ctx().copy_text(VARS_INFO_TEXT.to_string());
-            state.set_info("Описание переменных скопировано в буфер обмена.");
+        ui.label(t!("translation.composition.available_variables_label"));
+        if ui.button(t!("translation.common.copy_button")).clicked() {
+            ui.ctx().copy_text(vars_info_text().to_string());
+            state.set_info(t!("translation.composition.variables_copied_status"));
         }
     });
-    draw_readonly_big_text(ui, "composition_vars_info", VARS_INFO_TEXT, VARS_ROWS, "");
-    ui.label("Шаблон MiniJinja:");
+    draw_readonly_big_text(ui, "composition_vars_info", vars_info_text(), VARS_ROWS, "");
+    ui.label(t!("translation.composition.minijinja_template_label"));
     changed |= draw_editable_big_text(
         ui,
         "composition_template_editor",
@@ -528,7 +531,7 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
     }
 
     if filtered.is_empty() {
-        return NO_ITEMS_TEXT.to_string();
+        return no_items_text().to_string();
     }
 
     filtered.sort_by(|a, b| match options.sort_method {
@@ -739,7 +742,7 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
     }
 
     if result_lines.is_empty() {
-        NO_ITEMS_TEXT.to_string()
+        no_items_text().to_string()
     } else {
         result_lines.join(&sep_between)
     }
@@ -747,17 +750,17 @@ fn compose_plain(project: &ProjectData, options: &CompositionPanelOptions) -> St
 
 fn compose_minijinja(project: &ProjectData, options: &CompositionPanelOptions) -> String {
     if options.jinja2_template.trim().is_empty() {
-        return EMPTY_TEMPLATE_TEXT.to_string();
+        return empty_template_text().to_string();
     }
 
     let mut env = Environment::new();
     env.set_auto_escape_callback(|_| AutoEscape::None);
     if let Err(err) = env.add_template("composition", &options.jinja2_template) {
-        return format!("Ошибка MiniJinja: {err}");
+        return tf!("translation.composition.minijinja_error", err = err);
     }
     let template = match env.get_template("composition") {
         Ok(template) => template,
-        Err(err) => return format!("Ошибка MiniJinja: {err}"),
+        Err(err) => return tf!("translation.composition.minijinja_error", err = err),
     };
 
     let bubbles = project
@@ -769,7 +772,7 @@ fn compose_minijinja(project: &ProjectData, options: &CompositionPanelOptions) -
 
     template
         .render(context! { bubbles => bubbles })
-        .unwrap_or_else(|err| format!("Ошибка MiniJinja: {err}"))
+        .unwrap_or_else(|err| tf!("translation.composition.minijinja_error", err = err))
 }
 
 /// True when the bubble is an `ImageBubble` (`bubble_class == "image"`).
@@ -827,9 +830,9 @@ fn bubble_character_text(bubble: &Bubble) -> String {
     let mut character = if !character_name.is_empty() {
         character_name
     } else if is_known {
-        UNKNOWN_CHARACTER.to_string()
+        unknown_character_text().to_string()
     } else {
-        NARRATOR_CHARACTER.to_string()
+        narrator_character_text().to_string()
     };
 
     if is_known && !clarification.is_empty() {
@@ -1107,9 +1110,9 @@ fn write_zip_store(path: &Path, entries: &[(&str, Vec<u8>)]) -> Result<(), Strin
     for (name, data) in entries {
         let name_bytes = name.as_bytes();
         let crc = crc32(data);
-        let size_u32 = u32::try_from(data.len()).map_err(|_| "Слишком большой файл".to_string())?;
+        let size_u32 = u32::try_from(data.len()).map_err(|_| t!("translation.composition.zip_file_too_large_error").to_string())?;
         let name_len =
-            u16::try_from(name_bytes.len()).map_err(|_| "Слишком длинное имя файла".to_string())?;
+            u16::try_from(name_bytes.len()).map_err(|_| t!("translation.composition.zip_name_too_long_error").to_string())?;
 
         write_u32(&mut file, 0x0403_4b50)?;
         write_u16(&mut file, 20)?;
@@ -1153,9 +1156,9 @@ fn write_zip_store(path: &Path, entries: &[(&str, Vec<u8>)]) -> Result<(), Strin
     let central_offset = local_offset;
     file.write_all(&central).map_err(|err| err.to_string())?;
     let central_size =
-        u32::try_from(central.len()).map_err(|_| "Слишком большой архив".to_string())?;
+        u32::try_from(central.len()).map_err(|_| t!("translation.composition.zip_archive_too_large_error").to_string())?;
     let entries_count =
-        u16::try_from(entries.len()).map_err(|_| "Слишком много файлов в архиве".to_string())?;
+        u16::try_from(entries.len()).map_err(|_| t!("translation.composition.zip_too_many_files_error").to_string())?;
 
     write_u32(&mut file, 0x0605_4b50)?;
     write_u16(&mut file, 0)?;

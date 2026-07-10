@@ -27,10 +27,7 @@ pub(super) fn render_and_store_created_overlay(
     request: TypingCreateOverlayRequest,
 ) -> Result<TypingOverlayDecoded, String> {
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
-        format!(
-            "Не удалось создать папку {}: {err}",
-            request.text_images_dir.display()
-        )
+        tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
     let file_name = next_created_overlay_file_name(&request.text_images_dir, request.page_idx);
     let render_params = render_params_with_adjacent_layout_path(
@@ -52,7 +49,7 @@ pub(super) fn render_and_store_created_overlay(
         err
     })?;
     if rendered.width == 0 || rendered.height == 0 {
-        return Err("Рендер вернул изображение нулевого размера.".to_string());
+        return Err(t!("typing.render.zero_size_render_error").to_string());
     }
 
     let image_path = request.text_images_dir.join(&file_name);
@@ -63,7 +60,7 @@ pub(super) fn render_and_store_created_overlay(
         rendered.height,
         image::ColorType::Rgba8,
     )
-    .map_err(|err| format!("Не удалось сохранить {}: {err}", image_path.display()))?;
+    .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
     let layout_image_path = save_drawn_lines_layout_image_if_needed(
         &request.text_images_dir,
         &file_name,
@@ -111,17 +108,14 @@ pub(super) fn render_and_store_created_image_overlay(
         TypingCreateImageSource::File(path) => read_image_rgba_from_file(path.as_path())?,
     };
     if width == 0 || height == 0 {
-        return Err("Изображение нулевого размера.".to_string());
+        return Err(t!("typing.errors.zero_size_image").to_string());
     }
     if rgba.len() != width.saturating_mul(height).saturating_mul(4) {
-        return Err("Некорректный буфер RGBA изображения.".to_string());
+        return Err(t!("typing.errors.invalid_rgba_buffer").to_string());
     }
 
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
-        format!(
-            "Не удалось создать папку {}: {err}",
-            request.text_images_dir.display()
-        )
+        tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
     let file_name = next_created_overlay_file_name(&request.text_images_dir, request.page_idx);
     let image_path = request.text_images_dir.join(&file_name);
@@ -132,7 +126,7 @@ pub(super) fn render_and_store_created_image_overlay(
         height as u32,
         image::ColorType::Rgba8,
     )
-    .map_err(|err| format!("Не удалось сохранить {}: {err}", image_path.display()))?;
+    .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
 
     let render_data_json = default_render_data_for_image();
     let overlay_uid = uuid::Uuid::new_v4().to_string();
@@ -176,10 +170,10 @@ pub(super) fn render_and_store_created_raster(
         TypingCreateImageSource::File(path) => read_image_rgba_from_file(path.as_path())?,
     };
     if width == 0 || height == 0 {
-        return Err("Изображение нулевого размера.".to_string());
+        return Err(t!("typing.errors.zero_size_image").to_string());
     }
     if rgba.len() != width.saturating_mul(height).saturating_mul(4) {
-        return Err("Некорректный буфер RGBA изображения.".to_string());
+        return Err(t!("typing.errors.invalid_rgba_buffer").to_string());
     }
     let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
     let name = match &request.source {
@@ -187,8 +181,8 @@ pub(super) fn render_and_store_created_raster(
             .file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "Картинка".to_string()),
-        TypingCreateImageSource::Clipboard => "Картинка".to_string(),
+            .unwrap_or_else(|| t!("typing.layers.image_row_label").to_string()),
+        TypingCreateImageSource::Clipboard => t!("typing.layers.image_row_label").to_string(),
     };
     let uid = uuid::Uuid::new_v4().to_string();
     let transform = crate::models::layer_model::manifest::TransformRec {
@@ -231,7 +225,7 @@ pub(super) fn render_raster_effects(
         Some(img) => (img, "memory"),
         None => {
             let img = load_raster_base_png(&base_file, primary.as_deref(), fallback.as_deref())
-                .ok_or_else(|| format!("Не найден исходный PNG растра «{base_file}»."))?;
+                .ok_or_else(|| tf!("typing.render.raster_source_png_missing_error", base_file = base_file))?;
             (img, "disk")
         }
     };
@@ -251,10 +245,10 @@ pub(super) fn render_raster_effects(
         });
     }
     let effects_json = serde_json::to_string(&Value::Array(effects.clone()))
-        .map_err(|e| format!("Эффекты растра: {e}"))?;
+        .map_err(|e| tf!("typing.render.raster_effects_error", e = e))?;
     let (rendered, _origin) =
         crate::models::layer_model::effects::apply_effects_to_color_image(&base, &effects_json)
-            .map_err(|e| format!("Эффекты растра: {e}"))?;
+            .map_err(|e| tf!("typing.render.raster_effects_error", e = e))?;
     Ok(TypingRasterEffectsResult {
         page_idx,
         uid,
@@ -323,7 +317,7 @@ pub(super) fn render_and_store_edited_overlay(
         }
     };
     if rendered.width == 0 || rendered.height == 0 {
-        return Err("Рендер редактирования вернул изображение нулевого размера.".to_string());
+        return Err(t!("typing.render.zero_size_edit_render_error").to_string());
     }
 
     if request.latest_token.load(Ordering::Acquire) != request.token {
@@ -331,10 +325,7 @@ pub(super) fn render_and_store_edited_overlay(
     }
 
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
-        format!(
-            "Не удалось создать папку {}: {err}",
-            request.text_images_dir.display()
-        )
+        tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
     let image_path = request.text_images_dir.join(&request.file_name);
     if request.latest_token.load(Ordering::Acquire) != request.token {
@@ -347,7 +338,7 @@ pub(super) fn render_and_store_edited_overlay(
         rendered.height,
         image::ColorType::Rgba8,
     )
-    .map_err(|err| format!("Не удалось сохранить {}: {err}", image_path.display()))?;
+    .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
     save_drawn_lines_layout_image_if_needed(
         &request.text_images_dir,
         &request.file_name,
@@ -402,7 +393,7 @@ pub(super) fn render_vector_transform_base(
         }
     };
     if rendered.width == 0 || rendered.height == 0 {
-        return Err("Рендер базового изображения векторной трансформации вернул нулевой размер.".to_string());
+        return Err(t!("typing.render.zero_size_vector_base_error").to_string());
     }
     if request.latest_token.load(Ordering::Acquire) != request.token {
         return Ok(None);
@@ -446,15 +437,12 @@ pub(super) fn render_and_store_image_effects_overlay(
     };
     let decoded = image::open(&source_path)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть исходную картинку {}: {err}",
-                source_path.display()
-            )
+            tf!("typing.render.open_source_image_error", source_path = source_path.display(), err = err)
         })?
         .to_rgba8();
     let (width, height) = decoded.dimensions();
     if width == 0 || height == 0 {
-        return Err("Исходная картинка нулевого размера.".to_string());
+        return Err(t!("typing.render.zero_size_source_image_error").to_string());
     }
 
     let effects_json = effects_json_from_render_data(&request.render_data_json);
@@ -472,7 +460,7 @@ pub(super) fn render_and_store_image_effects_overlay(
         Err(err) => return Err(err),
     };
     if rendered.width == 0 || rendered.height == 0 {
-        return Err("Рендер эффектов вернул изображение нулевого размера.".to_string());
+        return Err(t!("typing.render.zero_size_effects_render_error").to_string());
     }
     if request.latest_token.load(Ordering::Acquire) != request.token {
         return Ok(None);
@@ -490,7 +478,7 @@ pub(super) fn render_and_store_image_effects_overlay(
             rendered.height,
             image::ColorType::Rgba8,
         )
-        .map_err(|err| format!("Не удалось сохранить {}: {err}", fx_path.display()))?;
+        .map_err(|err| tf!("typing.render.save_fx_error", fx_path = fx_path.display(), err = err))?;
         (fx_name, Some(source_name))
     } else {
         // Если раньше был отдельный `_fx`-файл — удаляем его, возвращаясь к исходнику.

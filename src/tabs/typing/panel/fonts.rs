@@ -279,10 +279,10 @@ pub(super) fn assign_font_disambiguators(entries: &mut [FontEntry]) {
 pub(super) fn font_groups_label(groups: &[Option<String>]) -> String {
     let parts: Vec<&str> = groups
         .iter()
-        .map(|group| group.as_deref().unwrap_or("корень"))
+        .map(|group| group.as_deref().unwrap_or(t!("typing.fonts.root_group_label")))
         .collect();
     if parts.is_empty() {
-        "корень".to_string()
+        t!("typing.fonts.root_group_label").to_string()
     } else {
         parts.join(", ")
     }

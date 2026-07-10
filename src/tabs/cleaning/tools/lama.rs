@@ -29,7 +29,7 @@ use crate::backend_ipc::{self, CallError};
 use crate::canvas::CanvasView;
 use crate::config;
 use crate::project::ProjectData;
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use image::{ColorType, ImageEncoder};
@@ -48,21 +48,34 @@ const DEFAULT_LAMA_MODEL_FILENAME: &str = "anime-manga-big-lama.pt";
 #[derive(Debug, Clone, Copy)]
 pub struct LamaModelSpec {
     pub file_name: &'static str,
-    pub display_name: &'static str,
+    /// Stable i18n catalog key for the model's UI display name. The persisted
+    /// selection is keyed by `file_name`, so the display label is free to
+    /// localize (see `docs/i18n_exclusions.md` §A5: a name is unsafe only when
+    /// it doubles as stored content).
+    pub display_key: &'static str,
+}
+
+impl LamaModelSpec {
+    /// Localized UI display name for this model. Runtime lookup (not `const`)
+    /// because `t!` is not const; falls back to the key on a catalog miss.
+    #[must_use]
+    pub fn display_name(&self) -> &'static str {
+        ms_i18n::lookup(self.display_key).unwrap_or(self.display_key)
+    }
 }
 
 const LAMA_MODEL_SPECS: [LamaModelSpec; 3] = [
     LamaModelSpec {
         file_name: "best.ckpt",
-        display_name: "Базовая",
+        display_key: "cleaning.tools.lama.model_base",
     },
     LamaModelSpec {
         file_name: "lama_large_512px.ckpt",
-        display_name: "Аниме и комиксы V1",
+        display_key: "cleaning.tools.lama.model_anime_v1",
     },
     LamaModelSpec {
         file_name: "anime-manga-big-lama.pt",
-        display_name: "Аниме и комиксы V2",
+        display_key: "cleaning.tools.lama.model_anime_v2",
     },
 ];
 
@@ -139,7 +152,7 @@ impl LamaInpaintTool {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновая загрузка списка моделей Lama была прервана.".to_string(),
+                    t!("cleaning.tools.lama.model_scan_aborted_status").to_string(),
                 )),
             },
             LamaModelListState::Idle
@@ -168,7 +181,7 @@ impl LamaInpaintTool {
         selected_model: Option<&str>,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let width = image.size[0];
         let height = image.size[1];
@@ -201,18 +214,15 @@ impl LamaInpaintTool {
         let (_response_header, out_bytes) =
             inpaint_call(backend_ipc::protocol::METHOD_INPAINT_LAMA_V2, header, &blob)?;
         if out_bytes.is_empty() {
-            return Err("AI backend не вернул PNG результата.".to_string());
+            return Err(t!("cleaning.inpaint.no_png_result_error").to_string());
         }
         let out_rgba = image::load_from_memory(&out_bytes)
-            .map_err(|err| format!("AI backend вернул повреждённый PNG: {err}"))?
+            .map_err(|err| tf!("cleaning.inpaint.corrupt_png_error", err = err))?
             .to_rgba8();
         let out_w = out_rgba.width() as usize;
         let out_h = out_rgba.height() as usize;
         if out_w != width || out_h != height {
-            return Err(format!(
-                "AI backend вернул неожиданный размер: {}x{} (ожидалось {}x{}).",
-                out_w, out_h, width, height
-            ));
+            return Err(tf!("cleaning.inpaint.unexpected_size_error", out_w = out_w, out_h = out_h, width = width, height = height));
         }
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [out_w, out_h],
@@ -227,7 +237,7 @@ impl CleaningTool for LamaInpaintTool {
     }
 
     fn title(&self) -> &'static str {
-        "AI удаление (Lama)"
+        t!("cleaning.tools.lama.title")
     }
 
     fn pytorch_required(&self) -> bool {
@@ -240,7 +250,7 @@ impl CleaningTool for LamaInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Обработка через Python AI backend (v2 IPC): метод inpaint.lama_v2 (LaMa V2).");
+        ui.small(t!("cleaning.tools.lama.description_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -298,7 +308,7 @@ impl CleaningTool for LamaInpaintTool {
             ctx,
             canvas,
             project,
-            "AI удаление (Lama)",
+            t!("cleaning.tools.lama.title"),
             {
                 let params = *params;
                 move |image, mask| {
@@ -315,7 +325,7 @@ impl CleaningTool for LamaInpaintTool {
                 )
                 .show_header(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Параметры Lama");
+                        ui.label(t!("cleaning.tools.lama.params_heading"));
                         ui.add_space(8.0);
                         draw_model_picker_header_ui(ui, model_list_state, selected_model);
                     });
@@ -332,11 +342,11 @@ impl CleaningTool for LamaInpaintTool {
                     });
                     draw_model_picker_refresh_ui(ui, model_list_state);
                 });
-                if ui.small_button("Выгрузить Lama из backend").clicked() {
+                if ui.small_button(t!("cleaning.tools.lama.unload_button")).clicked() {
                     *unload_status =
                         match unload_call(backend_ipc::protocol::METHOD_INPAINT_LAMA_V2_UNLOAD) {
-                            Ok(_) => Some("Запрошена выгрузка Lama из памяти backend.".to_string()),
-                            Err(err) => Some(format!("Ошибка выгрузки: {err}")),
+                            Ok(_) => Some(t!("cleaning.tools.lama.unload_requested_status").to_string()),
+                            Err(err) => Some(tf!("cleaning.inpaint.unload_error", err = err)),
                         };
                 }
                 if let Some(status) = unload_status.as_ref() {
@@ -368,9 +378,9 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let width = image.size[0];
     let height = image.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина изображения слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота изображения слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
     for px in &image.pixels {
@@ -380,7 +390,7 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
     Ok(out)
 }
 
@@ -388,9 +398,9 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let width = mask.size[0];
     let height = mask.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина маски слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота маски слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
     for px in &mask.pixels {
@@ -399,7 +409,7 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG маски: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
     Ok(out)
 }
 
@@ -422,7 +432,7 @@ fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
 /// - `Interrupted` → transient abort surfaced to the status line.
 /// - `Transport`   → connect/framing failure (unified backend offline message).
 fn inpaint_call(method: &str, header: Value, blob: &[u8]) -> Result<(Value, Vec<u8>), String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call(method, header, blob, LAMA_BACKEND_CALL_TIMEOUT)
         .map_err(map_inpaint_call_error)
@@ -440,10 +450,10 @@ fn unload_call(method: &str) -> Result<(), String> {
 fn map_inpaint_call_error(err: CallError) -> String {
     match err {
         CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
+        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
         // A transport failure means the backend is offline; surface the unified
         // offline message (matching device calls) instead of the raw error string.
-        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -453,19 +463,13 @@ fn scan_lama_models() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let entries = fs::read_dir(&models_dir).map_err(|err| {
-        format!(
-            "Не удалось прочитать папку моделей Lama '{}': {err}",
-            models_dir.display()
-        )
+        tf!("cleaning.tools.lama.read_models_dir_error", models_dir = models_dir.display(), err = err)
     })?;
     let mut models = Vec::new();
 
     for entry in entries {
         let entry = entry.map_err(|err| {
-            format!(
-                "Не удалось прочитать запись в папке моделей Lama '{}': {err}",
-                models_dir.display()
-            )
+            tf!("cleaning.tools.lama.read_models_entry_error", models_dir = models_dir.display(), err = err)
         })?;
         let path = entry.path();
         if !path.is_file() {
@@ -536,24 +540,24 @@ fn is_lama_model_present(models: &[String], model_name: &str) -> bool {
 
 fn lama_model_status_text(model_name: &str, model_list_state: &LamaModelListState) -> &'static str {
     match model_list_state {
-        LamaModelListState::Idle | LamaModelListState::Loading(_) => "Проверка файлов...",
+        LamaModelListState::Idle | LamaModelListState::Loading(_) => t!("cleaning.tools.lama.checking_files_status"),
         LamaModelListState::Ready(models) => {
             if is_lama_model_present(models, model_name) {
-                "Файл найден"
+                t!("cleaning.tools.lama.file_found_status")
             } else if lama_model_spec_by_name(model_name).is_some() {
-                "Будет скачана перед запуском"
+                t!("cleaning.tools.lama.will_download_status")
             } else {
-                "Ожидается от установщика"
+                t!("cleaning.tools.lama.expected_from_installer_status")
             }
         }
-        LamaModelListState::Error(_) => "Статус недоступен",
+        LamaModelListState::Error(_) => t!("cleaning.tools.lama.status_unavailable_status"),
     }
 }
 
 fn ensure_selected_lama_model_ready(selected_model: Option<&str>) -> Result<&'static str, String> {
     let selected_name = selected_model.unwrap_or(DEFAULT_LAMA_MODEL_FILENAME);
     let spec = lama_model_spec_by_name(selected_name)
-        .ok_or_else(|| format!("Выбрана неподдерживаемая модель Lama: {selected_name}"))?;
+        .ok_or_else(|| tf!("cleaning.tools.lama.unsupported_model_error", selected_name = selected_name))?;
     let local_path = lama_models_dir().join(spec.file_name);
     if local_path.exists() {
         return Ok(spec.file_name);
@@ -573,7 +577,7 @@ fn draw_model_picker_header_ui(
         LamaModelListState::Idle => {
             ui.add_enabled_ui(false, |ui| {
                 WheelComboBox::from_id_salt("cleaning_lama_model_picker")
-                    .selected_text("Проверка моделей...")
+                    .selected_text(t!("cleaning.tools.lama.checking_models_status"))
                     .show_ui(ui, |_ui| {});
             });
         }
@@ -581,7 +585,7 @@ fn draw_model_picker_header_ui(
             let selected_text = selected_model
                 .as_deref()
                 .and_then(lama_model_spec_by_name)
-                .map_or("Выберите модель", |spec| spec.display_name);
+                .map_or(t!("cleaning.common.select_model_placeholder"), |spec| spec.display_name());
             WheelComboBox::from_id_salt("cleaning_lama_model_picker")
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
@@ -590,7 +594,7 @@ fn draw_model_picker_header_ui(
                             .selectable_value(
                                 selected_model,
                                 Some(spec.file_name.to_string()),
-                                spec.display_name,
+                                spec.display_name(),
                             )
                             .changed();
                     }
@@ -603,7 +607,7 @@ fn draw_model_picker_header_ui(
             let selected_text = selected_model
                 .as_deref()
                 .and_then(lama_model_spec_by_name)
-                .map_or("Выберите модель", |spec| spec.display_name);
+                .map_or(t!("cleaning.common.select_model_placeholder"), |spec| spec.display_name());
             WheelComboBox::from_id_salt("cleaning_lama_model_picker")
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
@@ -612,7 +616,7 @@ fn draw_model_picker_header_ui(
                             .selectable_value(
                                 selected_model,
                                 Some(spec.file_name.to_string()),
-                                spec.display_name,
+                                spec.display_name(),
                             )
                             .changed();
                     }
@@ -628,7 +632,7 @@ fn draw_model_picker_header_ui(
 }
 
 fn draw_model_picker_refresh_ui(ui: &mut egui::Ui, model_list_state: &mut LamaModelListState) {
-    if ui.small_button("Проверить модели").clicked() {
+    if ui.small_button(t!("cleaning.tools.lama.refresh_models_button")).clicked() {
         *model_list_state = LamaModelListState::Idle;
     }
 }
@@ -738,12 +742,15 @@ mod tests {
             map_inpaint_call_error(CallError::Error("boom".to_string())),
             "boom"
         );
-        assert!(
-            map_inpaint_call_error(CallError::Interrupted("x".to_string())).contains("прерван")
+        // Pin the exact catalog key, not just that the payload survived: a mapping
+        // regression that picked a different message would still pass a `contains` check.
+        assert_eq!(
+            map_inpaint_call_error(CallError::Interrupted("MARKER".to_string())),
+            tf!("cleaning.inpaint.request_aborted_error", msg = "MARKER")
         );
         assert_eq!(
             map_inpaint_call_error(CallError::Transport("dead".to_string())),
-            AI_BACKEND_OFFLINE_ERROR
+            ai_backend_offline_error()
         );
     }
 }

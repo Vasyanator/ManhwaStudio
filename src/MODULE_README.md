@@ -65,6 +65,17 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   launch/exe directory, except on macOS when the executable runs inside a `*.app` bundle: there the
   read-only bundle forces the writable root to `~/Library/Application Support/ManhwaStudio`
   (`#[cfg(target_os = "macos")]`, no effect on Linux/Windows).
+  `General.enabled_tabs` object keys are the stable English `AppTab::key()` ids
+  (`tabs/mod.rs`) — the persistence contract, byte-stable across releases and UI languages, so they
+  are NEVER localized (`docs/i18n_exclusions.md` A3/B1). The field has NO reader today (verified
+  repo-wide): it is structurally a key set coupled 1:1 to `AppTab::key()`. The keys were migrated
+  from legacy Russian labels to English ids in the same change that split `AppTab::key()` from the
+  localized `AppTab::title()`. No config migration is performed: `merge_missing` adds the new English
+  keys but never removes, so an upgraded user config may carry both the old Russian keys and the new
+  English keys. Because nothing reads the field, the stale Russian keys are functionally inert and
+  are left untouched on disk rather than paying for startup rename I/O for a field with no reader. If
+  a future tab-visibility feature ever reads `enabled_tabs`, that change owns the one-time cleanup
+  migration (keyed by `AppTab::key()`).
 - `memory_manager.rs`: image-cache memory profile, pressure classification, budget policy, and
   typed eviction ordering for cache owners; it does not own image data or GPU handles.
 - `python_manager.rs`: the only Rust-side owner of Python environment discovery, Python command
@@ -230,10 +241,12 @@ prompts instead of blocking the GUI thread.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
-- General settings editor (projects directory + global memory profile) shared by the studio settings
-  tab AND the launcher settings page: `general_settings_panel.rs`. Per-UI `GeneralSettingsPanelState`
-  + a returned `GeneralSettingsOutcome`; synchronous persistence to `user_config.json` serialized on
-  `config::lock_user_config_write()`.
+- General settings editor (projects directory, global memory profile, UI language, and a duplicate
+  surface for the typesetting-language selector owned by `tabs/settings/typesetting.rs`) shared by
+  the studio settings tab AND the launcher settings page: `general_settings_panel.rs`. Per-UI
+  `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to
+  `user_config.json` serialized on `config::lock_user_config_write()`, except the typesetting
+  language, which is written off-thread through `tabs::settings::save_text_language`.
 - AI install-type detection from installed Python packages: `ai_install_probe.rs`.
 - App-managed AI model coverage, Hugging Face paths, or lazy download behavior: `ai_models.rs`.
 - Native ONNX Runtime path (MangaOCR + PaddleOCR OCR, PaddleOCR text detection; runtime/engine

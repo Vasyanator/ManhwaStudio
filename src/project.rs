@@ -151,9 +151,9 @@ impl ComicType {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            Self::Pages => "Страничный",
-            Self::Ribbon => "Вебтун",
-            Self::Custom => "Свой",
+            Self::Pages => t!("project.comic_type.pages"),
+            Self::Ribbon => t!("project.comic_type.ribbon"),
+            Self::Custom => t!("project.comic_type.custom"),
         }
     }
 

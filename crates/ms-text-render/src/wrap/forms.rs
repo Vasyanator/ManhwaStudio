@@ -248,14 +248,33 @@ pub enum TextFormPreset {
     Narrow,
 }
 
+/// How a preset's UI label is produced. This crate is GUI-free and must not depend
+/// on the UI-string catalog (see `docs/i18n_exclusions.md` §F), so a localizable
+/// label is returned as a catalog key for the binary to resolve, while a fixed
+/// ASCII shape sketch is returned verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetLabel {
+    /// Catalog key; the binary resolves it via `ms_i18n::lookup(key).unwrap_or(key)`.
+    Key(&'static str),
+    /// Literal ASCII shape sketch — geometry (`(  )`, `/  \`, `\  /`), not words.
+    /// Painted verbatim; must never be localized.
+    Shape(&'static str),
+}
+
 impl TextFormPreset {
+    /// UI label for this preset. Only `FreeNoTree` is prose (a catalog key); the
+    /// other three are ASCII shape sketches painted verbatim. Total (exhaustive
+    /// match, no catch-all).
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> PresetLabel {
         match self {
-            TextFormPreset::FreeNoTree => "Свободный без ёлки",
-            TextFormPreset::Lens => "(  )",
-            TextFormPreset::Widen => "/  \\",
-            TextFormPreset::Narrow => "\\  /",
+            TextFormPreset::FreeNoTree => {
+                PresetLabel::Key("typing.advanced.form_preset_free_no_tree")
+            }
+            // ASCII shapes are geometric sketches of the form, not translatable text.
+            TextFormPreset::Lens => PresetLabel::Shape("(  )"),
+            TextFormPreset::Widen => PresetLabel::Shape("/  \\"),
+            TextFormPreset::Narrow => PresetLabel::Shape("\\  /"),
         }
     }
 
@@ -1112,6 +1131,25 @@ mod tests {
             .iter()
             .map(|line| CHAR_METRIC.line_width(line))
             .collect()
+    }
+
+    #[test]
+    fn preset_labels_split_prose_from_shapes() {
+        // Only the prose preset carries a catalog key; the shapes are literal ASCII.
+        assert!(matches!(
+            TextFormPreset::FreeNoTree.label(),
+            PresetLabel::Key(k) if !k.is_empty()
+        ));
+        for preset in [
+            TextFormPreset::Lens,
+            TextFormPreset::Widen,
+            TextFormPreset::Narrow,
+        ] {
+            assert!(
+                matches!(preset.label(), PresetLabel::Shape(s) if !s.is_empty()),
+                "{preset:?} must be a literal shape"
+            );
+        }
     }
 
     #[test]

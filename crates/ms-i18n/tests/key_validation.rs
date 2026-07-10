@@ -7,6 +7,13 @@ source tree for `t!` / `tf!` / `tp!` invocations, extracts each string-literal
 key, and asserts it exists in the reference catalog `en.json`. It also asserts
 `ru.json` introduces no key that `en.json` lacks (en is the reference locale).
 
+A second guard (`every_catalog_key_is_referenced_in_source`) closes the opposite gap:
+every catalog key must be reachable, i.e. it must appear as a bare `"key"` string
+literal somewhere under `src/` or `crates/` (a GUI-free crate may return a catalog
+key it chose from an enum variant — see `docs/i18n_exclusions.md` §F). This catches
+ORPHAN keys left behind after a rename/refactor, which would otherwise sit
+unreachable and untranslated forever.
+
 Notes:
 - Almost no call sites exist yet, so the extracted set is expected to be (near)
   empty; the test must still pass on an empty result while performing a real scan.
@@ -297,6 +304,137 @@ fn every_macro_key_exists_in_en_and_ru_is_a_subset() {
             }
         }
     }
+}
+
+/// Guards the `_meta` contract: every locale file's `_meta` object holds EXACTLY
+/// the field `name` and nothing else.
+///
+/// "Untranslated" is DERIVED, not stored — a value equal to the Russian source is
+/// untranslated (`tools/i18n_extract.py --untranslated <tag>` lists them). A
+/// previous `_meta.untranslated` list duplicated that derivable state and drifted;
+/// removing it means any future write-only `_meta` field must fail the build here
+/// rather than silently rot. The allowlist is explicit and rejecting: a new field
+/// hits the `other` arm and panics, so it is never silently accepted.
+#[test]
+fn meta_holds_only_name() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let locales = crate_dir.join("locales");
+    let entries = std::fs::read_dir(&locales)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", locales.display()));
+
+    let mut checked = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let value: serde_json::Value = serde_json::from_str(&source)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+        let meta = value
+            .get("_meta")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| panic!("{}: missing or non-object `_meta`", path.display()));
+
+        for field in meta.keys() {
+            // Explicit allowlist. `name` is the ONLY permitted `_meta` field; every
+            // other field is rejected here on purpose (no silent catch-all accept).
+            match field.as_str() {
+                "name" => {}
+                other => panic!(
+                    "{}: `_meta` contains disallowed field {other:?}; `_meta` may hold \
+                     only `name`. \"Untranslated\" is derived (a value equal to the \
+                     Russian source), not stored — see docs/i18n.md.",
+                    path.display()
+                ),
+            }
+        }
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 2,
+        "expected at least the en/ru locale files under {}, checked {checked}",
+        locales.display()
+    );
+}
+
+/// Guards against orphan catalog keys: every key in the reference catalog
+/// (`en.json`) must appear as a bare `"key"` string literal somewhere under `src/`
+/// (the shipped binary tree) OR `crates/` (the workspace crates). A key that no
+/// longer appears anywhere is unreachable — a leftover from a rename/refactor — and
+/// is flagged here so it is removed instead of rotting untranslated.
+///
+/// `crates/` is scanned because a GUI-free logic crate may hand the binary a catalog
+/// KEY it chose from an enum variant (the crate never depends on the UI-string
+/// catalog — see `docs/i18n_exclusions.md` §F). Those keys appear as `"…"` literals in
+/// the crate source, not under `src/`: e.g. `ScriptGroup::name_key` /
+/// `TextLanguage::name_key` (`ms-text-util`), `Conservatism::label_key`
+/// (`ms-text-util`), `TextFormPreset::label` (`ms-text-render`). Without scanning
+/// `crates/` those keys would be false-positive orphans.
+///
+/// The match is intentionally PERMISSIVE — "does the quoted key text occur anywhere
+/// in a source file", NOT "is it a `t!` argument". Some keys are stored in runtime
+/// key-tables and passed to `t!` indirectly (e.g. `translation/ocr_langs.rs`,
+/// `cleaning/tools/lama.rs` `display_name`, `onnx_runtime/builds.rs` `display_label`,
+/// `launcher/new_project/reline_models.rs` `CURATED`); as long as the key text is a
+/// literal somewhere, it counts as referenced, so those tables never false-positive.
+/// The surrounding quotes in the `"key"` needle prevent a shorter key from matching
+/// inside a longer one.
+#[test]
+fn every_catalog_key_is_referenced_in_source() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = crate_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("ms-i18n crate must live two levels under the repo root")
+        .to_path_buf();
+
+    let en_keys = load_keys(&crate_dir.join("locales/en.json"));
+
+    // Scan the shipped binary source tree (`src/`) and the workspace crates
+    // (`crates/`). `collect_rs_files`'s `skip` argument is the ms-i18n crate dir, so
+    // that crate's own test fixtures (which use unknown keys on purpose) are excluded
+    // from the `crates/` walk.
+    let src_dir = repo_root.join("src");
+    let crates_dir = repo_root.join("crates");
+    let mut files = Vec::new();
+    collect_rs_files(&src_dir, &crate_dir, &mut files);
+    collect_rs_files(&crates_dir, &crate_dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "scan found no .rs files under {} or {}; the walk is broken",
+        src_dir.display(),
+        crates_dir.display()
+    );
+
+    // Concatenate all src sources once. A key counts as referenced when its quoted
+    // form `"key"` occurs anywhere — a `t!`/`tf!`/`tp!` argument, a runtime key-table
+    // entry, a `lookup()` call, or a test fixture.
+    let mut blob = String::new();
+    for file in &files {
+        if let Ok(src) = std::fs::read_to_string(file) {
+            blob.push_str(&src);
+            blob.push('\n');
+        }
+    }
+
+    let mut orphans: Vec<&str> = en_keys
+        .iter()
+        .filter(|key| !blob.contains(&format!("\"{key}\"")))
+        .map(String::as_str)
+        .collect();
+    orphans.sort_unstable();
+
+    assert!(
+        orphans.is_empty(),
+        "orphan catalog key(s) never referenced as a \"key\" literal under {} or {}: {:?}. \
+         Remove them from en.json/ru.json, or reference them via t!/tf!/tp!.",
+        src_dir.display(),
+        crates_dir.display(),
+        orphans
+    );
 }
 
 #[cfg(test)]

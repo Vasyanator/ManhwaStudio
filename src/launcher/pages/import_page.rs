@@ -94,7 +94,7 @@ impl ImportPageState {
             archive_path: None,
             status: ImportPageStatus::LoadingTitles,
             title_combo: EditableComboBox::new("launcher_import_title")
-                .with_hint_text("Введите или выберите тайтл")
+                .with_hint_text(t!("launcher.import_page.title_input_hint"))
                 .with_desired_text_width(432.0)
                 .with_popup_style(theme::combo_popup_style()),
             pending_titles: None,
@@ -122,23 +122,23 @@ impl ImportPageState {
                 theme::card_frame().show(ui, |ui| {
                     ui.set_width(520.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Импорт главы").size(24.0).strong());
+                        ui.label(RichText::new(t!("launcher.import_page.heading")).size(24.0).strong());
                         ui.add_space(14.0);
 
-                        ui.label(theme::status("Файл главы (.mschapter):", theme::TEXT_MUTED));
+                        ui.label(theme::status(t!("launcher.import_page.chapter_file_label"), theme::TEXT_MUTED));
                         ui.horizontal(|ui| {
                             let mut file_label = self
                                 .archive_path
                                 .as_ref()
                                 .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "Файл не выбран".to_string());
+                                .unwrap_or_else(|| t!("launcher.import_page.no_file_selected").to_string());
                             ui.add_enabled(
                                 false,
                                 egui::TextEdit::singleline(&mut file_label).desired_width(360.0),
                             );
                             if theme::launcher_button(
                                 ui,
-                                "Обзор...",
+                                t!("launcher.import_page.browse_button"),
                                 egui::vec2(108.0, 34.0),
                                 !self.is_busy(),
                             )
@@ -150,7 +150,7 @@ impl ImportPageState {
 
                         ui.add_space(10.0);
                         ui.label(theme::status(
-                            "Тайтл (существующий или новый):",
+                            t!("launcher.import_page.title_label"),
                             theme::TEXT_MUTED,
                         ));
                         let title_response = ui
@@ -168,7 +168,7 @@ impl ImportPageState {
                         }
 
                         ui.add_space(10.0);
-                        ui.label(theme::status("Название главы:", theme::TEXT_MUTED));
+                        ui.label(theme::status(t!("launcher.import_page.chapter_name_label"), theme::TEXT_MUTED));
                         let chapter_response = ui.add_sized(
                             [432.0, ui.spacing().interact_size.y.max(34.0)],
                             egui::TextEdit::singleline(&mut self.chapter_input),
@@ -191,7 +191,7 @@ impl ImportPageState {
                             let can_import = self.can_import();
                             if theme::launcher_button(
                                 ui,
-                                "Импортировать и открыть",
+                                t!("launcher.import_page.import_and_open_button"),
                                 egui::vec2(198.0, 36.0),
                                 can_import,
                             )
@@ -201,7 +201,7 @@ impl ImportPageState {
                             }
                             if theme::launcher_button(
                                 ui,
-                                "Импортировать",
+                                t!("launcher.import_page.import_button"),
                                 egui::vec2(132.0, 36.0),
                                 can_import,
                             )
@@ -211,7 +211,7 @@ impl ImportPageState {
                             }
                             if theme::launcher_button(
                                 ui,
-                                "Обновить",
+                                t!("launcher.common.refresh_button"),
                                 egui::vec2(118.0, 36.0),
                                 !self.is_busy(),
                             )
@@ -258,7 +258,7 @@ impl ImportPageState {
             .unwrap_or_else(|| self.projects_root.clone());
         let Some(path) = FileDialog::new()
             .set_directory(start_dir)
-            .add_filter("Файлы глав", &["mschapter"])
+            .add_filter(t!("launcher.common.chapter_files_filter"), &["mschapter"])
             .pick_file()
         else {
             return;
@@ -274,7 +274,7 @@ impl ImportPageState {
     #[cfg(target_arch = "wasm32")]
     fn pick_archive_file(&mut self) {
         self.status = ImportPageStatus::Error(
-            "Выбор файла главы недоступен в веб-версии.".to_string(),
+            t!("launcher.import_page.select_file_web_unsupported").to_string(),
         );
     }
 
@@ -293,11 +293,7 @@ impl ImportPageState {
                     },
                     Err(err) => TitleRefreshResult {
                         titles: Vec::new(),
-                        error_message: Some(format!(
-                            "Не удалось прочитать папку проектов '{}': {}",
-                            projects_root.display(),
-                            err
-                        )),
+                        error_message: Some(tf!("launcher.common.read_projects_folder_error", projects_root = projects_root.display(), err = err)),
                     },
                 };
                 if tx.send(result).is_err() {
@@ -309,7 +305,7 @@ impl ImportPageState {
         if let Err(err) = spawn_result {
             self.pending_titles = None;
             self.status = ImportPageStatus::Error(
-                "Не удалось запустить обновление списка тайтлов.".to_string(),
+                t!("launcher.import_page.start_refresh_error").to_string(),
             );
             runtime_log::log_error(format!(
                 "[launcher-import] failed to spawn title refresh worker: {err}"
@@ -327,12 +323,12 @@ impl ImportPageState {
                 let result = match read_archive_root_name(&path) {
                     Ok(Some(chapter_name)) => ArchiveMetadataResult {
                         chapter_name: Some(chapter_name),
-                        user_message: Some("Файл главы прочитан.".to_string()),
+                        user_message: Some(t!("launcher.import_page.chapter_file_read_status").to_string()),
                         log_message: None,
                     },
                     Ok(None) => ArchiveMetadataResult {
                         chapter_name: None,
-                        user_message: Some("Архив не содержит папки главы.".to_string()),
+                        user_message: Some(t!("launcher.import_page.archive_no_chapter_folder").to_string()),
                         log_message: Some(format!(
                             "[launcher-import] archive '{}' contained no root folder",
                             path.display()
@@ -340,9 +336,7 @@ impl ImportPageState {
                     },
                     Err(err) => ArchiveMetadataResult {
                         chapter_name: None,
-                        user_message: Some(format!(
-                            "Не удалось прочитать информацию из файла главы: {err}"
-                        )),
+                        user_message: Some(tf!("launcher.import_page.read_chapter_info_error", err = err)),
                         log_message: Some(format!(
                             "[launcher-import] failed to read archive metadata '{}': {err}",
                             path.display()
@@ -358,7 +352,7 @@ impl ImportPageState {
         if let Err(err) = spawn_result {
             self.pending_metadata = None;
             self.status =
-                ImportPageStatus::Error("Не удалось запустить чтение файла главы.".to_string());
+                ImportPageStatus::Error(t!("launcher.import_page.start_read_chapter_error").to_string());
             runtime_log::log_error(format!(
                 "[launcher-import] failed to spawn metadata worker: {err}"
             ));
@@ -373,7 +367,7 @@ impl ImportPageState {
         let chapter = self.chapter_input.trim().to_string();
         if title.is_empty() || chapter.is_empty() {
             self.status =
-                ImportPageStatus::Error("Укажите файл главы, тайтл и название главы.".to_string());
+                ImportPageStatus::Error(t!("launcher.import_page.specify_file_title_chapter_error").to_string());
             return;
         }
 
@@ -385,10 +379,7 @@ impl ImportPageState {
             // chapter, refuse the overwrite with a clear status.
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let description = format!(
-                    "Глава «{}» в тайтле «{}» уже существует.\nПри импорте она будет полностью заменена.\n\nПродолжить?",
-                    chapter, title
-                );
+                let description = tf!("launcher.import_page.chapter_exists_prompt", chapter = chapter, title = title);
                 let should_continue = MessageDialog::new()
                     .set_title("ManhwaStudio")
                     .set_description(&description)
@@ -403,7 +394,7 @@ impl ImportPageState {
             #[cfg(target_arch = "wasm32")]
             {
                 self.status = ImportPageStatus::Error(
-                    "Замена существующей главы недоступна в веб-версии.".to_string(),
+                    t!("launcher.import_page.replace_web_unsupported").to_string(),
                 );
                 return;
             }
@@ -425,10 +416,7 @@ impl ImportPageState {
                 ) {
                     Ok(selection) => ImportWorkerResult {
                         selection,
-                        user_message: format!(
-                            "Глава успешно импортирована в:\n{}",
-                            projects_root.join(&title).join(&chapter).display()
-                        ),
+                        user_message: tf!("launcher.import_page.import_success_status", projects_root = projects_root.join(&title).join(&chapter).display()),
                         log_message: Some(format!(
                             "[launcher-import] imported '{}' into '{}/{}'",
                             archive_path.display(),
@@ -439,7 +427,7 @@ impl ImportPageState {
                     },
                     Err(err) => ImportWorkerResult {
                         selection: None,
-                        user_message: format!("Не удалось импортировать главу: {err}"),
+                        user_message: tf!("launcher.import_page.import_error", err = err),
                         log_message: Some(format!(
                             "[launcher-import] failed to import '{}' into '{}/{}': {err}",
                             archive_path.display(),
@@ -457,7 +445,7 @@ impl ImportPageState {
             });
         if let Err(err) = spawn_result {
             self.pending_import = None;
-            self.status = ImportPageStatus::Error("Не удалось запустить импорт главы.".to_string());
+            self.status = ImportPageStatus::Error(t!("launcher.import_page.start_import_error").to_string());
             runtime_log::log_error(format!(
                 "[launcher-import] failed to spawn import worker: {err}"
             ));
@@ -485,7 +473,7 @@ impl ImportPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear = true;
                     self.status = ImportPageStatus::Error(
-                        "Обновление списка тайтлов завершилось ошибкой.".to_string(),
+                        t!("launcher.import_page.refresh_failed").to_string(),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -519,7 +507,7 @@ impl ImportPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear = true;
                     self.status = ImportPageStatus::Error(
-                        "Чтение файла главы завершилось ошибкой.".to_string(),
+                        t!("launcher.import_page.read_chapter_failed").to_string(),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -553,7 +541,7 @@ impl ImportPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear = true;
                     self.status =
-                        ImportPageStatus::Error("Импорт главы завершился ошибкой.".to_string());
+                        ImportPageStatus::Error(t!("launcher.import_page.import_failed").to_string());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -581,21 +569,21 @@ fn show_status(ui: &mut Ui, status: &ImportPageStatus) {
     match status {
         ImportPageStatus::LoadingTitles => {
             ui.label(theme::status(
-                "Считываем список тайтлов...",
+                t!("launcher.common.reading_titles_status"),
                 theme::TEXT_MUTED,
             ));
         }
         ImportPageStatus::Ready => {
-            ui.label(theme::status("Готово к импорту.", theme::TEXT_MUTED));
+            ui.label(theme::status(t!("launcher.import_page.ready_to_import"), theme::TEXT_MUTED));
         }
         ImportPageStatus::LoadingMetadata => {
             ui.label(theme::status(
-                "Читаем содержимое файла главы...",
+                t!("launcher.import_page.reading_chapter_status"),
                 theme::TEXT_MUTED,
             ));
         }
         ImportPageStatus::Importing => {
-            ui.label(theme::status("Импортируем главу...", theme::TEXT_MUTED));
+            ui.label(theme::status(t!("launcher.import_page.importing_status"), theme::TEXT_MUTED));
         }
         ImportPageStatus::Success(message) => {
             ui.label(theme::status(message, theme::STATUS_SUCCESS));
@@ -617,20 +605,20 @@ fn clear_status_if_success(status: &mut ImportPageStatus) {
 
 fn read_archive_root_name(path: &Path) -> Result<Option<String>, String> {
     let file = File::open(path)
-        .map_err(|err| format!("не удалось открыть '{}': {err}", path.display()))?;
+        .map_err(|err| tf!("launcher.import_page.open_file_error", path = path.display(), err = err))?;
     let decoder = zstd::stream::read::Decoder::new(file)
-        .map_err(|err| format!("не удалось открыть zstd-поток: {err}"))?;
+        .map_err(|err| tf!("launcher.import_page.open_zstd_stream_error", err = err))?;
     let mut archive = tar::Archive::new(decoder);
     let entries = archive
         .entries()
-        .map_err(|err| format!("не удалось прочитать tar-архив: {err}"))?;
+        .map_err(|err| tf!("launcher.import_page.read_tar_error", err = err))?;
 
     for entry_result in entries {
         let entry =
-            entry_result.map_err(|err| format!("не удалось прочитать запись архива: {err}"))?;
+            entry_result.map_err(|err| tf!("launcher.import_page.read_archive_entry_error", err = err))?;
         let path = entry
             .path()
-            .map_err(|err| format!("не удалось прочитать путь записи архива: {err}"))?;
+            .map_err(|err| tf!("launcher.import_page.read_archive_entry_path_error", err = err))?;
         if let Some(root) = first_normal_component(&path) {
             return Ok(Some(root.to_string_lossy().into_owned()));
         }
@@ -648,10 +636,7 @@ fn import_archive_into_projects(
 ) -> Result<Option<OpenProjectSelection>, String> {
     let title_dir = projects_root.join(title);
     fs::create_dir_all(&title_dir).map_err(|err| {
-        format!(
-            "не удалось создать папку тайтла '{}': {err}",
-            title_dir.display()
-        )
+        tf!("launcher.import_page.create_title_folder_error", title_dir = title_dir.display(), err = err)
     })?;
     let chapter_dir = title_dir.join(chapter);
     let temp_dir = title_dir.join(format!(
@@ -661,58 +646,49 @@ fn import_archive_into_projects(
     ));
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).map_err(|err| {
-            format!(
-                "не удалось очистить временную папку '{}': {err}",
-                temp_dir.display()
-            )
+            tf!("launcher.import_page.clear_temp_folder_error", temp_dir = temp_dir.display(), err = err)
         })?;
     }
     fs::create_dir_all(&temp_dir).map_err(|err| {
-        format!(
-            "не удалось создать временную папку '{}': {err}",
-            temp_dir.display()
-        )
+        tf!("launcher.import_page.create_temp_folder_error", temp_dir = temp_dir.display(), err = err)
     })?;
 
     let import_result = (|| -> Result<(), String> {
         let file = File::open(archive_path)
-            .map_err(|err| format!("не удалось открыть '{}': {err}", archive_path.display()))?;
+            .map_err(|err| tf!("launcher.import_page.open_archive_error", archive_path = archive_path.display(), err = err))?;
         let decoder = zstd::stream::read::Decoder::new(file)
-            .map_err(|err| format!("не удалось открыть zstd-поток: {err}"))?;
+            .map_err(|err| tf!("launcher.import_page.open_zstd_stream_error", err = err))?;
         let mut archive = tar::Archive::new(decoder);
         let entries = archive
             .entries()
-            .map_err(|err| format!("не удалось прочитать tar-архив: {err}"))?;
+            .map_err(|err| tf!("launcher.import_page.read_tar_error", err = err))?;
 
         let mut expected_root: Option<OsString> = None;
         let mut wrote_any = false;
 
         for entry_result in entries {
             let mut entry =
-                entry_result.map_err(|err| format!("не удалось прочитать запись архива: {err}"))?;
+                entry_result.map_err(|err| tf!("launcher.import_page.read_archive_entry_error", err = err))?;
             let archive_path = entry
                 .path()
-                .map_err(|err| format!("не удалось прочитать путь записи архива: {err}"))?;
+                .map_err(|err| tf!("launcher.import_page.read_archive_entry_path_error", err = err))?;
             let Some(relative) = strip_archive_root(&archive_path, &mut expected_root)? else {
                 continue;
             };
             let destination = temp_dir.join(relative);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).map_err(|err| {
-                    format!(
-                        "не удалось создать папку '{}' при импорте: {err}",
-                        parent.display()
-                    )
+                    tf!("launcher.import_page.create_folder_on_import_error", parent = parent.display(), err = err)
                 })?;
             }
             entry.unpack(&destination).map_err(|err| {
-                format!("не удалось распаковать '{}' : {err}", destination.display())
+                tf!("launcher.import_page.extract_error", destination = destination.display(), err = err)
             })?;
             wrote_any = true;
         }
 
         if !wrote_any {
-            return Err("архив не содержит файлов главы".to_string());
+            return Err(t!("launcher.import_page.archive_no_chapter_files").to_string());
         }
 
         Ok(())
@@ -732,17 +708,11 @@ fn import_archive_into_projects(
 
     if chapter_dir.exists() {
         fs::remove_dir_all(&chapter_dir).map_err(|err| {
-            format!(
-                "не удалось удалить старую главу '{}': {err}",
-                chapter_dir.display()
-            )
+            tf!("launcher.import_page.delete_old_chapter_error", chapter_dir = chapter_dir.display(), err = err)
         })?;
     }
     fs::rename(&temp_dir, &chapter_dir).map_err(|err| {
-        format!(
-            "не удалось переместить импортированную главу в '{}': {err}",
-            chapter_dir.display()
-        )
+        tf!("launcher.import_page.move_imported_chapter_error", chapter_dir = chapter_dir.display(), err = err)
     })?;
 
     Ok(open_after.then(|| OpenProjectSelection {
@@ -772,7 +742,7 @@ fn strip_archive_root(
             Some(Component::Normal(value)) => break value.to_os_string(),
             Some(Component::CurDir) => continue,
             Some(Component::ParentDir | Component::RootDir | Component::Prefix(_)) => {
-                return Err("архив содержит небезопасный путь".to_string());
+                return Err(t!("launcher.import_page.archive_unsafe_path").to_string());
             }
             None => return Ok(None),
         }
@@ -780,7 +750,7 @@ fn strip_archive_root(
 
     if let Some(expected) = expected_root.as_ref() {
         if expected != &root {
-            return Err("архив содержит несколько корневых папок".to_string());
+            return Err(t!("launcher.import_page.archive_multiple_roots").to_string());
         }
     } else {
         *expected_root = Some(root);
@@ -792,7 +762,7 @@ fn strip_archive_root(
             Component::Normal(value) => relative.push(value),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err("архив содержит небезопасный путь".to_string());
+                return Err(t!("launcher.import_page.archive_unsafe_path").to_string());
             }
         }
     }

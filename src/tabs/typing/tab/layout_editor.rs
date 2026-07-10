@@ -24,7 +24,7 @@ use super::*;
 
 pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mut TypingLayoutEditorState) {
     ensure_layout_editor_has_line(editor);
-    ui.label(egui::RichText::new("Строки").strong());
+    ui.label(egui::RichText::new(t!("typing.layout_editor.lines_heading")).strong());
     ui.add_space(6.0);
     egui::ScrollArea::vertical()
         .id_salt("typing_layout_editor_vector_lines_scroll")
@@ -49,7 +49,7 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
                                 .lines
                                 .get(idx)
                                 .map(|line| line.label.as_str())
-                                .unwrap_or("Строка");
+                                .unwrap_or(t!("typing.layout_editor.line_row_label"));
                             if ui.selectable_label(selected, label).clicked() {
                                 editor.active_line_idx = idx;
                             }
@@ -77,7 +77,7 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
                         if ui.button("+").clicked() {
                             let next_idx = editor.lines.len() + 1;
                             editor.lines.push(TypingLayoutEditorLine {
-                                label: format!("Строка {next_idx}"),
+                                label: tf!("typing.layout_editor.line_add_label", next_idx = next_idx),
                                 points: Vec::new(),
                                 corner_smoothing_px: 0.0,
                                 text_direction: TextVectorLineTextDirection::LeftToRight,
@@ -91,7 +91,7 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
             if plus_response.response.clicked() {
                 let next_idx = editor.lines.len() + 1;
                 editor.lines.push(TypingLayoutEditorLine {
-                    label: format!("Строка {next_idx}"),
+                    label: tf!("typing.layout_editor.line_add_label", next_idx = next_idx),
                     points: Vec::new(),
                     corner_smoothing_px: 0.0,
                     text_direction: TextVectorLineTextDirection::LeftToRight,
@@ -102,10 +102,15 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
             }
         });
     ui.separator();
-    ui.label(egui::RichText::new("Параметры строки").strong());
+    ui.label(egui::RichText::new(t!("typing.layout_editor.line_params_heading")).strong());
     if let Some(line) = editor.lines.get_mut(editor.active_line_idx) {
-        ui.add(WheelSlider::new(&mut line.corner_smoothing_px, 0.0..=256.0).text("Сглаживание"));
-        egui::ComboBox::from_label("Направление текста")
+        ui.add(WheelSlider::new(&mut line.corner_smoothing_px, 0.0..=256.0).text(t!("typing.layout_editor.antialias_label")));
+        // `egui::ComboBox` has no `id_salt()` builder; `new(id_salt, label)` sets a
+        // stable, language-independent id while still showing the localized label.
+        egui::ComboBox::new(
+            "typing.layout_editor.text_direction_combo_id",
+            t!("typing.layout_editor.text_direction_combo_id"),
+        )
             .selected_text(vector_line_text_direction_label(line.text_direction))
             .show_ui(ui, |ui| {
                 ui.selectable_value(
@@ -119,7 +124,10 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
                     vector_line_text_direction_label(TextVectorLineTextDirection::RightToLeft),
                 );
             });
-        egui::ComboBox::from_label("Режим расстояния")
+        egui::ComboBox::new(
+            "typing.layout_editor.distance_mode_combo_id",
+            t!("typing.layout_editor.distance_mode_combo_id"),
+        )
             .selected_text(vector_line_distance_mode_label(line.distance_mode))
             .show_ui(ui, |ui| {
                 ui.selectable_value(
@@ -135,28 +143,28 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
                     ),
                 );
             });
-        ui.checkbox(&mut line.flip_text, "Перевернуть текст");
+        ui.checkbox(&mut line.flip_text, t!("typing.layout_editor.flip_text"));
     }
 }
 
 pub(super) fn vector_line_text_direction_label(direction: TextVectorLineTextDirection) -> &'static str {
     match direction {
-        TextVectorLineTextDirection::LeftToRight => "Слева направо",
-        TextVectorLineTextDirection::RightToLeft => "Справа налево",
+        TextVectorLineTextDirection::LeftToRight => t!("typing.params.direction_left_to_right"),
+        TextVectorLineTextDirection::RightToLeft => t!("typing.params.direction_right_to_left"),
     }
 }
 
 pub(super) fn vector_line_distance_mode_label(mode: TextVectorLineDistanceMode) -> &'static str {
     match mode {
-        TextVectorLineDistanceMode::ByLineLength => "По длине линии",
-        TextVectorLineDistanceMode::MinimumPreviousDistance => "Мин. расстояние до символа",
+        TextVectorLineDistanceMode::ByLineLength => t!("typing.layout_editor.distance_mode_by_line_length"),
+        TextVectorLineDistanceMode::MinimumPreviousDistance => t!("typing.layout_editor.distance_mode_min_distance"),
     }
 }
 
 pub(super) fn ensure_layout_editor_has_line(editor: &mut TypingLayoutEditorState) {
     if editor.lines.is_empty() {
         editor.lines.push(TypingLayoutEditorLine {
-            label: "Строка 1".to_string(),
+            label: t!("typing.layout_editor.line_first_label").to_string(),
             points: Vec::new(),
             corner_smoothing_px: 0.0,
             text_direction: TextVectorLineTextDirection::LeftToRight,
@@ -185,7 +193,7 @@ pub(super) fn remove_layout_editor_line(editor: &mut TypingLayoutEditorState, id
         editor.lines.remove(idx);
     }
     for (line_idx, line) in editor.lines.iter_mut().enumerate() {
-        line.label = format!("Строка {}", line_idx + 1);
+        line.label = tf!("typing.layout_editor.line_renumber_label", line_idx = line_idx + 1);
     }
     editor.active_line_idx = editor
         .active_line_idx
@@ -200,7 +208,7 @@ pub(super) fn layout_editor_lines_from_vector_layout(
         .into_iter()
         .enumerate()
         .map(|(idx, line)| TypingLayoutEditorLine {
-            label: format!("Строка {}", idx + 1),
+            label: tf!("typing.layout_editor.line_load_label", idx = idx + 1),
             points: line
                 .points
                 .into_iter()

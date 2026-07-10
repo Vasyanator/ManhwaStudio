@@ -272,7 +272,7 @@ fn ensure_remote_files(
     _remote_files: &[&str],
     _reporter: &mut ModelDownloadReporter<'_>,
 ) -> Result<(), String> {
-    Err("Загрузка моделей ИИ недоступна в веб-версии.".to_string())
+    Err(t!("ai_models.web_unavailable").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -291,15 +291,12 @@ fn ensure_remote_files(
     }
 
     fs::create_dir_all(models_root).map_err(|err| {
-        format!(
-            "Не удалось создать корневую папку моделей {}: {err}",
-            models_root.display()
-        )
+        tf!("ai_models.create_root_error", models_root = models_root.display(), err = err)
     })?;
     let lock = DOWNLOAD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock
         .lock()
-        .map_err(|_| "Глобальная блокировка скачивания моделей повреждена.".to_string())?;
+        .map_err(|_| t!("ai_models.download_lock_poisoned").to_string())?;
 
     let still_missing = remote_files
         .iter()
@@ -316,17 +313,14 @@ fn ensure_remote_files(
     let api = ApiBuilder::from_env()
         .with_progress(false)
         .build()
-        .map_err(|err| format!("Не удалось создать Hugging Face client: {err}"))?;
+        .map_err(|err| tf!("ai_models.hf_client_error", err = err))?;
     let repo = api.model(format!("{HF_OWNER}/{HF_REPO_NAME}"));
     for remote in still_missing {
         let url = repo.url(remote);
         download_hf_file_direct(&url, &models_root.join(remote), remote)?;
         let local = models_root.join(remote);
         if !is_nonempty_file(&local) {
-            return Err(format!(
-                "Hugging Face download завершился, но файл модели не найден: {}",
-                local.display()
-            ));
+            return Err(tf!("ai_models.file_missing_after_download", local = local.display()));
         }
     }
     Ok(())
@@ -336,39 +330,33 @@ fn ensure_remote_files(
 fn download_hf_file_direct(url: &str, local_path: &Path, remote: &str) -> Result<(), String> {
     let parent = local_path
         .parent()
-        .ok_or_else(|| format!("Некорректный путь модели: {}", local_path.display()))?;
+        .ok_or_else(|| tf!("ai_models.invalid_model_path", local_path = local_path.display()))?;
     fs::create_dir_all(parent)
-        .map_err(|err| format!("Не удалось создать папку {}: {err}", parent.display()))?;
+        .map_err(|err| tf!("ai_models.create_folder_error", parent = parent.display(), err = err))?;
 
     let tmp_path = local_path.with_extension("part");
     let response = ureq::get(url)
         .call()
-        .map_err(|err| format!("Не удалось скачать модель {remote} из HF: {err}"))?;
+        .map_err(|err| tf!("ai_models.download_error", remote = remote, err = err))?;
     let mut reader = response.into_reader();
     let mut file = fs::File::create(&tmp_path).map_err(|err| {
-        format!(
-            "Не удалось создать временный файл модели {}: {err}",
-            tmp_path.display()
-        )
+        tf!("ai_models.temp_file_error", tmp_path = tmp_path.display(), err = err)
     })?;
     let mut buffer = [0_u8; 128 * 1024];
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|err| format!("Ошибка чтения HF потока {remote}: {err}"))?;
+            .map_err(|err| tf!("ai_models.stream_read_error", remote = remote, err = err))?;
         if read == 0 {
             break;
         }
         file.write_all(&buffer[..read])
-            .map_err(|err| format!("Ошибка записи файла {}: {err}", tmp_path.display()))?;
+            .map_err(|err| tf!("ai_models.write_error", tmp_path = tmp_path.display(), err = err))?;
     }
     file.flush()
-        .map_err(|err| format!("Не удалось flush файла {}: {err}", tmp_path.display()))?;
+        .map_err(|err| tf!("ai_models.flush_error", tmp_path = tmp_path.display(), err = err))?;
     fs::rename(&tmp_path, local_path).map_err(|err| {
-        format!(
-            "Не удалось сохранить модель {}: {err}",
-            local_path.display()
-        )
+        tf!("ai_models.save_error", local_path = local_path.display(), err = err)
     })?;
     Ok(())
 }

@@ -311,12 +311,12 @@ impl WsHandle {
                 Ok(()) => Ok(buf.len()),
                 Err(_) => Err(std::io::Error::new(
                     ErrorKind::BrokenPipe,
-                    "WS I/O поток backend завершился, запись невозможна",
+                    t!("backend_ipc.transport.ws_io_thread_ended"),
                 )),
             },
             None => Err(std::io::Error::new(
                 ErrorKind::BrokenPipe,
-                "WS соединение с backend закрыто",
+                t!("backend_ipc.transport.ws_connection_closed"),
             )),
         }
     }
@@ -502,7 +502,7 @@ impl BackendStream {
         match &self.inner {
             Inner::Unix(stream) => stream
                 .set_read_timeout(timeout)
-                .map_err(|err| format!("Не удалось выставить read timeout backend-сокета: {err}")),
+                .map_err(|err| tf!("backend_ipc.transport.read_timeout_error", err = err)),
             Inner::Ws(handle) => {
                 handle.set_read_timeout(timeout);
                 Ok(())
@@ -520,7 +520,7 @@ impl BackendStream {
         match &self.inner {
             Inner::Unix(stream) => stream
                 .set_write_timeout(timeout)
-                .map_err(|err| format!("Не удалось выставить write timeout backend-сокета: {err}")),
+                .map_err(|err| tf!("backend_ipc.transport.write_timeout_error", err = err)),
             Inner::Ws(handle) => {
                 handle.set_write_timeout(timeout);
                 Ok(())
@@ -544,7 +544,7 @@ impl BackendStream {
                 .map(|inner| BackendStream {
                     inner: Inner::Unix(inner),
                 })
-                .map_err(|err| format!("Не удалось клонировать backend-сокет: {err}")),
+                .map_err(|err| tf!("backend_ipc.transport.clone_socket_error", err = err)),
             Inner::Ws(handle) => Ok(BackendStream {
                 inner: Inner::Ws(handle.clone()),
             }),
@@ -565,7 +565,7 @@ impl BackendStream {
         match &self.inner {
             Inner::Unix(stream) => stream
                 .shutdown(std::net::Shutdown::Both)
-                .map_err(|err| format!("Не удалось закрыть backend-сокет: {err}")),
+                .map_err(|err| tf!("backend_ipc.transport.close_socket_error", err = err)),
             Inner::Ws(handle) => {
                 handle.shutdown();
                 Ok(())
@@ -631,10 +631,7 @@ pub(crate) fn connect_path(
     let connect_path = path.clone();
     thread::spawn(move || {
         let result = UnixStream::connect(&connect_path).map_err(|err| {
-            format!(
-                "Не удалось подключиться к AI backend по сокету {}: {err}",
-                connect_path.display()
-            )
+            tf!("backend_ipc.transport.connect_error", connect_path = connect_path.display(), err = err)
         });
         // The receiver may already be gone on timeout; dropping the result is the
         // intended cleanup, so the send error is deliberately ignored.
@@ -653,18 +650,12 @@ pub(crate) fn connect_path(
             return Err(err);
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            let msg = format!(
-                "Тайм-аут подключения к AI backend по сокету {path_display} \
-                 (превышено {} мс). Возможная причина: backend не запущен.",
-                connect_timeout.as_millis()
-            );
+            let msg = tf!("backend_ipc.transport.connect_timeout", path_display = path_display, connect_timeout = connect_timeout.as_millis());
             report_connect_failure(&msg);
             return Err(msg);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let msg = format!(
-                "Поток подключения к AI backend ({path_display}) завершился без результата."
-            );
+            let msg = tf!("backend_ipc.transport.connect_thread_no_result", path_display = path_display);
             crate::runtime_log::log_error(format!("[backend_ipc] {msg}"));
             return Err(msg);
         }
@@ -710,37 +701,31 @@ pub(crate) fn connect_ws(
 ) -> Result<BackendStream, String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let tcp = TcpStream::connect_timeout(&addr, connect_timeout).map_err(|err| {
-        let msg = format!(
-            "Не удалось подключиться к AI backend по WebSocket 127.0.0.1:{port}: {err}. \
-             Возможная причина: backend не запущен или порт не совпадает."
-        );
+        let msg = tf!("backend_ipc.transport.ws_connect_error", port = port, err = err);
         report_connect_failure(&msg);
         msg
     })?;
     tcp.set_nodelay(true).map_err(|err| {
-        format!("Не удалось выставить TCP_NODELAY для WS backend (порт {port}): {err}")
+        tf!("backend_ipc.transport.ws_nodelay_error", port = port, err = err)
     })?;
 
     // Retained clone of the same socket: the I/O thread owns the WebSocket, and this
     // handle lets `shutdown` force-unblock the thread's blocking read.
     let tcp_shutdown = tcp.try_clone().map_err(|err| {
-        format!("Не удалось клонировать WS TCP-сокет backend (порт {port}): {err}")
+        tf!("backend_ipc.transport.ws_clone_socket_error", port = port, err = err)
     })?;
 
     // Bound handshake reads/writes so a hung server fails fast; the I/O thread
     // switches the read timeout to a short poll interval right after the handshake.
     tcp.set_write_timeout(write_timeout)
-        .map_err(|err| format!("Не удалось выставить WS write timeout (порт {port}): {err}"))?;
+        .map_err(|err| tf!("backend_ipc.transport.ws_write_timeout_error", port = port, err = err))?;
     tcp.set_read_timeout(Some(connect_timeout)).map_err(|err| {
-        format!("Не удалось выставить WS handshake read timeout (порт {port}): {err}")
+        tf!("backend_ipc.transport.ws_handshake_read_timeout_error", port = port, err = err)
     })?;
 
     let url = format!("ws://127.0.0.1:{port}/?token={token}");
     let (ws, _response) = tungstenite::client(url.as_str(), tcp).map_err(|err| {
-        let msg = format!(
-            "Не удалось выполнить WebSocket-рукопожатие с AI backend (порт {port}): {err}. \
-             Возможная причина: неверный токен или backend не готов."
-        );
+        let msg = tf!("backend_ipc.transport.ws_handshake_error", port = port, err = err);
         report_connect_failure(&msg);
         msg
     })?;
@@ -751,7 +736,7 @@ pub(crate) fn connect_ws(
     // TCP socket (a `None` read timeout must not wedge the I/O thread forever).
     ws.get_ref()
         .set_read_timeout(Some(WS_IO_POLL_INTERVAL))
-        .map_err(|err| format!("Не удалось выставить WS poll timeout (порт {port}): {err}"))?;
+        .map_err(|err| tf!("backend_ipc.transport.ws_poll_timeout_error", port = port, err = err))?;
 
     let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>();
     let shared = Arc::new(WsShared {
@@ -771,7 +756,7 @@ pub(crate) fn connect_ws(
     thread::Builder::new()
         .name("backend-ipc-ws-io".to_string())
         .spawn(move || ws_io_loop(io_weak, ws, outbound_rx))
-        .map_err(|err| format!("Не удалось запустить WS I/O поток backend (порт {port}): {err}"))?;
+        .map_err(|err| tf!("backend_ipc.transport.ws_io_thread_start_error", port = port, err = err))?;
 
     // Connected: clear the outage flag so the next outage is reported again.
     if CONNECT_FAILURE_WARNED.swap(false, Ordering::SeqCst) {
@@ -849,14 +834,14 @@ pub fn current_backend_endpoint() -> Result<BackendEndpoint, String> {
     {
         let guard = WS_ENDPOINT
             .read()
-            .map_err(|_| "Внутренняя ошибка: WS endpoint RwLock отравлён.".to_string())?;
+            .map_err(|_| t!("backend_ipc.transport.ws_endpoint_lock_poisoned").to_string())?;
         match guard.as_ref() {
             Some((port, token)) => Ok(BackendEndpoint::Ws {
                 port: *port,
                 token: token.clone(),
             }),
             None => {
-                Err("WS endpoint не опубликован (backend ещё не сообщил порт).".to_string())
+                Err(t!("backend_ipc.transport.ws_endpoint_not_published").to_string())
             }
         }
     }

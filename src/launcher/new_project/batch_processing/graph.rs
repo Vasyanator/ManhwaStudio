@@ -85,16 +85,34 @@ pub enum ConnectError {
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // These messages are surfaced to the user via `launcher.batch.connect_error`
+        // (window.rs). They are message *values*, never persisted or `==`-compared.
         match self {
-            Self::SrcSocketNotFound => write!(f, "исходный сокет не найден"),
-            Self::DstSocketNotFound => write!(f, "целевой сокет не найден"),
-            Self::WrongDirection => write!(f, "соединение должно идти от выхода ко входу"),
-            Self::KindMismatch => write!(f, "нельзя соединить exec и data сокеты"),
+            Self::SrcSocketNotFound => {
+                write!(f, "{}", t!("launcher.batch.graph.connect_src_socket_not_found"))
+            }
+            Self::DstSocketNotFound => {
+                write!(f, "{}", t!("launcher.batch.graph.connect_dst_socket_not_found"))
+            }
+            Self::WrongDirection => {
+                write!(f, "{}", t!("launcher.batch.graph.connect_wrong_direction"))
+            }
+            Self::KindMismatch => {
+                write!(f, "{}", t!("launcher.batch.graph.connect_kind_mismatch"))
+            }
             Self::TypeMismatch { src, dst } => {
-                write!(f, "несовместимые типы: {} → {}", src.label(), dst.label())
+                write!(
+                    f,
+                    "{}",
+                    tf!(
+                        "launcher.batch.graph.connect_type_mismatch",
+                        src = src.label(),
+                        dst = dst.label()
+                    )
+                )
             }
             Self::InputAlreadyConnected => {
-                write!(f, "входной сокет уже подключён")
+                write!(f, "{}", t!("launcher.batch.graph.connect_input_already_connected"))
             }
         }
     }
@@ -290,7 +308,7 @@ impl GraphModel {
     pub fn from_json(value: &Value) -> Result<Self, String> {
         let version = value.get("version").and_then(Value::as_u64).unwrap_or(1);
         if version != 1 {
-            return Err(format!("неподдерживаемая версия файла: {version}"));
+            return Err(tf!("launcher.batch.graph.unsupported_version_error", version = version));
         }
 
         let mut model = Self::new();
@@ -310,9 +328,10 @@ impl GraphModel {
                     Some("str") => DataType::Str,
                     Some("image_list") => DataType::ImageList,
                     other => {
-                        return Err(format!(
-                            "неизвестный тип переменной '{}': {:?}",
-                            name, other
+                        return Err(tf!(
+                            "launcher.batch.graph.unknown_variable_type_error",
+                            name = name,
+                            other = format!("{other:?}")
                         ));
                     }
                 };
@@ -345,7 +364,7 @@ impl GraphModel {
                     .unwrap_or(Value::Object(Default::default()));
 
                 let params = params_from_flat_json(key, &flat_params)
-                    .ok_or_else(|| format!("неизвестный тип ноды: '{key}'"))?;
+                    .ok_or_else(|| tf!("launcher.batch.graph.unknown_node_type_error", key = key))?;
 
                 model.nodes.push(GraphNode {
                     id,
@@ -362,7 +381,12 @@ impl GraphModel {
                 let kind = match e.get("kind").and_then(Value::as_str) {
                     Some("exec") => EdgeKind::Exec,
                     Some("data") => EdgeKind::Data,
-                    other => return Err(format!("неизвестный kind рёбра: {other:?}")),
+                    other => {
+                        return Err(tf!(
+                            "launcher.batch.graph.unknown_edge_kind_error",
+                            other = format!("{other:?}")
+                        ));
+                    }
                 };
                 let src_node = u32::try_from(
                     e.get("src_node_id")
@@ -571,5 +595,144 @@ fn params_from_flat_json(key: &str, v: &Value) -> Option<NodeParams> {
         }),
         "end" => Some(NodeParams::End),
         _ => None,
+    }
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphModel, GraphVariable};
+    use crate::launcher::new_project::batch_processing::node_defs::NodeDefs;
+    use crate::launcher::new_project::batch_processing::types::{DataType, NodeParams, SocketKind};
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    /// Builds a small graph exercising an exec edge and an `ImageList` data edge, each
+    /// wired by the Cyrillic socket identifiers (`"Далее"`/`"Вход"`, `"Картинки"`).
+    fn sample_graph_with_cyrillic_edges(defs: &NodeDefs) -> GraphModel {
+        let mut g = GraphModel::new();
+        let start = g.add_node(
+            NodeParams::StartNumber {
+                start: 0,
+                step: 1,
+                end: 5,
+            },
+            egui::pos2(0.0, 0.0),
+        );
+        let downloader = g.add_node(NodeParams::QuickDownloader, egui::pos2(200.0, 0.0));
+        let save = g.add_node(
+            NodeParams::SaveFolder {
+                path: PathBuf::new(),
+                name_prefix: "page_".to_owned(),
+            },
+            egui::pos2(400.0, 0.0),
+        );
+        g.add_variable(GraphVariable {
+            name: "cnt".to_owned(),
+            data_type: DataType::Int,
+            persist_between_cycles: true,
+        });
+        g.add_edge(defs, start, "Далее", downloader, "Вход")
+            .expect("exec edge connects");
+        g.add_edge(defs, downloader, "Картинки", save, "Картинки")
+            .expect("image data edge connects");
+        g
+    }
+
+    /// Asserts every edge reconnects: both endpoints resolve by their raw socket name,
+    /// i.e. `add_edge` would not raise `Src/DstSocketNotFound` for the loaded graph.
+    fn assert_all_edges_resolve(model: &GraphModel, defs: &NodeDefs) {
+        for e in &model.edges {
+            let src_key = model.node_by_id(e.src_node).expect("src node").template_key();
+            let dst_key = model.node_by_id(e.dst_node).expect("dst node").template_key();
+            assert!(
+                defs.socket_spec(src_key, &e.src_socket).is_some(),
+                "src socket {:?} did not resolve on {src_key}",
+                e.src_socket
+            );
+            assert!(
+                defs.socket_spec(dst_key, &e.dst_socket).is_some(),
+                "dst socket {:?} did not resolve on {dst_key}",
+                e.dst_socket
+            );
+        }
+    }
+
+    #[test]
+    fn graph_round_trips_through_json_preserving_cyrillic_sockets() {
+        let defs = NodeDefs::build();
+        let g = sample_graph_with_cyrillic_edges(&defs);
+        let json_before = g.to_json();
+        let reloaded = GraphModel::from_json(&json_before).expect("reload succeeds");
+        // Semantic round-trip: re-serializing the reloaded graph reproduces the wire form.
+        assert_eq!(reloaded.to_json(), json_before);
+        // The Cyrillic identifiers survived verbatim in the persisted edges.
+        assert!(
+            reloaded
+                .edges
+                .iter()
+                .any(|e| e.src_socket == "Далее" && e.dst_socket == "Вход")
+        );
+        assert!(
+            reloaded
+                .edges
+                .iter()
+                .any(|e| e.src_socket == "Картинки" && e.dst_socket == "Картинки")
+        );
+        assert_all_edges_resolve(&reloaded, &defs);
+    }
+
+    #[test]
+    fn python_format_cyrillic_graph_loads_and_edges_resolve() {
+        let defs = NodeDefs::build();
+        // Hand-authored JSON in the Python version=1 shape, edges keyed by the Cyrillic
+        // socket names the Python implementation emits.
+        let src = r#"{
+            "version": 1,
+            "nodes": [
+                {"id": 1, "template_key": "start_number", "x": 0.0, "y": 0.0,
+                 "params": {"start": 0, "step": 1, "end": 5}},
+                {"id": 2, "template_key": "quick_downloader", "x": 100.0, "y": 0.0, "params": {}},
+                {"id": 3, "template_key": "save_folder", "x": 200.0, "y": 0.0,
+                 "params": {"path": "", "name_prefix": "page_"}}
+            ],
+            "edges": [
+                {"kind": "exec", "src_node_id": 1, "src_socket": "Далее",
+                 "dst_node_id": 2, "dst_socket": "Вход"},
+                {"kind": "data", "src_node_id": 2, "src_socket": "Картинки",
+                 "dst_node_id": 3, "dst_socket": "Картинки"}
+            ],
+            "variables": []
+        }"#;
+        let value: Value = serde_json::from_str(src).expect("fixture parses");
+        let model = GraphModel::from_json(&value).expect("python-format graph loads");
+        assert_eq!(model.nodes.len(), 3);
+        assert_eq!(model.edges.len(), 2);
+        assert_all_edges_resolve(&model, &defs);
+    }
+
+    #[test]
+    fn executor_input_socket_identifiers_match_node_defs() {
+        // `executor.rs` fetches node inputs by literal name (`inputs.get("Картинки")`,
+        // `inputs.get("Путь")`, `inputs.get("Значение")`). Those literals must match the
+        // declared socket identifiers, otherwise the lookup silently returns `None`.
+        let defs = NodeDefs::build();
+        let save_images = defs
+            .socket_spec("save_folder", "Картинки")
+            .expect("save_folder has a Картинки input");
+        assert!(save_images.is_input);
+        assert!(matches!(
+            save_images.kind,
+            SocketKind::Data(DataType::ImageList)
+        ));
+        assert!(
+            defs.socket_spec("save_folder", "Путь")
+                .expect("save_folder has a Путь input")
+                .is_input
+        );
+        assert!(defs.socket_spec("stitch_split", "Картинки").is_some());
+        assert!(defs.socket_spec("waifu2x", "Картинки").is_some());
+        assert!(defs.socket_spec("variable_write", "Значение").is_some());
     }
 }

@@ -252,7 +252,7 @@ impl LayerStack {
         let source_layer = Layer {
             id: 0,
             uid: uuid::Uuid::new_v4(),
-            name: "Исходник".to_string(),
+            name: t!("ps_editor.layers.source_base_name").to_string(),
             kind: LayerKind::Source,
             visible: true,
             opacity: 1.0,
@@ -267,7 +267,7 @@ impl LayerStack {
         let clean_layer = Layer {
             id: 1,
             uid: uuid::Uuid::new_v4(),
-            name: "Клин".to_string(),
+            name: t!("ps_editor.layers.clean_base_name").to_string(),
             kind: LayerKind::Clean,
             visible: true,
             opacity: 1.0,
@@ -358,6 +358,8 @@ impl LayerStack {
         let layer = Layer {
             id,
             uid: uuid::Uuid::new_v4(),
+            // Persisted layer name (round-trips to `layers.json`); must stay a stable
+            // literal, not a UI-language string. See docs/i18n_exclusions.md §A (layer names).
             name: format!("Слой {raster_index}"),
             kind: LayerKind::Raster,
             visible: true,

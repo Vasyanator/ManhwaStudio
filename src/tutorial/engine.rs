@@ -618,7 +618,7 @@ impl<C> Tutorial<C> {
         let counter = if self.linear {
             format!("{} / {}", idx + 1, self.steps.len())
         } else {
-            format!("Шаг {}", self.history.len())
+            tf!("tutorial.step_counter", step = self.history.len())
         };
 
         let screen = ctx.viewport_rect();
@@ -813,7 +813,7 @@ impl<C> Tutorial<C> {
     ) {
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let next_label = if terminal { "Готово" } else { "Далее" };
+                let next_label = if terminal { t!("tutorial.done_button") } else { t!("tutorial.next_button") };
                 match next_button {
                     NextButton::Enabled => {
                         if ui.button(next_label).clicked() {
@@ -825,14 +825,14 @@ impl<C> Tutorial<C> {
                     }
                     NextButton::Waiting => {
                         ui.add(egui::Spinner::new().size(16.0));
-                        ui.label("Ожидание…");
+                        ui.label(t!("tutorial.waiting"));
                     }
                     NextButton::Hidden => {}
                 }
-                if show_back && ui.button("Назад").clicked() {
+                if show_back && ui.button(t!("tutorial.back_button")).clicked() {
                     *action = Some(CalloutAction::Back);
                 }
-                if ui.button("Пропустить").clicked() {
+                if ui.button(t!("tutorial.skip_button")).clicked() {
                     *action = Some(CalloutAction::Stop);
                 }
             });
@@ -856,7 +856,7 @@ impl<C> Tutorial<C> {
         }
         ui.add_space(4.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Пропустить").clicked() {
+            if ui.button(t!("tutorial.skip_button")).clicked() {
                 *action = Some(CalloutAction::Stop);
             }
         });

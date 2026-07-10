@@ -124,8 +124,7 @@ impl FontSettingsEditorState {
         self.poll_categories_load(ui.ctx());
 
         ui.label(
-            "Списки шрифтов приложения по категориям. Имя каждого шрифта показано его \
-             собственным начертанием.",
+            t!("typing.font_settings.description_hint"),
         );
         ui.add_space(4.0);
 
@@ -136,7 +135,7 @@ impl FontSettingsEditorState {
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Загрузка списков шрифтов…");
+                    ui.label(t!("typing.font_settings.loading_status"));
                 });
             }
             Some(cats) => self.draw_categories(ui, cats),
@@ -148,26 +147,23 @@ impl FontSettingsEditorState {
 
     /// Renders the three category collapsing headers from a loaded snapshot.
     fn draw_categories(&mut self, ui: &mut egui::Ui, cats: &FontCategories) {
-        egui::CollapsingHeader::new(format!("Шрифты из папки fonts ({})", cats.folder.len()))
+        egui::CollapsingHeader::new(tf!("typing.font_settings.folder_fonts_header", cats = cats.folder.len()))
             .id_salt("font_settings_folder")
             .default_open(false)
             .show(ui, |ui| {
                 if cats.folder.is_empty() {
-                    ui.small("Папка fonts пуста.");
+                    ui.small(t!("typing.font_settings.folder_empty_hint"));
                 } else {
                     Self::draw_font_rows_virtualized(ui, &cats.folder, "font_settings_folder_rows");
                 }
             });
 
-        egui::CollapsingHeader::new(format!(
-            "Добавленные системные шрифты ({})",
-            cats.imported.len()
-        ))
+        egui::CollapsingHeader::new(tf!("typing.font_settings.imported_fonts_header", cats = cats.imported.len()))
         .id_salt("font_settings_imported")
         .default_open(false)
         .show(ui, |ui| {
             if cats.imported.is_empty() {
-                ui.small("Пусто. Добавьте шрифты кнопкой ниже.");
+                ui.small(t!("typing.font_settings.imported_empty_hint"));
             } else {
                 // Virtualized like the folder list; each row additionally carries a remove
                 // button that drives the store (bumping its revision → the lists reload).
@@ -185,7 +181,7 @@ impl FontSettingsEditorState {
                             ui.horizontal(|ui| {
                                 if ui
                                     .small_button("✕")
-                                    .on_hover_text("Удалить из импортированных")
+                                    .on_hover_text(t!("typing.font_settings.remove_imported_tooltip"))
                                     .clicked()
                                 {
                                     font_settings_store::remove_imported_system_font(&font.path);
@@ -197,19 +193,19 @@ impl FontSettingsEditorState {
             }
             ui.add_space(4.0);
             // Kept OUTSIDE the scrolled row area so it stays reachable regardless of scroll.
-            if ui.button("Импортировать шрифт из системы").clicked() {
+            if ui.button(t!("typing.font_settings.import_from_system_button")).clicked() {
                 self.picker_open = true;
             }
         });
 
-        egui::CollapsingHeader::new("Кастомные шрифты")
+        egui::CollapsingHeader::new(t!("typing.font_settings.custom_fonts_header")).id_salt("typing.font_settings.custom_fonts_header")
             .id_salt("font_settings_custom")
             .default_open(false)
             .show(ui, |ui| {
                 // `custom` is intentionally empty for now; still read it so the field is
                 // wired for the future virtual-font category.
                 if cats.custom.is_empty() {
-                    ui.small("Пока не поддерживаются.");
+                    ui.small(t!("typing.font_settings.custom_fonts_unsupported_hint"));
                 } else {
                     Self::draw_font_rows_virtualized(ui, &cats.custom, "font_settings_custom_rows");
                 }
@@ -343,7 +339,7 @@ impl FontSettingsEditorState {
         let mut close_requested = false;
         let mut to_add: Option<PathBuf> = None;
 
-        egui::Window::new("Импорт системного шрифта")
+        egui::Window::new(t!("typing.font_settings.import_window_title")).id(egui::Id::new("typing.font_settings.import_window_title"))
             .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
@@ -352,7 +348,7 @@ impl FontSettingsEditorState {
                 None => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Загрузка списка системных шрифтов…");
+                        ui.label(t!("typing.font_settings.system_list_loading_status"));
                     });
                     ui.ctx().request_repaint();
                 }
@@ -456,11 +452,11 @@ fn draw_picker_body(
     close_requested: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.label("Поиск:");
+        ui.label(t!("typing.font_settings.search_label"));
         ui.add(
             egui::TextEdit::singleline(search)
                 .desired_width(300.0)
-                .hint_text("имя шрифта"),
+                .hint_text(t!("typing.font_settings.search_placeholder")),
         );
     });
     ui.add_space(4.0);
@@ -474,7 +470,7 @@ fn draw_picker_body(
         .collect();
 
     if filtered.is_empty() {
-        ui.small("Ничего не найдено.");
+        ui.small(t!("typing.font_settings.nothing_found_status"));
     } else {
         let body_size = egui::TextStyle::Body.resolve(ui.style()).size;
         // Rows are drawn in each font's own face, whose intrinsic line height can exceed
@@ -529,17 +525,17 @@ fn draw_picker_body(
     ui.horizontal(|ui| {
         let can_add = selected.is_some() && !already_imported;
         if ui
-            .add_enabled(can_add, egui::Button::new("Добавить"))
+            .add_enabled(can_add, egui::Button::new(t!("typing.font_settings.add_button")))
             .clicked()
         {
             *to_add = selected.clone();
             *close_requested = true;
         }
-        if ui.button("Отмена").clicked() {
+        if ui.button(t!("typing.common.cancel_button")).clicked() {
             *close_requested = true;
         }
         if already_imported {
-            ui.label("Уже добавлен.");
+            ui.label(t!("typing.font_settings.already_added_status"));
         }
     });
 }

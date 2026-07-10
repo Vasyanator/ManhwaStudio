@@ -24,6 +24,23 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   background highlights.
 - `spellchecked_line.rs`: multiline text editor with asynchronous Hunspell-compatible
   spellchecking, misspelling underlines, and global/project custom-word helpers.
+  The active dictionary follows the TYPESETTING language (`ms_text_util::language::text_language`,
+  like hyphenation and font coverage), never the UI language. `dictionary_spec(language)` is the
+  language→dictionary provenance table (on-disk stem + verified `.aff`/`.dic` URLs); it is pure,
+  total, and unit-tested. Most dictionaries come from `LibreOffice/dictionaries`, but `fr`, `pl`,
+  and `sl` come from `wooorm/dictionaries` on purpose (LibreOffice has no `fr_FR` directory, and its
+  `pl_PL`/`sl_SI` files are `SET ISO8859-2`, which this module's UTF-8 `read_to_string` load path
+  rejects — do not "fix" these back). The background worker compares `text_language()` each batch
+  and downloads the active language's dictionary at most once per language
+  (`download_attempted: HashSet<TextLanguage>`), so a failed download of one language never blocks
+  another. Per-word matching is language-first, script-second: a word in the active language's own
+  script is judged ONLY by that language's dictionary (a stale same-script dictionary left on disk,
+  e.g. `uk_UA` after switching to Russian, must not vote), while a word of the other script is judged
+  by any dictionary of that script so mixed-script text keeps working. If the active language's
+  dictionary is missing, its words are left unmarked rather than judged by a sibling dictionary that
+  would flag nearly all of them. The per-word cache key carries the typesetting language, and the
+  whole cache is cleared whenever the loaded dictionary set changes, so a verdict from one language
+  never survives a switch. On wasm the download layer is unavailable; the word is left unmarked.
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
   list.
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
@@ -46,6 +63,10 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   scroll areas permanently blocked.
 - `ViewportColorSelector` samples only egui screenshot events for its own token; callers own the
   selected color and any durable persistence.
+- `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
+  (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
+  (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but
+  the id source must not follow the translation.
 
 ## Editing map
 - To add a reusable widget, create a focused source file and re-export its public type in

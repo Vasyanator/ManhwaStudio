@@ -43,6 +43,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `disabled_reason` is shown. The panel reads capabilities from the process-global `AiCaps::current`,
   not from parameters.
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
+  Each entry is `(wire_code, display_key)`: the wire code is the persisted identity
+  sent to the backend, the display key is an i18n catalog key resolved to a localized
+  label at render time via `lang_label`. Only the wire code is identity; labels localize.
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
   actions, and line/mask edit mode toggles.
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API
@@ -75,6 +78,10 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   action; errors must be returned and shown rather than ignored.
 - Language catalogs in `ocr_langs.rs` are data only. Runtime model availability and downloads are
   handled outside this directory.
+- UI strings localize through the `ms-i18n` `t!`/`tf!` macros; user-facing text must not be a
+  Cyrillic literal. Display labels stored in `const` tables (`ocr_langs.rs` tuples,
+  `MtLanguage.title` in `machine_translation.rs`) hold a catalog key, not the text, and resolve at
+  render time (`t!` is not `const`). Wire codes/tokens sent to the backend stay literal identities.
 
 ## Editing map
 - To add a new translation side panel, add the module here, route it in `TranslationPanel` and

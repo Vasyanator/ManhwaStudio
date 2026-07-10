@@ -45,7 +45,7 @@ use crate::launcher::new_project::project_io::{
     dir_has_entries,
 };
 use crate::launcher::new_project::quick_download::{
-    QuickDownloadController, QuickDownloadEvent, SUPPORTED_SITES_TOOLTIP,
+    QuickDownloadController, QuickDownloadEvent, supported_sites_tooltip,
 };
 use crate::launcher::new_project::reline::{
     RelineController, RelineCvtColorOptions, RelineEvent, RelineHalftoneOptions, RelineInputImage,
@@ -149,10 +149,10 @@ impl SimpleModeStep {
 
     fn title(self) -> &'static str {
         match self {
-            Self::ImportDownload => "Импорт/выкачка",
-            Self::StitchCut => "Сшивание и нарезка",
-            Self::Denoise => "Удаление шума",
-            Self::Save => "Сохранение",
+            Self::ImportDownload => t!("launcher.new_project.step_import"),
+            Self::StitchCut => t!("launcher.new_project.step_stitch"),
+            Self::Denoise => t!("launcher.new_project.step_denoise"),
+            Self::Save => t!("launcher.new_project.step_save"),
         }
     }
 
@@ -300,22 +300,22 @@ impl RelineSimplePreset {
     /// Short label shown on the preset selector.
     fn label(self) -> &'static str {
         match self {
-            Self::ModelOnly => "Только модель",
-            Self::RestoreLightSharp => "Реставрация + лёгкая резкость",
-            Self::Descreen => "Убрать растр",
-            Self::AddHalftone => "Добавить скринтон",
+            Self::ModelOnly => t!("launcher.new_project.processor_model_only"),
+            Self::RestoreLightSharp => t!("launcher.new_project.processor_restore_light_sharp"),
+            Self::Descreen => t!("launcher.new_project.processor_remove_screen"),
+            Self::AddHalftone => t!("launcher.new_project.processor_add_screentone"),
         }
     }
 
     /// One-line recommendation shown under the selected preset.
     fn hint(self) -> &'static str {
         match self {
-            Self::ModelOnly => "Чистый прогон выбранной модели без дополнительной обработки.",
+            Self::ModelOnly => t!("launcher.new_project.processor_model_only_desc"),
             Self::RestoreLightSharp => {
-                "Модель плюс мягкая резкость — универсальный выбор для большинства сканов."
+                t!("launcher.new_project.processor_restore_light_sharp_desc")
             }
-            Self::Descreen => "Подходит, когда на скане видна сетка растра печати.",
-            Self::AddHalftone => "Накладывает полутоновую сетку (скринтон) поверх результата.",
+            Self::Descreen => t!("launcher.new_project.processor_remove_screen_desc"),
+            Self::AddHalftone => t!("launcher.new_project.processor_add_screentone_desc"),
         }
     }
 }
@@ -740,7 +740,7 @@ impl NewProjectWindowState {
             save_title: 0,
             save_title_input: "Title A".to_string(),
             save_title_combo: EditableComboBox::new("launcher_new_project_save_title")
-                .with_hint_text("Выберите тайтл или введите свой"),
+                .with_hint_text(t!("launcher.new_project.title_combo_hint")),
             save_chapter: String::new(),
             save_mode: SaveMode::ProjectBase,
             last_independent_save_dir: None,
@@ -748,7 +748,7 @@ impl NewProjectWindowState {
             alt_chapter: 0,
             alt_name: String::new(),
             project_catalog_error: None,
-            import_status: "Изображения ещё не загружены".to_string(),
+            import_status: t!("launcher.new_project.no_images_loaded_hint").to_string(),
             last_error: None,
             source_import: SourceImportController::new(),
             project_catalog: ProjectCatalogController::new(projects_root.clone()),
@@ -966,7 +966,7 @@ impl NewProjectWindowState {
 
     fn show_embedded(&mut self, ctx: &egui::Context) -> bool {
         let mut keep_open = true;
-        Window::new("Новый проект")
+        Window::new(t!("launcher.new_project.window_title")).id(egui::Id::new("launcher.new_project.window_title"))
             .open(&mut keep_open)
             .default_size(egui::vec2(1180.0, 760.0))
             .min_width(1000.0)
@@ -1006,7 +1006,7 @@ impl NewProjectWindowState {
             || self.screen_capture_in_flight;
         ui.set_width(LEFT_PANEL_WIDTH);
         ui.vertical(|ui| {
-            ui.label(RichText::new("Общий прогресс").small());
+            ui.label(RichText::new(t!("launcher.new_project.overall_progress_label")).small());
             ui.label(RichText::new(&self.import_status).small().weak());
             let global_progress = self.current_progress(any_loading);
             ui.horizontal(|ui| {
@@ -1016,13 +1016,13 @@ impl NewProjectWindowState {
                         .desired_width((LEFT_PANEL_WIDTH - 86.0).max(180.0))
                         .text(global_progress.label),
                 );
-                if button_sized(ui, "Гайд", egui::vec2(64.0, 22.0), true).clicked() {
+                if button_sized(ui, t!("launcher.new_project.guide_button"), egui::vec2(64.0, 22.0), true).clicked() {
                     self.pending_open_wiki_guide = true;
                 }
             });
             if button_sized(
                 ui,
-                "Массовая обработка",
+                t!("launcher.new_project.batch_processing_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 4.0, 34.0),
                 true,
             )
@@ -1047,12 +1047,12 @@ impl NewProjectWindowState {
             ui.selectable_value(
                 &mut self.left_panel_mode,
                 LeftPanelMode::Simple,
-                "Простой режим",
+                t!("launcher.new_project.mode_simple"),
             );
             ui.selectable_value(
                 &mut self.left_panel_mode,
                 LeftPanelMode::Full,
-                "Полная панель",
+                t!("launcher.new_project.mode_full"),
             );
         });
         #[cfg(feature = "tutorial")]
@@ -1064,25 +1064,25 @@ impl NewProjectWindowState {
             .id_salt("launcher_new_project_left_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                section_group(ui, "Импорт", |ui| self.show_import_section(ui));
+                section_group(ui, t!("launcher.new_project.section_import"), |ui| self.show_import_section(ui));
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "Быстрый выкачиватель", |ui| {
+                section_group(ui, t!("launcher.new_project.section_quick_dl"), |ui| {
                     self.show_quick_downloader(ui)
                 });
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "Продвинутый выкачиватель", |ui| {
+                section_group(ui, t!("launcher.new_project.section_advanced_dl"), |ui| {
                     self.show_advanced_downloader(ui)
                 });
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "Сшивание / Нарезка", |ui| {
+                section_group(ui, t!("launcher.new_project.section_stitch"), |ui| {
                     self.show_stitch_section(ui)
                 });
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "Обработка изображений", |ui| {
+                section_group(ui, t!("launcher.new_project.section_processing"), |ui| {
                     self.show_image_processing_section(ui)
                 });
                 ui.add_space(SECTION_SPACING);
-                section_group(ui, "Сохранение", |ui| self.show_save_section(ui));
+                section_group(ui, t!("launcher.new_project.step_save"), |ui| self.show_save_section(ui));
             });
     }
 
@@ -1128,15 +1128,11 @@ impl NewProjectWindowState {
 
         section_group(
             ui,
-            &format!(
-                "Шаг {}. {}",
-                self.simple_mode_step.number(),
-                self.simple_mode_step.title()
-            ),
+            &tf!("launcher.new_project.simple_step_header", arg = self.simple_mode_step.number(), arg_2 = self.simple_mode_step.title()),
             |ui| {
                 ui.label(
                     RichText::new(
-                        "Перед тем, как открыть основную студию, нужно скачать предварительно обработать главу. Выполните эти этапы.",
+                        t!("launcher.new_project.simple_intro_text"),
                     )
                     .color(egui::Color32::WHITE)
                     .strong(),
@@ -1147,7 +1143,7 @@ impl NewProjectWindowState {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new(
-                                "Продвинутый выкачиватель открыт внутри простого режима.",
+                                t!("launcher.new_project.simple_adv_dl_open_notice"),
                             )
                             .small()
                             .weak(),
@@ -1155,7 +1151,7 @@ impl NewProjectWindowState {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if button_sized(
                                 ui,
-                                "Вернуться к вариантам",
+                                t!("launcher.new_project.back_to_options_button"),
                                 egui::vec2(176.0, 28.0),
                                 true,
                             )
@@ -1170,15 +1166,15 @@ impl NewProjectWindowState {
                     return;
                 }
 
-                sub_group(ui, "Откуда вы берёте главу?", |ui| {
+                sub_group(ui, t!("launcher.new_project.source_question"), |ui| {
                     ui.label(
-                        RichText::new("Уже скачанный архив, папка, или одна картинка:").strong(),
+                        RichText::new(t!("launcher.new_project.already_downloaded_hint")).strong(),
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if button_sized(
                             ui,
-                            "Открыть архив/картинку",
+                            t!("launcher.new_project.open_archive_image_button"),
                             egui::vec2(198.0, 34.0),
                             file_button_enabled,
                         )
@@ -1188,7 +1184,7 @@ impl NewProjectWindowState {
                         }
                         if button_sized(
                             ui,
-                            "Открыть папку",
+                            t!("launcher.new_project.open_folder_button"),
                             egui::vec2(146.0, 34.0),
                             folder_button_enabled,
                         )
@@ -1199,7 +1195,7 @@ impl NewProjectWindowState {
                     });
                     if button_sized(
                         ui,
-                        "Вставить из буфера",
+                        t!("launcher.new_project.paste_from_clipboard_button"),
                         egui::vec2(198.0, 34.0),
                         clipboard_button_enabled,
                     )
@@ -1213,12 +1209,12 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 sub_group(
                     ui,
-                    "Скачанная веб-страница (Ctrl+S в браузере)",
+                    t!("launcher.new_project.saved_webpage_hint"),
                     |ui| {
                         ui.horizontal(|ui| {
                             if button_sized(
                                 ui,
-                                "Открыть папку страницы",
+                                t!("launcher.new_project.open_page_folder_button"),
                                 egui::vec2(198.0, 34.0),
                                 folder_button_enabled,
                             )
@@ -1228,7 +1224,7 @@ impl NewProjectWindowState {
                             }
                             if button_sized(
                                 ui,
-                                "Открыть HTML страницы",
+                                t!("launcher.new_project.open_page_html_button"),
                                 egui::vec2(182.0, 34.0),
                                 file_button_enabled,
                             )
@@ -1243,9 +1239,9 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 sub_group(
                     ui,
-                    "Глава бесплатная и на одном из следующих сайтов:",
+                    t!("launcher.new_project.free_chapter_sites_hint"),
                     |ui| {
-                        egui::CollapsingHeader::new("Поддерживаемые сайты")
+                        egui::CollapsingHeader::new(t!("launcher.new_project.supported_sites_header")).id_salt("launcher.new_project.supported_sites_header")
                             .default_open(false)
                             .show(ui, |ui| {
                                 for site in supported_quick_download_sites() {
@@ -1256,12 +1252,12 @@ impl NewProjectWindowState {
                         ui.add(
                             TextEdit::singleline(&mut self.quick_link)
                                 .desired_width(fill_width(ui))
-                                .hint_text("Вставьте ссылку на главу"),
+                                .hint_text(t!("launcher.new_project.paste_chapter_link_placeholder")),
                         );
                         ui.add_space(8.0);
                         if button_sized(
                             ui,
-                            "Скачать",
+                            t!("launcher.new_project.download_button"),
                             egui::vec2(140.0, 34.0),
                             quick_download_enabled,
                         )
@@ -1276,11 +1272,11 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 sub_group(
                     ui,
-                    "Не планировал переводить и просто хочешь поигратся с программой?",
+                    t!("launcher.new_project.test_chapter_intro"),
                     |ui| {
                         ui.label(
                             RichText::new(
-                                "Можно скачать тестовую главу. Убедитесь, что у вас работает сайт comic.naver.com.",
+                                t!("launcher.new_project.test_chapter_hint"),
                             )
                             .small()
                             .weak(),
@@ -1288,7 +1284,7 @@ impl NewProjectWindowState {
                         ui.add_space(8.0);
                         let test_dl = button_sized(
                             ui,
-                            "Скачать тестовую главу",
+                            t!("launcher.new_project.download_test_chapter_button"),
                             egui::vec2(220.0, 34.0),
                             quick_download_enabled,
                         );
@@ -1304,11 +1300,11 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 sub_group(
                     ui,
-                    "Автоматический перехват картинок",
+                    t!("launcher.new_project.auto_intercept_title"),
                     |ui| {
                         ui.label(
                             RichText::new(
-                                "Наиболее универсальный метод, но потом нужно будет вручную удалить лишние картинки",
+                                t!("launcher.new_project.auto_intercept_hint"),
                             )
                             .small()
                             .weak(),
@@ -1317,7 +1313,7 @@ impl NewProjectWindowState {
                         ui.add(
                             TextEdit::singleline(&mut self.advanced_page_url)
                                 .desired_width(fill_width(ui))
-                                .hint_text("Вставьте ссылку на главу"),
+                                .hint_text(t!("launcher.new_project.paste_chapter_link_placeholder")),
                         );
                         ui.add_space(8.0);
 
@@ -1328,7 +1324,7 @@ impl NewProjectWindowState {
 
                         if button_sized(
                             ui,
-                            "Открыть в браузере",
+                            t!("launcher.new_project.open_in_browser_button"),
                             egui::vec2(220.0, 34.0),
                             !capture_busy && !self.advanced_intercept_active && url_ready,
                         )
@@ -1342,10 +1338,7 @@ impl NewProjectWindowState {
                         if self.advanced_intercept_active {
                             let counts = self.advanced_intercept_counts;
                             ui.label(
-                                RichText::new(format!(
-                                    "Перехвачено {} холстов, найдено {} обычных картинок",
-                                    counts.canvases, counts.images
-                                ))
+                                RichText::new(tf!("launcher.new_project.intercept_counts_status", counts = counts.canvases, counts_2 = counts.images))
                                 .color(egui::Color32::from_rgb(76, 175, 80))
                                 .strong(),
                             );
@@ -1354,7 +1347,7 @@ impl NewProjectWindowState {
 
                         if button_sized(
                             ui,
-                            "Начать перехват",
+                            t!("launcher.new_project.start_intercept_button"),
                             egui::vec2(220.0, 34.0),
                             !capture_busy && !self.advanced_intercept_active,
                         )
@@ -1365,7 +1358,7 @@ impl NewProjectWindowState {
                         }
                         if button_sized(
                             ui,
-                            "Завершить перехват",
+                            t!("launcher.new_project.finish_intercept_button"),
                             egui::vec2(220.0, 34.0),
                             !capture_busy && self.advanced_intercept_active,
                         )
@@ -1380,17 +1373,17 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 sub_group(
                     ui,
-                    "Все предыдущие методы не сработали",
+                    t!("launcher.new_project.all_methods_failed_hint"),
                     |ui| {
                         ui.label(
-                            RichText::new("Будьте готовы порыться в HTML коде сайта.")
+                            RichText::new(t!("launcher.new_project.html_dig_hint"))
                                 .small()
                                 .weak(),
                         );
                         ui.add_space(8.0);
                         if button_sized(
                             ui,
-                            "Открыть продвинутый выкачиватель",
+                            t!("launcher.new_project.open_advanced_dl_button"),
                             egui::vec2(260.0, 34.0),
                             advanced_button_enabled,
                         )
@@ -1408,17 +1401,13 @@ impl NewProjectWindowState {
         let can_start = self.can_start_stitch();
         section_group(
             ui,
-            &format!(
-                "Шаг {}. {}",
-                self.simple_mode_step.number(),
-                self.simple_mode_step.title()
-            ),
+            &tf!("launcher.new_project.simple_step_header", arg = self.simple_mode_step.number(), arg_2 = self.simple_mode_step.title()),
             |ui| {
                 ui.label(
-                    "У вас вертикальный комикс (манхва/вебтун), или страничный (манга, классический западный)? Если страничный, то сшивание не нужно, переходите к следующему этапу.",
+                    t!("launcher.new_project.vertical_or_paged_question"),
                 );
                 ui.add_space(8.0);
-                if button_sized(ui, "Пропустить сшивание", egui::vec2(220.0, 34.0), true).clicked()
+                if button_sized(ui, t!("launcher.new_project.skip_stitch_button"), egui::vec2(220.0, 34.0), true).clicked()
                 {
                     self.simple_stitch_done = true;
                     self.simple_manual_cut_preview_active = false;
@@ -1426,11 +1415,11 @@ impl NewProjectWindowState {
                 }
 
                 ui.add_space(SECTION_SPACING * 1.6);
-                ui.label(RichText::new("Если это вебтун, то нарежьте его:").strong());
+                ui.label(RichText::new(t!("launcher.new_project.if_webtoon_cut_hint")).strong());
                 ui.add_space(8.0);
                 if button_sized(
                     ui,
-                    "Сшить и нарезать автоматически",
+                    t!("launcher.new_project.stitch_cut_auto_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     can_start,
                 )
@@ -1442,7 +1431,7 @@ impl NewProjectWindowState {
                 }
                 if button_sized(
                     ui,
-                    "Сшить и посмотреть места резки",
+                    t!("launcher.new_project.stitch_show_cuts_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     can_start,
                 )
@@ -1458,7 +1447,7 @@ impl NewProjectWindowState {
                     ui.add_space(SECTION_SPACING);
                     ui.label(
                         RichText::new(
-                            "Автоматические разрезы расставлены. Посмотрите каждое место, отмеченное красной стрелочкой, и убедитесь, что разрезы будут в удобных местах. Можете добавить дополнительные разрезы в меню ПКМ. В конце нажмите большую красную кнопку Нарезать вверху ленты",
+                            t!("launcher.new_project.auto_cuts_review_hint"),
                         )
                         .color(egui::Color32::WHITE)
                         .strong(),
@@ -1469,13 +1458,13 @@ impl NewProjectWindowState {
                     ui.add_space(SECTION_SPACING);
                     ui.label(
                         RichText::new(
-                            "Лишние разрезы можно сшить назад, выбрав в меню ПКМ опцию сшивания текущей страницы со следующей и предыдущей",
+                            t!("launcher.new_project.extra_cuts_hint"),
                         )
                         .color(egui::Color32::WHITE)
                         .strong(),
                     );
                     ui.add_space(10.0);
-                    if button_sized(ui, "Далее", egui::vec2(124.0, 34.0), true).clicked() {
+                    if button_sized(ui, t!("launcher.common.next_button"), egui::vec2(124.0, 34.0), true).clicked() {
                         self.simple_mode_step = SimpleModeStep::Denoise;
                     }
                 }
@@ -1486,15 +1475,11 @@ impl NewProjectWindowState {
     fn show_simple_denoise_step(&mut self, ui: &mut Ui) {
         section_group(
             ui,
-            &format!(
-                "Шаг {}. {}",
-                self.simple_mode_step.number(),
-                self.simple_mode_step.title()
-            ),
+            &tf!("launcher.new_project.simple_step_header", arg = self.simple_mode_step.number(), arg_2 = self.simple_mode_step.title()),
             |ui| {
                 ui.label(
                     RichText::new(
-                        "Это не обязательно. Может помочь, если глава с пиратского сайта и в плохом качестве, но может немного подпортить мелкие текстуры на чистой главе",
+                        t!("launcher.new_project.denoise_optional_hint"),
                     )
                     .color(egui::Color32::WHITE)
                     .strong(),
@@ -1504,7 +1489,7 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING * 1.6);
                 if button_sized(
                     ui,
-                    &format!("Обработать через {}", self.image_processor.title()),
+                    &tf!("launcher.new_project.process_with_button", arg = self.image_processor.title()),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     self.can_start_image_processing(),
                 )
@@ -1513,7 +1498,7 @@ impl NewProjectWindowState {
                     self.start_image_processing();
                     self.simple_mode_step = SimpleModeStep::Save;
                 }
-                if button_sized(ui, "пропустить", egui::vec2(140.0, 34.0), true).clicked()
+                if button_sized(ui, t!("launcher.new_project.skip_button"), egui::vec2(140.0, 34.0), true).clicked()
                 {
                     self.simple_mode_step = SimpleModeStep::Save;
                 }
@@ -1528,15 +1513,11 @@ impl NewProjectWindowState {
 
         section_group(
             ui,
-            &format!(
-                "Шаг {}. {}",
-                self.simple_mode_step.number(),
-                self.simple_mode_step.title()
-            ),
+            &tf!("launcher.new_project.simple_step_header", arg = self.simple_mode_step.number(), arg_2 = self.simple_mode_step.title()),
             |ui| {
                 let mut save_to_project = self.save_mode != SaveMode::Independent;
                 if ui
-                    .checkbox(&mut save_to_project, "Сохранить в проекты ManhwaStudio")
+                    .checkbox(&mut save_to_project, t!("launcher.new_project.save_to_projects_button"))
                     .changed()
                     && save_to_project
                 {
@@ -1545,14 +1526,14 @@ impl NewProjectWindowState {
 
                 let mut save_to_folder = self.save_mode == SaveMode::Independent;
                 if ui
-                    .checkbox(&mut save_to_folder, "Сохранить в любую другую папку")
+                    .checkbox(&mut save_to_folder, t!("launcher.new_project.save_to_other_folder_button"))
                     .changed()
                     && save_to_folder
                 {
                     self.save_mode = SaveMode::Independent;
                 }
                 ui.label(
-                    RichText::new("Если просто решили использовать эту программу для выкачки")
+                    RichText::new(t!("launcher.new_project.just_downloading_hint"))
                         .small()
                         .weak(),
                 );
@@ -1560,7 +1541,7 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 if self.project_catalog.is_loading() {
                     ui.label(
-                        RichText::new("Обновляем список тайтлов и глав...")
+                        RichText::new(t!("launcher.new_project.refreshing_titles_status"))
                             .small()
                             .weak(),
                     );
@@ -1571,7 +1552,7 @@ impl NewProjectWindowState {
                 if self.save_mode == SaveMode::Independent {
                     if button_sized(
                         ui,
-                        "Выбрать папку для сохранения",
+                        t!("launcher.new_project.choose_save_folder_button"),
                         egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                         can_save,
                     )
@@ -1583,26 +1564,26 @@ impl NewProjectWindowState {
                     return;
                 }
 
-                ui.label("Введите название своего тайтла или выберите из существующих:");
+                ui.label(t!("launcher.new_project.title_input_hint"));
                 let save_title_response =
                     self.save_title_combo
                         .draw(ui, &mut self.save_title_input, titles.as_slice());
                 if save_title_response.changed {
                     self.sync_save_title_from_input();
                 }
-                if button_sized(ui, "Обновить", SMALL_BUTTON_SIZE, can_refresh_catalog).clicked()
+                if button_sized(ui, t!("launcher.common.refresh_button"), SMALL_BUTTON_SIZE, can_refresh_catalog).clicked()
                 {
                     self.refresh_project_catalog();
                 }
 
                 ui.add_space(8.0);
-                ui.label("Введите номер главы или её название:");
+                ui.label(t!("launcher.new_project.chapter_input_hint"));
                 ui.add(TextEdit::singleline(&mut self.save_chapter).desired_width(fill_width(ui)));
 
                 ui.add_space(SECTION_SPACING);
                 if button_sized(
                     ui,
-                    "Сохранить главу и открыть в основной студии",
+                    t!("launcher.new_project.save_and_open_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     can_save,
                 )
@@ -1612,7 +1593,7 @@ impl NewProjectWindowState {
                 }
                 if button_sized(
                     ui,
-                    "Сохранить главу и скачать ещё одну",
+                    t!("launcher.new_project.save_and_download_more_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     can_save,
                 )
@@ -1625,7 +1606,7 @@ impl NewProjectWindowState {
                 ui.add_space(SECTION_SPACING);
                 ui.label(
                     RichText::new(
-                        "Главы хранятся в ваших документах в папке manhwastudio_projects, там папки с тайтлами, в тайтлах главы. Исходники найдете в папке главы в src",
+                        t!("launcher.new_project.projects_location_hint"),
                     )
                     .small()
                     .weak(),
@@ -1641,14 +1622,14 @@ impl NewProjectWindowState {
         let can_go_next = next_step.is_some()
             && (self.simple_mode_step != SimpleModeStep::StitchCut || self.simple_stitch_done);
         let next_label = if self.simple_mode_step == SimpleModeStep::StitchCut {
-            "Далее"
+            t!("launcher.common.next_button")
         } else {
-            "Вперед"
+            t!("launcher.common.forward_button")
         };
         ui.horizontal(|ui| {
             if button_sized(
                 ui,
-                "Назад",
+                t!("launcher.common.back_button"),
                 egui::vec2(124.0, 34.0),
                 previous_step.is_some(),
             )
@@ -1680,7 +1661,7 @@ impl NewProjectWindowState {
         ui.horizontal(|ui| {
             let open_folder = button_sized(
                 ui,
-                "Открыть папку...",
+                t!("launcher.new_project.open_folder_menu"),
                 ACTION_BUTTON_SIZE,
                 !self.source_import.is_loading(),
             );
@@ -1691,7 +1672,7 @@ impl NewProjectWindowState {
             }
             if button_sized(
                 ui,
-                "Открыть файл...",
+                t!("launcher.new_project.open_file_menu"),
                 ACTION_BUTTON_SIZE,
                 !self.source_import.is_loading() && !self.clipboard_paste_in_flight,
             )
@@ -1702,7 +1683,7 @@ impl NewProjectWindowState {
         });
         if button_sized(
             ui,
-            "Вставить из буфера",
+            t!("launcher.new_project.paste_from_clipboard_button"),
             ACTION_BUTTON_SIZE,
             !self.source_import.is_loading()
                 && !self.clipboard_paste_in_flight
@@ -1713,9 +1694,9 @@ impl NewProjectWindowState {
             self.start_clipboard_paste();
         }
         let capture_button_label = if self.is_screen_capture_mode_enabled() {
-            "Выйти из режима захвата"
+            t!("launcher.new_project.exit_capture_mode_button")
         } else {
-            "Режим захвата"
+            t!("launcher.new_project.capture_mode_button")
         };
         if button_sized(
             ui,
@@ -1736,31 +1717,31 @@ impl NewProjectWindowState {
         }
         if !SCREEN_CAPTURE_UI_ENABLED {
             ui.label(
-                RichText::new("Режим захвата временно отключён.")
+                RichText::new(t!("launcher.new_project.capture_mode_disabled_notice"))
                     .small()
                     .weak(),
             );
         }
-        field_label(ui, "Режим импорта:");
+        field_label(ui, t!("launcher.new_project.import_mode_label"));
         let mut import_mode_index = self.import_mode.as_index();
         combo_index(
             ui,
             "launcher_new_project_import_mode",
             &[
-                "Заменить ленту",
-                "Добавить в начало",
-                "Добавить в конец",
-                "Добавить перед текущей страницей",
-                "Добавить после текущей страницы",
+                t!("launcher.new_project.import_mode_replace"),
+                t!("launcher.new_project.import_mode_prepend"),
+                t!("launcher.new_project.import_mode_append"),
+                t!("launcher.new_project.import_mode_before_current"),
+                t!("launcher.new_project.import_mode_after_current"),
             ],
             &mut import_mode_index,
         );
         self.import_mode = ImportMode::from_index(import_mode_index);
         ui.checkbox(
             &mut self.filter_same_width,
-            "Фильтровать по одинаковой ширине (±50%)",
+            t!("launcher.new_project.filter_same_width_check"),
         );
-        field_label(ui, "Доп. имена файлов (маски * и ? поддерживаются)");
+        field_label(ui, t!("launcher.new_project.extra_filenames_hint"));
         ui.add(
             TextEdit::singleline(&mut self.import_extra_names)
                 .desired_width(fill_width(ui))
@@ -1770,22 +1751,22 @@ impl NewProjectWindowState {
     }
 
     fn show_quick_downloader(&mut self, ui: &mut Ui) {
-        field_label(ui, "Ссылка на главу");
+        field_label(ui, t!("launcher.new_project.chapter_link_label"));
         ui.add(
             TextEdit::singleline(&mut self.quick_link)
                 .desired_width(fill_width(ui))
-                .hint_text("Вставьте ссылку на главу, если сайт поддерживается"),
+                .hint_text(t!("launcher.new_project.chapter_link_placeholder")),
         );
         ui.add_space(6.0);
         let can_start_download =
             !self.source_import.is_loading() && !self.quick_download.is_loading();
         let response = button_sized(
             ui,
-            "Загрузить главы из ссылки",
+            t!("launcher.new_project.load_chapters_from_link_button"),
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             can_start_download,
         );
-        let response = response.on_hover_text(SUPPORTED_SITES_TOOLTIP);
+        let response = response.on_hover_text(supported_sites_tooltip());
         #[cfg(feature = "tutorial")]
         self.tutorial.mark(tutorial::TARGET_QUICK, response.rect);
         if response.clicked() {
@@ -1803,7 +1784,7 @@ impl NewProjectWindowState {
         self.clipboard_paste_in_flight = true;
         self.active_progress = None;
         self.last_error = None;
-        self.import_status = "Чтение изображения из буфера обмена...".to_string();
+        self.import_status = t!("launcher.new_project.reading_clipboard_status").to_string();
         let page_name = self.next_clipboard_page_name();
         thread::spawn(move || {
             let result = match paste_image::read_image_from_clipboard() {
@@ -1824,7 +1805,7 @@ impl NewProjectWindowState {
                         None => ClipboardPasteResult {
                             image: None,
                             error: Some(
-                                "Буфер обмена вернул изображение в неподдерживаемом размере."
+                                t!("launcher.new_project.clipboard_unsupported_size_error")
                                     .to_string(),
                             ),
                         },
@@ -1848,7 +1829,7 @@ impl NewProjectWindowState {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(ClipboardPasteResult {
                 image: None,
-                error: Some("Поток чтения буфера обмена был прерван.".to_string()),
+                error: Some(t!("launcher.new_project.clipboard_read_interrupted_error").to_string()),
             }),
         };
         let Some(result) = result else {
@@ -1864,12 +1845,12 @@ impl NewProjectWindowState {
             );
             self.crop_editor = None;
             self.manual_cut_guides.clear();
-            self.import_status = "Изображение вставлено из буфера обмена.".to_string();
+            self.import_status = t!("launcher.new_project.clipboard_image_pasted_status").to_string();
             self.last_error = None;
             self.advance_simple_import_step_after_success();
             crate::runtime_log::log_info("[new-project] ribbon image pasted from clipboard");
         } else if let Some(error) = result.error {
-            self.import_status = "Не удалось вставить изображение из буфера обмена.".to_string();
+            self.import_status = t!("launcher.new_project.clipboard_paste_error").to_string();
             self.last_error = Some(error.clone());
             crate::runtime_log::log_error(format!("[new-project] clipboard paste failed: {error}"));
         }
@@ -1904,7 +1885,7 @@ impl NewProjectWindowState {
                 self.screen_capture_rx = None;
                 self.screen_capture_in_flight = false;
                 self.import_status =
-                    "Режим захвата активен. Переместите рамку и нажмите S.".to_string();
+                    t!("launcher.new_project.capture_active_hint").to_string();
                 self.last_error = None;
                 crate::runtime_log::log_info(format!(
                     "[new-project] screen capture mode enabled for desktop {}x{} at {},{}",
@@ -1912,7 +1893,7 @@ impl NewProjectWindowState {
                 ));
             }
             Err(error) => {
-                self.import_status = "Не удалось включить режим захвата.".to_string();
+                self.import_status = t!("launcher.new_project.capture_enable_error").to_string();
                 self.last_error = Some(error.clone());
                 crate::runtime_log::log_error(format!(
                     "[new-project] failed to enable screen capture mode: {error}"
@@ -1926,7 +1907,7 @@ impl NewProjectWindowState {
         self.screen_capture_pending = None;
         self.screen_capture_rx = None;
         self.screen_capture_in_flight = false;
-        self.import_status = "Режим захвата выключен.".to_string();
+        self.import_status = t!("launcher.new_project.capture_disabled_status").to_string();
         self.last_error = None;
         crate::runtime_log::log_info("[new-project] screen capture mode disabled");
     }
@@ -1946,7 +1927,7 @@ impl NewProjectWindowState {
             ),
         });
         self.import_status =
-            "Подготовка снимка: временно скрываю рамку и снимаю экран...".to_string();
+            t!("launcher.new_project.capture_preparing_status").to_string();
         self.last_error = None;
     }
 
@@ -1967,7 +1948,7 @@ impl NewProjectWindowState {
         self.screen_capture_rx = Some(rx);
         self.screen_capture_in_flight = true;
         self.screen_capture_pending = None;
-        self.import_status = "Снимаю выделенную область экрана...".to_string();
+        self.import_status = t!("launcher.new_project.capture_snapping_status").to_string();
 
         thread::spawn(move || {
             let result = match screen_capture::capture_screen_rect(region) {
@@ -1996,7 +1977,7 @@ impl NewProjectWindowState {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(ScreenCaptureResult {
                 image: None,
-                error: Some("Поток захвата экрана был прерван.".to_string()),
+                error: Some(t!("launcher.new_project.capture_interrupted_error").to_string()),
             }),
         };
         let Some(result) = result else {
@@ -2012,12 +1993,12 @@ impl NewProjectWindowState {
             );
             self.crop_editor = None;
             self.manual_cut_guides.clear();
-            self.import_status = "Снимок области экрана добавлен в ленту.".to_string();
+            self.import_status = t!("launcher.new_project.capture_added_status").to_string();
             self.last_error = None;
             self.advance_simple_import_step_after_success();
             crate::runtime_log::log_info("[new-project] screen capture inserted into ribbon");
         } else if let Some(error) = result.error {
-            self.import_status = "Не удалось снять выделенную область экрана.".to_string();
+            self.import_status = t!("launcher.new_project.capture_failed_error").to_string();
             self.last_error = Some(error.clone());
             crate::runtime_log::log_error(format!("[new-project] screen capture failed: {error}"));
         }
@@ -2041,7 +2022,7 @@ impl NewProjectWindowState {
         let mut capture_requested = false;
         let builder = crate::launcher::apply_launcher_window_metadata(
             egui::ViewportBuilder::default()
-                .with_title("Режим захвата")
+                .with_title(t!("launcher.new_project.capture_mode_button"))
                 .with_app_id(crate::launcher::launcher_app_id(false))
                 .with_position(egui::pos2(
                     overlay.desktop_bounds.x as f32,
@@ -2093,14 +2074,14 @@ impl NewProjectWindowState {
     }
 
     fn show_advanced_downloader(&mut self, ui: &mut Ui) {
-        field_label(ui, "Ссылка на страницу");
+        field_label(ui, t!("launcher.new_project.page_link_label"));
         ui.add(
             TextEdit::singleline(&mut self.advanced_page_url)
                 .desired_width(fill_width(ui))
-                .hint_text("Откройте страницу главы в выбранном браузере"),
+                .hint_text(t!("launcher.new_project.open_page_in_browser_hint")),
         );
 
-        field_label(ui, "Движок браузера");
+        field_label(ui, t!("launcher.new_project.browser_engine_label"));
         ui.add_enabled_ui(
             !self.advanced_download.is_loading()
                 && !self.advanced_link_collect_active
@@ -2120,18 +2101,18 @@ impl NewProjectWindowState {
         self.advanced_download
             .set_backend(self.selected_advanced_backend);
 
-        field_label(ui, "Браузер");
+        field_label(ui, t!("launcher.new_project.browser_label"));
         self.clamp_advanced_indexes();
         if self.selected_advanced_backend == AdvancedBrowserBackend::Cloak {
             ui.label(RichText::new("CloakBrowser").small());
             ui.label(
-                RichText::new("Используется отдельный persistent profile CloakBrowser.")
+                RichText::new(t!("launcher.new_project.cloak_profile_hint"))
                     .small()
                     .weak(),
             );
         } else if self.browser_names.is_empty() {
             ui.label(
-                RichText::new("Поддерживаемые браузеры не найдены на этой системе.")
+                RichText::new(t!("launcher.new_project.no_supported_browsers_hint"))
                     .small()
                     .weak(),
             );
@@ -2151,7 +2132,7 @@ impl NewProjectWindowState {
             && !self.advanced_page_url.trim().is_empty();
         if button_sized(
             ui,
-            "Открыть в браузере",
+            t!("launcher.new_project.open_in_browser_button"),
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             can_open_browser,
         )
@@ -2160,7 +2141,7 @@ impl NewProjectWindowState {
             self.start_advanced_open();
         }
         ui.label(
-            RichText::new("Убедитесь, что все картинки на сайте прогружены.")
+            RichText::new(t!("launcher.new_project.ensure_images_loaded_hint"))
                 .small()
                 .weak(),
         );
@@ -2175,7 +2156,7 @@ impl NewProjectWindowState {
             self.advanced_mode = AdvancedDownloadMode::PatternLinkSearch;
         }
 
-        field_label(ui, "Режим");
+        field_label(ui, t!("launcher.new_project.mode_label"));
         ui.add_enabled_ui(
             !self.advanced_link_collect_active && !self.advanced_intercept_active,
             |ui| {
@@ -2183,12 +2164,12 @@ impl NewProjectWindowState {
                     ui.selectable_value(
                         &mut self.advanced_mode,
                         AdvancedDownloadMode::PatternLinkSearch,
-                        "Поиск ссылок по паттерну",
+                        t!("launcher.new_project.mode_pattern_search"),
                     );
                     ui.selectable_value(
                         &mut self.advanced_mode,
                         AdvancedDownloadMode::CanvasDownload,
-                        "Скачивание Canvas со страницы",
+                        t!("launcher.new_project.mode_canvas_download"),
                     );
                     ui.add_enabled_ui(
                         self.selected_advanced_backend == AdvancedBrowserBackend::Cloak,
@@ -2196,7 +2177,7 @@ impl NewProjectWindowState {
                             ui.selectable_value(
                                 &mut self.advanced_mode,
                                 AdvancedDownloadMode::DeepCapture,
-                                "Глубокий перехват",
+                                t!("launcher.new_project.mode_deep_intercept"),
                             );
                         },
                     );
@@ -2211,17 +2192,17 @@ impl NewProjectWindowState {
                     && !self.advanced_link_collect_active
                     && !self.advanced_intercept_active,
                 |ui| {
-                    field_label(ui, "Тип поиска ссылок");
+                    field_label(ui, t!("launcher.new_project.link_search_type_label"));
                     ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(
                             &mut self.advanced_link_source_mode,
                             AdvancedLinkSourceMode::Pattern,
-                            "Обычный шаблон",
+                            t!("launcher.new_project.link_search_normal"),
                         );
                         ui.selectable_value(
                             &mut self.advanced_link_source_mode,
                             AdvancedLinkSourceMode::AutoReview,
-                            "Автоподбор",
+                            t!("launcher.new_project.link_search_autofind"),
                         );
                     });
                 },
@@ -2231,7 +2212,7 @@ impl NewProjectWindowState {
             if self.advanced_link_source_mode == AdvancedLinkSourceMode::Pattern {
                 field_label(
                     ui,
-                    "Сайт (пресет) / префиксы ссылок (* — любая последовательность, ? — символ)",
+                    t!("launcher.new_project.site_preset_prefix_hint"),
                 );
                 let previous_site = self.selected_site;
                 combo_index_pairs(
@@ -2246,19 +2227,19 @@ impl NewProjectWindowState {
                     self.image_prefix = prefix.clone();
                 }
 
-                field_label(ui, "Префикс");
+                field_label(ui, t!("launcher.new_project.prefix_label"));
                 ui.add(TextEdit::singleline(&mut self.image_prefix).desired_width(fill_width(ui)));
 
-                field_label(ui, "Название нового сайта");
+                field_label(ui, t!("launcher.new_project.new_site_name_label"));
                 ui.add(
                     TextEdit::singleline(&mut self.site_name)
                         .desired_width(fill_width(ui))
-                        .hint_text("название для сохранения"),
+                        .hint_text(t!("launcher.new_project.save_name_placeholder")),
                 );
 
                 if button_sized(
                     ui,
-                    "Сохранить префикс",
+                    t!("launcher.new_project.save_prefix_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                     !self.advanced_download.is_loading()
                         && !self.advanced_link_collect_active
@@ -2271,28 +2252,25 @@ impl NewProjectWindowState {
             } else {
                 ui.label(
                     RichText::new(
-                        "Автоподбор соберёт ссылки со страницы, скачает реальные изображения и откроет окно проверки.",
+                        t!("launcher.new_project.autofind_hint"),
                     )
                     .small()
                     .weak(),
                 );
             }
 
-            field_label(ui, "Потоков выкачки");
+            field_label(ui, t!("launcher.new_project.download_threads_label"));
             ui.add_enabled(
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
                     && !self.advanced_intercept_active,
-                Slider::new(&mut self.advanced_fetch_parallelism, 1..=8).text("потоков"),
+                Slider::new(&mut self.advanced_fetch_parallelism, 1..=8).text(t!("launcher.new_project.threads_suffix")),
             );
 
-            sub_group(ui, "Сбор и загрузка", |ui| {
+            sub_group(ui, t!("launcher.new_project.collect_and_download_button"), |ui| {
                 if self.advanced_link_collect_active {
                     ui.label(
-                        RichText::new(format!(
-                            "Собрано ссылок: {}",
-                            self.advanced_link_collect_found_links
-                        ))
+                        RichText::new(tf!("launcher.new_project.collected_links_status", arg = self.advanced_link_collect_found_links))
                         .color(egui::Color32::from_rgb(76, 175, 80))
                         .strong(),
                     );
@@ -2300,7 +2278,7 @@ impl NewProjectWindowState {
                 }
                 if button_sized(
                     ui,
-                    "Скачать сразу",
+                    t!("launcher.new_project.download_now_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
                     !self.advanced_download.is_loading()
                         && !self.advanced_link_collect_active
@@ -2314,7 +2292,7 @@ impl NewProjectWindowState {
                 if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview
                     && button_sized(
                         ui,
-                        "Прекратить выкачку",
+                        t!("launcher.new_project.stop_download_button"),
                         egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
                         self.advanced_download.can_cancel_current_auto_fetch(),
                     )
@@ -2324,7 +2302,7 @@ impl NewProjectWindowState {
                 }
                 if button_sized(
                     ui,
-                    "Начать сбор ссылок",
+                    t!("launcher.new_project.start_collect_links_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
                     !self.advanced_download.is_loading()
                         && !self.advanced_link_collect_active
@@ -2337,7 +2315,7 @@ impl NewProjectWindowState {
                 }
                 if button_sized(
                     ui,
-                    "Остановить сбор ссылок",
+                    t!("launcher.new_project.stop_collect_links_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 74.0, 34.0),
                     !self.advanced_download.is_loading()
                         && self.advanced_link_collect_active
@@ -2351,10 +2329,7 @@ impl NewProjectWindowState {
         } else if self.advanced_mode == AdvancedDownloadMode::CanvasDownload {
             if self.advanced_intercept_active {
                 ui.label(
-                    RichText::new(format!(
-                        "Найдено страниц: {}",
-                        self.advanced_intercept_counts.total
-                    ))
+                    RichText::new(tf!("launcher.new_project.found_pages_status", arg = self.advanced_intercept_counts.total))
                     .color(egui::Color32::from_rgb(76, 175, 80))
                     .strong(),
                 );
@@ -2362,7 +2337,7 @@ impl NewProjectWindowState {
             }
             if button_sized(
                 ui,
-                "Скачать сразу",
+                t!("launcher.new_project.download_now_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
@@ -2375,7 +2350,7 @@ impl NewProjectWindowState {
             }
             if button_sized(
                 ui,
-                "Начать перехват",
+                t!("launcher.new_project.start_intercept_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
@@ -2388,7 +2363,7 @@ impl NewProjectWindowState {
             }
             if button_sized(
                 ui,
-                "Завершить перехват",
+                t!("launcher.new_project.finish_intercept_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
@@ -2403,10 +2378,7 @@ impl NewProjectWindowState {
             if self.advanced_intercept_active {
                 let counts = self.advanced_intercept_counts;
                 ui.label(
-                    RichText::new(format!(
-                        "Перехвачено {} холстов, найдено {} обычных картинок",
-                        counts.canvases, counts.images
-                    ))
+                    RichText::new(tf!("launcher.new_project.intercept_counts_status", counts = counts.canvases, counts_2 = counts.images))
                     .color(egui::Color32::from_rgb(76, 175, 80))
                     .strong(),
                 );
@@ -2414,7 +2386,7 @@ impl NewProjectWindowState {
             }
             ui.label(
                 RichText::new(
-                    "Cloak перезагрузит текущую страницу, сохранит загружаемые данные и после остановки откроет проверку найденных картинок.",
+                    t!("launcher.new_project.cloak_deep_intercept_hint"),
                 )
                 .small()
                 .weak(),
@@ -2422,7 +2394,7 @@ impl NewProjectWindowState {
             ui.add_space(8.0);
             if button_sized(
                 ui,
-                "Начать глубокий перехват",
+                t!("launcher.new_project.start_deep_intercept_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
@@ -2435,7 +2407,7 @@ impl NewProjectWindowState {
             }
             if button_sized(
                 ui,
-                "Завершить глубокий перехват",
+                t!("launcher.new_project.finish_deep_intercept_button"),
                 egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
                 !self.advanced_download.is_loading()
                     && !self.advanced_link_collect_active
@@ -2455,28 +2427,24 @@ impl NewProjectWindowState {
         let mut close_review = false;
         if let Some(review) = self.advanced_auto_review.as_mut() {
             let mut open = review.open;
-            Window::new("Проверка автоподбора ссылок")
+            Window::new(t!("launcher.new_project.autofind_review_title")).id(egui::Id::new("launcher.new_project.autofind_review_title"))
                 .open(&mut open)
                 .resizable(true)
                 .default_width(980.0)
                 .default_height(720.0)
                 .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.checkbox(&mut review.group_view, "Разделять по группам");
+                        ui.checkbox(&mut review.group_view, t!("launcher.new_project.split_by_groups_check"));
                         ui.separator();
-                        ui.label(format!(
-                            "Картинок: {} / {}",
-                            review.retained_count(),
-                            review.candidates.items.len()
-                        ));
-                        ui.label(format!("Групп: {}", review.candidates.groups.len()));
+                        ui.label(tf!("launcher.new_project.review_images_count", review = review.retained_count(), review_2 = review.candidates.items.len()));
+                        ui.label(tf!("launcher.new_project.review_groups_count", review = review.candidates.groups.len()));
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Добавить на ленту").clicked() {
+                        if ui.button(t!("launcher.new_project.add_to_ribbon_button")).clicked() {
                             apply_clicked = true;
                         }
-                        if ui.button("Закрыть").clicked() {
+                        if ui.button(t!("launcher.common.close_button")).clicked() {
                             close_review = true;
                         }
                     });
@@ -2488,7 +2456,7 @@ impl NewProjectWindowState {
                             if review.group_view {
                                 Self::show_auto_review_groups(ui, review);
                                 ui.separator();
-                                ui.heading("Итоговый порядок");
+                                ui.heading(t!("launcher.new_project.final_order_label"));
                             }
                             Self::show_auto_review_order(ui, review);
                         });
@@ -2524,18 +2492,14 @@ impl NewProjectWindowState {
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new(format!(
-                                "Группа {} · {} карт.",
-                                group_id + 1,
-                                item_ids.len()
-                            ))
+                            RichText::new(tf!("launcher.new_project.group_images_count", group_id = group_id + 1, item_ids = item_ids.len()))
                             .strong(),
                         );
                         ui.label(RichText::new(signature).small().weak());
                         let label = if removed {
-                            "Вернуть группу"
+                            t!("launcher.new_project.restore_group_button")
                         } else {
-                            "Удалить группу"
+                            t!("launcher.new_project.delete_group_button")
                         };
                         if ui.button(label).clicked() {
                             if removed {
@@ -2675,7 +2639,7 @@ impl NewProjectWindowState {
                 ui.label(RichText::new(format!("#{}", order_index + 1)).small());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let label = if review.removed_items.contains(&item_id) {
-                        "Вернуть"
+                        t!("launcher.new_project.restore_button")
                     } else {
                         "×"
                     };
@@ -2779,7 +2743,7 @@ impl NewProjectWindowState {
             review.expanded_texture = Some((item_id, texture));
         }
         let mut open = true;
-        Window::new("Просмотр картинки")
+        Window::new(t!("launcher.new_project.image_view_title")).id(egui::Id::new("launcher.new_project.image_view_title"))
             .open(&mut open)
             .resizable(true)
             .default_width(960.0)
@@ -2788,10 +2752,10 @@ impl NewProjectWindowState {
                 ui.label(format!("{width}×{height}"));
                 ui.label(RichText::new(url).small().weak());
                 ui.horizontal(|ui| {
-                    if ui.button("Удалить").clicked() {
+                    if ui.button(t!("launcher.common.delete_button")).clicked() {
                         review.removed_items.insert(item_id);
                     }
-                    if ui.button("Оставить").clicked() {
+                    if ui.button(t!("launcher.new_project.keep_button")).clicked() {
                         review.removed_items.remove(&item_id);
                     }
                 });
@@ -2823,7 +2787,7 @@ impl NewProjectWindowState {
             Ok(pages) => pages,
             Err(message) => {
                 self.last_error = Some(message);
-                self.import_status = "Автоподбор не содержит картинок для ленты.".to_string();
+                self.import_status = t!("launcher.new_project.autofind_no_images_for_ribbon").to_string();
                 return;
             }
         };
@@ -2840,7 +2804,7 @@ impl NewProjectWindowState {
         self.simple_manual_cut_preview_active = false;
         self.advance_simple_import_step_after_success();
         self.import_status =
-            format!("Автоподбор добавил {page_count} изображений из {source_url}.");
+            tf!("launcher.new_project.autofind_added_status", page_count = page_count, source_url = source_url);
         self.advanced_auto_review = None;
     }
 
@@ -2860,36 +2824,36 @@ impl NewProjectWindowState {
             && !self.stitch.is_loading()
             && !self.ribbon.pages().is_empty();
 
-        field_label(ui, "K (кол-во частей, пусто = авто)");
+        field_label(ui, t!("launcher.new_project.stitch_k_label"));
         ui.add(
             TextEdit::singleline(&mut self.stitch_parts)
                 .desired_width(160.0)
-                .hint_text("пусто = авто"),
+                .hint_text(t!("launcher.new_project.stitch_k_placeholder")),
         );
 
-        field_label(ui, "Hmax (лимит высоты, px)");
+        field_label(ui, t!("launcher.new_project.stitch_hmax_label"));
         ui.add(TextEdit::singleline(&mut self.stitch_target_height).desired_width(160.0));
 
-        field_label(ui, "Белая полоса: band_rows");
+        field_label(ui, t!("launcher.new_project.stitch_band_rows_label"));
         ui.add(TextEdit::singleline(&mut self.stitch_band_rows).desired_width(160.0));
 
-        field_label(ui, "tol (допуск одноцветности)");
+        field_label(ui, t!("launcher.new_project.stitch_tol_label"));
         ui.add(TextEdit::singleline(&mut self.stitch_tolerance).desired_width(160.0));
 
         field_label(ui, "search_radius (px)");
         ui.add(TextEdit::singleline(&mut self.stitch_search_radius).desired_width(160.0));
 
-        ui.checkbox(&mut self.stitch_prefer_up, "Сначала вверх при refine");
+        ui.checkbox(&mut self.stitch_prefer_up, t!("launcher.new_project.stitch_up_first_check"));
 
         let wide_button = egui::vec2(LEFT_PANEL_WIDTH - 52.0, 32.0);
-        if button_sized(ui, "Сшить ленту", wide_button, can_start).clicked() {
+        if button_sized(ui, t!("launcher.new_project.stitch_ribbon_button"), wide_button, can_start).clicked() {
             self.start_stitch_split(StitchSplitMode::StitchOnly);
         }
-        if button_sized(ui, "Сшить и проставить линии резки", wide_button, can_start).clicked()
+        if button_sized(ui, t!("launcher.new_project.stitch_set_cut_lines_button"), wide_button, can_start).clicked()
         {
             self.start_stitch_split(StitchSplitMode::ManualCutPreview);
         }
-        let stitch_auto = button_sized(ui, "Сшить и нарезать автоматически", wide_button, can_start);
+        let stitch_auto = button_sized(ui, t!("launcher.new_project.stitch_cut_auto_button"), wide_button, can_start);
         #[cfg(feature = "tutorial")]
         self.tutorial.mark(tutorial::TARGET_STITCH, stitch_auto.rect);
         if stitch_auto.clicked() {
@@ -2897,7 +2861,7 @@ impl NewProjectWindowState {
         }
         if button_sized(
             ui,
-            "Сшить только в неоднородных местах",
+            t!("launcher.new_project.stitch_only_uneven_button"),
             wide_button,
             can_start,
         )
@@ -2905,25 +2869,25 @@ impl NewProjectWindowState {
         {
             self.start_stitch_split(StitchSplitMode::HeterogeneousBottoms);
         }
-        if button_sized(ui, "Вернуть исходное", ACTION_BUTTON_SIZE, can_restore).clicked()
+        if button_sized(ui, t!("launcher.new_project.restore_original_button"), ACTION_BUTTON_SIZE, can_restore).clicked()
         {
             self.restore_original_pages();
         }
         if can_apply_manual
-            && button_sized(ui, "Применить ручную нарезку", wide_button, true).clicked()
+            && button_sized(ui, t!("launcher.new_project.apply_manual_cut_button"), wide_button, true).clicked()
         {
             self.apply_manual_cut_guides();
         }
 
         ui.add_space(8.0);
         self.show_operation_progress(ui, "stitch");
-        sub_group(ui, "Нарезать как главу", |ui| {
+        sub_group(ui, t!("launcher.new_project.cut_as_chapter_button"), |ui| {
             ui.checkbox(
                 &mut self.cut_as_chapter_enabled,
-                "Включить нарезку по существующей главе",
+                t!("launcher.new_project.enable_cut_by_chapter_check"),
             );
             ui.add_enabled_ui(self.cut_as_chapter_enabled, |ui| {
-                field_label(ui, "Тайтл");
+                field_label(ui, t!("launcher.common.title_label"));
                 let previous_cut_title = self.cut_title;
                 combo_index_owned(
                     ui,
@@ -2934,7 +2898,7 @@ impl NewProjectWindowState {
                 if previous_cut_title != self.cut_title {
                     self.cut_chapter = 0;
                 }
-                field_label(ui, "Глава");
+                field_label(ui, t!("launcher.common.chapter_label"));
                 combo_index_owned(
                     ui,
                     "launcher_new_project_cut_chapter",
@@ -2942,12 +2906,12 @@ impl NewProjectWindowState {
                     &mut self.cut_chapter,
                 );
                 ui.horizontal(|ui| {
-                    if button_sized(ui, "Обновить", SMALL_BUTTON_SIZE, can_refresh_catalog)
+                    if button_sized(ui, t!("launcher.common.refresh_button"), SMALL_BUTTON_SIZE, can_refresh_catalog)
                         .clicked()
                     {
                         self.refresh_project_catalog();
                     }
-                    if button_sized(ui, "Взять эту главу", ACTION_BUTTON_SIZE, can_take_chapter)
+                    if button_sized(ui, t!("launcher.new_project.take_this_chapter_button"), ACTION_BUTTON_SIZE, can_take_chapter)
                         .clicked()
                     {
                         self.start_cut_like_project_chapter();
@@ -2955,7 +2919,7 @@ impl NewProjectWindowState {
                 });
                 if button_sized(
                     ui,
-                    "Выбрать папку",
+                    t!("launcher.new_project.choose_folder_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 84.0, 32.0),
                     can_pick_folder,
                 )
@@ -2970,7 +2934,7 @@ impl NewProjectWindowState {
     fn show_image_processing_section(&mut self, ui: &mut Ui) {
         let processor_labels = ["waifu2x", "Reline"];
         let mut processor_index = self.image_processor.as_index();
-        field_label(ui, "Движок");
+        field_label(ui, t!("launcher.new_project.waifu2x_engine_label"));
         combo_index(
             ui,
             "launcher_new_project_image_processor",
@@ -2989,7 +2953,7 @@ impl NewProjectWindowState {
         let noise_levels = ["-1", "0", "1", "2", "3"];
         let scale_levels = ["1", "2", "4", "8", "16", "32"];
 
-        field_label(ui, "Бэкенд / путь");
+        field_label(ui, t!("launcher.new_project.waifu2x_backend_path_label"));
         let mut backend = self.waifu_backend_path_display();
         ui.add_enabled(
             false,
@@ -2999,7 +2963,7 @@ impl NewProjectWindowState {
             ui.colored_label(egui::Color32::from_rgb(236, 112, 99), reason);
         }
 
-        field_label(ui, "Шумоподавление -n");
+        field_label(ui, t!("launcher.new_project.waifu2x_noise_label"));
         combo_index(
             ui,
             "launcher_new_project_w2x_noise",
@@ -3007,7 +2971,7 @@ impl NewProjectWindowState {
             &mut self.waifu_noise,
         );
 
-        field_label(ui, "Масштаб -s");
+        field_label(ui, t!("launcher.new_project.waifu2x_scale_label"));
         combo_index(
             ui,
             "launcher_new_project_w2x_scale",
@@ -3020,7 +2984,7 @@ impl NewProjectWindowState {
 
         let waifu_run = button_sized(
             ui,
-            "Прогнать через waifu2x",
+            t!("launcher.new_project.run_waifu2x_button"),
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             self.can_start_waifu2x(),
         );
@@ -3037,11 +3001,11 @@ impl NewProjectWindowState {
     /// The mode is persisted in user config; toggling writes the new mode once (not per frame).
     fn show_reline_section(&mut self, ui: &mut Ui) {
         let mut mode_index = self.reline_ui_mode.as_index();
-        field_label(ui, "Интерфейс Reline");
+        field_label(ui, t!("launcher.new_project.reline_interface_label"));
         combo_index(
             ui,
             "launcher_new_project_reline_ui_mode",
-            &["Упрощённый", "Полный"],
+            &[t!("launcher.new_project.reline_interface_simple"), t!("launcher.new_project.reline_interface_full")],
             &mut mode_index,
         );
         let new_mode = RelineUiMode::from_index(mode_index);
@@ -3064,11 +3028,11 @@ impl NewProjectWindowState {
     fn show_reline_simple(&mut self, ui: &mut Ui) {
         self.ensure_reline_model_catalog_requested();
 
-        field_label(ui, "Модель");
+        field_label(ui, t!("launcher.new_project.reline_model_label"));
         self.show_reline_model_gallery(ui);
         ui.add_space(10.0);
 
-        sub_group(ui, "Режим обработки", |ui| {
+        sub_group(ui, t!("launcher.new_project.reline_process_mode_label"), |ui| {
             for preset in RelineSimplePreset::ALL {
                 let mut selected = self.reline_simple_preset == preset.as_index();
                 if ui.radio(selected, preset.label()).clicked() {
@@ -3084,26 +3048,26 @@ impl NewProjectWindowState {
         });
         ui.add_space(8.0);
 
-        field_label(ui, "Резкость");
+        field_label(ui, t!("launcher.new_project.reline_sharpness_label"));
         combo_index(
             ui,
             "launcher_new_project_reline_simple_sharp",
-            &["Нет", "Слабая", "Сильная"],
+            &[t!("launcher.new_project.reline_sharpness_none"), t!("launcher.new_project.reline_sharpness_weak"), t!("launcher.new_project.reline_sharpness_strong")],
             &mut self.reline_simple_sharp,
         );
 
-        field_label(ui, "Целевой масштаб");
+        field_label(ui, t!("launcher.new_project.reline_target_scale_label"));
         combo_index(
             ui,
             "launcher_new_project_reline_simple_scale",
-            &["Авто (масштаб модели)", "×2", "×4"],
+            &[t!("launcher.new_project.reline_scale_auto"), "×2", "×4"],
             &mut self.reline_simple_scale,
         );
 
         ui.add_space(4.0);
         ui.checkbox(
             &mut self.reline_simple_resize_enabled,
-            "Изменить высоту результата (px)",
+            t!("launcher.new_project.reline_result_height_label"),
         );
         if self.reline_simple_resize_enabled {
             ui.add(
@@ -3114,7 +3078,7 @@ impl NewProjectWindowState {
         ui.add_space(10.0);
         if button_sized(
             ui,
-            "Прогнать через Reline",
+            t!("launcher.new_project.run_reline_button"),
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             self.can_start_reline(),
         )
@@ -3136,7 +3100,7 @@ impl NewProjectWindowState {
 
         if self.reline_model_catalog.is_loading() {
             ui.label(
-                RichText::new("Загружаем список моделей Reline...")
+                RichText::new(t!("launcher.new_project.reline_loading_models_status"))
                     .small()
                     .weak(),
             );
@@ -3147,24 +3111,24 @@ impl NewProjectWindowState {
 
         ui.horizontal(|ui| {
             let toggle_label = if self.reline_model_picker_open {
-                "Скрыть список"
+                t!("launcher.new_project.reline_hide_list_button")
             } else {
-                "Выбрать модель"
+                t!("launcher.new_project.reline_choose_model_button")
             };
             if ui.button(toggle_label).clicked() {
                 self.reline_model_picker_open = !self.reline_model_picker_open;
             }
             let refresh_label = if self.reline_model_catalog.is_loading() {
-                "Загрузка..."
+                t!("launcher.common.loading")
             } else {
-                "Обновить"
+                t!("launcher.common.refresh_button")
             };
             if ui
                 .add_enabled(
                     !self.reline_model_catalog.is_loading(),
                     Button::new(refresh_label),
                 )
-                .on_hover_text("Обновить список моделей из AI backend")
+                .on_hover_text(t!("launcher.new_project.reline_refresh_models_tooltip"))
                 .clicked()
             {
                 self.refresh_reline_model_catalog();
@@ -3173,7 +3137,7 @@ impl NewProjectWindowState {
 
         if self.reline_model_catalog_entries.is_empty() {
             ui.label(
-                RichText::new("Список моделей пуст. Запустите AI backend и нажмите «Обновить».")
+                RichText::new(t!("launcher.new_project.reline_models_empty_hint"))
                     .small()
                     .weak(),
             );
@@ -3184,7 +3148,7 @@ impl NewProjectWindowState {
         if !self.reline_model_picker_open {
             if self.reline_model_name.trim().is_empty() {
                 ui.label(
-                    RichText::new("Модель не выбрана — нажмите «Выбрать модель».")
+                    RichText::new(t!("launcher.new_project.reline_no_model_selected_hint"))
                         .small()
                         .weak(),
                 );
@@ -3227,7 +3191,7 @@ impl NewProjectWindowState {
                         let selected = self.reline_model_name == name;
 
                         let header = if downloaded {
-                            format!("{}  ✓ скачана", meta.display_title())
+                            tf!("launcher.new_project.reline_model_downloaded_marker", meta = meta.display_title())
                         } else {
                             meta.display_title()
                         };
@@ -3321,19 +3285,10 @@ impl NewProjectWindowState {
             "dpid_1",
         ];
         const CVT_TYPES: [&str; 4] = ["RGB2Gray2020", "RGB2Gray709", "RGB2Gray", "Gray2RGB"];
-        const READER_MODE_HELP: &str = "Как Reline читает исходные пиксели перед обработкой. rgb сохраняет цвет, gray загружает изображение в оттенках серого, dynamic позволяет Reline выбрать режим по исходнику.";
-        const UPSCALE_HELP: &str = "Загружает локальную или автоматически скачанную модель Reline и запускает тайловую реставрацию/увеличение. 1x модели подходят для очистки, устранения JPEG-артефактов и растра; 2x/4x модели увеличивают масштаб.";
-        const SHARP_HELP: &str = "Этап очистки и повышения резкости: входные уровни, гамма, фильтрация белого/чёрного диапазона и опциональная обработка краёв через Canny.";
-        const HALFTONE_HELP: &str = "Создаёт или корректирует полутоновые точки/скринтон. Размер точки, угол, тип, цветовой режим и SSAA управляют рисунком сетки.";
-        const RESIZE_HELP: &str = "Меняет размер после предыдущих этапов Reline по ширине, высоте или проценту с выбранным фильтром. Параметры разброса (spread) относятся к настройкам изменения размера для больших изображений.";
-        const LEVEL_HELP: &str =
-            "Финальная коррекция уровней: входные и выходные точки чёрного/белого плюс гамма.";
-        const CVT_COLOR_HELP: &str =
-            "Преобразует RGB и оттенки серого с выбранной матрицей конвертации Reline.";
 
         self.ensure_reline_model_catalog_requested();
 
-        field_label_hover(ui, "Режим чтения", READER_MODE_HELP);
+        field_label_hover(ui, t!("launcher.new_project.reline_read_mode_label"), t!("launcher.new_project.reline_read_mode_tooltip"));
         combo_index(
             ui,
             "launcher_new_project_reline_reader_mode",
@@ -3341,67 +3296,67 @@ impl NewProjectWindowState {
             &mut self.reline_reader_mode,
         );
 
-        let response = egui::CollapsingHeader::new("Реставрация / увеличение")
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_restore")).id_salt("launcher.new_project.reline_section_restore")
             .default_open(true)
             .show(ui, |ui| {
                 ui.checkbox(
                     &mut self.reline_upscale_enabled,
-                    "Включить реставрацию / увеличение",
+                    t!("launcher.new_project.reline_enable_restore"),
                 );
-                field_label(ui, "Модель из каталога");
+                field_label(ui, t!("launcher.new_project.reline_model_from_catalog"));
                 self.show_reline_model_combo(ui);
-                field_label(ui, "Локальный путь к модели");
+                field_label(ui, t!("launcher.new_project.reline_local_model_path"));
                 ui.add(
                     TextEdit::singleline(&mut self.reline_model_path).desired_width(fill_width(ui)),
                 );
-                field_label(ui, "Прямой URL модели");
+                field_label(ui, t!("launcher.new_project.reline_direct_url"));
                 ui.add(
                     TextEdit::singleline(&mut self.reline_model_url).desired_width(fill_width(ui)),
                 );
-                field_label(ui, "Тайлинг");
+                field_label(ui, t!("launcher.new_project.reline_tiling"));
                 combo_index(
                     ui,
                     "launcher_new_project_reline_tiler",
                     &TILERS,
                     &mut self.reline_tiler,
                 );
-                field_label(ui, "Целевой масштаб (пусто = масштаб модели)");
+                field_label(ui, t!("launcher.new_project.reline_target_scale_field_hint"));
                 ui.add(TextEdit::singleline(&mut self.reline_target_scale).desired_width(160.0));
-                field_label(ui, "Тип вычислений");
+                field_label(ui, t!("launcher.new_project.reline_compute_type"));
                 combo_index(
                     ui,
                     "launcher_new_project_reline_dtype",
                     &DTYPES,
                     &mut self.reline_dtype,
                 );
-                field_label(ui, "Размер exact-тайла");
+                field_label(ui, t!("launcher.new_project.reline_exact_tile_size"));
                 ui.add(
                     TextEdit::singleline(&mut self.reline_exact_tiler_size).desired_width(160.0),
                 );
                 ui.checkbox(
                     &mut self.reline_allow_cpu_upscale,
-                    "Разрешить обработку на CPU",
+                    t!("launcher.new_project.reline_allow_cpu"),
                 );
             });
-        response.header_response.on_hover_text(UPSCALE_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_restore_tooltip"));
 
-        let response = egui::CollapsingHeader::new("Резкость").show(ui, |ui| {
-            ui.checkbox(&mut self.reline_sharp_enabled, "Включить резкость");
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_sharpen")).id_salt("launcher.new_project.reline_section_sharpen").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_sharp_enabled, t!("launcher.new_project.reline_enable_sharpen"));
             numeric_text_field(
                 ui,
-                "Нижний входной уровень",
+                t!("launcher.new_project.reline_input_low_level"),
                 &mut self.reline_sharp_low_input,
             );
             numeric_text_field(
                 ui,
-                "Верхний входной уровень",
+                t!("launcher.new_project.reline_input_high_level"),
                 &mut self.reline_sharp_high_input,
             );
-            numeric_text_field(ui, "Гамма", &mut self.reline_sharp_gamma);
-            numeric_text_field(ui, "Белый диапазон", &mut self.reline_sharp_diapason_white);
-            numeric_text_field(ui, "Чёрный диапазон", &mut self.reline_sharp_diapason_black);
-            ui.checkbox(&mut self.reline_sharp_canny, "Canny-контур");
-            field_label(ui, "Режим Canny");
+            numeric_text_field(ui, t!("launcher.new_project.reline_gamma"), &mut self.reline_sharp_gamma);
+            numeric_text_field(ui, t!("launcher.new_project.reline_white_range"), &mut self.reline_sharp_diapason_white);
+            numeric_text_field(ui, t!("launcher.new_project.reline_black_range"), &mut self.reline_sharp_diapason_black);
+            ui.checkbox(&mut self.reline_sharp_canny, t!("launcher.new_project.reline_canny_contour"));
+            field_label(ui, t!("launcher.new_project.reline_canny_mode"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_canny_type",
@@ -3409,20 +3364,20 @@ impl NewProjectWindowState {
                 &mut self.reline_sharp_canny_type,
             );
         });
-        response.header_response.on_hover_text(SHARP_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_sharpen_tooltip"));
 
-        let response = egui::CollapsingHeader::new("Полутон / скринтон").show(ui, |ui| {
-            ui.checkbox(&mut self.reline_halftone_enabled, "Включить полутон");
-            numeric_text_field(ui, "Размер точки", &mut self.reline_halftone_dot_size);
-            numeric_text_field(ui, "Угол", &mut self.reline_halftone_angle);
-            field_label(ui, "Тип точки");
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_halftone")).id_salt("launcher.new_project.reline_section_halftone").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_halftone_enabled, t!("launcher.new_project.reline_enable_halftone"));
+            numeric_text_field(ui, t!("launcher.new_project.reline_dot_size"), &mut self.reline_halftone_dot_size);
+            numeric_text_field(ui, t!("launcher.new_project.reline_angle"), &mut self.reline_halftone_angle);
+            field_label(ui, t!("launcher.new_project.reline_dot_type"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_dot_type",
                 &DOT_TYPES,
                 &mut self.reline_halftone_dot_type,
             );
-            field_label(ui, "Цветовой режим полутона");
+            field_label(ui, t!("launcher.new_project.reline_halftone_color_mode"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_halftone_mode",
@@ -3431,10 +3386,10 @@ impl NewProjectWindowState {
             );
             numeric_text_field(
                 ui,
-                "Масштаб SSAA (пусто = выключено)",
+                t!("launcher.new_project.reline_ssaa_scale"),
                 &mut self.reline_halftone_ssaa_scale,
             );
-            field_label(ui, "Фильтр SSAA");
+            field_label(ui, t!("launcher.new_project.reline_ssaa_filter"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_halftone_filter",
@@ -3443,64 +3398,64 @@ impl NewProjectWindowState {
             );
             ui.checkbox(
                 &mut self.reline_halftone_disable_auto_dot,
-                "Отключить авторазмер точки",
+                t!("launcher.new_project.reline_disable_auto_dot"),
             );
         });
-        response.header_response.on_hover_text(HALFTONE_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_halftone_tooltip"));
 
-        let response = egui::CollapsingHeader::new("Изменение размера").show(ui, |ui| {
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_resize")).id_salt("launcher.new_project.reline_section_resize").show(ui, |ui| {
             ui.checkbox(
                 &mut self.reline_resize_enabled,
-                "Включить изменение размера",
+                t!("launcher.new_project.reline_enable_resize"),
             );
-            numeric_text_field(ui, "Высота", &mut self.reline_resize_height);
-            numeric_text_field(ui, "Ширина", &mut self.reline_resize_width);
-            numeric_text_field(ui, "Процент", &mut self.reline_resize_percent);
-            field_label(ui, "Фильтр");
+            numeric_text_field(ui, t!("launcher.new_project.reline_height"), &mut self.reline_resize_height);
+            numeric_text_field(ui, t!("launcher.new_project.reline_width"), &mut self.reline_resize_width);
+            numeric_text_field(ui, t!("launcher.new_project.reline_percent"), &mut self.reline_resize_percent);
+            field_label(ui, t!("launcher.new_project.reline_filter"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_resize_filter",
                 &RESIZE_FILTERS,
                 &mut self.reline_resize_filter,
             );
-            ui.checkbox(&mut self.reline_resize_gamma_correction, "Гамма-коррекция");
-            ui.checkbox(&mut self.reline_resize_spread, "Разброс (spread)");
-            numeric_text_field(ui, "Размер разброса", &mut self.reline_resize_spread_size);
+            ui.checkbox(&mut self.reline_resize_gamma_correction, t!("launcher.new_project.reline_gamma_correction"));
+            ui.checkbox(&mut self.reline_resize_spread, t!("launcher.new_project.reline_spread"));
+            numeric_text_field(ui, t!("launcher.new_project.reline_spread_size"), &mut self.reline_resize_spread_size);
         });
-        response.header_response.on_hover_text(RESIZE_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_resize_tooltip"));
 
-        let response = egui::CollapsingHeader::new("Уровни").show(ui, |ui| {
-            ui.checkbox(&mut self.reline_level_enabled, "Включить уровни");
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_levels")).id_salt("launcher.new_project.reline_section_levels").show(ui, |ui| {
+            ui.checkbox(&mut self.reline_level_enabled, t!("launcher.new_project.reline_enable_levels"));
             numeric_text_field(
                 ui,
-                "Нижний входной уровень",
+                t!("launcher.new_project.reline_input_low_level"),
                 &mut self.reline_level_low_input,
             );
             numeric_text_field(
                 ui,
-                "Верхний входной уровень",
+                t!("launcher.new_project.reline_input_high_level"),
                 &mut self.reline_level_high_input,
             );
             numeric_text_field(
                 ui,
-                "Нижний выходной уровень",
+                t!("launcher.new_project.reline_output_low_level"),
                 &mut self.reline_level_low_output,
             );
             numeric_text_field(
                 ui,
-                "Верхний выходной уровень",
+                t!("launcher.new_project.reline_output_high_level"),
                 &mut self.reline_level_high_output,
             );
-            numeric_text_field(ui, "Гамма", &mut self.reline_level_gamma);
+            numeric_text_field(ui, t!("launcher.new_project.reline_gamma"), &mut self.reline_level_gamma);
         });
-        response.header_response.on_hover_text(LEVEL_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_levels_tooltip"));
 
-        let response = egui::CollapsingHeader::new("Цветовое преобразование").show(ui, |ui| {
+        let response = egui::CollapsingHeader::new(t!("launcher.new_project.reline_section_colorconv")).id_salt("launcher.new_project.reline_section_colorconv").show(ui, |ui| {
             ui.checkbox(
                 &mut self.reline_cvt_color_enabled,
-                "Включить цветовое преобразование",
+                t!("launcher.new_project.reline_enable_colorconv"),
             );
-            field_label(ui, "Тип преобразования");
+            field_label(ui, t!("launcher.new_project.reline_conv_type"));
             combo_index(
                 ui,
                 "launcher_new_project_reline_cvt_type",
@@ -3508,11 +3463,11 @@ impl NewProjectWindowState {
                 &mut self.reline_cvt_color_type,
             );
         });
-        response.header_response.on_hover_text(CVT_COLOR_HELP);
+        response.header_response.on_hover_text(t!("launcher.new_project.reline_colorconv_tooltip"));
 
         if button_sized(
             ui,
-            "Прогнать через Reline",
+            t!("launcher.new_project.run_reline_button"),
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             self.can_start_reline(),
         )
@@ -3544,7 +3499,7 @@ impl NewProjectWindowState {
             .iter()
             .map(|entry| {
                 let label = if entry.downloaded {
-                    format!("{} (скачана)", entry.name)
+                    tf!("launcher.new_project.reline_entry_downloaded_marker", entry = entry.name)
                 } else {
                     entry.name.clone()
                 };
@@ -3558,7 +3513,7 @@ impl NewProjectWindowState {
                 0,
                 (
                     current_model.to_string(),
-                    format!("{current_model} (текущее значение)"),
+                    tf!("launcher.new_project.reline_current_value_marker", current_model = current_model),
                     String::new(),
                 ),
             );
@@ -3571,7 +3526,7 @@ impl NewProjectWindowState {
             ComboBox::from_id_salt("launcher_new_project_reline_model_name")
                 .width(combo_width)
                 .selected_text(if self.reline_model_name.trim().is_empty() {
-                    "Не выбрана"
+                    t!("launcher.new_project.reline_not_selected")
                 } else {
                     self.reline_model_name.as_str()
                 })
@@ -3579,11 +3534,11 @@ impl NewProjectWindowState {
                     ui.selectable_value(
                         &mut self.reline_model_name,
                         String::new(),
-                        "Не выбирать из каталога",
+                        t!("launcher.new_project.reline_dont_pick_from_catalog"),
                     )
-                    .on_hover_text("Используйте локальный путь или прямой URL модели ниже");
+                    .on_hover_text(t!("launcher.new_project.reline_use_local_or_url_hint"));
                     if options.is_empty() {
-                        ui.label("Список моделей не загружен");
+                        ui.label(t!("launcher.new_project.reline_models_not_loaded"));
                     } else {
                         for (name, label, filename) in &options {
                             let response = ui.selectable_value(
@@ -3592,23 +3547,23 @@ impl NewProjectWindowState {
                                 label,
                             );
                             if !filename.trim().is_empty() {
-                                response.on_hover_text(format!("Файл: {filename}"));
+                                response.on_hover_text(tf!("launcher.new_project.reline_file_label", filename = filename));
                             }
                         }
                     }
                 });
 
             let refresh_label = if self.reline_model_catalog.is_loading() {
-                "Загрузка..."
+                t!("launcher.common.loading")
             } else {
-                "Обновить"
+                t!("launcher.common.refresh_button")
             };
             if ui
                 .add_enabled(
                     !self.reline_model_catalog.is_loading(),
                     Button::new(refresh_label).min_size(egui::vec2(refresh_width, 28.0)),
                 )
-                .on_hover_text("Обновить список моделей из AI backend")
+                .on_hover_text(t!("launcher.new_project.reline_refresh_models_tooltip"))
                 .clicked()
             {
                 self.refresh_reline_model_catalog();
@@ -3617,7 +3572,7 @@ impl NewProjectWindowState {
 
         if self.reline_model_catalog.is_loading() {
             ui.label(
-                RichText::new("Загружаем список моделей Reline...")
+                RichText::new(t!("launcher.new_project.reline_loading_models_status"))
                     .small()
                     .weak(),
             );
@@ -3636,7 +3591,7 @@ impl NewProjectWindowState {
         ui.vertical(|ui| {
             let mut project_base = self.save_mode == SaveMode::ProjectBase;
             if ui
-                .checkbox(&mut project_base, "Сохранить как основу проекта")
+                .checkbox(&mut project_base, t!("launcher.new_project.save_as_project_base_button"))
                 .changed()
                 && project_base
             {
@@ -3645,7 +3600,7 @@ impl NewProjectWindowState {
 
             let mut alt_version = self.save_mode == SaveMode::AltVersion;
             if ui
-                .checkbox(&mut alt_version, "Сохранить как альтернативную версию")
+                .checkbox(&mut alt_version, t!("launcher.new_project.save_as_alt_version_button"))
                 .changed()
                 && alt_version
             {
@@ -3654,7 +3609,7 @@ impl NewProjectWindowState {
 
             let mut independent = self.save_mode == SaveMode::Independent;
             if ui
-                .checkbox(&mut independent, "Независимое сохранение")
+                .checkbox(&mut independent, t!("launcher.new_project.save_independent_button"))
                 .changed()
                 && independent
             {
@@ -3663,16 +3618,13 @@ impl NewProjectWindowState {
         });
         ui.add_space(6.0);
         ui.label(
-            RichText::new(format!(
-                "Папка проектов: {}",
-                self.project_catalog.projects_root().display()
-            ))
+            RichText::new(tf!("launcher.new_project.projects_folder_label", arg = self.project_catalog.projects_root().display()))
             .small()
             .weak(),
         );
         if self.project_catalog.is_loading() {
             ui.label(
-                RichText::new("Обновляем список тайтлов и глав...")
+                RichText::new(t!("launcher.new_project.refreshing_titles_status"))
                     .small()
                     .weak(),
             );
@@ -3684,9 +3636,9 @@ impl NewProjectWindowState {
             ui.add_space(10.0);
             sub_group(
                 ui,
-                "Сохранить как основу проекта",
+                t!("launcher.new_project.save_as_project_base_button"),
                 |ui| {
-                    field_label(ui, "Тайтл");
+                    field_label(ui, t!("launcher.common.title_label"));
                     let save_title_response = self.save_title_combo.draw(
                         ui,
                         &mut self.save_title_input,
@@ -3695,18 +3647,18 @@ impl NewProjectWindowState {
                     if save_title_response.changed {
                         self.sync_save_title_from_input();
                     }
-                    if button_sized(ui, "Обновить", SMALL_BUTTON_SIZE, can_refresh_catalog)
+                    if button_sized(ui, t!("launcher.common.refresh_button"), SMALL_BUTTON_SIZE, can_refresh_catalog)
                         .clicked()
                     {
                         self.refresh_project_catalog();
                     }
-                    field_label(ui, "Название главы");
+                    field_label(ui, t!("launcher.new_project.chapter_name_label"));
                     ui.add(
                         TextEdit::singleline(&mut self.save_chapter).desired_width(fill_width(ui)),
                     );
                     if button_sized(
                         ui,
-                        "Сохранить и открыть",
+                        t!("launcher.common.save_and_open_button"),
                         egui::vec2(LEFT_PANEL_WIDTH - 84.0, 32.0),
                         can_save,
                     )
@@ -3716,7 +3668,7 @@ impl NewProjectWindowState {
                     }
                     if button_sized(
                         ui,
-                        "Сохранить в проект",
+                        t!("launcher.new_project.save_to_project_button"),
                         egui::vec2(LEFT_PANEL_WIDTH - 84.0, 32.0),
                         can_save,
                     )
@@ -3732,9 +3684,9 @@ impl NewProjectWindowState {
             ui.add_space(10.0);
             sub_group(
                 ui,
-                "Сохранить как альтернативную версию",
+                t!("launcher.new_project.save_as_alt_version_button"),
                 |ui| {
-                    field_label(ui, "Тайтл");
+                    field_label(ui, t!("launcher.common.title_label"));
                     let previous_alt_title = self.alt_title;
                     combo_index_owned(
                         ui,
@@ -3745,30 +3697,30 @@ impl NewProjectWindowState {
                     if previous_alt_title != self.alt_title {
                         self.alt_chapter = 0;
                     }
-                    if button_sized(ui, "Обновить", SMALL_BUTTON_SIZE, can_refresh_catalog)
+                    if button_sized(ui, t!("launcher.common.refresh_button"), SMALL_BUTTON_SIZE, can_refresh_catalog)
                         .clicked()
                     {
                         self.refresh_project_catalog();
                     }
 
-                    field_label(ui, "Глава");
+                    field_label(ui, t!("launcher.common.chapter_label"));
                     combo_index_owned(
                         ui,
                         "launcher_new_project_alt_chapter",
                         alt_chapters.as_slice(),
                         &mut self.alt_chapter,
                     );
-                    if button_sized(ui, "Обновить", SMALL_BUTTON_SIZE, can_refresh_catalog)
+                    if button_sized(ui, t!("launcher.common.refresh_button"), SMALL_BUTTON_SIZE, can_refresh_catalog)
                         .clicked()
                     {
                         self.refresh_project_catalog();
                     }
 
-                    field_label(ui, "Название альтер-версии");
+                    field_label(ui, t!("launcher.new_project.alt_version_name_label"));
                     ui.add(TextEdit::singleline(&mut self.alt_name).desired_width(fill_width(ui)));
                     if button_sized(
                         ui,
-                        "Сохранить как альтер-версию",
+                        t!("launcher.new_project.save_as_alt_version_short_button"),
                         egui::vec2(LEFT_PANEL_WIDTH - 84.0, 32.0),
                         can_save,
                     )
@@ -3782,10 +3734,10 @@ impl NewProjectWindowState {
 
         if self.save_mode == SaveMode::Independent {
             ui.add_space(10.0);
-            sub_group(ui, "Независимое сохранение", |ui| {
+            sub_group(ui, t!("launcher.new_project.save_independent_button"), |ui| {
                 if button_sized(
                     ui,
-                    "Сохранить в папку",
+                    t!("launcher.new_project.save_to_folder_button"),
                     egui::vec2(LEFT_PANEL_WIDTH - 84.0, 32.0),
                     can_save,
                 )
@@ -3806,20 +3758,17 @@ impl NewProjectWindowState {
                 ui.set_min_height(VIEWER_MIN_HEIGHT);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Превью страниц").size(20.0).strong());
+                        ui.label(RichText::new(t!("launcher.new_project.pages_preview_title")).size(20.0).strong());
                         ui.add_space(10.0);
                         ui.label(
-                            RichText::new(format!(
-                                "Страниц на ленте: {}",
-                                self.ribbon.pages().len()
-                            ))
+                            RichText::new(tf!("launcher.new_project.pages_on_ribbon_count", arg = self.ribbon.pages().len()))
                             .small()
                             .weak(),
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if self.has_manual_cut_preview() {
                                 let button = Button::new(
-                                    RichText::new("Нарезать")
+                                    RichText::new(t!("launcher.new_project.cut_button"))
                                         .size(14.0)
                                         .strong()
                                         .color(egui::Color32::WHITE),
@@ -3843,7 +3792,7 @@ impl NewProjectWindowState {
                                     RichText::new(folder.display().to_string()).small().weak(),
                                 );
                             } else {
-                                ui.label(RichText::new("Папка не выбрана").small().weak());
+                                ui.label(RichText::new(t!("launcher.new_project.folder_not_selected")).small().weak());
                             }
                         });
                     });
@@ -3901,11 +3850,11 @@ impl NewProjectWindowState {
                         if self.ribbon.pages().is_empty() {
                             ui.add_space(24.0);
                             ui.vertical_centered(|ui| {
-                                ui.label(RichText::new("Лента пока пуста").size(18.0));
+                                ui.label(RichText::new(t!("launcher.new_project.ribbon_empty_hint")).size(18.0));
                                 ui.add_space(4.0);
                                 ui.label(
                                     RichText::new(
-                                        "Откройте папку, и окно соберёт простую вертикальную ленту из найденных изображений.",
+                                        t!("launcher.new_project.ribbon_empty_description"),
                                     )
                                     .small()
                                     .weak(),
@@ -3964,14 +3913,14 @@ impl NewProjectWindowState {
                                         });
                                     }
                                     image_response.context_menu(|ui| {
-                                        if ui.button("Добавить линию резки").clicked() {
+                                        if ui.button(t!("launcher.new_project.add_cut_line_menu")).clicked() {
                                             add_manual_cut_at = manual_cut_context_guide;
                                             ui.close();
                                         }
                                         if ui
                                             .add_enabled(
                                                 index > 0,
-                                                Button::new("Склеить с предыдущей страницей"),
+                                                Button::new(t!("launcher.new_project.stitch_with_prev_menu")),
                                             )
                                             .clicked()
                                         {
@@ -3982,7 +3931,7 @@ impl NewProjectWindowState {
                                         if ui
                                             .add_enabled(
                                                 index + 1 < pages_len,
-                                                Button::new("Склеить со следующей страницей"),
+                                                Button::new(t!("launcher.new_project.stitch_with_next_menu")),
                                             )
                                             .clicked()
                                         {
@@ -4183,7 +4132,7 @@ impl NewProjectWindowState {
                 self.merge_manual_cut_guide_pages(first_index, first_height);
                 self.clamp_manual_cut_guides_to_current_pages();
                 self.selected_ribbon_page = Some(first_index);
-                self.import_status = "Страницы склеены.".to_string();
+                self.import_status = t!("launcher.new_project.pages_stitched_status").to_string();
                 self.last_error = None;
             }
             Err(RibbonMergeError::WidthMismatch {
@@ -4192,14 +4141,12 @@ impl NewProjectWindowState {
                 second_name,
                 second_width,
             }) => {
-                self.last_error = Some(format!(
-                    "Нельзя склеить страницы разной ширины: '{first_name}' — {first_width}px, '{second_name}' — {second_width}px."
-                ));
-                self.import_status = "Склейка страниц отменена.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.stitch_width_mismatch_error", first_name = first_name, first_width = first_width, second_name = second_name, second_width = second_width));
+                self.import_status = t!("launcher.new_project.stitch_pages_cancelled").to_string();
             }
             Err(RibbonMergeError::MissingPage) => {
-                self.last_error = Some("Нет соседней страницы для склейки.".to_string());
-                self.import_status = "Склейка страниц недоступна.".to_string();
+                self.last_error = Some(t!("launcher.new_project.no_adjacent_page_error").to_string());
+                self.import_status = t!("launcher.new_project.stitch_pages_unavailable").to_string();
             }
         }
     }
@@ -4214,7 +4161,7 @@ impl NewProjectWindowState {
                 if self.ribbon.move_page_up(index) {
                     self.swap_manual_cut_guide_pages(index - 1, index);
                     self.selected_ribbon_page = Some(index - 1);
-                    self.import_status = "Изображение перемещено вверх.".to_string();
+                    self.import_status = t!("launcher.new_project.image_moved_up").to_string();
                     self.last_error = None;
                 }
             }
@@ -4222,7 +4169,7 @@ impl NewProjectWindowState {
                 if self.ribbon.move_page_down(index) {
                     self.swap_manual_cut_guide_pages(index, index + 1);
                     self.selected_ribbon_page = Some(index + 1);
-                    self.import_status = "Изображение перемещено вниз.".to_string();
+                    self.import_status = t!("launcher.new_project.image_moved_down").to_string();
                     self.last_error = None;
                 }
             }
@@ -4232,7 +4179,7 @@ impl NewProjectWindowState {
                     self.remove_manual_cut_guide_page(index);
                     self.clamp_manual_cut_guides_to_current_pages();
                     self.import_status =
-                        format!("Изображение '{}' удалено из ленты.", removed_page.name);
+                        tf!("launcher.new_project.image_removed_status", removed_page = removed_page.name);
                     self.last_error = None;
                 }
             }
@@ -4299,7 +4246,7 @@ impl NewProjectWindowState {
 
         let mut keep_open = true;
         let mut request_apply = false;
-        let shown = Window::new(format!("Обрезка: {}", editor.page_name))
+        let shown = Window::new(tf!("launcher.new_project.crop_editor_title", editor = editor.page_name))
             .id(egui::Id::new((
                 "launcher_new_project_crop",
                 editor.page_index,
@@ -4316,7 +4263,7 @@ impl NewProjectWindowState {
                 ui.set_min_size(CROP_WINDOW_MIN_SIZE.min(max_window_size));
                 ui.label(
                     RichText::new(
-                        "Оригинал сохраняется. Рамка задаёт область, которая попадёт в ленту.",
+                        t!("launcher.new_project.crop_editor_hint"),
                     )
                     .small()
                     .weak(),
@@ -4330,7 +4277,7 @@ impl NewProjectWindowState {
                     });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Сбросить").clicked() {
+                    if ui.button(t!("launcher.new_project.reset_button")).clicked() {
                         editor.crop_rect = RibbonCrop {
                             left: 0,
                             top: 0,
@@ -4341,7 +4288,7 @@ impl NewProjectWindowState {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
-                            .add_sized(egui::vec2(132.0, 32.0), Button::new("Применить"))
+                            .add_sized(egui::vec2(132.0, 32.0), Button::new(t!("launcher.new_project.apply_button")))
                             .clicked()
                         {
                             request_apply = true;
@@ -4359,10 +4306,10 @@ impl NewProjectWindowState {
             let crop_rect = editor.crop_rect;
             if self.ribbon.apply_crop(page_index, crop_rect) {
                 self.clamp_manual_cut_guides_to_current_pages();
-                self.import_status = format!("Изображение '{page_name}' обрезано.");
+                self.import_status = tf!("launcher.new_project.image_cropped_status", page_name = page_name);
                 self.last_error = None;
             } else {
-                self.last_error = Some("Не удалось применить обрезку.".to_string());
+                self.last_error = Some(t!("launcher.new_project.apply_crop_error").to_string());
             }
             self.crop_editor = None;
             return;
@@ -4388,18 +4335,13 @@ impl NewProjectWindowState {
             return;
         };
         if !manual_cut_y_is_valid(guide.y, page.original_size[1]) {
-            self.last_error = Some(format!(
-                "Линия резки должна быть не ближе {MANUAL_CUT_MIN_EDGE_DISTANCE_PX}px к началу или концу картинки."
-            ));
-            self.import_status = "Линия резки не добавлена.".to_string();
+            self.last_error = Some(tf!("launcher.new_project.cut_line_min_distance_error", manual_cut_min_edge_distance_px = MANUAL_CUT_MIN_EDGE_DISTANCE_PX));
+            self.import_status = t!("launcher.new_project.cut_line_not_added").to_string();
             return;
         };
         self.manual_cut_guides.push(guide);
         self.clamp_manual_cut_guides_to_current_pages();
-        self.import_status = format!(
-            "Добавлена ручная линия резки. Всего линий: {}.",
-            self.manual_cut_guides.len()
-        );
+        self.import_status = tf!("launcher.new_project.manual_cut_added_status", arg = self.manual_cut_guides.len());
         self.last_error = None;
     }
 
@@ -4409,8 +4351,8 @@ impl NewProjectWindowState {
         };
         let images = self.current_stitch_images();
         if images.is_empty() {
-            self.last_error = Some("Сначала откройте папку или скачайте главу.".to_string());
-            self.import_status = "Сшивание недоступно: нет загруженных изображений.".to_string();
+            self.last_error = Some(t!("launcher.new_project.open_or_download_chapter_error").to_string());
+            self.import_status = t!("launcher.new_project.stitch_no_images_error").to_string();
             return;
         }
         self.manual_cut_guides.clear();
@@ -4430,10 +4372,10 @@ impl NewProjectWindowState {
         if self.ribbon.restore_original() {
             self.selected_ribbon_page = self.default_selected_page();
             self.manual_cut_guides.clear();
-            self.import_status = "Исходные изображения восстановлены.".to_string();
+            self.import_status = t!("launcher.new_project.source_images_restored").to_string();
             self.last_error = None;
         } else {
-            self.last_error = Some("Исходные изображения ещё не были загружены.".to_string());
+            self.last_error = Some(t!("launcher.new_project.source_images_not_loaded").to_string());
         }
     }
 
@@ -4443,7 +4385,7 @@ impl NewProjectWindowState {
         }
         let images = self.current_stitch_images();
         if images.is_empty() {
-            self.last_error = Some("Для ручной нарезки нужна хотя бы одна страница.".to_string());
+            self.last_error = Some(t!("launcher.new_project.manual_cut_needs_page_error").to_string());
             return;
         }
         self.last_error = None;
@@ -4453,7 +4395,7 @@ impl NewProjectWindowState {
             current: 0,
             total: self.manual_cut_guides.len().saturating_add(1).max(1),
         });
-        self.import_status = "Ручная нарезка ленты...".to_string();
+        self.import_status = t!("launcher.new_project.manual_cut_progress").to_string();
         self.stitch.begin(StitchRequest::ApplyManualCutsToPages {
             images,
             cut_guides: self.manual_cut_guides.clone(),
@@ -4462,13 +4404,13 @@ impl NewProjectWindowState {
 
     fn start_cut_like_project_chapter(&mut self) {
         let Some(title) = self.current_cut_title_name().map(str::to_string) else {
-            self.last_error = Some("Выберите тайтл для примера главы.".to_string());
-            self.import_status = "Нарезка по примеру главы недоступна.".to_string();
+            self.last_error = Some(t!("launcher.new_project.select_title_for_example_error").to_string());
+            self.import_status = t!("launcher.new_project.cut_by_example_unavailable").to_string();
             return;
         };
         let Some(chapter) = self.current_cut_chapter_name().map(str::to_string) else {
-            self.last_error = Some("Выберите главу для примера нарезки.".to_string());
-            self.import_status = "Нарезка по примеру главы недоступна.".to_string();
+            self.last_error = Some(t!("launcher.new_project.select_chapter_for_example_error").to_string());
+            self.import_status = t!("launcher.new_project.cut_by_example_unavailable").to_string();
             return;
         };
 
@@ -4490,15 +4432,15 @@ impl NewProjectWindowState {
             if legacy_dir.exists() {
                 legacy_dir
             } else {
-                self.last_error = Some("У выбранной главы не найдена папка src/scr.".to_string());
-                self.import_status = "Нарезка по примеру главы недоступна.".to_string();
+                self.last_error = Some(t!("launcher.new_project.example_no_src_folder_error").to_string());
+                self.import_status = t!("launcher.new_project.cut_by_example_unavailable").to_string();
                 return;
             }
         };
 
         self.start_cut_like_reference(
             reference_dir,
-            &format!("Нарезаем по примеру {title}/{chapter}..."),
+            &tf!("launcher.new_project.cut_by_example_progress", title = title, chapter = chapter),
         );
     }
 
@@ -4509,7 +4451,7 @@ impl NewProjectWindowState {
         };
         self.start_cut_like_reference(
             folder.clone(),
-            &format!("Нарезаем по примеру папки '{}'...", folder.display()),
+            &tf!("launcher.new_project.cut_by_folder_progress", folder = folder.display()),
         );
     }
 
@@ -4517,15 +4459,15 @@ impl NewProjectWindowState {
     /// equivalent, so this reports the missing capability instead of opening one.
     #[cfg(target_arch = "wasm32")]
     fn start_cut_like_folder(&mut self) {
-        self.last_error = Some("Выбор папки недоступен в веб-версии.".to_string());
-        self.import_status = "Нарезка по примеру папки недоступна в веб-версии.".to_string();
+        self.last_error = Some(t!("launcher.new_project.choose_folder_web_unsupported").to_string());
+        self.import_status = t!("launcher.new_project.cut_by_folder_web_unsupported").to_string();
     }
 
     fn start_cut_like_reference(&mut self, reference_dir: PathBuf, status_message: &str) {
         let images = self.current_stitch_images();
         if images.is_empty() {
-            self.last_error = Some("Сначала откройте папку или скачайте главу.".to_string());
-            self.import_status = "Нарезка по примеру главы недоступна: лента пуста.".to_string();
+            self.last_error = Some(t!("launcher.new_project.open_or_download_chapter_error").to_string());
+            self.import_status = t!("launcher.new_project.cut_by_example_empty_ribbon_error").to_string();
             return;
         }
 
@@ -4556,8 +4498,8 @@ impl NewProjectWindowState {
                 Ok(value) if value > 0 => Some(value),
                 _ => {
                     self.last_error =
-                        Some("K должно быть положительным целым числом или пустым.".to_string());
-                    self.import_status = "Некорректные параметры склейки.".to_string();
+                        Some(t!("launcher.new_project.stitch_k_positive_error").to_string());
+                    self.import_status = t!("launcher.new_project.stitch_invalid_params_error").to_string();
                     return None;
                 }
             }
@@ -4566,7 +4508,7 @@ impl NewProjectWindowState {
         let parse_positive = |value: &str, name: &str| -> Result<usize, String> {
             match value.trim().parse::<usize>() {
                 Ok(parsed) if parsed > 0 => Ok(parsed),
-                _ => Err(format!("{name} должно быть больше нуля.")),
+                _ => Err(tf!("launcher.new_project.stitch_field_positive_error", name = name)),
             }
         };
 
@@ -4574,7 +4516,7 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(message) => {
                 self.last_error = Some(message);
-                self.import_status = "Некорректные параметры склейки.".to_string();
+                self.import_status = t!("launcher.new_project.stitch_invalid_params_error").to_string();
                 return None;
             }
         };
@@ -4582,7 +4524,7 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(message) => {
                 self.last_error = Some(message);
-                self.import_status = "Некорректные параметры склейки.".to_string();
+                self.import_status = t!("launcher.new_project.stitch_invalid_params_error").to_string();
                 return None;
             }
         };
@@ -4590,15 +4532,15 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(message) => {
                 self.last_error = Some(message);
-                self.import_status = "Некорректные параметры склейки.".to_string();
+                self.import_status = t!("launcher.new_project.stitch_invalid_params_error").to_string();
                 return None;
             }
         };
         let tolerance = match self.stitch_tolerance.trim().parse::<u8>() {
             Ok(value) if value > 0 => value,
             _ => {
-                self.last_error = Some("tol должен быть целым числом больше нуля.".to_string());
-                self.import_status = "Некорректные параметры склейки.".to_string();
+                self.last_error = Some(t!("launcher.new_project.stitch_tol_positive_error").to_string());
+                self.import_status = t!("launcher.new_project.stitch_invalid_params_error").to_string();
                 return None;
             }
         };
@@ -4747,8 +4689,8 @@ impl NewProjectWindowState {
         let title = self.save_title_input.trim().to_string();
         let chapter = self.save_chapter.trim().to_string();
         if title.is_empty() || chapter.is_empty() {
-            self.last_error = Some("Укажите тайтл и название главы.".to_string());
-            self.import_status = "Сохранение в проект недоступно.".to_string();
+            self.last_error = Some(t!("launcher.new_project.specify_title_chapter_error").to_string());
+            self.import_status = t!("launcher.new_project.save_to_project_unavailable").to_string();
             return false;
         }
         let target_dir = self
@@ -4761,8 +4703,8 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
-                    Some("Не удалось проверить папку проекта перед сохранением.".to_string());
-                self.import_status = "Сохранение в проект завершилось с ошибкой.".to_string();
+                    Some(t!("launcher.new_project.check_project_folder_error").to_string());
+                self.import_status = t!("launcher.new_project.save_to_project_failed").to_string();
                 crate::runtime_log::log_error(format!(
                     "[new-project] failed to inspect project save dir '{}': {err}",
                     target_dir.display()
@@ -4779,26 +4721,26 @@ impl NewProjectWindowState {
                 images: self.current_save_images(),
             },
             open_after_save,
-            "Сохраняем главу в проект...",
+            t!("launcher.new_project.saving_to_project_progress"),
         );
         true
     }
 
     fn start_save_alt_version(&mut self) {
         let Some(title) = self.current_alt_title_name().map(str::to_string) else {
-            self.last_error = Some("Выберите тайтл для альтер-версии.".to_string());
-            self.import_status = "Сохранение альтер-версии недоступно.".to_string();
+            self.last_error = Some(t!("launcher.new_project.select_title_for_alt_error").to_string());
+            self.import_status = t!("launcher.new_project.save_alt_unavailable").to_string();
             return;
         };
         let Some(chapter) = self.current_alt_chapter_name().map(str::to_string) else {
-            self.last_error = Some("Выберите главу для альтер-версии.".to_string());
-            self.import_status = "Сохранение альтер-версии недоступно.".to_string();
+            self.last_error = Some(t!("launcher.new_project.select_chapter_for_alt_error").to_string());
+            self.import_status = t!("launcher.new_project.save_alt_unavailable").to_string();
             return;
         };
         let alt_name = self.alt_name.trim().to_string();
         if alt_name.is_empty() {
-            self.last_error = Some("Укажите название альтер-версии.".to_string());
-            self.import_status = "Сохранение альтер-версии недоступно.".to_string();
+            self.last_error = Some(t!("launcher.new_project.specify_alt_name_error").to_string());
+            self.import_status = t!("launcher.new_project.save_alt_unavailable").to_string();
             return;
         }
         let target_dir = self
@@ -4812,8 +4754,8 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
-                    Some("Не удалось проверить папку альтер-версии перед сохранением.".to_string());
-                self.import_status = "Сохранение альтер-версии завершилось с ошибкой.".to_string();
+                    Some(t!("launcher.new_project.check_alt_folder_error").to_string());
+                self.import_status = t!("launcher.new_project.save_alt_failed").to_string();
                 crate::runtime_log::log_error(format!(
                     "[new-project] failed to inspect alt save dir '{}': {err}",
                     target_dir.display()
@@ -4834,7 +4776,7 @@ impl NewProjectWindowState {
                 images: self.current_save_images(),
             },
             false,
-            "Сохраняем альтер-версию...",
+            t!("launcher.new_project.saving_alt_progress"),
         );
     }
 
@@ -4842,8 +4784,8 @@ impl NewProjectWindowState {
     /// (`rfd`), unavailable in the browser. Reports the missing capability.
     #[cfg(target_arch = "wasm32")]
     fn start_save_to_folder(&mut self) {
-        self.last_error = Some("Сохранение в папку недоступно в веб-версии.".to_string());
-        self.import_status = "Сохранение в папку недоступно в веб-версии.".to_string();
+        self.last_error = Some(t!("launcher.new_project.save_to_folder_web_unsupported").to_string());
+        self.import_status = t!("launcher.new_project.save_to_folder_web_unsupported").to_string();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -4867,8 +4809,8 @@ impl NewProjectWindowState {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
-                    Some("Не удалось проверить выбранную папку перед сохранением.".to_string());
-                self.import_status = "Сохранение в папку завершилось с ошибкой.".to_string();
+                    Some(t!("launcher.new_project.check_selected_folder_error").to_string());
+                self.import_status = t!("launcher.new_project.save_to_folder_failed").to_string();
                 crate::runtime_log::log_error(format!(
                     "[new-project] failed to inspect folder save dir '{}': {err}",
                     folder.display()
@@ -4887,7 +4829,7 @@ impl NewProjectWindowState {
                 images: self.current_save_images(),
             },
             false,
-            &format!("Сохраняем изображения в '{}'...", folder.display()),
+            &tf!("launcher.new_project.saving_to_folder_progress", folder = folder.display()),
         );
     }
 
@@ -4898,8 +4840,8 @@ impl NewProjectWindowState {
         status_message: &str,
     ) {
         if request.images.is_empty() {
-            self.last_error = Some("На холсте нет изображений для сохранения.".to_string());
-            self.import_status = "Сохранение недоступно: лента пуста.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_images_to_save_error").to_string());
+            self.import_status = t!("launcher.new_project.save_empty_ribbon_error").to_string();
             return;
         }
         self.last_error = None;
@@ -5059,10 +5001,7 @@ impl NewProjectWindowState {
             if delete_response.clicked() {
                 self.manual_cut_guides.remove(index);
                 screen_positions.pop();
-                self.import_status = format!(
-                    "Линия резки удалена. Осталось линий: {}.",
-                    self.manual_cut_guides.len()
-                );
+                self.import_status = tf!("launcher.new_project.cut_line_removed_status", arg = self.manual_cut_guides.len());
                 continue;
             }
             index += 1;
@@ -5133,7 +5072,7 @@ impl NewProjectWindowState {
                 current: 0,
                 total: 1,
             });
-            self.import_status = "Сканирование папки...".to_string();
+            self.import_status = t!("launcher.new_project.scanning_folder_status").to_string();
         }
     }
 
@@ -5150,15 +5089,15 @@ impl NewProjectWindowState {
                 current: 0,
                 total: 1,
             });
-            self.import_status = "Открытие файла...".to_string();
+            self.import_status = t!("launcher.new_project.opening_file_status").to_string();
         }
     }
 
     fn start_quick_download(&mut self) {
         let url = self.quick_link.trim();
         if url.is_empty() {
-            self.last_error = Some("Вставьте ссылку на главу перед загрузкой.".to_string());
-            self.import_status = "Быстрый выкачиватель ждёт ссылку.".to_string();
+            self.last_error = Some(t!("launcher.new_project.paste_link_before_download_error").to_string());
+            self.import_status = t!("launcher.new_project.quick_dl_waiting_link").to_string();
             return;
         }
         self.last_error = None;
@@ -5168,7 +5107,7 @@ impl NewProjectWindowState {
             current: 0,
             total: 1,
         });
-        self.import_status = "Подготовка быстрого выкачивания...".to_string();
+        self.import_status = t!("launcher.new_project.quick_dl_preparing_status").to_string();
         self.quick_download.begin_download(url.to_string());
     }
 
@@ -5185,7 +5124,7 @@ impl NewProjectWindowState {
             current: 0,
             total: 1,
         });
-        self.import_status = "Проверяем доступность comic.naver.com...".to_string();
+        self.import_status = t!("launcher.new_project.checking_naver_status").to_string();
         let chapter_number = random_test_chapter_number();
         let chapter_url =
             format!("https://comic.naver.com/webtoon/detail?titleId=842647&no={chapter_number}");
@@ -5205,8 +5144,8 @@ impl NewProjectWindowState {
         };
         let images = self.current_waifu2x_images();
         if images.is_empty() {
-            self.last_error = Some("Сначала откройте или скачайте изображения.".to_string());
-            self.import_status = "waifu2x недоступен: лента пуста.".to_string();
+            self.last_error = Some(t!("launcher.new_project.open_or_download_first_error").to_string());
+            self.import_status = t!("launcher.new_project.waifu2x_empty_ribbon_error").to_string();
             return;
         }
         self.last_error = None;
@@ -5216,7 +5155,7 @@ impl NewProjectWindowState {
             current: 0,
             total: images.len(),
         });
-        self.import_status = "Подготавливаем waifu2x runtime...".to_string();
+        self.import_status = t!("launcher.new_project.preparing_waifu2x_status").to_string();
         self.waifu2x.begin(images, options);
     }
 
@@ -5230,8 +5169,8 @@ impl NewProjectWindowState {
         };
         let images = self.current_reline_images();
         if images.is_empty() {
-            self.last_error = Some("Сначала откройте или скачайте изображения.".to_string());
-            self.import_status = "Reline недоступен: лента пуста.".to_string();
+            self.last_error = Some(t!("launcher.new_project.open_or_download_first_error").to_string());
+            self.import_status = t!("launcher.new_project.reline_empty_ribbon_error").to_string();
             return;
         }
         self.last_error = None;
@@ -5241,7 +5180,7 @@ impl NewProjectWindowState {
             current: 0,
             total: images.len(),
         });
-        self.import_status = "Отправляем изображения в Reline backend...".to_string();
+        self.import_status = t!("launcher.new_project.sending_to_reline_status").to_string();
         self.reline.begin(images, options);
     }
 
@@ -5285,24 +5224,9 @@ impl NewProjectWindowState {
                     self.import_status = if let Some((median, min_width, max_width)) =
                         result.filter_bounds
                     {
-                        format!(
-                            "Загружено {} изображений из {}. Пропущено: {}, отфильтровано: {}. Медиана ширины: {} px, диапазон: [{}; {}].",
-                            result.imported_images,
-                            result.source_path.display(),
-                            result.skipped_files,
-                            result.filtered_out,
-                            median,
-                            min_width,
-                            max_width,
-                        )
+                        tf!("launcher.new_project.import_summary_with_median", result = result.imported_images, result_2 = result.source_path.display(), result_3 = result.skipped_files, result_4 = result.filtered_out, median = median, min_width = min_width, max_width = max_width)
                     } else {
-                        format!(
-                            "Загружено {} изображений из {}. Пропущено: {}, отфильтровано: {}.",
-                            result.imported_images,
-                            result.source_path.display(),
-                            result.skipped_files,
-                            result.filtered_out,
-                        )
+                        tf!("launcher.new_project.import_summary", result = result.imported_images, result_2 = result.source_path.display(), result_3 = result.skipped_files, result_4 = result.filtered_out)
                     };
                     self.last_error = None;
                 }
@@ -5318,7 +5242,7 @@ impl NewProjectWindowState {
                     self.selected_ribbon_page = None;
                     self.crop_editor = None;
                     self.active_progress = None;
-                    self.import_status = "Не удалось загрузить источник".to_string();
+                    self.import_status = t!("launcher.new_project.load_source_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 SourceLoadEvent::WorkerDisconnected => {
@@ -5329,9 +5253,9 @@ impl NewProjectWindowState {
                     self.selected_ribbon_page = None;
                     self.crop_editor = None;
                     self.active_progress = None;
-                    self.import_status = "Не удалось загрузить источник".to_string();
+                    self.import_status = t!("launcher.new_project.load_source_error").to_string();
                     self.last_error = Some(
-                        "Не удалось загрузить источник. Фоновая задача завершилась с ошибкой."
+                        t!("launcher.new_project.load_source_bg_error")
                             .to_string(),
                     );
                 }
@@ -5371,7 +5295,7 @@ impl NewProjectWindowState {
                 }
                 ProjectCatalogEvent::WorkerDisconnected => {
                     self.project_catalog_error = Some(
-                        "Фоновый поток чтения списка проектов неожиданно завершился.".to_string(),
+                        t!("launcher.new_project.read_projects_bg_error").to_string(),
                     );
                     crate::runtime_log::log_error(
                         "[new-project] project catalog worker disconnected unexpectedly",
@@ -5412,9 +5336,9 @@ impl NewProjectWindowState {
                 "[new-project] comic.naver.com availability check failed: {log_message}"
             ));
         }
-        self.import_status = "Тестовую главу скачать не удалось.".to_string();
+        self.import_status = t!("launcher.new_project.test_chapter_download_failed").to_string();
         self.last_error = Some(
-            "Сайт comic.naver.com недоступен. Попробуйте включить VPN если вы из России"
+            t!("launcher.new_project.naver_unavailable_vpn_hint")
                 .to_string(),
         );
     }
@@ -5451,10 +5375,7 @@ impl NewProjectWindowState {
                         "[new-project] quick-downloaded {} ribbon images from '{}'",
                         page_count, result.source_url,
                     ));
-                    self.import_status = format!(
-                        "Быстрый выкачиватель загрузил {} изображений из {}.",
-                        result.downloaded_images, result.source_url,
-                    );
+                    self.import_status = tf!("launcher.new_project.quick_dl_done_status", result = result.downloaded_images, result_2 = result.source_url);
                     self.last_error = None;
                 }
                 QuickDownloadEvent::Failed {
@@ -5465,7 +5386,7 @@ impl NewProjectWindowState {
                         "[new-project] quick downloader failed: {log_message}",
                     ));
                     self.active_progress = None;
-                    self.import_status = "Быстрый выкачиватель завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.quick_dl_failed_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 QuickDownloadEvent::WorkerDisconnected => {
@@ -5473,9 +5394,9 @@ impl NewProjectWindowState {
                         "[new-project] quick download worker disconnected unexpectedly",
                     );
                     self.active_progress = None;
-                    self.import_status = "Быстрый выкачиватель завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.quick_dl_failed_error").to_string();
                     self.last_error =
-                        Some("Фоновый поток загрузки неожиданно завершился.".to_string());
+                        Some(t!("launcher.new_project.quick_dl_bg_error").to_string());
                 }
             }
         }
@@ -5514,7 +5435,7 @@ impl NewProjectWindowState {
                     self.active_progress = None;
                     self.last_error = None;
                     self.import_status =
-                        format!("Страница открыта в браузере Selenium: {current_url}");
+                        tf!("launcher.new_project.browser_opened_status", current_url = current_url);
                 }
                 AdvancedDownloadEvent::LinkCollectStarted { current_url } => {
                     self.advanced_link_collect_active = true;
@@ -5523,9 +5444,7 @@ impl NewProjectWindowState {
                         Instant::now() - Duration::from_secs(1);
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "Сбор ссылок запущен в Selenium-браузере: {current_url}. Прокручивайте страницу или открывайте новые блоки, затем нажмите «Остановить сбор ссылок»."
-                    );
+                    self.import_status = tf!("launcher.new_project.collect_started_status", current_url = current_url);
                 }
                 AdvancedDownloadEvent::LinkCollectCountUpdated { found_links } => {
                     self.advanced_link_collect_found_links = found_links;
@@ -5539,13 +5458,9 @@ impl NewProjectWindowState {
                     self.last_error = None;
                     self.import_status = if self.advanced_mode == AdvancedDownloadMode::DeepCapture
                     {
-                        format!(
-                            "Глубокий перехват запущен в CloakBrowser: {current_url}. Выполните нужные действия на странице и затем завершите перехват."
-                        )
+                        tf!("launcher.new_project.deep_intercept_started_status", current_url = current_url)
                     } else {
-                        format!(
-                            "Перехват Canvas запущен в браузере: {current_url}. Выполните нужные действия на странице и затем нажмите «Завершить перехват»."
-                        )
+                        tf!("launcher.new_project.canvas_intercept_started_status", current_url = current_url)
                     };
                 }
                 AdvancedDownloadEvent::InterceptCountUpdated { counts } => {
@@ -5570,15 +5485,9 @@ impl NewProjectWindowState {
                     self.advance_simple_import_step_after_success();
                     self.import_status =
                         if self.advanced_mode == AdvancedDownloadMode::CanvasDownload {
-                            format!(
-                                "Canvas-режим загрузил {} изображений из {}.",
-                                result.downloaded_images, result.source_url,
-                            )
+                            tf!("launcher.new_project.canvas_mode_done_status", result = result.downloaded_images, result_2 = result.source_url)
                         } else {
-                            format!(
-                                "Продвинутый выкачиватель загрузил {} изображений из {}.",
-                                result.downloaded_images, result.source_url,
-                            )
+                            tf!("launcher.new_project.advanced_dl_done_status", result = result.downloaded_images, result_2 = result.source_url)
                         };
                     crate::runtime_log::log_info(format!(
                         "[new-project] advanced downloader loaded {page_count} ribbon images from '{}'",
@@ -5595,9 +5504,7 @@ impl NewProjectWindowState {
                     self.advanced_auto_review = Some(AdvancedAutoReviewState::new(candidates));
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "Автоподбор подготовил {item_count} картинок в {group_count} группах. Проверьте список перед добавлением на ленту."
-                    );
+                    self.import_status = tf!("launcher.new_project.autofind_prepared_status", item_count = item_count, group_count = group_count);
                 }
                 AdvancedDownloadEvent::Failed {
                     user_message,
@@ -5612,7 +5519,7 @@ impl NewProjectWindowState {
                     ));
                     self.active_progress = None;
                     self.import_status =
-                        "Продвинутый выкачиватель завершился с ошибкой.".to_string();
+                        t!("launcher.new_project.advanced_dl_failed_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 AdvancedDownloadEvent::WorkerDisconnected => {
@@ -5625,9 +5532,9 @@ impl NewProjectWindowState {
                     );
                     self.active_progress = None;
                     self.import_status =
-                        "Продвинутый выкачиватель завершился с ошибкой.".to_string();
+                        t!("launcher.new_project.advanced_dl_failed_error").to_string();
                     self.last_error = Some(
-                        "Фоновый поток Selenium-выкачивателя неожиданно завершился.".to_string(),
+                        t!("launcher.new_project.advanced_dl_bg_error").to_string(),
                     );
                 }
             }
@@ -5674,7 +5581,7 @@ impl NewProjectWindowState {
             return;
         }
 
-        Window::new("Предупреждение")
+        Window::new(t!("launcher.new_project.warning_dialog_title")).id(egui::Id::new("launcher.new_project.warning_dialog_title"))
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
@@ -5747,23 +5654,16 @@ impl NewProjectWindowState {
                     );
                     self.import_status = match result.kind {
                         StitchSuccessKind::AutoCut => {
-                            format!("Склейка завершена, получено {page_count} частей.")
+                            tf!("launcher.new_project.stitch_done_status", page_count = page_count)
                         }
                         StitchSuccessKind::StitchOnly => {
-                            format!("Сшивание ленты завершено, получено {page_count} частей.")
+                            tf!("launcher.new_project.stitch_ribbon_done_status", page_count = page_count)
                         }
-                        StitchSuccessKind::HeterogeneousBottoms => format!(
-                            "Сшивание неоднородных мест завершено, получено {page_count} частей."
-                        ),
-                        StitchSuccessKind::ReferenceCut => format!(
-                            "Нарезка по примеру главы завершена, получено {page_count} частей."
-                        ),
-                        StitchSuccessKind::ManualPreview => format!(
-                            "Склейка завершена: выставлено {} ручных линий.",
-                            self.manual_cut_guides.len()
-                        ),
+                        StitchSuccessKind::HeterogeneousBottoms => tf!("launcher.new_project.stitch_uneven_done_status", page_count = page_count),
+                        StitchSuccessKind::ReferenceCut => tf!("launcher.new_project.cut_by_example_done_status", page_count = page_count),
+                        StitchSuccessKind::ManualPreview => tf!("launcher.new_project.stitch_manual_lines_done_status", arg = self.manual_cut_guides.len()),
                         StitchSuccessKind::ManualApply => {
-                            format!("Ручная нарезка завершена, получено {page_count} частей.")
+                            tf!("launcher.new_project.manual_cut_done_status", page_count = page_count)
                         }
                     };
                     crate::runtime_log::log_info(format!(
@@ -5781,7 +5681,7 @@ impl NewProjectWindowState {
                         "[new-project] stitch worker failed: {log_message}"
                     ));
                     self.active_progress = None;
-                    self.import_status = "Сшивание / нарезка завершились с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.stitch_cut_failed_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 StitchEvent::WorkerDisconnected => {
@@ -5789,9 +5689,9 @@ impl NewProjectWindowState {
                         "[new-project] stitch worker disconnected unexpectedly",
                     );
                     self.active_progress = None;
-                    self.import_status = "Сшивание / нарезка завершились с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.stitch_cut_failed_error").to_string();
                     self.last_error =
-                        Some("Фоновый поток склейки неожиданно завершился.".to_string());
+                        Some(t!("launcher.new_project.stitch_cut_bg_error").to_string());
                 }
             }
         }
@@ -5817,11 +5717,7 @@ impl NewProjectWindowState {
                 ProjectSaveEvent::Completed(result) => {
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "Сохранено {} файлов в '{}'.",
-                        result.saved_images,
-                        result.target_dir.display()
-                    );
+                    self.import_status = tf!("launcher.new_project.save_done_status", result = result.saved_images, result_2 = result.target_dir.display());
                     crate::runtime_log::log_info(format!(
                         "[new-project] save completed: files={}, dir='{}'",
                         result.saved_images,
@@ -5854,7 +5750,7 @@ impl NewProjectWindowState {
                     self.return_to_import_after_save_requested = false;
                     self.pending_open_selection = None;
                     self.active_progress = None;
-                    self.import_status = "Сохранение завершилось с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.save_failed_error").to_string();
                     self.last_error = Some(user_message);
                     crate::runtime_log::log_error(format!(
                         "[new-project] save failed: {log_message}"
@@ -5865,9 +5761,9 @@ impl NewProjectWindowState {
                     self.return_to_import_after_save_requested = false;
                     self.pending_open_selection = None;
                     self.active_progress = None;
-                    self.import_status = "Сохранение завершилось с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.save_failed_error").to_string();
                     self.last_error =
-                        Some("Фоновый поток сохранения неожиданно завершился.".to_string());
+                        Some(t!("launcher.new_project.save_bg_error").to_string());
                     crate::runtime_log::log_error(
                         "[new-project] save worker disconnected unexpectedly",
                     );
@@ -5901,11 +5797,7 @@ impl NewProjectWindowState {
                     self.manual_cut_guides.clear();
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "waifu2x обработал {} изображений через {}.",
-                        result.processed_images,
-                        result.backend_path.display()
-                    );
+                    self.import_status = tf!("launcher.new_project.waifu2x_done_status", result = result.processed_images, result_2 = result.backend_path.display());
                     crate::runtime_log::log_info(format!(
                         "[new-project] waifu2x completed: pages={}, backend='{}'",
                         page_count,
@@ -5920,7 +5812,7 @@ impl NewProjectWindowState {
                         "[new-project] waifu2x failed: {log_message}"
                     ));
                     self.active_progress = None;
-                    self.import_status = "waifu2x завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.waifu2x.failed_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 Waifu2xEvent::WorkerDisconnected => {
@@ -5928,9 +5820,9 @@ impl NewProjectWindowState {
                         "[new-project] waifu2x worker disconnected unexpectedly",
                     );
                     self.active_progress = None;
-                    self.import_status = "waifu2x завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.waifu2x.failed_error").to_string();
                     self.last_error =
-                        Some("Фоновый поток waifu2x неожиданно завершился.".to_string());
+                        Some(t!("launcher.new_project.waifu2x_bg_error").to_string());
                 }
             }
         }
@@ -5961,10 +5853,7 @@ impl NewProjectWindowState {
                     self.manual_cut_guides.clear();
                     self.active_progress = None;
                     self.last_error = None;
-                    self.import_status = format!(
-                        "Reline обработал {} изображений через {}.",
-                        result.processed_images, result.backend_endpoint
-                    );
+                    self.import_status = tf!("launcher.new_project.reline_done_status", result = result.processed_images, result_2 = result.backend_endpoint);
                     crate::runtime_log::log_info(format!(
                         "[new-project] Reline completed: pages={}, endpoint='{}'",
                         page_count, result.backend_endpoint
@@ -5978,7 +5867,7 @@ impl NewProjectWindowState {
                         "[new-project] Reline failed: {log_message}"
                     ));
                     self.active_progress = None;
-                    self.import_status = "Reline завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.reline_failed_error").to_string();
                     self.last_error = Some(user_message);
                 }
                 RelineEvent::WorkerDisconnected => {
@@ -5986,9 +5875,9 @@ impl NewProjectWindowState {
                         "[new-project] Reline worker disconnected unexpectedly",
                     );
                     self.active_progress = None;
-                    self.import_status = "Reline завершился с ошибкой.".to_string();
+                    self.import_status = t!("launcher.new_project.reline_failed_error").to_string();
                     self.last_error =
-                        Some("Фоновый поток Reline неожиданно завершился.".to_string());
+                        Some(t!("launcher.new_project.reline_bg_error").to_string());
                 }
             }
         }
@@ -6021,7 +5910,7 @@ impl NewProjectWindowState {
                 }
                 RelineModelCatalogEvent::WorkerDisconnected => {
                     self.reline_model_catalog_error = Some(
-                        "Фоновый поток списка моделей Reline неожиданно завершился.".to_string(),
+                        t!("launcher.new_project.reline_models_bg_error").to_string(),
                     );
                     crate::runtime_log::log_error(
                         "[new-project] Reline model catalog worker disconnected unexpectedly",
@@ -6042,21 +5931,21 @@ impl NewProjectWindowState {
         let noise_levels = [-1, 0, 1, 2, 3];
         let scale_levels = [1, 2, 4, 8, 16, 32];
         let Some(&noise) = noise_levels.get(self.waifu_noise) else {
-            self.last_error = Some("Некорректный уровень шумоподавления для waifu2x.".to_string());
-            self.import_status = "Некорректные параметры waifu2x.".to_string();
+            self.last_error = Some(t!("launcher.new_project.waifu2x_invalid_noise_error").to_string());
+            self.import_status = t!("launcher.new_project.waifu2x_invalid_params_error").to_string();
             return None;
         };
         let Some(&scale) = scale_levels.get(self.waifu_scale) else {
-            self.last_error = Some("Некорректный масштаб для waifu2x.".to_string());
-            self.import_status = "Некорректные параметры waifu2x.".to_string();
+            self.last_error = Some(t!("launcher.new_project.waifu2x_invalid_scale_error").to_string());
+            self.import_status = t!("launcher.new_project.waifu2x_invalid_params_error").to_string();
             return None;
         };
         let tile_size = match self.waifu_tile_size.trim().parse::<u32>() {
             Ok(value) if value == 0 || value >= 32 => value,
             _ => {
                 self.last_error =
-                    Some("Tile size должен быть равен 0 или не меньше 32.".to_string());
-                self.import_status = "Некорректные параметры waifu2x.".to_string();
+                    Some(t!("launcher.new_project.waifu2x_tile_size_error").to_string());
+                self.import_status = t!("launcher.new_project.waifu2x_invalid_params_error").to_string();
                 return None;
             }
         };
@@ -6135,100 +6024,100 @@ impl NewProjectWindowState {
         ];
         const CVT_TYPES: [&str; 4] = ["RGB2Gray2020", "RGB2Gray709", "RGB2Gray", "Gray2RGB"];
 
-        let reader_mode = selected_label(&READER_MODES, self.reline_reader_mode, "режим чтения")?;
-        let tiler = selected_label(&TILERS, self.reline_tiler, "тайлинг Reline")?;
-        let dtype = selected_label(&DTYPES, self.reline_dtype, "тип вычислений Reline")?;
-        let canny_type = selected_label(&CANNY_TYPES, self.reline_sharp_canny_type, "режим Canny")?;
-        let dot_type = selected_label(&DOT_TYPES, self.reline_halftone_dot_type, "тип точки")?;
+        let reader_mode = selected_label(&READER_MODES, self.reline_reader_mode, t!("launcher.new_project.reline_field_read_mode"))?;
+        let tiler = selected_label(&TILERS, self.reline_tiler, t!("launcher.new_project.reline_field_tiling"))?;
+        let dtype = selected_label(&DTYPES, self.reline_dtype, t!("launcher.new_project.reline_field_compute_type"))?;
+        let canny_type = selected_label(&CANNY_TYPES, self.reline_sharp_canny_type, t!("launcher.new_project.reline_field_canny_mode"))?;
+        let dot_type = selected_label(&DOT_TYPES, self.reline_halftone_dot_type, t!("launcher.new_project.reline_field_dot_type"))?;
         let halftone_mode = selected_label(
             &HALFTONE_MODES,
             self.reline_halftone_mode,
-            "цветовой режим полутона",
+            t!("launcher.new_project.reline_field_halftone_color_mode"),
         )?;
         let halftone_filter = selected_label(
             &HALFTONE_FILTERS,
             self.reline_halftone_ssaa_filter,
-            "фильтр SSAA",
+            t!("launcher.new_project.reline_field_ssaa_filter"),
         )?;
         let resize_filter = selected_label(
             &RESIZE_FILTERS,
             self.reline_resize_filter,
-            "фильтр изменения размера",
+            t!("launcher.new_project.reline_field_resize_filter"),
         )?;
         let cvt_type = selected_label(
             &CVT_TYPES,
             self.reline_cvt_color_type,
-            "тип цветового преобразования",
+            t!("launcher.new_project.reline_field_colorconv_type"),
         )?;
 
         let exact_tiler_size = self.parse_required_u32_field(
             &self.reline_exact_tiler_size.clone(),
-            "Размер exact-тайла",
+            t!("launcher.new_project.reline_field_exact_tile"),
         )?;
         let target_scale =
-            self.parse_optional_u32_field(&self.reline_target_scale.clone(), "Целевой масштаб")?;
+            self.parse_optional_u32_field(&self.reline_target_scale.clone(), t!("launcher.new_project.reline_field_target_scale"))?;
         let sharp_low_input = self.parse_required_i32_field(
             &self.reline_sharp_low_input.clone(),
-            "Нижний входной уровень резкости",
+            t!("launcher.new_project.reline_field_sharpen_input_low"),
         )?;
         let sharp_high_input = self.parse_required_i32_field(
             &self.reline_sharp_high_input.clone(),
-            "Верхний входной уровень резкости",
+            t!("launcher.new_project.reline_field_sharpen_input_high"),
         )?;
         let sharp_gamma =
-            self.parse_required_f32_field(&self.reline_sharp_gamma.clone(), "Гамма резкости")?;
+            self.parse_required_f32_field(&self.reline_sharp_gamma.clone(), t!("launcher.new_project.reline_field_sharpen_gamma"))?;
         let sharp_diapason_white = self.parse_required_i32_field(
             &self.reline_sharp_diapason_white.clone(),
-            "Белый диапазон резкости",
+            t!("launcher.new_project.reline_field_sharpen_white"),
         )?;
         let sharp_diapason_black = self.parse_required_i32_field(
             &self.reline_sharp_diapason_black.clone(),
-            "Чёрный диапазон резкости",
+            t!("launcher.new_project.reline_field_sharpen_black"),
         )?;
         let halftone_dot_size = self.parse_required_i32_field(
             &self.reline_halftone_dot_size.clone(),
-            "Размер точки полутона",
+            t!("launcher.new_project.reline_field_dot_size"),
         )?;
         let halftone_angle =
-            self.parse_required_i32_field(&self.reline_halftone_angle.clone(), "Угол полутона")?;
+            self.parse_required_i32_field(&self.reline_halftone_angle.clone(), t!("launcher.new_project.reline_field_angle"))?;
         let halftone_ssaa_scale = self
-            .parse_optional_f32_field(&self.reline_halftone_ssaa_scale.clone(), "Масштаб SSAA")?;
+            .parse_optional_f32_field(&self.reline_halftone_ssaa_scale.clone(), t!("launcher.new_project.reline_field_ssaa_scale"))?;
         let resize_height =
-            self.parse_optional_u32_field(&self.reline_resize_height.clone(), "Высота")?;
+            self.parse_optional_u32_field(&self.reline_resize_height.clone(), t!("launcher.new_project.reline_height"))?;
         let resize_width =
-            self.parse_optional_u32_field(&self.reline_resize_width.clone(), "Ширина")?;
+            self.parse_optional_u32_field(&self.reline_resize_width.clone(), t!("launcher.new_project.reline_width"))?;
         let resize_percent =
-            self.parse_optional_f32_field(&self.reline_resize_percent.clone(), "Процент")?;
+            self.parse_optional_f32_field(&self.reline_resize_percent.clone(), t!("launcher.new_project.reline_percent"))?;
         if self.reline_resize_enabled
             && resize_height.is_none()
             && resize_width.is_none()
             && resize_percent.is_none()
         {
             self.last_error =
-                Some("Изменение размера Reline требует высоту, ширину или процент.".to_string());
-            self.import_status = "Некорректные параметры Reline.".to_string();
+                Some(t!("launcher.new_project.reline_resize_requires_error").to_string());
+            self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
             return None;
         }
         let resize_spread_size = self
-            .parse_required_u32_field(&self.reline_resize_spread_size.clone(), "Размер разброса")?;
+            .parse_required_u32_field(&self.reline_resize_spread_size.clone(), t!("launcher.new_project.reline_spread_size"))?;
         let level_low_input = self.parse_required_i32_field(
             &self.reline_level_low_input.clone(),
-            "Нижний входной уровень",
+            t!("launcher.new_project.reline_input_low_level"),
         )?;
         let level_high_input = self.parse_required_i32_field(
             &self.reline_level_high_input.clone(),
-            "Верхний входной уровень",
+            t!("launcher.new_project.reline_input_high_level"),
         )?;
         let level_low_output = self.parse_required_i32_field(
             &self.reline_level_low_output.clone(),
-            "Нижний выходной уровень",
+            t!("launcher.new_project.reline_output_low_level"),
         )?;
         let level_high_output = self.parse_required_i32_field(
             &self.reline_level_high_output.clone(),
-            "Верхний выходной уровень",
+            t!("launcher.new_project.reline_output_high_level"),
         )?;
         let level_gamma =
-            self.parse_required_f32_field(&self.reline_level_gamma.clone(), "Гамма")?;
+            self.parse_required_f32_field(&self.reline_level_gamma.clone(), t!("launcher.new_project.reline_gamma"))?;
 
         Some(RelineOptions {
             reader_mode: reader_mode.to_string(),
@@ -6324,7 +6213,7 @@ impl NewProjectWindowState {
         let resize_height = if resize_enabled {
             Some(self.parse_required_u32_field(
                 &self.reline_simple_resize_target.clone(),
-                "Высота результата",
+                t!("launcher.new_project.reline_result_height"),
             )?)
         } else {
             None
@@ -6434,8 +6323,8 @@ impl NewProjectWindowState {
         match raw.trim().parse::<u32>() {
             Ok(value) if value > 0 => Some(value),
             _ => {
-                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
-                self.import_status = "Некорректные параметры Reline.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.reline_field_positive_error", field_name = field_name));
+                self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
                 None
             }
         }
@@ -6448,8 +6337,8 @@ impl NewProjectWindowState {
         match raw.trim().parse::<u32>() {
             Ok(value) if value > 0 => Some(Some(value)),
             _ => {
-                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
-                self.import_status = "Некорректные параметры Reline.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.reline_field_positive_error", field_name = field_name));
+                self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
                 None
             }
         }
@@ -6459,8 +6348,8 @@ impl NewProjectWindowState {
         match raw.trim().parse::<i32>() {
             Ok(value) => Some(value),
             _ => {
-                self.last_error = Some(format!("{field_name} должен быть целым числом."));
-                self.import_status = "Некорректные параметры Reline.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.reline_field_integer_error", field_name = field_name));
+                self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
                 None
             }
         }
@@ -6470,8 +6359,8 @@ impl NewProjectWindowState {
         match raw.trim().parse::<f32>() {
             Ok(value) => Some(value),
             _ => {
-                self.last_error = Some(format!("{field_name} должен быть числом."));
-                self.import_status = "Некорректные параметры Reline.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.reline_field_number_error", field_name = field_name));
+                self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
                 None
             }
         }
@@ -6484,8 +6373,8 @@ impl NewProjectWindowState {
         match raw.trim().parse::<f32>() {
             Ok(value) if value > 0.0 => Some(Some(value)),
             _ => {
-                self.last_error = Some(format!("{field_name} должен быть положительным числом."));
-                self.import_status = "Некорректные параметры Reline.".to_string();
+                self.last_error = Some(tf!("launcher.new_project.reline_field_positive_error", field_name = field_name));
+                self.import_status = t!("launcher.new_project.reline_invalid_params_error").to_string();
                 None
             }
         }
@@ -6532,13 +6421,13 @@ impl NewProjectWindowState {
 
     fn start_advanced_open(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         if self.advanced_page_url.trim().is_empty() {
-            self.last_error = Some("Введите ссылку на страницу.".to_string());
-            self.import_status = "Продвинутый выкачиватель ждёт ссылку.".to_string();
+            self.last_error = Some(t!("launcher.new_project.enter_page_link_error").to_string());
+            self.import_status = t!("launcher.new_project.advanced_dl_waiting_link").to_string();
             return;
         }
         self.last_error = None;
@@ -6550,15 +6439,15 @@ impl NewProjectWindowState {
             current: 0,
             total: 0,
         });
-        self.import_status = "Открываем страницу в Selenium-браузере...".to_string();
+        self.import_status = t!("launcher.new_project.opening_page_selenium_status").to_string();
         self.advanced_download
             .begin_open(browser, self.advanced_page_url.clone());
     }
 
     fn start_advanced_fetch(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6569,7 +6458,7 @@ impl NewProjectWindowState {
             current: 0,
             total: 0,
         });
-        self.import_status = "Собираем ссылки из активной вкладки браузера...".to_string();
+        self.import_status = t!("launcher.new_project.collecting_links_status").to_string();
         if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
             self.advanced_download
                 .begin_fetch_auto(browser, self.advanced_fetch_parallelism);
@@ -6586,10 +6475,10 @@ impl NewProjectWindowState {
         match self.advanced_download.request_cancel_current_auto_fetch() {
             Ok(()) => {
                 self.import_status =
-                    "Останавливаем автоподбор после уже скачанных картинок...".to_string();
+                    t!("launcher.new_project.stopping_autofind_status").to_string();
             }
             Err(err) => {
-                self.last_error = Some("Не удалось остановить автоподбор.".to_string());
+                self.last_error = Some(t!("launcher.new_project.stop_autofind_error").to_string());
                 crate::runtime_log::log_warn(format!(
                     "[new-project] failed to request advanced auto fetch cancellation: {err}"
                 ));
@@ -6599,8 +6488,8 @@ impl NewProjectWindowState {
 
     fn start_advanced_link_collect(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6611,7 +6500,7 @@ impl NewProjectWindowState {
             current: 0,
             total: 0,
         });
-        self.import_status = "Запускаем фоновый сбор ссылок в Selenium-браузере...".to_string();
+        self.import_status = t!("launcher.new_project.starting_bg_collect_status").to_string();
         if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
             self.advanced_download
                 .begin_start_auto_link_collect(browser, self.advanced_fetch_parallelism);
@@ -6626,8 +6515,8 @@ impl NewProjectWindowState {
 
     fn finish_advanced_link_collect(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6639,7 +6528,7 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status =
-            "Останавливаем сбор ссылок и скачиваем найденные страницы...".to_string();
+            t!("launcher.new_project.stopping_collect_status").to_string();
         if self.advanced_link_source_mode == AdvancedLinkSourceMode::AutoReview {
             self.advanced_download.begin_stop_auto_link_collect(browser);
         } else {
@@ -6649,8 +6538,8 @@ impl NewProjectWindowState {
 
     fn start_advanced_canvas_fetch(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6661,14 +6550,14 @@ impl NewProjectWindowState {
             current: 0,
             total: 0,
         });
-        self.import_status = "Собираем Canvas с текущей страницы Selenium...".to_string();
+        self.import_status = t!("launcher.new_project.collecting_canvas_status").to_string();
         self.advanced_download.begin_fetch_canvas(browser);
     }
 
     fn start_advanced_canvas_intercept(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6678,14 +6567,14 @@ impl NewProjectWindowState {
             current: 0,
             total: 0,
         });
-        self.import_status = "Запускаем фоновый перехват Canvas в Selenium-браузере...".to_string();
+        self.import_status = t!("launcher.new_project.starting_canvas_intercept_status").to_string();
         self.advanced_download.begin_start_canvas_intercept(browser);
     }
 
     fn finish_advanced_canvas_intercept(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("Не найден ни один поддерживаемый браузер.".to_string());
-            self.import_status = "Браузер для Selenium недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.no_supported_browser_error").to_string());
+            self.import_status = t!("launcher.new_project.selenium_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6696,7 +6585,7 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status =
-            "Останавливаем перехват Canvas и сохраняем найденные холсты...".to_string();
+            t!("launcher.new_project.stopping_canvas_intercept_status").to_string();
         self.advanced_download.begin_stop_canvas_intercept(browser);
     }
 
@@ -6715,12 +6604,12 @@ impl NewProjectWindowState {
     fn start_advanced_deep_intercept(&mut self) {
         if self.selected_advanced_backend != AdvancedBrowserBackend::Cloak {
             self.last_error =
-                Some("Глубокий перехват доступен только для CloakBrowser.".to_string());
+                Some(t!("launcher.new_project.deep_intercept_cloak_only_error").to_string());
             return;
         }
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("CloakBrowser недоступен.".to_string());
-            self.import_status = "Браузер для глубокого перехвата недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.cloak_unavailable_error").to_string());
+            self.import_status = t!("launcher.new_project.deep_intercept_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6731,14 +6620,14 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status =
-            "Запускаем глубокий перехват в CloakBrowser и перезагружаем страницу...".to_string();
+            t!("launcher.new_project.starting_deep_intercept_status").to_string();
         self.advanced_download.begin_start_deep_intercept(browser);
     }
 
     fn finish_advanced_deep_intercept(&mut self) {
         let Some(browser) = self.selected_browser_name() else {
-            self.last_error = Some("CloakBrowser недоступен.".to_string());
-            self.import_status = "Браузер для глубокого перехвата недоступен.".to_string();
+            self.last_error = Some(t!("launcher.new_project.cloak_unavailable_error").to_string());
+            self.import_status = t!("launcher.new_project.deep_intercept_browser_unavailable").to_string();
             return;
         };
         self.last_error = None;
@@ -6749,7 +6638,7 @@ impl NewProjectWindowState {
             total: 0,
         });
         self.import_status =
-            "Останавливаем глубокий перехват и отбираем декодируемые картинки...".to_string();
+            t!("launcher.new_project.stopping_deep_intercept_status").to_string();
         self.advanced_download.begin_stop_deep_intercept(browser);
     }
 
@@ -6762,8 +6651,8 @@ impl NewProjectWindowState {
             .map(|(name, _)| name.clone())
             .unwrap_or_default();
         if prefix.is_empty() {
-            self.last_error = Some("Введите префикс URL.".to_string());
-            self.import_status = "Префикс для сайта не указан.".to_string();
+            self.last_error = Some(t!("launcher.new_project.enter_url_prefix_error").to_string());
+            self.import_status = t!("launcher.new_project.prefix_not_specified_error").to_string();
             return;
         }
         let target_name = if new_name.is_empty() {
@@ -6773,8 +6662,8 @@ impl NewProjectWindowState {
         };
         if target_name.trim().is_empty() {
             self.last_error =
-                Some("Введите название сайта или выберите существующий пресет.".to_string());
-            self.import_status = "Не удалось сохранить префикс.".to_string();
+                Some(t!("launcher.new_project.enter_site_name_error").to_string());
+            self.import_status = t!("launcher.new_project.save_prefix_failed").to_string();
             return;
         }
 
@@ -6789,15 +6678,15 @@ impl NewProjectWindowState {
                 self.site_name.clear();
                 self.last_error = None;
                 self.import_status =
-                    format!("Префикс для сайта «{}» сохранён.", target_name.trim());
+                    tf!("launcher.new_project.prefix_saved_status", target_name = target_name.trim());
             }
             Err(err) => {
                 crate::runtime_log::log_error(format!(
                     "[new-project] failed to save image url preset '{target_name}': {err}"
                 ));
                 self.last_error =
-                    Some("Не удалось сохранить префикс сайта в user_config.json.".to_string());
-                self.import_status = "Не удалось сохранить префикс.".to_string();
+                    Some(t!("launcher.new_project.save_prefix_config_error").to_string());
+                self.import_status = t!("launcher.new_project.save_prefix_failed").to_string();
             }
         }
     }
@@ -6839,7 +6728,7 @@ impl NewProjectWindowState {
         }
         ui.add_space(8.0);
         ui.label(
-            RichText::new(format!("Этап: {}", progress_stage_title(&progress.stage)))
+            RichText::new(tf!("launcher.new_project.stage_status", progress_stage_title = progress_stage_title(&progress.stage)))
                 .small()
                 .weak(),
         );
@@ -6861,7 +6750,7 @@ impl NewProjectWindowState {
         }
         let viewport_id = egui::ViewportId::from_hash_of("launcher_batch_processing_window");
         let builder = egui::ViewportBuilder::default()
-            .with_title("Массовая обработка")
+            .with_title(t!("launcher.batch.window_title"))
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
             .with_resizable(true);
@@ -6883,7 +6772,7 @@ struct ProgressDisplay {
 
 fn progress_status_label(stage: &str, current: usize, total: usize) -> String {
     if stage == "collect_canvas" && total == 0 && current > 0 {
-        return format!("Сбор Canvas: найдено {current} стр.");
+        return tf!("launcher.new_project.canvas_collect_status", current = current);
     }
     let prefix = progress_stage_title(stage);
     if total == 0 {
@@ -7204,7 +7093,7 @@ fn show_ribbon_image_controls(
 
 fn ribbon_crop_button() -> Button<'static> {
     Button::new(
-        RichText::new("Обрезать")
+        RichText::new(t!("launcher.new_project.crop_menu"))
             .size(13.0)
             .strong()
             .color(egui::Color32::WHITE),
@@ -7442,7 +7331,7 @@ fn show_screen_capture_overlay_controls(ui: &mut Ui, selection: RibbonCrop) -> b
     ui.scope_builder(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
         frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                if button_sized(ui, "Снять (S)", button_size, true).clicked() {
+                if button_sized(ui, t!("launcher.new_project.capture_snap_button"), button_size, true).clicked() {
                     capture_clicked = true;
                 }
                 ui.label(
@@ -7451,7 +7340,7 @@ fn show_screen_capture_overlay_controls(ui: &mut Ui, selection: RibbonCrop) -> b
                         .weak(),
                 );
                 ui.add_space(4.0);
-                ui.label(RichText::new("Esc: выйти").small().weak());
+                ui.label(RichText::new(t!("launcher.new_project.capture_esc_hint")).small().weak());
             });
         });
     });
@@ -7847,9 +7736,9 @@ fn screen_capture_selection_to_global_rect(
 
 fn progress_label(is_loading: bool) -> &'static str {
     if is_loading {
-        "Загрузка..."
+        t!("launcher.common.loading")
     } else {
-        "Готово"
+        t!("launcher.common.done")
     }
 }
 
@@ -7869,7 +7758,7 @@ fn check_test_chapter_site_availability(chapter_url: String) -> TestChapterAvail
         available: false,
         chapter_url,
         log_message: Some(
-            "проверка доступности сайта недоступна в веб-версии".to_string(),
+            t!("launcher.new_project.site_check_web_unsupported").to_string(),
         ),
     }
 }
@@ -7918,19 +7807,19 @@ fn progress_fraction(current: usize, total: usize) -> f32 {
 
 fn progress_operation_title(operation: &str) -> &'static str {
     match operation {
-        "source" => "Загрузка изображений",
-        "save" => "Сохранение",
-        "advanced_download" => "Продвинутый выкачиватель",
-        "quick_download" => "Быстрый выкачиватель",
-        "stitch" => "Нарезка",
+        "source" => t!("launcher.new_project.progress_download_images"),
+        "save" => t!("launcher.new_project.progress_save"),
+        "advanced_download" => t!("launcher.new_project.progress_advanced_dl"),
+        "quick_download" => t!("launcher.new_project.progress_quick_dl"),
+        "stitch" => t!("launcher.new_project.progress_cut"),
         "waifu2x" => "waifu2x",
         "reline" => "Reline",
-        _ => "Обработка",
+        _ => t!("launcher.new_project.progress_processing"),
     }
 }
 
 fn supported_quick_download_sites() -> Vec<&'static str> {
-    SUPPORTED_SITES_TOOLTIP
+    supported_sites_tooltip()
         .lines()
         .skip(1)
         .map(str::trim)
@@ -7940,31 +7829,31 @@ fn supported_quick_download_sites() -> Vec<&'static str> {
 
 fn progress_stage_title(stage: &str) -> &'static str {
     match stage {
-        "prepare" => "Подготовка файлов",
-        "clean" => "Очистка папки",
-        "write" => "Запись PNG",
-        "browser" => "Запуск браузера",
-        "collect" => "Поиск ссылок",
-        "collect_canvas" => "Сбор Canvas",
-        "connect" => "Проверка доступности",
-        "scan" => "Поиск источника",
-        "parse_html" => "Разбор HTML",
-        "archive" => "Распаковка архива",
-        "download_waifu2x" => "Загрузка waifu2x",
-        "extract_waifu2x" => "Распаковка waifu2x",
-        "download" => "Загрузка страниц",
-        "save_canvas" => "Сохранение Canvas",
-        "decode" => "Чтение изображений",
-        "filter" => "Фильтрация ширины",
-        "preview" => "Подготовка превью",
-        "normalize" => "Выравнивание ширины",
-        "stitch" => "Склейка ленты",
-        "waifu2x" => "Обработка waifu2x",
-        "reline" => "Обработка Reline",
-        "cuts" => "Поиск линий нарезки",
-        "compose" => "Сборка ленты",
-        "split" => "Нарезка страниц",
-        _ => "Обработка",
+        "prepare" => t!("launcher.new_project.progress_prepare_files"),
+        "clean" => t!("launcher.new_project.progress_clean_folder"),
+        "write" => t!("launcher.new_project.progress_write_png"),
+        "browser" => t!("launcher.new_project.progress_start_browser"),
+        "collect" => t!("launcher.new_project.progress_search_links"),
+        "collect_canvas" => t!("launcher.new_project.progress_collect_canvas"),
+        "connect" => t!("launcher.new_project.progress_check_availability"),
+        "scan" => t!("launcher.new_project.progress_search_source"),
+        "parse_html" => t!("launcher.new_project.progress_parse_html"),
+        "archive" => t!("launcher.new_project.progress_extract_archive"),
+        "download_waifu2x" => t!("launcher.new_project.progress_download_waifu2x"),
+        "extract_waifu2x" => t!("launcher.new_project.progress_extract_waifu2x"),
+        "download" => t!("launcher.new_project.progress_download_pages"),
+        "save_canvas" => t!("launcher.new_project.progress_save_canvas"),
+        "decode" => t!("launcher.new_project.progress_read_images"),
+        "filter" => t!("launcher.new_project.progress_filter_width"),
+        "preview" => t!("launcher.new_project.progress_prepare_preview"),
+        "normalize" => t!("launcher.new_project.progress_align_width"),
+        "stitch" => t!("launcher.new_project.progress_stitch_ribbon"),
+        "waifu2x" => t!("launcher.new_project.progress_waifu2x"),
+        "reline" => t!("launcher.new_project.progress_reline"),
+        "cuts" => t!("launcher.new_project.progress_find_cut_lines"),
+        "compose" => t!("launcher.new_project.progress_assemble_ribbon"),
+        "split" => t!("launcher.new_project.progress_cut_pages"),
+        _ => t!("launcher.new_project.progress_processing"),
     }
 }
 
@@ -7975,7 +7864,7 @@ fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::E
     }
     Ok(MessageDialog::new()
         .set_title("ManhwaStudio")
-        .set_description("Папка не пустая. Перезаписать файлы?")
+        .set_description(t!("launcher.new_project.folder_not_empty_prompt"))
         .set_buttons(MessageButtons::YesNo)
         .set_level(MessageLevel::Warning)
         .show()
@@ -8105,10 +7994,10 @@ fn stitch_mode_initial_stage(mode: StitchSplitMode) -> &'static str {
 
 fn stitch_mode_start_status(mode: StitchSplitMode) -> &'static str {
     match mode {
-        StitchSplitMode::StitchOnly => "Сшивание ленты...",
-        StitchSplitMode::ManualCutPreview => "Сшивание и подготовка ручных линий...",
-        StitchSplitMode::AutoCut => "Сшивание и автоматическая нарезка...",
-        StitchSplitMode::HeterogeneousBottoms => "Сшивание только в неоднородных местах...",
+        StitchSplitMode::StitchOnly => t!("launcher.new_project.stitching_progress"),
+        StitchSplitMode::ManualCutPreview => t!("launcher.new_project.stitching_manual_progress"),
+        StitchSplitMode::AutoCut => t!("launcher.new_project.stitching_auto_progress"),
+        StitchSplitMode::HeterogeneousBottoms => t!("launcher.new_project.stitching_uneven_progress"),
     }
 }
 

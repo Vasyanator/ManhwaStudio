@@ -127,68 +127,147 @@ const MIN_MAX_LOADED_MODELS: usize = 1;
 
 /// Errors from the native ONNX Runtime OCR path.
 ///
-/// Each variant carries a user-facing Russian message; wrapped values add
-/// diagnostic context for logs.
-#[derive(Debug, thiserror::Error)]
+/// `Display` is hand-written (see the `impl` below) and localized through the
+/// `ms-i18n` catalog (`native_runtime.error.*` keys), so the user-facing message
+/// follows the selected UI language rather than being a compile-time Russian
+/// literal. `Debug` (derived) stays a stable English variant name and is what the
+/// log sites format, so logs remain language-independent and grep-able. Wrapped
+/// values add diagnostic context, rendered through `Display` on the frame.
+#[derive(Debug)]
 pub enum NativeRuntimeError {
     /// A prior ORT load began but never confirmed success (likely a SIGILL), so
     /// loading is refused for this scope until the guard is reset. Callers fall
     /// back to the Python backend.
-    #[error(
-        "Нативный рантайм ONNX (провайдер «{provider}») отключён защитой: в прошлый раз загрузка \
-         прервалась аварийно. Используется Python-бэкенд. Нажмите «Повторить попытку ORT» в настройках, \
-         чтобы попробовать снова."
-    )]
     GuardDisabled {
         /// Execution-provider id the guard is scoped to (e.g. `"cpu"`).
         provider: &'static str,
     },
 
     /// The onnxruntime dynamic library could not be resolved/downloaded/extracted.
-    #[error("Не удалось подготовить библиотеку ONNX Runtime. {0}")]
-    DylibResolve(#[from] OrtRuntimeError),
+    /// Wraps the resolver error (retained as `Error::source`).
+    DylibResolve(OrtRuntimeError),
 
     /// Loading (dlopen + committing the environment) the onnxruntime library failed.
-    #[error("Не удалось загрузить нативный ONNX Runtime. {0}")]
-    OrtLoad(#[source] OrtError),
+    OrtLoad(OrtError),
 
     /// Resolving/downloading the MangaOCR model files failed.
-    #[error("Не удалось подготовить файлы модели MangaOCR. {0}")]
     ModelEnsure(String),
 
     /// Building the native MangaOCR engine (encoder/decoder sessions + vocab) failed.
-    #[error("Не удалось создать нативный движок MangaOCR. {0}")]
-    EngineLoad(#[source] OrtError),
+    EngineLoad(OrtError),
 
     /// Native MangaOCR inference failed.
-    #[error("Ошибка нативного распознавания MangaOCR. {0}")]
-    Inference(#[source] OrtError),
+    Inference(OrtError),
 
     /// Building the native PaddleOCR recognizer (recognizer session + dict) failed.
-    #[error("Не удалось создать нативный движок PaddleOCR. {0}")]
-    PaddleEngineLoad(#[source] OrtError),
+    PaddleEngineLoad(OrtError),
 
     /// Native PaddleOCR recognition failed.
-    #[error("Ошибка нативного распознавания PaddleOCR. {0}")]
-    PaddleInference(#[source] OrtError),
+    PaddleInference(OrtError),
 
     /// Building the native PaddleOCR text detector failed.
-    #[error("Не удалось создать нативный детектор текста PaddleOCR. {0}")]
-    PaddleDetectorLoad(#[source] OrtError),
+    PaddleDetectorLoad(OrtError),
 
     /// Native PaddleOCR text detection failed.
-    #[error("Ошибка нативной детекции текста PaddleOCR. {0}")]
-    PaddleDetect(#[source] OrtError),
+    PaddleDetect(OrtError),
 
     /// Persisting the SIGILL load-guard marker failed.
-    #[error("Не удалось записать состояние защиты ONNX Runtime. {0}")]
     GuardWrite(String),
 
     /// The cached engine/detector disappeared between load and inference. For the
     /// shared PaddleOCR detector this cannot happen under contention (paddle ops are
     /// serialized by `PADDLE_OP_LOCK`); it is surfaced instead of panicking.
-    #[error("Внутренняя ошибка: нативный движок недоступен после загрузки.")]
     EngineUnavailable,
+}
+
+impl std::fmt::Display for NativeRuntimeError {
+    /// Renders the localized user-facing message for the active UI language via
+    /// `ms-i18n` (`native_runtime.error.*`). Each wrapped source/detail is
+    /// interpolated through its own `Display`, preserving the information the old
+    /// derived `#[error("… {0}")]` message showed. The `match` is exhaustive so a
+    /// new variant forces a new catalog key here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GuardDisabled { provider } => {
+                // The message tells the user which button to press. Interpolate that
+                // button's own catalog entry instead of repeating its text here: the two
+                // are translated independently, and a duplicated literal drifts (pt-BR
+                // shipped "Repetir ORT" in the message and "Tentar ORT novamente" on the
+                // button before this was interpolated).
+                f.write_str(&tf!(
+                    "native_runtime.error.guard_disabled",
+                    provider = provider,
+                    button = t!("ai_backend.ort_retry_button")
+                ))
+            }
+            Self::DylibResolve(source) => {
+                f.write_str(&tf!("native_runtime.error.dylib_resolve", detail = source))
+            }
+            Self::OrtLoad(source) => {
+                f.write_str(&tf!("native_runtime.error.ort_load", detail = source))
+            }
+            Self::ModelEnsure(detail) => {
+                f.write_str(&tf!("native_runtime.error.model_ensure", detail = detail))
+            }
+            Self::EngineLoad(source) => {
+                f.write_str(&tf!("native_runtime.error.engine_load", detail = source))
+            }
+            Self::Inference(source) => {
+                f.write_str(&tf!("native_runtime.error.inference", detail = source))
+            }
+            Self::PaddleEngineLoad(source) => {
+                f.write_str(&tf!("native_runtime.error.paddle_engine_load", detail = source))
+            }
+            Self::PaddleInference(source) => {
+                f.write_str(&tf!("native_runtime.error.paddle_inference", detail = source))
+            }
+            Self::PaddleDetectorLoad(source) => {
+                f.write_str(&tf!(
+                    "native_runtime.error.paddle_detector_load",
+                    detail = source
+                ))
+            }
+            Self::PaddleDetect(source) => {
+                f.write_str(&tf!("native_runtime.error.paddle_detect", detail = source))
+            }
+            Self::GuardWrite(detail) => {
+                f.write_str(&tf!("native_runtime.error.guard_write", detail = detail))
+            }
+            Self::EngineUnavailable => {
+                f.write_str(t!("native_runtime.error.engine_unavailable"))
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeRuntimeError {
+    /// Preserves the previous `#[source]`/`#[from]` chaining: the wrapping variants
+    /// expose their inner error, the String/leaf variants none. `Display` still
+    /// renders the inner detail inline, matching the old derived behavior.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DylibResolve(source) => Some(source),
+            Self::OrtLoad(source)
+            | Self::EngineLoad(source)
+            | Self::Inference(source)
+            | Self::PaddleEngineLoad(source)
+            | Self::PaddleInference(source)
+            | Self::PaddleDetectorLoad(source)
+            | Self::PaddleDetect(source) => Some(source),
+            Self::GuardDisabled { .. }
+            | Self::ModelEnsure(_)
+            | Self::GuardWrite(_)
+            | Self::EngineUnavailable => None,
+        }
+    }
+}
+
+impl From<OrtRuntimeError> for NativeRuntimeError {
+    /// Replaces the removed `#[from]` on `DylibResolve`, so `?` on a
+    /// [`OrtRuntimeError`] keeps converting into this error unchanged.
+    fn from(source: OrtRuntimeError) -> Self {
+        Self::DylibResolve(source)
+    }
 }
 
 /// The effective native (build, execution provider, device) triple for this process,
@@ -1211,10 +1290,7 @@ fn ensure_shared_vocab(
     }
 
     if !vocab.is_file() {
-        return Err(NativeRuntimeError::ModelEnsure(format!(
-            "Файл словаря отсутствует после загрузки модели 2025: {}",
-            vocab.display()
-        )));
+        return Err(NativeRuntimeError::ModelEnsure(tf!("native_runtime.vocab_missing_2025", vocab = vocab.display())));
     }
     Ok(vocab)
 }

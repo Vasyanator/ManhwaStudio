@@ -1346,13 +1346,13 @@ impl CanvasView {
         want_switch_bubble_type: &mut Option<BubbleType>,
         interacted_with_bubble: &mut bool,
     ) {
-        if ui.button("Копировать пузырь").clicked() {
+        if ui.button(t!("canvas.bubble_menu.copy_bubble")).clicked() {
             *want_copy_whole_bubble = true;
             *interacted_with_bubble = true;
             ui.close();
         }
         if ui
-            .add_enabled(self.editable, egui::Button::new("Дублировать пузырь"))
+            .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.duplicate_bubble")))
             .clicked()
         {
             *want_duplicate_bubble = true;
@@ -1362,7 +1362,7 @@ impl CanvasView {
         if ui
             .add_enabled(
                 self.editable && self.bubble_runtime.copied_bubble_data.is_some(),
-                egui::Button::new("Вставить пузырь"),
+                egui::Button::new(t!("canvas.bubble_menu.paste_bubble")),
             )
             .clicked()
         {
@@ -1371,12 +1371,12 @@ impl CanvasView {
             ui.close();
         }
         ui.separator();
-        if ui.button("Копировать оригинал").clicked() {
+        if ui.button(t!("canvas.bubble_menu.copy_original")).clicked() {
             ui.ctx().copy_text(original_text.to_owned());
             *interacted_with_bubble = true;
             ui.close();
         }
-        if ui.button("Копировать перевод").clicked() {
+        if ui.button(t!("canvas.bubble_menu.copy_translation")).clicked() {
             ui.ctx().copy_text(translated_text.to_owned());
             *interacted_with_bubble = true;
             ui.close();
@@ -1385,7 +1385,7 @@ impl CanvasView {
         if ui
             .add_enabled(
                 self.editable && bubble_type != BubbleType::Default,
-                egui::Button::new("Сделать стандартным"),
+                egui::Button::new(t!("canvas.bubble_menu.make_default")),
             )
             .clicked()
         {
@@ -1396,7 +1396,7 @@ impl CanvasView {
         if ui
             .add_enabled(
                 self.editable && bubble_type != BubbleType::Aside,
-                egui::Button::new("Сделать сбоку"),
+                egui::Button::new(t!("canvas.bubble_menu.make_aside")),
             )
             .clicked()
         {
@@ -1407,7 +1407,7 @@ impl CanvasView {
         if ui
             .add_enabled(
                 self.editable && bubble_type != BubbleType::OnTop,
-                egui::Button::new("Сделать поверх"),
+                egui::Button::new(t!("canvas.bubble_menu.make_on_top")),
             )
             .clicked()
         {
@@ -1417,7 +1417,7 @@ impl CanvasView {
         }
         ui.separator();
         if ui
-            .add_enabled(self.editable, egui::Button::new("Вставить в оригинал"))
+            .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.paste_into_original")))
             .clicked()
         {
             *want_paste_original = true;
@@ -1425,7 +1425,7 @@ impl CanvasView {
             ui.close();
         }
         if ui
-            .add_enabled(self.editable, egui::Button::new("Вставить в перевод"))
+            .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.paste_into_translation")))
             .clicked()
         {
             *want_paste_translation = true;
@@ -1439,7 +1439,7 @@ impl CanvasView {
             if ui
                 .checkbox(
                     &mut original_spellcheck_enabled,
-                    "Проверять орфографию в оригинале",
+                    t!("canvas.bubble_menu.spellcheck_original"),
                 )
                 .changed()
             {
@@ -1458,7 +1458,7 @@ impl CanvasView {
             if ui
                 .checkbox(
                     &mut translation_spellcheck_enabled,
-                    "Проверять орфографию в переводе",
+                    t!("canvas.bubble_menu.spellcheck_translation"),
                 )
                 .changed()
             {
@@ -1479,13 +1479,13 @@ impl CanvasView {
             .as_deref()
         {
             ui.separator();
-            ui.label(format!("Орфография: {word}"));
-            if ui.button("Добавить в общие исключения").clicked() {
+            ui.label(tf!("canvas.bubble_menu.spellcheck_word", word = word));
+            if ui.button(t!("canvas.bubble_menu.add_shared_exclusion")).clicked() {
                 queue_word_to_global_exceptions(word);
                 *interacted_with_bubble = true;
                 ui.close();
             }
-            if ui.button("Добавить в исключения проекта").clicked() {
+            if ui.button(t!("canvas.bubble_menu.add_project_exclusion")).clicked() {
                 queue_word_to_project_exceptions(word);
                 *interacted_with_bubble = true;
                 ui.close();
@@ -2603,10 +2603,10 @@ fn load_image_bubble_color_image(
         .get("image_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| "Картинка не выбрана".to_string())?;
+        .ok_or_else(|| t!("canvas.image_bubble.no_image").to_string())?;
     let path = resolve_image_bubble_path(project, raw_path);
     let image = image::open(&path)
-        .map_err(|err| format!("Не удалось открыть картинку {}: {err}", path.display()))?
+        .map_err(|err| tf!("canvas.image_bubble.open_error", path = path.display(), err = err))?
         .to_rgba8();
     color_image_from_rgba(image)
 }
@@ -2626,9 +2626,9 @@ fn load_image_bubble_crop(
         .pages
         .iter()
         .find(|page| page.idx == page_idx)
-        .ok_or_else(|| format!("Страница вырезки не найдена: #{}", page_idx + 1))?;
+        .ok_or_else(|| tf!("canvas.image_bubble.crop_page_not_found", page_idx = page_idx + 1))?;
     let source = image::open(&page.path)
-        .map_err(|err| format!("Не удалось открыть страницу {}: {err}", page.path.display()))?
+        .map_err(|err| tf!("canvas.image_bubble.open_page_error", page = page.path.display(), err = err))?
         .to_rgba8();
     let rect = crop_override.unwrap_or_else(|| image_bubble_crop_rect(bubble));
     let width = source.width().max(1);
@@ -2644,8 +2644,8 @@ fn load_image_bubble_crop(
 }
 
 fn color_image_from_rgba(image: image::RgbaImage) -> Result<egui::ColorImage, String> {
-    let w = usize::try_from(image.width()).map_err(|_| "Картинка слишком широкая".to_string())?;
-    let h = usize::try_from(image.height()).map_err(|_| "Картинка слишком высокая".to_string())?;
+    let w = usize::try_from(image.width()).map_err(|_| t!("canvas.image_bubble.too_wide").to_string())?;
+    let h = usize::try_from(image.height()).map_err(|_| t!("canvas.image_bubble.too_tall").to_string())?;
     Ok(egui::ColorImage::from_rgba_unmultiplied(
         [w, h],
         image.as_raw(),

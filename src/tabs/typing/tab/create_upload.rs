@@ -176,14 +176,14 @@ impl TypingTextOverlayLayer {
         else {
             self.set_create_error(
                 ctx,
-                "Выделение должно пересекать хотя бы одну страницу холста.",
+                t!("typing.create.selection_must_cross_page_error"),
             );
             return;
         };
 
         let width_px = selection_width_in_source_px(canvas, page_idx, page_rect, scene_rect);
         if width_px == 0 {
-            self.set_create_error(ctx, "Не удалось определить ширину выделения в пикселях.");
+            self.set_create_error(ctx, t!("typing.create.selection_width_error"));
             return;
         }
 
@@ -389,11 +389,11 @@ impl TypingTextOverlayLayer {
             || self.raster_effects_state.is_some()
             || self.create_raster_state.is_some()
         {
-            self.set_create_error(ctx, "Сначала дождитесь завершения текущей операции.");
+            self.set_create_error(ctx, t!("typing.create.wait_current_operation_error"));
             return;
         }
         if project.pages.is_empty() {
-            self.set_create_error(ctx, "В проекте нет страниц.");
+            self.set_create_error(ctx, t!("typing.create.no_pages_error"));
             return;
         }
         let target_page_idx = page_idx.min(project.pages.len().saturating_sub(1));
@@ -443,7 +443,7 @@ impl TypingTextOverlayLayer {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Рендер текста...");
+                        ui.label(t!("typing.create.rendering_text_hint"));
                     });
                 });
             });
@@ -520,7 +520,7 @@ impl TypingTextOverlayLayer {
                 .and_then(Value::as_str)
                 .map(|s| s.chars().take(40).collect::<String>())
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "Текст".to_string());
+                .unwrap_or_else(|| t!("typing.layers.text_row_label").to_string());
             let transform = crate::models::layer_model::manifest::TransformRec {
                 cx: decoded.center_page_px[0],
                 cy: decoded.center_page_px[1],

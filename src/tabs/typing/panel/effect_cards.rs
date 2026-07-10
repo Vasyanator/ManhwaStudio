@@ -25,21 +25,21 @@ use super::*;
 
 pub(super) fn effect_card_title(effect: &EffectCard) -> &'static str {
     match effect {
-        EffectCard::TextShake(_) => "Тряска текста",
-        EffectCard::Stroke(_) => "Обводка",
-        EffectCard::Shadow(_) => "Тень",
-        EffectCard::Blur(_) => "Размытие",
-        EffectCard::MotionBlur(_) => "Размытие в движении",
-        EffectCard::DryMedia(_) => "Мел/Карандаш",
+        EffectCard::TextShake(_) => t!("typing.effects.text_shake_title"),
+        EffectCard::Stroke(_) => t!("typing.effects.stroke_title"),
+        EffectCard::Shadow(_) => t!("typing.effects.shadow_title"),
+        EffectCard::Blur(_) => t!("typing.effects.blur_title"),
+        EffectCard::MotionBlur(_) => t!("typing.effects.motion_blur_title"),
+        EffectCard::DryMedia(_) => t!("typing.effects.dry_media_title"),
         EffectCard::Glow(glow) => match glow.version {
-            GlowEffectVersion::V1 => "Свечение V1",
-            GlowEffectVersion::V2 => "Свечение V2",
-            GlowEffectVersion::Soft => "Мягкое свечение",
+            GlowEffectVersion::V1 => t!("typing.effects.glow_v1_title"),
+            GlowEffectVersion::V2 => t!("typing.effects.glow_v2_title"),
+            GlowEffectVersion::Soft => t!("typing.effects.soft_glow_title"),
         },
-        EffectCard::Gradient2(_) => "Градиент 2",
-        EffectCard::Gradient4(_) => "Градиент 4",
-        EffectCard::Reflect(_) => "Отражение",
-        EffectCard::Shake(_) => "Тряска",
+        EffectCard::Gradient2(_) => t!("typing.effects.gradient2_title"),
+        EffectCard::Gradient4(_) => t!("typing.effects.gradient4_title"),
+        EffectCard::Reflect(_) => t!("typing.effects.reflection_title"),
+        EffectCard::Shake(_) => t!("typing.effects.shake_title"),
     }
 }
 
@@ -190,27 +190,27 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
     match effect {
         EffectCard::TextShake(shake) => {
             changed |= ui
-                .add(WheelSlider::new(&mut shake.spread_x_px, 0.0..=256.0).text("Разброс по X"))
+                .add(WheelSlider::new(&mut shake.spread_x_px, 0.0..=256.0).text(t!("typing.effects.shake_spread_x_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.spread_y_px, 0.0..=256.0).text("Разброс по Y"))
+                .add(WheelSlider::new(&mut shake.spread_y_px, 0.0..=256.0).text(t!("typing.effects.shake_spread_y_label")))
                 .changed();
             changed |= SeedSpinBox::new(&mut shake.seed)
-                .prefix("Сид ")
+                .prefix(t!("typing.effects.shake_seed_label"))
                 .draw(ui)
                 .changed();
         }
         EffectCard::Stroke(stroke) => {
             changed |= ui
-                .add(WheelSlider::new(&mut stroke.width_px, 0.0..=24.0).text("Ширина (px)"))
+                .add(WheelSlider::new(&mut stroke.width_px, 0.0..=24.0).text(t!("typing.params.width_px_label")))
                 .changed();
-            changed |= stroke.color.draw(ui, "Цвет:");
-            changed |= ui.checkbox(&mut stroke.smoothing, "Сглаживание").changed();
+            changed |= stroke.color.draw(ui, t!("typing.effects.color_label"));
+            changed |= ui.checkbox(&mut stroke.smoothing, t!("typing.effects.antialias_toggle")).changed();
             ui.add_enabled_ui(stroke.smoothing, |ui| {
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut stroke.smoothing_strength_percent, 0.0..=100.0)
-                            .text("Сила сглаживания (%)"),
+                            .text(t!("typing.effects.antialias_strength_label")),
                     )
                     .changed();
             });
@@ -220,20 +220,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 1
             };
             let stroke_opacity_prev = opacity_idx;
-            let stroke_opacity_combo = WheelComboBox::from_label("Прозрачность контура")
+            let stroke_opacity_combo = WheelComboBox::from_label(t!("typing.effects.stroke_opacity_combo_id")).id_salt("typing.effects.stroke_opacity_combo_id")
                 .selected_text(match stroke.opacity_mode {
-                    StrokeOpacityMode::Static => "Статическая",
-                    StrokeOpacityMode::FromContour => "От контура",
+                    StrokeOpacityMode::Static => t!("typing.effects.opacity_static_option"),
+                    StrokeOpacityMode::FromContour => t!("typing.effects.opacity_from_outline_option"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
                     if ui
-                        .selectable_label(opacity_idx == 0, "Статическая")
+                        .selectable_label(opacity_idx == 0, t!("typing.effects.opacity_static_option"))
                         .clicked()
                     {
                         opacity_idx = 0;
                     }
                     if ui
-                        .selectable_label(opacity_idx == 1, "От контура")
+                        .selectable_label(opacity_idx == 1, t!("typing.effects.opacity_from_outline_option"))
                         .clicked()
                     {
                         opacity_idx = 1;
@@ -252,25 +252,25 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut stroke.transparency_percent, 0.0..=100.0)
-                            .text("Прозрачность (%)"),
+                            .text(t!("typing.effects.opacity_percent_label")),
                     )
                     .changed();
             });
         }
         EffectCard::Shadow(shadow) => {
             changed |= ui
-                .add(WheelSlider::new(&mut shadow.offset_x_px, -400..=400).text("Смещение X (px)"))
+                .add(WheelSlider::new(&mut shadow.offset_x_px, -400..=400).text(t!("typing.effects.offset_x_px_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shadow.offset_y_px, -400..=400).text("Смещение Y (px)"))
+                .add(WheelSlider::new(&mut shadow.offset_y_px, -400..=400).text(t!("typing.effects.offset_y_px_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shadow.blur_radius_px, 0.0..=64.0).text("Размытие (px)"))
+                .add(WheelSlider::new(&mut shadow.blur_radius_px, 0.0..=64.0).text(t!("typing.effects.blur_px_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut shadow.transparency_percent, 0.0..=100.0)
-                        .text("Прозрачность (%)"),
+                        .text(t!("typing.effects.opacity_percent_label")),
                 )
                 .changed();
             let mut color_mode_idx = if shadow.color_mode == ShadowColorMode::SingleColor {
@@ -279,20 +279,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 1
             };
             let color_mode_prev = color_mode_idx;
-            let color_mode_combo = WheelComboBox::from_label("Режим цвета")
+            let color_mode_combo = WheelComboBox::from_label(t!("typing.effects.color_mode_combo_id")).id_salt("typing.effects.color_mode_combo_id")
                 .selected_text(match shadow.color_mode {
-                    ShadowColorMode::SingleColor => "Один цвет",
-                    ShadowColorMode::SourceColors => "Исходные цвета",
+                    ShadowColorMode::SingleColor => t!("typing.effects.color_mode_single"),
+                    ShadowColorMode::SourceColors => t!("typing.effects.color_mode_source"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
                     if ui
-                        .selectable_label(color_mode_idx == 0, "Один цвет")
+                        .selectable_label(color_mode_idx == 0, t!("typing.effects.color_mode_single"))
                         .clicked()
                     {
                         color_mode_idx = 0;
                     }
                     if ui
-                        .selectable_label(color_mode_idx == 1, "Исходные цвета")
+                        .selectable_label(color_mode_idx == 1, t!("typing.effects.color_mode_source"))
                         .clicked()
                     {
                         color_mode_idx = 1;
@@ -308,20 +308,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 ShadowColorMode::SourceColors
             };
             ui.add_enabled_ui(shadow.color_mode == ShadowColorMode::SingleColor, |ui| {
-                changed |= shadow.color.draw(ui, "Цвет:");
+                changed |= shadow.color.draw(ui, t!("typing.effects.color_label"));
             });
         }
         EffectCard::Blur(blur) => {
             changed |= ui
-                .add(WheelSlider::new(&mut blur.radius_px, 0.0..=128.0).text("Радиус (px)"))
+                .add(WheelSlider::new(&mut blur.radius_px, 0.0..=128.0).text(t!("typing.effects.radius_px_label")))
                 .changed();
         }
         EffectCard::MotionBlur(blur) => {
             changed |= ui
-                .add(WheelSlider::new(&mut blur.angle_deg, -360.0..=360.0).text("Угол (°)"))
+                .add(WheelSlider::new(&mut blur.angle_deg, -360.0..=360.0).text(t!("typing.params.angle_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut blur.distance_px, 0.0..=512.0).text("Смещение (px)"))
+                .add(WheelSlider::new(&mut blur.distance_px, 0.0..=512.0).text(t!("typing.effects.offset_px_label")))
                 .changed();
             let mut sharp_copy_idx = match blur.sharp_copy_mode {
                 MotionBlurSharpCopyMode::None => 0,
@@ -329,20 +329,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 MotionBlurSharpCopyMode::Under => 2,
             };
             let sharp_copy_prev = sharp_copy_idx;
-            let sharp_copy_combo = WheelComboBox::from_label("Неразмытая копия")
+            let sharp_copy_combo = WheelComboBox::from_label(t!("typing.effects.unblurred_copy_combo_id")).id_salt("typing.effects.unblurred_copy_combo_id")
                 .selected_text(match blur.sharp_copy_mode {
-                    MotionBlurSharpCopyMode::None => "Нет",
-                    MotionBlurSharpCopyMode::Over => "Сверху",
-                    MotionBlurSharpCopyMode::Under => "Снизу",
+                    MotionBlurSharpCopyMode::None => t!("typing.effects.unblurred_copy_none"),
+                    MotionBlurSharpCopyMode::Over => t!("typing.effects.unblurred_copy_above"),
+                    MotionBlurSharpCopyMode::Under => t!("typing.effects.unblurred_copy_below"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
-                    if ui.selectable_label(sharp_copy_idx == 0, "Нет").clicked() {
+                    if ui.selectable_label(sharp_copy_idx == 0, t!("typing.effects.unblurred_copy_none")).clicked() {
                         sharp_copy_idx = 0;
                     }
-                    if ui.selectable_label(sharp_copy_idx == 1, "Сверху").clicked() {
+                    if ui.selectable_label(sharp_copy_idx == 1, t!("typing.effects.unblurred_copy_above")).clicked() {
                         sharp_copy_idx = 1;
                     }
-                    if ui.selectable_label(sharp_copy_idx == 2, "Снизу").clicked() {
+                    if ui.selectable_label(sharp_copy_idx == 2, t!("typing.effects.unblurred_copy_below")).clicked() {
                         sharp_copy_idx = 2;
                     }
                 });
@@ -363,16 +363,16 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 1
             };
             let material_prev = material_idx;
-            let material_combo = WheelComboBox::from_label("Материал")
+            let material_combo = WheelComboBox::from_label(t!("typing.effects.material_combo_id")).id_salt("typing.effects.material_combo_id")
                 .selected_text(match dry_media.material {
-                    DryMediaMaterial::Pencil => "Карандаш",
-                    DryMediaMaterial::Chalk => "Мел",
+                    DryMediaMaterial::Pencil => t!("typing.effects.material_pencil"),
+                    DryMediaMaterial::Chalk => t!("typing.effects.material_chalk"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
-                    if ui.selectable_label(material_idx == 0, "Карандаш").clicked() {
+                    if ui.selectable_label(material_idx == 0, t!("typing.effects.material_pencil")).clicked() {
                         material_idx = 0;
                     }
-                    if ui.selectable_label(material_idx == 1, "Мел").clicked() {
+                    if ui.selectable_label(material_idx == 1, t!("typing.effects.material_chalk")).clicked() {
                         material_idx = 1;
                     }
                 });
@@ -387,91 +387,91 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             };
 
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.strength, 0.0..=1.0).text("Сила"))
+                .add(WheelSlider::new(&mut dry_media.strength, 0.0..=1.0).text(t!("typing.effects.strength_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.seed, 0..=u64::MAX).text("Сид"))
+                .add(WheelSlider::new(&mut dry_media.seed, 0..=u64::MAX).text(t!("typing.effects.dry_media_seed_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut dry_media.grain_scale_px, 0.5..=32.0)
-                        .text("Размер зерна (px)"),
+                        .text(t!("typing.effects.grain_size_px_label")),
                 )
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.grain_amount, 0.0..=1.0).text("Зернистость"))
+                .add(WheelSlider::new(&mut dry_media.grain_amount, 0.0..=1.0).text(t!("typing.effects.graininess_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut dry_media.edge_roughness, 0.0..=1.0)
-                        .text("Рваность края"),
+                        .text(t!("typing.effects.edge_roughness_label")),
                 )
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.porosity, 0.0..=1.0).text("Пористость"))
+                .add(WheelSlider::new(&mut dry_media.porosity, 0.0..=1.0).text(t!("typing.effects.porosity_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut dry_media.direction_deg, -360.0..=360.0)
-                        .text("Угол штриха (°)"),
+                        .text(t!("typing.effects.stroke_angle_label")),
                 )
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut dry_media.directional_amount, 0.0..=1.0)
-                        .text("Сила штриховки"),
+                        .text(t!("typing.effects.hatching_strength_label")),
                 )
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.dust_amount, 0.0..=1.0).text("Пыль"))
+                .add(WheelSlider::new(&mut dry_media.dust_amount, 0.0..=1.0).text(t!("typing.effects.dust_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut dry_media.dust_radius_px, 0.0..=32.0)
-                        .text("Радиус пыли (px)"),
+                        .text(t!("typing.effects.dust_radius_px_label")),
                 )
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut dry_media.softness_px, 0.0..=16.0).text("Мягкость (px)"))
+                .add(WheelSlider::new(&mut dry_media.softness_px, 0.0..=16.0).text(t!("typing.effects.softness_px_label")))
                 .changed();
             changed |= ui
-                .checkbox(&mut dry_media.use_source_color, "Сохранить исходный цвет")
+                .checkbox(&mut dry_media.use_source_color, t!("typing.effects.keep_source_color"))
                 .changed();
             ui.add_enabled_ui(!dry_media.use_source_color, |ui| {
-                changed |= dry_media.color.draw(ui, "Цвет:");
+                changed |= dry_media.color.draw(ui, t!("typing.effects.color_label"));
             });
         }
         EffectCard::Glow(glow) => {
             changed |= ui
-                .add(WheelSlider::new(&mut glow.radius_px, 0.0..=300.0).text("Радиус (px)"))
+                .add(WheelSlider::new(&mut glow.radius_px, 0.0..=300.0).text(t!("typing.effects.radius_px_label")))
                 .changed();
             if glow.version == GlowEffectVersion::Soft {
                 changed |= ui
-                    .add(WheelSlider::new(&mut glow.softness_px, 0.0..=100.0).text("Мягкость (px)"))
+                    .add(WheelSlider::new(&mut glow.softness_px, 0.0..=100.0).text(t!("typing.effects.softness_px_label")))
                     .changed();
-                changed |= glow.color.draw(ui, "Цвет:");
+                changed |= glow.color.draw(ui, t!("typing.effects.color_label"));
             } else {
-                changed |= glow.color.draw(ui, "Цвет:");
+                changed |= glow.color.draw(ui, t!("typing.effects.color_label"));
                 let mut opacity_idx = if glow.opacity_mode == StrokeOpacityMode::Static {
                     0
                 } else {
                     1
                 };
                 let glow_opacity_prev = opacity_idx;
-                let glow_opacity_combo = WheelComboBox::from_label("Прозрачность")
+                let glow_opacity_combo = WheelComboBox::from_label(t!("typing.effects.glow_opacity_combo_id")).id_salt("typing.effects.glow_opacity_combo_id")
                     .selected_text(match glow.opacity_mode {
-                        StrokeOpacityMode::Static => "Статическая",
-                        StrokeOpacityMode::FromContour => "От контура",
+                        StrokeOpacityMode::Static => t!("typing.effects.opacity_static_option"),
+                        StrokeOpacityMode::FromContour => t!("typing.effects.opacity_from_outline_option"),
                     })
                     .show_ui_with_wheel(ui, |ui| {
                         if ui
-                            .selectable_label(opacity_idx == 0, "Статическая")
+                            .selectable_label(opacity_idx == 0, t!("typing.effects.opacity_static_option"))
                             .clicked()
                         {
                             opacity_idx = 0;
                         }
                         if ui
-                            .selectable_label(opacity_idx == 1, "От контура")
+                            .selectable_label(opacity_idx == 1, t!("typing.effects.opacity_from_outline_option"))
                             .clicked()
                         {
                             opacity_idx = 1;
@@ -490,38 +490,38 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                     changed |= ui
                         .add(
                             WheelSlider::new(&mut glow.transparency_percent, 0.0..=100.0)
-                                .text("Прозрачность (%)"),
+                                .text(t!("typing.effects.opacity_percent_label")),
                         )
                         .changed();
                 });
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut glow.fade_strength, -100.0..=100.0)
-                            .text("Сила затухания"),
+                            .text(t!("typing.effects.falloff_strength_label")),
                     )
                     .changed();
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut glow.fade_shift, -100.0..=100.0)
-                            .text("Смещение затухания"),
+                            .text(t!("typing.effects.falloff_offset_label")),
                     )
                     .changed();
             }
         }
         EffectCard::Gradient2(gradient) => {
-            changed |= gradient.color1.draw(ui, "Цвет 1:");
-            changed |= gradient.color2.draw(ui, "Цвет 2:");
+            changed |= gradient.color1.draw(ui, t!("typing.effects.gradient_color1_label"));
+            changed |= gradient.color2.draw(ui, t!("typing.effects.gradient_color2_label"));
             changed |= ui
-                .add(WheelSlider::new(&mut gradient.angle_deg, -360.0..=360.0).text("Угол (°)"))
+                .add(WheelSlider::new(&mut gradient.angle_deg, -360.0..=360.0).text(t!("typing.params.angle_label")))
                 .changed();
             changed |= ui
                 .add(
                     WheelSlider::new(&mut gradient.width_percent, 1.0..=400.0)
-                        .text("Ширина градиента (%)"),
+                        .text(t!("typing.effects.gradient_width_percent_label")),
                 )
                 .changed();
             changed |= ui
-                .checkbox(&mut gradient.respect_source_alpha, "Учитывать прозрачность")
+                .checkbox(&mut gradient.respect_source_alpha, t!("typing.effects.respect_alpha"))
                 .changed();
             let mut fill_mode_idx = if gradient.fill_mode == Gradient2FillMode::AllOpaque {
                 0
@@ -529,20 +529,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 1
             };
             let gradient2_fill_prev = fill_mode_idx;
-            let gradient2_fill_combo = WheelComboBox::from_label("Тип заполнения")
+            let gradient2_fill_combo = WheelComboBox::from_label(t!("typing.effects.gradient2_fill_type_combo_id")).id_salt("typing.effects.gradient2_fill_type_combo_id")
                 .selected_text(match gradient.fill_mode {
-                    Gradient2FillMode::AllOpaque => "Всё непрозрачное",
-                    Gradient2FillMode::SpecificColor => "Конкретный цвет",
+                    Gradient2FillMode::AllOpaque => t!("typing.effects.fill_type_all_opaque"),
+                    Gradient2FillMode::SpecificColor => t!("typing.effects.fill_type_specific_color"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
                     if ui
-                        .selectable_label(fill_mode_idx == 0, "Всё непрозрачное")
+                        .selectable_label(fill_mode_idx == 0, t!("typing.effects.fill_type_all_opaque"))
                         .clicked()
                     {
                         fill_mode_idx = 0;
                     }
                     if ui
-                        .selectable_label(fill_mode_idx == 1, "Конкретный цвет")
+                        .selectable_label(fill_mode_idx == 1, t!("typing.effects.fill_type_specific_color"))
                         .clicked()
                     {
                         fill_mode_idx = 1;
@@ -560,23 +560,23 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             ui.add_enabled_ui(
                 gradient.fill_mode == Gradient2FillMode::SpecificColor,
                 |ui| {
-                    changed |= gradient.target_color.draw(ui, "Заменяемый:");
+                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
                 },
             );
         }
         EffectCard::Gradient4(gradient) => {
-            changed |= gradient.color_top_left.draw(ui, "Левый верх:");
-            changed |= gradient.color_top_right.draw(ui, "Правый верх:");
-            changed |= gradient.color_bottom_left.draw(ui, "Левый низ:");
-            changed |= gradient.color_bottom_right.draw(ui, "Правый низ:");
+            changed |= gradient.color_top_left.draw(ui, t!("typing.effects.gradient_corner_top_left_label"));
+            changed |= gradient.color_top_right.draw(ui, t!("typing.effects.gradient_corner_top_right_label"));
+            changed |= gradient.color_bottom_left.draw(ui, t!("typing.effects.gradient_corner_bottom_left_label"));
+            changed |= gradient.color_bottom_right.draw(ui, t!("typing.effects.gradient_corner_bottom_right_label"));
             changed |= ui
                 .add(
                     WheelSlider::new(&mut gradient.width_percent, 1.0..=400.0)
-                        .text("Ширина градиента (%)"),
+                        .text(t!("typing.effects.gradient_width_percent_label")),
                 )
                 .changed();
             changed |= ui
-                .checkbox(&mut gradient.respect_source_alpha, "Учитывать прозрачность")
+                .checkbox(&mut gradient.respect_source_alpha, t!("typing.effects.respect_alpha"))
                 .changed();
             let mut fill_mode_idx = if gradient.fill_mode == Gradient4FillMode::AllOpaque {
                 0
@@ -584,20 +584,20 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 1
             };
             let gradient4_fill_prev = fill_mode_idx;
-            let gradient4_fill_combo = WheelComboBox::from_label("Тип заполнения")
+            let gradient4_fill_combo = WheelComboBox::from_label(t!("typing.effects.gradient4_fill_type_combo_id")).id_salt("typing.effects.gradient4_fill_type_combo_id")
                 .selected_text(match gradient.fill_mode {
-                    Gradient4FillMode::AllOpaque => "Всё непрозрачное",
-                    Gradient4FillMode::SpecificColor => "Конкретный цвет",
+                    Gradient4FillMode::AllOpaque => t!("typing.effects.fill_type_all_opaque"),
+                    Gradient4FillMode::SpecificColor => t!("typing.effects.fill_type_specific_color"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
                     if ui
-                        .selectable_label(fill_mode_idx == 0, "Всё непрозрачное")
+                        .selectable_label(fill_mode_idx == 0, t!("typing.effects.fill_type_all_opaque"))
                         .clicked()
                     {
                         fill_mode_idx = 0;
                     }
                     if ui
-                        .selectable_label(fill_mode_idx == 1, "Конкретный цвет")
+                        .selectable_label(fill_mode_idx == 1, t!("typing.effects.fill_type_specific_color"))
                         .clicked()
                     {
                         fill_mode_idx = 1;
@@ -615,24 +615,24 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             ui.add_enabled_ui(
                 gradient.fill_mode == Gradient4FillMode::SpecificColor,
                 |ui| {
-                    changed |= gradient.target_color.draw(ui, "Заменяемый:");
+                    changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
                 },
             );
         }
         EffectCard::Reflect(reflect) => {
             let mut axis_idx = if reflect.axis == ReflectAxis::X { 0 } else { 1 };
             let reflect_axis_prev = axis_idx;
-            let reflect_axis_combo = WheelComboBox::from_label("Ось отражения")
+            let reflect_axis_combo = WheelComboBox::from_label(t!("typing.effects.reflection_axis_combo_id")).id_salt("typing.effects.reflection_axis_combo_id")
                 .selected_text(match reflect.axis {
-                    ReflectAxis::X => "X (верх-низ)",
-                    ReflectAxis::Y => "Y (лево-право)",
+                    ReflectAxis::X => t!("typing.effects.reflection_axis_x"),
+                    ReflectAxis::Y => t!("typing.effects.reflection_axis_y"),
                 })
                 .show_ui_with_wheel(ui, |ui| {
-                    if ui.selectable_label(axis_idx == 0, "X (верх-низ)").clicked() {
+                    if ui.selectable_label(axis_idx == 0, t!("typing.effects.reflection_axis_x")).clicked() {
                         axis_idx = 0;
                     }
                     if ui
-                        .selectable_label(axis_idx == 1, "Y (лево-право)")
+                        .selectable_label(axis_idx == 1, t!("typing.effects.reflection_axis_y"))
                         .clicked()
                     {
                         axis_idx = 1;
@@ -650,22 +650,22 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
         }
         EffectCard::Shake(shake) => {
             changed |= ui
-                .add(WheelSlider::new(&mut shake.angle_deg, -360.0..=360.0).text("Угол (°)"))
+                .add(WheelSlider::new(&mut shake.angle_deg, -360.0..=360.0).text(t!("typing.params.angle_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.up_px, 0.0..=1000.0).text("Ампл. вверх (px)"))
+                .add(WheelSlider::new(&mut shake.up_px, 0.0..=1000.0).text(t!("typing.effects.shake_amplitude_up_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.down_px, 0.0..=1000.0).text("Ампл. вниз (px)"))
+                .add(WheelSlider::new(&mut shake.down_px, 0.0..=1000.0).text(t!("typing.effects.shake_amplitude_down_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.steps, 0..=128).text("Шаги"))
+                .add(WheelSlider::new(&mut shake.steps, 0..=128).text(t!("typing.effects.shake_steps_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.base_fade, 0.0..=1.0).text("Базовое затухание"))
+                .add(WheelSlider::new(&mut shake.base_fade, 0.0..=1.0).text(t!("typing.effects.shake_base_falloff_label")))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut shake.decay, 0.0..=1.0).text("Спад"))
+                .add(WheelSlider::new(&mut shake.decay, 0.0..=1.0).text(t!("typing.effects.shake_decay_label")))
                 .changed();
             changed |= ui
                 .add(WheelSlider::new(&mut shake.blur_px, 0..=64).text("Blur (px)"))
@@ -675,7 +675,7 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 .changed();
             ui.add_enabled_ui(shake.autogrow, |ui| {
                 changed |= ui
-                    .add(WheelSlider::new(&mut shake.grow_margin_px, 0..=1024).text("Доп. отступ"))
+                    .add(WheelSlider::new(&mut shake.grow_margin_px, 0..=1024).text(t!("typing.effects.shake_extra_padding_label")))
                     .changed();
             });
         }

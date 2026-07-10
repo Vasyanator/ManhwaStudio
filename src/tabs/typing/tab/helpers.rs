@@ -373,7 +373,7 @@ pub(super) fn save_drawn_lines_layout_image_if_needed(
                 .ok()
                 .map(|height_usize| width_usize.saturating_mul(height_usize))
         })
-        .ok_or_else(|| "Размер layout-изображения не помещается в память.".to_string())?;
+        .ok_or_else(|| t!("typing.errors.layout_image_too_large").to_string())?;
     let layout_path = text_images_dir.join(layout_image_file_name_for_overlay(overlay_file_name));
     if layout_path.is_file() {
         return Ok(Some(layout_path));
@@ -386,13 +386,13 @@ pub(super) fn save_drawn_lines_layout_image_if_needed(
         height.max(1),
         image::ColorType::Rgba8,
     )
-    .map_err(|err| format!("Не удалось сохранить {}: {err}", layout_path.display()))?;
+    .map_err(|err| tf!("typing.errors.save_layout_error", layout_path = layout_path.display(), err = err))?;
     Ok(Some(layout_path))
 }
 
 pub(super) fn read_image_rgba_from_file(path: &Path) -> Result<(Vec<u8>, usize, usize), String> {
     let img = image::open(path)
-        .map_err(|err| format!("Не удалось открыть {}: {err}", path.display()))?
+        .map_err(|err| tf!("typing.errors.open_file_error", path = path.display(), err = err))?
         .to_rgba8();
     let width = img.width() as usize;
     let height = img.height() as usize;
@@ -440,14 +440,11 @@ pub(super) fn load_typing_overlays_from_dir(
     }
 
     let raw = fs::read_to_string(&text_info_path)
-        .map_err(|err| format!("Не удалось прочитать {}: {err}", text_info_path.display()))?;
+        .map_err(|err| tf!("typing.errors.read_text_info_error", text_info_path = text_info_path.display(), err = err))?;
     let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|err| format!("Не удалось распарсить {}: {err}", text_info_path.display()))?;
+        .map_err(|err| tf!("typing.errors.parse_file_error", text_info_path = text_info_path.display(), err = err))?;
     let Some(items) = parsed.as_array() else {
-        return Err(format!(
-            "Файл {} должен содержать JSON-массив оверлеев.",
-            text_info_path.display()
-        ));
+        return Err(tf!("typing.errors.text_info_not_array_error", text_info_path = text_info_path.display()));
     };
 
     // Migrate the cross-entry legacy placement families (absolute ribbon x/y, top-left u/v) up front

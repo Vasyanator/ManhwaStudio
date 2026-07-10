@@ -556,6 +556,13 @@ fn install_embedded_fallback(tag: &LocaleTag) {
     }
 }
 
+/// Serializes every test in this binary that drives the process-global active
+/// catalog (`ms-i18n`'s `ACTIVE` slot, shared across the whole test binary). Any
+/// test that installs a locale or asserts on a `t!`/`tf!`/`tp!` result must hold
+/// this so a concurrent test's catalog swap cannot be observed mid-assertion.
+#[cfg(test)]
+pub(crate) static GLOBAL_LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,7 +714,7 @@ mod tests {
         // A partial ru file: only one key plus a custom _meta and an obsolete key.
         fs::write(
             &ru_path,
-            r#"{ "_meta": { "name": "MyRu" }, "tab.translation": "Мой перевод", "obsolete": "keep" }"#,
+            r#"{ "_meta": { "name": "MyRu" }, "app.tab.translation": "Мой перевод", "obsolete": "keep" }"#,
         )
         .expect("write");
         reconcile_dir_at(&dir).expect("reconcile");
@@ -715,11 +722,11 @@ mod tests {
         let value: Value = serde_json::from_str(&raw).expect("parse");
         let obj = value.as_object().expect("object");
         // Existing value untouched, obsolete key kept, custom _meta preserved.
-        assert_eq!(obj.get("tab.translation"), Some(&json!("Мой перевод")));
+        assert_eq!(obj.get("app.tab.translation"), Some(&json!("Мой перевод")));
         assert_eq!(obj.get("obsolete"), Some(&json!("keep")));
         assert_eq!(obj.get("_meta"), Some(&json!({ "name": "MyRu" })));
         // A key missing from the partial file was backfilled from embedded ru.
-        assert!(obj.contains_key("tab.settings"));
+        assert!(obj.contains_key("app.tab.settings"));
         cleanup(&dir);
     }
 
@@ -734,7 +741,7 @@ mod tests {
         let value: Value = serde_json::from_str(&raw).expect("parse");
         let obj = value.as_object().expect("object");
         // Backfill comes from en.json ("Translation"), never from ru.json.
-        assert_eq!(obj.get("tab.translation"), Some(&json!("Translation")));
+        assert_eq!(obj.get("app.tab.translation"), Some(&json!("Translation")));
         cleanup(&dir);
     }
 
@@ -791,10 +798,6 @@ mod tests {
         );
     }
 
-    /// Serializes the tests that drive the process-global active catalog (they
-    /// share `ms-i18n`'s `ACTIVE` slot within this test binary).
-    static GLOBAL_LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Writes the embedded English source to `<dir>/en.json` verbatim (the disk
     /// English reference the custom-tag fallback chain resolves through).
     fn write_embedded_en(dir: &Path) {
@@ -816,7 +819,7 @@ mod tests {
         // intentionally absent so the catalog's English fallback must supply it.
         fs::write(
             dir.join("de.json"),
-            r#"{ "_meta": { "name": "Deutsch" }, "tab.settings": "Einstellungen" }"#,
+            r#"{ "_meta": { "name": "Deutsch" }, "app.tab.settings": "Einstellungen" }"#,
         )
         .expect("write de.json");
 
@@ -825,9 +828,9 @@ mod tests {
         ms_i18n::install(catalog);
 
         // The German value is returned for the translated key.
-        assert_eq!(ms_i18n::lookup("tab.settings"), Some("Einstellungen"));
+        assert_eq!(ms_i18n::lookup("app.tab.settings"), Some("Einstellungen"));
         // A key missing from de.json falls back to the English value.
-        assert_eq!(ms_i18n::lookup("tab.translation"), Some("Translation"));
+        assert_eq!(ms_i18n::lookup("app.tab.translation"), Some("Translation"));
         cleanup(&dir);
     }
 
@@ -840,7 +843,7 @@ mod tests {
         assert!(load_catalog_from_disk(&dir, &xx).is_err());
         install_embedded_fallback(&xx);
         // English strings are active (not Russian "Настройки").
-        assert_eq!(ms_i18n::lookup("tab.settings"), Some("Settings"));
+        assert_eq!(ms_i18n::lookup("app.tab.settings"), Some("Settings"));
     }
 
     #[test]
@@ -861,7 +864,7 @@ mod tests {
         ));
         // The install path then falls back to English.
         install_embedded_fallback(&de);
-        assert_eq!(ms_i18n::lookup("tab.settings"), Some("Settings"));
+        assert_eq!(ms_i18n::lookup("app.tab.settings"), Some("Settings"));
         // The corrupt file is left byte-for-byte intact for manual repair.
         assert_eq!(fs::read_to_string(&de_path).expect("read"), corrupt);
         cleanup(&dir);

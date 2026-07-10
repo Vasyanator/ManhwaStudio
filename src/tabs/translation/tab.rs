@@ -30,7 +30,7 @@ Key constants:
 - `TEXT_DETECTOR_MASK_TILE_SIDE`: tile size for text-detector mask textures.
 - `TEXT_DETECTOR_MASK_TEXTURE_OPTIONS`: texture sampling for mask tiles.
 - `TEXT_DETECTOR_MASK_VISUAL_ALPHA_MAX`: max overlay alpha used when drawing detector mask.
-- `FOOTER_ADDITIONAL_CHARACTER_NAMES`: built-in extra names for footer character picker.
+- `footer_additional_character_names()`: built-in extra names for footer character picker.
 - `TEXT_DETECTOR_STATUS_OK` / `TEXT_DETECTOR_STATUS_WARN` / `TEXT_DETECTOR_STATUS_ERR`:
   status colors for detector panel.
 - `TEXT_DETECTOR_OCR_RETRY_DELAY_SECS`: retry delay for failed detector-ocr block.
@@ -206,8 +206,8 @@ use crate::tabs::translation::ocr::{
     OcrRuntimeOptions, TranslationOcrController, is_likely_multimodal_model,
 };
 use crate::tabs::translation::panels::bubbles::{
-    BubbleFooterState, BubblesPanelContext, BubblesPanelState, FOOTER_NO_CHARACTER,
-    FOOTER_NO_CHARACTERS, bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel,
+    BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
+    footer_no_characters,
     footer_state_for_bubble,
 };
 use crate::tabs::translation::panels::composition::{
@@ -253,21 +253,28 @@ const FOOTER_PATCH_DEBOUNCE_SECS: f64 = 0.25;
 const TEXT_DETECTOR_MASK_TILE_SIDE: usize = 1024;
 const TEXT_DETECTOR_MASK_TEXTURE_OPTIONS: egui::TextureOptions = egui::TextureOptions::NEAREST;
 const TEXT_DETECTOR_MASK_VISUAL_ALPHA_MAX: u8 = 96;
-const FOOTER_ADDITIONAL_CHARACTER_NAMES: &[&str] = &[
-    "Подпись",
-    "Звук",
-    "ГГ",
-    "Мысли ГГ",
-    "Непонятно",
-    "Кто-то",
-    "Кто-то из них",
-    "Какая-то девочка",
-    "Какой-то мальчик",
-    "Какой-то парень",
-    "Какая-то девушка",
-    "Какая-то женщина",
-    "Какой-то мужчина",
-];
+/// Built-in extra character-name suggestions for the bubble footer picker.
+///
+/// Runtime (not `const`) because `t!` is not const. These are display-only
+/// autocomplete suggestions; the value a user picks is stored verbatim, so
+/// localizing the suggestions does not rewrite any saved bubble data.
+fn footer_additional_character_names() -> [&'static str; 13] {
+    [
+        t!("translation.tab.footer_character.caption"),
+        t!("translation.tab.footer_character.sound"),
+        t!("translation.tab.footer_character.mc"),
+        t!("translation.tab.footer_character.mc_thoughts"),
+        t!("translation.tab.footer_character.unclear"),
+        t!("translation.tab.footer_character.someone"),
+        t!("translation.tab.footer_character.someone_of_them"),
+        t!("translation.tab.footer_character.some_girl"),
+        t!("translation.tab.footer_character.some_boy"),
+        t!("translation.tab.footer_character.some_guy"),
+        t!("translation.tab.footer_character.some_young_woman"),
+        t!("translation.tab.footer_character.some_woman"),
+        t!("translation.tab.footer_character.some_man"),
+    ]
+}
 const TEXT_DETECTOR_STATUS_OK: Color32 = Color32::from_rgb(143, 218, 143);
 const TEXT_DETECTOR_STATUS_WARN: Color32 = Color32::from_rgb(247, 201, 72);
 const TEXT_DETECTOR_STATUS_ERR: Color32 = Color32::from_rgb(240, 102, 102);
@@ -330,22 +337,22 @@ impl TranslationPanel {
     fn title(self) -> &'static str {
         match self {
             TranslationPanel::None => "",
-            TranslationPanel::Bubbles => "Пузыри",
-            TranslationPanel::Ocr => "Распознавание текста",
-            TranslationPanel::Composition => "Компоновка",
-            TranslationPanel::MachineTranslation => "Машинный/ИИ перевод",
-            TranslationPanel::TextDetector => "Массовый детектор текста",
+            TranslationPanel::Bubbles => t!("translation.tab.bubbles_title"),
+            TranslationPanel::Ocr => t!("translation.tab.panel_ocr_title"),
+            TranslationPanel::Composition => t!("translation.tab.panel_composition_title"),
+            TranslationPanel::MachineTranslation => t!("translation.tab.panel_mt_title"),
+            TranslationPanel::TextDetector => t!("translation.text_detector.title"),
         }
     }
 
     fn short_button_title(self) -> &'static str {
         match self {
             TranslationPanel::None => "",
-            TranslationPanel::Bubbles => "Пузыри",
-            TranslationPanel::Ocr => "Распознавание текста",
-            TranslationPanel::Composition => "Компоновка",
-            TranslationPanel::MachineTranslation => "Маш./ИИ перевод",
-            TranslationPanel::TextDetector => "Массовый детектор текста",
+            TranslationPanel::Bubbles => t!("translation.tab.bubbles_title"),
+            TranslationPanel::Ocr => t!("translation.tab.panel_ocr_title"),
+            TranslationPanel::Composition => t!("translation.tab.panel_composition_title"),
+            TranslationPanel::MachineTranslation => t!("translation.tab.panel_mt_short_title"),
+            TranslationPanel::TextDetector => t!("translation.text_detector.title"),
         }
     }
 }
@@ -634,7 +641,7 @@ impl TranslationTabState {
         [
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,
-                title: "Быстрое распознавание: режим выделения",
+                title: t!("translation.tab.hotkey_quick_recognition"),
                 section: "OCR",
                 default_shortcut: None,
                 default_modifier_only: Some(ModifierOnlyV2::Shift),
@@ -643,7 +650,7 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE,
-                title: "Продвинутое распознавание: режим выделения",
+                title: t!("translation.tab.hotkey_advanced_recognition"),
                 section: "OCR",
                 default_shortcut: None,
                 default_modifier_only: Some(ModifierOnlyV2::Alt),
@@ -652,8 +659,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL,
-                title: "Открыть панель пузырей",
-                section: "Панели",
+                title: t!("translation.tab.hotkey_open_bubbles"),
+                section: t!("translation.tab.hotkey_scope_panels"),
                 default_shortcut: Some(egui::KeyboardShortcut::new(
                     egui::Modifiers::NONE,
                     egui::Key::P,
@@ -664,8 +671,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL,
-                title: "Открыть панель распознавания",
-                section: "Панели",
+                title: t!("translation.tab.hotkey_open_ocr"),
+                section: t!("translation.tab.hotkey_scope_panels"),
                 default_shortcut: Some(egui::KeyboardShortcut::new(
                     egui::Modifiers::NONE,
                     egui::Key::S,
@@ -676,8 +683,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL,
-                title: "Открыть панель компоновки",
-                section: "Панели",
+                title: t!("translation.tab.hotkey_open_composition"),
+                section: t!("translation.tab.hotkey_scope_panels"),
                 default_shortcut: Some(egui::KeyboardShortcut::new(
                     egui::Modifiers::NONE,
                     egui::Key::K,
@@ -688,8 +695,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
-                title: "Открыть панель машинного перевода",
-                section: "Панели",
+                title: t!("translation.tab.hotkey_open_mt"),
+                section: t!("translation.tab.hotkey_scope_panels"),
                 default_shortcut: Some(egui::KeyboardShortcut::new(
                     egui::Modifiers::NONE,
                     egui::Key::M,
@@ -700,8 +707,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL,
-                title: "Открыть панель детектора текста",
-                section: "Панели",
+                title: t!("translation.tab.hotkey_open_text_detector"),
+                section: t!("translation.tab.hotkey_scope_panels"),
                 default_shortcut: Some(egui::KeyboardShortcut::new(
                     egui::Modifiers::NONE,
                     egui::Key::D,
@@ -712,8 +719,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL,
-                title: "Копировать оригинал выбранного пузыря",
-                section: "Пузыри",
+                title: t!("translation.tab.hotkey_copy_original"),
+                section: t!("translation.tab.bubbles_title"),
                 default_shortcut: None,
                 default_modifier_only: None,
                 scope: HotkeyScopeV2::Tab(AppTab::Translation),
@@ -721,8 +728,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
-                title: "Копировать перевод выбранного пузыря",
-                section: "Пузыри",
+                title: t!("translation.tab.hotkey_copy_translation"),
+                section: t!("translation.tab.bubbles_title"),
                 default_shortcut: None,
                 default_modifier_only: None,
                 scope: HotkeyScopeV2::Tab(AppTab::Translation),
@@ -730,8 +737,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL,
-                title: "Вставить с заменой в оригинал выбранного пузыря",
-                section: "Пузыри",
+                title: t!("translation.tab.hotkey_paste_original"),
+                section: t!("translation.tab.bubbles_title"),
                 default_shortcut: None,
                 default_modifier_only: None,
                 scope: HotkeyScopeV2::Tab(AppTab::Translation),
@@ -739,8 +746,8 @@ impl TranslationTabState {
             },
             HotkeySpecV2 {
                 id: HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION,
-                title: "Вставить с заменой в перевод выбранного пузыря",
-                section: "Пузыри",
+                title: t!("translation.tab.hotkey_paste_translation"),
+                section: t!("translation.tab.bubbles_title"),
                 default_shortcut: None,
                 default_modifier_only: None,
                 scope: HotkeyScopeV2::Tab(AppTab::Translation),
@@ -788,7 +795,7 @@ impl TranslationTabState {
             text_detector_mask_textures: HashMap::new(),
             text_mask_model: None,
             text_mask_synced_revision: 0,
-            text_detector_status: "Готов к работе".to_string(),
+            text_detector_status: t!("translation.tab.ready_status").to_string(),
             text_detector_status_color: TEXT_DETECTOR_STATUS_OK,
             text_detector_progress: None,
             text_detector_edit_lines_mode: false,
@@ -1245,7 +1252,7 @@ impl TranslationTabState {
             return None;
         }
         matches!(self.ai_backend_torch_available(), Some(false))
-            .then(|| "PyTorch не установлен".to_string())
+            .then(|| t!("translation.common.pytorch_not_installed_status").to_string())
     }
 
     fn draw_active_panel(
@@ -1323,20 +1330,20 @@ impl TranslationTabState {
                         }
                     }
                     if actions.save_ai_api_key {
-                        self.ocr_panel_options.ai_api_status = "Сохранение API key...".to_string();
+                        self.ocr_panel_options.ai_api_status = t!("translation.common.saving_api_key_status").to_string();
                         self.ocr_controller.store_ai_api_key(
                             self.ocr_panel_options.ai_api_service,
                             self.ocr_panel_options.ai_api_key_edit.clone(),
                         );
                     }
                     if actions.clear_ai_api_key {
-                        self.ocr_panel_options.ai_api_status = "Удаление API key...".to_string();
+                        self.ocr_panel_options.ai_api_status = t!("translation.common.deleting_api_key_status").to_string();
                         self.ocr_controller
                             .clear_ai_api_key(self.ocr_panel_options.ai_api_service);
                     }
                     if actions.refresh_ai_api_metadata {
                         self.ocr_panel_options.ai_api_status =
-                            "Обновление AI API данных...".to_string();
+                            t!("translation.common.refreshing_ai_api_status").to_string();
                         self.ocr_controller
                             .refresh_ai_api_metadata(self.ocr_panel_options.ai_api_service);
                     }
@@ -1355,9 +1362,9 @@ impl TranslationTabState {
                     ui.separator();
                     ui.colored_label(
                         Color32::from_rgb(225, 180, 60),
-                        "OCR отключён флагом --no-ai.",
+                        t!("translation.tab.ocr_disabled_status"),
                     );
-                    ui.small("Перезапустите приложение без --no-ai, чтобы использовать OCR.");
+                    ui.small(t!("translation.tab.ocr_restart_hint"));
                 }
                 self.ocr_last_panel_engine = Some(self.ocr_panel_options.engine);
             }
@@ -1381,20 +1388,20 @@ impl TranslationTabState {
                         self.mt_settings_dirty = true;
                     }
                     if actions.save_ai_api_key {
-                        self.mt_panel_options.ai_api_status = "Сохранение API key...".to_string();
+                        self.mt_panel_options.ai_api_status = t!("translation.common.saving_api_key_status").to_string();
                         self.mt_controller.store_ai_api_key(
                             self.mt_panel_options.ai_api_service,
                             self.mt_panel_options.ai_api_key_edit.clone(),
                         );
                     }
                     if actions.clear_ai_api_key {
-                        self.mt_panel_options.ai_api_status = "Удаление API key...".to_string();
+                        self.mt_panel_options.ai_api_status = t!("translation.common.deleting_api_key_status").to_string();
                         self.mt_controller
                             .clear_ai_api_key(self.mt_panel_options.ai_api_service);
                     }
                     if actions.refresh_ai_api_metadata {
                         self.mt_panel_options.ai_api_status =
-                            "Обновление AI API данных...".to_string();
+                            t!("translation.common.refreshing_ai_api_status").to_string();
                         self.mt_controller
                             .refresh_ai_api_metadata(self.mt_panel_options.ai_api_service);
                     }
@@ -1419,10 +1426,10 @@ impl TranslationTabState {
                     ui.separator();
                     ui.colored_label(
                         Color32::from_rgb(225, 180, 60),
-                        "Машинный перевод отключён флагом --no-ai.",
+                        t!("translation.tab.mt_disabled_status"),
                     );
                     ui.small(
-                        "Перезапустите приложение без --no-ai, чтобы использовать машинный перевод.",
+                        t!("translation.tab.mt_restart_hint"),
                     );
                 }
             }
@@ -1499,7 +1506,7 @@ impl TranslationTabState {
                     self.clear_text_mask_model();
                     self.text_detector_progress = None;
                     self.clear_text_detector_line_edit_state();
-                    self.set_text_detector_status("Результаты очищены", TEXT_DETECTOR_STATUS_OK);
+                    self.set_text_detector_status(t!("translation.tab.results_cleared_status"), TEXT_DETECTOR_STATUS_OK);
                 }
                 if actions.detect_current {
                     self.start_text_detection_for_current_page(project, canvas);
@@ -1526,15 +1533,15 @@ impl TranslationTabState {
                     ui.separator();
                     ui.colored_label(
                         Color32::from_rgb(225, 180, 60),
-                        "Распознавание по найденным блокам отключено флагом --no-ai.",
+                        t!("translation.tab.block_ocr_disabled_status"),
                     );
                 } else if self.ocr_controller.state() != OcrLoadState::Ready {
                     ui.separator();
-                    ui.small("Для распознавания по блокам сначала загрузите движок в Распознавании текста");
+                    ui.small(t!("translation.tab.block_ocr_load_engine_hint"));
                 }
             }
             _ => {
-                ui.label("Раздел переносится из Python-версии.");
+                ui.label(t!("translation.tab.section_porting_notice"));
             }
         }
     }
@@ -1926,7 +1933,7 @@ impl TranslationTabState {
     fn bubble_has_character_for_status(&self, bubble: &Bubble) -> bool {
         let character_name = self.footer_state_for(bubble).character_name;
         let trimmed = character_name.trim();
-        !trimmed.is_empty() && trimmed != FOOTER_NO_CHARACTER && trimmed != FOOTER_NO_CHARACTERS
+        !trimmed.is_empty() && trimmed != footer_no_character() && trimmed != footer_no_characters()
     }
 
     fn poll_ocr_events(
@@ -1945,7 +1952,7 @@ impl TranslationTabState {
                         self.mark_ocr_model_download_started_for_engine(engine);
                         self.push_toast(
                             ctx,
-                            "Скачивание модели...".to_string(),
+                            t!("translation.common.downloading_model_status").to_string(),
                             Color32::GOLD,
                             2.2,
                         );
@@ -1957,7 +1964,7 @@ impl TranslationTabState {
                         self.mark_ocr_load_requested_for_engine(engine);
                         self.push_toast(
                             ctx,
-                            "Движок загружается...".to_string(),
+                            t!("translation.tab.engine_loading_status").to_string(),
                             Color32::GOLD,
                             2.2,
                         );
@@ -1970,7 +1977,7 @@ impl TranslationTabState {
                         self.set_ocr_state_for_engine(engine, OcrLoadState::Error);
                         self.push_toast(
                             ctx,
-                            "Ошибка загрузки движка распознавания.".to_string(),
+                            t!("translation.tab.engine_load_error").to_string(),
                             Color32::RED,
                             3.0,
                         );
@@ -2002,7 +2009,7 @@ impl TranslationTabState {
                             self.advanced_recognition.apply_quick_recognition_result(
                                 request_id,
                                 manual_text.clone(),
-                                "Распознавание выделения завершено.".to_string(),
+                                t!("translation.tab.selection_recognition_done_status").to_string(),
                             )
                         }
                         _ => self
@@ -2027,9 +2034,9 @@ impl TranslationTabState {
                             ctx.copy_text(manual_text.clone());
                         }
                         let quick_msg = if manual_text.trim().is_empty() {
-                            "Быстрое OCR: текст не найден".to_string()
+                            t!("translation.tab.quick_ocr_no_text_status").to_string()
                         } else {
-                            format!("Быстрое OCR: {}", manual_text.trim())
+                            tf!("translation.tab.quick_ocr_result_status", manual_text = manual_text.trim())
                         };
                         self.push_toast(ctx, quick_msg, Color32::from_rgb(42, 168, 88), 3.0);
                     }
@@ -2061,14 +2068,14 @@ impl TranslationTabState {
                                 self.textdetector_ocr_recognized.saturating_add(1);
                         }
                         self.set_text_detector_status(
-                            "Распознавание блоков...",
+                            t!("translation.tab.block_recognition_status"),
                             TEXT_DETECTOR_STATUS_WARN,
                         );
                     }
                     let msg = if result.lines.is_empty() {
-                        "Распознавание: текст не найден".to_string()
+                        t!("translation.tab.recognition_no_text_status").to_string()
                     } else {
-                        format!("Распознавание: {} строк", result.lines.len())
+                        tf!("translation.tab.recognition_lines_status", lines = result.lines.len())
                     };
                     self.push_toast(ctx, msg, Color32::from_rgb(42, 168, 88), 2.2);
                 }
@@ -2097,15 +2104,15 @@ impl TranslationTabState {
                                 retry_at_s: now_s + TEXT_DETECTOR_OCR_RETRY_DELAY_SECS,
                             });
                             self.set_text_detector_status(
-                                format!(
-                                    "Ошибка распознавания, повтор блока через {:.0} c...",
-                                    TEXT_DETECTOR_OCR_RETRY_DELAY_SECS
+                                tf!(
+                                    "translation.tab.recognition_error_retry_status",
+                                    sec = format!("{:.0}", TEXT_DETECTOR_OCR_RETRY_DELAY_SECS)
                                 ),
                                 TEXT_DETECTOR_STATUS_WARN,
                             );
                             self.push_toast(
                                 ctx,
-                                "Ошибка распознавания: повтор через несколько секунд".to_string(),
+                                t!("translation.tab.recognition_retry_status").to_string(),
                                 Color32::from_rgb(255, 172, 66),
                                 2.8,
                             );
@@ -2113,15 +2120,15 @@ impl TranslationTabState {
                         }
                         self.abort_textdetector_ocr(
                             ctx,
-                            format!("Распознавание остановлено после повторной ошибки: {error}"),
+                            tf!("translation.tab.recognition_stopped_error", error = error),
                         );
                     }
                     if manual_target == Some(ManualOcrResultTarget::ToastAndClipboard) {
-                        self.push_toast(ctx, format!("Быстрое OCR: {error}"), Color32::RED, 3.0);
+                        self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Color32::RED, 3.0);
                     } else if !adv_rec_error_applied {
                         self.push_toast(
                             ctx,
-                            format!("ошибка распознавания: {error}"),
+                            tf!("translation.tab.recognition_error", error = error),
                             Color32::RED,
                             3.0,
                         );
@@ -2132,12 +2139,12 @@ impl TranslationTabState {
                         self.ocr_panel_options.ai_api_key_edit.clear();
                         self.ocr_panel_options.ai_api_key_configured = Some(true);
                         self.ocr_panel_options.ai_api_status =
-                            format!("API key {} сохранен.", service.label());
+                            tf!("translation.common.api_key_saved_status", service = service.label());
                         self.ocr_controller.refresh_ai_api_metadata(service);
                     }
                     self.push_toast(
                         ctx,
-                        format!("API key {} сохранен.", service.label()),
+                        tf!("translation.common.api_key_saved_status", service = service.label()),
                         Color32::from_rgb(42, 168, 88),
                         2.2,
                     );
@@ -2148,9 +2155,9 @@ impl TranslationTabState {
                         self.ocr_panel_options.ai_api_key_configured = Some(false);
                         self.ocr_panel_options.ai_api_models.clear();
                         self.ocr_panel_options.ai_api_account_status =
-                            "API key не задан".to_string();
+                            t!("translation.common.api_key_not_set_status").to_string();
                         self.ocr_panel_options.ai_api_status =
-                            format!("API key {} удален.", service.label());
+                            tf!("translation.common.api_key_deleted_status", service = service.label());
                     }
                 }
                 OcrControllerEvent::AiApiMetadataLoaded(metadata) => {
@@ -2170,7 +2177,7 @@ impl TranslationTabState {
                             self.ocr_settings_dirty = true;
                         }
                         self.ocr_panel_options.ai_api_status =
-                            "AI API данные обновлены.".to_string();
+                            t!("translation.common.ai_api_updated_status").to_string();
                     }
                 }
                 OcrControllerEvent::AiApiMetadataFailed { service, error } => {
@@ -2188,7 +2195,7 @@ impl TranslationTabState {
             match event {
                 TextDetectorControllerEvent::ModelDownloadStarted => {
                     self.set_text_detector_status(
-                        "Скачивание модели...",
+                        t!("translation.common.downloading_model_status"),
                         TEXT_DETECTOR_STATUS_WARN,
                     );
                 }
@@ -2212,7 +2219,7 @@ impl TranslationTabState {
                 TextDetectorControllerEvent::PageFailed { page_idx, error } => {
                     self.push_toast(
                         ctx,
-                        format!("Детектор: страница #{page_idx} пропущена ({error})"),
+                        tf!("translation.tab.detector_page_skipped_status", page_idx = page_idx, error = error),
                         Color32::from_rgb(255, 172, 66),
                         2.8,
                     );
@@ -2226,9 +2233,9 @@ impl TranslationTabState {
                 } => {
                     self.text_detector_progress = None;
                     let status = if failed_pages == 0 {
-                        format!("Готово. Найдено блоков: {total_blocks}")
+                        tf!("translation.tab.detector_done_blocks_status", total_blocks = total_blocks)
                     } else {
-                        format!("Готово. Блоков: {total_blocks}, страниц с ошибкой: {failed_pages}")
+                        tf!("translation.tab.detector_done_blocks_errors_status", total_blocks = total_blocks, failed_pages = failed_pages)
                     };
                     let color = if failed_pages == 0 {
                         TEXT_DETECTOR_STATUS_OK
@@ -2240,7 +2247,7 @@ impl TranslationTabState {
                 TextDetectorControllerEvent::DetectFailed { error } => {
                     self.text_detector_progress = None;
                     self.set_text_detector_status(
-                        format!("Ошибка поиска текста: {error}"),
+                        tf!("translation.tab.detector_error", error = error),
                         TEXT_DETECTOR_STATUS_ERR,
                     );
                 }
@@ -2277,7 +2284,7 @@ impl TranslationTabState {
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
         self.text_detection_storage_busy = true;
         self.text_detection_storage_rx = Some(rx);
-        self.set_text_detector_status("Загрузка сохранённой маски...", TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.loading_saved_mask_status"), TEXT_DETECTOR_STATUS_WARN);
 
         thread::spawn(move || {
             let event = match load_text_detection_storage(&storage_dir, &page_indices) {
@@ -2299,7 +2306,7 @@ impl TranslationTabState {
         }
         if self.text_detector_results.is_empty() {
             self.set_text_detector_status(
-                "Нет результатов для сохранения",
+                t!("translation.tab.no_results_to_save_status"),
                 TEXT_DETECTOR_STATUS_ERR,
             );
             return;
@@ -2314,7 +2321,7 @@ impl TranslationTabState {
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
         self.text_detection_storage_busy = true;
         self.text_detection_storage_rx = Some(rx);
-        self.set_text_detector_status("Сохранение маски...", TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.saving_mask_status"), TEXT_DETECTOR_STATUS_WARN);
 
         thread::spawn(move || {
             let event = match save_text_detection_storage(&storage_dir, &pages) {
@@ -2340,7 +2347,7 @@ impl TranslationTabState {
                 self.text_detection_storage_rx = None;
                 self.text_detection_storage_busy = false;
                 self.set_text_detector_status(
-                    "Операция text_detection прервана",
+                    t!("translation.tab.text_detection_aborted_status"),
                     TEXT_DETECTOR_STATUS_ERR,
                 );
                 return;
@@ -2371,9 +2378,9 @@ impl TranslationTabState {
                 }
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 let status = if failed == 0 {
-                    format!("Загружено сохранённых страниц: {loaded}")
+                    tf!("translation.tab.loaded_saved_pages_status", loaded = loaded)
                 } else {
-                    format!("Загрузка: {loaded}, с ошибками: {failed}")
+                    tf!("translation.tab.load_progress_status", loaded = loaded, failed = failed)
                 };
                 let color = if failed == 0 {
                     TEXT_DETECTOR_STATUS_OK
@@ -2392,9 +2399,9 @@ impl TranslationTabState {
                 }
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 let status = if failed == 0 {
-                    format!("Сохранено страниц: {saved}")
+                    tf!("translation.tab.saved_pages_status", saved = saved)
                 } else {
-                    format!("Сохранено: {saved}, с ошибками: {failed}")
+                    tf!("translation.tab.save_progress_status", saved = saved, failed = failed)
                 };
                 let color = if failed == 0 {
                     TEXT_DETECTOR_STATUS_OK
@@ -2409,7 +2416,7 @@ impl TranslationTabState {
                 }
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 self.set_text_detector_status(
-                    format!("Ошибка text_detection: {error}"),
+                    tf!("translation.tab.text_detection_error", error = error),
                     TEXT_DETECTOR_STATUS_ERR,
                 );
             }
@@ -2770,7 +2777,7 @@ impl TranslationTabState {
             TextDetectorAlgorithm::Classic => Ok(TextDetectorRunMode::Classic),
             TextDetectorAlgorithm::PaddleOcr => {
                 if !self.ai_enabled {
-                    return Err("PaddleOCR-детектор отключён флагом --no-ai.".to_string());
+                    return Err(t!("translation.text_detector.paddle_disabled_status").to_string());
                 }
                 Ok(TextDetectorRunMode::PaddleOcr(
                     TextDetectorPaddleOcrOptions::default(),
@@ -2778,10 +2785,10 @@ impl TranslationTabState {
             }
             TextDetectorAlgorithm::Ai => {
                 if !self.ai_enabled {
-                    return Err("ИИ-детектор отключён флагом --no-ai.".to_string());
+                    return Err(t!("translation.text_detector.ai_disabled_status").to_string());
                 }
                 if matches!(self.ai_backend_torch_available(), Some(false)) {
-                    return Err("PyTorch не установлен".to_string());
+                    return Err(t!("translation.common.pytorch_not_installed_status").to_string());
                 }
                 Ok(TextDetectorRunMode::AiCtd(TextDetectorAiCtdOptions {
                     detect_size: self.text_detector_options.ai_detect_size,
@@ -2796,10 +2803,10 @@ impl TranslationTabState {
             }
             TextDetectorAlgorithm::Surya => {
                 if !self.ai_enabled {
-                    return Err("Surya-детектор отключён флагом --no-ai.".to_string());
+                    return Err(t!("translation.text_detector.surya_disabled_status").to_string());
                 }
                 if matches!(self.ai_backend_torch_available(), Some(false)) {
-                    return Err("PyTorch не установлен".to_string());
+                    return Err(t!("translation.common.pytorch_not_installed_status").to_string());
                 }
                 Ok(TextDetectorRunMode::Surya(TextDetectorSuryaOptions))
             }
@@ -2808,10 +2815,10 @@ impl TranslationTabState {
 
     fn text_detector_running_status(&self) -> &'static str {
         match self.text_detector_options.algorithm {
-            TextDetectorAlgorithm::Classic => "Поиск текста...",
-            TextDetectorAlgorithm::PaddleOcr => "Поиск текста (PaddleOCR)...",
-            TextDetectorAlgorithm::Ai => "Поиск текста (ИИ)...",
-            TextDetectorAlgorithm::Surya => "Поиск текста (Surya)...",
+            TextDetectorAlgorithm::Classic => t!("translation.tab.detecting_status"),
+            TextDetectorAlgorithm::PaddleOcr => t!("translation.tab.detecting_paddle_status"),
+            TextDetectorAlgorithm::Ai => t!("translation.tab.detecting_ai_status"),
+            TextDetectorAlgorithm::Surya => t!("translation.tab.detecting_surya_status"),
         }
     }
 
@@ -2825,7 +2832,7 @@ impl TranslationTabState {
         }
         let page_idx = canvas.current_page_idx();
         let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) else {
-            self.set_text_detector_status("Текущая страница не найдена", TEXT_DETECTOR_STATUS_ERR);
+            self.set_text_detector_status(t!("translation.tab.current_page_not_found_status"), TEXT_DETECTOR_STATUS_ERR);
             return;
         };
         let mode = match self.text_detector_run_mode() {
@@ -2850,7 +2857,7 @@ impl TranslationTabState {
             }
             Err(error) => {
                 self.set_text_detector_status(
-                    format!("Ошибка запуска детектора: {error}"),
+                    tf!("translation.tab.detector_start_error", error = error),
                     TEXT_DETECTOR_STATUS_ERR,
                 );
             }
@@ -2889,7 +2896,7 @@ impl TranslationTabState {
             }
             Err(error) => {
                 self.set_text_detector_status(
-                    format!("Ошибка запуска детектора: {error}"),
+                    tf!("translation.tab.detector_start_error", error = error),
                     TEXT_DETECTOR_STATUS_ERR,
                 );
             }
@@ -2905,7 +2912,7 @@ impl TranslationTabState {
         if !self.ai_enabled {
             self.push_toast(
                 ctx,
-                "OCR отключён флагом --no-ai.".to_string(),
+                t!("translation.tab.ocr_disabled_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.6,
             );
@@ -2917,7 +2924,7 @@ impl TranslationTabState {
         }
         if self.ocr_controller.state() != OcrLoadState::Ready {
             self.set_text_detector_status(
-                "Движок распознавания не загружен",
+                t!("translation.tab.engine_not_loaded_status"),
                 TEXT_DETECTOR_STATUS_ERR,
             );
             return;
@@ -2957,7 +2964,7 @@ impl TranslationTabState {
         }
 
         if tasks.is_empty() {
-            self.set_text_detector_status("Нет блоков для распознавания", TEXT_DETECTOR_STATUS_ERR);
+            self.set_text_detector_status(t!("translation.tab.no_blocks_status"), TEXT_DETECTOR_STATUS_ERR);
             self.text_detector_progress = None;
             return;
         }
@@ -2970,7 +2977,7 @@ impl TranslationTabState {
         self.textdetector_ocr_done = 0;
         self.textdetector_ocr_recognized = 0;
         self.text_detector_progress = Some((0, self.textdetector_ocr_total));
-        self.set_text_detector_status("Распознавание блоков...", TEXT_DETECTOR_STATUS_WARN);
+        self.set_text_detector_status(t!("translation.tab.block_recognition_status"), TEXT_DETECTOR_STATUS_WARN);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
     }
 
@@ -3003,7 +3010,7 @@ impl TranslationTabState {
             self.textdetector_ocr_retry_state = None;
             self.pending_textdetector_ocr_tasks
                 .push_front(retry_state.task);
-            self.set_text_detector_status("Распознавание блоков...", TEXT_DETECTOR_STATUS_WARN);
+            self.set_text_detector_status(t!("translation.tab.block_recognition_status"), TEXT_DETECTOR_STATUS_WARN);
         }
 
         if self.ocr_controller.state().is_busy() {
@@ -3061,9 +3068,9 @@ impl TranslationTabState {
                         retry_at_s: now_s + TEXT_DETECTOR_OCR_RETRY_DELAY_SECS,
                     });
                     self.set_text_detector_status(
-                        format!(
-                            "Распознавание недоступно, повтор блока через {:.0} c...",
-                            TEXT_DETECTOR_OCR_RETRY_DELAY_SECS
+                        tf!(
+                            "translation.tab.recognition_unavailable_retry_status",
+                            sec = format!("{:.0}", TEXT_DETECTOR_OCR_RETRY_DELAY_SECS)
                         ),
                         TEXT_DETECTOR_STATUS_WARN,
                     );
@@ -3071,7 +3078,7 @@ impl TranslationTabState {
                 }
                 self.abort_textdetector_ocr(
                     ctx,
-                    "Распознавание остановлено после повторной ошибки запуска".to_string(),
+                    t!("translation.tab.recognition_start_stopped_status").to_string(),
                 );
                 break;
             }
@@ -3110,7 +3117,7 @@ impl TranslationTabState {
 
         if force_error {
             self.set_text_detector_status(
-                "Движок распознавания не загружен",
+                t!("translation.tab.engine_not_loaded_status"),
                 TEXT_DETECTOR_STATUS_ERR,
             );
             return;
@@ -3118,18 +3125,18 @@ impl TranslationTabState {
 
         if recognized > 0 {
             self.set_text_detector_status(
-                format!("Распознавание готово. Распознано блоков: {recognized}/{total}"),
+                tf!("translation.tab.recognition_done_blocks_status", recognized = recognized, total = total),
                 TEXT_DETECTOR_STATUS_OK,
             );
             self.push_toast(
                 ctx,
-                format!("Распознавание по детектору: {recognized}/{total}"),
+                tf!("translation.tab.detector_recognition_progress_status", recognized = recognized, total = total),
                 Color32::from_rgb(42, 168, 88),
                 2.4,
             );
         } else {
             self.set_text_detector_status(
-                "Распознавание завершено, текст не найден",
+                t!("translation.tab.recognition_done_no_text_status"),
                 TEXT_DETECTOR_STATUS_WARN,
             );
         }
@@ -3569,7 +3576,7 @@ impl TranslationTabState {
                 (center_x + half_w).clamp(0.0, source_w),
                 (center_y + half_h).clamp(0.0, source_h),
             )
-            .ok_or_else(|| "Не удалось создать строку: невалидные координаты.".to_string())?;
+            .ok_or_else(|| t!("translation.tab.create_line_invalid_coords_error").to_string())?;
             result.blocks.push(rect);
             result.blocks.len().saturating_sub(1)
         };
@@ -3593,13 +3600,9 @@ impl TranslationTabState {
                 .pages
                 .iter()
                 .find(|page| page.idx == page_idx)
-                .ok_or_else(|| format!("Страница #{page_idx} не найдена."))?;
+                .ok_or_else(|| tf!("translation.tab.page_not_found_error", page_idx = page_idx))?;
             let (w, h) = image::image_dimensions(&page.path).map_err(|err| {
-                format!(
-                    "Не удалось получить размер изображения для страницы #{} ({}): {err}",
-                    page_idx,
-                    page.path.display()
-                )
+                tf!("translation.tab.page_image_size_error", page_idx = page_idx, page = page.path.display(), err = err)
             })?;
             e.insert(TextDetectorPageResult {
                 source_size: [w.max(1), h.max(1)],
@@ -3610,7 +3613,7 @@ impl TranslationTabState {
         }
         self.text_detector_results
             .get_mut(&page_idx)
-            .ok_or_else(|| format!("Не удалось подготовить детекцию для страницы #{page_idx}."))
+            .ok_or_else(|| tf!("translation.tab.prepare_detection_error", page_idx = page_idx))
     }
 
     fn poll_mt_events(&mut self, ctx: &egui::Context, canvas: &mut CanvasView) {
@@ -3641,7 +3644,7 @@ impl TranslationTabState {
                     if !applied {
                         self.push_toast(
                             ctx,
-                            format!("Не удалось применить перевод для пузыря #{bubble_id}."),
+                            tf!("translation.tab.apply_translation_error", bubble_id = bubble_id),
                             Color32::from_rgb(255, 172, 66),
                             2.4,
                         );
@@ -3651,9 +3654,7 @@ impl TranslationTabState {
                     if !canvas.apply_machine_translation_areas(bubble_id, areas) {
                         self.push_toast(
                             ctx,
-                            format!(
-                                "Не удалось применить перевод областей для пузыря #{bubble_id}."
-                            ),
+                            tf!("translation.tab.apply_area_translation_error", bubble_id = bubble_id),
                             Color32::from_rgb(255, 172, 66),
                             2.4,
                         );
@@ -3674,10 +3675,7 @@ impl TranslationTabState {
                     };
                     self.push_toast(
                         ctx,
-                        format!(
-                            "Маш. перевод: {translated}/{}, ошибок: {errors}",
-                            translated + errors
-                        ),
+                        tf!("translation.tab.mt_progress_status", translated = translated, translated_2 = translated + errors, errors = errors),
                         color,
                         2.8,
                     );
@@ -3686,7 +3684,7 @@ impl TranslationTabState {
                     self.mt_progress = None;
                     self.push_toast(
                         ctx,
-                        format!("Маш. перевод отменён: готово {translated}, ошибок: {errors}"),
+                        tf!("translation.tab.mt_cancelled_status", translated = translated, errors = errors),
                         Color32::from_rgb(255, 172, 66),
                         2.8,
                     );
@@ -3704,7 +3702,7 @@ impl TranslationTabState {
                     } else {
                         self.push_toast(
                             ctx,
-                            format!("Маш. перевод ошибка: {error}"),
+                            tf!("translation.tab.mt_error_status", error = error),
                             Color32::RED,
                             3.2,
                         );
@@ -3728,11 +3726,7 @@ impl TranslationTabState {
                     });
                     self.push_toast(
                         ctx,
-                        format!(
-                            "ИИ перевод: {translated}/{total}, ошибок: {errors}. Контекст: {}/{}. Обрезано реплик: {pruned_replicas}",
-                            format_context_chars(context_used_chars),
-                            format_context_chars(context_budget_chars),
-                        ),
+                        tf!("translation.tab.ai_mt_progress_status", translated = translated, total = total, errors = errors, used = format_context_chars(context_used_chars), budget = format_context_chars(context_budget_chars), pruned_replicas = pruned_replicas),
                         Color32::from_rgb(255, 172, 66),
                         2.4,
                     );
@@ -3742,12 +3736,12 @@ impl TranslationTabState {
                         self.mt_panel_options.ai_api_key_edit.clear();
                         self.mt_panel_options.ai_api_key_configured = Some(true);
                         self.mt_panel_options.ai_api_status =
-                            format!("API key {} сохранен.", service.label());
+                            tf!("translation.common.api_key_saved_status", service = service.label());
                         self.mt_controller.refresh_ai_api_metadata(service);
                     }
                     self.push_toast(
                         ctx,
-                        format!("API key {} сохранен.", service.label()),
+                        tf!("translation.common.api_key_saved_status", service = service.label()),
                         Color32::from_rgb(42, 168, 88),
                         2.2,
                     );
@@ -3758,9 +3752,9 @@ impl TranslationTabState {
                         self.mt_panel_options.ai_api_key_configured = Some(false);
                         self.mt_panel_options.ai_api_models.clear();
                         self.mt_panel_options.ai_api_account_status =
-                            "API key не задан".to_string();
+                            t!("translation.common.api_key_not_set_status").to_string();
                         self.mt_panel_options.ai_api_status =
-                            format!("API key {} удален.", service.label());
+                            tf!("translation.common.api_key_deleted_status", service = service.label());
                     }
                 }
                 MtControllerEvent::AiApiMetadataLoaded(metadata) => {
@@ -3779,7 +3773,7 @@ impl TranslationTabState {
                             self.mt_settings_dirty = true;
                         }
                         self.mt_panel_options.ai_api_status =
-                            "AI API данные обновлены.".to_string();
+                            t!("translation.common.ai_api_updated_status").to_string();
                     }
                 }
                 MtControllerEvent::AiApiMetadataFailed { service, error } => {
@@ -3810,14 +3804,14 @@ impl TranslationTabState {
         if self.mt_controller.request_cancel() {
             self.push_toast(
                 ctx,
-                "Машинный перевод отменён.".to_string(),
+                t!("translation.tab.mt_cancelled_notice").to_string(),
                 Color32::from_rgb(255, 172, 66),
                 2.2,
             );
         } else if had_pending {
             self.push_toast(
                 ctx,
-                "Отложенный запуск машинного перевода отменён.".to_string(),
+                t!("translation.tab.mt_deferred_cancelled_status").to_string(),
                 Color32::from_rgb(255, 172, 66),
                 2.2,
             );
@@ -3856,7 +3850,7 @@ impl TranslationTabState {
         if !items.iter().any(|item| item.needs_translation) {
             self.push_toast(
                 ctx,
-                "Нет пузырей для машинного перевода.".to_string(),
+                t!("translation.tab.no_bubbles_for_mt_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.3,
             );
@@ -4044,7 +4038,7 @@ impl TranslationTabState {
         if !self.ai_enabled {
             self.push_toast(
                 ctx,
-                "Машинный перевод отключён флагом --no-ai.".to_string(),
+                t!("translation.tab.mt_disabled_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.6,
             );
@@ -4053,7 +4047,7 @@ impl TranslationTabState {
         if self.mt_controller.is_busy() {
             self.push_toast(
                 ctx,
-                "Перевод уже выполняется.".to_string(),
+                t!("translation.mt.already_running_status").to_string(),
                 Color32::from_rgb(255, 172, 66),
                 2.2,
             );
@@ -4074,7 +4068,7 @@ impl TranslationTabState {
 
         if let Err(err) = self.mt_controller.start_translation(request) {
             eprintln!("[MT][StartFailed] {}", err.replace('\n', " "));
-            self.push_toast(ctx, format!("Ошибка запуска: {err}"), Color32::RED, 3.0);
+            self.push_toast(ctx, tf!("translation.tab.mt_start_error", err = err), Color32::RED, 3.0);
         } else {
             // Drop any previous credit/limit notice as soon as a new run is accepted.
             self.mt_stop_notice = None;
@@ -4131,7 +4125,7 @@ impl TranslationTabState {
         if !self.ai_enabled {
             self.push_toast(
                 ctx,
-                "Машинный перевод отключён флагом --no-ai.".to_string(),
+                t!("translation.tab.mt_disabled_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.6,
             );
@@ -4141,7 +4135,7 @@ impl TranslationTabState {
         if !items.iter().any(|item| item.needs_translation) {
             self.push_toast(
                 ctx,
-                "Нет пузырей для предпросмотра запроса.".to_string(),
+                t!("translation.tab.no_bubbles_preview_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.3,
             );
@@ -4151,9 +4145,9 @@ impl TranslationTabState {
         let source_lang = normalized_lang_input(&self.mt_panel_options.source_lang, "auto");
         let target_lang = normalized_lang_input(&self.mt_panel_options.target_lang, "ru");
         let scope_label = if current_page_only {
-            "текущая страница"
+            t!("translation.tab.scope_current_page")
         } else {
-            "весь проект"
+            t!("translation.tab.scope_whole_project")
         }
         .to_string();
 
@@ -4170,7 +4164,7 @@ impl TranslationTabState {
         });
         self.push_toast(
             ctx,
-            "Подготовка полного запроса...".to_string(),
+            t!("translation.tab.preparing_request_status").to_string(),
             Color32::from_rgb(120, 180, 255),
             1.6,
         );
@@ -4201,7 +4195,7 @@ impl TranslationTabState {
                 self.mt_request_preview_rx = None;
                 self.push_toast(
                     ctx,
-                    format!("Не удалось собрать запрос: {error}"),
+                    tf!("translation.tab.build_request_error", error = error),
                     Color32::RED,
                     3.5,
                 );
@@ -4229,35 +4223,27 @@ impl TranslationTabState {
             image_textures,
             ..
         } = window;
-        egui::Window::new("Полный запрос ИИ перевода")
+        egui::Window::new(t!("translation.tab.ai_request_window_title")).id(egui::Id::new("translation.tab.ai_request_window_title"))
             .open(&mut open)
             .resizable(true)
             .default_size([720.0, 640.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Область: {scope_label} • батч 1/{} • перевод: {} • контекст: {} • items всего: {} • картинок: {} ({} KiB)",
-                    preview.batch_total,
-                    preview.translate_count,
-                    preview.context_count,
-                    preview.total_item_count,
-                    preview.image_count,
-                    preview.image_bytes / 1024,
-                ));
+                ui.label(tf!("translation.tab.request_preview_summary", scope_label = scope_label, batch_total = preview.batch_total, translate = preview.translate_count, context = preview.context_count, items_total = preview.total_item_count, images = preview.image_count, kib = preview.image_bytes / 1024));
                 if preview.batch_total > 1 {
                     ui.colored_label(
                         Color32::from_rgb(225, 180, 60),
-                        "Показан контекст только первого шага (батча). Остальные батчи уходят отдельными запросами.",
+                        t!("translation.tab.request_preview_context_hint"),
                     );
                 }
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.heading("Системный промпт");
+                        ui.heading(t!("translation.tab.system_prompt_label"));
                         selectable_monospace(ui, &preview.system_prompt);
                         ui.add_space(10.0);
                         ui.separator();
-                        ui.heading("Сообщение пользователя (первый батч)");
+                        ui.heading(t!("translation.tab.user_message_label"));
                         let mut image_idx = 0usize;
                         for part in &preview.parts {
                             match part {
@@ -4266,13 +4252,7 @@ impl TranslationTabState {
                                     ui.add_space(6.0);
                                 }
                                 MtRequestPreviewPart::Image(image) => {
-                                    ui.label(format!(
-                                        "[картинка пузыря #{}: {}x{}, PNG {} KiB]",
-                                        image.bubble_id,
-                                        image.width,
-                                        image.height,
-                                        image.png_byte_len / 1024,
-                                    ));
+                                    ui.label(tf!("translation.tab.bubble_image_summary", image = image.bubble_id, image_2 = image.width, image_3 = image.height, image_4 = image.png_byte_len / 1024));
                                     if let Some(slot) = image_textures.get_mut(image_idx) {
                                         let texture = slot.get_or_insert_with(|| {
                                             let dims = [
@@ -4373,14 +4353,11 @@ impl TranslationTabState {
         }
 
         let progress = (status.loaded_pages as f32 / status.total_pages as f32).clamp(0.0, 1.0);
-        let title = format!(
-            "Загрузка картинок: {}/{}",
-            status.loaded_pages, status.total_pages
-        );
+        let title = tf!("translation.tab.loading_images_status", loaded = status.loaded_pages, total = status.total_pages);
         let details = if status.load_errors_count > 0 {
-            format!("Ошибок загрузки: {}", status.load_errors_count)
+            tf!("translation.tab.load_errors_status", errors = status.load_errors_count)
         } else {
-            "Подготовка страниц для холста...".to_string()
+            t!("translation.tab.preparing_pages_status").to_string()
         };
 
         egui::Area::new("translation_startup_page_load_toast".into())
@@ -4671,7 +4648,7 @@ impl TranslationTabState {
         ) else {
             self.push_toast(
                 ctx,
-                "Выделение не пересекается со страницами.".to_string(),
+                t!("translation.tab.selection_no_pages_status").to_string(),
                 Color32::RED,
                 2.6,
             );
@@ -4728,7 +4705,7 @@ impl TranslationTabState {
             self.pending_bubble_inserts.remove(&request_id);
         }
         if !was_ready {
-            self.push_toast(ctx, "Движок загружается...".to_string(), Color32::GOLD, 2.2);
+            self.push_toast(ctx, t!("translation.tab.engine_loading_status").to_string(), Color32::GOLD, 2.2);
         }
     }
 
@@ -4746,7 +4723,7 @@ impl TranslationTabState {
                 if !self.ai_enabled {
                     self.push_toast(
                         ctx,
-                        "OCR отключён флагом --no-ai.".to_string(),
+                        t!("translation.tab.ocr_disabled_status").to_string(),
                         Color32::from_rgb(225, 180, 60),
                         2.6,
                     );
@@ -4755,7 +4732,7 @@ impl TranslationTabState {
                 if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
                     self.push_toast(
                         ctx,
-                        "ИИ бэкенд недоступен".to_string(),
+                        t!("translation.tab.backend_unavailable_status").to_string(),
                         Color32::from_rgb(240, 102, 102),
                         2.6,
                     );
@@ -4771,7 +4748,7 @@ impl TranslationTabState {
                 let Some(mut built_request) = self.advanced_recognition_request.clone() else {
                     self.push_toast(
                         ctx,
-                        "Не найдено выделение для распознавания.".to_string(),
+                        t!("translation.tab.no_selection_status").to_string(),
                         Color32::RED,
                         2.6,
                     );
@@ -4792,7 +4769,7 @@ impl TranslationTabState {
                     let error = self
                         .ocr_controller
                         .last_error()
-                        .unwrap_or("Не удалось запустить распознавание.")
+                        .unwrap_or(t!("translation.tab.start_recognition_error"))
                         .to_string();
                     let _ = self
                         .advanced_recognition
@@ -4803,7 +4780,7 @@ impl TranslationTabState {
                 if !self.ai_enabled {
                     self.push_toast(
                         ctx,
-                        "OCR отключён флагом --no-ai.".to_string(),
+                        t!("translation.tab.ocr_disabled_status").to_string(),
                         Color32::from_rgb(225, 180, 60),
                         2.6,
                     );
@@ -4812,7 +4789,7 @@ impl TranslationTabState {
                 if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
                     self.push_toast(
                         ctx,
-                        "ИИ бэкенд недоступен".to_string(),
+                        t!("translation.tab.backend_unavailable_status").to_string(),
                         Color32::from_rgb(240, 102, 102),
                         2.6,
                     );
@@ -4828,7 +4805,7 @@ impl TranslationTabState {
                 let Some(mut built_request) = self.advanced_recognition_request.clone() else {
                     self.push_toast(
                         ctx,
-                        "Не найдено выделение для распознавания.".to_string(),
+                        t!("translation.tab.no_selection_status").to_string(),
                         Color32::RED,
                         2.6,
                     );
@@ -4849,12 +4826,12 @@ impl TranslationTabState {
                     let error = self
                         .ocr_controller
                         .last_error()
-                        .unwrap_or("Не удалось запустить распознавание.")
+                        .unwrap_or(t!("translation.tab.start_recognition_error"))
                         .to_string();
                     let _ = self
                         .advanced_recognition
                         .apply_recognition_error(request_id, error.clone());
-                    self.push_toast(ctx, format!("Быстрое OCR: {error}"), Color32::RED, 3.0);
+                    self.push_toast(ctx, tf!("translation.tab.quick_ocr_error", error = error), Color32::RED, 3.0);
                 }
             }
             AdvancedRecognitionAction::CreateBubble {
@@ -4887,7 +4864,7 @@ impl TranslationTabState {
         if !self.ai_enabled {
             self.push_toast(
                 ctx,
-                "OCR отключён флагом --no-ai.".to_string(),
+                t!("translation.tab.ocr_disabled_status").to_string(),
                 Color32::from_rgb(225, 180, 60),
                 2.6,
             );
@@ -4896,7 +4873,7 @@ impl TranslationTabState {
         if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
             self.push_toast(
                 ctx,
-                "ИИ бэкенд недоступен".to_string(),
+                t!("translation.tab.backend_unavailable_status").to_string(),
                 Color32::from_rgb(240, 102, 102),
                 2.6,
             );
@@ -4918,7 +4895,7 @@ impl TranslationTabState {
         ) else {
             self.push_toast(
                 ctx,
-                "Выделение не пересекается со страницами.".to_string(),
+                t!("translation.tab.selection_no_pages_status").to_string(),
                 Color32::RED,
                 2.6,
             );
@@ -4939,7 +4916,7 @@ impl TranslationTabState {
         if self.manual_ocr_active_request_id.is_some() {
             self.push_toast(
                 ctx,
-                "OCR уже выполняется".to_string(),
+                t!("translation.tab.ocr_already_running_status").to_string(),
                 Color32::from_rgb(255, 172, 66),
                 2.0,
             );
@@ -4971,21 +4948,21 @@ impl TranslationTabState {
         let before_source_type = source_type.clone();
         WheelComboBox::from_id_salt(("translation_footer_image_source_type", bubble_id))
             .selected_text(if source_type == "page_crop" {
-                "Вырезка из ленты"
+                t!("translation.tab.image_source_ribbon_crop")
             } else {
-                "Сторонняя картинка"
+                t!("translation.common.image_source_external")
             })
             .width(170.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(
                     &mut source_type,
                     "page_crop".to_string(),
-                    "Вырезка из ленты",
+                    t!("translation.tab.image_source_ribbon_crop"),
                 );
                 ui.selectable_value(
                     &mut source_type,
                     "external".to_string(),
-                    "Сторонняя картинка",
+                    t!("translation.common.image_source_external"),
                 );
             });
         if source_type != before_source_type {
@@ -5012,7 +4989,7 @@ impl TranslationTabState {
         }
 
         if source_type == "external" {
-            if ui.small_button("Вставить картинку из буфера").clicked() {
+            if ui.small_button(t!("translation.common.paste_image_button")).clicked() {
                 match save_clipboard_image_bubble(project, bubble_id) {
                     Ok(path) => self.queue_footer_patch(
                         bubble_id,
@@ -5023,7 +5000,7 @@ impl TranslationTabState {
                     Err(err) => self.push_toast(ui.ctx(), err, Color32::RED, 3.0),
                 }
             }
-            if ui.small_button("Выбрать файл").clicked()
+            if ui.small_button(t!("translation.common.choose_file_button")).clicked()
                 && let Some(path) = pick_image_bubble_file()
             {
                 match copy_external_image_bubble(project, bubble_id, &path) {
@@ -5203,7 +5180,7 @@ impl CanvasHooks for TranslationTabState {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     // Заголовок по центру
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("Инструменты").strong());
+                        ui.label(egui::RichText::new(t!("translation.tab.tools_heading")).strong());
                     });
 
                     ui.add_space(4.0);
@@ -5260,11 +5237,11 @@ impl CanvasHooks for TranslationTabState {
                         .stroke(Stroke::new(1.0, Color32::from_rgb(88, 180, 110)))
                         .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new("Режим изменения найденных строк")
+                                egui::RichText::new(t!("translation.tab.lines_edit_mode_label"))
                                     .color(Color32::from_rgb(210, 255, 220))
                                     .strong(),
                             );
-                            if ui.button("Выйти").clicked() {
+                            if ui.button(t!("translation.tab.exit_button")).clicked() {
                                 self.set_text_detector_edit_lines_mode(false);
                             }
                         });
@@ -5283,20 +5260,20 @@ impl CanvasHooks for TranslationTabState {
                         .stroke(Stroke::new(1.0, Color32::from_rgb(212, 72, 72)))
                         .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new("Режим изменения маски текста")
+                                egui::RichText::new(t!("translation.tab.mask_edit_mode_label"))
                                     .color(Color32::from_rgb(255, 220, 220))
                                     .strong(),
                             );
                             let mut radius = self.text_detector_mask_brush.radius_px();
                             if ui
-                                .add(WheelSlider::new(&mut radius, 1..=200).text("Кисть (px)"))
+                                .add(WheelSlider::new(&mut radius, 1..=200).text(t!("translation.tab.brush_px_label")))
                                 .changed()
                             {
                                 self.text_detector_mask_brush.set_radius_px(radius);
                             }
-                            ui.small("ЛКМ: рисовать");
-                            ui.small("ПКМ или Shift+ЛКМ: стирать");
-                            if ui.button("Выйти").clicked() {
+                            ui.small(t!("translation.tab.paint_hint"));
+                            ui.small(t!("translation.tab.erase_hint"));
+                            if ui.button(t!("translation.tab.exit_button")).clicked() {
                                 self.set_text_detector_edit_mask_mode(false);
                             }
                         });
@@ -5360,7 +5337,7 @@ impl CanvasHooks for TranslationTabState {
                         .range(0..=100_000)
                         .speed(0.25),
                 )
-                .on_hover_text("Номер реплики для упорядочивания");
+                .on_hover_text(t!("translation.tab.replica_order_tooltip"));
             if order_resp.changed() {
                 state.bubble_order = bubble_order.clamp(0, 100_000);
                 self.queue_footer_patch(
@@ -5390,7 +5367,7 @@ impl CanvasHooks for TranslationTabState {
                     AutocompleteLine::new(("translation_footer_character", bubble_id))
                 });
             autocomplete.set_max_suggestions(FOOTER_CHARACTER_AUTOCOMPLETE_MAX);
-            autocomplete.set_hint_text("Кто говорит?");
+            autocomplete.set_hint_text(t!("translation.tab.who_speaks_placeholder"));
 
             let field_resp = autocomplete.draw(ui, &mut state.character_name, suggestions);
             if field_resp.changed || field_resp.submitted {
@@ -5456,7 +5433,7 @@ impl CanvasHooks for TranslationTabState {
         if !self.text_detector_edit_lines_mode {
             return false;
         }
-        if ui.button("Создать строку").clicked() {
+        if ui.button(t!("translation.tab.create_line_button")).clicked() {
             let _ = self.create_text_detector_line_at_uv(project, page_idx, page_uv);
             ui.close();
         }
@@ -5925,11 +5902,11 @@ fn build_translation_character_names(base: Vec<String>) -> Vec<String> {
         }
     };
 
-    push_unique(FOOTER_NO_CHARACTER);
+    push_unique(footer_no_character());
     for name in base {
         push_unique(&name);
     }
-    for name in FOOTER_ADDITIONAL_CHARACTER_NAMES {
+    for name in footer_additional_character_names() {
         push_unique(name);
     }
     out
@@ -5937,7 +5914,7 @@ fn build_translation_character_names(base: Vec<String>) -> Vec<String> {
 
 fn recent_character_entry_from_state(state: &BubbleFooterState) -> Option<RecentCharacterEntry> {
     let trimmed = state.character_name.trim();
-    if trimmed.is_empty() || trimmed == FOOTER_NO_CHARACTER || trimmed == FOOTER_NO_CHARACTERS {
+    if trimmed.is_empty() || trimmed == footer_no_character() || trimmed == footer_no_characters() {
         return None;
     }
     Some(RecentCharacterEntry {
@@ -6471,7 +6448,7 @@ fn load_text_detection_page(
     };
 
     let source_size = parse_u32_pair(obj.get("source_size"))
-        .ok_or_else(|| format!("{}: невалидный source_size", blocks_path.display()))?;
+        .ok_or_else(|| tf!("translation.tab.invalid_source_size_error", path = blocks_path.display()))?;
     let mut blocks = Vec::<TextDetectorRect>::new();
     if let Some(items) = obj.get("blocks").and_then(Value::as_array) {
         for item in items {
@@ -6591,7 +6568,7 @@ fn save_text_detection_page(
             result.mask_size[1],
             result.mask_alpha.clone(),
         )
-        .ok_or_else(|| format!("Некорректная маска для страницы {page_idx}"))?;
+        .ok_or_else(|| tf!("translation.tab.invalid_mask_error", page_idx = page_idx))?;
         img.save_with_format(&mask_path, image::ImageFormat::Png)
             .map_err(|err| format!("{}: {err}", mask_path.display()))?;
     } else if mask_path.exists() {
@@ -6799,19 +6776,19 @@ fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
 fn save_clipboard_image_bubble(project: &ProjectData, bubble_id: i64) -> Result<PathBuf, String> {
     let clipboard_image = paste_image::read_image_from_clipboard()?;
     let width = u32::try_from(clipboard_image.width)
-        .map_err(|_| "картинка из буфера слишком широкая".to_string())?;
+        .map_err(|_| t!("translation.image_io.clipboard_too_wide_error").to_string())?;
     let height = u32::try_from(clipboard_image.height)
-        .map_err(|_| "картинка из буфера слишком высокая".to_string())?;
+        .map_err(|_| t!("translation.image_io.clipboard_too_tall_error").to_string())?;
     let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
-        return Err("буфер картинки не соответствует ширине и высоте".to_string());
+        return Err(t!("translation.image_io.clipboard_size_mismatch_error").to_string());
     };
     let dir = image_bubbles_dir(project);
     fs::create_dir_all(&dir)
-        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
     let path = dir.join(format!("image_bubble_{bubble_id}.png"));
     image
         .save(&path)
-        .map_err(|err| format!("не удалось сохранить {}: {err}", path.display()))?;
+        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
     Ok(path)
 }
 
@@ -6839,11 +6816,11 @@ fn copy_external_image_bubble(
     source: &Path,
 ) -> Result<PathBuf, String> {
     if !source.is_file() {
-        return Err(format!("файл не найден: {}", source.display()));
+        return Err(tf!("translation.image_io.file_not_found_error", source = source.display()));
     }
     let dir = image_bubbles_dir(project);
     fs::create_dir_all(&dir)
-        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
     let ext = source
         .extension()
         .and_then(|value| value.to_str())
@@ -6851,11 +6828,7 @@ fn copy_external_image_bubble(
         .unwrap_or("png");
     let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
     fs::copy(source, &path).map_err(|err| {
-        format!(
-            "не удалось скопировать {} в {}: {err}",
-            source.display(),
-            path.display()
-        )
+        tf!("translation.image_io.copy_error", source = source.display(), path = path.display(), err = err)
     })?;
     Ok(path)
 }

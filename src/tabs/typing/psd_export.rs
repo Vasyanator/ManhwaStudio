@@ -35,10 +35,7 @@ pub(super) fn export_typing_single_page_psd(job: &TypingExportPageJob) -> Result
     // Источник страницы (RGBA8) на полном разрешении.
     let source = image::open(&job.page_path)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть страницу {}: {err}",
-                job.page_path.display()
-            )
+            tf!("typing.errors.open_page_error", job = job.page_path.display(), err = err)
         })?
         .to_rgba8();
     let page_w = source.width() as usize;
@@ -86,16 +83,14 @@ pub(super) fn build_typing_page_psd(
     let mut layers: Vec<Layer> = Vec::new();
 
     // 1. Слой-источник (самый нижний).
-    layers.push(full_page_layer(
-        "Источник",
-        page_w,
-        page_h,
-        source_rgba,
-        None,
-    ));
+    // NOTE (i18n §A5): PSD layer names are DATA written into the exported .psd, not UI
+    // labels — keep them as stable Russian literals so the export format is deterministic
+    // and independent of the interface language.
+    layers.push(full_page_layer("Источник", page_w, page_h, source_rgba, None));
 
     // 2. Слой-клин (если присутствует).
     if let Some(clean) = clean_rgba {
+        // i18n §A5: PSD layer name is exported data, not a UI label — keep it literal.
         layers.push(full_page_layer("Клин", page_w, page_h, clean, None));
     }
 
@@ -112,6 +107,7 @@ pub(super) fn build_typing_page_psd(
         if let Some(layer_idx) = layer_idx
             && !group.is_empty()
         {
+            // i18n §A5: exported PSD group name is data, not a UI label — keep it literal.
             layers.push(text_group_layer(
                 &format!("Слой текста {layer_idx}"),
                 std::mem::take(group),
@@ -135,6 +131,7 @@ pub(super) fn build_typing_page_psd(
             // CASE A: один видимый текстовый слой с запечённым аффинным превью.
             let baked = bake_affine_overlay(overlay, &clipped_rgba, page_w, page_h, &deform_mesh);
             let layer = make_baked_layer(
+                // i18n §A5: exported PSD layer name is data, not a UI label — keep literal.
                 &format!("Текст {text_index}"),
                 page_w,
                 page_h,
@@ -148,6 +145,7 @@ pub(super) fn build_typing_page_psd(
             let affine_baked =
                 bake_affine_overlay(overlay, &clipped_rgba, page_w, page_h, &deform_mesh);
             let hidden_text_layer = make_baked_layer(
+                // i18n §A5: exported PSD layer name is data, not a UI label — keep literal.
                 &format!("Текст {text_index} (текст)"),
                 page_w,
                 page_h,
@@ -167,6 +165,7 @@ pub(super) fn build_typing_page_psd(
                 &deform_mesh,
             );
             let raster_layer = make_baked_layer(
+                // i18n §A5: exported PSD layer name is data, not a UI label — keep literal.
                 &format!("Текст {text_index} (растр)"),
                 page_w,
                 page_h,

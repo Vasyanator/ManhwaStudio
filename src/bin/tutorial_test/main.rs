@@ -35,6 +35,12 @@ Run with the inspection harness for MCP verification:
 
 use eframe::egui::{self, Align, Layout};
 
+// The mounted `engine.rs` calls the bare `t!` / `tf!` localization macros. The main
+// crate brings them into scope with a crate-root `#[macro_use]`; this dev binary is a
+// separate crate, so it must do the same for the mounted engine to compile.
+#[macro_use]
+extern crate ms_i18n;
+
 // Reusable widgets from the main application. The package has no lib target, so
 // they are physically mounted with `#[path]`. The wheel widgets reference
 // `super::wheel_input_guard`, so all four are mounted at the crate root (their

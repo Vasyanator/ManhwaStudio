@@ -109,7 +109,9 @@ use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
 use crate::tabs::typing::tab::TypingExportFormat;
 use crate::tabs::typing::tab::TypingTextOverlayLayer;
 use crate::tabs::typing::tab::decode_vector_mesh_warp;
-use crate::tabs::typing::render_next::forms::{self, PeakBase, TextForm, TextFormPreset};
+use crate::tabs::typing::render_next::forms::{
+    self, PeakBase, PresetLabel, TextForm, TextFormPreset,
+};
 use crate::tabs::typing::segmentation::Conservatism;
 use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_path};
 use crate::tabs::typing::render_next::render_text_to_image;
@@ -166,15 +168,29 @@ const CREATE_PREVIEW_HEIGHT_PX: f32 = 200.0;
 const EDIT_TEXT_FIELD_HEIGHT_PX: f32 = 170.0;
 
 const PREVIEW_TEXTURE_ID: &str = "typing-create-preview-texture";
-const DEFAULT_PREVIEW_TEXT: &str = "Текст будет выглядеть так";
 const DEFAULT_PREVIEW_WIDTH_PX: u32 = 300;
+
+/// Localized default preview text shown before the user types anything.
+///
+/// A runtime accessor rather than a `const` because `t!` is a locale-catalog lookup,
+/// not a `const` expression, and the active locale can change at runtime.
+fn default_preview_text() -> &'static str {
+    t!("typing.panel.default_preview_text")
+}
+
+/// Localized label for the "no preset" entry at the top of the preset dropdowns.
+///
+/// A runtime accessor rather than a `const` because `t!` is a locale-catalog lookup,
+/// not a `const` expression, and the active locale can change at runtime.
+fn text_preset_none_label() -> &'static str {
+    t!("typing.presets.none_option")
+}
 const TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY: &str = "use_legacy_inline_tags";
 const TEXT_TAB_CREATE_PRESETS_KEY: &str = "create_presets";
 const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
 // Per-effect-kind default parameter overrides, keyed by the effect discriminator
 // string (see `effect_defaults::effect_kind_key`); value = the one-card JSON object.
 const TEXT_TAB_EFFECT_DEFAULTS_KEY: &str = "effect_defaults";
-const TEXT_PRESET_NONE_LABEL: &str = "Нет";
 const INLINE_TAG_DIM_TEXT_COLOR: Color32 = Color32::from_gray(120);
 const INLINE_TAG_CONTENT_TEXT_COLOR: Color32 = Color32::WHITE;
 mod facade;
@@ -266,8 +282,8 @@ impl TypingArcOrientation {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Horizontal => "Горизонтальная",
-            Self::Vertical => "Вертикальная",
+            Self::Horizontal => t!("typing.params.line_mode_horizontal"),
+            Self::Vertical => t!("typing.params.line_mode_vertical"),
         }
     }
 }
@@ -597,8 +613,8 @@ enum TypingVerticalMainTab {
 impl TypingVerticalMainTab {
     fn label(self) -> &'static str {
         match self {
-            Self::Parameters => "Параметры",
-            Self::Effects => "Эффекты",
+            Self::Parameters => t!("typing.panel.params_tab"),
+            Self::Effects => t!("typing.panel.effects_tab"),
         }
     }
 }
@@ -614,8 +630,8 @@ enum TypingActionsPanelTab {
 impl TypingActionsPanelTab {
     fn label(self) -> &'static str {
         match self {
-            Self::Actions => "Действия",
-            Self::Layers => "Слои",
+            Self::Actions => t!("typing.panel.actions_tab"),
+            Self::Layers => t!("typing.panel.layers_tab"),
         }
     }
 }
@@ -680,19 +696,19 @@ enum AvailableEffectKind {
 impl AvailableEffectKind {
     fn label(self) -> &'static str {
         match self {
-            Self::TextShake => "Тряска текста",
-            Self::Stroke => "Обводка",
-            Self::Shadow => "Тень",
-            Self::Blur => "Размытие",
-            Self::MotionBlur => "Размытие в движении",
-            Self::DryMedia => "Мел/Карандаш",
-            Self::GlowV1 => "Свечение V1",
-            Self::GlowV2 => "Свечение V2",
-            Self::SoftGlow => "Мягкое свечение",
-            Self::Gradient2 => "Градиент 2",
-            Self::Gradient4 => "Градиент 4",
-            Self::Reflect => "Отражение",
-            Self::Shake => "Тряска",
+            Self::TextShake => t!("typing.effects.text_shake_title"),
+            Self::Stroke => t!("typing.effects.stroke_title"),
+            Self::Shadow => t!("typing.effects.shadow_title"),
+            Self::Blur => t!("typing.effects.blur_title"),
+            Self::MotionBlur => t!("typing.effects.motion_blur_title"),
+            Self::DryMedia => t!("typing.effects.dry_media_title"),
+            Self::GlowV1 => t!("typing.effects.glow_v1_title"),
+            Self::GlowV2 => t!("typing.effects.glow_v2_title"),
+            Self::SoftGlow => t!("typing.effects.soft_glow_title"),
+            Self::Gradient2 => t!("typing.effects.gradient2_title"),
+            Self::Gradient4 => t!("typing.effects.gradient4_title"),
+            Self::Reflect => t!("typing.effects.reflection_title"),
+            Self::Shake => t!("typing.effects.shake_title"),
         }
     }
 }

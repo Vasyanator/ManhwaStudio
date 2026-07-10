@@ -54,10 +54,10 @@ pub enum BubbleBorderKind {
 impl BubbleBorderKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Solid => "Сплошная",
-            Self::Dashed => "Пунктир",
-            Self::Dotted => "Точки",
-            Self::Wavy => "Волнистая",
+            Self::Solid => t!("bubble_status.border_solid"),
+            Self::Dashed => t!("bubble_status.border_dashed"),
+            Self::Dotted => t!("bubble_status.border_dotted"),
+            Self::Wavy => t!("bubble_status.border_wavy"),
         }
     }
 }
@@ -99,9 +99,9 @@ pub enum BubbleStatusField {
 impl BubbleStatusField {
     pub fn label(self) -> &'static str {
         match self {
-            Self::TranslationFilled => "Перевод заполнен",
-            Self::OriginalFilled => "Оригинал заполнен",
-            Self::CharacterFilled => "Персонаж заполнен",
+            Self::TranslationFilled => t!("bubble_status.field_translation_filled"),
+            Self::OriginalFilled => t!("bubble_status.field_original_filled"),
+            Self::CharacterFilled => t!("bubble_status.field_character_filled"),
         }
     }
 }
@@ -119,18 +119,18 @@ pub enum BubbleStatusCondition {
 impl BubbleStatusCondition {
     pub fn summary(&self) -> String {
         match self {
-            Self::Empty => "Пусто".to_string(),
+            Self::Empty => t!("bubble_status.summary_empty").to_string(),
             Self::Field(field) => field.label().to_string(),
-            Self::All(items) => join_condition_summary(items, " И "),
-            Self::Any(items) => join_condition_summary(items, " ИЛИ "),
-            Self::Not(item) => format!("НЕ ({})", item.summary()),
+            Self::All(items) => join_condition_summary(items, t!("bubble_status.summary_and")),
+            Self::Any(items) => join_condition_summary(items, t!("bubble_status.summary_or")),
+            Self::Not(item) => tf!("bubble_status.summary_not", item = item.summary()),
         }
     }
 }
 
 fn join_condition_summary(items: &[BubbleStatusCondition], delimiter: &str) -> String {
     if items.is_empty() {
-        return "пусто".to_string();
+        return t!("bubble_status.summary_empty_list").to_string();
     }
     items
         .iter()

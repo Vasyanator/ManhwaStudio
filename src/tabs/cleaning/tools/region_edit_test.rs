@@ -30,7 +30,7 @@ impl Default for RegionPaintTestTool {
 impl RegionPaintTestTool {
     fn run(image: &egui::ColorImage, mask: &egui::ColorImage) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let mut out = image.clone();
         for (dst, m) in out.pixels.iter_mut().zip(mask.pixels.iter()) {
@@ -48,7 +48,7 @@ impl CleaningTool for RegionPaintTestTool {
     }
 
     fn title(&self) -> &'static str {
-        "Тест: mask inpaint"
+        t!("cleaning.tools.region_edit_test.title")
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -57,8 +57,8 @@ impl CleaningTool for RegionPaintTestTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Тестовый run: «Обработать» заполняет красным пиксели под маской.");
-        ui.small("Zoom в окне: Ctrl/Z + колесо, Ctrl/Z + ЛКМ drag, Ctrl/Z + -/=, Ctrl/Z + 0.");
+        ui.small(t!("cleaning.tools.region_edit_test.description_hint"));
+        ui.small(t!("cleaning.tools.region_edit_test.zoom_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -107,7 +107,7 @@ impl CleaningTool for RegionPaintTestTool {
             ctx,
             canvas,
             project,
-            "Тестовый mask-inpaint редактор",
+            t!("cleaning.tools.region_edit_test.overlay_title"),
             Self::run,
         );
     }

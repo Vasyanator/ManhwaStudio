@@ -32,8 +32,6 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-const MISSING_ENV_MESSAGE: &str = "не найдено Python-окружение (ожидается installer_files/venv, venv, installer_files/env или installer_files/python)";
-
 #[derive(Debug, Clone)]
 pub enum PythonEnvironment {
     VirtualEnv { root: PathBuf },
@@ -123,7 +121,7 @@ pub fn detect_python_environment(root_dir: &Path) -> Result<PythonEnvironment, S
         return Ok(PythonEnvironment::StandalonePython { executable });
     }
 
-    Err(MISSING_ENV_MESSAGE.to_string())
+    Err(t!("python_manager.env_not_found").to_string())
 }
 
 pub fn resolve_python_executable(root_dir: &Path) -> Result<PathBuf, String> {
@@ -144,10 +142,10 @@ pub fn resolve_python_executable_in_dir(python_dir: &Path) -> Result<PathBuf, St
     }
 
     let nested = std::fs::read_dir(python_dir)
-        .map_err(|err| format!("не удалось прочитать '{}': {err}", python_dir.display()))?;
+        .map_err(|err| tf!("python_manager.read_dir_error", python_dir = python_dir.display(), err = err))?;
     for entry_result in nested {
         let entry = entry_result
-            .map_err(|err| format!("ошибка чтения '{}': {err}", python_dir.display()))?;
+            .map_err(|err| tf!("python_manager.read_entry_error", python_dir = python_dir.display(), err = err))?;
         let candidate_root = entry.path();
         if !candidate_root.is_dir() {
             continue;
@@ -160,10 +158,7 @@ pub fn resolve_python_executable_in_dir(python_dir: &Path) -> Result<PathBuf, St
         }
     }
 
-    Err(format!(
-        "не удалось найти Python executable в '{}'",
-        python_dir.display()
-    ))
+    Err(tf!("python_manager.executable_not_found", python_dir = python_dir.display()))
 }
 
 pub fn build_python_command(root_dir: &Path) -> Result<Command, String> {
@@ -317,7 +312,7 @@ pub fn activation_commands(environment: &PythonEnvironment, shell: PythonShellKi
             vec![
                 shell_echo_command(
                     shell,
-                    &format!("Активируем virtual environment: {}", root.display()),
+                    &tf!("python_manager.activate_venv", root = root.display()),
                 ),
                 shell_set_path_command(shell, &scripts_dir),
                 shell_set_env_command(shell, "VIRTUAL_ENV", root),
@@ -325,7 +320,7 @@ pub fn activation_commands(environment: &PythonEnvironment, shell: PythonShellKi
         }
         PythonEnvironment::CondaEnv { root } => {
             let mut commands = vec![
-                shell_echo_command(shell, &format!("Активируем conda env: {}", root.display())),
+                shell_echo_command(shell, &tf!("python_manager.activate_conda", root = root.display())),
                 shell_set_path_command(shell, &conda_primary_bin(root)),
             ];
             if let Some(extra_path) = conda_secondary_bin(root) {
@@ -342,7 +337,7 @@ pub fn activation_commands(environment: &PythonEnvironment, shell: PythonShellKi
             vec![
                 shell_echo_command(
                     shell,
-                    &format!("Используем standalone Python: {}", executable.display()),
+                    &tf!("python_manager.use_standalone", executable = executable.display()),
                 ),
                 shell_set_path_command(shell, &executable_dir),
             ]

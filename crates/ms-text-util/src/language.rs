@@ -111,25 +111,32 @@ impl ScriptGroup {
         }
     }
 
-    /// Human-readable group name in Russian, for the group selector. Total:
-    /// every variant maps to a non-empty name.
+    /// Catalog key for this group's display name, for the group selector. The
+    /// binary resolves it via `ms_i18n::lookup(key).unwrap_or(key)`; this crate is
+    /// GUI-free and must not depend on the UI-string catalog, so it returns the key
+    /// rather than the localized text. Total: every variant maps to a non-empty,
+    /// unique key (see `docs/i18n_exclusions.md` §F).
     #[must_use]
-    pub fn display_name(self) -> &'static str {
+    pub fn name_key(self) -> &'static str {
         match self {
-            ScriptGroup::CyrillicSlavic => "Славянские (кириллица)",
-            ScriptGroup::LatinSlavic => "Славянские (латиница)",
-            ScriptGroup::Romance => "Романские",
-            ScriptGroup::English => "Английский",
+            ScriptGroup::CyrillicSlavic => "typesetting.script_group.cyrillic_slavic",
+            ScriptGroup::LatinSlavic => "typesetting.script_group.latin_slavic",
+            ScriptGroup::Romance => "typesetting.script_group.romance",
+            ScriptGroup::English => "typesetting.script_group.english",
         }
     }
 
-    /// Nominative Russian name of the writing system this group uses, for the
-    /// font-coverage tooltip ("кириллица" / "латиница"). Total; non-empty.
+    /// Catalog key for the nominative name of the writing system this group uses
+    /// ("кириллица" / "латиница"), for the font-coverage tooltip. Resolved by the
+    /// binary; see [`ScriptGroup::name_key`] for why a key is returned. Total; each
+    /// key is non-empty.
     #[must_use]
-    pub fn script_display_name(self) -> &'static str {
+    pub fn script_name_key(self) -> &'static str {
         match self {
-            ScriptGroup::CyrillicSlavic => "кириллица",
-            ScriptGroup::LatinSlavic | ScriptGroup::Romance | ScriptGroup::English => "латиница",
+            ScriptGroup::CyrillicSlavic => "typesetting.script.cyrillic",
+            ScriptGroup::LatinSlavic | ScriptGroup::Romance | ScriptGroup::English => {
+                "typesetting.script.latin"
+            }
         }
     }
 }
@@ -190,25 +197,27 @@ impl TextLanguage {
         ]
     }
 
-    /// Human-readable display name of this language, in Russian (the current UI
-    /// language). Used by the typesetting-language selector and the font-coverage
-    /// tooltip. Total: every variant maps to a non-empty name (exhaustive match).
+    /// Catalog key for this language's display name, used by the typesetting-language
+    /// selector and the font-coverage tooltip. The binary resolves it via
+    /// `ms_i18n::lookup(key).unwrap_or(key)`; this crate is GUI-free and returns the
+    /// key rather than localized text (see `docs/i18n_exclusions.md` §F). Total:
+    /// every variant maps to a non-empty, unique key (exhaustive match).
     #[must_use]
-    pub fn display_name(self) -> &'static str {
+    pub fn name_key(self) -> &'static str {
         match self {
-            TextLanguage::Ru => "Русский",
-            TextLanguage::Uk => "Украинский",
-            TextLanguage::Be => "Белорусский",
-            TextLanguage::Sr => "Сербский",
-            TextLanguage::Pl => "Польский",
-            TextLanguage::Cs => "Чешский",
-            TextLanguage::Sk => "Словацкий",
-            TextLanguage::Sl => "Словенский",
-            TextLanguage::Hr => "Хорватский",
-            TextLanguage::Es => "Испанский",
-            TextLanguage::Fr => "Французский",
-            TextLanguage::Pt => "Португальский",
-            TextLanguage::En => "Английский",
+            TextLanguage::Ru => "typesetting.language.ru",
+            TextLanguage::Uk => "typesetting.language.uk",
+            TextLanguage::Be => "typesetting.language.be",
+            TextLanguage::Sr => "typesetting.language.sr",
+            TextLanguage::Pl => "typesetting.language.pl",
+            TextLanguage::Cs => "typesetting.language.cs",
+            TextLanguage::Sk => "typesetting.language.sk",
+            TextLanguage::Sl => "typesetting.language.sl",
+            TextLanguage::Hr => "typesetting.language.hr",
+            TextLanguage::Es => "typesetting.language.es",
+            TextLanguage::Fr => "typesetting.language.fr",
+            TextLanguage::Pt => "typesetting.language.pt",
+            TextLanguage::En => "typesetting.language.en",
         }
     }
 
@@ -408,13 +417,27 @@ mod tests {
     }
 
     #[test]
-    fn display_name_tables_are_total() {
+    fn name_key_tables_are_total_and_unique() {
+        use std::collections::HashSet;
+
+        // Every language maps to a non-empty, UNIQUE catalog key (the binary resolves
+        // it; a duplicate key would collapse two languages onto one label).
+        let mut language_keys = HashSet::new();
         for language in TextLanguage::all() {
-            assert!(!language.display_name().is_empty());
+            let key = language.name_key();
+            assert!(!key.is_empty(), "empty key for {language:?}");
+            assert!(language_keys.insert(key), "duplicate language key {key:?}");
         }
+
+        // Every group's display-name key is non-empty and unique.
+        let mut group_keys = HashSet::new();
         for group in ScriptGroup::all() {
-            assert!(!group.display_name().is_empty());
-            assert!(!group.script_display_name().is_empty());
+            let key = group.name_key();
+            assert!(!key.is_empty(), "empty key for {group:?}");
+            assert!(group_keys.insert(key), "duplicate group key {key:?}");
+            // The writing-system key is deliberately many-to-one (Latin groups share
+            // one), so only its non-emptiness is a contract here.
+            assert!(!group.script_name_key().is_empty(), "empty script key for {group:?}");
         }
     }
 

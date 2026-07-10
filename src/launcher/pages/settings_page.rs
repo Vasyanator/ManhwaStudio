@@ -349,7 +349,7 @@ impl SettingsPageState {
                 ui.set_width(card_width);
                 ui.set_min_height(420.0);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Настройки").size(24.0).strong());
+                    ui.label(RichText::new(t!("launcher.settings.heading")).size(24.0).strong());
                     ui.add_space(18.0);
 
                     save_log_button_rect = Some(self.show_tab_bar(ui));
@@ -413,31 +413,31 @@ impl SettingsPageState {
     fn show_tab_bar(&mut self, ui: &mut Ui) -> egui::Rect {
         let mut save_log_rect = egui::Rect::NOTHING;
         ui.horizontal_wrapped(|ui| {
-            self.show_tab_button(ui, SettingsTab::General, "Общие настройки");
-            self.show_tab_button(ui, SettingsTab::SystemInfo, "Информация о системе");
-            self.show_tab_button(ui, SettingsTab::AiComputations, "ИИ вычисления");
-            self.show_tab_button(ui, SettingsTab::AiBackend, "ИИ бэкенд");
+            self.show_tab_button(ui, SettingsTab::General, t!("launcher.settings.tab_general"));
+            self.show_tab_button(ui, SettingsTab::SystemInfo, t!("launcher.settings.tab_system_info"));
+            self.show_tab_button(ui, SettingsTab::AiComputations, t!("launcher.settings.tab_ai_compute"));
+            self.show_tab_button(ui, SettingsTab::AiBackend, t!("launcher.settings.tab_ai_backend"));
             match self.ai_install_type {
                 config::AiInstallType::Base => self.show_tab_button_highlighted(
                     ui,
                     SettingsTab::TorchUpgrade,
-                    "Обновить до полной версии",
+                    t!("launcher.settings.upgrade_to_full_button"),
                 ),
                 config::AiInstallType::Full => self.show_tab_button(
                     ui,
                     SettingsTab::TorchUpgrade,
-                    "Установить другую версию PyTorch",
+                    t!("launcher.settings.install_other_pytorch_button"),
                 ),
                 config::AiInstallType::None => {}
             }
-            self.show_tab_button(ui, SettingsTab::PythonEnvironment, "Python окружение");
+            self.show_tab_button(ui, SettingsTab::PythonEnvironment, t!("launcher.settings.tab_python_env"));
             #[cfg(feature = "tutorial")]
-            self.show_tab_button(ui, SettingsTab::Tutorials, "Обучение");
+            self.show_tab_button(ui, SettingsTab::Tutorials, t!("launcher.settings.tab_tutorial"));
 
             let response = show_two_line_button(
                 ui,
-                "Сохранить лог",
-                "Скиньте разработчику если столкнулись с багом",
+                t!("launcher.settings.save_log_button"),
+                t!("launcher.settings.save_log_hint"),
                 egui::vec2(300.0, 40.0),
                 self.log_popup_open,
             );
@@ -545,8 +545,8 @@ impl SettingsPageState {
                         ui.vertical(|ui| {
                             if show_two_line_button(
                                 ui,
-                                "Текущий лог",
-                                "Если программа не закрывалась после проблемы",
+                                t!("launcher.settings.current_log_label"),
+                                t!("launcher.settings.current_log_hint"),
                                 egui::vec2(POPUP_WIDTH, POPUP_BUTTON_HEIGHT),
                                 false,
                             )
@@ -557,8 +557,8 @@ impl SettingsPageState {
                             ui.add_space(POPUP_GAP);
                             if show_two_line_button(
                                 ui,
-                                "Предыдущий лог",
-                                "Если программа закрывалась после проблемы",
+                                t!("launcher.settings.previous_log_label"),
+                                t!("launcher.settings.previous_log_hint"),
                                 egui::vec2(POPUP_WIDTH, POPUP_BUTTON_HEIGHT),
                                 false,
                             )
@@ -607,7 +607,7 @@ impl SettingsPageState {
 
         let Some(save_path) = FileDialog::new()
             .set_file_name(&default_name)
-            .add_filter("Файлы логов", &["log"])
+            .add_filter(t!("launcher.settings.log_files_filter"), &["log"])
             .save_file()
         else {
             return;
@@ -643,12 +643,12 @@ impl SettingsPageState {
 
         ui.horizontal(|ui| {
             ui.label(theme::status(
-                "Системная информация собирается в фоновом потоке.",
+                t!("launcher.settings.system_info_collecting"),
                 theme::TEXT_MUTED,
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let enabled = !matches!(self.system_info_probe.status, SystemInfoStatus::Running);
-                if theme::launcher_button(ui, "Обновить", Vec2::new(112.0, 34.0), enabled).clicked()
+                if theme::launcher_button(ui, t!("launcher.common.refresh_button"), Vec2::new(112.0, 34.0), enabled).clicked()
                 {
                     self.start_system_info_probe(ui);
                 }
@@ -702,7 +702,7 @@ impl SettingsPageState {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.system_info_probe.status = SystemInfoStatus::Error(
-                    "Фоновая проверка системной информации завершилась без ответа.".to_string(),
+                    t!("launcher.settings.system_info_no_response").to_string(),
                 );
                 ui.ctx().request_repaint();
             }
@@ -710,28 +710,28 @@ impl SettingsPageState {
     }
 
     fn show_system_info_placeholder(&self, ui: &mut Ui) {
-        self.show_info_card(ui, "CPU и память", |ui| {
-            self.show_info_row(ui, "Статус", "Проверяется...");
+        self.show_info_card(ui, t!("launcher.settings.cpu_memory_label"), |ui| {
+            self.show_info_row(ui, t!("launcher.settings.status_label"), t!("launcher.settings.checking_status"));
         });
         ui.add_space(10.0);
-        self.show_info_card(ui, "Видеоускорители (Apple / NVIDIA / AMD)", |ui| {
-            self.show_info_row(ui, "Статус", "Проверяется...");
+        self.show_info_card(ui, t!("launcher.settings.video_accelerators_label"), |ui| {
+            self.show_info_row(ui, t!("launcher.settings.status_label"), t!("launcher.settings.checking_status"));
         });
     }
 
     fn show_system_info_report(&self, ui: &mut Ui, report: &SystemInfoReport) {
-        self.show_info_card(ui, "CPU и память", |ui| {
+        self.show_info_card(ui, t!("launcher.settings.cpu_memory_label"), |ui| {
             self.show_info_row(ui, "CPU", &report.cpu.name);
             self.show_info_row(
                 ui,
-                "Ядра",
+                t!("launcher.settings.cores_label"),
                 &format_core_count(report.cpu.physical_cores, report.cpu.logical_cores),
             );
             self.show_info_row(ui, "RAM", &format_memory_total(report.memory.total_bytes));
         });
 
         ui.add_space(10.0);
-        self.show_info_card(ui, "Видеоускорители (Apple / NVIDIA / AMD)", |ui| {
+        self.show_info_card(ui, t!("launcher.settings.video_accelerators_label"), |ui| {
             if let Some(apple) = &report.gpu.apple_gpu {
                 self.show_info_row(ui, "Apple GPU (Metal)", apple);
                 ui.add_space(8.0);
@@ -740,9 +740,9 @@ impl SettingsPageState {
                 ui,
                 "NVIDIA",
                 if report.gpu.nvidia_detected {
-                    "обнаружена"
+                    t!("launcher.settings.detected_female")
                 } else {
-                    "не обнаружена"
+                    t!("launcher.settings.not_detected_female")
                 },
             );
             self.show_info_row(
@@ -752,7 +752,7 @@ impl SettingsPageState {
                     .gpu
                     .cuda_version
                     .map(|version| version.to_string())
-                    .unwrap_or_else(|| "не обнаружена".to_string()),
+                    .unwrap_or_else(|| t!("launcher.settings.not_detected_female").to_string()),
             );
             self.show_info_row(
                 ui,
@@ -761,12 +761,12 @@ impl SettingsPageState {
                     .gpu
                     .nvidia_compute_capability
                     .map(|version| version.to_string())
-                    .unwrap_or_else(|| "не определён".to_string()),
+                    .unwrap_or_else(|| t!("launcher.settings.not_determined_male").to_string()),
             );
             if let Some(architecture) = &report.gpu.nvidia_architecture {
                 self.show_info_row(
                     ui,
-                    "Архитектура NVIDIA",
+                    t!("launcher.settings.nvidia_arch_label"),
                     &format_gpu_architecture(architecture),
                 );
             }
@@ -776,9 +776,9 @@ impl SettingsPageState {
                 ui,
                 "AMD",
                 if report.gpu.amd_detected {
-                    "обнаружена"
+                    t!("launcher.settings.detected_female")
                 } else {
-                    "не обнаружена"
+                    t!("launcher.settings.not_detected_female")
                 },
             );
             self.show_info_row(
@@ -788,16 +788,16 @@ impl SettingsPageState {
                     .gpu
                     .rocm_version
                     .map(|version| version.to_string())
-                    .unwrap_or_else(|| "не обнаружен".to_string()),
+                    .unwrap_or_else(|| t!("launcher.settings.not_detected_masc").to_string()),
             );
             if let Some(installation) = &report.gpu.rocm_installation {
                 self.show_info_row(
                     ui,
-                    "ROCm в системе",
+                    t!("launcher.settings.rocm_in_system_label"),
                     if installation.present {
-                        "найден"
+                        t!("launcher.settings.found_masc")
                     } else {
-                        "не найден"
+                        t!("launcher.settings.not_found_masc")
                     },
                 );
             }
@@ -807,7 +807,7 @@ impl SettingsPageState {
             }
             self.show_info_row(
                 ui,
-                "AMD архитектуры",
+                t!("launcher.settings.amd_arch_label"),
                 &format_architecture_list(&report.gpu.amd_architectures),
             );
             self.show_info_row(
@@ -817,9 +817,9 @@ impl SettingsPageState {
             );
             if let Some(validation) = &report.gpu.rocm_validation {
                 let text = if validation.supported {
-                    format!("поддерживается: {}", validation.reason)
+                    tf!("launcher.settings.supported_status", validation = validation.reason)
                 } else {
-                    format!("не подтверждено: {}", validation.reason)
+                    tf!("launcher.settings.not_confirmed_status", validation = validation.reason)
                 };
                 self.show_info_row(ui, "ROCm 7.2", &text);
             }
@@ -868,12 +868,12 @@ impl SettingsPageState {
 
         ui.horizontal(|ui| {
             ui.label(theme::status(
-                "Проверка выполняется из найденного Python-окружения через прямой импорт модулей.",
+                t!("launcher.settings.ai_check_hint"),
                 theme::TEXT_MUTED,
             ));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let enabled = !matches!(self.ai_probe.status, AiProbeStatus::Running);
-                if theme::launcher_button(ui, "Обновить", Vec2::new(112.0, 34.0), enabled).clicked()
+                if theme::launcher_button(ui, t!("launcher.common.refresh_button"), Vec2::new(112.0, 34.0), enabled).clicked()
                 {
                     self.start_ai_probe(ui);
                 }
@@ -944,7 +944,7 @@ impl SettingsPageState {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.ai_probe.status = AiProbeStatus::Error(
-                    "Фоновая проверка ИИ окружения завершилась без ответа.".to_string(),
+                    t!("launcher.settings.ai_env_no_response").to_string(),
                 );
                 ui.ctx().request_repaint();
             }
@@ -968,7 +968,7 @@ impl SettingsPageState {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| match status {
                         AiPackageStatusView::Checking => {
-                            ui.label(theme::status("Проверяется...", theme::TEXT_MUTED));
+                            ui.label(theme::status(t!("launcher.settings.checking_status"), theme::TEXT_MUTED));
                         }
                         AiPackageStatusView::Torch(package)
                         | AiPackageStatusView::OnnxRuntime(package) => {
@@ -980,7 +980,7 @@ impl SettingsPageState {
                 match status {
                     AiPackageStatusView::Checking => {
                         ui.label(theme::status(
-                            "Скомпилировал с поддержкой: проверяется",
+                            t!("launcher.settings.compiled_support_checking"),
                             theme::TEXT_MUTED,
                         ));
                     }
@@ -996,7 +996,7 @@ impl SettingsPageState {
 
     fn show_ai_package_version(&self, ui: &mut Ui, package: &AiPackageProbe) {
         if package.installed {
-            let label = package.version.as_deref().unwrap_or("версия неизвестна");
+            let label = package.version.as_deref().unwrap_or(t!("launcher.settings.version_unknown"));
             let color = if package.import_error.is_some() {
                 STATUS_ERROR
             } else {
@@ -1007,18 +1007,18 @@ impl SettingsPageState {
                 response.on_hover_text(import_error);
             }
         } else {
-            ui.label(theme::status("Не установлен", STATUS_ERROR));
+            ui.label(theme::status(t!("launcher.settings.not_installed"), STATUS_ERROR));
         }
     }
 
     fn show_ai_package_support(&self, ui: &mut Ui, values: &[String]) {
         let support_text = if values.is_empty() {
-            "не определено".to_string()
+            t!("launcher.settings.not_determined_neuter").to_string()
         } else {
             values.join(", ")
         };
         ui.label(theme::status(
-            &format!("Скомпилировал с поддержкой: {support_text}"),
+            &tf!("launcher.settings.compiled_support_status", support_text = support_text),
             theme::TEXT_MUTED,
         ));
     }
@@ -1038,9 +1038,9 @@ impl SettingsPageState {
         let installing_full_dependencies = self.ai_install_type == config::AiInstallType::Base;
 
         let description = if installing_full_dependencies {
-            "Выберите PyTorch wheel. После PyTorch будут установлены полные torch-зависимости."
+            t!("launcher.settings.pytorch_choose_wheel_hint")
         } else {
-            "Выберите другую версию PyTorch. Полные зависимости повторно устанавливаться не будут."
+            t!("launcher.settings.pytorch_choose_other_hint")
         };
         ui.label(theme::status(description, theme::TEXT_MUTED));
         ui.add_space(12.0);
@@ -1049,7 +1049,7 @@ impl SettingsPageState {
             TorchUpgradeStatus::Idle => {
                 if theme::launcher_button(
                     ui,
-                    "Проверить доступные версии PyTorch",
+                    t!("launcher.settings.check_pytorch_versions_button"),
                     Vec2::new(300.0, 36.0),
                     true,
                 )
@@ -1062,7 +1062,7 @@ impl SettingsPageState {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(theme::status(
-                        "Проверяем GPU / CUDA / ROCm...",
+                        t!("launcher.settings.checking_gpu_status"),
                         theme::TEXT_MUTED,
                     ));
                 });
@@ -1072,17 +1072,14 @@ impl SettingsPageState {
                 ui.add_space(8.0);
                 if !prompt.options.is_empty() {
                     ui.label(theme::status(
-                        &format!(
-                            "Рекомендуется: {}",
-                            prompt.options[prompt.recommended_index].label
-                        ),
+                        &tf!("launcher.settings.recommended_label", prompt = prompt.options[prompt.recommended_index].label),
                         theme::TEXT_MUTED,
                     ));
                     ui.add_space(8.0);
                     let options = prompt.options.clone();
                     for (idx, option) in options.into_iter().enumerate() {
                         let title = if idx == prompt.recommended_index {
-                            format!("{} (Рекомендуется)", option.label)
+                            tf!("launcher.settings.option_recommended_marker", option = option.label)
                         } else {
                             option.label.clone()
                         };
@@ -1098,7 +1095,7 @@ impl SettingsPageState {
                         ui.add_space(6.0);
                     }
                 }
-                if theme::launcher_button(ui, "Оставить на CPU", Vec2::new(220.0, 34.0), true)
+                if theme::launcher_button(ui, t!("launcher.settings.keep_cpu_button"), Vec2::new(220.0, 34.0), true)
                     .clicked()
                 {
                     self.start_torch_upgrade_install(
@@ -1112,10 +1109,10 @@ impl SettingsPageState {
                 self.show_torch_upgrade_progress(ui);
             }
             TorchUpgradeStatus::Completed => {
-                ui.label(theme::status("Установка завершена.", theme::TEXT_MAIN));
+                ui.label(theme::status(t!("launcher.settings.install_complete"), theme::TEXT_MAIN));
                 self.show_torch_upgrade_progress(ui);
                 ui.add_space(8.0);
-                if theme::launcher_button(ui, "Выбрать другую версию", Vec2::new(230.0, 34.0), true)
+                if theme::launcher_button(ui, t!("launcher.settings.choose_other_version_button"), Vec2::new(230.0, 34.0), true)
                     .clicked()
                 {
                     self.start_torch_upgrade_preflight(ui);
@@ -1125,7 +1122,7 @@ impl SettingsPageState {
                 ui.label(theme::status(&message, STATUS_ERROR));
                 self.show_torch_upgrade_progress(ui);
                 ui.add_space(8.0);
-                if theme::launcher_button(ui, "Повторить", Vec2::new(140.0, 34.0), true).clicked()
+                if theme::launcher_button(ui, t!("launcher.settings.retry_button"), Vec2::new(140.0, 34.0), true).clicked()
                 {
                     self.start_torch_upgrade_preflight(ui);
                 }
@@ -1140,7 +1137,7 @@ impl SettingsPageState {
     #[cfg(target_arch = "wasm32")]
     fn show_torch_upgrade_tab(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
         ui.label(theme::status(
-            "Управление PyTorch недоступно в веб-версии.",
+            t!("launcher.settings.pytorch_web_unsupported"),
             theme::TEXT_MUTED,
         ));
         None
@@ -1149,7 +1146,7 @@ impl SettingsPageState {
     #[cfg(not(target_arch = "wasm32"))]
     fn show_torch_upgrade_progress(&self, ui: &mut Ui) {
         ui.label(theme::status(
-            &format!("Этап: {}", self.torch_upgrade.stage_label),
+            &tf!("launcher.settings.torch_stage_status", arg = self.torch_upgrade.stage_label),
             theme::TEXT_MUTED,
         ));
         ui.add(egui::ProgressBar::new(self.torch_upgrade.stage_progress).show_percentage());
@@ -1185,9 +1182,9 @@ impl SettingsPageState {
             rx: Some(rx),
             pending_ai_install_type_action: None,
             stage_progress: 0.0,
-            stage_label: "Проверка GPU / CUDA / ROCm".to_string(),
+            stage_label: t!("launcher.settings.stage_check_gpu").to_string(),
             overall_progress: 0.0,
-            overall_label: "Подготовка выбора PyTorch".to_string(),
+            overall_label: t!("launcher.settings.stage_prepare_pytorch_choice").to_string(),
             console_lines: Vec::new(),
         };
         let _ = thread::Builder::new()
@@ -1212,9 +1209,9 @@ impl SettingsPageState {
         self.torch_upgrade.rx = Some(rx);
         self.torch_upgrade.pending_ai_install_type_action = None;
         self.torch_upgrade.stage_progress = 0.0;
-        self.torch_upgrade.stage_label = "Запуск установки PyTorch".to_string();
+        self.torch_upgrade.stage_label = t!("launcher.settings.stage_start_pytorch_install").to_string();
         self.torch_upgrade.overall_progress = 0.0;
-        self.torch_upgrade.overall_label = "Установка запущена".to_string();
+        self.torch_upgrade.overall_label = t!("launcher.settings.stage_install_started").to_string();
         self.torch_upgrade.console_lines.clear();
 
         let _ = thread::Builder::new()
@@ -1288,9 +1285,7 @@ impl SettingsPageState {
                                     Some(config::AiInstallType::Full);
                             }
                             Err(err) => {
-                                self.torch_upgrade.status = TorchUpgradeStatus::Error(format!(
-                                    "Установка завершена, но не удалось сохранить Full: {err}"
-                                ));
+                                self.torch_upgrade.status = TorchUpgradeStatus::Error(tf!("launcher.settings.install_saved_full_error", err = err));
                                 continue;
                             }
                         }
@@ -1350,7 +1345,7 @@ impl SettingsPageState {
                 TextEdit::multiline(&mut self.python_console.input)
                     .desired_rows(CONSOLE_INPUT_ROWS)
                     .font(TextStyle::Monospace)
-                    .hint_text("Введите команду окружения"),
+                    .hint_text(t!("launcher.settings.console_command_placeholder")),
             );
             let submit_from_button =
                 theme::launcher_button(ui, "Enter", egui::vec2(100.0, 40.0), true).clicked();
@@ -1371,7 +1366,7 @@ impl SettingsPageState {
         });
         ui.add_space(6.0);
         ui.label(theme::footer(
-            "Enter отправляет команду. Ctrl+Enter оставляет перевод строки во вводе.",
+            t!("launcher.settings.console_enter_hint"),
         ));
     }
 
@@ -1379,7 +1374,7 @@ impl SettingsPageState {
     #[cfg(target_arch = "wasm32")]
     fn show_python_environment_tab(&mut self, ui: &mut Ui) {
         ui.label(theme::status(
-            "Консоль Python-окружения недоступна в веб-версии.",
+            t!("launcher.settings.console_web_unsupported"),
             theme::TEXT_MUTED,
         ));
     }
@@ -1393,7 +1388,7 @@ impl SettingsPageState {
         self.python_console.attempted_start = true;
         self.python_console
             .output
-            .push_str("Запуск shell и активация Python-окружения...\n");
+            .push_str(t!("launcher.settings.console_starting_status"));
 
         match PythonConsoleRuntime::spawn(config::program_dir()) {
             Ok(runtime) => {
@@ -1407,7 +1402,7 @@ impl SettingsPageState {
                 ));
                 self.python_console
                     .output
-                    .push_str(&format!("Не удалось запустить консоль: {err}\n"));
+                    .push_str(&tf!("launcher.settings.console_start_error", err = err));
             }
         }
     }
@@ -1435,7 +1430,7 @@ impl SettingsPageState {
                     runtime.terminated = true;
                     self.python_console
                         .output
-                        .push_str(&format!("\n[shell завершён: {}]\n", status));
+                        .push_str(&tf!("launcher.settings.shell_finished_status", status = status));
                     received_any = true;
                 }
                 Ok(None) => {}
@@ -1443,7 +1438,7 @@ impl SettingsPageState {
                     runtime.terminated = true;
                     self.python_console
                         .output
-                        .push_str(&format!("\n[не удалось получить статус shell: {err}]\n"));
+                        .push_str(&tf!("launcher.settings.shell_status_error", err = err));
                     runtime_log::log_error(format!(
                         "[launcher-settings] failed to poll python console process: {err}"
                     ));
@@ -1472,19 +1467,19 @@ impl SettingsPageState {
         let Some(runtime) = self.python_console.runtime.as_mut() else {
             self.python_console
                 .output
-                .push_str("[shell ещё не запущен]\n");
+                .push_str(t!("launcher.settings.shell_not_started"));
             return;
         };
         if runtime.terminated {
             self.python_console
                 .output
-                .push_str("[shell уже завершён]\n");
+                .push_str(t!("launcher.settings.shell_already_finished"));
             return;
         }
         if let Err(err) = runtime.send_command(command) {
             self.python_console
                 .output
-                .push_str(&format!("[ошибка отправки команды: {err}]\n"));
+                .push_str(&tf!("launcher.settings.shell_send_error", err = err));
             runtime_log::log_error(format!(
                 "[launcher-settings] failed to send python console command: {err}"
             ));
@@ -1572,16 +1567,16 @@ impl PythonConsoleRuntime {
 
         let mut child = command
             .spawn()
-            .map_err(|err| format!("не удалось запустить shell для Python-окружения: {err}"))?;
+            .map_err(|err| tf!("launcher.settings.shell_start_env_error", err = err))?;
         let stdin = child.stdin.take().ok_or_else(|| {
-            "shell запущен без stdin, интерактивная консоль недоступна".to_string()
+            t!("launcher.settings.shell_no_stdin").to_string()
         })?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "shell запущен без stdout, вывод консоли недоступен".to_string())?;
+            .ok_or_else(|| t!("launcher.settings.shell_no_stdout").to_string())?;
         let stderr = child.stderr.take().ok_or_else(|| {
-            "shell запущен без stderr, вывод ошибок консоли недоступен".to_string()
+            t!("launcher.settings.shell_no_stderr").to_string()
         })?;
 
         let (command_tx, command_rx) = mpsc::channel::<String>();
@@ -1626,9 +1621,7 @@ impl PythonConsoleRuntime {
                 runtime_log::log_warn(format!(
                     "[launcher-settings] python environment not found for console: {err}"
                 ));
-                self.send_command(shell_echo_command(&format!(
-                    "Python-окружение не найдено: {err}"
-                )))?;
+                self.send_command(shell_echo_command(&tf!("launcher.settings.python_env_not_found_error", err = err)))?;
             }
         }
         Ok(())
@@ -1637,7 +1630,7 @@ impl PythonConsoleRuntime {
     fn send_command(&self, command: String) -> Result<(), String> {
         self.command_tx
             .send(command)
-            .map_err(|err| format!("канал shell-команд закрыт: {err}"))
+            .map_err(|err| tf!("launcher.settings.shell_channel_closed_error", err = err))
     }
 
     fn terminate(&mut self) {
@@ -1710,7 +1703,7 @@ fn spawn_system_info_probe() -> Receiver<Result<SystemInfoReport, String>> {
 
     if let Err(err) = spawn_result {
         let (fallback_tx, fallback_rx) = mpsc::channel();
-        let message = format!("Не удалось запустить фоновую проверку системы: {err}");
+        let message = tf!("launcher.settings.start_system_check_error", err = err);
         if fallback_tx.send(Err(message)).is_err() {
             runtime_log::log_warn(
                 "[launcher-settings] failed to send system info probe spawn error to UI",
@@ -1736,7 +1729,7 @@ fn collect_cpu_info() -> CpuInfoReport {
         .map(usize::from)
         .unwrap_or(1);
     CpuInfoReport {
-        name: detect_cpu_name().unwrap_or_else(|| "CPU не определён".to_string()),
+        name: detect_cpu_name().unwrap_or_else(|| t!("launcher.settings.cpu_not_determined").to_string()),
         physical_cores: detect_physical_core_count(),
         logical_cores,
     }
@@ -1902,14 +1895,14 @@ fn detect_total_memory_bytes() -> Option<u64> {
 
 fn format_core_count(physical: Option<usize>, logical: usize) -> String {
     match physical {
-        Some(value) => format!("{value} физических / {logical} логических"),
-        None => format!("{logical} логических"),
+        Some(value) => tf!("launcher.settings.cores_phys_logical", value = value, logical = logical),
+        None => tf!("launcher.settings.cores_logical", logical = logical),
     }
 }
 
 fn format_memory_total(total_bytes: Option<u64>) -> String {
     let Some(bytes) = total_bytes else {
-        return "не определено".to_string();
+        return t!("launcher.settings.not_determined_neuter").to_string();
     };
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
@@ -1948,7 +1941,7 @@ fn format_gpu_architecture(architecture: &GpuArchitecture) -> String {
         parts.push(target.to_string());
     }
     if parts.is_empty() {
-        "не определена".to_string()
+        t!("launcher.settings.not_determined_fem").to_string()
     } else {
         parts.join(" / ")
     }
@@ -1956,7 +1949,7 @@ fn format_gpu_architecture(architecture: &GpuArchitecture) -> String {
 
 fn format_architecture_list(architectures: &[GpuArchitecture]) -> String {
     if architectures.is_empty() {
-        return "не определены".to_string();
+        return t!("launcher.settings.not_determined_plural").to_string();
     }
     architectures
         .iter()
@@ -1967,10 +1960,10 @@ fn format_architecture_list(architectures: &[GpuArchitecture]) -> String {
 
 fn format_directml_accelerators(accelerators: &[DirectMlAccelerator]) -> String {
     if !cfg!(target_os = "windows") {
-        return "доступно только на Windows".to_string();
+        return t!("launcher.settings.windows_only").to_string();
     }
     if accelerators.is_empty() {
-        return "совместимые ускорители не обнаружены".to_string();
+        return t!("launcher.settings.no_compatible_accelerators").to_string();
     }
     accelerators
         .iter()
@@ -1980,7 +1973,7 @@ fn format_directml_accelerators(accelerators: &[DirectMlAccelerator]) -> String 
 }
 
 fn bool_status(value: bool) -> &'static str {
-    if value { "да" } else { "нет" }
+    if value { t!("launcher.settings.yes") } else { t!("launcher.settings.no") }
 }
 
 #[cfg(target_os = "macos")]
@@ -2045,21 +2038,15 @@ fn spawn_console_writer_thread(
         let mut writer = BufWriter::new(stdin);
         for command in command_rx {
             if let Err(err) = writer.write_all(command.as_bytes()) {
-                let _ = event_tx.send(PythonConsoleEvent::Error(format!(
-                    "\n[ошибка записи в shell: {err}]\n"
-                )));
+                let _ = event_tx.send(PythonConsoleEvent::Error(tf!("launcher.settings.shell_write_error", err = err)));
                 return;
             }
             if let Err(err) = writer.write_all(shell_line_ending().as_bytes()) {
-                let _ = event_tx.send(PythonConsoleEvent::Error(format!(
-                    "\n[ошибка завершения строки shell: {err}]\n"
-                )));
+                let _ = event_tx.send(PythonConsoleEvent::Error(tf!("launcher.settings.shell_newline_error", err = err)));
                 return;
             }
             if let Err(err) = writer.flush() {
-                let _ = event_tx.send(PythonConsoleEvent::Error(format!(
-                    "\n[ошибка flush shell: {err}]\n"
-                )));
+                let _ = event_tx.send(PythonConsoleEvent::Error(tf!("launcher.settings.shell_flush_error", err = err)));
                 return;
             }
         }
@@ -2091,9 +2078,7 @@ fn spawn_console_reader_thread(
                     }
                 }
                 Err(err) => {
-                    let _ = event_tx.send(PythonConsoleEvent::Error(format!(
-                        "\n[ошибка чтения shell: {err}]\n"
-                    )));
+                    let _ = event_tx.send(PythonConsoleEvent::Error(tf!("launcher.settings.shell_read_error", err = err)));
                     return;
                 }
             }

@@ -158,7 +158,7 @@ pub(crate) fn detect_bubble_from_overlay_cache(
 ) -> Result<TypingAutoTypingDetectionResult, String> {
     let image = build_source_from_cache_model(model, page_idx)?;
     if image.width == 0 || image.height == 0 {
-        return Err("Страница из кэша имеет нулевой размер.".to_string());
+        return Err(t!("typing.auto_typing.cache_page_zero_size_error").to_string());
     }
 
     let click_x = uv_to_px_index(click_uv[0], image.width);
@@ -195,16 +195,16 @@ fn build_source_from_cache_model(
 ) -> Result<AnalysisImage, String> {
     let mut locked = model
         .lock()
-        .map_err(|_| "Не удалось получить доступ к кэшу clean overlay.".to_string())?;
+        .map_err(|_| t!("typing.errors.clean_overlay_cache_unavailable").to_string())?;
 
     let Some(page_rgba) = locked.cached_page_rgba(page_idx) else {
         return Err(
-            "Страница ещё не готова в кэше. Подождите загрузку и повторите авто-тайп.".to_string(),
+            t!("typing.auto_typing.page_not_ready_error").to_string(),
         );
     };
     let page_size = [page_rgba.width() as usize, page_rgba.height() as usize];
     if page_size[0] == 0 || page_size[1] == 0 {
-        return Err("Страница в кэше имеет нулевой размер.".to_string());
+        return Err(t!("typing.auto_typing.source_page_zero_size_error").to_string());
     }
 
     let mut out = page_rgba.as_raw().clone();
@@ -255,7 +255,7 @@ fn detect_bubble_from_click(
 ) -> DetectionResult {
     if click_x >= image.width || click_y >= image.height {
         return DetectionResult {
-            status: "Точка поиска вне изображения".to_string(),
+            status: t!("typing.auto_typing.search_point_outside_error").to_string(),
             accepted: false,
             center: None,
             bounds: None,
@@ -343,7 +343,7 @@ fn detect_bubble_from_click(
 
             if count > area_cap {
                 return DetectionResult {
-                    status: "Область слишком большая: похоже, это не пузырь".to_string(),
+                    status: t!("typing.auto_typing.region_too_large_error").to_string(),
                     accepted: false,
                     center: None,
                     bounds: None,
@@ -355,7 +355,7 @@ fn detect_bubble_from_click(
 
     if count < MIN_REGION_PIXELS {
         return DetectionResult {
-            status: format!("Слишком маленькая область ({count} px): не пузырь"),
+            status: tf!("typing.auto_typing.region_too_small_error", count = count),
             accepted: false,
             center: None,
             bounds: None,
@@ -420,7 +420,7 @@ fn detect_bubble_from_click(
     let bounds = Some(bounds_px);
     if !shape.accepted {
         return DetectionResult {
-            status: format!("Это не похоже на пузырь: {}", shape.reason),
+            status: tf!("typing.auto_typing.not_a_bubble_error", shape = shape.reason),
             accepted: false,
             center: None,
             bounds,
@@ -441,9 +441,13 @@ fn detect_bubble_from_click(
     });
     let (center_x, center_y) = center.unwrap_or((0.0, 0.0));
     DetectionResult {
-        status: format!(
-            "Центр найден ({:.1}, {:.1}), форма: {}",
-            center_x, center_y, shape.class_label
+        // Manual `tf!`: the tool cannot express the `{:.1}` numeric precision, so the
+        // formatted coordinates are pre-rendered and passed as plain string arguments.
+        status: tf!(
+            "typing.auto_typing.center_found_status",
+            x = format!("{center_x:.1}"),
+            y = format!("{center_y:.1}"),
+            shape = shape.class_label
         ),
         accepted: true,
         center: Some((center_x, center_y)),
@@ -665,7 +669,7 @@ fn evaluate_bubble_shape(
         return ShapeEvaluation {
             accepted: false,
             class_label: "",
-            reason: "граница слишком короткая".to_string(),
+            reason: t!("typing.auto_typing.shape_reason_border_too_short").to_string(),
         };
     }
 
@@ -677,7 +681,7 @@ fn evaluate_bubble_shape(
         return ShapeEvaluation {
             accepted: false,
             class_label: "",
-            reason: "пустой bbox".to_string(),
+            reason: t!("typing.auto_typing.shape_reason_empty_bbox").to_string(),
         };
     }
 
@@ -716,24 +720,38 @@ fn evaluate_bubble_shape(
     let hull_area = polygon_area(&hull).max(1.0);
     let solidity = area / hull_area;
 
+    // These reasons are joined into the user-facing "not a bubble" message, so they are
+    // localized. Manual `tf!`: the tool cannot express the `{:.2}` numeric precision, so
+    // each metric is pre-rendered and passed as a plain string argument.
     let mut reasons = Vec::new();
     if fill_ratio < MIN_FILL_RATIO {
-        reasons.push(format!("низкая заполненность bbox ({fill_ratio:.2})"));
+        reasons.push(tf!(
+            "typing.auto_typing.reason_low_fill",
+            value = format!("{fill_ratio:.2}")
+        ));
     }
     if solidity < MIN_SOLIDITY {
-        reasons.push(format!(
-            "сильные впадины/невыпуклость (solidity {solidity:.2})"
+        reasons.push(tf!(
+            "typing.auto_typing.reason_low_solidity",
+            value = format!("{solidity:.2}")
         ));
     }
     if shape_factor > MAX_SHAPE_FACTOR {
-        reasons.push(format!("слишком рваная граница (shape {shape_factor:.2})"));
+        reasons.push(tf!(
+            "typing.auto_typing.reason_ragged_border",
+            value = format!("{shape_factor:.2}")
+        ));
     }
     if radial_cv > MAX_RADIAL_CV {
-        reasons.push(format!("большой разброс радиусов (cv {radial_cv:.2})"));
+        reasons.push(tf!(
+            "typing.auto_typing.reason_radius_spread",
+            value = format!("{radial_cv:.2}")
+        ));
     }
     if min_mean_ratio < MIN_RADIAL_MIN_MEAN_RATIO {
-        reasons.push(format!(
-            "глубокие впадины контура (min/mean {min_mean_ratio:.2})"
+        reasons.push(tf!(
+            "typing.auto_typing.reason_deep_dents",
+            value = format!("{min_mean_ratio:.2}")
         ));
     }
 
@@ -746,11 +764,11 @@ fn evaluate_bubble_shape(
     }
 
     let class_label = if shape_factor < 1.45 {
-        "круглый/овальный"
+        t!("typing.auto_typing.shape_reason_round")
     } else if fill_ratio > 0.78 && radial_cv > 0.20 && shape_factor < 2.6 {
-        "квадратный/прямоугольный"
+        t!("typing.auto_typing.shape_reason_rectangular")
     } else {
-        "угловатый"
+        t!("typing.auto_typing.shape_reason_angular")
     };
 
     ShapeEvaluation {

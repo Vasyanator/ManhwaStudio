@@ -41,8 +41,19 @@ startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
   `executor.rs` or reused worker-safe helpers.
 - `GraphSnapshot` is the boundary between UI state and execution. The executor must not borrow or
   mutate the live `GraphModel`.
-- Graph JSON remains version `1` and compatible with the Python format. Socket names are persisted
-  user-facing strings, so renaming them requires a migration or explicit compatibility handling.
+- Graph JSON remains version `1` and compatible with the Python format. Socket `name` fields
+  (`"Вход"`, `"Далее"`, `"Индекс"`, `"Строка"`, `"Картинки"`, `"Путь"`, `"Значение"`) are graph JSON
+  keys resolved by name (`socket_spec`), so they are **wire identifiers, not UI labels**: they must
+  stay raw Russian literals and must never be routed through the i18n `t!`/`tf!` catalog (see
+  `docs/i18n_exclusions.md` §A2). Renaming them requires a migration or explicit compatibility
+  handling. The painted label is a **separate** field: `SocketSpec.label_key: Option<&'static str>`
+  (a `launcher.batch.socket.*` catalog key), resolved by `SocketSpec::display_label()` and painted in
+  `canvas.rs`. Fixed template sockets carry a key and are localized; genuinely user-authored sockets
+  (`string_template` placeholders) have `label_key: None` and paint their raw `name`. `SocketSpec.name`
+  is a `Cow<'static, str>` so dynamic sockets own their name instead of leaking a `&'static str` on the
+  per-frame draw path. By contrast node titles/descriptions and palette-group names (`types.rs`,
+  `node_defs.rs`) are display-only — node identity is the English `template_key()` — and connection/load
+  error messages (`graph.rs`) are localized message values; both go through `t!`/`tf!`.
 - Connections must be validated through `GraphModel::add_edge`; direction, exec/data kind, data
   type, and single-input fan-in rules must not be bypassed.
 - `NodeParams` is the typed source of truth for node behavior. Do not infer a node's capabilities

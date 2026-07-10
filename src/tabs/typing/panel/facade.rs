@@ -214,9 +214,9 @@ impl TypingTopPanelState {
                     ui.horizontal(|ui| {
                         let toggle_icon = if self.collapsed { "▶" } else { "▼" };
                         let toggle_hint = if self.collapsed {
-                            "Развернуть панель текста"
+                            t!("typing.panel.expand_text_panel_tooltip")
                         } else {
-                            "Свернуть панель текста"
+                            t!("typing.panel.collapse_text_panel_tooltip")
                         };
                         if ui
                             .small_button(toggle_icon)
@@ -261,9 +261,9 @@ impl TypingTopPanelState {
                                             ui.add_space(6.0);
                                         }
                                         let params_title = if image_edit_only {
-                                            "Параметры картинки"
+                                            t!("typing.panel.image_params_heading")
                                         } else {
-                                            "Основные параметры текста"
+                                            t!("typing.panel.main_text_params_heading")
                                         };
                                         ui.label(egui::RichText::new(params_title).strong());
                                         ui.scope(|ui| {
@@ -424,9 +424,9 @@ impl TypingTopPanelState {
                             "▼"
                         };
                         let toggle_hint = if self.vertical_actions_panel.collapsed {
-                            "Развернуть панель"
+                            t!("typing.panel.expand_panel_tooltip")
                         } else {
-                            "Свернуть панель"
+                            t!("typing.panel.collapse_panel_tooltip")
                         };
                         if ui
                             .small_button(toggle_icon)
@@ -527,19 +527,13 @@ impl TypingTopPanelState {
             .create_panel
             .build_render_params_for(text.clone(), width_px.max(1))
             .ok_or_else(|| {
-                format!(
-                    "Шрифты не найдены в {}",
-                    self.create_panel.fonts_dir.display()
-                )
+                tf!("typing.errors.fonts_not_found", arg = self.create_panel.fonts_dir.display())
             })?;
         let render_data_json = self
             .create_panel
             .build_render_data_json_for(text, width_px.max(1))
             .ok_or_else(|| {
-                format!(
-                    "Шрифты не найдены в {}",
-                    self.create_panel.fonts_dir.display()
-                )
+                tf!("typing.errors.fonts_not_found", arg = self.create_panel.fonts_dir.display())
             })?;
         Ok((render_params, render_data_json))
     }
@@ -793,9 +787,9 @@ impl TypingTopPanelState {
                             "▼"
                         };
                         let toggle_hint = if self.create_preview_panel.collapsed {
-                            "Развернуть превью текста"
+                            t!("typing.preview.expand_tooltip")
                         } else {
-                            "Свернуть превью текста"
+                            t!("typing.preview.collapse_tooltip")
                         };
                         if ui
                             .small_button(toggle_icon)
@@ -805,7 +799,7 @@ impl TypingTopPanelState {
                             self.create_preview_panel.collapsed =
                                 !self.create_preview_panel.collapsed;
                         }
-                        ui.label("Превью текста");
+                        ui.label(t!("typing.preview.panel_heading"));
                     });
                     if self.create_preview_panel.collapsed {
                         return;
@@ -822,9 +816,9 @@ impl TypingTopPanelState {
     pub(super) fn draw_auto_typing_controls(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         let toggle_label = if self.auto_typing_panel_open {
-            "Закрыть Авто-тайп"
+            t!("typing.autotype.close_tooltip")
         } else {
-            "Открыть Авто-тайп"
+            t!("typing.autotype.open_tooltip")
         };
         if ui.button(toggle_label).clicked() {
             self.auto_typing_panel_open = !self.auto_typing_panel_open;
@@ -836,15 +830,15 @@ impl TypingTopPanelState {
 
         ui.add_space(4.0);
         ui.group(|ui| {
-            ui.label(egui::RichText::new("Авто-тайп").strong());
-            ui.label("Hotkey: C (для выделенного текстового оверлея)");
-            ui.checkbox(&mut self.auto_typing_debug_visuals, "Показывать отладку");
+            ui.label(egui::RichText::new(t!("typing.autotype.heading")).strong());
+            ui.label(t!("typing.autotype.hotkey_hint"));
+            ui.checkbox(&mut self.auto_typing_debug_visuals, t!("typing.autotype.show_debug"));
             ui.add(
                 WheelSlider::new(
                     &mut self.auto_typing_extra_downward_shift_percent,
                     -25.0..=50.0,
                 )
-                .text("Доп. смещение вниз (%)"),
+                .text(t!("typing.autotype.extra_down_offset_label")),
             );
         });
     }

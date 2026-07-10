@@ -63,12 +63,9 @@ fn read_exact_or_eof(r: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()
     while filled < buf.len() {
         let n = r
             .read(&mut buf[filled..])
-            .map_err(|err| format!("Не удалось прочитать {what} кадра backend: {err}"))?;
+            .map_err(|err| tf!("backend_ipc.frame.read_error", what = what, err = err))?;
         if n == 0 {
-            return Err(format!(
-                "AI backend закрыл соединение посреди кадра ({what}, прочитано {filled} из {} байт).",
-                buf.len()
-            ));
+            return Err(tf!("backend_ipc.frame.closed_mid_frame", what = what, filled = filled, buf = buf.len()));
         }
         filled += n;
     }
@@ -92,29 +89,25 @@ fn read_len_be(r: &mut impl Read, what: &str) -> Result<u32, String> {
 /// Returns a human-readable error string on read failure, truncated frame, a
 /// size-guard violation, invalid UTF-8, non-object/invalid JSON header.
 pub fn read_frame(r: &mut impl Read) -> Result<Frame, String> {
-    let header_len = read_len_be(r, "длину заголовка")? as usize;
+    let header_len = read_len_be(r, t!("backend_ipc.frame.what_header_len"))? as usize;
     if header_len > MAX_HEADER_BYTES {
-        return Err(format!(
-            "Заголовок кадра backend превышает лимит: {header_len} > {MAX_HEADER_BYTES} байт."
-        ));
+        return Err(tf!("backend_ipc.frame.header_over_limit_read", header_len = header_len, max_header_bytes = MAX_HEADER_BYTES));
     }
     if header_len == 0 {
-        return Err("Кадр backend с пустым заголовком (header_len == 0).".to_string());
+        return Err(t!("backend_ipc.frame.empty_header").to_string());
     }
 
     let mut header_bytes = vec![0_u8; header_len];
-    read_exact_or_eof(r, &mut header_bytes, "заголовок")?;
+    read_exact_or_eof(r, &mut header_bytes, t!("backend_ipc.frame.what_header"))?;
     let header: Value = serde_json::from_slice(&header_bytes)
-        .map_err(|err| format!("Не удалось разобрать JSON-заголовок кадра backend: {err}"))?;
+        .map_err(|err| tf!("backend_ipc.frame.header_json_parse_error", err = err))?;
     if !header.is_object() {
-        return Err("JSON-заголовок кадра backend должен быть объектом.".to_string());
+        return Err(t!("backend_ipc.frame.header_not_object").to_string());
     }
 
-    let blob_len = read_len_be(r, "длину blob")? as usize;
+    let blob_len = read_len_be(r, t!("backend_ipc.frame.what_blob_len"))? as usize;
     if blob_len > MAX_BLOB_BYTES {
-        return Err(format!(
-            "Blob кадра backend превышает лимит: {blob_len} > {MAX_BLOB_BYTES} байт."
-        ));
+        return Err(tf!("backend_ipc.frame.blob_over_limit_read", blob_len = blob_len, max_blob_bytes = MAX_BLOB_BYTES));
     }
 
     let mut blob = vec![0_u8; blob_len];
@@ -144,18 +137,12 @@ pub fn write_frame(w: &mut impl Write, header: &Value, blob: &[u8]) -> Result<()
         "frame header must be a JSON object, got: {header}"
     );
     let header_bytes = serde_json::to_vec(header)
-        .map_err(|err| format!("Не удалось сериализовать заголовок кадра backend: {err}"))?;
+        .map_err(|err| tf!("backend_ipc.frame.header_serialize_error", err = err))?;
     if header_bytes.len() > MAX_HEADER_BYTES {
-        return Err(format!(
-            "Заголовок кадра backend превышает лимит: {} > {MAX_HEADER_BYTES} байт.",
-            header_bytes.len()
-        ));
+        return Err(tf!("backend_ipc.frame.header_over_limit_write", header_bytes = header_bytes.len(), max_header_bytes = MAX_HEADER_BYTES));
     }
     if blob.len() > MAX_BLOB_BYTES {
-        return Err(format!(
-            "Blob кадра backend превышает лимит: {} > {MAX_BLOB_BYTES} байт.",
-            blob.len()
-        ));
+        return Err(tf!("backend_ipc.frame.blob_over_limit_write", blob = blob.len(), max_blob_bytes = MAX_BLOB_BYTES));
     }
 
     let header_len = header_bytes.len() as u32;
@@ -167,9 +154,9 @@ pub fn write_frame(w: &mut impl Write, header: &Value, blob: &[u8]) -> Result<()
     out.extend_from_slice(blob);
 
     w.write_all(&out)
-        .map_err(|err| format!("Не удалось записать кадр backend: {err}"))?;
+        .map_err(|err| tf!("backend_ipc.frame.write_error", err = err))?;
     w.flush()
-        .map_err(|err| format!("Не удалось сбросить кадр backend в сокет: {err}"))
+        .map_err(|err| tf!("backend_ipc.frame.flush_error", err = err))
 }
 
 #[cfg(test)]
@@ -213,7 +200,15 @@ mod tests {
         buf.extend_from_slice(&bogus_len.to_be_bytes());
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).expect_err("oversized header must be rejected");
-        assert!(err.contains("превышает лимит"), "unexpected error: {err}");
+        // Pin the exact catalog key + rendered value (not a substring marker).
+        assert_eq!(
+            err,
+            tf!(
+                "backend_ipc.frame.header_over_limit_read",
+                header_len = MAX_HEADER_BYTES + 1,
+                max_header_bytes = MAX_HEADER_BYTES
+            ),
+        );
     }
 
     #[test]
@@ -228,7 +223,14 @@ mod tests {
         buf.extend_from_slice(&bogus_blob_len.to_be_bytes());
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).expect_err("oversized blob must be rejected");
-        assert!(err.contains("превышает лимит"), "unexpected error: {err}");
+        assert_eq!(
+            err,
+            tf!(
+                "backend_ipc.frame.blob_over_limit_read",
+                blob_len = MAX_BLOB_BYTES + 1,
+                max_blob_bytes = MAX_BLOB_BYTES
+            ),
+        );
     }
 
     #[test]
@@ -242,7 +244,7 @@ mod tests {
         buf.extend_from_slice(&0_u32.to_be_bytes()); // blob_len = 0
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).expect_err("array header must be rejected");
-        assert!(err.contains("объектом"), "unexpected error: {err}");
+        assert_eq!(err, t!("backend_ipc.frame.header_not_object"));
     }
 
     #[test]
@@ -283,6 +285,16 @@ mod tests {
         buf.truncate(buf.len() - 1); // drop last byte of the blob_len prefix
         let mut cursor = Cursor::new(buf);
         let err = read_frame(&mut cursor).expect_err("truncated frame must error");
-        assert!(err.contains("посреди кадра"), "unexpected error: {err}");
+        // The blob-length prefix (4 bytes) is truncated to 3, so the reader fills 3
+        // of 4 bytes before EOF while reading the blob-length field.
+        assert_eq!(
+            err,
+            tf!(
+                "backend_ipc.frame.closed_mid_frame",
+                what = t!("backend_ipc.frame.what_blob_len"),
+                filled = 3,
+                buf = 4
+            ),
+        );
     }
 }

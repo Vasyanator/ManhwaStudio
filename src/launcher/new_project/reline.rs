@@ -25,7 +25,7 @@ separately; failures are surfaced as backend connectivity errors.
 
 use crate::backend_ipc::{self, CallError};
 use crate::launcher::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
-use crate::tabs::translation::backend_health::{AI_BACKEND_OFFLINE_ERROR, check_ai_backend_health};
+use crate::tabs::translation::backend_health::{ai_backend_offline_error, check_ai_backend_health};
 use image::{ImageFormat, RgbaImage};
 use ms_thread as thread;
 use serde::Serialize;
@@ -321,7 +321,7 @@ fn spawn_reline_model_catalog_worker() -> Receiver<RelineModelCatalogWorkerEvent
             ));
             if tx
                 .send(RelineModelCatalogWorkerEvent::Finished(Err(RelineError {
-                    user_message: "Не удалось загрузить список моделей Reline.".to_string(),
+                    user_message: t!("launcher.new_project.reline.load_models_error").to_string(),
                     log_message: format!("failed to spawn Reline model catalog worker: {err}"),
                 })))
                 .is_err()
@@ -337,7 +337,7 @@ fn spawn_reline_model_catalog_worker() -> Receiver<RelineModelCatalogWorkerEvent
 
 fn fetch_reline_model_catalog() -> Result<Vec<RelineModelCatalogEntry>, RelineError> {
     let client = backend_ipc::shared_client().map_err(|err| RelineError {
-        user_message: AI_BACKEND_OFFLINE_ERROR.to_string(),
+        user_message: ai_backend_offline_error().to_string(),
         log_message: format!("Reline model catalog backend offline: {err}"),
     })?;
     let (header, _blob) = client
@@ -348,7 +348,7 @@ fn fetch_reline_model_catalog() -> Result<Vec<RelineModelCatalogEntry>, RelineEr
             RELINE_MODELS_CALL_TIMEOUT,
         )
         .map_err(|err| {
-            map_reline_call_error(err, RELINE_MODELS_ENDPOINT, "список моделей Reline")
+            map_reline_call_error(err, RELINE_MODELS_ENDPOINT, t!("launcher.new_project.reline.models_list_label"))
         })?;
 
     let models = parse_reline_models(&header);
@@ -401,15 +401,15 @@ fn parse_reline_models(header: &Value) -> Vec<RelineModelCatalogEntry> {
 fn map_reline_call_error(err: CallError, endpoint: &str, what: &str) -> RelineError {
     match err {
         CallError::Error(msg) => RelineError {
-            user_message: format!("Reline backend вернул ошибку: {msg}"),
+            user_message: tf!("launcher.new_project.reline.backend_error", msg = msg),
             log_message: format!("Reline endpoint '{endpoint}' returned error: {msg}"),
         },
         CallError::Interrupted(msg) => RelineError {
-            user_message: format!("Запрос Reline ({what}) был прерван."),
+            user_message: tf!("launcher.new_project.reline.request_aborted", what = what),
             log_message: format!("Reline endpoint '{endpoint}' interrupted: {msg}"),
         },
         CallError::Transport(msg) => RelineError {
-            user_message: AI_BACKEND_OFFLINE_ERROR.to_string(),
+            user_message: ai_backend_offline_error().to_string(),
             log_message: format!("Reline endpoint '{endpoint}' transport error: {msg}"),
         },
     }
@@ -436,7 +436,7 @@ fn spawn_reline_worker(
             ));
             if tx
                 .send(RelineWorkerEvent::Finished(Err(RelineError {
-                    user_message: "Не удалось запустить Reline.".to_string(),
+                    user_message: t!("launcher.new_project.reline.start_error").to_string(),
                     log_message: format!("failed to spawn Reline worker: {err}"),
                 })))
                 .is_err()
@@ -455,13 +455,13 @@ fn run_reline(
 ) -> Result<RelineSuccess, RelineError> {
     if images.is_empty() {
         return Err(RelineError {
-            user_message: "Сначала откройте или скачайте изображения.".to_string(),
+            user_message: t!("launcher.new_project.open_or_download_first_error").to_string(),
             log_message: "Reline started without input images".to_string(),
         });
     }
 
     check_ai_backend_health().map_err(|err| RelineError {
-        user_message: "ИИ бэкенд недоступен. Запустите его отдельно и повторите Reline."
+        user_message: t!("launcher.new_project.reline.backend_unavailable_error")
             .to_string(),
         log_message: format!("Reline backend health check failed: {err}"),
     })?;
@@ -486,7 +486,7 @@ fn run_reline(
             process_one_image(&input_path, &output_path, &options)?;
             let output_image = image::open(&output_path)
                 .map_err(|err| RelineError {
-                    user_message: "Reline вернул повреждённое изображение.".to_string(),
+                    user_message: t!("launcher.new_project.reline.corrupt_image_error").to_string(),
                     log_message: format!(
                         "failed to decode Reline output '{}': {err}",
                         output_path.display()
@@ -524,7 +524,7 @@ fn process_one_image(
 ) -> Result<(), RelineError> {
     let header_fields = reline_process_header(input_path, output_path, options);
     let client = backend_ipc::shared_client().map_err(|err| RelineError {
-        user_message: AI_BACKEND_OFFLINE_ERROR.to_string(),
+        user_message: ai_backend_offline_error().to_string(),
         log_message: format!("Reline backend offline: {err}"),
     })?;
     // `reline.process` returns the backend service result dict verbatim in the
@@ -537,10 +537,10 @@ fn process_one_image(
             &[],
             RELINE_PROCESS_CALL_TIMEOUT,
         )
-        .map_err(|err| map_reline_call_error(err, RELINE_ENDPOINT, "обработка изображения"))?;
+        .map_err(|err| map_reline_call_error(err, RELINE_ENDPOINT, t!("launcher.new_project.reline.processing_image_label")))?;
     if !output_path.is_file() {
         return Err(RelineError {
-            user_message: "Reline не создал выходное изображение.".to_string(),
+            user_message: t!("launcher.new_project.reline.no_output_image_error").to_string(),
             log_message: format!(
                 "Reline response ok but output path is missing: '{}'",
                 output_path.display()
@@ -566,11 +566,11 @@ fn save_rgba_png(path: &Path, image: &RgbaImage) -> Result<(), RelineError> {
     image::DynamicImage::ImageRgba8(image.clone())
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
         .map_err(|err| RelineError {
-            user_message: "Не удалось подготовить PNG для Reline.".to_string(),
+            user_message: t!("launcher.new_project.reline.prepare_png_error").to_string(),
             log_message: format!("failed to encode Reline input PNG: {err}"),
         })?;
     fs::write(path, bytes).map_err(|err| RelineError {
-        user_message: "Не удалось записать временный файл для Reline.".to_string(),
+        user_message: t!("launcher.new_project.reline.write_temp_error").to_string(),
         log_message: format!("failed to write Reline input '{}': {err}", path.display()),
     })
 }
@@ -586,7 +586,7 @@ fn create_work_dir() -> Result<PathBuf, RelineError> {
         millis
     ));
     fs::create_dir_all(&path).map_err(|err| RelineError {
-        user_message: "Не удалось подготовить временную папку для Reline.".to_string(),
+        user_message: t!("launcher.new_project.reline.prepare_temp_dir_error").to_string(),
         log_message: format!(
             "failed to create Reline temp dir '{}': {err}",
             path.display()
@@ -757,20 +757,26 @@ mod tests {
     fn map_reline_call_error_maps_each_variant() {
         let err =
             map_reline_call_error(CallError::Error("boom".to_string()), "/reline/process", "x");
-        assert!(err.user_message.contains("boom"));
+        assert_eq!(
+            err.user_message,
+            tf!("launcher.new_project.reline.backend_error", msg = "boom"),
+        );
 
         let err = map_reline_call_error(
             CallError::Interrupted("c".to_string()),
             "/reline/process",
             "x",
         );
-        assert!(err.user_message.contains("прерван"));
+        assert_eq!(
+            err.user_message,
+            tf!("launcher.new_project.reline.request_aborted", what = "x"),
+        );
 
         let err = map_reline_call_error(
             CallError::Transport("dead".to_string()),
             "/reline/process",
             "x",
         );
-        assert_eq!(err.user_message, AI_BACKEND_OFFLINE_ERROR);
+        assert_eq!(err.user_message, ai_backend_offline_error());
     }
 }

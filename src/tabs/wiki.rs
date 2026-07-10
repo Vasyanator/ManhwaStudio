@@ -167,7 +167,7 @@ impl WikiTabState {
             image_rx,
             image_tx,
             image_cache: HashMap::new(),
-            status: "Инициализация вкладки вики...".to_owned(),
+            status: t!("wiki.initializing").to_owned(),
         };
         state.refresh_files();
         state
@@ -177,10 +177,10 @@ impl WikiTabState {
         self.poll_background(ui.ctx());
 
         ui.horizontal(|ui| {
-            if ui.button("Обновить список").clicked() {
+            if ui.button(t!("wiki.refresh_list_button")).clicked() {
                 self.refresh_files();
             }
-            ui.label(format!("Папка: {}", self.wiki_dir.display()));
+            ui.label(tf!("wiki.folder_path", path = self.wiki_dir.display()));
         });
         ui.label(&self.status);
         ui.separator();
@@ -205,7 +205,7 @@ impl WikiTabState {
                 });
             });
         if self.files.is_empty() {
-            ui.label("В папке wiki нет .md файлов.");
+            ui.label(t!("wiki.no_files"));
         }
         if let Some(idx) = clicked_idx {
             self.selected_idx = Some(idx);
@@ -216,9 +216,9 @@ impl WikiTabState {
     fn draw_document(&mut self, ui: &mut egui::Ui) {
         let Some(doc) = self.doc.as_ref() else {
             if self.files.is_empty() {
-                ui.label("Добавьте .md файлы в папку wiki.");
+                ui.label(t!("wiki.add_files_hint"));
             } else {
-                ui.label("Выберите Markdown-файл во вкладках выше.");
+                ui.label(t!("wiki.select_file_hint"));
             }
             return;
         };
@@ -226,7 +226,11 @@ impl WikiTabState {
         let chars_count = doc.markdown.chars().count();
         let blocks = doc.blocks.clone();
 
-        ui.small(format!("{path_label} ({chars_count} символов)"));
+        // Russian needs the correct plural form of "символ" for the count, so the
+        // count noun is a `tp!` plural entry (`wiki.chars`) rather than being baked
+        // into the frame; the frame only positions the path and the pluralized count.
+        let chars = tp!("wiki.chars", chars_count);
+        ui.small(tf!("wiki.document_char_count", path_label = path_label, chars = chars));
         ui.separator();
 
         egui::ScrollArea::vertical()
@@ -370,19 +374,19 @@ impl WikiTabState {
                     WikiRowItem::Pending(source) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!("Загрузка изображения: {source}"));
+                            ui.label(tf!("wiki.image_loading", source = source));
                         });
                     }
                     WikiRowItem::Error { source, error } => {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            format!("Не удалось загрузить изображение {source}: {error}"),
+                            tf!("wiki.image_load_error", source = source, error = error),
                         );
                     }
                     WikiRowItem::Missing(source) => {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            format!("Изображение не загружено: {source}"),
+                            tf!("wiki.image_not_loaded", source = source),
                         );
                     }
                 }
@@ -483,7 +487,7 @@ impl WikiTabState {
                 WikiScanResult::Ok(files) => {
                     self.files = files;
                     self.selected_idx = if self.files.is_empty() { None } else { Some(0) };
-                    self.status = format!("Найдено файлов: {}", self.files.len());
+                    self.status = tf!("wiki.files_found", count = self.files.len());
                     self.load_selected_file();
                 }
                 WikiScanResult::Err(err) => {
@@ -512,7 +516,7 @@ impl WikiTabState {
             match event {
                 WikiDocLoadResult::Ok(doc) => {
                     self.doc = Some(doc);
-                    self.status = "Файл загружен".to_owned();
+                    self.status = t!("wiki.file_loaded").to_owned();
                 }
                 WikiDocLoadResult::Err(err) => {
                     self.doc = None;
@@ -559,7 +563,7 @@ impl WikiTabState {
     }
 
     fn refresh_files(&mut self) {
-        self.status = "Сканирование папки wiki...".to_owned();
+        self.status = t!("wiki.scanning").to_owned();
         self.doc = None;
         self.image_cache.clear();
         let wiki_dir = self.wiki_dir.clone();
@@ -577,7 +581,7 @@ impl WikiTabState {
         let Some(entry) = self.files.get(idx) else {
             return;
         };
-        self.status = format!("Загрузка файла: {}", entry.path.display());
+        self.status = tf!("wiki.file_loading", path = entry.path.display());
         let path = entry.path.clone();
         let (tx, rx) = channel();
         self.doc_rx = Some(rx);
@@ -622,20 +626,14 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
         let store = crate::storage::storage();
         let wiki_dir_str = wiki_dir.to_string_lossy();
         if let Err(err) = store.create_dir_all(wiki_dir_str.as_ref()) {
-            let _ = tx.send(WikiScanResult::Err(format!(
-                "Не удалось создать папку {}: {err}",
-                wiki_dir.display()
-            )));
+            let _ = tx.send(WikiScanResult::Err(tf!("wiki.create_folder_error", wiki_dir = wiki_dir.display(), err = err)));
             return;
         }
 
         let entries = match store.read_dir(wiki_dir_str.as_ref()) {
             Ok(entries) => entries,
             Err(err) => {
-                let _ = tx.send(WikiScanResult::Err(format!(
-                    "Не удалось прочитать папку {}: {err}",
-                    wiki_dir.display()
-                )));
+                let _ = tx.send(WikiScanResult::Err(tf!("wiki.read_folder_error", wiki_dir = wiki_dir.display(), err = err)));
                 return;
             }
         };
@@ -650,7 +648,7 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
             let title = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("Без имени")
+                .unwrap_or(t!("wiki.untitled"))
                 .to_owned();
             files.push(WikiFileEntry { title, path });
         }
@@ -668,10 +666,7 @@ fn spawn_document_load_thread(path: PathBuf, tx: Sender<WikiDocLoadResult>) {
         let markdown = match crate::storage::storage().read_to_string(path_str.as_ref()) {
             Ok(text) => text,
             Err(err) => {
-                let _ = tx.send(WikiDocLoadResult::Err(format!(
-                    "Не удалось прочитать {}: {err}",
-                    path.display()
-                )));
+                let _ = tx.send(WikiDocLoadResult::Err(tf!("wiki.read_file_error", path = path.display(), err = err)));
                 return;
             }
         };
@@ -1055,13 +1050,30 @@ fn load_remote_image_rgba(url: &str) -> Result<(usize, usize, Vec<u8>), String> 
 
 #[cfg(target_arch = "wasm32")]
 fn load_remote_image_rgba(_url: &str) -> Result<(usize, usize, Vec<u8>), String> {
-    Err("загрузка изображений по сети недоступна в веб-версии".to_string())
+    Err(t!("wiki.remote_image_web_unavailable").to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_image_alt_width, parse_image_row, resolve_image_source};
     use std::path::Path;
+
+    /// Russian selects the correct CLDR plural form of "символ" for the wiki
+    /// document character count. Installs the `ru` catalog under the shared locale
+    /// lock so the process-global active-catalog swap cannot race another test in
+    /// this binary, then asserts the exact `tp!("wiki.chars", n)` rendering — the
+    /// same key `draw_document` uses: 1/21 -> one, 2 -> few, 5/11 -> many.
+    #[test]
+    fn wiki_chars_uses_russian_plural_forms() {
+        let _guard = crate::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap();
+        let ru = ms_i18n::LocaleTag::parse("ru").expect("ru tag is valid");
+        ms_i18n::set_locale(&ru).expect("ru catalog installs");
+        assert_eq!(tp!("wiki.chars", 1_usize), "1 символ");
+        assert_eq!(tp!("wiki.chars", 2_usize), "2 символа");
+        assert_eq!(tp!("wiki.chars", 5_usize), "5 символов");
+        assert_eq!(tp!("wiki.chars", 11_usize), "11 символов");
+        assert_eq!(tp!("wiki.chars", 21_usize), "21 символ");
+    }
 
     #[test]
     fn parse_image_row_strips_markdown_angle_delimiters() {

@@ -92,7 +92,7 @@ pub fn query_virtual_desktop_bounds() -> Result<ScreenRect, String> {
     // Web build: no desktop to query — the capture flow is a native launcher feature.
     #[cfg(target_arch = "wasm32")]
     {
-        Err("Захват экрана недоступен в веб-версии.".to_string())
+        Err(t!("screen_capture.web_unavailable").to_string())
     }
     #[cfg(all(
         not(target_arch = "wasm32"),
@@ -128,7 +128,7 @@ pub fn capture_screen_rect(rect: ScreenRect) -> Result<RgbaImage, String> {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = rect;
-        Err("Захват экрана недоступен в веб-версии.".to_string())
+        Err(t!("screen_capture.web_unavailable").to_string())
     }
     #[cfg(all(
         not(target_arch = "wasm32"),

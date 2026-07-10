@@ -782,7 +782,7 @@ impl MangaApp {
             let _ = tx.send(result);
         });
         self.save_to_project_rx = Some(rx);
-        self.save_to_project_status = Some(("Сохраняется…".to_string(), 0.0));
+        self.save_to_project_status = Some((t!("app.save.saving").to_string(), 0.0));
     }
 
     /// Poll the in-flight "save to project" job.  Returns true when the job completed this frame.
@@ -800,13 +800,13 @@ impl MangaApp {
                     model.mark_saved_to_project();
                 }
                 self.has_unsaved_changes_cached = false;
-                self.save_to_project_status = Some(("Сохранено ✓".to_string(), now));
+                self.save_to_project_status = Some((t!("app.save.saved").to_string(), now));
                 runtime_log::log_info("[save_to_project] merge complete");
                 true
             }
             Ok(Err(err)) => {
                 self.save_to_project_rx = None;
-                let msg = format!("Ошибка сохранения: {err}");
+                let msg = tf!("app.save.error", err = err);
                 runtime_log::log_error(format!("[save_to_project] {msg}"));
                 self.save_to_project_status = Some((msg, now));
                 true
@@ -814,7 +814,7 @@ impl MangaApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.save_to_project_rx = None;
-                let msg = "Ошибка: поток сохранения завершился неожиданно.".to_string();
+                let msg = t!("app.save.thread_crashed").to_string();
                 self.save_to_project_status = Some((msg.clone(), now));
                 runtime_log::log_error(format!("[save_to_project] {msg}"));
                 true
@@ -830,10 +830,7 @@ impl MangaApp {
         thread::spawn(move || {
             let result = if unsaved_dir.exists() {
                 fs::remove_dir_all(&unsaved_dir).map_err(|err| {
-                    format!(
-                        "Не удалось удалить временную папку {}: {err}",
-                        unsaved_dir.display()
-                    )
+                    tf!("app.save.remove_temp_error", unsaved_dir = unsaved_dir.display(), err = err)
                 })
             } else {
                 Ok(())
@@ -859,7 +856,7 @@ impl MangaApp {
         }
         let rx = Self::spawn_unsaved_delete_job(self.project.paths.unsaved_dir.clone());
         self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
-        self.save_to_project_status = Some(("Завершается очистка сессии…".to_string(), 0.0));
+        self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
     }
 
     fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
@@ -892,21 +889,21 @@ impl MangaApp {
                     model.mark_saved_to_project();
                 }
                 self.has_unsaved_changes_cached = false;
-                self.save_to_project_status = Some(("Временная сессия очищена ✓".to_string(), now));
+                self.save_to_project_status = Some((t!("app.cleanup.cleaned").to_string(), now));
                 runtime_log::log_info("[exit] unsaved cleanup complete");
                 self.finalize_close(ctx, action);
             }
             Ok(Err(err)) => {
                 self.pending_exit_cleanup = None;
                 self.exit_dialog = None;
-                let msg = format!("Ошибка завершения: {err}");
+                let msg = tf!("app.cleanup.error", err = err);
                 self.save_to_project_status = Some((msg.clone(), now));
                 runtime_log::log_error(format!("[exit] {msg}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.pending_exit_cleanup = None;
-                let msg = "Ошибка: очистка временной сессии завершилась неожиданно.".to_string();
+                let msg = t!("app.cleanup.thread_crashed").to_string();
                 self.save_to_project_status = Some((msg.clone(), now));
                 runtime_log::log_error(format!("[exit] {msg}"));
             }
@@ -924,8 +921,8 @@ impl MangaApp {
         let mut handled = false;
 
         let title = match kind {
-            ExitDialogKind::WindowClose => "Выход",
-            ExitDialogKind::ReturnToLauncher => "Выход в лаунчер",
+            ExitDialogKind::WindowClose => t!("app.exit.exit_button"),
+            ExitDialogKind::ReturnToLauncher => t!("app.exit.to_launcher_button"),
         };
 
         egui::Window::new(title)
@@ -935,13 +932,13 @@ impl MangaApp {
             .show(ctx, |ui| {
                 match kind {
                     ExitDialogKind::WindowClose => {
-                        ui.label("В сессии есть несохранённые изменения.");
+                        ui.label(t!("app.exit.unsaved_warning"));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Не выходить").clicked() {
+                            if ui.button(t!("app.exit.cancel_button")).clicked() {
                                 close_dialog = true;
                             }
-                            if ui.button("Сохранить главу").clicked() {
+                            if ui.button(t!("app.exit.save_chapter_button")).clicked() {
                                 self.start_save_to_project();
                                 // Wait for the save to complete before we exit.
                                 // We set a flag so the next poll triggers the close.
@@ -952,7 +949,7 @@ impl MangaApp {
                                 self.exit_dialog = Some(ExitDialogKind::WindowClose);
                                 handled = true; // skip the unconditional close_dialog below
                             }
-                            if ui.button("Не сохранять").clicked() {
+                            if ui.button(t!("app.exit.discard_button")).clicked() {
                                 self.start_exit_cleanup(PendingCloseAction::Exit);
                                 close_dialog = true;
                                 handled = true;
@@ -960,20 +957,20 @@ impl MangaApp {
                         });
                     }
                     ExitDialogKind::ReturnToLauncher => {
-                        ui.label("В сессии есть несохранённые изменения.");
+                        ui.label(t!("app.exit.unsaved_warning"));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Не выходить").clicked() {
+                            if ui.button(t!("app.exit.cancel_button")).clicked() {
                                 close_dialog = true;
                             }
-                            if ui.button("Сохранить главу").clicked() {
+                            if ui.button(t!("app.exit.save_chapter_button")).clicked() {
                                 self.pending_save_completion_action =
                                     Some(PendingCloseAction::ReturnToLauncher);
                                 self.start_save_to_project();
                                 close_dialog = true;
                                 handled = true;
                             }
-                            if ui.button("Не сохранять").clicked() {
+                            if ui.button(t!("app.exit.discard_button")).clicked() {
                                 self.start_exit_cleanup(PendingCloseAction::ReturnToLauncher);
                                 close_dialog = true;
                                 handled = true;
@@ -1008,7 +1005,7 @@ impl MangaApp {
         if let Err(err) =
             save_comic_type_to_project_file(&self.project.paths.settings_file, comic_type)
         {
-            let user_message = "Не удалось сохранить тип комикса.\nПроверьте, доступен ли settings.json для записи.";
+            let user_message = t!("app.comic_type.save_error");
             self.comic_type_prompt_error = Some(user_message.to_string());
             runtime_log::log_error(format!(
                 "[app] failed to persist comic_type='{}'; settings_file='{}'; cause={err}",
@@ -1096,7 +1093,7 @@ impl MangaApp {
             return;
         }
 
-        egui::Window::new("Выберите тип комикса")
+        egui::Window::new(t!("app.comic_type.window_title")).id(egui::Id::new("app.comic_type.window_title"))
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
@@ -1106,10 +1103,10 @@ impl MangaApp {
                     ui.colored_label(egui::Color32::from_rgb(220, 90, 90), message);
                     ui.add_space(8.0);
                 }
-                if ui.button("Страничный (манга)").clicked() {
+                if ui.button(t!("app.comic_type.pages_option")).clicked() {
                     self.apply_comic_type_preset(ComicType::Pages);
                 }
-                if ui.button("Вебтун (манхва, маньхуа)").clicked() {
+                if ui.button(t!("app.comic_type.ribbon_option")).clicked() {
                     self.apply_comic_type_preset(ComicType::Ribbon);
                 }
             });
@@ -1194,13 +1191,13 @@ impl MangaApp {
             self.ai_device_prompt_initialized = true;
         }
 
-        egui::Window::new("Выбор видеокарты")
+        egui::Window::new(t!("app.gpu_prompt.window_title")).id(egui::Id::new("app.gpu_prompt.window_title"))
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
             .movable(false)
             .show(ctx, |ui| {
-                ui.label("Выберите самую мощную видеокарту из доступных");
+                ui.label(t!("app.gpu_prompt.hint"));
                 ui.add_space(8.0);
 
                 if let Some(message) = self.ai_device_prompt_error.as_ref() {
@@ -1208,7 +1205,7 @@ impl MangaApp {
                     ui.add_space(8.0);
                 }
                 if self.ai_device_prompt_applying {
-                    ui.small("Применяется выбор устройства...");
+                    ui.small(t!("app.gpu_prompt.applying"));
                     ui.add_space(8.0);
                 }
 
@@ -1217,7 +1214,10 @@ impl MangaApp {
                         &snapshot.device_options,
                         &self.ai_device_prompt_pytorch_device,
                     );
-                    egui::ComboBox::from_label("Устройство PyTorch")
+                    // Stable id_salt so a live UI-language switch does not reset the
+                    // combo state (native `ComboBox` derives its id from the label text
+                    // unless given an explicit salt).
+                    egui::ComboBox::new("ai_device_prompt_pytorch_combo", t!("app.gpu_prompt.pytorch_device_label"))
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for option in &snapshot.device_options {
@@ -1234,7 +1234,8 @@ impl MangaApp {
                 if snapshot.onnx_device_needs_selection {
                     let selected_text =
                         option_label(&directml_options, &self.ai_device_prompt_directml_device_id);
-                    egui::ComboBox::from_label("Устройство DirectML")
+                    // Stable id_salt (see the PyTorch combo above).
+                    egui::ComboBox::new("ai_device_prompt_directml_combo", t!("app.gpu_prompt.directml_device_label"))
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for option in &directml_options {
@@ -1252,7 +1253,7 @@ impl MangaApp {
                     if ui
                         .add_enabled(
                             !self.ai_device_prompt_applying,
-                            egui::Button::new("Подтвердить"),
+                            egui::Button::new(t!("app.gpu_prompt.confirm_button")),
                         )
                         .clicked()
                     {
@@ -1260,7 +1261,7 @@ impl MangaApp {
                             && self.ai_device_prompt_directml_device_id.trim().is_empty()
                         {
                             self.ai_device_prompt_error =
-                                Some("Выберите устройство DirectML.".to_string());
+                                Some(t!("app.gpu_prompt.select_directml_hint").to_string());
                             return;
                         }
                         if let Some(tx) = self.ai_backend_probe_tx.as_ref() {
@@ -1301,11 +1302,11 @@ impl MangaApp {
                                 self.ai_device_prompt_applying = true;
                             } else {
                                 self.ai_device_prompt_error =
-                                    Some("Не удалось отправить выбор в AI backend.".to_string());
+                                    Some(t!("app.gpu_prompt.send_failed").to_string());
                             }
                         } else {
                             self.ai_device_prompt_error =
-                                Some("AI backend сейчас недоступен.".to_string());
+                                Some(t!("app.gpu_prompt.backend_unavailable").to_string());
                         }
                     }
                 });
@@ -1324,7 +1325,7 @@ impl MangaApp {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("неизвестна")
+            .unwrap_or(t!("app.version.unknown"))
             .to_string();
         if backend_version == studio_version {
             return None;
@@ -1360,7 +1361,7 @@ impl MangaApp {
         };
         let message = ai_backend_version_warning_message(&studio_version, &backend_version);
 
-        egui::Window::new("Предупреждение")
+        egui::Window::new(t!("app.version_warning.window_title")).id(egui::Id::new("app.version_warning.window_title"))
             .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .collapsible(false)
             .resizable(false)
@@ -2181,7 +2182,7 @@ impl MangaApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Выйти в лаунчер").clicked() {
+                if ui.button(t!("app.menu.to_launcher_button")).clicked() {
                     if self.has_unsaved_changes() {
                         self.exit_dialog = Some(ExitDialogKind::ReturnToLauncher);
                     } else {
@@ -2190,7 +2191,7 @@ impl MangaApp {
                 }
                 let save_busy = self.save_to_project_rx.is_some();
                 if ui
-                    .add_enabled(!save_busy, egui::Button::new("Сохранить проект"))
+                    .add_enabled(!save_busy, egui::Button::new(t!("app.menu.save_project_button")))
                     .clicked()
                 {
                     self.start_save_to_project();
@@ -2290,10 +2291,7 @@ impl eframe::App for MangaApp {
             && self.save_to_project_rx.is_none()
         {
             if self.has_unsaved_changes() {
-                let msg = format!(
-                    "Ошибка сохранения: временная папка {} не была удалена.",
-                    self.project.paths.unsaved_dir.display()
-                );
+                let msg = tf!("app.save.temp_not_removed_error", arg = self.project.paths.unsaved_dir.display());
                 self.save_to_project_status = Some((msg.clone(), now));
                 runtime_log::log_error(format!("[save_to_project] {msg}"));
             } else {
@@ -2552,9 +2550,7 @@ impl eframe::App for MangaApp {
 }
 
 fn ai_backend_version_warning_message(studio_version: &str, backend_version: &str) -> String {
-    format!(
-        "Версии студии и ИИ бэкенда не соответствуют: {studio_version}/{backend_version}. Возможна некорректная работа некоторых ИИ сервисов"
-    )
+    tf!("app.version_warning.mismatch_message", studio_version = studio_version, backend_version = backend_version)
 }
 
 fn append_eviction_report(target: &mut CacheEvictionReport, source: CacheEvictionReport) {
@@ -2577,7 +2573,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     let mut manager = InputManagerV2::default();
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_ZOOM_IN,
-        title: "Увеличить масштаб",
+        title: t!("app.hotkey.zoom_in"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2589,7 +2585,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_ZOOM_OUT,
-        title: "Уменьшить масштаб",
+        title: t!("app.hotkey.zoom_out"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2601,7 +2597,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_ZOOM_RESET,
-        title: "Сбросить масштаб",
+        title: t!("app.hotkey.zoom_reset"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2613,8 +2609,8 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_DELETE_BUBBLE,
-        title: "Удалить выбранный пузырь",
-        section: "Пузыри",
+        title: t!("app.hotkey.delete_bubble"),
+        section: t!("app.hotkey.bubbles_category"),
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::NONE,
             egui::Key::Delete,
@@ -2625,8 +2621,8 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_CREATE_BUBBLE,
-        title: "Создать пузырь в позиции курсора",
-        section: "Пузыри",
+        title: t!("app.hotkey.create_bubble"),
+        section: t!("app.hotkey.bubbles_category"),
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::NONE,
             egui::Key::T,
@@ -2637,7 +2633,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_CLEANING_ZOOM_IN,
-        title: "Увеличить масштаб",
+        title: t!("app.hotkey.zoom_in"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2649,7 +2645,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_CLEANING_ZOOM_OUT,
-        title: "Уменьшить масштаб",
+        title: t!("app.hotkey.zoom_out"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2661,7 +2657,7 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     manager.register(HotkeySpecV2 {
         id: HOTKEY_CLEANING_ZOOM_RESET,
-        title: "Сбросить масштаб",
+        title: t!("app.hotkey.zoom_reset"),
         section: "Canvas",
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND,
@@ -2685,7 +2681,7 @@ fn option_label(options: &[AiBackendDeviceOption], selected_id: &str) -> String 
         .map(|option| option.label.clone())
         .unwrap_or_else(|| {
             if selected_id.trim().is_empty() {
-                "нет данных".to_string()
+                t!("app.hotkey.no_binding").to_string()
             } else {
                 selected_id.to_string()
             }
@@ -3208,12 +3204,9 @@ fn merge_unsaved_into_project(
         &unsaved_layers,
         owned_text_pages,
     )
-    .map_err(|e| format!("Не удалось слить layers.json: {e}"))?;
+    .map_err(|e| tf!("app.merge.layers_merge_error", e = e))?;
     fs::remove_dir_all(unsaved_dir).map_err(|e| {
-        format!(
-            "Не удалось удалить временную папку {}: {e}",
-            unsaved_dir.display()
-        )
+        tf!("app.merge.remove_temp_error", unsaved_dir = unsaved_dir.display(), e = e)
     })?;
     Ok(())
 }
@@ -3222,11 +3215,11 @@ fn merge_unsaved_into_project(
 /// in `dst` are overwritten. The file at the absolute path `skip` is NOT copied (handled separately).
 fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), String> {
     fs::create_dir_all(dst)
-        .map_err(|e| format!("Не удалось создать папку {}: {e}", dst.display()))?;
+        .map_err(|e| tf!("app.merge.create_dir_error", dst = dst.display(), e = e))?;
     let entries = fs::read_dir(src)
-        .map_err(|e| format!("Не удалось прочитать папку {}: {e}", src.display()))?;
+        .map_err(|e| tf!("app.merge.read_dir_error", src = src.display(), e = e))?;
     for entry in entries {
-        let entry = entry.map_err(|e| format!("Ошибка чтения записи в {}: {e}", src.display()))?;
+        let entry = entry.map_err(|e| tf!("app.merge.read_entry_error", src = src.display(), e = e))?;
         let src_path = entry.path();
         if src_path == skip {
             continue;
@@ -3236,11 +3229,7 @@ fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), 
             copy_dir_overwrite_except(&src_path, &dst_path, skip)?;
         } else {
             fs::copy(&src_path, &dst_path).map_err(|e| {
-                format!(
-                    "Не удалось скопировать {} → {}: {e}",
-                    src_path.display(),
-                    dst_path.display()
-                )
+                tf!("app.merge.copy_error", src_path = src_path.display(), dst_path = dst_path.display(), e = e)
             })?;
         }
     }
@@ -3257,9 +3246,15 @@ mod tests {
 
     #[test]
     fn formats_ai_backend_version_warning() {
+        // Pins the exact catalog key + args (in tests the empty default catalog makes
+        // both sides render the key verbatim, so this compares key + interpolation).
         assert_eq!(
             ai_backend_version_warning_message("3.4.0", "3.3.0"),
-            "Версии студии и ИИ бэкенда не соответствуют: 3.4.0/3.3.0. Возможна некорректная работа некоторых ИИ сервисов"
+            tf!(
+                "app.version_warning.mismatch_message",
+                studio_version = "3.4.0",
+                backend_version = "3.3.0"
+            )
         );
     }
 

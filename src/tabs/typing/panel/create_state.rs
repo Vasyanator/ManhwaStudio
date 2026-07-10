@@ -40,9 +40,9 @@ impl TypingCreatePanelState {
         let formula_presets_by_name = load_text_tab_formula_presets();
         let (request_tx, result_rx) = spawn_preview_render_worker();
         let status_line = if fonts.is_empty() {
-            format!("Не найдено шрифтов в {}", fonts_dir.display())
+            tf!("typing.errors.no_fonts_found", fonts_dir = fonts_dir.display())
         } else {
-            "Готово к рендеру".to_string()
+            t!("typing.preview.ready_status").to_string()
         };
         let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
         let mut state = Self {
@@ -70,7 +70,7 @@ impl TypingCreatePanelState {
             preview_enabled,
             selected_font_idx: 0,
             selected_face_idx: 0,
-            text: DEFAULT_PREVIEW_TEXT.to_string(),
+            text: default_preview_text().to_string(),
             text_color: Color32::BLACK,
             text_color_selector: ViewportColorSelector::default(),
             font_size_px: 24.0,
@@ -233,7 +233,7 @@ impl TypingCreatePanelState {
         let (tx, rx) = mpsc::channel::<FontReloadResult>();
         self.font_reload_rx = Some(rx);
         self.fonts_reload_in_flight = true;
-        self.status_line = "Обновление списка шрифтов...".to_string();
+        self.status_line = t!("typing.fonts.reloading_status").to_string();
         let _ = thread::Builder::new()
             .name("typing-font-reload-worker".to_string())
             .spawn(move || {
@@ -275,9 +275,9 @@ impl TypingCreatePanelState {
                     self.clamp_face_index();
                     self.active_font_key = self.current_font_key();
                     self.status_line = if self.fonts.is_empty() {
-                        format!("Не найдено шрифтов в {}", self.fonts_dir.display())
+                        tf!("typing.errors.no_fonts_found_reload", arg = self.fonts_dir.display())
                     } else {
-                        "Готово к рендеру".to_string()
+                        t!("typing.preview.ready_status").to_string()
                     };
                     if self.preview_enabled
                         && let Some(font_key) = self.current_font_key()
@@ -298,7 +298,7 @@ impl TypingCreatePanelState {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.font_reload_rx = None;
                 self.fonts_reload_in_flight = false;
-                self.status_line = "Ошибка обновления списка шрифтов".to_string();
+                self.status_line = t!("typing.fonts.reload_error_status").to_string();
             }
         }
     }

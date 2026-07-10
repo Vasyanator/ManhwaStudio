@@ -583,7 +583,7 @@ fn draw_socket_rows(
         let socket_pos = pos2(socket_x, y);
         let socket_ref = SocketRef {
             node_id,
-            socket_name: spec.name.to_owned(),
+            socket_name: spec.name.to_string(),
             is_input: spec.is_input,
         };
         positions.push((socket_ref.clone(), socket_pos));
@@ -606,10 +606,13 @@ fn draw_socket_rows(
         } else {
             egui::Align2::RIGHT_CENTER
         };
+        // Painted label is localized when the socket carries a catalog key; dynamic
+        // user-authored sockets (string-template placeholders) show their raw name.
+        // `display_label` is a wait-free catalog read, safe on the paint path.
         socket_painter.text(
             pos2(label_x, socket_pos.y),
             align,
-            spec.name,
+            spec.display_label(),
             egui::FontId::proportional((10.0 * zoom).max(1.0)),
             COL_TEXT_DIM,
         );
@@ -629,24 +632,24 @@ fn show_inline_param_editor_ui(
     let text_width = (NODE_WIDTH - 56.0).max(80.0) * zoom;
     match params {
         NodeParams::StartNumber { start, step, end } => {
-            inline_drag_value(ui, "Начало", start, zoom, interactive_rects);
-            inline_drag_value(ui, "Шаг", step, zoom, interactive_rects);
-            inline_drag_value(ui, "Конец", end, zoom, interactive_rects);
+            inline_drag_value(ui, t!("launcher.batch.field_start"), start, zoom, interactive_rects);
+            inline_drag_value(ui, t!("launcher.batch.field_step"), step, zoom, interactive_rects);
+            inline_drag_value(ui, t!("launcher.batch.field_end"), end, zoom, interactive_rects);
         }
         NodeParams::StartString { path } => {
             inline_path_edit(
                 ui,
-                "Файл",
+                t!("launcher.batch.field_file"),
                 path,
                 text_width,
-                "Открыть текстовый файл",
+                t!("launcher.batch.open_text_file_button"),
                 || {
                     // Native file picker (`rfd`); on web there is no dialog, so the
                     // picker yields no path (logged as a dropped capability).
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         rfd::FileDialog::new()
-                            .add_filter("Текстовый файл", &["txt"])
+                            .add_filter(t!("launcher.batch.text_file_label"), &["txt"])
                             .pick_file()
                     }
                     #[cfg(target_arch = "wasm32")]
@@ -662,10 +665,10 @@ fn show_inline_param_editor_ui(
             template,
             placeholders,
         } => {
-            inline_text_edit(ui, "Шаблон", template, text_width, interactive_rects);
+            inline_text_edit(ui, t!("launcher.batch.field_template"), template, text_width, interactive_rects);
 
             let mut placeholder_text = placeholders.join(", ");
-            ui.label(egui::RichText::new("Поля через запятую").text_style(TextStyle::Small));
+            ui.label(egui::RichText::new(t!("launcher.batch.fields_comma_separated")).text_style(TextStyle::Small));
             let response = ui.add_sized(
                 [text_width, ui.spacing().interact_size.y],
                 egui::TextEdit::singleline(&mut placeholder_text),
@@ -681,7 +684,7 @@ fn show_inline_param_editor_ui(
             }
         }
         NodeParams::OpenUrl { browser } => {
-            ui.label("Браузер");
+            ui.label(t!("launcher.batch.section_browser"));
             let response = egui::ComboBox::from_id_salt(("bpn_browser", node_id))
                 .width(text_width)
                 .selected_text(browser.label())
@@ -693,8 +696,8 @@ fn show_inline_param_editor_ui(
             interactive_rects.push(response.response.rect);
         }
         NodeParams::FetchFromBrowser { pattern } => {
-            inline_text_edit(ui, "Паттерн URL", pattern, text_width, interactive_rects);
-            ui.label(egui::RichText::new("Например: *.jpg").text_style(TextStyle::Small));
+            inline_text_edit(ui, t!("launcher.batch.field_url_pattern"), pattern, text_width, interactive_rects);
+            ui.label(egui::RichText::new(t!("launcher.batch.url_pattern_hint")).text_style(TextStyle::Small));
         }
         NodeParams::StitchSplit {
             parts,
@@ -705,10 +708,10 @@ fn show_inline_param_editor_ui(
             prefer_up_first,
             auto_cut,
         } => {
-            interactive_rects.push(ui.checkbox(auto_cut, "Автонарезка").rect);
+            interactive_rects.push(ui.checkbox(auto_cut, t!("launcher.batch.section_autocut")).rect);
             inline_drag_value_with_range(
                 ui,
-                "Целевая высота",
+                t!("launcher.batch.field_target_height"),
                 target_height,
                 500..=20_000,
                 zoom,
@@ -716,7 +719,7 @@ fn show_inline_param_editor_ui(
             );
             inline_drag_value_with_range(
                 ui,
-                "Полос сшивки",
+                t!("launcher.batch.field_stitch_bands"),
                 band_rows,
                 1..=50,
                 zoom,
@@ -724,7 +727,7 @@ fn show_inline_param_editor_ui(
             );
             inline_drag_value_with_range(
                 ui,
-                "Допуск",
+                t!("launcher.batch.field_tolerance"),
                 tolerance,
                 0..=255_u8,
                 zoom,
@@ -732,15 +735,15 @@ fn show_inline_param_editor_ui(
             );
             inline_drag_value_with_range(
                 ui,
-                "Радиус поиска",
+                t!("launcher.batch.field_search_radius"),
                 search_radius,
                 100..=10_000,
                 zoom,
                 interactive_rects,
             );
-            interactive_rects.push(ui.checkbox(prefer_up_first, "Искать вверх сначала").rect);
+            interactive_rects.push(ui.checkbox(prefer_up_first, t!("launcher.batch.field_search_up_first")).rect);
 
-            ui.label("Частей");
+            ui.label(t!("launcher.batch.field_parts"));
             let mut parts_value = parts.unwrap_or(0);
             let response = ui.add(
                 egui::DragValue::new(&mut parts_value)
@@ -761,7 +764,7 @@ fn show_inline_param_editor_ui(
             noise,
             tile_size,
         } => {
-            ui.label("Масштаб");
+            ui.label(t!("launcher.batch.field_scale"));
             let scale_response = egui::ComboBox::from_id_salt(("bpn_w2x_scale", node_id))
                 .width(text_width)
                 .selected_text(scale.to_string())
@@ -771,8 +774,8 @@ fn show_inline_param_editor_ui(
                     }
                 });
             interactive_rects.push(scale_response.response.rect);
-            inline_drag_value_with_range(ui, "Шум", noise, -1..=3_i32, zoom, interactive_rects);
-            ui.label("Тайл");
+            inline_drag_value_with_range(ui, t!("launcher.batch.field_noise"), noise, -1..=3_i32, zoom, interactive_rects);
+            ui.label(t!("launcher.batch.field_tile"));
             let tile_response = egui::ComboBox::from_id_salt(("bpn_w2x_tile", node_id))
                 .width(text_width)
                 .selected_text(tile_size.to_string())
@@ -786,10 +789,10 @@ fn show_inline_param_editor_ui(
         NodeParams::SaveFolder { path, name_prefix } => {
             inline_path_edit(
                 ui,
-                "Папка",
+                t!("launcher.batch.field_folder"),
                 path,
                 text_width,
-                "Выбрать папку",
+                t!("launcher.batch.choose_folder_button"),
                 || {
                     // Native folder picker (`rfd`); unavailable on web.
                     #[cfg(not(target_arch = "wasm32"))]
@@ -804,15 +807,15 @@ fn show_inline_param_editor_ui(
                 },
                 interactive_rects,
             );
-            inline_text_edit(ui, "Префикс", name_prefix, text_width, interactive_rects);
+            inline_text_edit(ui, t!("launcher.batch.field_prefix"), name_prefix, text_width, interactive_rects);
         }
         NodeParams::VariableRead { variable_name }
         | NodeParams::VariableWrite { variable_name } => {
-            ui.label("Переменная");
+            ui.label(t!("launcher.batch.field_variable"));
             let response = egui::ComboBox::from_id_salt(("bpn_variable", node_id))
                 .width(text_width)
                 .selected_text(if variable_name.is_empty() {
-                    "Не выбрана"
+                    t!("launcher.batch.variable_not_selected")
                 } else {
                     variable_name.as_str()
                 })
@@ -828,7 +831,7 @@ fn show_inline_param_editor_ui(
             interactive_rects.push(response.response.rect);
             if variables.is_empty() {
                 ui.label(
-                    egui::RichText::new("Создайте переменную слева").text_style(TextStyle::Small),
+                    egui::RichText::new(t!("launcher.batch.create_variable_hint")).text_style(TextStyle::Small),
                 );
             }
         }

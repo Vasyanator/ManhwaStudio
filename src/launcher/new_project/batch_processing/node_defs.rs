@@ -14,10 +14,14 @@ Key structures:
 - NodeDefs      — the registry
 
 Notes:
-Socket names are Russian strings matching the Python originals so that JSON files
-produced by the Python implementation can be loaded without edge remapping.
+Socket `name` fields are Russian identifiers matching the Python originals so that JSON
+files produced by the Python implementation load without edge remapping; they are wire
+keys, never localized. The painted UI label is a separate `SocketSpec::label_key` (catalog
+key `launcher.batch.socket.*`) attached to fixed template sockets via `.with_label(...)`.
+Dynamic sockets (string-template placeholders, variable nodes) carry user-authored names,
+get no `label_key`, and display their raw `name`.
 Variable-node socket layout is dynamic (depends on variable data_type) and handled
-via socket_spec_for_variable_node().
+via socket_specs_for_node().
 */
 
 use super::types::{DataType, SocketSpec};
@@ -46,11 +50,12 @@ impl NodeDefs {
         defs.insert(
             "start_number",
             NodeDef {
-                title: "Старт (число)",
-                description: "Генерирует целые числа в диапазоне [start, end] с шагом step.",
+                title: t!("launcher.batch.node_number_start_title"),
+                description: t!("launcher.batch.node_number_start_desc"),
                 sockets: vec![
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_out("Индекс", DataType::Int),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_out("Индекс", DataType::Int)
+                        .with_label("launcher.batch.socket.index"),
                 ],
             },
         );
@@ -59,11 +64,12 @@ impl NodeDefs {
         defs.insert(
             "start_string",
             NodeDef {
-                title: "Старт (строка)",
-                description: "Читает строки из txt-файла и выдаёт их по одной за цикл.",
+                title: t!("launcher.batch.node_string_start_title"),
+                description: t!("launcher.batch.node_string_start_desc"),
                 sockets: vec![
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_out("Строка", DataType::Str),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_out("Строка", DataType::Str)
+                        .with_label("launcher.batch.socket.string"),
                 ],
             },
         );
@@ -72,14 +78,15 @@ impl NodeDefs {
         defs.insert(
             "string_template",
             NodeDef {
-                title: "Шаблон строки",
-                description: "Подставляет значения переменных в шаблон с {placeholder} метками.",
+                title: t!("launcher.batch.node_string_template_title"),
+                description: t!("launcher.batch.node_string_template_desc"),
                 // Actual sockets depend on the placeholders list and are computed dynamically
                 // in socket_specs_for_node(); this list is a base with only fixed sockets.
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_out("Строка", DataType::Str),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_out("Строка", DataType::Str)
+                        .with_label("launcher.batch.socket.string"),
                 ],
             },
         );
@@ -88,13 +95,15 @@ impl NodeDefs {
         defs.insert(
             "quick_downloader",
             NodeDef {
-                title: "Быстрая загрузка",
-                description: "Скачивает изображения по URL с поддерживаемых сайтов.",
+                title: t!("launcher.batch.node_quick_download_title"),
+                description: t!("launcher.batch.node_quick_download_desc"),
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    // "URL" is already Latin; no label key, painted verbatim.
                     SocketSpec::data_in("URL", DataType::Str),
-                    SocketSpec::data_out("Картинки", DataType::ImageList),
+                    SocketSpec::data_out("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
                 ],
             },
         );
@@ -103,11 +112,12 @@ impl NodeDefs {
         defs.insert(
             "open_url",
             NodeDef {
-                title: "Открыть URL",
-                description: "Открывает URL в браузере через Selenium и ждёт загрузки страницы.",
+                title: t!("launcher.batch.node_open_url_title"),
+                description: t!("launcher.batch.node_open_url_desc"),
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    // "URL" is already Latin; no label key, painted verbatim.
                     SocketSpec::data_in("URL", DataType::Str),
                 ],
             },
@@ -115,11 +125,11 @@ impl NodeDefs {
 
         // ── Прокрутить страницу ──────────────────────────────────────────────
         defs.insert("scroll_page", NodeDef {
-            title: "Прокрутить страницу",
-            description: "Медленно прокручивает страницу вниз и вверх для загрузки lazy-контента.",
+            title: t!("launcher.batch.node_scroll_page_title"),
+            description: t!("launcher.batch.node_scroll_page_desc"),
             sockets: vec![
-                SocketSpec::exec_in("Вход"),
-                SocketSpec::exec_out("Далее"),
+                SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
             ],
         });
 
@@ -127,12 +137,13 @@ impl NodeDefs {
         defs.insert(
             "fetch_from_browser",
             NodeDef {
-                title: "Получить из браузера",
-                description: "Собирает картинки из текущей страницы браузера по шаблону URL.",
+                title: t!("launcher.batch.node_browser_fetch_title"),
+                description: t!("launcher.batch.node_browser_fetch_desc"),
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_out("Картинки", DataType::ImageList),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_out("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
                 ],
             },
         );
@@ -141,13 +152,15 @@ impl NodeDefs {
         defs.insert(
             "stitch_split",
             NodeDef {
-                title: "Склейка / Нарезка",
-                description: "Склеивает страницы вертикально и нарезает по безопасным строкам.",
+                title: t!("launcher.batch.node_stitch_cut_title"),
+                description: t!("launcher.batch.node_stitch_cut_desc"),
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_in("Картинки", DataType::ImageList),
-                    SocketSpec::data_out("Картинки", DataType::ImageList),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_in("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
+                    SocketSpec::data_out("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
                 ],
             },
         );
@@ -157,25 +170,29 @@ impl NodeDefs {
             "waifu2x",
             NodeDef {
                 title: "Waifu2x",
-                description: "Увеличивает изображения с помощью waifu2x-ncnn-vulkan.",
+                description: t!("launcher.batch.node_waifu2x_desc"),
                 sockets: vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_in("Картинки", DataType::ImageList),
-                    SocketSpec::data_out("Картинки", DataType::ImageList),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_in("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
+                    SocketSpec::data_out("Картинки", DataType::ImageList)
+                        .with_label("launcher.batch.socket.images"),
                 ],
             },
         );
 
         // ── Сохранить в папку ────────────────────────────────────────────────
         defs.insert("save_folder", NodeDef {
-            title: "Сохранить в папку",
-            description: "Записывает список картинок в указанную папку с числовыми именами. Сокет «Путь» переопределяет папку из параметров.",
+            title: t!("launcher.batch.node_save_folder_title"),
+            description: t!("launcher.batch.node_save_folder_desc"),
             sockets: vec![
-                SocketSpec::exec_in("Вход"),
-                SocketSpec::exec_out("Далее"),
-                SocketSpec::data_in("Картинки", DataType::ImageList),
-                SocketSpec::data_in("Путь", DataType::Str),
+                SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                SocketSpec::data_in("Картинки", DataType::ImageList)
+                    .with_label("launcher.batch.socket.images"),
+                SocketSpec::data_in("Путь", DataType::Str)
+                    .with_label("launcher.batch.socket.path"),
             ],
         });
 
@@ -185,8 +202,8 @@ impl NodeDefs {
         defs.insert(
             "variable_read",
             NodeDef {
-                title: "Чтение переменной",
-                description: "Читает значение переменной и передаёт его в граф.",
+                title: t!("launcher.batch.node_read_variable_title"),
+                description: t!("launcher.batch.node_read_variable_desc"),
                 sockets: vec![
                     SocketSpec::data_out("Значение", DataType::Str), // placeholder; overridden at runtime
                 ],
@@ -197,8 +214,8 @@ impl NodeDefs {
         defs.insert(
             "variable_write",
             NodeDef {
-                title: "Запись переменной",
-                description: "Сохраняет входное значение в переменную.",
+                title: t!("launcher.batch.node_write_variable_title"),
+                description: t!("launcher.batch.node_write_variable_desc"),
                 sockets: vec![
                     SocketSpec::exec_in("Вход"),
                     SocketSpec::exec_out("Далее"),
@@ -209,15 +226,10 @@ impl NodeDefs {
 
         // ── Конец ────────────────────────────────────────────────────────────
         defs.insert("end", NodeDef {
-            title: "Конец",
-            description: "Точка синхронизации: ждёт все входящие exec-сигналы перед завершением цикла.",
+            title: t!("launcher.batch.node_end_title"),
+            description: t!("launcher.batch.node_end_desc"),
             sockets: vec![
-                SocketSpec {
-                    name: "Вход",
-                    is_input: true,
-                    kind: super::types::SocketKind::Exec,
-                    allow_multiple: true,
-                },
+                SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
             ],
         });
 
@@ -248,26 +260,34 @@ impl NodeDefs {
                 let mut sockets = Vec::new();
                 if let super::types::NodeParams::StringTemplate { placeholders, .. } = node_params {
                     for name in placeholders {
-                        // Use a leaked string so the lifetime matches &'static str requirement.
-                        // In practice, placeholders live as long as the graph.
-                        let name_static: &'static str = Box::leak(name.clone().into_boxed_str());
-                        sockets.push(SocketSpec::data_in(name_static, DataType::Str));
+                        // User-authored placeholder: the name is both the wire identifier and
+                        // the painted label (no catalog key). `SocketSpec::name` is a `Cow`, so
+                        // we clone the owned `String` instead of leaking a `&'static str` — this
+                        // runs every frame on the draw path (canvas.rs), so a leak would grow
+                        // memory without bound.
+                        sockets.push(SocketSpec::data_in(name.clone(), DataType::Str));
                     }
                 }
                 // Append fixed sockets.
                 sockets.extend(base);
                 sockets
             }
+            // Variable-node sockets are rebuilt here with the referenced variable's data type.
+            // Their NAMES are the same fixed identifiers used everywhere else
+            // (`"Вход"`/`"Далее"`/`"Значение"`, see `docs/i18n_exclusions.md` §A2), so they
+            // reuse the shared `launcher.batch.socket.*` label keys — only the data type is
+            // dynamic, not the label. (Genuinely user-authored socket names exist only for
+            // `string_template` placeholders, which carry no key and paint verbatim.)
             "variable_read" => {
                 let dt = variable_data_type(node_params, variables).unwrap_or(DataType::Str);
-                vec![SocketSpec::data_out("Значение", dt)]
+                vec![SocketSpec::data_out("Значение", dt).with_label("launcher.batch.socket.value")]
             }
             "variable_write" => {
                 let dt = variable_data_type(node_params, variables).unwrap_or(DataType::Str);
                 vec![
-                    SocketSpec::exec_in("Вход"),
-                    SocketSpec::exec_out("Далее"),
-                    SocketSpec::data_in("Значение", dt),
+                    SocketSpec::exec_in("Вход").with_label("launcher.batch.socket.input"),
+                    SocketSpec::exec_out("Далее").with_label("launcher.batch.socket.next"),
+                    SocketSpec::data_in("Значение", dt).with_label("launcher.batch.socket.value"),
                 ]
             }
             key => self
@@ -284,22 +304,22 @@ impl NodeDefs {
         // For the common case we can use the static list.
         self.defs
             .get(template_key)
-            .and_then(|d| d.sockets.iter().find(|s| s.name == socket_name).cloned())
+            .and_then(|d| d.sockets.iter().find(|s| s.name.as_ref() == socket_name).cloned())
     }
 
     /// Return a list of (category, keys) groups for the palette panel.
     pub fn palette_groups() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
-            ("Старт", vec!["start_number", "start_string"]),
-            ("Строки", vec!["string_template"]),
+            (t!("launcher.batch.palette_start"), vec!["start_number", "start_string"]),
+            (t!("launcher.batch.palette_strings"), vec!["string_template"]),
             ("I/O", vec!["quick_downloader", "save_folder"]),
             (
-                "Браузер",
+                t!("launcher.batch.palette_browser"),
                 vec!["open_url", "scroll_page", "fetch_from_browser"],
             ),
-            ("Обработка", vec!["stitch_split", "waifu2x"]),
-            ("Переменные", vec!["variable_read", "variable_write"]),
-            ("Поток", vec!["end"]),
+            (t!("launcher.batch.palette_processing"), vec!["stitch_split", "waifu2x"]),
+            (t!("launcher.batch.palette_variables"), vec!["variable_read", "variable_write"]),
+            (t!("launcher.batch.palette_flow"), vec!["end"]),
         ]
     }
 }
@@ -319,4 +339,79 @@ fn variable_data_type(
         .iter()
         .find(|v| v.name == name)
         .map(|v| v.data_type)
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::NodeDefs;
+    use crate::launcher::new_project::batch_processing::types::{NodeParams, SocketKind};
+    use std::borrow::Cow;
+
+    #[test]
+    fn string_template_yields_one_owned_socket_per_placeholder() {
+        let defs = NodeDefs::build();
+        let params = NodeParams::StringTemplate {
+            template: "{a}/{b}/{c}".to_owned(),
+            placeholders: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        };
+        let sockets = defs.socket_specs_for_node("string_template", &params, &[]);
+        // One data-input socket per placeholder (the fixed Вход/Далее/Строка are exec/output).
+        let placeholder_inputs: Vec<_> = sockets
+            .iter()
+            .filter(|s| s.is_input && matches!(s.kind, SocketKind::Data(_)))
+            .collect();
+        assert_eq!(placeholder_inputs.len(), 3);
+        for (spec, name) in placeholder_inputs.iter().zip(["a", "b", "c"]) {
+            // The placeholder text is both the wire identifier and the painted label.
+            assert_eq!(spec.name.as_ref(), name);
+            assert_eq!(spec.display_label(), name);
+            assert!(spec.label_key.is_none());
+            // Owned, not a leaked `&'static str`: the socket carries its own `String`.
+            assert!(matches!(spec.name, Cow::Owned(_)));
+        }
+        // Calling again returns fresh owned data. Because `SocketSpec::name` is a `Cow`,
+        // repeated draw-path calls cannot leak a growing set of `&'static str` (compile-level
+        // guarantee); the owned names are freed with the returned `Vec`.
+        let again = defs.socket_specs_for_node("string_template", &params, &[]);
+        assert_eq!(again.len(), sockets.len());
+    }
+
+    #[test]
+    fn socket_label_key_resolves_through_active_catalog() {
+        use ms_i18n::{Catalog, LocaleTag};
+        // The binary's tests share one process-global catalog slot; serialize against the
+        // locale-store tests so an install here cannot race their assertions.
+        let _guard = crate::locale_store::GLOBAL_LOCALE_LOCK
+            .lock()
+            .expect("locale lock");
+
+        let defs = NodeDefs::build();
+        // The "end" node's only socket is the fixed exec-in identifier "Вход", labeled by key.
+        let sockets = defs.socket_specs_for_node("end", &NodeParams::End, &[]);
+        let exec_in = sockets
+            .iter()
+            .find(|s| s.is_input && matches!(s.kind, SocketKind::Exec))
+            .expect("end node has an exec-in socket");
+        assert_eq!(exec_in.label_key, Some("launcher.batch.socket.input"));
+        // The wire identifier is never localized, whatever the active language.
+        assert_eq!(exec_in.name.as_ref(), "Вход");
+
+        let ru = Catalog::from_json_str(
+            &LocaleTag::parse("ru").expect("ru tag"),
+            r#"{ "launcher.batch.socket.input": "Вход" }"#,
+        )
+        .expect("ru catalog parses");
+        ms_i18n::install(ru);
+        assert_eq!(exec_in.display_label(), "Вход");
+
+        let en = Catalog::from_json_str(
+            &LocaleTag::parse("en").expect("en tag"),
+            r#"{ "launcher.batch.socket.input": "Input" }"#,
+        )
+        .expect("en catalog parses");
+        ms_i18n::install(en);
+        assert_eq!(exec_in.display_label(), "Input");
+    }
 }

@@ -66,7 +66,7 @@ impl LauncherState {
             psd_import_window_open: false,
             import_popup_open: false,
             main_page_message: None,
-            footer_label: "Разработал ChatGPT и Claude под руководством Vasyanator".to_string(),
+            footer_label: t!("launcher.about.credits").to_string(),
         }
     }
 

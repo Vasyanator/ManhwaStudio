@@ -26,9 +26,12 @@ Three independent modules. None reads config or touches the filesystem.
 - `src/lib.rs`: crate root; re-exports the three modules.
 - `src/language.rs`: `TextLanguage`, `ScriptGroup`, `set_text_language`,
   `text_language`. Also the UI-facing metadata used by the settings selector and the
-  font-coverage tooltip: `TextLanguage::display_name`, `ScriptGroup::all` /
-  `languages` / `first_language` / `display_name` / `script_display_name` (all
-  exhaustive, no catch-all arms; the group→language partition is unit-tested).
+  font-coverage tooltip: `TextLanguage::name_key`, `ScriptGroup::all` /
+  `languages` / `first_language` / `name_key` / `script_name_key` (all
+  exhaustive, no catch-all arms; the group→language partition is unit-tested). These
+  `*_key` methods return CATALOG KEYS, not localized text — this crate is GUI-free and
+  must not depend on `ms-i18n`; the binary resolves them via
+  `ms_i18n::lookup(key).unwrap_or(key)` (see `docs/i18n_exclusions.md` §F).
 - `src/text_punctuation.rs`: `is_hanging_punctuation`, `set_hanging_punctuation`,
   `hanging_punctuation_string`, `DEFAULT_HANGING_PUNCTUATION`.
 - `src/segmentation/`: language-neutral core (`base`), per-language groups

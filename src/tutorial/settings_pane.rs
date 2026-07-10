@@ -40,10 +40,9 @@ pub fn draw_tutorials_pane(ui: &mut egui::Ui, progress: &TutorialProgressHandle)
         (guard.autoplay(), rows)
     };
 
-    ui.heading("Обучение");
+    ui.heading(t!("tutorial.settings.heading"));
     ui.label(
-        "Здесь можно заново пройти обучающие подсказки. После сброса обучение запустится \
-         при следующем входе в соответствующее окно или вкладку.",
+        t!("tutorial.settings.description"),
     );
     ui.add_space(8.0);
 
@@ -51,7 +50,7 @@ pub fn draw_tutorials_pane(ui: &mut egui::Ui, progress: &TutorialProgressHandle)
     if ui
         .checkbox(
             &mut autoplay,
-            "Автоматически запускать обучение при первом входе",
+            t!("tutorial.settings.autostart_label"),
         )
         .changed()
     {
@@ -64,7 +63,7 @@ pub fn draw_tutorials_pane(ui: &mut egui::Ui, progress: &TutorialProgressHandle)
     ui.separator();
 
     if rows.is_empty() {
-        ui.label("Пока нет доступных обучений.");
+        ui.label(t!("tutorial.settings.empty"));
         return;
     }
 
@@ -73,13 +72,13 @@ pub fn draw_tutorials_pane(ui: &mut egui::Ui, progress: &TutorialProgressHandle)
         ui.horizontal(|ui| {
             ui.label(id.title());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Пройти заново обучение").clicked() {
+                if ui.button(t!("tutorial.settings.replay_button")).clicked() {
                     reset_target = Some(id);
                 }
                 if completed {
-                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "✔ пройдено");
+                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), t!("tutorial.settings.status_completed"));
                 } else {
-                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "○ не пройдено");
+                    ui.colored_label(egui::Color32::from_rgb(180, 180, 180), t!("tutorial.settings.status_not_completed"));
                 }
             });
         });

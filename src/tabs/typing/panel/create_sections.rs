@@ -52,7 +52,7 @@ impl TypingCreatePanelState {
                             egui::Layout::centered_and_justified(egui::Direction::TopDown),
                         ),
                         |ui| {
-                            ui.label("Превью ещё не готово.");
+                            ui.label(t!("typing.preview.not_ready_status"));
                         },
                     );
                 }
@@ -85,9 +85,9 @@ impl TypingCreatePanelState {
     pub(super) fn draw_effects_section(&mut self, ui: &mut egui::Ui, vertical_cards: bool) -> bool {
         let mut changed = false;
         ui.label(if vertical_cards {
-            "Порядок применения: сверху вниз"
+            t!("typing.effects.order_top_to_bottom_hint")
         } else {
-            "Порядок применения: слева направо"
+            t!("typing.effects.order_left_to_right_hint")
         });
         ui.horizontal(|ui| {
             let effect_kinds = [
@@ -109,7 +109,7 @@ impl TypingCreatePanelState {
                 .iter()
                 .position(|kind| *kind == self.effect_to_add)
                 .unwrap_or(0);
-            let effect_combo = WheelComboBox::from_label("Добавить эффект")
+            let effect_combo = WheelComboBox::from_label(t!("typing.effects.add_effect_combo_id")).id_salt("typing.effects.add_effect_combo_id")
                 .selected_text(self.effect_to_add.label())
                 .show_ui_with_wheel(ui, |ui| {
                     for (idx, kind) in effect_kinds.iter().enumerate() {
@@ -126,7 +126,7 @@ impl TypingCreatePanelState {
             }
             self.effect_to_add = effect_kinds[effect_idx];
 
-            if ui.button("+ Добавить").clicked() {
+            if ui.button(t!("typing.effects.add_button")).clicked() {
                 // Prefer the user-configured per-kind default; fall back to the built-in
                 // when no override is stored (byte-identical to the historical behavior).
                 let card = effect_defaults::effect_default_card(self.effect_to_add, self.text_color)
@@ -140,7 +140,7 @@ impl TypingCreatePanelState {
 
         ui.add_space(4.0);
         if self.effects.is_empty() {
-            ui.label("Эффекты не добавлены.");
+            ui.label(t!("typing.effects.none_added_hint"));
         } else {
             let mut move_up: Option<usize> = None;
             let mut move_down: Option<usize> = None;
@@ -159,19 +159,19 @@ impl TypingCreatePanelState {
                                     ));
                                     if ui
                                         .add_enabled(idx > 0, egui::Button::new("↑"))
-                                        .on_hover_text("Переместить выше")
+                                        .on_hover_text(t!("typing.effects.move_up_tooltip"))
                                         .clicked()
                                     {
                                         move_up = Some(idx);
                                     }
                                     if ui
                                         .add_enabled(idx + 1 < effects_len, egui::Button::new("↓"))
-                                        .on_hover_text("Переместить ниже")
+                                        .on_hover_text(t!("typing.effects.move_down_tooltip"))
                                         .clicked()
                                     {
                                         move_down = Some(idx);
                                     }
-                                    if ui.button("X").on_hover_text("Удалить").clicked() {
+                                    if ui.button("X").on_hover_text(t!("typing.common.delete_button")).clicked() {
                                         remove_idx = Some(idx);
                                     }
                                 });
@@ -228,7 +228,7 @@ impl TypingCreatePanelState {
                                                                     idx > 0,
                                                                     egui::Button::new("←"),
                                                                 )
-                                                                .on_hover_text("Переместить влево")
+                                                                .on_hover_text(t!("typing.effects.move_left_tooltip"))
                                                                 .clicked()
                                                             {
                                                                 move_up = Some(idx);
@@ -238,14 +238,14 @@ impl TypingCreatePanelState {
                                                                     idx + 1 < effects_len,
                                                                     egui::Button::new("→"),
                                                                 )
-                                                                .on_hover_text("Переместить вправо")
+                                                                .on_hover_text(t!("typing.effects.move_right_tooltip"))
                                                                 .clicked()
                                                             {
                                                                 move_down = Some(idx);
                                                             }
                                                             if ui
                                                                 .button("X")
-                                                                .on_hover_text("Удалить")
+                                                                .on_hover_text(t!("typing.common.delete_button"))
                                                                 .clicked()
                                                             {
                                                                 remove_idx = Some(idx);
@@ -438,9 +438,9 @@ impl TypingCreatePanelState {
         };
         ui.vertical(|ui| {
             let mask_button_label = if mask_panel_open {
-                "Закрыть маску обрезки"
+                t!("typing.export.close_clip_mask_button")
             } else {
-                "Открыть маску обрезки"
+                t!("typing.export.open_clip_mask_button")
             };
             if ui.button(mask_button_label).clicked() {
                 out.toggle_mask = true;
@@ -448,7 +448,7 @@ impl TypingCreatePanelState {
             if self.preview_enabled {
                 let mut format = export_format;
                 ui.horizontal(|ui| {
-                    ui.label("Формат:");
+                    ui.label(t!("typing.export.format_label"));
                     if ui
                         .selectable_value(&mut format, TypingExportFormat::Png, "PNG")
                         .clicked()
@@ -460,7 +460,7 @@ impl TypingCreatePanelState {
                     }
                 });
             }
-            if self.preview_enabled && ui.button("Наложить и сохранить в папку").clicked()
+            if self.preview_enabled && ui.button(t!("typing.export.overlay_and_save_button")).clicked()
             {
                 // Native folder picker; on web there is no OS dialog (folder export
                 // is handled by a zip download in the web-glue phase).
@@ -474,11 +474,11 @@ impl TypingCreatePanelState {
                 }
             }
             if self.preview_enabled {
-                if ui.button("Вставить картинку из буфера обмена").clicked()
+                if ui.button(t!("typing.export.paste_image_from_clipboard_button")).clicked()
                 {
                     out.create_image_request = Some(TypingCreateImageRequest::FromClipboard);
                 }
-                if ui.button("Выбрать картинку из файла").clicked() {
+                if ui.button(t!("typing.export.pick_image_from_file_button")).clicked() {
                     // Native file picker; web file selection arrives via an
                     // <input type=file> in the web-glue phase.
                     #[cfg(not(target_arch = "wasm32"))]
@@ -488,7 +488,7 @@ impl TypingCreatePanelState {
                             dialog = dialog.set_directory(path);
                         }
                         if let Some(path) = dialog
-                            .add_filter("Картинки", &["png", "jpg", "jpeg", "webp", "bmp"])
+                            .add_filter(t!("typing.export.images_label"), &["png", "jpg", "jpeg", "webp", "bmp"])
                             .pick_file()
                         {
                             out.create_image_request =
@@ -504,7 +504,7 @@ impl TypingCreatePanelState {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(format!("Обработка страниц: {done}/{total}"));
+                            ui.label(tf!("typing.export.processing_pages_status", done = done, total = total));
                         });
                         let progress = if *total == 0 {
                             0.0
@@ -519,7 +519,7 @@ impl TypingCreatePanelState {
                     }
                     TypingExportUiStatus::Success { done, total } => {
                         ui.add_space(4.0);
-                        let text = format!("Готово: {done}/{total}");
+                        let text = tf!("typing.export.done_pages_status", done = done, total = total);
                         let rich = egui::RichText::new(text).color(Color32::from_rgb(90, 230, 120));
                         ui.label(rich);
                         ui.add(
@@ -539,7 +539,7 @@ impl TypingCreatePanelState {
             // редактирование); остальные действия ниже — только при создании.
             ui.separator();
             let mut show_clean = clean_overlays_visible;
-            if ui.checkbox(&mut show_clean, "Показывать клин").changed() {
+            if ui.checkbox(&mut show_clean, t!("typing.export.show_clean_overlay")).changed() {
                 out.changed_clean_overlays = Some(show_clean);
             }
             if self.preview_enabled {
@@ -547,13 +547,13 @@ impl TypingCreatePanelState {
                 if ui
                     .checkbox(
                         &mut strict_pixel_movement_value,
-                        "Перемещение строго по пикселям",
+                        t!("typing.export.strict_pixel_move"),
                     )
                     .changed()
                 {
                     out.changed_strict_pixel_movement = Some(strict_pixel_movement_value);
                 }
-                if ui.button("Округлить позиции текста").clicked() {
+                if ui.button(t!("typing.export.round_text_positions")).clicked() {
                     out.round_text_positions = true;
                 }
             }

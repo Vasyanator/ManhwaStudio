@@ -620,7 +620,7 @@ impl LauncherApp {
             let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT);
             let builder = crate::launcher::apply_launcher_window_metadata(
                 egui::ViewportBuilder::default()
-                    .with_title("Новый проект")
+                    .with_title(t!("launcher.new_project.window_title"))
                     .with_inner_size([1180.0, 760.0])
                     .with_min_inner_size([1000.0, 680.0])
                     .with_app_id(&self.app_id)
@@ -684,7 +684,7 @@ impl LauncherApp {
         let mut keep_open = true;
         let builder = crate::launcher::apply_launcher_window_metadata(
             egui::ViewportBuilder::default()
-                .with_title("Импорт из PSD")
+                .with_title(t!("launcher.psd_import.window_title"))
                 .with_inner_size([1360.0, 820.0])
                 .with_min_inner_size([1120.0, 720.0])
                 .with_app_id(&self.app_id)
@@ -736,7 +736,7 @@ impl LauncherApp {
             viewport_id,
             crate::launcher::apply_launcher_window_metadata(
                 egui::ViewportBuilder::default()
-                    .with_title("Гайд")
+                    .with_title(t!("launcher.wiki_guide.window_title"))
                     .with_inner_size([980.0, 760.0])
                     .with_min_inner_size([720.0, 540.0])
                     .with_app_id(&self.app_id)

@@ -83,7 +83,7 @@ fn run_launcher_internal(
         "Rust launcher window{} is unavailable on the web build",
         if test_mode { " test mode" } else { "" }
     ));
-    Err(anyhow::anyhow!("Оконный лаунчер недоступен в веб-версии"))
+    Err(anyhow::anyhow!(t!("launcher.web.window_launcher_unavailable")))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

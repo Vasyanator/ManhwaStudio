@@ -75,9 +75,9 @@ impl ViewportColorSelector {
             }
 
             let button_label = if self.eyedropper_active {
-                "Пипетка (активно)"
+                t!("widgets.viewport_color_selector.eyedropper_active")
             } else {
-                "Пипетка"
+                t!("widgets.viewport_color_selector.eyedropper")
             };
             let button_resp = ui.button(button_label);
             if button_resp.clicked() && !self.eyedropper_active {

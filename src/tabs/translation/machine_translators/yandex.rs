@@ -29,7 +29,7 @@ impl MachineTranslatorBackend for YandexMtBackend {
         _target_lang: &str,
         _texts: Vec<String>,
     ) -> Result<Vec<Result<String, String>>, String> {
-        Err("Перевод через Yandex недоступен в веб-версии.".to_string())
+        Err(t!("translation.mt.yandex.web_unavailable_error").to_string())
     }
 }
 
@@ -118,7 +118,7 @@ impl YandexApiClient {
 
         let (status, body) = read_response(response)?;
         let parsed: YandexDetectResponse = serde_json::from_str(&body)
-            .map_err(|err| format!("Yandex detect: некорректный JSON: {err}"))?;
+            .map_err(|err| tf!("translation.mt.yandex.detect_invalid_json_error", err = err))?;
         if status < 400 && parsed.code == 200 {
             let lang = parsed
                 .lang
@@ -149,7 +149,7 @@ impl YandexApiClient {
 
         let (status, body) = read_response(response)?;
         let parsed: YandexTranslateResponse = serde_json::from_str(&body)
-            .map_err(|err| format!("Yandex translate: некорректный JSON: {err}"))?;
+            .map_err(|err| tf!("translation.mt.yandex.translate_invalid_json_error", err = err))?;
         if status < 400 && parsed.code == 200 {
             parsed
                 .text
@@ -160,7 +160,7 @@ impl YandexApiClient {
                         Some(values.remove(0))
                     }
                 })
-                .ok_or_else(|| "Yandex translate: пустой ответ.".to_string())
+                .ok_or_else(|| t!("translation.mt.yandex.translate_empty_error").to_string())
         } else {
             Err(format_yandex_api_error(parsed.code, status, &body))
         }
@@ -173,14 +173,14 @@ fn read_response(response: Result<ureq::Response, ureq::Error>) -> Result<(u16, 
             let status = resp.status();
             let body = resp
                 .into_string()
-                .map_err(|err| format!("Yandex: ошибка чтения тела ответа: {err}"))?;
+                .map_err(|err| tf!("translation.mt.yandex.read_body_error", err = err))?;
             Ok((status, body))
         }
         Err(ureq::Error::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             Ok((status, body))
         }
-        Err(ureq::Error::Transport(err)) => Err(format!("Yandex: ошибка сети: {err}")),
+        Err(ureq::Error::Transport(err)) => Err(tf!("translation.mt.yandex.network_error", err = err)),
     }
 }
 

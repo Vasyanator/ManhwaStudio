@@ -108,8 +108,8 @@ impl PsTool for SelectTool {
 
     fn title(&self) -> &'static str {
         match self.mode {
-            SelectMode::Rect => "Прямоугольное выделение",
-            SelectMode::Lasso => "Лассо",
+            SelectMode::Rect => t!("ps_editor.tools.rect_select_title"),
+            SelectMode::Lasso => t!("ps_editor.tools.lasso_title"),
         }
     }
 
@@ -214,13 +214,13 @@ impl PsTool for SelectTool {
     fn options_ui(&mut self, ui: &mut egui::Ui) {
         match self.mode {
             SelectMode::Rect => {
-                ui.label("Растяните прямоугольник на странице.");
+                ui.label(t!("ps_editor.tools.rect_select_hint"));
             }
             SelectMode::Lasso => {
-                ui.label("Обведите область, удерживая ЛКМ.");
+                ui.label(t!("ps_editor.tools.lasso_hint"));
             }
         }
-        ui.label("Клик без выделения снимает выделение.");
+        ui.label(t!("ps_editor.tools.select_clear_hint"));
     }
 }
 

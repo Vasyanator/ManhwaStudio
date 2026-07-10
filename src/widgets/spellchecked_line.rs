@@ -8,23 +8,41 @@ Purpose:
 Main responsibilities:
 - оборачивать стандартный `TextEdit` без блокировки GUI-потока;
 - загружать все словари из папки `spell_check` и автоматически докачивать
-  `ru_RU` из LibreOffice при отсутствии русского словаря;
+  словарь ДЛЯ ЯЗЫКА ВЁРСТКИ (`ms_text_util::language::text_language`) при его
+  отсутствии, по одному разу на язык;
 - кэшировать проверки слов и отправлять новые слова в background worker;
 - подчёркивать слова с ошибками через custom layouter.
 
 Key structures:
 - `SpellcheckedTextEdit`
 - `SpellcheckService`
+- `DictionarySpec` / `dictionary_spec` — таблица «язык вёрстки → словарь»
+  (on-disk stem + verified `.aff`/`.dic` URL'ы).
 
 Notes:
 - Проверка использует pure-Rust crate `zspell`, совместимый с Hunspell
   словарями `.aff` + `.dic`.
 - Словари читаются из app-local папки `spell_check`; GUI-поток не делает
   файловых и сетевых операций.
+- Активный словарь следует за ЯЗЫКОМ ВЁРСТКИ (как переносы и покрытие шрифта), а
+  не за языком интерфейса. Воркер сравнивает `text_language()` каждый батч
+  (паттерн `panel/facade.rs`) и докачивает словарь нового языка. Скачивание
+  идёт по одному разу на язык (`download_attempted: HashSet<TextLanguage>`),
+  чтобы неудача одного языка не блокировала другой.
+- Сопоставление по СЛОВУ: language-first, script-second. Слово в письменности
+  активного языка судит ТОЛЬКО словарь этого языка (иначе оставшийся на диске
+  `uk_UA` молча принял бы украинское написание в русской главе). Слово другой
+  письменности судит любой словарь этой письменности — так работает смешанный
+  текст (кириллическое имя в испанской главе). Если словаря активного языка нет,
+  его слова остаются НЕ подчёркнутыми, а не судятся соседним словарём.
+- Кэш проверок ключуется языком вёрстки (`SpellCacheKey.language`) и полностью
+  очищается при смене набора загруженных словарей, чтобы вердикт, вынесенный при
+  одном языке, не переживал переключение.
 - Пользовательские исключения объединяют app-global `custom.dic` и project-local
   список из `settings.json`.
 */
 
+use crate::language::{TextLanguage, text_language};
 use crate::runtime_log;
 use egui::epaint::text::{LayoutJob, TextFormat};
 use egui::text_edit::TextEditOutput;
@@ -60,8 +78,105 @@ enum ScriptGroup {
     Cyrillic,
 }
 
+/// Provenance of one language's Hunspell dictionary.
+///
+/// `stem` is OUR on-disk file stem (`<stem>.aff` + `<stem>.dic`), chosen by this
+/// module and independent of the upstream filename. It must keep
+/// `infer_script_group` correct (a stem typo would silently disable checking for
+/// that language); the unit tests enforce this. `aff_url`/`dic_url` are the exact
+/// verified upstream sources (200 for both, declared `SET UTF-8`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DictionarySpec {
+    stem: &'static str,
+    aff_url: &'static str,
+    dic_url: &'static str,
+}
+
+// Upstream dictionary bases. Two are needed:
+// - `LibreOffice/dictionaries` is the primary source (UTF-8, official).
+// - `wooorm/dictionaries` is used ONLY for `fr`, `pl`, and `sl`, and must not be
+//   "fixed" back to LibreOffice:
+//     * `fr`: the LibreOffice dictionaries repo has NO `fr_FR` directory at all
+//       (French ships as a separate extension), so there is nothing to point at.
+//     * `pl` / `sl`: LibreOffice's `pl_PL.aff` / `sl_SI.aff` declare
+//       `SET ISO8859-2`. This module reads dictionary bodies with
+//       `read_to_string`, which rejects non-UTF-8 bytes, so those files cannot be
+//       loaded as-is. The wooorm copies declare `SET UTF-8`.
+// `concat!` needs literal arguments, so the base is inlined per URL rather than
+// referenced through a `const`.
+
+/// Returns the dictionary provenance for `language`. Pure and total: an
+/// exhaustive `match` maps every `TextLanguage` to a spec with a unique on-disk
+/// stem and verified https `.aff`/`.dic` URLs. Never panics. The unit tests
+/// assert totality, stem uniqueness, URL shape, and stem→script agreement.
+fn dictionary_spec(language: TextLanguage) -> DictionarySpec {
+    // LibreOffice-hosted entry: `path` is the repo-relative path without extension.
+    macro_rules! lo {
+        ($stem:literal, $path:literal) => {
+            DictionarySpec {
+                stem: $stem,
+                aff_url: concat!(
+                    "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/",
+                    $path,
+                    ".aff"
+                ),
+                dic_url: concat!(
+                    "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/",
+                    $path,
+                    ".dic"
+                ),
+            }
+        };
+    }
+    // wooorm-hosted entry (see the two-source rationale above).
+    macro_rules! wm {
+        ($stem:literal, $path:literal) => {
+            DictionarySpec {
+                stem: $stem,
+                aff_url: concat!(
+                    "https://raw.githubusercontent.com/wooorm/dictionaries/main/dictionaries/",
+                    $path,
+                    ".aff"
+                ),
+                dic_url: concat!(
+                    "https://raw.githubusercontent.com/wooorm/dictionaries/main/dictionaries/",
+                    $path,
+                    ".dic"
+                ),
+            }
+        };
+    }
+    match language {
+        // `ru_RU` stem is kept exactly as-is so existing installs are not re-downloaded.
+        TextLanguage::Ru => lo!("ru_RU", "ru_RU/ru_RU"),
+        TextLanguage::Uk => lo!("uk_UA", "uk_UA/uk_UA"),
+        TextLanguage::Be => lo!("be_BY", "be_BY/be-official"),
+        TextLanguage::Sr => lo!("sr_RS", "sr/sr"),
+        TextLanguage::Pl => wm!("pl_PL", "pl/index"),
+        TextLanguage::Cs => lo!("cs_CZ", "cs_CZ/cs_CZ"),
+        TextLanguage::Sk => lo!("sk_SK", "sk_SK/sk_SK"),
+        TextLanguage::Sl => wm!("sl_SI", "sl/index"),
+        TextLanguage::Hr => lo!("hr_HR", "hr_HR/hr_HR"),
+        TextLanguage::Es => lo!("es_ES", "es/es_ES"),
+        TextLanguage::Fr => wm!("fr_FR", "fr/index"),
+        TextLanguage::Pt => lo!("pt_PT", "pt_PT/pt_PT"),
+        TextLanguage::En => lo!("en_US", "en/en_US"),
+    }
+}
+
+/// Per-word spellcheck cache key.
+///
+/// Carries the active typesetting `language` in addition to the script `group`
+/// and the lowercased `word`. The language field is the cache-invalidation
+/// contract: a verdict computed while one language was active is stored under a
+/// distinct key from the same word under another language, so switching the
+/// typesetting language can never surface a stale verdict (e.g. a word judged as
+/// Russian keeping its verdict after a switch to Ukrainian). Per-word *matching*
+/// is language-first, script-second (see `evaluate_word`); the language partitions the
+/// cache.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct SpellCacheKey {
+    language: TextLanguage,
     group: ScriptGroup,
     word: String,
 }
@@ -138,6 +253,10 @@ impl SpellcheckCustomWordsService {
 
 #[derive(Debug)]
 struct DictionaryBundle {
+    /// On-disk file stem (`ru_RU`, `es_ES`, …). Identifies which language this
+    /// bundle belongs to, so `evaluate_word` can prefer the active language's
+    /// dictionary over another dictionary of the same script.
+    stem: String,
     group: ScriptGroup,
     dictionary: Dictionary,
 }
@@ -156,7 +275,14 @@ struct SpellcheckWorkerState {
     bundles: Vec<DictionaryBundle>,
     custom_words: HashMap<ScriptGroup, HashSet<String>>,
     loaded_signature: Vec<String>,
-    russian_download_attempted: bool,
+    /// Languages whose dictionary download has already been attempted this
+    /// process. Per-language (not a single boolean) so a failed download of one
+    /// language never blocks a later attempt for another.
+    download_attempted: HashSet<TextLanguage>,
+    /// Typesetting language the worker last ensured a dictionary for. `None`
+    /// until the first batch; a change drives an ensure/download of the new
+    /// language's dictionary.
+    active_language: Option<TextLanguage>,
 }
 
 impl SpellcheckWorkerState {
@@ -167,7 +293,8 @@ impl SpellcheckWorkerState {
             bundles: Vec::new(),
             custom_words: HashMap::new(),
             loaded_signature: Vec::new(),
-            russian_download_attempted: false,
+            download_attempted: HashSet::new(),
+            active_language: None,
         }
     }
 }
@@ -428,7 +555,11 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphabetic() || ch == '\'' || ch == '-' || ch == '’'
 }
 
-fn build_cache_key(raw: &str) -> Option<SpellCacheKey> {
+/// Classifies a raw token into its script group and lowercased form, or `None`
+/// when it should not be spellchecked (too short, contains digits, an all-caps
+/// acronym, or mixed/unknown script). Pure and language-independent — the script
+/// classification and normalization do not depend on the active language.
+fn classify_and_normalize(raw: &str) -> Option<(ScriptGroup, String)> {
     let trimmed = raw.trim_matches(|ch: char| ch == '\'' || ch == '’' || ch == '-');
     if trimmed.chars().count() < 2 {
         return None;
@@ -446,10 +577,25 @@ fn build_cache_key(raw: &str) -> Option<SpellCacheKey> {
         return None;
     }
 
-    Some(SpellCacheKey {
+    Some((group, lowered))
+}
+
+/// Builds the per-word cache key for `language`. Pure and total; the returned key
+/// carries `language` so a verdict cached under one typesetting language is never
+/// reused after the user switches languages. Returns `None` for tokens that are
+/// not spellchecked (see `classify_and_normalize`).
+fn build_cache_key_for(raw: &str, language: TextLanguage) -> Option<SpellCacheKey> {
+    classify_and_normalize(raw).map(|(group, word)| SpellCacheKey {
+        language,
         group,
-        word: lowered,
+        word,
     })
+}
+
+/// Cache key for the current process-global typesetting language. Cheap (one
+/// atomic load); safe on the GUI thread.
+fn build_cache_key(raw: &str) -> Option<SpellCacheKey> {
+    build_cache_key_for(raw, text_language())
 }
 
 fn classify_word(word: &str) -> Option<ScriptGroup> {
@@ -566,40 +712,75 @@ fn process_spellcheck_batch(
 ) {
     refresh_dictionaries(cache, state);
 
-    let mut grouped: HashMap<ScriptGroup, Vec<String>> = HashMap::new();
-    for SpellRequest(key) in batch {
-        grouped.entry(key.group).or_default().push(key.word);
+    // Evaluate every request outside the cache lock (dictionary checks are hashmap
+    // lookups but there is no reason to hold the lock across them), then insert the
+    // finished verdicts under a short critical section. Each key keeps its original
+    // language, so the cache stays partitioned by typesetting language.
+    let results: Vec<(SpellCacheKey, SpellStatus)> = batch
+        .into_iter()
+        .map(|SpellRequest(key)| {
+            let status = evaluate_word(state, key.group, &key.word);
+            (key, status)
+        })
+        .collect();
+
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for (key, status) in results {
+        guard.insert(key, status);
+    }
+}
+
+/// Judges a single lowercased `word` of script `group` against the currently
+/// loaded state.
+///
+/// Dictionary choice is language-first, script-second:
+/// - A word written in the ACTIVE typesetting language's own script is judged
+///   ONLY by that language's dictionary. Dictionaries of other languages sharing
+///   the script (left on disk from a previous selection) must not vote, or a
+///   Ukrainian spelling would silently pass inside a Russian chapter.
+/// - A word of the OTHER script is judged by any loaded dictionary of that script.
+///   This keeps mixed-script text working (a Cyrillic name inside a Spanish
+///   chapter), where being lenient is the right trade-off.
+///
+/// Returns `Unsupported` (word left unmarked, never flagged) when no applicable
+/// dictionary is loaded — including when the active language's own dictionary is
+/// missing because its download failed. Judging Ukrainian text against a Russian
+/// dictionary would flag nearly every word, so silence is the honest degradation.
+fn evaluate_word(state: &SpellcheckWorkerState, group: ScriptGroup, word: &str) -> SpellStatus {
+    if state
+        .custom_words
+        .get(&group)
+        .is_some_and(|custom_words| custom_words.contains(word))
+    {
+        return SpellStatus::Correct;
     }
 
-    for (group, words) in grouped {
-        let bundles: Vec<&DictionaryBundle> = state
-            .bundles
-            .iter()
-            .filter(|bundle| bundle.group == group)
-            .collect();
-        let mut guard = match cache.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for word in words {
-            let status = if state
-                .custom_words
-                .get(&group)
-                .is_some_and(|custom_words| custom_words.contains(&word))
-            {
-                SpellStatus::Correct
-            } else if bundles.is_empty() {
-                SpellStatus::Unsupported
-            } else if bundles
-                .iter()
-                .any(|bundle| bundle.dictionary.check_word(&word))
-            {
-                SpellStatus::Correct
-            } else {
-                SpellStatus::Incorrect
-            };
-            guard.insert(SpellCacheKey { group, word }, status);
+    // Stem of the active language's dictionary, when the word shares its script.
+    let active_stem = state
+        .active_language
+        .map(dictionary_spec)
+        .filter(|spec| infer_script_group(spec.stem) == Some(group))
+        .map(|spec| spec.stem);
+
+    let mut saw_applicable_dictionary = false;
+    for bundle in state.bundles.iter().filter(|bundle| bundle.group == group) {
+        // Same-script bundles that are not the active language's dictionary do not
+        // vote; other-script bundles all vote (mixed-script fallback).
+        if active_stem.is_some_and(|stem| bundle.stem != stem) {
+            continue;
         }
+        saw_applicable_dictionary = true;
+        if bundle.dictionary.check_word(word) {
+            return SpellStatus::Correct;
+        }
+    }
+    if saw_applicable_dictionary {
+        SpellStatus::Incorrect
+    } else {
+        SpellStatus::Unsupported
     }
 }
 
@@ -616,12 +797,23 @@ fn refresh_dictionaries(
         return;
     }
 
+    // The spellcheck dictionary follows the TYPESETTING language (as hyphenation and
+    // font-coverage do), not the UI language. Ensure the active language's dictionary
+    // is present, downloading it at most once per language. Per-word matching is
+    // language-first below, so already-downloaded dictionaries of another script keep
+    // working for mixed text.
+    let current_language = text_language();
+    state.active_language = Some(current_language);
+    let spec = dictionary_spec(current_language);
+
     let mut files = discover_dictionary_files(&state.root_dir);
-    if !contains_russian_bundle(&files) && !state.russian_download_attempted {
-        state.russian_download_attempted = true;
-        if let Err(err) = download_russian_dictionary(&state.root_dir) {
+    let dictionary_missing = !contains_stem(&files, spec.stem);
+    if dictionary_missing && state.download_attempted.insert(current_language) {
+        if let Err(err) = download_dictionary(&state.root_dir, spec) {
             runtime_log::log_warn(format!(
-                "[widgets::spellchecked_line] failed to download LibreOffice ru_RU dictionary: {err}"
+                "[widgets::spellchecked_line] failed to download '{}' dictionary for language '{}': {err}",
+                spec.stem,
+                current_language.tag()
             ));
         }
         files = discover_dictionary_files(&state.root_dir);
@@ -654,11 +846,16 @@ fn refresh_dictionaries(
     state.bundles = bundles;
     state.custom_words = custom_words;
 
+    // The loaded dictionary set changed (a language was downloaded, or a file on
+    // disk changed). Per-word matching is cumulative across every same-script
+    // dictionary now present, so a previously-cached verdict may be wrong (e.g. a
+    // word that was Incorrect before uk_UA was added may now be Correct). Clear the
+    // whole cache so every visible word is re-evaluated against the new set.
     let mut guard = match cache.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.retain(|_, status| *status != SpellStatus::Unsupported);
+    guard.clear();
 }
 
 fn discover_dictionary_files(root_dir: &Path) -> Vec<DictionaryFiles> {
@@ -708,10 +905,13 @@ fn discover_dictionary_files(root_dir: &Path) -> Vec<DictionaryFiles> {
     bundles
 }
 
-fn contains_russian_bundle(files: &[DictionaryFiles]) -> bool {
+/// Whether a dictionary with the given on-disk `stem` is already present (either
+/// bundled or previously downloaded). Case-insensitive to match filesystem
+/// case-folding.
+fn contains_stem(files: &[DictionaryFiles], stem: &str) -> bool {
     files
         .iter()
-        .any(|files| files.stem.eq_ignore_ascii_case("ru_RU"))
+        .any(|files| files.stem.eq_ignore_ascii_case(stem))
 }
 
 fn dictionary_signature(
@@ -787,7 +987,11 @@ fn load_dictionary_bundles(files: &[DictionaryFiles]) -> Vec<DictionaryBundle> {
             continue;
         };
         match build_dictionary(files) {
-            Ok(dictionary) => bundles.push(DictionaryBundle { group, dictionary }),
+            Ok(dictionary) => bundles.push(DictionaryBundle {
+                stem: files.stem.clone(),
+                group,
+                dictionary,
+            }),
             Err(err) => {
                 runtime_log::log_warn(format!(
                     "[widgets::spellchecked_line] failed to load dictionary '{}': {err}",
@@ -825,21 +1029,27 @@ fn infer_script_group(stem: &str) -> Option<ScriptGroup> {
     None
 }
 
-fn download_russian_dictionary(root_dir: &Path) -> Result<(), String> {
-    const RU_AFF_URL: &str =
-        "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/ru_RU/ru_RU.aff";
-    const RU_DIC_URL: &str =
-        "https://raw.githubusercontent.com/LibreOffice/dictionaries/master/ru_RU/ru_RU.dic";
-
+/// Downloads a language's Hunspell dictionary described by `spec` into
+/// `root_dir`, writing `<stem>.aff` and `<stem>.dic`.
+///
+/// # Errors
+/// Returns an error string (no network, HTTP failure, or write failure) without
+/// writing a partial/fake dictionary: both bodies are fetched before either file
+/// is written. Runs only on the background spellcheck worker thread; on wasm the
+/// download layer is unavailable and this returns an error.
+fn download_dictionary(root_dir: &Path, spec: DictionarySpec) -> Result<(), String> {
     runtime_log::log_info(format!(
-        "[widgets::spellchecked_line] downloading LibreOffice ru_RU dictionary into '{}'",
+        "[widgets::spellchecked_line] downloading '{}' dictionary into '{}'",
+        spec.stem,
         root_dir.display()
     ));
 
-    let aff_content = download_text_file(RU_AFF_URL)?;
-    let dic_content = download_text_file(RU_DIC_URL)?;
-    write_text_file(&root_dir.join("ru_RU.aff"), &aff_content)?;
-    write_text_file(&root_dir.join("ru_RU.dic"), &dic_content)?;
+    // Fetch both bodies first so a mid-download failure never leaves a lone
+    // `.aff`/`.dic` on disk that would look like a valid pair to discovery.
+    let aff_content = download_text_file(spec.aff_url)?;
+    let dic_content = download_text_file(spec.dic_url)?;
+    write_text_file(&root_dir.join(format!("{}.aff", spec.stem)), &aff_content)?;
+    write_text_file(&root_dir.join(format!("{}.dic", spec.stem)), &dic_content)?;
     Ok(())
 }
 
@@ -863,7 +1073,7 @@ fn download_text_file(url: &str) -> Result<String, String> {
 
 #[cfg(target_arch = "wasm32")]
 fn download_text_file(_url: &str) -> Result<String, String> {
-    Err("загрузка словаря недоступна в веб-версии".to_string())
+    Err(t!("widgets.spellchecked_line.dictionary_download_unavailable_web").to_string())
 }
 
 fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
@@ -1097,4 +1307,196 @@ fn load_json_object_root(path: &Path, scope: &str) -> Result<Value, String> {
 
 fn resolve_spellcheck_dir() -> PathBuf {
     crate::config::data_dir().join("spell_check")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::ScriptGroup as TextScriptGroup;
+    use std::collections::HashSet;
+
+    /// The widget-level (`Latin`/`Cyrillic`) script a language's dictionary must
+    /// classify to. Derived from the language's segmentation group so the two
+    /// stay in sync: only the Cyrillic-Slavic languages use a Cyrillic dictionary.
+    fn expected_widget_script(language: TextLanguage) -> ScriptGroup {
+        match language.group() {
+            TextScriptGroup::CyrillicSlavic => ScriptGroup::Cyrillic,
+            TextScriptGroup::LatinSlavic
+            | TextScriptGroup::Romance
+            | TextScriptGroup::English => ScriptGroup::Latin,
+        }
+    }
+
+    #[test]
+    fn dictionary_spec_is_total_with_unique_stems_and_valid_urls() {
+        let mut stems = HashSet::new();
+        for language in TextLanguage::all() {
+            // Total: every language yields a spec (the match is exhaustive; this
+            // just exercises it and guards the invariants below).
+            let spec = dictionary_spec(language);
+
+            assert!(
+                stems.insert(spec.stem),
+                "duplicate on-disk stem '{}' for language '{}'",
+                spec.stem,
+                language.tag()
+            );
+
+            for url in [spec.aff_url, spec.dic_url] {
+                assert!(
+                    url.starts_with("https://"),
+                    "non-https url for '{}': {url}",
+                    spec.stem
+                );
+            }
+            assert!(
+                spec.aff_url.ends_with(".aff"),
+                "aff_url must end in .aff for '{}': {}",
+                spec.stem,
+                spec.aff_url
+            );
+            assert!(
+                spec.dic_url.ends_with(".dic"),
+                "dic_url must end in .dic for '{}': {}",
+                spec.stem,
+                spec.dic_url
+            );
+        }
+        assert_eq!(stems.len(), TextLanguage::all().len());
+    }
+
+    #[test]
+    fn every_spec_stem_infers_the_expected_script() {
+        // A stem typo would make `infer_script_group` return the wrong script (or
+        // `None`), silently disabling checking for that language.
+        for language in TextLanguage::all() {
+            let spec = dictionary_spec(language);
+            assert_eq!(
+                infer_script_group(spec.stem),
+                Some(expected_widget_script(language)),
+                "stem '{}' (language '{}') infers the wrong script",
+                spec.stem,
+                language.tag()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_partitions_by_language() {
+        // A word cached under one typesetting language must be a DIFFERENT key from
+        // the same word under another language, so switching languages never reuses
+        // a stale verdict. The script group and normalized word are identical (the
+        // word matching stays script-based); only the language field differs.
+        let ru = build_cache_key_for("привет", TextLanguage::Ru)
+            .expect("cyrillic word should classify");
+        let uk = build_cache_key_for("привет", TextLanguage::Uk)
+            .expect("cyrillic word should classify");
+
+        assert_ne!(ru, uk, "keys must differ across languages");
+        assert_eq!(ru.language, TextLanguage::Ru);
+        assert_eq!(uk.language, TextLanguage::Uk);
+        assert_eq!(ru.group, uk.group);
+        assert_eq!(ru.group, ScriptGroup::Cyrillic);
+        assert_eq!(ru.word, uk.word);
+    }
+
+    /// Builds an in-memory dictionary bundle from a word list. No filesystem, no
+    /// network: `zspell` accepts the `.aff`/`.dic` bodies as strings.
+    fn test_bundle(stem: &str, group: ScriptGroup, words: &[&str]) -> DictionaryBundle {
+        let dic_body = format!("{}\n{}\n", words.len(), words.join("\n"));
+        let dictionary = zspell::builder()
+            .config_str("SET UTF-8\n")
+            .dict_str(&dic_body)
+            .build()
+            .expect("in-memory test dictionary should build");
+        DictionaryBundle {
+            stem: stem.to_string(),
+            group,
+            dictionary,
+        }
+    }
+
+    fn test_state(active: Option<TextLanguage>, bundles: Vec<DictionaryBundle>) -> SpellcheckWorkerState {
+        SpellcheckWorkerState {
+            root_dir: PathBuf::from("/nonexistent-spellcheck-root"),
+            project_settings_file: None,
+            bundles,
+            custom_words: HashMap::new(),
+            loaded_signature: Vec::new(),
+            download_attempted: HashSet::new(),
+            active_language: active,
+        }
+    }
+
+    /// The regression this guards: with `ru_RU` and `uk_UA` both left on disk, a
+    /// purely script-based match would accept a Ukrainian spelling inside a Russian
+    /// chapter. Only the ACTIVE language's dictionary may vote on its own script.
+    #[test]
+    fn same_script_dictionary_of_another_language_does_not_vote() {
+        let bundles = vec![
+            test_bundle("ru_RU", ScriptGroup::Cyrillic, &["привет"]),
+            test_bundle("uk_UA", ScriptGroup::Cyrillic, &["привіт"]),
+        ];
+        let state = test_state(Some(TextLanguage::Ru), bundles);
+
+        assert_eq!(
+            evaluate_word(&state, ScriptGroup::Cyrillic, "привет"),
+            SpellStatus::Correct,
+            "the active language's own word must be accepted"
+        );
+        assert_eq!(
+            evaluate_word(&state, ScriptGroup::Cyrillic, "привіт"),
+            SpellStatus::Incorrect,
+            "a Ukrainian spelling must not pass just because uk_UA is still on disk"
+        );
+    }
+
+    /// A word of the OTHER script is still judged by any dictionary of that script,
+    /// so mixed-script text (a Cyrillic name inside a Spanish chapter) keeps working.
+    #[test]
+    fn other_script_dictionary_still_votes_for_mixed_text() {
+        let bundles = vec![
+            test_bundle("es_ES", ScriptGroup::Latin, &["casa"]),
+            test_bundle("ru_RU", ScriptGroup::Cyrillic, &["привет"]),
+        ];
+        let state = test_state(Some(TextLanguage::Es), bundles);
+
+        assert_eq!(
+            evaluate_word(&state, ScriptGroup::Cyrillic, "привет"),
+            SpellStatus::Correct,
+            "a Cyrillic word must still match the Cyrillic dictionary on disk"
+        );
+        assert_eq!(evaluate_word(&state, ScriptGroup::Latin, "casa"), SpellStatus::Correct);
+        assert_eq!(evaluate_word(&state, ScriptGroup::Latin, "kasa"), SpellStatus::Incorrect);
+    }
+
+    /// When the active language's dictionary is absent (e.g. its download failed),
+    /// its words are left UNMARKED rather than judged by a sibling-script dictionary
+    /// that would flag nearly all of them.
+    #[test]
+    fn missing_active_dictionary_leaves_words_unmarked() {
+        let bundles = vec![test_bundle("ru_RU", ScriptGroup::Cyrillic, &["привет"])];
+        let state = test_state(Some(TextLanguage::Sr), bundles);
+
+        assert_eq!(
+            evaluate_word(&state, ScriptGroup::Cyrillic, "здраво"),
+            SpellStatus::Unsupported,
+            "Serbian text must not be judged by the Russian dictionary"
+        );
+    }
+
+    #[test]
+    fn classification_is_language_independent() {
+        // The (group, normalized word) pair does not depend on the active language;
+        // only the cache partition does.
+        let latin = classify_and_normalize("Casa").expect("latin word should classify");
+        assert_eq!(latin, (ScriptGroup::Latin, "casa".to_string()));
+
+        for language in TextLanguage::all() {
+            let key = build_cache_key_for("Casa", language).expect("should classify");
+            assert_eq!(key.group, ScriptGroup::Latin);
+            assert_eq!(key.word, "casa");
+            assert_eq!(key.language, language);
+        }
+    }
 }

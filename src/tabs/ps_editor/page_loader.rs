@@ -121,10 +121,7 @@ fn load_page(
         None => {
             let decoded = image::open(&request.page_path)
                 .map_err(|err| {
-                    format!(
-                        "Не удалось открыть страницу {}: {err}",
-                        request.page_path.display()
-                    )
+                    tf!("ps_editor.page_loader.open_error", path = request.page_path.display(), err = err)
                 })?
                 .to_rgba8();
             let decoded = Arc::new(decoded);
@@ -137,10 +134,7 @@ fn load_page(
 
     let size = [source_rgba.width() as usize, source_rgba.height() as usize];
     if size[0] == 0 || size[1] == 0 {
-        return Err(format!(
-            "Страница {} имеет нулевой размер.",
-            request.page_path.display()
-        ));
+        return Err(tf!("ps_editor.page_loader.zero_size", path = request.page_path.display()));
     }
 
     let clean_rgba = overlays_model

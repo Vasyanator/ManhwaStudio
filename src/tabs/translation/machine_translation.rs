@@ -225,11 +225,11 @@ impl AiMtReasoning {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::None => "Нет",
-            Self::Low => "Низкое",
-            Self::Medium => "Среднее",
-            Self::High => "Высокое",
-            Self::XHigh => "Очень высокое",
+            Self::None => t!("translation.mt.reasoning_none"),
+            Self::Low => t!("translation.mt.reasoning_low"),
+            Self::Medium => t!("translation.mt.reasoning_medium"),
+            Self::High => t!("translation.mt.reasoning_high"),
+            Self::XHigh => t!("translation.mt.reasoning_very_high"),
         }
     }
 
@@ -279,9 +279,9 @@ impl AiMtImageDetail {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Auto => "Авто",
-            Self::Low => "Низкая",
-            Self::High => "Высокая",
+            Self::Auto => t!("translation.mt.image_detail_auto"),
+            Self::Low => t!("translation.mt.image_detail_low"),
+            Self::High => t!("translation.mt.image_detail_high"),
         }
     }
 
@@ -323,8 +323,8 @@ impl AiMtImageMode {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Normal => "Обычный",
-            Self::ImagesOnly => "Только картинки",
+            Self::Normal => t!("translation.mt.mode_normal"),
+            Self::ImagesOnly => t!("translation.mt.mode_images_only"),
         }
     }
 
@@ -355,8 +355,8 @@ impl AiMtContextSource {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Original => "Оригинал",
-            Self::Translation => "Перевод",
+            Self::Original => t!("translation.common.original_label"),
+            Self::Translation => t!("translation.common.translation_label"),
         }
     }
 
@@ -482,10 +482,10 @@ impl TranslationMtController {
 
     pub fn start_translation(&mut self, request: MtTranslateRequest) -> Result<(), String> {
         if self.busy {
-            return Err("Перевод уже выполняется.".to_string());
+            return Err(t!("translation.mt.already_running_status").to_string());
         }
         if request.items.is_empty() {
-            return Err("Нет пузырей для перевода.".to_string());
+            return Err(t!("translation.mt.no_bubbles_status").to_string());
         }
 
         self.reap_detached_run_threads();
@@ -502,7 +502,7 @@ impl TranslationMtController {
             if result.is_err() {
                 let _ = evt_tx.send(WorkerEvent::RunFailed {
                     run_id,
-                    error: "Worker машинного перевода аварийно завершился.".to_string(),
+                    error: t!("translation.mt.worker_crashed_error").to_string(),
                 });
             }
         });
@@ -672,7 +672,7 @@ impl TranslationMtController {
                 Err(TryRecvError::Disconnected) => {
                     self.finish_active_run();
                     out.push(MtControllerEvent::RunFailed {
-                        error: "Worker машинного перевода отключился.".to_string(),
+                        error: t!("translation.mt.worker_disconnected_error").to_string(),
                     });
                     break;
                 }
@@ -851,10 +851,7 @@ fn run_translate_request(
         match backend_result {
             Ok(mut results) => {
                 if results.len() != 1 {
-                    let err = format!(
-                        "Некорректный ответ переводчика: ожидался 1 результат, получено {}.",
-                        results.len()
-                    );
+                    let err = tf!("translation.mt.invalid_response_error", results = results.len());
                     let _ = evt_tx.send(WorkerEvent::ItemFailed {
                         run_id,
                         bubble_id: item_id,
@@ -1037,7 +1034,7 @@ fn run_ai_translate_request(
 ) {
     let _ = evt_tx.send(WorkerEvent::RunFailed {
         run_id,
-        error: "Перевод через AI API недоступен в веб-версии.".to_string(),
+        error: t!("translation.mt.ai_api_web_unavailable_error").to_string(),
     });
 }
 
@@ -1060,7 +1057,7 @@ fn run_ai_translate_request(
         Ok(_) => {
             let _ = evt_tx.send(WorkerEvent::RunFailed {
                 run_id,
-                error: format!("API key {} не задан.", service.label()),
+                error: tf!("translation.mt.api_key_missing_error", service = service.label()),
             });
             return;
         }
@@ -1087,7 +1084,7 @@ fn run_ai_translate_request(
             ));
             let _ = evt_tx.send(WorkerEvent::RunFailed {
                 run_id,
-                error: format!("Не удалось создать async runtime для AI перевода: {err}"),
+                error: tf!("translation.mt.async_runtime_error", err = err),
             });
             return;
         }
@@ -1238,7 +1235,7 @@ async fn run_ai_translate_async(
                 runtime_log::log_error(format!(
                     "[MT][run {run_id}] batch {batch_no}/{batch_total}: provider request failed: {err}"
                 ));
-                return Err(format!("AI перевод не выполнен: {err}"));
+                return Err(tf!("translation.mt.ai_translate_failed_error", err = err));
             }
         };
         let response_text = response.first_text().unwrap_or("").trim().to_string();
@@ -1313,12 +1310,12 @@ async fn run_ai_translate_async(
                         *translated = translated.saturating_add(1);
                     } else {
                         let error = if multi_area {
-                            "AI не вернул areas с original_text и translation для ImageBubble."
+                            t!("translation.mt.ai_no_areas_error")
                                 .to_string()
                         } else if item.image.is_some() {
-                            "AI не вернул original_text и translation для ImageBubble.".to_string()
+                            t!("translation.mt.ai_no_original_translation_error").to_string()
                         } else {
-                            "AI не вернул перевод с этим ID.".to_string()
+                            t!("translation.mt.ai_no_translation_for_id_error").to_string()
                         };
                         let _ = evt_tx.send(WorkerEvent::ItemFailed {
                             run_id,
@@ -1500,7 +1497,7 @@ async fn run_ai_imagebubble_translate_async(
                     "[MT][run {run_id}] target {target_no}/{target_total} (id={}): provider request failed: {err}",
                     item.bubble_id,
                 ));
-                return Err(format!("AI перевод не выполнен: {err}"));
+                return Err(tf!("translation.mt.ai_translate_failed_error", err = err));
             }
         };
         let response_text = response.first_text().unwrap_or("").trim().to_string();
@@ -1614,7 +1611,7 @@ fn imagebubble_target_image(
     let image = item
         .image
         .as_ref()
-        .ok_or_else(|| "ImageBubble без прикреплённой картинки.".to_string())?;
+        .ok_or_else(|| t!("translation.mt.imagebubble_no_image_error").to_string())?;
     load_mt_encoded_image(&options.project, image, options.image_detail)
 }
 
@@ -1777,7 +1774,7 @@ fn emit_imagebubble_result(
                 let _ = evt_tx.send(WorkerEvent::ItemFailed {
                     run_id,
                     bubble_id: item.bubble_id,
-                    error: "AI не вернул areas с original_text и translation для ImageBubble."
+                    error: t!("translation.mt.ai_no_areas_error")
                         .to_string(),
                 });
                 *errors = errors.saturating_add(1);
@@ -1805,7 +1802,7 @@ fn emit_imagebubble_result(
                 let _ = evt_tx.send(WorkerEvent::ItemFailed {
                     run_id,
                     bubble_id: item.bubble_id,
-                    error: "AI не вернул original_text и translation для ImageBubble.".to_string(),
+                    error: t!("translation.mt.ai_no_original_translation_error").to_string(),
                 });
                 *errors = errors.saturating_add(1);
                 None
@@ -2010,7 +2007,7 @@ fn build_ai_mt_batch_prompt(
         })
         .collect::<Vec<_>>();
     let json = serde_json::to_string(&payload)
-        .map_err(|err| format!("Не удалось сериализовать batch для AI перевода: {err}"))?;
+        .map_err(|err| tf!("translation.mt.serialize_batch_error", err = err))?;
     Ok(format!("Translate this JSON batch:\n{json}"))
 }
 
@@ -2165,7 +2162,7 @@ pub fn build_ai_mt_request_preview(
     let batches = split_ai_mt_batches(&items, batch_size);
     let batch_total = batches.len();
     let Some(first) = batches.into_iter().next() else {
-        return Err("Нет реплик для перевода: предпросмотр запроса недоступен.".to_string());
+        return Err(t!("translation.mt.no_replicas_preview_status").to_string());
     };
 
     let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, options);
@@ -2182,7 +2179,7 @@ pub fn build_ai_mt_request_preview(
             MtUserPart::Image { bubble_id, encoded } => {
                 let decoded = image::load_from_memory(&encoded.bytes)
                     .map_err(|err| {
-                        format!("Не удалось декодировать картинку для предпросмотра: {err}")
+                        tf!("translation.mt.decode_preview_image_error", err = err)
                     })?
                     .to_rgba8();
                 image_count = image_count.saturating_add(1);
@@ -2234,13 +2231,13 @@ fn build_ai_mt_imagebubble_request_preview(
         ));
     }
     let Some(target) = target else {
-        return Err("Нет ImageBubble для перевода: предпросмотр запроса недоступен.".to_string());
+        return Err(t!("translation.mt.no_imagebubble_preview_status").to_string());
     };
 
     let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, options);
     let encoded = imagebubble_target_image(options, target)?;
     let decoded = image::load_from_memory(&encoded.bytes)
-        .map_err(|err| format!("Не удалось декодировать картинку для предпросмотра: {err}"))?
+        .map_err(|err| tf!("translation.mt.decode_preview_image_error", err = err))?
         .to_rgba8();
 
     let mut parts = Vec::new();
@@ -2391,7 +2388,7 @@ fn ai_mt_ordered_item_descriptor(
         );
     }
     let json = serde_json::to_string(&Value::Object(entry))
-        .map_err(|err| format!("Не удалось сериализовать item для AI перевода: {err}"))?;
+        .map_err(|err| tf!("translation.mt.serialize_item_error", err = err))?;
     Ok(format!("Item:\n{json}"))
 }
 
@@ -2417,7 +2414,7 @@ fn load_mt_encoded_image(
         MtImageSource::ExternalPath(raw_path) => {
             let path = resolve_project_image_bubble_path(project, raw_path);
             image::open(&path)
-                .map_err(|err| format!("Не удалось открыть картинку {}: {err}", path.display()))?
+                .map_err(|err| tf!("translation.mt.open_image_error", path = path.display(), err = err))?
         }
         MtImageSource::PageCrop {
             page_idx,
@@ -2427,10 +2424,10 @@ fn load_mt_encoded_image(
                 .pages
                 .iter()
                 .find(|page| page.idx == *page_idx)
-                .ok_or_else(|| format!("Страница вырезки не найдена: #{}", page_idx + 1))?;
+                .ok_or_else(|| tf!("translation.mt.crop_page_not_found_error", page_idx = page_idx + 1))?;
             let source = image::open(&page.path)
                 .map_err(|err| {
-                    format!("Не удалось открыть страницу {}: {err}", page.path.display())
+                    tf!("translation.mt.open_page_error", page = page.path.display(), err = err)
                 })?
                 .to_rgba8();
             let rect = normalize_uv_rect(*crop_rect);
@@ -2470,7 +2467,7 @@ fn encode_png(image: image::DynamicImage) -> Result<EncodedMtImage, String> {
     let mut out = Vec::new();
     image
         .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .map_err(|err| format!("Не удалось закодировать картинку ImageBubble: {err}"))?;
+        .map_err(|err| tf!("translation.mt.encode_imagebubble_error", err = err))?;
     Ok(EncodedMtImage {
         bytes: out,
         mime_type: "image/png",
@@ -2585,7 +2582,7 @@ struct AiMtArea {
 fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
     let json_text = extract_json_payload(raw);
     let value: Value = serde_json::from_str(&json_text)
-        .map_err(|err| format!("AI вернул невалидный JSON: {err}"))?;
+        .map_err(|err| tf!("translation.mt.invalid_json_error", err = err))?;
     // Accept a flat array, an object wrapping a `translations` array, or — as the per-ImageBubble
     // mode returns — a single result object for the one target bubble.
     let arr: Vec<&Value> = if let Some(arr) = value.as_array() {
@@ -2599,7 +2596,7 @@ fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
     {
         vec![&value]
     } else {
-        return Err("AI JSON должен быть массивом или объектом translations.".to_string());
+        return Err(t!("translation.mt.json_not_array_error").to_string());
     };
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
@@ -2607,7 +2604,7 @@ fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
             .get("id")
             .or_else(|| item.get("bubble_id"))
             .and_then(Value::as_i64)
-            .ok_or_else(|| "В элементе AI JSON нет числового id.".to_string())?;
+            .ok_or_else(|| t!("translation.mt.json_no_id_error").to_string())?;
         // Multi-area image bubble: a per-area array of {original_text, translation}.
         let areas = item
             .get("areas")
@@ -2620,7 +2617,7 @@ fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
             .and_then(Value::as_str)
             .map(|value| value.trim().to_string());
         if translation.is_none() && areas.is_empty() {
-            return Err("В элементе AI JSON нет ни translation, ни areas.".to_string());
+            return Err(t!("translation.mt.json_no_translation_error").to_string());
         }
         let original_text = item
             .get("original_text")
@@ -2964,7 +2961,16 @@ mod tests {
         // only after selecting the single target and gathering its two context replicas.
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("картинку") || err.contains("Не удалось"));
+        // Pin the catalog key rather than a Russian substring. Tests share one process and
+        // `locale_store`'s tests install a catalog into the process-global `ArcSwap`, so which
+        // language `t!` yields here depends on test order. Comparing against the template's
+        // fixed prefix is locale-independent and still proves the image-load error was chosen.
+        let template = t!("translation.mt.open_image_error");
+        let prefix = template.split("{path}").next().unwrap_or(template);
+        assert!(
+            err.starts_with(prefix),
+            "expected the image-load error, got {err:?}"
+        );
     }
 
     #[test]

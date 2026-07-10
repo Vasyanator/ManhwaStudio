@@ -485,7 +485,7 @@ impl TypingTextOverlayLayer {
                 });
                 response.context_menu(|menu_ui| {
                     if self.selected_overlay_idx != Some(entry.idx) {
-                        menu_ui.label("Выделите оверлей ЛКМ.");
+                        menu_ui.label(t!("typing.canvas.select_overlay_hint"));
                         return;
                     }
                     if self
@@ -504,7 +504,7 @@ impl TypingTextOverlayLayer {
                         );
                     }
                     if menu_ui
-                        .button("Войти в режим изменения раскладки")
+                        .button(t!("typing.context_menu.enter_layout_edit_mode"))
                         .clicked()
                     {
                         pending_enter_layout_editor_idx = Some(entry.idx);
@@ -513,7 +513,7 @@ impl TypingTextOverlayLayer {
                     menu_ui.separator();
                     if !is_transform_mode {
                         if menu_ui
-                            .button("Войти в режим трансформации (растровая)")
+                            .button(t!("typing.context_menu.enter_transform_mode_raster"))
                             .clicked()
                         {
                             if self.ensure_overlay_deform_mesh(entry.idx, image_rect, zoom) {
@@ -537,7 +537,7 @@ impl TypingTextOverlayLayer {
                         match vector_menu_state {
                             Some(true) => {
                                 if menu_ui
-                                    .button("Войти в режим трансформации (векторная)")
+                                    .button(t!("typing.context_menu.enter_transform_mode_vector"))
                                     .clicked()
                                 {
                                     crate::trace_log!(
@@ -559,16 +559,16 @@ impl TypingTextOverlayLayer {
                                     .add_enabled(
                                         false,
                                         egui::Button::new(
-                                            "Войти в режим трансформации (векторная)",
+                                            t!("typing.context_menu.enter_transform_mode_vector"),
                                         ),
                                     )
-                                    .on_disabled_hover_text("Недоступно для этой раскладки");
+                                    .on_disabled_hover_text(t!("typing.context_menu.layout_not_supported"));
                             }
                             None => {}
                         }
                     } else {
                         if menu_ui
-                            .button("Выйти из режима трансформации (растровая)")
+                            .button(t!("typing.context_menu.exit_transform_mode_raster"))
                             .clicked()
                         {
                             crate::trace_log!(
@@ -584,7 +584,7 @@ impl TypingTextOverlayLayer {
                             menu_ui.close();
                         }
                         if menu_ui
-                            .button("Сбросить трансформацию (растровая)")
+                            .button(t!("typing.context_menu.reset_transform_raster"))
                             .clicked()
                         {
                             crate::trace_log!(
@@ -605,9 +605,9 @@ impl TypingTextOverlayLayer {
                     menu_ui.separator();
                     if let Some(overlay) = self.overlays.get(entry.idx) {
                         let toggle_label = if overlay.mask_clip_enabled {
-                            "Выключить обрезание маской"
+                            t!("typing.context_menu.disable_mask_clip")
                         } else {
-                            "Включить обрезание маской"
+                            t!("typing.context_menu.enable_mask_clip")
                         };
                         if menu_ui.button(toggle_label).clicked() {
                             let mut new_state = false;
@@ -633,7 +633,7 @@ impl TypingTextOverlayLayer {
                         // number — order is the shared layer stack.
                         let mut move_z_up: Option<bool> = None;
                         menu_ui.horizontal(|row| {
-                            row.label("Порядок");
+                            row.label(t!("typing.context_menu.order"));
                             if row.button("▲").clicked() {
                                 move_z_up = Some(true);
                             }
@@ -646,7 +646,7 @@ impl TypingTextOverlayLayer {
                         }
                     }
                     menu_ui.separator();
-                    if menu_ui.button("Удалить оверлей").clicked() {
+                    if menu_ui.button(t!("typing.context_menu.delete_overlay")).clicked() {
                         pending_delete_overlay_idx = Some(entry.idx);
                         menu_ui.close();
                     }

@@ -77,7 +77,7 @@ impl PsTool for DeformTool {
     }
 
     fn title(&self) -> &'static str {
-        "Деформация (сетка)"
+        t!("ps_editor.tools.deform_title")
     }
 
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
@@ -207,9 +207,9 @@ impl PsTool for DeformTool {
     }
 
     fn options_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Тяните узлы сетки,");
-        ui.label("чтобы деформировать слой.");
-        ui.label("Сетка появляется при входе в режим.");
-        ui.label("Действует на активный слой (не базовый).");
+        ui.label(t!("ps_editor.tools.deform_hint_line1"));
+        ui.label(t!("ps_editor.tools.deform_hint_line2"));
+        ui.label(t!("ps_editor.tools.deform_hint_line3"));
+        ui.label(t!("ps_editor.tools.applies_to_active_layer_hint"));
     }
 }

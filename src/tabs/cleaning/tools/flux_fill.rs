@@ -20,7 +20,7 @@ use crate::backend_ipc::{self, CallError};
 use crate::canvas::CanvasView;
 use crate::config;
 use crate::project::ProjectData;
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use image::{ColorType, ImageEncoder};
@@ -247,7 +247,7 @@ impl FluxFillInpaintTool {
         progress: &Arc<Mutex<FluxSharedProgress>>,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let (width, height) = (image.size[0], image.size[1]);
         if width == 0 || height == 0 {
@@ -258,7 +258,7 @@ impl FluxFillInpaintTool {
         }
         let mode = FluxMode::from_wire(&cfg.settings.mode);
         if mode == FluxMode::Inpaint && cfg.settings.prompt.trim().is_empty() {
-            return Err("Для режима «Перерисовка» укажите запрос (prompt).".to_string());
+            return Err(t!("cleaning.tools.flux.prompt_required_error").to_string());
         }
 
         let image_png = encode_color_image_png_rgba(image)?;
@@ -292,7 +292,7 @@ impl FluxFillInpaintTool {
             guard.phase = "generate".to_string();
             guard.step = 0;
             guard.total = u64::from(cfg.settings.steps);
-            guard.label = "Подготовка…".to_string();
+            guard.label = t!("cleaning.tools.flux.preparing_status").to_string();
         }
         let stream_result = flux_stream_call(header, &blob, |phase, step, total, label| {
             let mut guard = lock_progress(progress);
@@ -307,16 +307,14 @@ impl FluxFillInpaintTool {
         }
         let (_response_header, out_bytes) = stream_result?;
         if out_bytes.is_empty() {
-            return Err("AI backend не вернул PNG результата.".to_string());
+            return Err(t!("cleaning.inpaint.no_png_result_error").to_string());
         }
         let out_rgba = image::load_from_memory(&out_bytes)
-            .map_err(|err| format!("AI backend вернул повреждённый PNG: {err}"))?
+            .map_err(|err| tf!("cleaning.inpaint.corrupt_png_error", err = err))?
             .to_rgba8();
         let (out_w, out_h) = (out_rgba.width() as usize, out_rgba.height() as usize);
         if out_w != width || out_h != height {
-            return Err(format!(
-                "AI backend вернул неожиданный размер: {out_w}x{out_h} (ожидалось {width}x{height})."
-            ));
+            return Err(tf!("cleaning.inpaint.unexpected_size_error", out_w = out_w, out_h = out_h, width = width, height = height));
         }
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [out_w, out_h],
@@ -331,7 +329,7 @@ impl CleaningTool for FluxFillInpaintTool {
     }
 
     fn title(&self) -> &'static str {
-        "AI редактирование области (FLUX.1 Fill)"
+        t!("cleaning.tools.flux.title")
     }
 
     fn pytorch_required(&self) -> bool {
@@ -344,8 +342,8 @@ impl CleaningTool for FluxFillInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Обработка через Python AI backend: inpaint.flux_fill (v2 IPC).");
-        ui.small("Модель (GGUF + компоненты) скачивается автоматически при первом запуске.");
+        ui.small(t!("cleaning.tools.flux.description_hint"));
+        ui.small(t!("cleaning.tools.flux.autodownload_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -414,22 +412,22 @@ impl CleaningTool for FluxFillInpaintTool {
             ctx,
             canvas,
             project,
-            "AI редактирование области (FLUX.1 Fill)",
+            t!("cleaning.tools.flux.title"),
             move |image, mask| Self::run_flux(image, mask, &run_config, &run_progress),
             |ui| {
                 draw_flux_progress_ui(ui, &ui_progress);
-                egui::CollapsingHeader::new("Параметры (FLUX.1 Fill)")
+                egui::CollapsingHeader::new(t!("cleaning.tools.flux.params_heading")).id_salt("cleaning.tools.flux.params_heading")
                     .id_salt("cleaning_flux_params_collapse")
                     .default_open(false)
                     .show(ui, |ui| {
                         changed |= draw_flux_params_ui(ui, settings, status_snapshot.as_ref());
-                        if ui.small_button("Обновить состояние загрузки").clicked() {
+                        if ui.small_button(t!("cleaning.tools.flux.refresh_download_button")).clicked() {
                             want_status = true;
                         }
-                        if ui.small_button("Выгрузить модель из backend").clicked() {
+                        if ui.small_button(t!("cleaning.tools.flux.unload_button")).clicked() {
                             *unload_status = match unload_flux() {
-                                Ok(()) => Some("Запрошена выгрузка Flux из памяти backend.".to_string()),
-                                Err(err) => Some(format!("Ошибка выгрузки: {err}")),
+                                Ok(()) => Some(t!("cleaning.tools.flux.unload_requested_status").to_string()),
+                                Err(err) => Some(tf!("cleaning.inpaint.unload_error", err = err)),
                             };
                         }
                         if let Some(s) = unload_status.as_ref() {
@@ -477,19 +475,19 @@ fn draw_flux_params_ui(
     let mut mode = FluxMode::from_wire(&settings.mode);
 
     ui.horizontal(|ui| {
-        ui.label("Режим");
+        ui.label(t!("cleaning.common.mode_label"));
         let mode_label = match mode {
-            FluxMode::ObjectRemoval => "Удаление объекта",
-            FluxMode::Inpaint => "Перерисовка по запросу",
+            FluxMode::ObjectRemoval => t!("cleaning.tools.flux.mode_remove_object"),
+            FluxMode::Inpaint => t!("cleaning.tools.flux.mode_prompt_repaint"),
         };
         WheelComboBox::from_id_salt("cleaning_flux_mode_picker")
             .selected_text(mode_label)
             .show_ui(ui, |ui| {
                 changed |= ui
-                    .selectable_value(&mut mode, FluxMode::ObjectRemoval, "Удаление объекта")
+                    .selectable_value(&mut mode, FluxMode::ObjectRemoval, t!("cleaning.tools.flux.mode_remove_object"))
                     .changed();
                 changed |= ui
-                    .selectable_value(&mut mode, FluxMode::Inpaint, "Перерисовка по запросу")
+                    .selectable_value(&mut mode, FluxMode::Inpaint, t!("cleaning.tools.flux.mode_prompt_repaint"))
                     .changed();
             });
     });
@@ -499,7 +497,7 @@ fn draw_flux_params_ui(
     }
 
     ui.horizontal(|ui| {
-        ui.label("Квант (GGUF)");
+        ui.label(t!("cleaning.tools.flux.quant_label"));
         let label = quant_label(&settings.quant, status);
         WheelComboBox::from_id_salt("cleaning_flux_quant_picker")
             .selected_text(label)
@@ -514,16 +512,16 @@ fn draw_flux_params_ui(
     });
     if let Some(s) = status {
         let comp = if s.components_ready {
-            "компоненты: скачаны"
+            t!("cleaning.tools.flux.components_downloaded_status")
         } else {
-            "компоненты: будут скачаны"
+            t!("cleaning.tools.flux.components_pending_status")
         };
         ui.small(comp);
     }
 
     let prompt_hint = match mode {
-        FluxMode::ObjectRemoval => "Запрос (необязательно; пусто = «чистый фон»):",
-        FluxMode::Inpaint => "Запрос (что нарисовать в области маски):",
+        FluxMode::ObjectRemoval => t!("cleaning.tools.flux.prompt_optional_label"),
+        FluxMode::Inpaint => t!("cleaning.tools.flux.prompt_repaint_label"),
     };
     ui.label(prompt_hint);
     changed |= ui
@@ -531,22 +529,22 @@ fn draw_flux_params_ui(
         .changed();
 
     changed |= ui
-        .add(WheelSlider::new(&mut settings.steps, 1..=100).text("Шаги"))
+        .add(WheelSlider::new(&mut settings.steps, 1..=100).text(t!("cleaning.common.steps_label")))
         .changed();
     changed |= ui
         .add(WheelSlider::new(&mut settings.guidance, 0.0..=60.0).text("Guidance"))
         .changed();
     changed |= ui
-        .add(WheelSlider::new(&mut settings.dilate, 0..=100).text("Расширение маски"))
+        .add(WheelSlider::new(&mut settings.dilate, 0..=100).text(t!("cleaning.common.mask_expand_label")))
         .changed();
     changed |= ui
-        .add(WheelSlider::new(&mut settings.feather, 0..=100).text("Растушёвка края"))
+        .add(WheelSlider::new(&mut settings.feather, 0..=100).text(t!("cleaning.tools.flux.edge_feather_label")))
         .changed();
     changed |= ui
-        .checkbox(&mut settings.seamless, "Сшивка по краю (выравнивание тона)")
+        .checkbox(&mut settings.seamless, t!("cleaning.tools.flux.edge_stitch_label"))
         .changed();
 
-    egui::CollapsingHeader::new("Дополнительно")
+    egui::CollapsingHeader::new(t!("cleaning.tools.flux.advanced_heading")).id_salt("cleaning.tools.flux.advanced_heading")
         .id_salt("cleaning_flux_advanced_collapse")
         .default_open(false)
         .show(ui, |ui| {
@@ -554,10 +552,10 @@ fn draw_flux_params_ui(
                 .add(WheelSlider::new(&mut settings.max_seq, 64..=512).text("Max tokens"))
                 .changed();
             changed |= ui
-                .add(WheelSlider::new(&mut settings.max_side, 256..=4096).text("Max сторона (инференс)"))
+                .add(WheelSlider::new(&mut settings.max_side, 256..=4096).text(t!("cleaning.tools.flux.max_side_label")))
                 .changed();
             ui.horizontal(|ui| {
-                ui.label("Seed (-1 — случайный)");
+                ui.label(t!("cleaning.common.seed_label"));
                 changed |= ui
                     .add(egui::DragValue::new(&mut settings.seed).speed(1.0))
                     .changed();
@@ -570,7 +568,7 @@ fn draw_flux_params_ui(
                 .checkbox(&mut settings.vae_tiling, "VAE tiling/slicing")
                 .changed();
             changed |= ui
-                .checkbox(&mut settings.cpu_offload, "CPU offload (меньше VRAM)")
+                .checkbox(&mut settings.cpu_offload, t!("cleaning.tools.flux.cpu_offload_label"))
                 .changed();
             changed |= ui
                 .checkbox(&mut settings.miopen_fast, "MIOpen Fast (ROCm)")
@@ -584,7 +582,7 @@ fn draw_flux_params_ui(
 fn quant_label(quant: &str, status: Option<&FluxStatus>) -> String {
     match status {
         Some(s) if s.downloaded.iter().any(|q| q == quant) => format!("{quant} ✓"),
-        Some(_) => format!("{quant} (скачать)"),
+        Some(_) => tf!("cleaning.tools.flux.quant_download_label", quant = quant),
         None => quant.to_string(),
     }
 }
@@ -613,9 +611,14 @@ fn draw_flux_progress_ui(ui: &mut egui::Ui, progress: &Mutex<FluxSharedProgress>
     let text = if phase == "download" {
         let done_gb = step as f64 / 1e9;
         let total_gb = total as f64 / 1e9;
-        format!("{label} — {:.2}/{:.2} ГБ", done_gb, total_gb)
+        tf!(
+            "cleaning.tools.flux.download_progress_status",
+            label = label,
+            done = format!("{done_gb:.2}"),
+            total = format!("{total_gb:.2}")
+        )
     } else if total > 0 {
-        format!("Шаг {step}/{total}")
+        tf!("cleaning.common.step_progress_status", step = step, total = total)
     } else {
         label.clone()
     };
@@ -644,7 +647,7 @@ fn flux_stream_call<F>(
 where
     F: FnMut(String, u64, u64, String),
 {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call_streaming(
             backend_ipc::protocol::METHOD_INPAINT_FLUX_FILL,
@@ -677,7 +680,7 @@ where
 }
 
 fn unload_flux() -> Result<(), String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call(
             backend_ipc::protocol::METHOD_INPAINT_FLUX_FILL_UNLOAD,
@@ -691,7 +694,7 @@ fn unload_flux() -> Result<(), String> {
 
 /// Queries the backend `.status` for the quant catalog + which are downloaded.
 fn fetch_flux_status() -> Result<FluxStatus, String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let (header, _blob) = client
         .call(
             backend_ipc::protocol::METHOD_INPAINT_FLUX_FILL_STATUS,
@@ -722,8 +725,8 @@ fn fetch_flux_status() -> Result<FluxStatus, String> {
 fn map_flux_call_error(err: CallError) -> String {
     match err {
         CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
-        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -740,19 +743,19 @@ fn save_flux_settings(settings: &FluxSettings) -> Result<(), String> {
     let path = config::flux_fill_inpaint_settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|err| format!("не удалось создать каталог настроек: {err}"))?;
+            .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
     }
     let raw = serde_json::to_string_pretty(settings)
-        .map_err(|err| format!("не удалось сериализовать настройки Flux: {err}"))?;
-    fs::write(&path, raw).map_err(|err| format!("не удалось записать настройки Flux: {err}"))
+        .map_err(|err| tf!("cleaning.tools.flux.serialize_settings_error", err = err))?;
+    fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.flux.write_settings_error", err = err))
 }
 
 fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let (width, height) = (image.size[0], image.size[1]);
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина изображения слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота изображения слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
     for px in &image.pixels {
         let [r, g, b, a] = px.to_srgba_unmultiplied();
@@ -761,15 +764,15 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
     Ok(out)
 }
 
 fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let (width, height) = (mask.size[0], mask.size[1]);
-    let width_u32 = u32::try_from(width).map_err(|_| "Ширина маски слишком большая.".to_string())?;
+    let width_u32 = u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота маски слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
     for px in &mask.pixels {
         raw.push(if px.a() > 0 { 255 } else { 0 });
@@ -777,7 +780,7 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG маски: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
     Ok(out)
 }
 
@@ -826,7 +829,10 @@ mod tests {
             components_ready: true,
         };
         assert_eq!(quant_label("Q8_0", Some(&status)), "Q8_0 ✓");
-        assert_eq!(quant_label("Q4_0", Some(&status)), "Q4_0 (скачать)");
+        assert_eq!(
+            quant_label("Q4_0", Some(&status)),
+            tf!("cleaning.tools.flux.quant_download_label", quant = "Q4_0")
+        );
         assert_eq!(quant_label("Q8_0", None), "Q8_0");
     }
 }

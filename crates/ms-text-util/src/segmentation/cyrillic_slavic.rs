@@ -5,9 +5,14 @@ Purpose:
 Cyrillic-Slavic implementation of the text segmenter (`ScriptGroup::CyrillicSlavic`:
 Russian, Ukrainian, Belarusian, Serbian-Cyrillic). Owns the historical Russian
 typographic rules — this is the byte-for-byte descendant of the former `ru.rs`,
-generalized only in which hyphenation dictionary is loaded (per `TextLanguage`).
-The binding word lists and boundary rules stay Russian-oriented for the whole
-group; the Russian output is unchanged from the pre-refactor renderer.
+generalized in which hyphenation dictionary is loaded (per `TextLanguage`) and in
+the service-word binding lists, which are now dispatched per language
+(Ru/Uk/Be/Sr). The boundary/syllable rules stay Russian-oriented for the whole
+group; the Russian output is unchanged from the pre-refactor renderer (the Uk/Be/Sr
+preposition and particle lists are best-effort, pending native-speaker review).
+Script-neutral binding primitives (`normalize_binding_token`, the single-letter
+orphan rule, the number+unit pair) live in `base` and are shared with
+`latin_slavic`.
 
 The dictionary (TeX patterns via the `hyphenation` crate) places syllable breaks
 and knows prefixes/doubled consonants. On top of it we enforce typographic rules
@@ -37,7 +42,10 @@ horizontal wrap; kept here so the group owns its own boundary policy):
 
 use std::rc::Rc;
 
-use super::base::{Conservatism, SOFT_HYPHEN, Segmenter};
+use super::base::{
+    Conservatism, SOFT_HYPHEN, Segmenter, is_numeric_measure_pair, is_single_letter_binding,
+    normalize_binding_token,
+};
 use super::dictionaries::HyphenationDictionaries;
 use crate::language::TextLanguage;
 
@@ -71,7 +79,7 @@ impl CyrillicSlavicSegmenter {
 
 impl Segmenter for CyrillicSlavicSegmenter {
     fn binding_conservatism(&self, left_token: &str, right_token: &str) -> Conservatism {
-        binding_conservatism(left_token, right_token)
+        binding_conservatism(self.language, left_token, right_token)
     }
 
     fn hyphenate_word(&self, word: &str) -> Option<String> {
@@ -394,11 +402,17 @@ fn is_cyrillic_consonant(ch: char) -> bool {
 
 // --- Word binding rules -----------------------------------------------------
 
-/// Conservatism category of a break between two tokens. `Safe` — an ordinary
-/// space (free to break); higher — a service binding whose separation is riskier
-/// the higher the class. The "above-Safe" set equals the former
-/// `should_keep_words_together`, so gluing (`BindingMode::Glue`) is unchanged.
-fn binding_conservatism(left_token: &str, right_token: &str) -> Conservatism {
+/// Conservatism category of a break between two tokens for `language` (one of the
+/// four Cyrillic-Slavic languages). `Safe` — an ordinary space (free to break);
+/// higher — a service binding whose separation is riskier the higher the class.
+/// The number+unit, single-letter and abbreviation rules are common to the group;
+/// only the preposition/particle lists are language-dispatched. For Russian the
+/// result is byte-identical to the pre-refactor renderer (golden tests).
+fn binding_conservatism(
+    language: TextLanguage,
+    left_token: &str,
+    right_token: &str,
+) -> Conservatism {
     // "Number + unit" ("5 кг") is the riskiest to break. Judged on RAW tokens:
     // normalization below would strip the digits and blank the left token.
     if is_numeric_measure_pair(left_token, right_token) {
@@ -412,12 +426,11 @@ fn binding_conservatism(left_token: &str, right_token: &str) -> Conservatism {
     }
 
     // A single-letter preposition/conjunction ("в дом", "к нам") is risky to strip.
-    let left_is_single = left.chars().count() == 1 && left.chars().all(char::is_alphabetic);
-    if left_is_single {
+    if is_single_letter_binding(left.as_str()) {
         return Conservatism::Reckless;
     }
     // Dictionary prepositions/conjunctions: short (2 letters) split more boldly.
-    if is_nonbreaking_prefix_word(left.as_str()) {
+    if is_nonbreaking_prefix_word(language, left.as_str()) {
         return if left.chars().count() <= 2 {
             Conservatism::Bold
         } else {
@@ -425,23 +438,63 @@ fn binding_conservatism(left_token: &str, right_token: &str) -> Conservatism {
         };
     }
     // Trailing particle ("же", "ли", "бы", "ка") clings to the previous word.
-    if is_nonbreaking_suffix_particle(right.as_str()) {
+    if is_nonbreaking_suffix_particle(language, right.as_str()) {
         return Conservatism::Bold;
     }
-    // Abbreviation with a dot ("стр.", "ул. Ленина").
+    // Abbreviation with a dot ("стр.", "ул. Ленина"). Russian-oriented and applied
+    // group-wide: it only raises break COST, never correctness.
     if is_nonbreaking_abbreviation(left_token) {
         return Conservatism::Relaxed;
     }
     Conservatism::Safe
 }
 
-fn normalize_binding_token(token: &str) -> String {
-    token
-        .trim_matches(|ch: char| !ch.is_alphabetic() && ch != SOFT_HYPHEN)
-        .to_lowercase()
+/// Whether `word` (already normalized/lowercased) is a preposition or conjunction
+/// that should not be orphaned at a line end, for the given Cyrillic-Slavic
+/// `language`. Non-Cyrillic languages never construct a `CyrillicSlavicSegmenter`,
+/// so they map to `false` (no Cyrillic service words) instead of panicking.
+fn is_nonbreaking_prefix_word(language: TextLanguage, word: &str) -> bool {
+    match language {
+        TextLanguage::Ru => is_russian_prefix_word(word),
+        TextLanguage::Uk => is_ukrainian_prefix_word(word),
+        TextLanguage::Be => is_belarusian_prefix_word(word),
+        TextLanguage::Sr => is_serbian_prefix_word(word),
+        TextLanguage::Pl
+        | TextLanguage::Cs
+        | TextLanguage::Sk
+        | TextLanguage::Sl
+        | TextLanguage::Hr
+        | TextLanguage::Es
+        | TextLanguage::Fr
+        | TextLanguage::Pt
+        | TextLanguage::En => false,
+    }
 }
 
-fn is_nonbreaking_prefix_word(word: &str) -> bool {
+/// Whether `word` (already normalized/lowercased) is a trailing particle that
+/// clings to the previous word, for the given Cyrillic-Slavic `language`. See
+/// [`is_nonbreaking_prefix_word`] for the non-Cyrillic mapping.
+fn is_nonbreaking_suffix_particle(language: TextLanguage, word: &str) -> bool {
+    match language {
+        TextLanguage::Ru => is_russian_suffix_particle(word),
+        TextLanguage::Uk => is_ukrainian_suffix_particle(word),
+        TextLanguage::Be => is_belarusian_suffix_particle(word),
+        TextLanguage::Sr => is_serbian_suffix_particle(word),
+        TextLanguage::Pl
+        | TextLanguage::Cs
+        | TextLanguage::Sk
+        | TextLanguage::Sl
+        | TextLanguage::Hr
+        | TextLanguage::Es
+        | TextLanguage::Fr
+        | TextLanguage::Pt
+        | TextLanguage::En => false,
+    }
+}
+
+/// Russian prepositions/conjunctions. BYTE-IDENTICAL to the pre-refactor list —
+/// guarded by `russian_segmentation_is_bit_identical`; do not edit.
+fn is_russian_prefix_word(word: &str) -> bool {
     matches!(
         word,
         "не" | "ни"
@@ -480,8 +533,103 @@ fn is_nonbreaking_prefix_word(word: &str) -> bool {
     )
 }
 
-fn is_nonbreaking_suffix_particle(word: &str) -> bool {
+/// Russian trailing particles. BYTE-IDENTICAL to the pre-refactor list — guarded
+/// by `russian_segmentation_is_bit_identical`; do not edit.
+fn is_russian_suffix_particle(word: &str) -> bool {
     matches!(word, "же" | "ли" | "ль" | "бы" | "б" | "ка" | "де" | "то")
+}
+
+// Best-effort service-word list for Ukrainian: common prepositions and
+// conjunctions. It only affects break COST (never correctness); a native speaker
+// should review it before it is treated as authoritative.
+fn is_ukrainian_prefix_word(word: &str) -> bool {
+    matches!(
+        word,
+        "без" | "для"
+            | "при"
+            | "про"
+            | "через"
+            | "перед"
+            | "від"
+            | "до"
+            | "за"
+            | "на"
+            | "над"
+            | "під"
+            | "по"
+            | "як"
+            | "що"
+            | "чи"
+            | "але"
+            | "не"
+            | "ні"
+    )
+}
+
+// Best-effort trailing-particle list for Ukrainian. Cost-only; native review
+// pending.
+fn is_ukrainian_suffix_particle(word: &str) -> bool {
+    matches!(word, "же" | "ж" | "би" | "б")
+}
+
+// Best-effort service-word list for Belarusian: common prepositions and
+// conjunctions. Cost-only; native review pending.
+fn is_belarusian_prefix_word(word: &str) -> bool {
+    matches!(
+        word,
+        "без" | "для"
+            | "пры"
+            | "праз"
+            | "перад"
+            | "ад"
+            | "да"
+            | "за"
+            | "на"
+            | "над"
+            | "пад"
+            | "па"
+            | "як"
+            | "што"
+            | "ці"
+            | "але"
+            | "не"
+            | "ня"
+    )
+}
+
+// Best-effort trailing-particle list for Belarusian. Cost-only; native review
+// pending.
+fn is_belarusian_suffix_particle(word: &str) -> bool {
+    matches!(word, "ж" | "бы" | "б" | "жа")
+}
+
+// Best-effort service-word list for Serbian (Cyrillic): common prepositions and
+// conjunctions. Cost-only; native review pending.
+fn is_serbian_prefix_word(word: &str) -> bool {
+    matches!(
+        word,
+        "без" | "за"
+            | "на"
+            | "над"
+            | "под"
+            | "при"
+            | "пре"
+            | "кроз"
+            | "али"
+            | "до"
+            | "од"
+            | "из"
+            | "као"
+            | "да"
+            | "не"
+            | "или"
+    )
+}
+
+// Best-effort trailing-particle/clitic list for Serbian (Cyrillic). Cost-only;
+// native review pending.
+fn is_serbian_suffix_particle(word: &str) -> bool {
+    matches!(word, "ли" | "се" | "би" | "ће")
 }
 
 fn is_nonbreaking_abbreviation(token: &str) -> bool {
@@ -497,43 +645,6 @@ fn is_nonbreaking_abbreviation(token: &str) -> bool {
         core.as_str(),
         "г" | "стр" | "рис" | "им" | "тов" | "ул" | "д" | "кв" | "см" | "т" | "п"
     )
-}
-
-fn is_numeric_measure_pair(left_token: &str, right_token: &str) -> bool {
-    let left = left_token
-        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\''));
-    let right = right_token
-        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '№')
-        .to_lowercase();
-    (is_numeric_token(left) || left == "№") && is_measure_or_unit_token(right.as_str())
-}
-
-fn is_numeric_token(token: &str) -> bool {
-    let compact = token
-        .trim_matches(|ch: char| !ch.is_alphanumeric())
-        .replace(',', ".")
-        .replace(' ', "");
-    !compact.is_empty() && compact.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
-}
-
-fn is_measure_or_unit_token(token: &str) -> bool {
-    matches!(
-        token,
-        "кг" | "г"
-            | "мг"
-            | "л"
-            | "мл"
-            | "м"
-            | "см"
-            | "мм"
-            | "км"
-            | "стр"
-            | "с"
-            | "мин"
-            | "ч"
-            | "шт"
-            | "гл"
-    ) || token.starts_with("стр")
 }
 
 #[cfg(test)]
@@ -680,14 +791,63 @@ mod tests {
 
     #[test]
     fn binding_conservatism_categories() {
-        assert_eq!(binding_conservatism("в", "дом"), Conservatism::Reckless);
-        assert_eq!(binding_conservatism("5", "кг"), Conservatism::Reckless);
-        assert_eq!(binding_conservatism("не", "вижу"), Conservatism::Bold);
-        assert_eq!(binding_conservatism("по", "небу"), Conservatism::Bold);
-        assert_eq!(binding_conservatism("он", "же"), Conservatism::Bold);
-        assert_eq!(binding_conservatism("через", "лес"), Conservatism::Relaxed);
-        assert_eq!(binding_conservatism("ул.", "Ленина"), Conservatism::Relaxed);
-        assert_eq!(binding_conservatism("кошка", "спит"), Conservatism::Safe);
+        use TextLanguage::Ru;
+        assert_eq!(binding_conservatism(Ru, "в", "дом"), Conservatism::Reckless);
+        assert_eq!(binding_conservatism(Ru, "5", "кг"), Conservatism::Reckless);
+        assert_eq!(binding_conservatism(Ru, "не", "вижу"), Conservatism::Bold);
+        assert_eq!(binding_conservatism(Ru, "по", "небу"), Conservatism::Bold);
+        assert_eq!(binding_conservatism(Ru, "он", "же"), Conservatism::Bold);
+        assert_eq!(binding_conservatism(Ru, "через", "лес"), Conservatism::Relaxed);
+        assert_eq!(binding_conservatism(Ru, "ул.", "Ленина"), Conservatism::Relaxed);
+        assert_eq!(binding_conservatism(Ru, "кошка", "спит"), Conservatism::Safe);
+    }
+
+    /// Pins the ONE intended Russian behavior change from extracting the binding
+    /// helpers into `base.rs`: the unit list became a script-agnostic superset, so a
+    /// Latin unit after a number now binds inside Russian text. Before the extraction
+    /// the Cyrillic-only list left "5 kg" a free break. Cyrillic units are unaffected
+    /// (asserted in `binding_conservatism_categories`).
+    #[test]
+    fn russian_binds_a_latin_unit_after_the_shared_extraction() {
+        assert_eq!(
+            binding_conservatism(TextLanguage::Ru, "5", "kg"),
+            Conservatism::Reckless
+        );
+    }
+
+    #[test]
+    fn binding_is_language_dispatched() {
+        use TextLanguage::{Ru, Sr, Uk};
+
+        // Ukrainian consults its own preposition list: "але" (but) is a Ukrainian
+        // conjunction absent from the Russian list, so it binds only under Uk.
+        assert_eq!(binding_conservatism(Uk, "але", "все"), Conservatism::Relaxed);
+        assert_eq!(binding_conservatism(Ru, "але", "все"), Conservatism::Safe);
+
+        // ...and vice versa: the Ukrainian 2-letter conjunction "ні" (spelled with
+        // Cyrillic і) binds in Uk but is an unknown word to Russian (whose list has
+        // "ни" with и instead).
+        assert_eq!(binding_conservatism(Uk, "ні", "я"), Conservatism::Bold);
+        assert_eq!(binding_conservatism(Ru, "ні", "я"), Conservatism::Safe);
+
+        // Serbian clitic "се" is a trailing particle in Serbian only.
+        assert_eq!(binding_conservatism(Sr, "он", "се"), Conservatism::Bold);
+        assert_eq!(binding_conservatism(Ru, "он", "се"), Conservatism::Safe);
+
+        // Serbian preposition "кроз" (through) is Serbian-specific.
+        assert_eq!(binding_conservatism(Sr, "кроз", "шуму"), Conservatism::Relaxed);
+        assert_eq!(binding_conservatism(Ru, "кроз", "шуму"), Conservatism::Safe);
+    }
+
+    #[test]
+    fn per_language_dispatch_is_observable() {
+        // The dispatch must be real, not a shared superset: at least one input must
+        // classify differently across languages. "але" binds in Ukrainian but is a
+        // plain word for Russian.
+        assert_ne!(
+            binding_conservatism(TextLanguage::Uk, "але", "все"),
+            binding_conservatism(TextLanguage::Ru, "але", "все"),
+        );
     }
 
     #[test]

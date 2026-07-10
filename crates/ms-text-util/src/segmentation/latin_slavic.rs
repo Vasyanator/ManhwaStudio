@@ -7,6 +7,14 @@ Latin-script Slavic implementation of the text segmenter
 the embedded TeX patterns for the selected language and the shared Latin
 boundary rules from `latin_common`.
 
+Binding: unlike the other Latin groups, this engine marks two risky junctions as
+`Conservatism::Reckless` (see `binding_conservatism`): a one-letter preposition/
+conjunction orphaned at a line end (Polish/Czech/Slovak/Slovenian/Croatian
+typography forbids it) and a "number + unit" pair. Both rules are language-agnostic
+and reuse the script-neutral primitives from `base` (`normalize_binding_token`,
+`is_single_letter_binding`, `is_numeric_measure_pair`); no per-language one-letter
+list is hand-authored.
+
 Known limitation — Polish/Czech repeated hyphen (NOT implemented, not faked):
 Polish and Czech orthography require the hyphen to be REPEATED at the START of
 the next line after a hyphenated break (the head line ends with "-" and the tail
@@ -25,7 +33,10 @@ Key type:
 
 use std::rc::Rc;
 
-use super::base::{Conservatism, Segmenter};
+use super::base::{
+    Conservatism, Segmenter, is_numeric_measure_pair, is_single_letter_binding,
+    normalize_binding_token,
+};
 use super::dictionaries::HyphenationDictionaries;
 use super::latin_common;
 use crate::language::TextLanguage;
@@ -57,9 +68,11 @@ impl LatinSlavicSegmenter {
 }
 
 impl Segmenter for LatinSlavicSegmenter {
-    /// No service-word gluing in this engine; every junction is a free break.
-    fn binding_conservatism(&self, _left_token: &str, _right_token: &str) -> Conservatism {
-        Conservatism::Safe
+    /// Marks the risky junctions of the Latin-Slavic languages (see the free
+    /// [`binding_conservatism`]). The rule is language-agnostic, so the segmenter's
+    /// own `language` is not consulted.
+    fn binding_conservatism(&self, left_token: &str, right_token: &str) -> Conservatism {
+        binding_conservatism(left_token, right_token)
     }
 
     fn hyphenate_word(&self, word: &str) -> Option<String> {
@@ -71,9 +84,52 @@ impl Segmenter for LatinSlavicSegmenter {
     }
 }
 
+/// Conservatism of a break between two Latin-Slavic tokens. Two language-agnostic
+/// rules apply, both the riskiest class (`Conservatism::Reckless`):
+/// - a one-letter preposition/conjunction left orphaned at a line end. Polish,
+///   Czech, Slovak, Slovenian and Croatian typography all forbid this (Polish `w`,
+///   `z`, `i`, `a`, `o`, `u`; Czech/Slovak `k`, `s`, `v`, ...). The single-alphabetic
+///   -character test covers every such word without a per-language list.
+/// - a "number + unit" pair ("5 kg").
+///
+/// Everything else is `Safe`; this engine does not glue multi-letter service words.
+fn binding_conservatism(left_token: &str, right_token: &str) -> Conservatism {
+    // Number+unit ("5 kg") judged on RAW tokens (normalization strips the digits).
+    if is_numeric_measure_pair(left_token, right_token) {
+        return Conservatism::Reckless;
+    }
+    let left = normalize_binding_token(left_token);
+    // A one-letter preposition/conjunction must not be orphaned at a line end.
+    if is_single_letter_binding(left.as_str()) {
+        return Conservatism::Reckless;
+    }
+    Conservatism::Safe
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_letter_preposition_is_reckless() {
+        // Polish one-letter prepositions/conjunctions must not be orphaned.
+        assert_eq!(binding_conservatism("w", "domu"), Conservatism::Reckless);
+        assert_eq!(binding_conservatism("z", "nami"), Conservatism::Reckless);
+        // A normal word pair breaks freely.
+        assert_eq!(binding_conservatism("kot", "śpi"), Conservatism::Safe);
+    }
+
+    #[test]
+    fn number_and_unit_is_reckless() {
+        assert_eq!(binding_conservatism("5", "kg"), Conservatism::Reckless);
+    }
+
+    #[test]
+    fn binding_via_trait_matches_free_function() {
+        let pl = LatinSlavicSegmenter::new(TextLanguage::Pl);
+        assert_eq!(pl.binding_conservatism("w", "domu"), Conservatism::Reckless);
+        assert_eq!(pl.binding_conservatism("kot", "śpi"), Conservatism::Safe);
+    }
 
     #[test]
     fn polish_and_czech_words_hyphenate() {

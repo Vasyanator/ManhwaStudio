@@ -30,7 +30,7 @@ Backend helpers (v2 framed IPC):
 */
 
 use crate::backend_ipc::{self, CallError};
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::{ai_models, config};
 // Native ONNX Runtime PaddleOCR text detector (desktop-only: the native runtime
 // depends on `ms-onnx`/`ort`, which are not part of the web build).
@@ -188,10 +188,10 @@ impl TranslationTextDetectorController {
         mask_dilate_size: i32,
     ) -> Result<(), String> {
         if self.busy {
-            return Err("Детектор уже выполняется.".to_string());
+            return Err(t!("translation.text_detector.already_running_status").to_string());
         }
         if pages.is_empty() {
-            return Err("Нет страниц для детекции.".to_string());
+            return Err(t!("translation.text_detector.no_pages_status").to_string());
         }
         self.busy = true;
         if self
@@ -205,7 +205,7 @@ impl TranslationTextDetectorController {
             .is_err()
         {
             self.busy = false;
-            return Err("Worker детектора недоступен.".to_string());
+            return Err(t!("translation.text_detector.worker_unavailable_error").to_string());
         }
         Ok(())
     }
@@ -247,7 +247,7 @@ impl TranslationTextDetectorController {
                 Err(TryRecvError::Disconnected) => {
                     self.busy = false;
                     out.push(TextDetectorControllerEvent::DetectFailed {
-                        error: "Worker детектора отключился.".to_string(),
+                        error: t!("translation.text_detector.worker_disconnected_error").to_string(),
                     });
                     break;
                 }
@@ -444,7 +444,7 @@ fn ensure_detector_models_for_mode(
 fn ensure_v2_backend_ready() -> Result<(), String> {
     backend_ipc::shared_client()
         .map(|_| ())
-        .map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())
+        .map_err(|_| ai_backend_offline_error().to_string())
 }
 
 /// Issues a blocking v2 framed call for a text-detector method.
@@ -463,7 +463,7 @@ fn detector_call(
     header_fields: Value,
     image_blob: &[u8],
 ) -> Result<(Value, Vec<u8>), String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call(
             method,
@@ -474,7 +474,7 @@ fn detector_call(
         .map_err(|err| match err {
             CallError::Error(msg) => msg,
             CallError::Interrupted(msg) => {
-                format!("Запрос к backend детектора прерван: {msg}")
+                tf!("translation.text_detector.request_aborted_error", msg = msg)
             }
             CallError::Transport(msg) => msg,
         })
@@ -482,19 +482,13 @@ fn detector_call(
 
 fn detect_page_classic(path: &PathBuf) -> Result<TextDetectorPageResult, String> {
     let img = image::open(path).map_err(|err| {
-        format!(
-            "Не удалось открыть изображение для детектора ({}): {err}",
-            path.display()
-        )
+        tf!("translation.text_detector.open_image_error", path = path.display(), err = err)
     })?;
     let gray = img.to_luma8();
     let source_w = gray.width();
     let source_h = gray.height();
     if source_w == 0 || source_h == 0 {
-        return Err(format!(
-            "Пустое изображение для детектора: {}",
-            path.display()
-        ));
+        return Err(tf!("translation.text_detector.empty_image_error", path = path.display()));
     }
 
     let (proc, scale_x, scale_y) = if source_w.max(source_h) > MAX_DETECTOR_DIM {
@@ -615,8 +609,10 @@ fn try_native_paddle_detect_page(path: &Path) -> Option<TextDetectorPageResult> 
             }
         },
         Err(err) => {
+            // Debug (stable English variant name) keeps logs grep-able regardless of
+            // the selected UI language; the localized Display is for the user surface.
             crate::runtime_log::log_error(format!(
-                "[text-detector] native Paddle detection failed for {}, falling back to backend: {err}",
+                "[text-detector] native Paddle detection failed for {}, falling back to backend: {err:?}",
                 path.display()
             ));
             None
@@ -674,9 +670,7 @@ fn glyph_mask_into_alpha(mask: image::GrayImage) -> Result<([u32; 2], Vec<u8>), 
     // instead of normalizing an unbounded buffer.
     let pixels = (w as usize).saturating_mul(h as usize);
     if pixels > MAX_MASK_PIXELS {
-        return Err(format!(
-            "Нативный детектор текста: размер маски слишком большой ({w}x{h})"
-        ));
+        return Err(tf!("translation.text_detector.native_mask_too_large_error", w = w, h = h));
     }
     let mut alpha = mask.into_raw();
     for px in &mut alpha {
@@ -713,8 +707,10 @@ fn try_native_paddle_mask_for_image(image: &egui::ColorImage) -> Option<([u32; 2
             }
         },
         Err(err) => {
+            // Debug (stable English variant name) keeps logs grep-able regardless of
+            // the selected UI language; the localized Display is for the user surface.
             crate::runtime_log::log_error(format!(
-                "[text-detector] native Paddle mask detection failed, falling back to backend: {err}"
+                "[text-detector] native Paddle mask detection failed, falling back to backend: {err:?}"
             ));
             None
         }
@@ -877,40 +873,25 @@ fn parse_v2_text_detector_response(
         .get("source_size")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            format!(
-                "{engine_name} backend вернул некорректный source_size для {}",
-                path.display()
-            )
+            tf!("translation.text_detector.invalid_source_size_error", engine_name = engine_name, path = path.display())
         })?;
     if source_size.len() < 2 {
-        return Err(format!(
-            "{engine_name} backend вернул неполный source_size для {}",
-            path.display()
-        ));
+        return Err(tf!("translation.text_detector.incomplete_source_size_error", engine_name = engine_name, path = path.display()));
     }
     let source_w = source_size[0]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| {
-            format!(
-                "{engine_name} backend: невалидная ширина source_size ({})",
-                path.display()
-            )
+            tf!("translation.text_detector.invalid_source_width_error", engine_name = engine_name, path = path.display())
         })?;
     let source_h = source_size[1]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
         .ok_or_else(|| {
-            format!(
-                "{engine_name} backend: невалидная высота source_size ({})",
-                path.display()
-            )
+            tf!("translation.text_detector.invalid_source_height_error", engine_name = engine_name, path = path.display())
         })?;
     if source_w == 0 || source_h == 0 {
-        return Err(format!(
-            "{engine_name} backend вернул пустой размер страницы ({})",
-            path.display()
-        ));
+        return Err(tf!("translation.text_detector.empty_page_size_error", engine_name = engine_name, path = path.display()));
     }
 
     let mut blocks = parse_backend_blocks(header);
@@ -1015,7 +996,7 @@ fn parse_mask_alpha_from_blob(blob: &[u8]) -> Result<([u32; 2], Vec<u8>), String
     }
     let image = image::load_from_memory(blob)
         .map_err(|err| {
-            format!("Backend детектора текста: не удалось декодировать PNG маски: {err}")
+            tf!("translation.text_detector.decode_mask_error", err = err)
         })?
         .to_luma8();
     let w = image.width();
@@ -1025,9 +1006,7 @@ fn parse_mask_alpha_from_blob(blob: &[u8]) -> Result<([u32; 2], Vec<u8>), String
     }
     let pixels = (w as usize).saturating_mul(h as usize);
     if pixels == 0 || pixels > MAX_MASK_PIXELS {
-        return Err(format!(
-            "Backend детектора текста: размер маски слишком большой ({w}x{h})"
-        ));
+        return Err(tf!("translation.text_detector.mask_too_large_error", w = w, h = h));
     }
     // CTD mask is logically binary; normalize to 0/255 to keep rendering consistent
     // for both 1-bit and 8-bit encodings.
@@ -1083,11 +1062,11 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(
             &raw,
-            u32::try_from(width).map_err(|_| "Ширина изображения слишком большая.".to_string())?,
-            u32::try_from(height).map_err(|_| "Высота изображения слишком большая.".to_string())?,
+            u32::try_from(width).map_err(|_| t!("translation.text_detector.image_width_too_large_error").to_string())?,
+            u32::try_from(height).map_err(|_| t!("translation.text_detector.image_height_too_large_error").to_string())?,
             ColorType::Rgba8.into(),
         )
-        .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
+        .map_err(|err| tf!("translation.text_detector.encode_image_error", err = err))?;
     Ok(out)
 }
 
@@ -1627,7 +1606,7 @@ mod tests {
         let result = ensure_v2_backend_ready();
         if let Err(msg) = result {
             assert_eq!(
-                msg, AI_BACKEND_OFFLINE_ERROR,
+                msg, ai_backend_offline_error(),
                 "offline error must use the canonical constant"
             );
         }

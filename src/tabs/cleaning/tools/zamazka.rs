@@ -41,10 +41,10 @@ enum ZamazkaMode {
 impl ZamazkaMode {
     fn title(self) -> &'static str {
         match self {
-            Self::Brush => "Кисть",
-            Self::Eraser => "Ластик",
-            Self::Eyedropper => "Пипетка",
-            Self::Rect => "Прямоуг.",
+            Self::Brush => t!("cleaning.common.brush_label"),
+            Self::Eraser => t!("cleaning.tools.zamazka.mode_eraser"),
+            Self::Eyedropper => t!("cleaning.tools.zamazka.mode_eyedropper"),
+            Self::Rect => t!("cleaning.tools.zamazka.mode_rect"),
         }
     }
 }
@@ -313,7 +313,7 @@ impl CleaningTool for ZamazkaTool {
     }
 
     fn title(&self) -> &'static str {
-        "Замазка"
+        t!("cleaning.tools.zamazka.title")
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -325,7 +325,7 @@ impl CleaningTool for ZamazkaTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Режим");
+        ui.label(t!("cleaning.common.mode_label"));
         WheelComboBox::from_id_salt("cleaning_zamazka_mode")
             .selected_text(self.mode.title())
             .show_ui(ui, |ui| {
@@ -349,7 +349,7 @@ impl CleaningTool for ZamazkaTool {
 
         let mut radius = self.brush_base.radius_px();
         if ui
-            .add(WheelSlider::new(&mut radius, 1..=200).text("Размер"))
+            .add(WheelSlider::new(&mut radius, 1..=200).text(t!("cleaning.common.size_label")))
             .changed()
         {
             self.brush_base.set_radius_px(radius);
@@ -358,20 +358,20 @@ impl CleaningTool for ZamazkaTool {
         let mut hardness = self.brush_base.hardness();
         let _ = ui.add(
             WheelSlider::new(&mut hardness, 0.0..=1.0)
-                .text("Жесткость")
+                .text(t!("cleaning.common.hardness_label"))
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
         let _ = self.brush_base.set_hardness(hardness);
         let mut blend_colors = self.brush_base.blend_colors();
         if ui
-            .checkbox(&mut blend_colors, "Смешивание цветов")
+            .checkbox(&mut blend_colors, t!("cleaning.tools.zamazka.color_blend_label"))
             .changed()
         {
             let _ = self.brush_base.set_blend_colors(blend_colors);
         }
         let mut strict_pixel_painting = self.brush_base.strict_pixel_painting();
         if ui
-            .checkbox(&mut strict_pixel_painting, "Рисовать строго по пикселям")
+            .checkbox(&mut strict_pixel_painting, t!("cleaning.tools.zamazka.pixel_perfect_label"))
             .changed()
         {
             let _ = self
@@ -380,14 +380,14 @@ impl CleaningTool for ZamazkaTool {
         }
 
         ui.horizontal(|ui| {
-            ui.label("Цвет");
+            ui.label(t!("cleaning.tools.zamazka.color_label"));
             color_picker::color_edit_button_srgba(ui, &mut self.color, Alpha::OnlyBlend);
         });
         let mut alpha = self.color.a();
         if ui
             .add(
                 WheelSlider::new(&mut alpha, 0..=255)
-                    .text("Прозрачность")
+                    .text(t!("cleaning.tools.zamazka.opacity_label"))
                     .custom_formatter(|value, _| format!("{:.0}%", value / 255.0 * 100.0)),
             )
             .changed()
@@ -397,17 +397,17 @@ impl CleaningTool for ZamazkaTool {
         }
 
         if self.mode == ZamazkaMode::Rect {
-            ui.checkbox(&mut self.rect_erase, "Прямоуг.: стирать");
+            ui.checkbox(&mut self.rect_erase, t!("cleaning.tools.zamazka.rect_erase_label"));
         }
 
         ui.separator();
-        ui.label("Горячие клавиши");
-        ui.label("ПКМ: взять цвет");
-        ui.label("Shift + ЛКМ: временный ластик");
-        ui.label("Ctrl + ЛКМ: прямоугольник");
-        ui.label("Ctrl + Shift + ЛКМ: стереть прямоугольник");
-        ui.label("Shift + колесо: размер кисти");
-        ui.label("- / =: размер кисти");
+        ui.label(t!("cleaning.tools.zamazka.hotkeys_heading"));
+        ui.label(t!("cleaning.tools.zamazka.pick_color_hint"));
+        ui.label(t!("cleaning.tools.zamazka.temp_eraser_hint"));
+        ui.label(t!("cleaning.tools.zamazka.rect_hint"));
+        ui.label(t!("cleaning.tools.zamazka.rect_erase_hint"));
+        ui.label(t!("cleaning.tools.zamazka.brush_size_wheel_hint"));
+        ui.label(t!("cleaning.tools.zamazka.brush_size_keys_hint"));
     }
 
     fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {

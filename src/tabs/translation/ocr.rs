@@ -23,7 +23,7 @@
 //   framed-заголовков `BackendClient`/`CallHandle` и JSON.
 // ============================================================================
 use crate::backend_ipc::{self, CallError, CallHandle};
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::{ai_models, config};
 // Native ONNX Runtime OCR path (Phase 1: MangaOCR only). Desktop-only: the native
 // runtime + ORT loader depend on `ms-onnx`/`ort`, which are not part of the web build.
@@ -364,7 +364,7 @@ impl TranslationOcrController {
             .send(WorkerCommand::Load { engine, options })
             .is_err()
         {
-            self.last_error = Some("OCR worker недоступен.".to_string());
+            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
             self.set_state(OcrLoadState::Error);
         }
     }
@@ -373,7 +373,7 @@ impl TranslationOcrController {
         match self.state {
             OcrLoadState::Ready => {
                 if self.cmd_tx.send(WorkerCommand::Recognize(request)).is_err() {
-                    self.last_error = Some("OCR worker недоступен.".to_string());
+                    self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
                     self.set_state(OcrLoadState::Error);
                 }
             }
@@ -395,7 +395,7 @@ impl TranslationOcrController {
             .send(WorkerCommand::StoreAiApiKey { service, api_key })
             .is_err()
         {
-            self.last_error = Some("OCR worker недоступен.".to_string());
+            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
         }
     }
 
@@ -405,7 +405,7 @@ impl TranslationOcrController {
             .send(WorkerCommand::ClearAiApiKey { service })
             .is_err()
         {
-            self.last_error = Some("OCR worker недоступен.".to_string());
+            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
         }
     }
 
@@ -415,7 +415,7 @@ impl TranslationOcrController {
             .send(WorkerCommand::RefreshAiApiMetadata { service })
             .is_err()
         {
-            self.last_error = Some("OCR worker недоступен.".to_string());
+            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
         }
     }
 
@@ -446,7 +446,7 @@ impl TranslationOcrController {
                     if let Some(request) = self.pending_request.take()
                         && self.cmd_tx.send(WorkerCommand::Recognize(request)).is_err()
                     {
-                        self.last_error = Some("OCR worker недоступен.".to_string());
+                        self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
                         self.set_state(OcrLoadState::Error);
                         out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
                     }
@@ -492,7 +492,7 @@ impl TranslationOcrController {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.last_error = Some("OCR worker отключился.".to_string());
+                    self.last_error = Some(t!("translation.ocr.worker_disconnected_error").to_string());
                     self.set_state(OcrLoadState::Error);
                     out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
                     break;
@@ -668,7 +668,7 @@ fn warmup_backend_ocr_engine(
     let _ = evt_tx.send(WorkerEvent::BackendLoadStarted);
     let method = engine
         .backend_method()
-        .ok_or_else(|| "Не задан метод OCR backend.".to_string())?;
+        .ok_or_else(|| t!("translation.ocr.method_not_set_error").to_string())?;
     // Warm the per-engine worker/model by recognizing a tiny throwaway image.
     // The header carries the engine params; the blob carries the raw PNG bytes.
     let header_fields = ocr_header_fields(options, true, false);
@@ -714,7 +714,7 @@ fn ocr_header_fields(
 fn ensure_v2_backend_ready() -> Result<(), String> {
     backend_ipc::shared_client()
         .map(|_| ())
-        .map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())
+        .map_err(|_| ai_backend_offline_error().to_string())
 }
 
 /// Issues a blocking backend OCR `call` with a bounded transport retry.
@@ -987,7 +987,7 @@ fn native_ai_runtime_selected() -> bool {
 /// Distinguishes "this op has no native path, use the backend" from "the native
 /// path was taken and failed" so the dispatcher can surface the real native error
 /// when the backend cannot serve as a fallback. `Failed` carries the user-facing
-/// (Russian) message derived from [`native_runtime::NativeRuntimeError`].
+/// localized message from [`native_runtime::NativeRuntimeError`]'s `Display`.
 #[cfg(not(target_arch = "wasm32"))]
 enum NativeOcrOutcome {
     /// Not a native route (unsupported engine, torch-only model, Suspect guard, or
@@ -1032,9 +1032,7 @@ fn try_native_ocr(
         Ok(image) => image.to_rgba8(),
         Err(err) => {
             crate::runtime_log::log_error(format!("[ocr] native OCR crop decode failed: {err}"));
-            return NativeOcrOutcome::Failed(format!(
-                "Нативный ONNX: не удалось подготовить изображение для распознавания. {err}"
-            ));
+            return NativeOcrOutcome::Failed(tf!("translation.ocr.native_prepare_image_error", err = err));
         }
     };
 
@@ -1077,14 +1075,15 @@ fn try_native_ocr(
         )),
         Err(err) => {
             // Log with the fallback framing for diagnostics; a Suspect guard never
-            // reaches here (it routes to Backend). The user-facing message keeps the
-            // native runtime's own Russian text so an offline-backend user sees the
-            // real reason instead of "backend offline".
+            // reaches here (it routes to Backend). Log the `Debug` form (a stable
+            // English variant name) so logs stay grep-able across UI languages, while
+            // the user-facing `Failed` message uses the localized `Display` so an
+            // offline-backend user sees the real reason instead of "backend offline".
             let engine_label = native_ocr_engine_label(route);
             crate::runtime_log::log_error(format!(
-                "[ocr] native {engine_label} failed (falls back to the Python backend if it is up): {err}"
+                "[ocr] native {engine_label} failed (falls back to the Python backend if it is up): {err:?}"
             ));
-            NativeOcrOutcome::Failed(format!("Нативный ONNX: {err}"))
+            NativeOcrOutcome::Failed(tf!("translation.ocr.native_error", err = err))
         }
     }
 }
@@ -1216,7 +1215,7 @@ fn run_backend_recognize(
         Some(method) => method,
         None => {
             return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(
-                "Не задан метод OCR backend.".to_string(),
+                t!("translation.ocr.method_not_set_error").to_string(),
             )));
         }
     };
@@ -1276,7 +1275,7 @@ fn watch_for_supersede(
             Ok(result) => return BackendRecognizeFlow::Outcome(interpret_call_result(result)),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return BackendRecognizeFlow::Outcome(interpret_call_result(Err(
-                    CallError::Transport("OCR backend waiter завершился до ответа.".to_string()),
+                    CallError::Transport(t!("translation.ocr.waiter_ended_error").to_string()),
                 )));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1382,15 +1381,12 @@ fn crop_image(
 ) -> Result<DynamicImage, String> {
     if let Some(image_override_png) = request.image_override_png.as_ref() {
         return image::load_from_memory(image_override_png)
-            .map_err(|err| format!("Не удалось декодировать overlay PNG для OCR: {err}"));
+            .map_err(|err| tf!("translation.ocr.decode_overlay_error", err = err));
     }
     let source = page_cache.get_or_load(&request.page_path)?;
     let (img_w, img_h) = source.dimensions();
     if img_w == 0 || img_h == 0 {
-        return Err(format!(
-            "Пустое изображение для OCR: {}",
-            request.page_path.display()
-        ));
+        return Err(tf!("translation.ocr.empty_image_error", request = request.page_path.display()));
     }
 
     let [u1, v1, u2, v2] = normalized_uv(request.uv_rect);
@@ -1400,7 +1396,7 @@ fn crop_image(
     let y2 = ((v2 * img_h as f32).ceil() as u32).min(img_h);
 
     if x2 <= x1 || y2 <= y1 {
-        return Err("Выделение OCR слишком маленькое.".to_string());
+        return Err(t!("translation.ocr.selection_too_small_error").to_string());
     }
     Ok(source.crop_imm(x1, y1, x2 - x1, y2 - y1))
 }
@@ -1409,7 +1405,7 @@ fn encode_png(image: DynamicImage) -> Result<Vec<u8>, String> {
     let mut cursor = Cursor::new(Vec::new());
     DynamicImage::ImageRgb8(image.to_rgb8())
         .write_to(&mut cursor, ImageFormat::Png)
-        .map_err(|err| format!("Не удалось сериализовать crop в PNG: {err}"))?;
+        .map_err(|err| tf!("translation.ocr.serialize_crop_error", err = err))?;
     Ok(cursor.into_inner())
 }
 
@@ -1466,13 +1462,10 @@ fn parse_ocr_response(response: &Value) -> Result<OcrRecognizeResult, String> {
 fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<(), String> {
     let service = options.ai_api_service;
     if read_ai_api_key(service)?.trim().is_empty() {
-        return Err(format!(
-            "API key для {} не задан в системном хранилище секретов.",
-            service.label()
-        ));
+        return Err(tf!("translation.ocr.api_key_missing_error", service = service.label()));
     }
     if options.ai_api_model.trim().is_empty() {
-        return Err("Не выбрана мультимодальная модель AI API.".to_string());
+        return Err(t!("translation.ocr.no_multimodal_model_error").to_string());
     }
     Ok(())
 }
@@ -1484,7 +1477,7 @@ fn run_ai_api_ocr_request(
     _request: &OcrRecognizeRequest,
     _page_cache: &mut PageImageCache,
 ) -> Result<OcrRecognizeResult, String> {
-    Err("Распознавание через AI API недоступно в веб-версии.".to_string())
+    Err(t!("translation.ocr.ai_api_web_unavailable_error").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1508,7 +1501,7 @@ fn run_ai_api_ocr_request(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|err| format!("Не удалось создать async runtime для AI API OCR: {err}"))?;
+        .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))?;
 
     let text = runtime.block_on(async move {
         let client = build_ai_api_client(service, api_key);
@@ -1525,7 +1518,7 @@ fn run_ai_api_ocr_request(
         let chat_res = client
             .exec_chat(model, chat_req, None)
             .await
-            .map_err(|err| format!("AI API OCR запрос не выполнен: {err}"))?;
+            .map_err(|err| tf!("translation.ocr.ai_api_request_failed_error", err = err))?;
         Ok::<String, String>(chat_res.first_text().unwrap_or("").trim().to_string())
     })?;
 
@@ -1577,7 +1570,7 @@ pub(crate) fn model_iden_for_ai_api_service(service: AiApiService, model: &str) 
 /// on the browser build. Surfaces a clear error rather than empty metadata.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn load_ai_api_metadata(_service: AiApiService) -> Result<AiApiMetadata, String> {
-    Err("Данные AI API недоступны в веб-версии.".to_string())
+    Err(t!("translation.ocr.ai_api_data_web_unavailable_error").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1585,9 +1578,9 @@ pub(crate) fn load_ai_api_metadata(service: AiApiService) -> Result<AiApiMetadat
     let key = read_ai_api_key(service).unwrap_or_default();
     let key_configured = !key.trim().is_empty();
     let mut account_status = if key_configured {
-        "Баланс/лимит: недоступно для этого сервиса".to_string()
+        t!("translation.ocr.balance_unavailable_status").to_string()
     } else {
-        "API key не задан".to_string()
+        t!("translation.common.api_key_not_set_status").to_string()
     };
     let mut models = Vec::new();
 
@@ -1595,7 +1588,7 @@ pub(crate) fn load_ai_api_metadata(service: AiApiService) -> Result<AiApiMetadat
         models = fetch_ai_api_model_names(service, &key)?;
         if service == AiApiService::OpenRouter {
             account_status = fetch_openrouter_account_status(&key)
-                .unwrap_or_else(|err| format!("OpenRouter баланс/лимит: {err}"));
+                .unwrap_or_else(|err| tf!("translation.ocr.openrouter_balance_error", err = err));
         }
     }
 
@@ -1612,7 +1605,7 @@ fn fetch_ai_api_model_names(service: AiApiService, api_key: &str) -> Result<Vec<
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|err| format!("Не удалось создать async runtime для списка моделей: {err}"))?;
+        .map_err(|err| tf!("translation.ocr.models_async_runtime_error", err = err))?;
     let adapter = service.adapter_kind();
     let key = api_key.to_string();
     let models = runtime.block_on(async move {
@@ -1624,10 +1617,7 @@ fn fetch_ai_api_model_names(service: AiApiService, api_key: &str) -> Result<Vec<
             )
             .await
             .map_err(|err| {
-                format!(
-                    "Не удалось получить список моделей {}: {err}",
-                    service.label()
-                )
+                tf!("translation.ocr.fetch_models_error", service = service.label(), err = err)
             })
     })?;
     let mut filtered = models
@@ -1676,10 +1666,10 @@ fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
     let response = ureq::get("https://openrouter.ai/api/v1/key")
         .set("Authorization", &format!("Bearer {api_key}"))
         .call()
-        .map_err(|err| format!("не удалось запросить /api/v1/key: {err}"))?;
+        .map_err(|err| tf!("translation.ocr.openrouter_key_request_error", err = err))?;
     let value: Value = response
         .into_json()
-        .map_err(|err| format!("OpenRouter вернул не-JSON: {err}"))?;
+        .map_err(|err| tf!("translation.ocr.openrouter_non_json_error", err = err))?;
     let data = value.get("data").unwrap_or(&value);
     let usage = data.get("usage").and_then(Value::as_f64);
     let limit = data.get("limit").and_then(Value::as_f64);
@@ -1688,20 +1678,33 @@ fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
 
     let mut parts = Vec::new();
     if let Some(usage) = usage {
-        parts.push(format!("использовано ${usage:.2}"));
+        parts.push(tf!(
+            "translation.ocr.openrouter_usage",
+            usage = format!("{usage:.2}")
+        ));
     }
     match (limit, remaining) {
         (Some(limit), Some(remaining)) => {
-            parts.push(format!("лимит ${limit:.2}, осталось ${remaining:.2}"));
+            parts.push(tf!(
+                "translation.ocr.openrouter_limit_remaining",
+                limit = format!("{limit:.2}"),
+                remaining = format!("{remaining:.2}")
+            ));
         }
         (None, Some(remaining)) => {
-            parts.push(format!("осталось ${remaining:.2}"));
+            parts.push(tf!(
+                "translation.ocr.openrouter_remaining",
+                remaining = format!("{remaining:.2}")
+            ));
         }
         (None, None) => {
-            parts.push("лимит не задан".to_string());
+            parts.push(t!("translation.ocr.limit_not_set_status").to_string());
         }
         (Some(limit), None) => {
-            parts.push(format!("лимит ${limit:.2}"));
+            parts.push(tf!(
+                "translation.ocr.openrouter_limit",
+                limit = format!("{limit:.2}")
+            ));
         }
     }
     if let Some(rate) = rate {
@@ -1718,35 +1721,32 @@ fn fetch_openrouter_account_status(api_key: &str) -> Result<String, String> {
 /// so storing an API key is rejected with a clear error.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn store_ai_api_key(_service: AiApiService, _api_key: &str) -> Result<(), String> {
-    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn store_ai_api_key(service: AiApiService, api_key: &str) -> Result<(), String> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
-        return Err("API key пустой.".to_string());
+        return Err(t!("translation.ocr.api_key_empty_error").to_string());
     }
     ai_api_keyring_entry(service)?
         .set_password(trimmed)
-        .map_err(|err| format!("Не удалось сохранить API key {}: {err}", service.label()))
+        .map_err(|err| tf!("translation.ocr.store_api_key_error", service = service.label(), err = err))
 }
 
 /// Web stub: no OS credential store on the browser build, so clearing a key is
 /// rejected with a clear error.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn clear_ai_api_key(_service: AiApiService) -> Result<(), String> {
-    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn clear_ai_api_key(service: AiApiService) -> Result<(), String> {
     match ai_api_keyring_entry(service)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(format!(
-            "Не удалось удалить API key {}: {err}",
-            service.label()
-        )),
+        Err(err) => Err(tf!("translation.ocr.delete_api_key_error", service = service.label(), err = err)),
     }
 }
 
@@ -1755,7 +1755,7 @@ pub(crate) fn clear_ai_api_key(service: AiApiService) -> Result<(), String> {
 /// than treating a missing key as an empty one.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn read_ai_api_key(_service: AiApiService) -> Result<String, String> {
-    Err("Хранилище API-ключей недоступно в веб-версии.".to_string())
+    Err(t!("translation.ocr.keystore_web_unavailable_error").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1763,17 +1763,14 @@ pub(crate) fn read_ai_api_key(service: AiApiService) -> Result<String, String> {
     match ai_api_keyring_entry(service)?.get_password() {
         Ok(key) => Ok(key),
         Err(keyring::Error::NoEntry) => Ok(String::new()),
-        Err(err) => Err(format!(
-            "Не удалось прочитать API key {} из системного хранилища: {err}",
-            service.label()
-        )),
+        Err(err) => Err(tf!("translation.ocr.read_api_key_error", service = service.label(), err = err)),
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn ai_api_keyring_entry(service: AiApiService) -> Result<keyring::Entry, String> {
     keyring::Entry::new("ManhwaStudio AI API OCR", service.key())
-        .map_err(|err| format!("Системное хранилище секретов недоступно: {err}"))
+        .map_err(|err| tf!("translation.ocr.keyring_unavailable_error", err = err))
 }
 
 struct CachedPageImage {
@@ -1807,14 +1804,11 @@ impl PageImageCache {
                 .entries
                 .get(path)
                 .map(|entry| &entry.image)
-                .ok_or_else(|| "Не удалось получить изображение из OCR cache.".to_string());
+                .ok_or_else(|| t!("translation.ocr.cache_get_error").to_string());
         }
 
         let image = image::open(path).map_err(|err| {
-            format!(
-                "Не удалось открыть изображение для OCR ({}): {err}",
-                path.display()
-            )
+            tf!("translation.ocr.open_image_error", path = path.display(), err = err)
         })?;
         let approx_bytes = approx_image_size_bytes(&image);
         let key = path.to_path_buf();
@@ -1833,7 +1827,7 @@ impl PageImageCache {
         self.entries
             .get(path)
             .map(|entry| &entry.image)
-            .ok_or_else(|| "Не удалось сохранить изображение в OCR cache.".to_string())
+            .ok_or_else(|| t!("translation.ocr.cache_store_error").to_string())
     }
 
     fn touch(&mut self, path: &Path) {

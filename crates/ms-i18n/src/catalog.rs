@@ -44,6 +44,12 @@ use crate::plural::{self, PluralRules};
 const EN_JSON: &str = include_str!("../locales/en.json");
 /// The embedded Russian catalog source.
 const RU_JSON: &str = include_str!("../locales/ru.json");
+/// The embedded Spanish catalog source.
+const ES_JSON: &str = include_str!("../locales/es.json");
+/// The embedded French catalog source.
+const FR_JSON: &str = include_str!("../locales/fr.json");
+/// The embedded Portuguese catalog source.
+const PT_JSON: &str = include_str!("../locales/pt.json");
 
 /// The reserved metadata key. It carries locale metadata (currently `name`) and is
 /// never exposed as a translatable entry.
@@ -51,16 +57,22 @@ const META_KEY: &str = "_meta";
 
 /// `(tag, json_source)` for every locale whose catalog is compiled in today.
 ///
-/// Only `en` and `ru` are present; any other tag (a reserved es/fr/pt, or a custom
-/// user-authored one) has no embedded source and must be loaded from disk. The
-/// unpack layer uses this to write the bundled sources to disk.
-static EMBEDDED: [(&str, &str); 2] = [("en", EN_JSON), ("ru", RU_JSON)];
+/// All five shipped locales are present. A custom user-authored tag (e.g. `de`) has no
+/// embedded source and must be loaded from disk. `src/locale_store.rs` uses this to
+/// materialize the bundled sources into the editable `locale/` folder.
+static EMBEDDED: [(&str, &str); 5] = [
+    ("en", EN_JSON),
+    ("ru", RU_JSON),
+    ("es", ES_JSON),
+    ("fr", FR_JSON),
+    ("pt", PT_JSON),
+];
 
 /// Returns the embedded locale sources as `(tag, json_source)` pairs.
 ///
-/// The slice contains only locales that ship a catalog (`en`, `ru`). Intended for
-/// a later unpack layer that materializes the bundled JSON onto disk; the catalog
-/// runtime itself parses these directly.
+/// The slice contains every locale that ships a catalog (`en`, `ru`, `es`, `fr`, `pt`).
+/// `src/locale_store.rs` materializes the bundled JSON onto disk; the catalog runtime
+/// itself parses these directly.
 #[must_use]
 pub fn embedded_locales() -> &'static [(&'static str, &'static str)] {
     &EMBEDDED
@@ -298,14 +310,15 @@ pub fn install(catalog: Catalog) {
 /// Loads the embedded catalog for `tag` and installs it (with an English
 /// fallback, unless `tag` is English itself).
 ///
-/// This is the EMBEDDED-only install path (no disk access): only `en`/`ru` have an
-/// embedded source. The on-disk layer (`locale_store` in the binary) is what loads
-/// custom `<tag>.json` files; this is its embedded fallback and the wasm path.
+/// This is the EMBEDDED-only install path (no disk access): the five shipped locales
+/// (`en`, `ru`, `es`, `fr`, `pt`) have an embedded source. The on-disk layer
+/// (`locale_store` in the binary) is what loads custom `<tag>.json` files; this is its
+/// embedded fallback and the wasm path.
 ///
 /// # Errors
-/// [`I18nError::NoCatalog`] if `tag` has no embedded catalog (any tag other than
-/// `en`/`ru`), or any [`Catalog::from_json_str`] error if a bundled source fails to
-/// parse (which would be a build-time bug in the shipped JSON).
+/// [`I18nError::NoCatalog`] if `tag` has no embedded catalog (any tag outside the five
+/// shipped locales), or any [`Catalog::from_json_str`] error if a bundled source fails
+/// to parse (which would be a build-time bug in the shipped JSON).
 pub fn set_locale(tag: &LocaleTag) -> Result<(), I18nError> {
     let mut catalog = load_embedded_catalog(tag)?;
     if !tag.is_english() {
@@ -355,11 +368,6 @@ pub fn lookup_plural(key: &str, n: i64) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that touch the process-global active catalog, since they
-    /// run in parallel by default and share `ACTIVE`.
-    static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Parses a tag for tests (all literals here are valid).
     fn tag(s: &str) -> LocaleTag {
@@ -436,29 +444,65 @@ mod tests {
 
     #[test]
     fn plural_selection_uses_ru_categories() {
-        let ru = Catalog::from_json_str(&tag("ru"), RU_JSON).unwrap();
-        assert_eq!(ru.lookup_plural("wiki.chars", 1), Some("{n} символ"));
-        assert_eq!(ru.lookup_plural("wiki.chars", 2), Some("{n} символа"));
-        assert_eq!(ru.lookup_plural("wiki.chars", 5), Some("{n} символов"));
+        // Self-contained ru fixture (no shipped-catalog dependency): the ru plural
+        // rule set — resolved from the tag at build time — must select one/few/many
+        // by count. Deleting a product plural key can never break this.
+        let ru = Catalog::from_json_str(
+            &tag("ru"),
+            r#"{ "fixture.chars": { "one": "{n} символ", "few": "{n} символа", "many": "{n} символов", "other": "{n} символа" } }"#,
+        )
+        .unwrap();
+        assert_eq!(ru.lookup_plural("fixture.chars", 1), Some("{n} символ"));
+        assert_eq!(ru.lookup_plural("fixture.chars", 2), Some("{n} символа"));
+        assert_eq!(ru.lookup_plural("fixture.chars", 5), Some("{n} символов"));
     }
 
     #[test]
-    fn install_and_set_locale_drive_global_lookup() {
-        let _guard = GLOBAL_TEST_LOCK.lock().unwrap();
-        set_locale(&tag("ru")).unwrap();
-        assert_eq!(lookup("tab.translation"), Some("Перевод"));
-        // English-only fallback still resolves through the ru catalog.
-        set_locale(&tag("en")).unwrap();
-        assert_eq!(lookup("tab.translation"), Some("Translation"));
+    fn install_drives_global_lookup_with_fallback() {
+        let _guard = crate::lock_active_catalog_for_test();
+        // Self-contained fixtures (no shipped-catalog dependency): a ru catalog with
+        // an en fallback. install() must swap the global slot and lookup() must read
+        // it, resolving a ru-missing key through the en fallback.
+        let en = Catalog::from_json_str(
+            &tag("en"),
+            r#"{ "fixture.k": "en value", "fixture.only_en": "en only" }"#,
+        )
+        .unwrap();
+        let ru = Catalog::from_json_str(&tag("ru"), r#"{ "fixture.k": "ru value" }"#)
+            .unwrap()
+            .with_fallback(Arc::new(en));
+        install(ru);
+        assert_eq!(lookup("fixture.k"), Some("ru value"));
+        assert_eq!(lookup("fixture.only_en"), Some("en only"));
+
+        // Swapping to an en-only catalog is observed by the next lookup.
+        let en_only =
+            Catalog::from_json_str(&tag("en"), r#"{ "fixture.k": "en value" }"#).unwrap();
+        install(en_only);
+        assert_eq!(lookup("fixture.k"), Some("en value"));
+    }
+
+    #[test]
+    fn every_shipped_locale_has_an_embedded_catalog() {
+        // Guards the `EMBEDDED` table against a locale JSON being added to `locales/`
+        // but never registered (or vice versa).
+        let _guard = crate::lock_active_catalog_for_test();
+        for shipped in ["en", "ru", "es", "fr", "pt"] {
+            assert!(
+                set_locale(&tag(shipped)).is_ok(),
+                "shipped locale {shipped} has no embedded catalog"
+            );
+        }
     }
 
     #[test]
     fn set_locale_without_embedded_catalog_errors() {
-        let _guard = GLOBAL_TEST_LOCK.lock().unwrap();
-        // `fr` is a valid tag but has no embedded catalog; `de` likewise.
+        let _guard = crate::lock_active_catalog_for_test();
+        // A syntactically valid tag that ships no catalog: only a user-authored
+        // `<tag>.json` on disk can serve it, which this embedded-only path cannot see.
         assert!(matches!(
-            set_locale(&tag("fr")),
-            Err(I18nError::NoCatalog(t)) if t == "fr"
+            set_locale(&tag("nl")),
+            Err(I18nError::NoCatalog(t)) if t == "nl"
         ));
         assert!(matches!(
             set_locale(&tag("de")),

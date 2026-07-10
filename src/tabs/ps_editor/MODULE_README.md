@@ -206,6 +206,14 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 ## Contracts and invariants
 - GUI thread never decodes images or holds the model lock across decode: that is `page_loader`'s
   job; the model lock is released before `image::open`.
+- **Default layer/group names are persisted, so they must stay non-localized literals.** A raster
+  layer's `name` and a group's `name` round-trip through `layers.json` (`persist_current_page` →
+  `saver::OwnedRasterLayer`/`GroupMeta`; reloaded by `sync_view_from_doc`). The default-name literals
+  — `format!("Слой {n}")` (`layers.rs::add_raster_layer`), `format!("Группа {n}")`,
+  `format!("Запечён: {name}")`, and the clip names `"Копия"`/`"Вырезка"` — are therefore left as
+  stable Russian literals and NOT routed through the `t!`/`tf!` UI catalog (a §A-class i18n exclusion;
+  see `docs/i18n_exclusions.md` §A). Base-layer names (`"Исходник"`/`"Клин"`) are display-only —
+  `persist_current_page` filters to `LayerKind::Raster` — so they ARE localized.
 - Non-destructive raster effects render off the GUI thread. `apply_effects_to_raster` parses the
   chain, clones the pre-effects base ColorImage (dropping the stack borrow first), and spawns
   `render_ps_raster_effects`, which runs the expensive `apply_effects_to_color_image`. A render

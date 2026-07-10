@@ -151,7 +151,7 @@ pub fn show_page_shell(ui: &mut Ui, add_body: impl FnOnce(&mut Ui)) -> Option<Pa
     );
     back_ui.set_clip_rect(rect);
     let back_clicked =
-        theme::launcher_button(&mut back_ui, "<- Назад", BACK_BUTTON_SIZE, true).clicked();
+        theme::launcher_button(&mut back_ui, t!("launcher.page.back_button"), BACK_BUTTON_SIZE, true).clicked();
 
     let body_rect = Rect::from_min_max(
         egui::pos2(rect.left() + PAGE_MARGIN, rect.top() + PAGE_TOP_PADDING),

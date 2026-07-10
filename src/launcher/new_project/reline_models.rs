@@ -85,15 +85,15 @@ impl ModelCategory {
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
-            ModelCategory::MangaBwUpscale => "Манга Ч/Б · увеличение",
-            ModelCategory::MangaRestore => "Манга Ч/Б · реставрация без увеличения",
-            ModelCategory::Descreen => "Убрать печатный растр (дескрин)",
-            ModelCategory::Halftone => "Полутон / скринтон",
-            ModelCategory::IllustrationColor => "Цветные иллюстрации / диджитал-арт",
-            ModelCategory::AnimeColor => "Аниме (цвет)",
-            ModelCategory::Photo => "Фото / универсальные",
-            ModelCategory::Generic => "Лёгкие универсальные апскейлеры",
-            ModelCategory::Other => "Прочие / без классификации",
+            ModelCategory::MangaBwUpscale => t!("launcher.new_project.reline_models.category_manga_bw_upscale"),
+            ModelCategory::MangaRestore => t!("launcher.new_project.reline_models.category_manga_bw_restore"),
+            ModelCategory::Descreen => t!("launcher.new_project.reline_models.category_descreen"),
+            ModelCategory::Halftone => t!("launcher.new_project.reline_models.category_halftone"),
+            ModelCategory::IllustrationColor => t!("launcher.new_project.reline_models.category_color_illustration"),
+            ModelCategory::AnimeColor => t!("launcher.new_project.reline_models.category_anime_color"),
+            ModelCategory::Photo => t!("launcher.new_project.reline_models.category_photo"),
+            ModelCategory::Generic => t!("launcher.new_project.reline_models.category_light_upscalers"),
+            ModelCategory::Other => t!("launcher.new_project.reline_models.category_other"),
         }
     }
 }
@@ -120,8 +120,8 @@ impl ModelMeta {
     #[must_use]
     pub fn display_title(&self) -> String {
         match self.scale {
-            Some(1) => format!("{} (без апскейла)", self.title),
-            Some(factor) => format!("{} (апскейл {factor}x)", self.title),
+            Some(1) => tf!("launcher.new_project.reline_models.suffix_no_upscale", arg = self.title),
+            Some(factor) => tf!("launcher.new_project.reline_models.suffix_upscale", arg = self.title, factor = factor),
             None => self.title.clone(),
         }
     }
@@ -135,6 +135,11 @@ enum MatchKind {
 }
 
 /// One curated family rule. Family-level by design: one entry annotates many catalog models.
+///
+/// `title`, `description`, and `recommendation` hold i18n catalog KEYS (not the text),
+/// because `t!` is not `const` and this table is a `static`. They are resolved to the
+/// active-locale label in `classify` via [`resolve_key`]. This mirrors the
+/// `(wire_code, display_key)` pattern in `tabs/translation/panels/ocr_langs.rs`.
 struct CuratedEntry {
     kind: MatchKind,
     /// Lowercased lookup key.
@@ -145,6 +150,12 @@ struct CuratedEntry {
     recommendation: Option<&'static str>,
 }
 
+/// Resolves an i18n catalog key to its localized label, falling back to the key on a
+/// catalog miss. Runtime (not `const`) because `t!` is not `const`.
+fn resolve_key(key: &'static str) -> String {
+    ms_i18n::lookup(key).unwrap_or(key).to_string()
+}
+
 // Order matters: the first matching entry wins, so more specific keys come before broader ones.
 static CURATED: &[CuratedEntry] = &[
     // --- Descreen / dehalftone (very specific, must precede generic manga rules) ---
@@ -152,24 +163,24 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "descreen",
         category: ModelCategory::Descreen,
-        title: "Дескрин печатного скана",
-        description: "Убирает растровую сетку (муар) с отсканированных печатных страниц и одновременно увеличивает изображение.",
-        recommendation: Some("Для сканов бумажных журналов с видимыми точками растра."),
+        title: "launcher.new_project.reline_models.descreen_title",
+        description: "launcher.new_project.reline_models.descreen_desc",
+        recommendation: Some("launcher.new_project.reline_models.descreen_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "dehalfton",
         category: ModelCategory::Descreen,
-        title: "Удаление полутонового растра",
-        description: "Сглаживает полутоновые точки (dehalftone) и восстанавливает чистые тона, с увеличением.",
-        recommendation: Some("Когда нужно превратить точечный растр в гладкую заливку."),
+        title: "launcher.new_project.reline_models.dehalftone_title",
+        description: "launcher.new_project.reline_models.dehalftone_desc",
+        recommendation: Some("launcher.new_project.reline_models.dehalftone_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "halftone",
         category: ModelCategory::Halftone,
-        title: "Полутон / скринтон",
-        description: "Модель, работающая с полутоновым растром (скринтоном) — синтез или коррекция точечной сетки.",
+        title: "launcher.new_project.reline_models.halftone_title",
+        description: "launcher.new_project.reline_models.halftone_desc",
         recommendation: None,
     },
     // --- Manga B/W restoration (1x de-JPEG / decompress) ---
@@ -177,97 +188,97 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "mangajpeg",
         category: ModelCategory::MangaRestore,
-        title: "Деджейпег манги",
-        description: "Убирает JPEG-артефакты и звон на Ч/Б манге без изменения размера. Варианты LQ/MQ/HQ рассчитаны на разную степень сжатия исходника (LQ — сильные артефакты, HQ — лёгкие).",
-        recommendation: Some("Подбирайте LQ/MQ/HQ под качество исходника."),
+        title: "launcher.new_project.reline_models.dejpeg_manga_title",
+        description: "launcher.new_project.reline_models.dejpeg_manga_desc",
+        recommendation: Some("launcher.new_project.reline_models.dejpeg_manga_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "dejpeg",
         category: ModelCategory::MangaRestore,
-        title: "Снятие JPEG-сжатия",
-        description: "Реставрирует изображение, пострадавшее от JPEG-компрессии.",
+        title: "launcher.new_project.reline_models.dejpeg_title",
+        description: "launcher.new_project.reline_models.dejpeg_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "decompress",
         category: ModelCategory::MangaRestore,
-        title: "Декомпрессия артефактов",
-        description: "Восстанавливает детали после агрессивного сжатия (decompress).",
+        title: "launcher.new_project.reline_models.decompress_title",
+        description: "launcher.new_project.reline_models.decompress_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "wtp_mr",
         category: ModelCategory::MangaRestore,
-        title: "WTP · реставрация манги",
-        description: "Серия WTP manga-restore: чистка и восстановление Ч/Б манги (линия, тон) без увеличения.",
+        title: "launcher.new_project.reline_models.wtp_restore_title",
+        description: "launcher.new_project.reline_models.wtp_restore_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "unimr",
         category: ModelCategory::MangaRestore,
-        title: "WTP · универсальная реставрация",
-        description: "Универсальный WTP-реставратор Ч/Б манги.",
+        title: "launcher.new_project.reline_models.wtp_universal_title",
+        description: "launcher.new_project.reline_models.wtp_universal_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "dwtp",
         category: ModelCategory::MangaRestore,
-        title: "DWTP · реставрация манги",
-        description: "Мощная серия DWTP: чистка датасета манги (de-screen/downsample), снятие артефактов и увеличение. Тяжёлые варианты (ATD/DAT2) дают лучшее качество, но медленнее.",
-        recommendation: Some("Сильная реставрация; тяжёлые архитектуры любят GPU."),
+        title: "launcher.new_project.reline_models.dwtp_title",
+        description: "launcher.new_project.reline_models.dwtp_desc",
+        recommendation: Some("launcher.new_project.reline_models.dwtp_hint"),
     },
     // --- Manga B/W upscaling ---
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "mangajanai",
         category: ModelCategory::MangaBwUpscale,
-        title: "MangaJaNai · апскейл Ч/Б манги",
-        description: "Флагман для Ч/Б манги: восстанавливает линию и скринтон, давит JPEG-артефакты, увеличивает ×4. Варианты 1200p…2048p подобраны под исходную высоту страницы.",
-        recommendation: Some("Лучший выбор для Ч/Б сканов; берите вариант под высоту страницы."),
+        title: "launcher.new_project.reline_models.mangajanai_title",
+        description: "launcher.new_project.reline_models.mangajanai_desc",
+        recommendation: Some("launcher.new_project.reline_models.mangajanai_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "mangascale",
         category: ModelCategory::MangaBwUpscale,
-        title: "MangaScale · апскейл манги",
-        description: "Увеличение Ч/Б манги с сохранением чёткой линии.",
+        title: "launcher.new_project.reline_models.mangascale_title",
+        description: "launcher.new_project.reline_models.mangascale_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "mangasoup",
         category: ModelCategory::MangaBwUpscale,
-        title: "MangaSoup · апскейл манги",
-        description: "Апскейл манги на основе CUGAN.",
+        title: "launcher.new_project.reline_models.mangasoup_title",
+        description: "launcher.new_project.reline_models.mangasoup_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "wtp_ms",
         category: ModelCategory::MangaBwUpscale,
-        title: "WTP · апскейл манги",
-        description: "Серия WTP manga-scale: увеличение Ч/Б манги.",
+        title: "launcher.new_project.reline_models.wtp_scale_title",
+        description: "launcher.new_project.reline_models.wtp_scale_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "mcover",
         category: ModelCategory::MangaBwUpscale,
-        title: "WTP · обложки",
-        description: "Апскейл обложек манги (CUGAN).",
+        title: "launcher.new_project.reline_models.wtp_covers_title",
+        description: "launcher.new_project.reline_models.wtp_covers_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "digimanga",
         category: ModelCategory::MangaBwUpscale,
-        title: "Цифровая Ч/Б манга",
-        description: "Реставрация и увеличение цифровой Ч/Б манги.",
+        title: "launcher.new_project.reline_models.digital_bw_title",
+        description: "launcher.new_project.reline_models.digital_bw_desc",
         recommendation: None,
     },
     // --- Color illustration / digital art ---
@@ -275,48 +286,48 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "enhancr",
         category: ModelCategory::IllustrationColor,
-        title: "enhancr · быстрая реставрация арта",
-        description: "Реставрация цветной манхвы и диджитал-арта на архитектуре SMoSR (автор Umzi). Очень быстрая: ≈0.5 c против ~1.5 мин у тяжёлых DAT2 на RTX 3060. Чуть шумнее и артефактнее, чем FIGSR, но в разы быстрее. Требует resselt ≥ 1.4.0.",
-        recommendation: Some("Когда нужна быстрая реставрация цветного арта/манхвы."),
+        title: "launcher.new_project.reline_models.enhancr_title",
+        description: "launcher.new_project.reline_models.enhancr_desc",
+        recommendation: Some("launcher.new_project.reline_models.enhancr_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "illustrationjanai",
         category: ModelCategory::IllustrationColor,
-        title: "IllustrationJaNai · цветной арт",
-        description: "Флагман для цветных иллюстраций и диджитал-арта: максимум деталей (DAT2) или быстрее (ESRGAN).",
-        recommendation: Some("Лучший выбор для цветных иллюстраций и вебтунов."),
+        title: "launcher.new_project.reline_models.illustrationjanai_title",
+        description: "launcher.new_project.reline_models.illustrationjanai_desc",
+        recommendation: Some("launcher.new_project.reline_models.illustrationjanai_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "digital_art",
         category: ModelCategory::IllustrationColor,
-        title: "Диджитал-арт",
-        description: "Увеличение цветного диджитал-арта. Суффиксы _t/_l — tiny/large (скорость против качества).",
+        title: "launcher.new_project.reline_models.digital_art_title",
+        description: "launcher.new_project.reline_models.digital_art_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "digitalart",
         category: ModelCategory::IllustrationColor,
-        title: "Диджитал-арт",
-        description: "Увеличение цветного диджитал-арта.",
+        title: "launcher.new_project.reline_models.digital_art_title",
+        description: "launcher.new_project.reline_models.digital_art_desc2",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "illust",
         category: ModelCategory::IllustrationColor,
-        title: "Иллюстрации",
-        description: "Реставрация/увеличение цветных иллюстраций.",
+        title: "launcher.new_project.reline_models.illustrations_title",
+        description: "launcher.new_project.reline_models.illustrations_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "comics",
         category: ModelCategory::IllustrationColor,
-        title: "Комиксы",
-        description: "Деджейпег и восстановление цветных комиксов.",
+        title: "launcher.new_project.reline_models.comics_title",
+        description: "launcher.new_project.reline_models.comics_desc",
         recommendation: None,
     },
     // --- Anime (color) ---
@@ -324,8 +335,8 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "anisd",
         category: ModelCategory::AnimeColor,
-        title: "AniSD · аниме",
-        description: "Реставрация/увеличение аниме-кадров (на быстрой архитектуре SPAN).",
+        title: "launcher.new_project.reline_models.anisd_title",
+        description: "launcher.new_project.reline_models.anisd_desc",
         recommendation: None,
     },
     CuratedEntry {
@@ -333,23 +344,23 @@ static CURATED: &[CuratedEntry] = &[
         key: "animesharp",
         category: ModelCategory::AnimeColor,
         title: "AnimeSharp",
-        description: "Резкий апскейл аниме ×4.",
+        description: "launcher.new_project.reline_models.anime_sharp_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "mahou",
         category: ModelCategory::AnimeColor,
-        title: "Mahou · аниме",
-        description: "Апскейл аниме ×2 на основе CUGAN.",
+        title: "launcher.new_project.reline_models.mahou_title",
+        description: "launcher.new_project.reline_models.mahou_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "anime",
         category: ModelCategory::AnimeColor,
-        title: "Аниме",
-        description: "Апскейл аниме-стиля.",
+        title: "launcher.new_project.reline_models.anime_title",
+        description: "launcher.new_project.reline_models.anime_desc",
         recommendation: None,
     },
     // --- Photo / general ---
@@ -357,32 +368,32 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "purephoto",
         category: ModelCategory::Photo,
-        title: "PurePhoto · фото",
-        description: "Увеличение фотографий (span — быстрее, compact — очень быстро).",
+        title: "launcher.new_project.reline_models.purephoto_title",
+        description: "launcher.new_project.reline_models.purephoto_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "realwebphoto",
         category: ModelCategory::Photo,
-        title: "RealWebPhoto · веб-фото",
-        description: "Восстановление «грязных» веб-фото с артефактами (ATD/DRCT-L — тяжёлые, лучшее восстановление).",
-        recommendation: Some("Для сжатых фото из интернета."),
+        title: "launcher.new_project.reline_models.realwebphoto_title",
+        description: "launcher.new_project.reline_models.realwebphoto_desc",
+        recommendation: Some("launcher.new_project.reline_models.realwebphoto_hint"),
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "ultramix",
         category: ModelCategory::Photo,
-        title: "UltraMix · универсал",
-        description: "Универсальные миксы: Balanced (баланс), Restore (упор на реставрацию), Smooth (сглаживание).",
+        title: "launcher.new_project.reline_models.ultramix_title",
+        description: "launcher.new_project.reline_models.ultramix_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "realesrgan",
         category: ModelCategory::Photo,
-        title: "RealESRGAN · классика",
-        description: "Классический универсальный апскейлер ×4. Вариант anime — для аниме/рисунка.",
+        title: "launcher.new_project.reline_models.realesrgan_title",
+        description: "launcher.new_project.reline_models.realesrgan_desc",
         recommendation: None,
     },
     // --- Generic lightweight ---
@@ -390,16 +401,16 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Contains,
         key: "spanplus",
         category: ModelCategory::Generic,
-        title: "SPAN+ · лёгкий апскейлер",
-        description: "Быстрый лёгкий апскейлер общего назначения. Суффиксы _s/_st — small/small-tiny.",
+        title: "launcher.new_project.reline_models.spanplus_title",
+        description: "launcher.new_project.reline_models.spanplus_desc",
         recommendation: None,
     },
     CuratedEntry {
         kind: MatchKind::Contains,
         key: "span_franken",
         category: ModelCategory::Generic,
-        title: "SPAN · сборный",
-        description: "Экспериментальный сборный SPAN-апскейлер.",
+        title: "launcher.new_project.reline_models.span_title",
+        description: "launcher.new_project.reline_models.span_desc",
         recommendation: None,
     },
     CuratedEntry {
@@ -407,7 +418,7 @@ static CURATED: &[CuratedEntry] = &[
         key: "span_v2",
         category: ModelCategory::Generic,
         title: "SPAN v2 (beta)",
-        description: "Бета лёгкого апскейлера SPAN v2.",
+        description: "launcher.new_project.reline_models.span_v2_desc",
         recommendation: None,
     },
     // --- Raw / unnamed checkpoints ---
@@ -415,8 +426,8 @@ static CURATED: &[CuratedEntry] = &[
         kind: MatchKind::Prefix,
         key: "net_g",
         category: ModelCategory::Other,
-        title: "Безымянный чекпоинт",
-        description: "Сырые тренировочные веса (имя = только номер итерации). Назначение по имени определить нельзя — используйте на свой риск.",
+        title: "launcher.new_project.reline_models.unnamed_title",
+        description: "launcher.new_project.reline_models.unnamed_desc",
         recommendation: None,
     },
 ];
@@ -437,9 +448,9 @@ pub fn classify(name: &str) -> ModelMeta {
         if matches {
             return ModelMeta {
                 category: entry.category,
-                title: entry.title.to_string(),
-                description: entry.description.to_string(),
-                recommendation: entry.recommendation.map(str::to_string),
+                title: resolve_key(entry.title),
+                description: resolve_key(entry.description),
+                recommendation: entry.recommendation.map(resolve_key),
                 scale,
             };
         }
@@ -457,12 +468,12 @@ fn derive_from_name(lowered: &str, scale: Option<u32>) -> ModelMeta {
     let (category, base) = match scale {
         Some(1) => (
             ModelCategory::Other,
-            "Реставрация без увеличения (1x): чистка/снятие артефактов.".to_string(),
+            t!("launcher.new_project.reline_models.restore_1x_desc").to_string(),
         ),
-        Some(factor) => (ModelCategory::Generic, format!("Апскейлер ×{factor}.")),
+        Some(factor) => (ModelCategory::Generic, tf!("launcher.new_project.reline_models.upscale_factor_desc", factor = factor)),
         None => (
             ModelCategory::Other,
-            "Назначение по имени определить не удалось.".to_string(),
+            t!("launcher.new_project.reline_models.unknown_purpose_desc").to_string(),
         ),
     };
 
@@ -473,7 +484,7 @@ fn derive_from_name(lowered: &str, scale: Option<u32>) -> ModelMeta {
 
     ModelMeta {
         category,
-        title: "Модель из каталога".to_string(),
+        title: t!("launcher.new_project.reline_model_from_catalog").to_string(),
         description,
         recommendation: None,
         scale,
@@ -520,20 +531,20 @@ fn arch_note(lowered: &str) -> Option<&'static str> {
 
     if HEAVY.iter().any(|token| lowered.contains(token)) {
         return Some(
-            "Тяжёлая трансформерная архитектура — максимум качества, медленно, лучше на GPU.",
+            t!("launcher.new_project.reline_models.arch_transformer_desc"),
         );
     }
     if lowered.contains("esrgan") {
-        return Some("Классическая архитектура ESRGAN — резкий результат, средняя скорость.");
+        return Some(t!("launcher.new_project.reline_models.arch_esrgan_desc"));
     }
     if lowered.contains("cugan") {
-        return Some("Архитектура CUGAN — заточена под аниме/рисунок.");
+        return Some(t!("launcher.new_project.reline_models.arch_cugan_desc"));
     }
     if MODERN.iter().any(|token| lowered.contains(token)) {
-        return Some("Современная архитектура — хороший баланс качества и скорости.");
+        return Some(t!("launcher.new_project.reline_models.arch_modern_desc"));
     }
     if FAST.iter().any(|token| lowered.contains(token)) {
-        return Some("Лёгкая быстрая архитектура — подходит для слабых ПК/CPU.");
+        return Some(t!("launcher.new_project.reline_models.arch_light_desc"));
     }
     None
 }
@@ -594,8 +605,16 @@ mod tests {
     fn fallback_upscale_with_heavy_arch() {
         let meta = classify("4x_unknownfamily_dat2");
         assert_eq!(meta.category, ModelCategory::Generic);
-        assert!(meta.description.contains("×4"));
-        assert!(meta.description.to_lowercase().contains("gpu"));
+        // Pin the exact catalog keys the description is composed from (upscale-factor
+        // note + heavy-architecture note), so a key remap fails here.
+        assert_eq!(
+            meta.description,
+            format!(
+                "{} {}",
+                tf!("launcher.new_project.reline_models.upscale_factor_desc", factor = 4u32),
+                t!("launcher.new_project.reline_models.arch_transformer_desc"),
+            ),
+        );
     }
 
     #[test]
@@ -625,30 +644,35 @@ mod tests {
         let meta = classify("2x_enhancr_da_smosr");
         assert_eq!(meta.category, ModelCategory::IllustrationColor);
         assert_eq!(meta.scale, Some(2));
-        assert!(meta.display_title().contains("(апскейл 2x)"));
+        assert_eq!(
+            meta.display_title(),
+            tf!("launcher.new_project.reline_models.suffix_upscale", arg = meta.title, factor = 2u32),
+        );
         assert!(meta.recommendation.is_some());
     }
 
     #[test]
     fn scale_suffix_in_display_title() {
-        assert_eq!(classify("1x-MangaJPEGLQ").scale, Some(1));
-        assert!(
-            classify("1x-MangaJPEGLQ")
-                .display_title()
-                .contains("(без апскейла)")
+        // `display_title` pins the suffix catalog keys, so a key remap fails here.
+        let m1 = classify("1x-MangaJPEGLQ");
+        assert_eq!(m1.scale, Some(1));
+        assert_eq!(
+            m1.display_title(),
+            tf!("launcher.new_project.reline_models.suffix_no_upscale", arg = m1.title),
         );
-        assert_eq!(classify("4x_MangaJaNai_V1RC34_ESRGAN_760k").scale, Some(4));
-        assert!(
-            classify("4x_MangaJaNai_V1RC34_ESRGAN_760k")
-                .display_title()
-                .contains("(апскейл 4x)")
+        let m4 = classify("4x_MangaJaNai_V1RC34_ESRGAN_760k");
+        assert_eq!(m4.scale, Some(4));
+        assert_eq!(
+            m4.display_title(),
+            tf!("launcher.new_project.reline_models.suffix_upscale", arg = m4.title, factor = 4u32),
         );
         // Embedded scale token without a leading prefix.
         assert_eq!(classify("RealESRGAN_x4plus").scale, Some(4));
         assert_eq!(classify("2x_spanplus").scale, Some(2));
-        // No recognizable scale -> no suffix.
-        assert_eq!(classify("net_g_20000").scale, None);
-        assert!(!classify("net_g_20000").display_title().contains("апскейл"));
+        // No recognizable scale -> no suffix (title returned verbatim).
+        let mn = classify("net_g_20000");
+        assert_eq!(mn.scale, None);
+        assert_eq!(mn.display_title(), mn.title);
     }
 
     #[test]

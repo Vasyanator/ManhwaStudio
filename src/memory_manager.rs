@@ -61,10 +61,10 @@ impl MemoryProfile {
     #[must_use]
     pub fn display_name_ru(self) -> &'static str {
         match self {
-            Self::Minimal => "Минимум",
-            Self::Low => "Низкое",
-            Self::Medium => "Среднее",
-            Self::Maximum => "Максимум",
+            Self::Minimal => t!("memory.profile.minimal"),
+            Self::Low => t!("memory.profile.low"),
+            Self::Medium => t!("memory.profile.medium"),
+            Self::Maximum => t!("memory.profile.maximum"),
         }
     }
 }

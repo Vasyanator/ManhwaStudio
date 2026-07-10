@@ -18,7 +18,7 @@ re-subscribes via `shared_client()` (which auto-reconnects) so health resumes wh
 the backend comes back.
 
 Main constants:
-- `AI_BACKEND_OFFLINE_ERROR`: unified user-facing message when health check fails.
+- `ai_backend_offline_error()`: unified user-facing message when health check fails.
 
 Main types:
 - `AiBackendHealthSnapshot`: last health result for UI status
@@ -43,7 +43,15 @@ use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::{Duration, Instant};
 
-pub const AI_BACKEND_OFFLINE_ERROR: &str = "ИИ бэкенд отключен";
+/// Unified user-facing message shown when the AI backend is unreachable.
+///
+/// Runtime (not `const`) because `t!` is not const; the returned `&'static str`
+/// is the active catalog value and stays safe to compare against as the
+/// canonical offline message.
+#[must_use]
+pub fn ai_backend_offline_error() -> &'static str {
+    t!("translation.backend_health.offline_error")
+}
 
 /// Cadence for control-command polling while no event is pending. The health
 /// snapshot itself is push-driven (`TOPIC_HEALTH` events ~once/sec); this only
@@ -94,7 +102,7 @@ impl Default for AiBackendHealthSnapshot {
     fn default() -> Self {
         Self {
             connected: false,
-            details: "Ожидание первой проверки...".to_string(),
+            details: t!("translation.backend_health.awaiting_first_probe_status").to_string(),
             checked_at: None,
             backend_version: None,
             is_torch_available: None,
@@ -107,7 +115,7 @@ impl Default for AiBackendHealthSnapshot {
             available_devices: Vec::new(),
             device_options: Vec::new(),
             torch_device_needs_selection: false,
-            device_details: "Список устройств ещё не запрошен.".to_string(),
+            device_details: t!("translation.backend_health.devices_not_requested_status").to_string(),
             selected_onnx_provider: None,
             available_onnx_providers: Vec::new(),
             selected_onnx_device_id: None,
@@ -115,9 +123,9 @@ impl Default for AiBackendHealthSnapshot {
             onnx_devices_by_provider: HashMap::new(),
             onnx_device_needs_selection: false,
             max_loaded_models: 3,
-            onnx_details: "Список ONNX-провайдеров ещё не запрошен.".to_string(),
+            onnx_details: t!("translation.backend_health.onnx_providers_not_requested_status").to_string(),
             device_checked_at: None,
-            cuda_diagnostics: "Диагностика CUDA/ROCm ещё не запускалась.".to_string(),
+            cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_not_run_status").to_string(),
             cuda_checked_at: None,
         }
     }
@@ -127,7 +135,7 @@ impl AiBackendHealthSnapshot {
     pub fn disabled() -> Self {
         Self {
             connected: false,
-            details: "Отключено флагом --no-ai.".to_string(),
+            details: t!("translation.backend_health.disabled_no_ai_status").to_string(),
             checked_at: None,
             backend_version: None,
             is_torch_available: Some(false),
@@ -140,7 +148,7 @@ impl AiBackendHealthSnapshot {
             available_devices: Vec::new(),
             device_options: Vec::new(),
             torch_device_needs_selection: false,
-            device_details: "Управление устройством отключено (--no-ai).".to_string(),
+            device_details: t!("translation.backend_health.device_mgmt_disabled_status").to_string(),
             selected_onnx_provider: None,
             available_onnx_providers: Vec::new(),
             selected_onnx_device_id: None,
@@ -148,9 +156,9 @@ impl AiBackendHealthSnapshot {
             onnx_devices_by_provider: HashMap::new(),
             onnx_device_needs_selection: false,
             max_loaded_models: 3,
-            onnx_details: "Управление ONNX отключено (--no-ai).".to_string(),
+            onnx_details: t!("translation.backend_health.onnx_mgmt_disabled_status").to_string(),
             device_checked_at: None,
-            cuda_diagnostics: "Диагностика CUDA/ROCm отключена (--no-ai).".to_string(),
+            cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_disabled_status").to_string(),
             cuda_checked_at: None,
         }
     }
@@ -205,11 +213,11 @@ fn pull_health_snapshot(timeout: Duration) -> Result<Value, String> {
         )
         .map_err(|err| match err {
             CallError::Error(msg) => msg,
-            CallError::Interrupted(msg) => format!("Запрос health прерван: {msg}"),
+            CallError::Interrupted(msg) => tf!("translation.backend_health.health_request_aborted_error", msg = msg),
             // A transport failure means the backend is offline / the socket is
             // dead; surface the unified offline message (matching device calls)
             // rather than the raw OS/framing string.
-            CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+            CallError::Transport(_) => ai_backend_offline_error().to_string(),
         })?;
     Ok(header)
 }
@@ -237,7 +245,7 @@ struct HealthFields {
 fn parse_health_payload(payload: &Value) -> HealthFields {
     HealthFields {
         connected: true,
-        details: "Состояние получено по IPC (v2 health).".to_string(),
+        details: t!("translation.backend_health.state_received_status").to_string(),
         is_torch_available: payload.get("is_torch_available").and_then(Value::as_bool),
         ocr_manga_ready: health_ocr_ready_flag(payload, "mangaocr"),
         ocr_easy_ready: health_ocr_ready_flag(payload, "easyocr"),
@@ -340,14 +348,8 @@ fn refresh_ai_backend_device_info(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = format!(
-                    "Текущее устройство PyTorch: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
             Err(mut poisoned) => {
@@ -357,14 +359,8 @@ fn refresh_ai_backend_device_info(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = format!(
-                    "Текущее устройство PyTorch: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
         },
@@ -403,14 +399,8 @@ fn set_ai_backend_device(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, device:
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = format!(
-                    "Устройство PyTorch применено: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.pytorch_device_applied_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
             Err(mut poisoned) => {
@@ -420,14 +410,8 @@ fn set_ai_backend_device(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, device:
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = format!(
-                    "Устройство PyTorch применено: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.pytorch_device_applied_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
         },
@@ -470,14 +454,8 @@ fn set_ai_backend_onnx_device(
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = format!(
-                    "Текущее устройство PyTorch: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Устройство ONNX применено: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.onnx_device_applied_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
             Err(mut poisoned) => {
@@ -487,14 +465,8 @@ fn set_ai_backend_onnx_device(
                     summarize_device_state(&device_state)
                 ));
                 apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = format!(
-                    "Текущее устройство PyTorch: {}",
-                    device_state.selected_device
-                );
-                guard.onnx_details = format!(
-                    "Устройство ONNX применено: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.current_pytorch_device_status", device = device_state.selected_device);
+                guard.onnx_details = tf!("translation.backend_health.onnx_device_applied_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
         },
@@ -527,27 +499,15 @@ fn set_ai_backend_max_loaded_models(
         Ok(device_state) => match snapshot.lock() {
             Ok(mut guard) => {
                 apply_device_state_snapshot(&mut guard, &device_state);
-                guard.device_details = format!(
-                    "Лимит загруженных моделей применён: {}",
-                    device_state.max_loaded_models
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.max_models_applied_status", limit = device_state.max_loaded_models);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
             Err(mut poisoned) => {
                 let guard = poisoned.get_mut();
                 apply_device_state_snapshot(guard, &device_state);
-                guard.device_details = format!(
-                    "Лимит загруженных моделей применён: {}",
-                    device_state.max_loaded_models
-                );
-                guard.onnx_details = format!(
-                    "Текущий ONNX: {} / {}",
-                    device_state.selected_onnx_provider, device_state.selected_onnx_device_id
-                );
+                guard.device_details = tf!("translation.backend_health.max_models_applied_status", limit = device_state.max_loaded_models);
+                guard.onnx_details = tf!("translation.backend_health.current_onnx_status", provider = device_state.selected_onnx_provider, device_id = device_state.selected_onnx_device_id);
                 guard.device_checked_at = Some(checked_at);
             }
         },
@@ -686,9 +646,9 @@ fn fetch_ai_backend_cuda_diagnostics() -> Result<String, String> {
     )?;
     let diagnostics = payload
         .get("diagnostics")
-        .ok_or_else(|| "Метод диагностики не вернул поле diagnostics.".to_string())?;
+        .ok_or_else(|| t!("translation.backend_health.diagnostics_field_missing_error").to_string())?;
     render_cuda_diagnostics(diagnostics)
-        .ok_or_else(|| "Метод диагностики вернул пустое поле diagnostics.".to_string())
+        .ok_or_else(|| t!("translation.backend_health.diagnostics_field_empty_error").to_string())
 }
 
 /// Turns the `diagnostics` value from `device.cuda_diagnostics` into the
@@ -730,7 +690,7 @@ fn parse_device_state_payload(payload: &Value) -> Result<AiBackendDeviceState, S
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "Эндпоинт устройств не вернул selected_device.".to_string())?;
+        .ok_or_else(|| t!("translation.backend_health.selected_device_missing_error").to_string())?;
 
     let mut devices = payload
         .get("available_devices")
@@ -1048,14 +1008,14 @@ fn apply_device_state_snapshot(
 /// empty and the result is the response header `Value` (the response blob is
 /// ignored). The readiness gate mirrors the other migrated subsystems: a failed
 /// `shared_client()` (backend offline / handshake failure) maps to
-/// [`AI_BACKEND_OFFLINE_ERROR`].
+/// [`ai_backend_offline_error`].
 ///
 /// `CallError` mapping preserves the previous device UX:
 /// - `Error`       → the backend error message (same as the old HTTP 4xx/5xx).
 /// - `Interrupted` → transient abort surfaced to the device status line.
 /// - `Transport`   → connect/framing failure (backend offline path).
 fn device_call(method: &str, header_fields: Value, timeout: Duration) -> Result<Value, String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let (header, _blob) = client
         .call(method, header_fields, &[], timeout)
         .map_err(map_device_call_error)?;
@@ -1066,8 +1026,8 @@ fn device_call(method: &str, header_fields: Value, timeout: Duration) -> Result<
 fn map_device_call_error(err: CallError) -> String {
     match err {
         CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
-        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+        CallError::Interrupted(msg) => tf!("translation.backend_health.request_aborted_error", msg = msg),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -1118,7 +1078,7 @@ fn subscribe_health(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>) -> Option<Re
             Some(rx)
         }
         Err(_) => {
-            apply_health_offline(snapshot, AI_BACKEND_OFFLINE_ERROR.to_string());
+            apply_health_offline(snapshot, ai_backend_offline_error().to_string());
             None
         }
     }
@@ -1291,7 +1251,10 @@ mod tests {
         assert_eq!(guard.ocr_paddle_vl_ready, Some(false));
         assert_eq!(guard.ocr_surya_ready, Some(true));
         assert!(guard.checked_at.is_some());
-        assert_eq!(guard.details, "Состояние получено по IPC (v2 health).");
+        assert_eq!(
+            guard.details,
+            t!("translation.backend_health.state_received_status")
+        );
     }
 
     /// First successful connect (no prior device info) requests a one-time device
@@ -1385,7 +1348,7 @@ mod tests {
             &snapshot,
             super::HealthFields {
                 connected: false,
-                details: super::AI_BACKEND_OFFLINE_ERROR.to_string(),
+                details: super::ai_backend_offline_error().to_string(),
                 is_torch_available: None,
                 ocr_manga_ready: None,
                 ocr_easy_ready: None,
@@ -1397,7 +1360,7 @@ mod tests {
         );
         let guard = snapshot.lock().unwrap();
         assert!(!guard.connected);
-        assert_eq!(guard.details, super::AI_BACKEND_OFFLINE_ERROR);
+        assert_eq!(guard.details, super::ai_backend_offline_error());
         assert!(guard.is_torch_available.is_none());
         assert!(guard.ocr_manga_ready.is_none());
         assert!(guard.backend_version.is_none());
@@ -1496,11 +1459,16 @@ mod tests {
             map_device_call_error(CallError::Error("boom".to_string())),
             "boom"
         );
-        assert!(map_device_call_error(CallError::Interrupted("x".to_string())).contains("прерван"));
+        // Pin the exact catalog key, not just that the payload survived: a mapping
+        // regression that picked a different message would still pass a `contains` check.
+        assert_eq!(
+            map_device_call_error(CallError::Interrupted("MARKER".to_string())),
+            tf!("translation.backend_health.request_aborted_error", msg = "MARKER")
+        );
         // Transport failures present as the unified offline message.
         assert_eq!(
             map_device_call_error(CallError::Transport("dead".to_string())),
-            super::AI_BACKEND_OFFLINE_ERROR
+            super::ai_backend_offline_error()
         );
     }
 

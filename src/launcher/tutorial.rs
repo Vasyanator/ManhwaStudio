@@ -30,36 +30,28 @@ pub fn steps() -> Vec<TutorialStep<LauncherState>> {
     vec![
         TutorialStep::new(
             [TARGET_OPEN],
-            "Открыть главу",
-            "Открывает уже созданную главу из вашей папки проектов, чтобы продолжить перевод.",
+            t!("launcher.tutorial.open_chapter_title"),
+            t!("launcher.tutorial.open_chapter_message"),
         ),
         TutorialStep::new(
             [TARGET_NEW],
-            "Новая глава",
-            "Полноценный комбайн для выкачки и предобработки глав:\n\
-             - Просто открытие уже скачанной главы\n\
-             - Быстрая выкачка с определенных сайтов\n\
-             - Продвинутая выкачка разными способами из подконтрольного браузера\n\
-             - Склейка и нарезка ленты вебтуна\n\
-             - Удаление шума и апскейл через Reline и Waifu2x\n\
-             - Можно использовать просто для выкачки и обработки глав, не обязательно сохраняя их как проект",
+            t!("launcher.tutorial.new_chapter_title"),
+            t!("launcher.tutorial.new_chapter_message"),
         ),
         TutorialStep::new(
             [TARGET_IMPORT],
-            "Импорт главы",
-            "Импортирует готовую главу из файла .mschapter или .psd.\n\n\
-            Можно импортировать сразу заклиненную главу в zip или rar.",
+            t!("launcher.tutorial.import_chapter_title"),
+            t!("launcher.tutorial.import_chapter_message"),
         ),
         TutorialStep::new(
             [TARGET_EXPORT],
-            "Экспорт главы",
-            "Упаковывает главу в .mschapter, чтобы передать её другому переводчику.",
+            t!("launcher.tutorial.export_chapter_title"),
+            t!("launcher.tutorial.export_chapter_message"),
         ),
         TutorialStep::new(
             [TARGET_SETTINGS],
-            "Настройки",
-            "Папка проектов, ИИ-бэкенд, вычислительные устройства и это обучение — всё здесь. \
-             Заново запустить любую подсказку можно во вкладке «Обучение».",
+            t!("launcher.tutorial.settings_title"),
+            t!("launcher.tutorial.settings_message"),
         ),
     ]
 }

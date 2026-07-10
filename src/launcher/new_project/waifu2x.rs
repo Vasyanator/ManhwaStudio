@@ -274,7 +274,7 @@ impl Waifu2xController {
     pub fn begin(&mut self, _images: Vec<Waifu2xInputImage>, _options: Waifu2xOptions) {
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(Waifu2xWorkerEvent::Finished(Err(Waifu2xError {
-            user_message: "waifu2x недоступен в веб-версии.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.web_unsupported").to_string(),
             log_message: "waifu2x backend is not available on the web build".to_string(),
         })));
         self.pending = Some(PendingWaifu2x { rx });
@@ -354,7 +354,7 @@ impl Waifu2xBackendProbe {
         Waifu2xError {
             user_message: self
                 .unavailable_reason()
-                .unwrap_or("waifu2x недоступен.")
+                .unwrap_or(t!("launcher.new_project.waifu2x.unavailable_error"))
                 .to_string(),
             log_message: format!(
                 "waifu2x backend unavailable: library='{}', model_dir='{}'",
@@ -385,7 +385,7 @@ impl Waifu2xSharedRuntime {
         let total = images.len();
         let backend = self.ensure_backend_ready(progress_tx)?;
         let mut state = self.state.lock().map_err(|_| Waifu2xError {
-            user_message: "waifu2x завершился с ошибкой.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.failed_error").to_string(),
             log_message: "waifu2x runtime mutex poisoned".to_string(),
         })?;
 
@@ -404,7 +404,7 @@ impl Waifu2xSharedRuntime {
             Some(runtime) => runtime,
             None => {
                 return Err(Waifu2xError {
-                    user_message: "Не удалось запустить waifu2x.".to_string(),
+                    user_message: t!("launcher.new_project.waifu2x.start_error").to_string(),
                     log_message: "waifu2x runtime disappeared after creation".to_string(),
                 });
             }
@@ -416,7 +416,7 @@ impl Waifu2xSharedRuntime {
         for (index, input) in images.iter().enumerate() {
             if self.shutdown_requested.load(Ordering::SeqCst) {
                 return Err(Waifu2xError {
-                    user_message: "waifu2x был остановлен при закрытии окна.".to_string(),
+                    user_message: t!("launcher.new_project.waifu2x.stopped_on_close").to_string(),
                     log_message: "waifu2x cancelled because new project window closed".to_string(),
                 });
             }
@@ -424,7 +424,7 @@ impl Waifu2xSharedRuntime {
             let output_image = runtime
                 .process_image(&input.image)
                 .map_err(|err| Waifu2xError {
-                    user_message: "waifu2x завершился с ошибкой. Подробности смотрите в логах."
+                    user_message: t!("launcher.new_project.waifu2x.failed_see_logs_error")
                         .to_string(),
                     log_message: format!("failed to process image '{}': {err}", input.name),
                 })?;
@@ -454,7 +454,7 @@ impl Waifu2xSharedRuntime {
         progress_tx: &Sender<Waifu2xWorkerEvent>,
     ) -> Result<Waifu2xBackendProbe, Waifu2xError> {
         let mut backend = self.backend.lock().map_err(|_| Waifu2xError {
-            user_message: "waifu2x завершился с ошибкой.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.failed_error").to_string(),
             log_message: "waifu2x backend mutex poisoned".to_string(),
         })?;
         if backend.is_available() {
@@ -514,28 +514,28 @@ impl Waifu2xRuntime {
         }
 
         let model_dir_utf8 = backend.model_dir.to_str().ok_or_else(|| Waifu2xError {
-            user_message: "Не удалось подготовить путь к модели waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.prepare_model_path_error").to_string(),
             log_message: format!(
                 "waifu2x model dir is not valid UTF-8: '{}'",
                 backend.model_dir.display()
             ),
         })?;
         let model_dir = CString::new(model_dir_utf8).map_err(|err| Waifu2xError {
-            user_message: "Не удалось подготовить путь к модели waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.prepare_model_path_error").to_string(),
             log_message: format!(
                 "waifu2x model dir contains interior NUL '{}': {err}",
                 backend.model_dir.display()
             ),
         })?;
         let scale = i32::try_from(options.scale).map_err(|err| Waifu2xError {
-            user_message: "Некорректный масштаб waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.invalid_scale_error").to_string(),
             log_message: format!(
                 "failed to convert waifu2x scale {} to i32: {err}",
                 options.scale
             ),
         })?;
         let tile_size = i32::try_from(options.tile_size).map_err(|err| Waifu2xError {
-            user_message: "Некорректный tile size waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.invalid_tile_error").to_string(),
             log_message: format!(
                 "failed to convert waifu2x tile size {} to i32: {err}",
                 options.tile_size
@@ -555,7 +555,7 @@ impl Waifu2xRuntime {
         let status = unsafe { (self.api.load)(self.context, &params) };
         if status != 0 {
             return Err(Waifu2xError {
-                user_message: "Не удалось загрузить модель waifu2x.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.load_model_error").to_string(),
                 log_message: format!(
                     "waifu2x_load failed with status {status}: {}",
                     self.last_error_message()
@@ -680,17 +680,11 @@ fn probe_waifu2x_backend() -> Waifu2xBackendProbe {
     let model_dir = default_waifu2x_model_dir();
     let availability = if !library_path.is_file() {
         Waifu2xAvailability::Unavailable {
-            user_message: format!(
-                "waifu2x отключён: не найдена библиотека '{}'.",
-                library_path.display()
-            ),
+            user_message: tf!("launcher.new_project.waifu2x.library_missing_error", library_path = library_path.display()),
         }
     } else if !model_dir.is_dir() {
         Waifu2xAvailability::Unavailable {
-            user_message: format!(
-                "waifu2x отключён: не найдена папка моделей '{}'.",
-                model_dir.display()
-            ),
+            user_message: tf!("launcher.new_project.waifu2x.models_dir_missing_error", model_dir = model_dir.display()),
         }
     } else {
         Waifu2xAvailability::Available
@@ -722,7 +716,7 @@ fn download_waifu2x_package(
 ) -> Result<PathBuf, Waifu2xError> {
     let download_dir = config::data_dir().join("waifu2x").join(".download");
     fs::create_dir_all(&download_dir).map_err(|err| Waifu2xError {
-        user_message: "Не удалось подготовить папку для загрузки waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.prepare_download_dir_error").to_string(),
         log_message: format!(
             "failed to create waifu2x download dir '{}': {err}",
             download_dir.display()
@@ -733,7 +727,7 @@ fn download_waifu2x_package(
     let partial_path = archive_path.with_extension("zip.part");
     if partial_path.exists() {
         fs::remove_file(&partial_path).map_err(|err| Waifu2xError {
-            user_message: "Не удалось обновить временный файл waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.update_temp_file_error").to_string(),
             log_message: format!(
                 "failed to remove old partial waifu2x archive '{}': {err}",
                 partial_path.display()
@@ -761,7 +755,7 @@ fn download_waifu2x_package(
 
     let mut reader = response.into_reader();
     let mut output = File::create(&partial_path).map_err(|err| Waifu2xError {
-        user_message: "Не удалось создать файл архива waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.create_archive_file_error").to_string(),
         log_message: format!(
             "failed to create waifu2x archive '{}': {err}",
             partial_path.display()
@@ -771,7 +765,7 @@ fn download_waifu2x_package(
     let mut downloaded = 0_u64;
     loop {
         let read = reader.read(&mut buffer).map_err(|err| Waifu2xError {
-            user_message: "Не удалось скачать архив waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.download_archive_error").to_string(),
             log_message: format!("failed to read waifu2x response from '{url}': {err}"),
         })?;
         if read == 0 {
@@ -780,14 +774,14 @@ fn download_waifu2x_package(
         output
             .write_all(&buffer[..read])
             .map_err(|err| Waifu2xError {
-                user_message: "Не удалось записать архив waifu2x.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.write_archive_error").to_string(),
                 log_message: format!(
                     "failed to write waifu2x archive '{}': {err}",
                     partial_path.display()
                 ),
             })?;
         let read_u64 = u64::try_from(read).map_err(|err| Waifu2xError {
-            user_message: "Не удалось скачать архив waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.download_archive_error").to_string(),
             log_message: format!("failed to convert downloaded chunk size {read}: {err}"),
         })?;
         downloaded = downloaded.saturating_add(read_u64);
@@ -799,7 +793,7 @@ fn download_waifu2x_package(
         );
     }
     output.flush().map_err(|err| Waifu2xError {
-        user_message: "Не удалось сохранить архив waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.save_archive_error").to_string(),
         log_message: format!(
             "failed to flush waifu2x archive '{}': {err}",
             partial_path.display()
@@ -808,7 +802,7 @@ fn download_waifu2x_package(
     drop(output);
 
     fs::rename(&partial_path, &archive_path).map_err(|err| Waifu2xError {
-        user_message: "Не удалось завершить загрузку waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.finish_download_error").to_string(),
         log_message: format!(
             "failed to move waifu2x archive '{}' to '{}': {err}",
             partial_path.display(),
@@ -825,14 +819,14 @@ fn extract_waifu2x_package(
 ) -> Result<(), Waifu2xError> {
     send_progress(progress_tx, "extract_waifu2x", 0, 1);
     let archive_file = File::open(archive_path).map_err(|err| Waifu2xError {
-        user_message: "Не удалось открыть архив waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.open_archive_error").to_string(),
         log_message: format!(
             "failed to open waifu2x archive '{}': {err}",
             archive_path.display()
         ),
     })?;
     let mut archive = ZipArchive::new(archive_file).map_err(|err| Waifu2xError {
-        user_message: "Не удалось прочитать архив waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.read_archive_error").to_string(),
         log_message: format!(
             "failed to parse waifu2x zip archive '{}': {err}",
             archive_path.display()
@@ -841,7 +835,7 @@ fn extract_waifu2x_package(
     let total = archive.len();
     let extract_root = config::data_dir().join("waifu2x");
     fs::create_dir_all(&extract_root).map_err(|err| Waifu2xError {
-        user_message: "Не удалось подготовить папку waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.prepare_folder_error").to_string(),
         log_message: format!(
             "failed to create waifu2x root '{}': {err}",
             extract_root.display()
@@ -850,7 +844,7 @@ fn extract_waifu2x_package(
 
     for index in 0..total {
         let mut entry = archive.by_index(index).map_err(|err| Waifu2xError {
-            user_message: "Не удалось распаковать архив waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.extract_archive_error").to_string(),
             log_message: format!(
                 "failed to access entry {index} in '{}': {err}",
                 archive_path.display()
@@ -858,7 +852,7 @@ fn extract_waifu2x_package(
         })?;
         let Some(relative_path) = entry.enclosed_name() else {
             return Err(Waifu2xError {
-                user_message: "Архив waifu2x содержит небезопасный путь.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.unsafe_path_error").to_string(),
                 log_message: format!(
                     "unsafe waifu2x zip entry '{}' in '{}'",
                     entry.name(),
@@ -869,7 +863,7 @@ fn extract_waifu2x_package(
         let output_path = extract_root.join(relative_path);
         if entry.is_dir() {
             fs::create_dir_all(&output_path).map_err(|err| Waifu2xError {
-                user_message: "Не удалось создать папку из архива waifu2x.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.create_dir_from_archive_error").to_string(),
                 log_message: format!(
                     "failed to create waifu2x extracted dir '{}': {err}",
                     output_path.display()
@@ -878,7 +872,7 @@ fn extract_waifu2x_package(
         } else {
             if let Some(parent) = output_path.parent() {
                 fs::create_dir_all(parent).map_err(|err| Waifu2xError {
-                    user_message: "Не удалось создать папку из архива waifu2x.".to_string(),
+                    user_message: t!("launcher.new_project.waifu2x.create_dir_from_archive_error").to_string(),
                     log_message: format!(
                         "failed to create waifu2x extracted parent '{}': {err}",
                         parent.display()
@@ -886,14 +880,14 @@ fn extract_waifu2x_package(
                 })?;
             }
             let mut output = File::create(&output_path).map_err(|err| Waifu2xError {
-                user_message: "Не удалось записать файл из архива waifu2x.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.write_file_from_archive_error").to_string(),
                 log_message: format!(
                     "failed to create waifu2x extracted file '{}': {err}",
                     output_path.display()
                 ),
             })?;
             io::copy(&mut entry, &mut output).map_err(|err| Waifu2xError {
-                user_message: "Не удалось распаковать файл waifu2x.".to_string(),
+                user_message: t!("launcher.new_project.waifu2x.extract_file_error").to_string(),
                 log_message: format!(
                     "failed to extract waifu2x file '{}' to '{}': {err}",
                     entry.name(),
@@ -915,14 +909,14 @@ fn extract_waifu2x_package(
 fn waifu2x_download_error(url: &str, err: ureq::Error) -> Waifu2xError {
     match err {
         ureq::Error::Status(status, response) => Waifu2xError {
-            user_message: "Не удалось скачать waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.download_error").to_string(),
             log_message: format!(
                 "waifu2x download failed for '{url}' with HTTP {status}: {}",
                 response.status_text()
             ),
         },
         ureq::Error::Transport(transport) => Waifu2xError {
-            user_message: "Не удалось скачать waifu2x. Проверьте подключение к интернету."
+            user_message: t!("launcher.new_project.waifu2x.download_error_check_internet")
                 .to_string(),
             log_message: format!("waifu2x download transport error for '{url}': {transport}"),
         },
@@ -1007,7 +1001,7 @@ fn spawn_waifu2x_worker(
             ));
             if tx
                 .send(Waifu2xWorkerEvent::Finished(Err(Waifu2xError {
-                    user_message: "Не удалось запустить waifu2x.".to_string(),
+                    user_message: t!("launcher.new_project.waifu2x.start_error").to_string(),
                     log_message: format!("failed to spawn waifu2x worker: {err}"),
                 })))
                 .is_err()
@@ -1028,7 +1022,7 @@ fn run_waifu2x(
 ) -> Result<Waifu2xSuccess, Waifu2xError> {
     if images.is_empty() {
         return Err(Waifu2xError {
-            user_message: "Сначала откройте или скачайте изображения.".to_string(),
+            user_message: t!("launcher.new_project.open_or_download_first_error").to_string(),
             log_message: "waifu2x started without input images".to_string(),
         });
     }
@@ -1040,7 +1034,7 @@ fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu
     // SAFETY: Loading a shared library is inherently unsafe; the path points to the bundled
     // waifu2x backend resolved by this module.
     let library = unsafe { Library::new(&backend.library_path) }.map_err(|err| Waifu2xError {
-        user_message: "Не удалось загрузить библиотеку waifu2x.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.load_library_error").to_string(),
         log_message: format!(
             "failed to load waifu2x library '{}': {err}",
             backend.library_path.display()
@@ -1052,7 +1046,7 @@ fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu
     let abi_version = unsafe { (api.abi_version)() };
     if abi_version != WAIFU2X_ABI_VERSION {
         return Err(Waifu2xError {
-            user_message: "Неподдерживаемая версия библиотеки waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.unsupported_library_version_error").to_string(),
             log_message: format!(
                 "waifu2x ABI mismatch for '{}': expected {}, got {}",
                 backend.library_path.display(),
@@ -1066,7 +1060,7 @@ fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu
     let init_status = unsafe { (api.global_init)() };
     if init_status != 0 {
         return Err(Waifu2xError {
-            user_message: "Не удалось инициализировать runtime waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.init_runtime_error").to_string(),
             log_message: format!(
                 "waifu2x_global_init failed for '{}': status {init_status}",
                 backend.library_path.display()
@@ -1085,7 +1079,7 @@ fn create_runtime(backend: &Waifu2xBackendProbe) -> Result<Waifu2xRuntime, Waifu
             ));
         }
         return Err(Waifu2xError {
-            user_message: "Не удалось создать контекст waifu2x.".to_string(),
+            user_message: t!("launcher.new_project.waifu2x.create_context_error").to_string(),
             log_message: format!(
                 "waifu2x_create returned null for '{}'",
                 backend.library_path.display()
@@ -1126,7 +1120,7 @@ where
     // SAFETY: the symbol names are from the companion waifu2x C header and the returned
     // function pointers remain valid while `library` is kept alive inside `Waifu2xRuntime`.
     let symbol_ref = unsafe { library.get::<T>(symbol) }.map_err(|err| Waifu2xError {
-        user_message: "Библиотека waifu2x повреждена или несовместима.".to_string(),
+        user_message: t!("launcher.new_project.waifu2x.library_corrupt_error").to_string(),
         log_message: format!(
             "failed to resolve symbol '{}' from '{}': {err}",
             String::from_utf8_lossy(symbol).trim_end_matches('\0'),

@@ -18,6 +18,12 @@ Purpose:
 Языковые детали (правила связывания слов, словарный перенос, оценка качества
 переноса) вынесены в хуки трейта `Segmenter`; конкретный язык реализует их в своём
 модуле (см. `ru`). Алгоритм сегментации и сборки строки — общий и живёт здесь.
+
+Shared, script-neutral binding primitives also live here (`normalize_binding_token`,
+`is_single_letter_binding`, `is_numeric_measure_pair`). They back the
+`binding_conservatism` hook of both the Cyrillic-Slavic and Latin-Slavic engines;
+they are placed in the language-neutral core (not in `latin_common`) so the
+Cyrillic engine need not depend on a Latin-named module.
 */
 
 use std::borrow::Cow;
@@ -64,14 +70,18 @@ impl Conservatism {
         ]
     }
 
-    /// Короткая подпись категории для UI.
+    /// Catalog key for this category's short UI label (painted as `+ {label}`). This
+    /// crate is GUI-free and must not depend on the UI-string catalog, so it returns
+    /// the key; the binary resolves it via `ms_i18n::lookup(key).unwrap_or(key)` (see
+    /// `docs/i18n_exclusions.md` §F). Total: every variant maps to a non-empty, unique
+    /// key.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label_key(self) -> &'static str {
         match self {
-            Conservatism::Safe => "базовая",
-            Conservatism::Relaxed => "длинные предлоги",
-            Conservatism::Bold => "короткие предлоги",
-            Conservatism::Reckless => "однобуквенные",
+            Conservatism::Safe => "typing.advanced.orphan_level_basic",
+            Conservatism::Relaxed => "typing.advanced.orphan_level_long_prepositions",
+            Conservatism::Bold => "typing.advanced.orphan_level_short_prepositions",
+            Conservatism::Reckless => "typing.advanced.orphan_level_single_letter",
         }
     }
 }
@@ -570,6 +580,99 @@ fn is_inline_hard_hyphen_break_char_default(text: &str, idx: usize, ch: char) ->
         && (left.is_alphabetic() || right.is_alphabetic())
 }
 
+// --- Shared word-binding primitives (script-neutral) ------------------------
+//
+// These helpers back the `binding_conservatism` hook of more than one group
+// (Cyrillic-Slavic and Latin-Slavic). They live here — in the language-neutral
+// core — rather than in `latin_common` so the Cyrillic-Slavic engine does not
+// have to depend on a module named for the Latin script. The rules themselves
+// (normalize, single-letter orphan, number+unit) are genuinely script-agnostic.
+
+/// Normalizes a token for service-word binding lookups: strips leading/trailing
+/// non-alphabetic characters (keeping soft hyphens) and lowercases. Shared by the
+/// Cyrillic-Slavic and Latin-Slavic binding rules so both normalize identically.
+pub(crate) fn normalize_binding_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| !ch.is_alphabetic() && ch != SOFT_HYPHEN)
+        .to_lowercase()
+}
+
+/// Whether a normalized binding token is a single alphabetic character. A
+/// one-letter preposition/conjunction (Russian «в дом», Polish `w domu`) left
+/// alone at a line end is the riskiest orphan (`Conservatism::Reckless`).
+/// `normalized` must already be `normalize_binding_token`'s output.
+#[must_use]
+pub(crate) fn is_single_letter_binding(normalized: &str) -> bool {
+    let mut chars = normalized.chars();
+    matches!((chars.next(), chars.next()), (Some(ch), None) if ch.is_alphabetic())
+}
+
+/// Whether `left`/`right` form a "number + unit" pair ("5 кг", "5 kg"). Breaking
+/// between a number and its unit is the riskiest class in every language. Judged
+/// on RAW tokens: `normalize_binding_token` would strip the digits and blank the
+/// left side, so this must run before normalization.
+#[must_use]
+pub(crate) fn is_numeric_measure_pair(left_token: &str, right_token: &str) -> bool {
+    let left = left_token
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\''));
+    let right = right_token
+        .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '№')
+        .to_lowercase();
+    (is_numeric_token(left) || left == "№") && is_measure_or_unit_token(right.as_str())
+}
+
+/// Whether `token` reads as a plain number (digits, with an optional decimal
+/// separator `,`/`.`), ignoring surrounding punctuation.
+fn is_numeric_token(token: &str) -> bool {
+    let compact = token
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .replace(',', ".")
+        .replace(' ', "");
+    !compact.is_empty() && compact.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+}
+
+/// Whether `token` (already lowercased) is a measurement unit or count word that
+/// should cling to a preceding number.
+///
+/// The list is a script-agnostic SUPERSET of the Cyrillic and Latin abbreviations.
+/// This deliberately WIDENS the Russian engine: before the shared extraction the
+/// Cyrillic list held Cyrillic units only, so a Latin unit inside Russian text
+/// ("5 kg") used to be a free break and now binds. The widening is intentional —
+/// a number must never be orphaned from its unit regardless of the unit's script —
+/// and is pinned by `russian_binds_a_latin_unit_after_the_shared_extraction`. It is
+/// the ONLY intended Russian behavior change here; the golden `*_bit_identical`
+/// tests cover the rest.
+fn is_measure_or_unit_token(token: &str) -> bool {
+    matches!(
+        token,
+        // Cyrillic units (Russian and relatives).
+        "кг" | "г"
+            | "мг"
+            | "л"
+            | "мл"
+            | "м"
+            | "см"
+            | "мм"
+            | "км"
+            | "стр"
+            | "с"
+            | "мин"
+            | "ч"
+            | "шт"
+            | "гл"
+        // Latin units, shared across the Latin-script languages.
+            | "kg"
+            | "g"
+            | "mg"
+            | "ml"
+            | "cm"
+            | "mm"
+            | "km"
+            | "min"
+            | "h"
+    ) || token.starts_with("стр")
+}
+
 /// Разбивает абзац на чередующиеся токены «непробел / пробел».
 #[must_use]
 fn tokenize_paragraph(paragraph: &str) -> Vec<String> {
@@ -595,4 +698,22 @@ fn tokenize_paragraph(paragraph: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Conservatism;
+    use std::collections::HashSet;
+
+    #[test]
+    fn conservatism_label_keys_are_total_and_unique() {
+        // Every category maps to a non-empty, unique catalog key: the binary resolves
+        // it, so a duplicate would collapse two levels onto one label.
+        let mut keys = HashSet::new();
+        for level in Conservatism::all() {
+            let key = level.label_key();
+            assert!(!key.is_empty(), "empty key for {level:?}");
+            assert!(keys.insert(key), "duplicate key {key:?}");
+        }
+    }
 }

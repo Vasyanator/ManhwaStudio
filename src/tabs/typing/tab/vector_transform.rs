@@ -247,7 +247,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновый рендер базового изображения векторной трансформации прерван.".to_string(),
+                    t!("typing.vector_transform.base_render_channel_error").to_string(),
                 )),
             }
         };
@@ -386,14 +386,14 @@ impl TypingTextOverlayLayer {
         let Some(text_images_dir) = self.text_images_save_dir.clone() else {
             self.set_create_error(
                 ctx,
-                "Не найдена папка text_images для векторной трансформации.",
+                t!("typing.vector_transform.text_images_dir_missing_error"),
             );
             return false;
         };
         let Some(render_params) = text_render_params_from_render_data(&render_data) else {
             self.set_create_error(
                 ctx,
-                "Не удалось построить параметры рендера для векторной трансформации.",
+                t!("typing.vector_transform.build_params_error"),
             );
             return false;
         };
@@ -451,7 +451,7 @@ impl TypingTextOverlayLayer {
             if report_errors {
                 self.set_create_error(
                     ctx,
-                    "У текстового оверлея нет render_data для векторной трансформации.",
+                    t!("typing.vector_transform.no_render_data_error"),
                 );
             }
             return false;
@@ -468,7 +468,7 @@ impl TypingTextOverlayLayer {
             if report_errors {
                 self.set_create_error(
                     ctx,
-                    "render_data оверлея не содержит text_params для векторной трансформации.",
+                    t!("typing.vector_transform.no_text_params_error"),
                 );
             }
             return false;
@@ -628,14 +628,14 @@ impl TypingTextOverlayLayer {
         let mut pending_reset = false;
         response.context_menu(|menu_ui| {
             if menu_ui
-                .button("Выйти из режима трансформации (векторная)")
+                .button(t!("typing.context_menu.exit_transform_mode_vector"))
                 .clicked()
             {
                 pending_exit = true;
                 menu_ui.close();
             }
             if menu_ui
-                .button("Сбросить трансформацию (векторная)")
+                .button(t!("typing.context_menu.reset_transform_vector"))
                 .clicked()
             {
                 pending_reset = true;

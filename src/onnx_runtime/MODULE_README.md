@@ -65,7 +65,11 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 - `builds.rs`: the static build catalog (`OrtBuild`, `BuildCategory`) and its API
   (`all_builds`, `build_by_slug`, `build_execution_providers`,
   `default_build_for_current_os`, `default_build_for_provider`). Edit here to add a
-  build, change a build's EP set/category/default policy, or its display name.
+  build, change a build's EP set/category/default policy, or its display name. The
+  `display_name` field is a plain product name for most builds but a localization
+  catalog KEY when the label needs translating (the const array cannot call `t!`);
+  read it through `OrtBuild::display_label`, which resolves the key with a fallback
+  to the literal.
 - `manifest.rs`: typed manifest model (`ArchiveKind`, `ManifestSource`,
   `ManifestEntry` with its `build` field), embedded JSON parsing, `lookup`
   (four-key), `lookup_build` (the resolution primary), `build_version`,

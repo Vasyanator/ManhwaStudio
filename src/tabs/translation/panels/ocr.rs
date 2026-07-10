@@ -30,11 +30,15 @@ use crate::tabs::translation::ocr::{
 };
 use crate::tabs::translation::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
-    PADDLEOCR_MAIN_LANGUAGES,
+    PADDLEOCR_MAIN_LANGUAGES, lang_label,
 };
 use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox};
 
-const PYTORCH_UNAVAILABLE_HINT: &str = "PyTorch не установлен";
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn pytorch_unavailable_hint() -> &'static str {
+    t!("translation.common.pytorch_not_installed_status")
+}
 const OCR_AI_API_PANEL_OUTSIDE_HEIGHT_RESERVE: f32 = 300.0;
 
 #[derive(Debug, Clone)]
@@ -125,7 +129,7 @@ impl Default for OcrPanelOptions {
             ai_api_key_edit: String::new(),
             ai_api_key_configured: None,
             ai_api_models: Vec::new(),
-            ai_api_account_status: "Нажмите обновить.".to_string(),
+            ai_api_account_status: t!("translation.common.press_refresh_status").to_string(),
             ai_api_status: String::new(),
             ai_api_system_instruction: "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /".to_string(),
             join_newlines: true,
@@ -321,8 +325,8 @@ pub fn draw_ocr_panel(
     // engine with the backend down (or torch unavailable) correctly disables.
     let selected_engine_enabled =
         selected_mode_requirement(options).is_none_or(|req| req.satisfied(&caps));
-    ui.heading("Настройки распознавания текста");
-    ui.label("Движок:");
+    ui.heading(t!("translation.ocr_panel.settings_heading"));
+    ui.label(t!("translation.ocr_panel.engine_label"));
     // Runtime engines gate their selection button on a per-engine AiRequirement
     // (optimistic while unknown); AiApi is network-only and stays a plain
     // selectable_value so it works with the backend offline (the outer
@@ -335,7 +339,7 @@ pub fn draw_ocr_panel(
                 OcrEngine::MangaOcr,
                 req,
                 "MangaOCR",
-                "Идеален для японского в манге.\nНе требует параметра 'Столбцы справа налево'",
+                t!("translation.ocr_panel.mangaocr_hint"),
             );
         }
         if let Some(req) = engine_button_requirement(OcrEngine::EasyOcr) {
@@ -345,7 +349,7 @@ pub fn draw_ocr_panel(
                 OcrEngine::EasyOcr,
                 req,
                 "EasyOCR",
-                "Быстрее чем Paddle и поддерживает несколько языков сразу.\nХорошо справляется с английским, но для Китайского и Корейского менее точен.",
+                t!("translation.ocr_panel.easyocr_hint"),
             );
         }
         if let Some(req) = engine_button_requirement(OcrEngine::PaddleOcr) {
@@ -355,7 +359,7 @@ pub fn draw_ocr_panel(
                 OcrEngine::PaddleOcr,
                 req,
                 "PaddleOCR",
-                "Более медленный и продвинутый движок.\nХорош для Китайского, Корейского и горизонтального Японского.",
+                t!("translation.ocr_panel.paddleocr_hint"),
             );
         }
         if let Some(req) = engine_button_requirement(OcrEngine::Surya) {
@@ -365,12 +369,12 @@ pub fn draw_ocr_panel(
                 OcrEngine::Surya,
                 req,
                 "Surya",
-                "Самый жирный и продвинутый OCR, соответственно самый медленный.\nНе требует выбора языка, поддерживает 90 языков из коробки.",
+                t!("translation.ocr_panel.paddleocr_full_hint"),
             );
         }
         actions.options_changed |= ui
             .selectable_value(&mut options.engine, OcrEngine::AiApi, "AI API")
-            .on_hover_text("Мультимодальные облачные модели через genai. API key хранится в системном хранилище секретов.")
+            .on_hover_text(t!("translation.ocr_panel.ai_api_hint"))
             .changed();
     });
     // Second engine row keeps wider engines off the first line so the side panel
@@ -383,7 +387,7 @@ pub fn draw_ocr_panel(
                 OcrEngine::PaddleVl,
                 req,
                 "PaddleOCR-VL",
-                "Vision-language OCR (Transformers).\nНе требует детекта текста и выбора языка, распознаёт текст сразу из изображения.",
+                t!("translation.ocr_panel.vision_language_hint"),
             );
         }
     });
@@ -391,7 +395,7 @@ pub fn draw_ocr_panel(
         match options.engine {
             OcrEngine::MangaOcr => {
                 normalize_selected_manga_model(options);
-                ui.label("Модель MangaOCR");
+                ui.label(t!("translation.ocr_panel.mangaocr_model_label"));
                 WheelComboBox::from_id_salt("translation_ocr_manga_model")
                     .selected_text(selected_manga_model_label(options))
                     .show_ui(ui, |ui| {
@@ -399,7 +403,7 @@ pub fn draw_ocr_panel(
                             .selectable_value(
                                 &mut options.manga_model,
                                 "base_onnx".to_string(),
-                                "Базовая (onnx)",
+                                t!("translation.ocr_panel.model_base_onnx"),
                             )
                             .changed();
                         actions.options_changed |= ui
@@ -413,7 +417,7 @@ pub fn draw_ocr_panel(
                             ui,
                             &mut options.manga_model,
                             "base_torch",
-                            "Базовая (PyTorch)",
+                            t!("translation.ocr_panel.model_base_pytorch"),
                             // Strict: the torch model is usable only when PyTorch is
                             // known-available (torch runs solely on the backend).
                             AiRequirement::Torch.satisfied(&caps),
@@ -422,7 +426,7 @@ pub fn draw_ocr_panel(
             }
             OcrEngine::PaddleOcr => {
                 let show_all_changed = ui
-                    .checkbox(&mut options.paddle_show_full_langs, "Показывать все модели")
+                    .checkbox(&mut options.paddle_show_full_langs, t!("translation.ocr_panel.show_all_models_label"))
                     .changed();
                 actions.options_changed |= show_all_changed;
                 if show_all_changed {
@@ -433,7 +437,7 @@ pub fn draw_ocr_panel(
                     options.paddle_show_full_langs,
                 ));
                 let selected_lang = selected_paddle_language_label(options, &available_langs);
-                WheelComboBox::from_label("Модель PaddleOCR")
+                WheelComboBox::from_label(t!("translation.ocr_panel.paddleocr_model_label")).id_salt("translation.ocr_panel.paddleocr_model_label")
                     .selected_text(selected_lang)
                     .show_ui(ui, |ui| {
                         for (code, title) in &available_langs {
@@ -441,7 +445,7 @@ pub fn draw_ocr_panel(
                                 .selectable_value(
                                     &mut options.paddle_lang,
                                     (*code).to_string(),
-                                    format!("{title} ({code})"),
+                                    format!("{} ({code})", lang_label(title)),
                                 )
                                 .changed();
                         }
@@ -449,7 +453,7 @@ pub fn draw_ocr_panel(
             }
             OcrEngine::EasyOcr => {
                 let show_all_changed = ui
-                    .checkbox(&mut options.easy_show_full_langs, "Показывать все языки")
+                    .checkbox(&mut options.easy_show_full_langs, t!("translation.ocr_panel.show_all_langs_label"))
                     .changed();
                 actions.options_changed |= show_all_changed;
                 if show_all_changed {
@@ -460,7 +464,7 @@ pub fn draw_ocr_panel(
                     sorted_language_options(easy_language_options(options.easy_show_full_langs));
                 let selected_lang = selected_easy_language_label(options, &available_langs);
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Язык:");
+                    ui.label(t!("translation.ocr_panel.language_label"));
                     WheelComboBox::from_id_salt("translation_ocr_easy_lang_to_add")
                         .selected_text(selected_lang)
                         .show_ui(ui, |ui| {
@@ -469,12 +473,12 @@ pub fn draw_ocr_panel(
                                     .selectable_value(
                                         &mut options.easy_lang_to_add,
                                         (*code).to_string(),
-                                        format!("{title} ({code})"),
+                                        format!("{} ({code})", lang_label(title)),
                                     )
                                     .changed();
                             }
                         });
-                    if ui.button("Добавить").clicked() {
+                    if ui.button(t!("translation.common.add_button")).clicked() {
                         actions.options_changed |= append_selected_easy_lang(options);
                     }
                 });
@@ -485,7 +489,7 @@ pub fn draw_ocr_panel(
                 // constrains decoding to one writing system to curb hallucination on
                 // messy/handwritten text (no separate language model is selected).
                 normalize_paddle_vl_script(options);
-                WheelComboBox::from_label("Ограничение письменности")
+                WheelComboBox::from_label(t!("translation.ocr_panel.script_restriction_label")).id_salt("translation.ocr_panel.script_restriction_label")
                     .selected_text(paddle_vl_script_label(&options.paddle_vl_script))
                     .show_ui(ui, |ui| {
                         for (key, label) in PADDLE_VL_SCRIPTS {
@@ -493,14 +497,14 @@ pub fn draw_ocr_panel(
                                 .selectable_value(
                                     &mut options.paddle_vl_script,
                                     (*key).to_string(),
-                                    *label,
+                                    lang_label(label),
                                 )
                                 .changed();
                         }
                     });
                 if options.paddle_vl_script != "auto" {
                     ui.small(
-                    "Жёсткий режим: модель выдаёт только выбранную письменность, цифры и знаки.",
+                    t!("translation.ocr_panel.script_restriction_hint"),
                 );
                 }
             }
@@ -514,79 +518,73 @@ pub fn draw_ocr_panel(
     ui.separator();
 
     let (status_color, status_text) = match state {
-        OcrLoadState::NotLoaded => (egui::Color32::GRAY, "Не загружен"),
+        OcrLoadState::NotLoaded => (egui::Color32::GRAY, t!("translation.ocr_panel.status_not_loaded")),
         OcrLoadState::DownloadingModel => (
             egui::Color32::from_rgb(255, 172, 66),
-            "Скачивание модели...",
+            t!("translation.common.downloading_model_status"),
         ),
-        OcrLoadState::Loading => (egui::Color32::from_rgb(255, 172, 66), "Загрузка"),
-        OcrLoadState::Ready => (egui::Color32::from_rgb(42, 168, 88), "Готов"),
-        OcrLoadState::Error => (egui::Color32::from_rgb(208, 84, 62), "Ошибка"),
+        OcrLoadState::Loading => (egui::Color32::from_rgb(255, 172, 66), t!("translation.ocr_panel.status_loading")),
+        OcrLoadState::Ready => (egui::Color32::from_rgb(42, 168, 88), t!("translation.ocr_panel.status_ready")),
+        OcrLoadState::Error => (egui::Color32::from_rgb(208, 84, 62), t!("translation.ocr_panel.status_error")),
     };
     ui.horizontal(|ui| {
-        ui.label("Статус:");
+        ui.label(t!("translation.ocr_panel.status_label"));
         ui.colored_label(status_color, status_text);
     });
 
     if let Some(err) = last_error
         && !err.is_empty()
     {
-        ui.label(format!("Ошибка: {err}"));
+        ui.label(tf!("translation.ocr_panel.error_detail", err = err));
     }
 
     ui.separator();
     actions.options_changed |= ui
-        .checkbox(&mut options.join_newlines, "Сохранять переносы строк")
+        .checkbox(&mut options.join_newlines, t!("translation.ocr_panel.keep_line_breaks_label"))
         .changed();
     actions.options_changed |= ui
         .checkbox(
             &mut options.reflect_strings,
-            "Столбцы справа налево (манга)",
+            t!("translation.ocr_panel.rtl_columns_label"),
         )
         .changed();
     actions.options_changed |= ui
         .checkbox(
             &mut options.copy_to_clipboard,
-            "Копировать полученный текст в буфер",
+            t!("translation.ocr_panel.copy_text_label"),
         )
         .changed();
     actions.options_changed |= ui
-        .checkbox(&mut options.create_bubble, "Создавать пузырь")
+        .checkbox(&mut options.create_bubble, t!("translation.ocr_panel.create_bubble_label"))
         .changed();
     draw_char_replacements(ui, options, &mut actions);
     let quick_label = match quick_selection_shortcut {
         Some(shortcut) if !shortcut.is_empty() => {
-            format!("Быстрое распознавание: {shortcut}+ЛКМ")
+            tf!("translation.ocr_panel.quick_recognition_shortcut_hint", shortcut = shortcut)
         }
-        _ => "Быстрое распознавание".to_string(),
+        _ => t!("translation.recognition.quick_title").to_string(),
     };
     let advanced_label = match advanced_selection_shortcut {
         Some(shortcut) if !shortcut.is_empty() => {
-            format!("Продвинутое распознавание: {shortcut}+ЛКМ")
+            tf!("translation.ocr_panel.advanced_recognition_shortcut_hint", shortcut = shortcut)
         }
-        _ => "Продвинутое распознавание".to_string(),
+        _ => t!("translation.recognition.advanced_title").to_string(),
     };
     if quick_selection_active {
-        ui.small(format!("{quick_label}. Активно: выделите область мышью."));
+        ui.small(tf!("translation.ocr_panel.quick_active_hint", quick_label = quick_label));
     } else {
-        ui.small(format!(
-            "{quick_label}. Удерживайте модификатор и выделите область."
-        ));
+        ui.small(tf!("translation.ocr_panel.quick_inactive_hint", quick_label = quick_label));
     }
     if advanced_selection_active {
-        ui.small(format!(
-            "{advanced_label}. Активно: выделите область мышью для открытия окна."
-        ));
+        ui.small(tf!("translation.ocr_panel.advanced_active_hint", advanced_label = advanced_label));
     } else {
-        ui.small(format!(
-            "{advanced_label}. Удерживайте модификатор и выделите область."
-        ));
+        ui.small(tf!("translation.ocr_panel.advanced_inactive_hint", advanced_label = advanced_label));
     }
 
     let button_label = if state == OcrLoadState::Ready {
-        "Перезагрузить движок"
+        t!("translation.ocr_panel.reload_engine_button")
     } else {
-        "Загрузить движок"
+        t!("translation.ocr_panel.load_engine_button")
     };
     ui.horizontal_wrapped(|ui| {
         let button = ui.add_enabled(
@@ -616,7 +614,7 @@ pub fn draw_ocr_panel(
         && !result.text.trim().is_empty()
     {
         ui.separator();
-        ui.label(format!("Последний OCR: {} строк", result.lines.len()));
+        ui.label(tf!("translation.ocr_panel.last_ocr_lines_status", lines = result.lines.len()));
         let mut preview = result.text.clone();
         ui.add(
             egui::TextEdit::multiline(&mut preview)
@@ -641,7 +639,7 @@ fn draw_char_replacements(
     ui.horizontal(|ui| {
         actions.options_changed |= ui
             .checkbox(&mut options.replace_chars_enabled, "")
-            .on_hover_text("Заменять отдельные символы в распознанном тексте.")
+            .on_hover_text(t!("translation.ocr_panel.char_replace_hint"))
             .changed();
         let arrow = if options.replace_chars_expanded {
             "⏷"
@@ -649,7 +647,7 @@ fn draw_char_replacements(
             "⏵"
         };
         let header = ui
-            .add(egui::Label::new(format!("{arrow} Заменять символы")).sense(egui::Sense::click()));
+            .add(egui::Label::new(tf!("translation.ocr_panel.char_replace_header", arrow = arrow)).sense(egui::Sense::click()));
         if header.clicked() {
             options.replace_chars_expanded = !options.replace_chars_expanded;
         }
@@ -665,7 +663,7 @@ fn draw_char_replacements(
             ui.horizontal(|ui| {
                 actions.options_changed |= ui
                     .checkbox(&mut rule.enabled, "")
-                    .on_hover_text("Включить эту строку замены")
+                    .on_hover_text(t!("translation.ocr_panel.enable_replace_row_label"))
                     .changed();
                 actions.options_changed |= ui
                     .add(
@@ -673,7 +671,7 @@ fn draw_char_replacements(
                             .desired_width(96.0)
                             .hint_text("'·', '…'"),
                     )
-                    .on_hover_text("Что заменять: значения в кавычках через запятую.")
+                    .on_hover_text(t!("translation.ocr_panel.replace_from_hint"))
                     .changed();
                 ui.label("→");
                 actions.options_changed |= ui
@@ -682,11 +680,11 @@ fn draw_char_replacements(
                             .desired_width(64.0)
                             .hint_text("."),
                     )
-                    .on_hover_text("На что заменять.")
+                    .on_hover_text(t!("translation.ocr_panel.replace_to_hint"))
                     .changed();
                 if ui
                     .small_button("🗑")
-                    .on_hover_text("Удалить строку")
+                    .on_hover_text(t!("translation.ocr_panel.delete_row_button"))
                     .clicked()
                 {
                     to_remove = Some(idx);
@@ -697,7 +695,7 @@ fn draw_char_replacements(
             options.char_replacements.remove(idx);
             actions.options_changed = true;
         }
-        if ui.button("Добавить замену").clicked() {
+        if ui.button(t!("translation.ocr_panel.add_replace_button")).clicked() {
             options.char_replacements.push(CharReplacementRuleUi {
                 enabled: true,
                 targets_raw: String::new(),
@@ -722,7 +720,7 @@ fn draw_ai_api_options(
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 ui.set_max_width(max_width);
-                ui.label("Сервис");
+                ui.label(t!("translation.common.service_label"));
                 WheelComboBox::from_id_salt("translation_ocr_ai_api_service")
                     .selected_text(options.ai_api_service.label())
                     .show_ui(ui, |ui| {
@@ -741,7 +739,7 @@ fn draw_ai_api_options(
                     options.ai_api_key_edit.clear();
                     options.ai_api_key_configured = None;
                     options.ai_api_models.clear();
-                    options.ai_api_account_status = "Нажмите обновить.".to_string();
+                    options.ai_api_account_status = t!("translation.common.press_refresh_status").to_string();
                     options.ai_api_status.clear();
                     actions.options_changed = true;
                     actions.refresh_ai_api_metadata = true;
@@ -749,12 +747,12 @@ fn draw_ai_api_options(
 
                 ui.horizontal_wrapped(|ui| {
                     let key_state = match options.ai_api_key_configured {
-                        Some(true) => "key сохранен",
-                        Some(false) => "key не задан",
-                        None => "key не проверен",
+                        Some(true) => t!("translation.common.key_saved_status"),
+                        Some(false) => t!("translation.common.key_not_set_status"),
+                        None => t!("translation.common.key_unverified_status"),
                     };
                     ui.small(key_state);
-                    if ui.small_button("Обновить").clicked() {
+                    if ui.small_button(t!("translation.common.refresh_button")).clicked() {
                         actions.refresh_ai_api_metadata = true;
                     }
                 });
@@ -766,10 +764,10 @@ fn draw_ai_api_options(
                         .desired_width(max_width),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button("Сохранить").clicked() {
+                    if ui.small_button(t!("translation.common.save_button")).clicked() {
                         actions.save_ai_api_key = true;
                     }
-                    if ui.small_button("Удалить").clicked() {
+                    if ui.small_button(t!("translation.common.delete_button")).clicked() {
                         actions.clear_ai_api_key = true;
                     }
                 });
@@ -777,7 +775,7 @@ fn draw_ai_api_options(
                     ui.small(options.ai_api_status.clone());
                 }
 
-                ui.label("Модель");
+                ui.label(t!("translation.common.model_label"));
                 let selected_model = compact_middle(&options.ai_api_model, 42);
                 WheelComboBox::from_id_salt("translation_ocr_ai_api_model")
                     .selected_text(selected_model)
@@ -801,10 +799,10 @@ fn draw_ai_api_options(
                     )
                     .changed();
 
-                ui.label("Баланс и лимиты");
+                ui.label(t!("translation.common.balance_limits_label"));
                 ui.small(options.ai_api_account_status.clone());
 
-                ui.label("Системная инструкция");
+                ui.label(t!("translation.common.system_instruction_label"));
                 actions.options_changed |= ui
                     .add(
                         egui::TextEdit::multiline(&mut options.ai_api_system_instruction)
@@ -850,7 +848,7 @@ fn disabled_manga_model_choice(
         response
     } else {
         response.on_disabled_hover_text(
-            egui::RichText::new(PYTORCH_UNAVAILABLE_HINT)
+            egui::RichText::new(pytorch_unavailable_hint())
                 .color(egui::Color32::from_rgb(240, 102, 102)),
         )
     };
@@ -861,14 +859,16 @@ fn disabled_manga_model_choice(
     false
 }
 
-// PaddleOCR-VL writing-system restriction modes: (wire key, UI label). `auto`
-// keeps the model's native multilingual detection; the others hard-restrict
-// decoding to that script. Keys must match `script_constraint.normalize_script`.
+// PaddleOCR-VL writing-system restriction modes: `(wire key, display i18n key)`.
+// `auto` keeps the model's native multilingual detection; the others
+// hard-restrict decoding to that script. The wire key is the persisted identity
+// (must match `script_constraint.normalize_script`); the display key resolves to
+// a localized label via `lang_label`.
 const PADDLE_VL_SCRIPTS: &[(&str, &str)] = &[
-    ("auto", "Авто (без ограничения)"),
-    ("korean", "Только корейский"),
-    ("chinese", "Только китайский"),
-    ("japanese", "Только японский"),
+    ("auto", "translation.ocr_panel.script_auto"),
+    ("korean", "translation.ocr_panel.script_korean_only"),
+    ("chinese", "translation.ocr_panel.script_chinese_only"),
+    ("japanese", "translation.ocr_panel.script_japanese_only"),
 ];
 
 fn normalize_paddle_vl_script(options: &mut OcrPanelOptions) {
@@ -884,8 +884,8 @@ fn paddle_vl_script_label(script: &str) -> &'static str {
     PADDLE_VL_SCRIPTS
         .iter()
         .find(|(key, _)| *key == script)
-        .map(|(_, label)| *label)
-        .unwrap_or("Авто (без ограничения)")
+        .map(|(_, label)| lang_label(label))
+        .unwrap_or_else(|| lang_label("translation.ocr_panel.script_auto"))
 }
 
 fn paddle_language_options(show_full: bool) -> &'static [(&'static str, &'static str)] {
@@ -911,8 +911,8 @@ fn normalize_selected_manga_model(options: &mut OcrPanelOptions) {
 fn selected_manga_model_label(options: &OcrPanelOptions) -> String {
     match options.manga_model.as_str() {
         "2025_onnx" => "2025 (onnx)".to_string(),
-        "base_torch" => "Базовая (PyTorch)".to_string(),
-        _ => "Базовая (onnx)".to_string(),
+        "base_torch" => t!("translation.ocr_panel.model_base_pytorch").to_string(),
+        _ => t!("translation.ocr_panel.model_base_onnx").to_string(),
     }
 }
 
@@ -949,11 +949,14 @@ fn normalize_selected_paddle_lang(options: &mut OcrPanelOptions) {
     options.paddle_lang = langs[0].0.to_string();
 }
 
-fn selected_paddle_language_label(options: &OcrPanelOptions, langs: &[(&str, &str)]) -> String {
+fn selected_paddle_language_label(
+    options: &OcrPanelOptions,
+    langs: &[(&'static str, &'static str)],
+) -> String {
     langs
         .iter()
         .find(|(code, _)| *code == options.paddle_lang.as_str())
-        .map(|(code, title)| format!("{title} ({code})"))
+        .map(|(code, title)| format!("{} ({code})", lang_label(title)))
         .unwrap_or_else(|| options.paddle_lang.clone())
 }
 
@@ -983,11 +986,14 @@ fn normalize_easy_lang_to_add(options: &mut OcrPanelOptions) {
     options.easy_lang_to_add = langs[0].0.to_string();
 }
 
-fn selected_easy_language_label(options: &OcrPanelOptions, langs: &[(&str, &str)]) -> String {
+fn selected_easy_language_label(
+    options: &OcrPanelOptions,
+    langs: &[(&'static str, &'static str)],
+) -> String {
     langs
         .iter()
         .find(|(code, _)| *code == options.easy_lang_to_add.as_str())
-        .map(|(code, title)| format!("{title} ({code})"))
+        .map(|(code, title)| format!("{} ({code})", lang_label(title)))
         .unwrap_or_else(|| options.easy_lang_to_add.clone())
 }
 
@@ -1008,9 +1014,9 @@ fn append_selected_easy_lang(options: &mut OcrPanelOptions) -> bool {
 
 fn draw_easy_selected_langs(ui: &mut egui::Ui, options: &mut OcrPanelOptions) -> bool {
     let langs = parse_lang_codes(&options.easy_langs);
-    ui.label("Активные языки EasyOCR: (можно выбрать несколько)");
+    ui.label(t!("translation.ocr_panel.easyocr_active_langs_label"));
     if langs.is_empty() {
-        ui.small("Не выбраны.");
+        ui.small(t!("translation.ocr_panel.no_langs_selected"));
         return false;
     }
 
@@ -1019,7 +1025,7 @@ fn draw_easy_selected_langs(ui: &mut egui::Ui, options: &mut OcrPanelOptions) ->
         let label = easy_lang_chip_label(code);
         ui.horizontal(|ui| {
             ui.label(label);
-            if ui.small_button("x").on_hover_text("Удалить язык").clicked() {
+            if ui.small_button("x").on_hover_text(t!("translation.ocr_panel.remove_lang_button")).clicked() {
                 to_remove = Some(code.clone());
             }
         });
@@ -1033,7 +1039,7 @@ fn draw_easy_selected_langs(ui: &mut egui::Ui, options: &mut OcrPanelOptions) ->
 
 fn easy_lang_chip_label(code: &str) -> String {
     match easy_lang_title_by_code(code) {
-        Some(title) => format!("{title} ({code})"),
+        Some(title) => format!("{} ({code})", lang_label(title)),
         None => code.to_string(),
     }
 }
@@ -1064,10 +1070,12 @@ fn sorted_language_options(
     langs: &[(&'static str, &'static str)],
 ) -> Vec<(&'static str, &'static str)> {
     let mut out = langs.to_vec();
+    // Sort by the localized display label so the dropdown is alphabetical in the
+    // active UI language, not by the internal catalog key.
     out.sort_by(|(code_a, title_a), (code_b, title_b)| {
-        title_a
+        lang_label(title_a)
             .to_lowercase()
-            .cmp(&title_b.to_lowercase())
+            .cmp(&lang_label(title_b).to_lowercase())
             .then_with(|| code_a.cmp(code_b))
     });
     out

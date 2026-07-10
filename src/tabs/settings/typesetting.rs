@@ -27,6 +27,7 @@ use super::{
 use crate::tabs::typing::rotation_ctrl_wheel::{
     RotationCtrlWheelMode, rotation_ctrl_wheel_mode, set_rotation_ctrl_wheel_mode,
 };
+use crate::i18n_resolve::resolve_key;
 use crate::runtime_log;
 use crate::text_punctuation;
 use crate::widgets::WheelComboBox;
@@ -40,7 +41,7 @@ impl SettingsTabState {
     /// the value to the live `text_punctuation` set and persists it to
     /// `user_config.json` (`TextTab.hanging_punctuation`) on a background thread.
     pub(super) fn draw_typesetting(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Тайп");
+        ui.heading(t!("settings.typesetting.heading"));
 
         ui.add_space(8.0);
         self.draw_rotation_ctrl_wheel_setting(ui);
@@ -53,11 +54,9 @@ impl SettingsTabState {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label("Висящая пунктуация:");
+        ui.label(t!("settings.typesetting.hanging_punctuation_label"));
         ui.small(
-            "Символы, которые при включённой висящей пунктуации выносятся за края \
-             строки и не идут в счёт её ширины (в т.ч. дефис переноса). Список общий \
-             для рендера текста и перебора форм. Пробелы игнорируются.",
+            t!("settings.typesetting.hanging_punctuation_hint"),
         );
 
         let mut should_save_punctuation = false;
@@ -74,7 +73,7 @@ impl SettingsTabState {
             if ui
                 .add_enabled(
                     self.hanging_punctuation_input != self.saved_hanging_punctuation,
-                    egui::Button::new("Сохранить"),
+                    egui::Button::new(t!("settings.typesetting.hanging_punctuation_save_button")),
                 )
                 .clicked()
             {
@@ -83,7 +82,7 @@ impl SettingsTabState {
             if ui
                 .add_enabled(
                     self.hanging_punctuation_input != text_punctuation::DEFAULT_HANGING_PUNCTUATION,
-                    egui::Button::new("По умолчанию"),
+                    egui::Button::new(t!("settings.typesetting.hanging_punctuation_reset_button")),
                 )
                 .clicked()
             {
@@ -122,7 +121,7 @@ impl SettingsTabState {
         // Per-effect-kind default parameters, collapsed by default. Self-contained
         // typing-panel widget; it owns its own live-apply + background persistence to
         // `TextTab.effect_defaults`.
-        egui::CollapsingHeader::new("Стандартные параметры эффектов")
+        egui::CollapsingHeader::new(t!("settings.typesetting.effect_defaults_header")).id_salt("settings.typesetting.effect_defaults_header")
             .default_open(false)
             .show(ui, |ui| {
                 self.effect_defaults_editor.ui(ui);
@@ -134,7 +133,7 @@ impl SettingsTabState {
         // Font-settings block, collapsed by default. Self-contained typing-panel widget;
         // it loads the font category lists off-thread and drives the runtime-global
         // imported-fonts store for system-font import/removal.
-        egui::CollapsingHeader::new("Настройки шрифтов")
+        egui::CollapsingHeader::new(t!("settings.typesetting.font_settings_header")).id_salt("settings.typesetting.font_settings_header")
             .default_open(false)
             .show(ui, |ui| {
                 self.font_settings_editor.ui(ui);
@@ -152,10 +151,9 @@ impl SettingsTabState {
     /// source of truth (the process-global atomic), so no selection state is stored
     /// on `SettingsTabState`.
     fn draw_text_language_setting(&self, ui: &mut egui::Ui) {
-        ui.label("Язык тайпсеттинга:");
+        ui.label(t!("settings.typesetting.text_language_label"));
         ui.small(
-            "Определяет правила переносов строк и проверку покрытия шрифта. Сначала \
-             выберите группу письменности, затем конкретный язык.",
+            t!("settings.typesetting.text_language_hint"),
         );
 
         let current = text_language();
@@ -165,11 +163,11 @@ impl SettingsTabState {
         // language.
         let mut selected_group = current_group;
         ui.horizontal_wrapped(|ui| {
-            WheelComboBox::from_label("Группа")
-                .selected_text(current_group.display_name())
+            WheelComboBox::from_label(t!("settings.typesetting.script_group_label")).id_salt("settings.typesetting.script_group_label")
+                .selected_text(resolve_key(current_group.name_key()))
                 .show_ui(ui, |ui| {
                     for group in ScriptGroup::all() {
-                        ui.selectable_value(&mut selected_group, group, group.display_name());
+                        ui.selectable_value(&mut selected_group, group, resolve_key(group.name_key()));
                     }
                 });
         });
@@ -182,14 +180,14 @@ impl SettingsTabState {
             selected_group.first_language()
         };
         ui.horizontal_wrapped(|ui| {
-            WheelComboBox::from_label("Язык")
-                .selected_text(selected_language.display_name())
+            WheelComboBox::from_label(t!("settings.typesetting.language_label")).id_salt("settings.typesetting.language_label")
+                .selected_text(resolve_key(selected_language.name_key()))
                 .show_ui(ui, |ui| {
                     for language in selected_group.languages() {
                         ui.selectable_value(
                             &mut selected_language,
                             *language,
-                            language.display_name(),
+                            resolve_key(language.name_key()),
                         );
                     }
                 });
@@ -225,19 +223,18 @@ impl SettingsTabState {
     /// it to `user_config.json` (`TextTab.rotation_ctrl_wheel_mode`) on a background
     /// thread.
     fn draw_rotation_ctrl_wheel_setting(&self, ui: &mut egui::Ui) {
-        ui.label("Поворот Ctrl+колесо:");
-        ui.small("Как жест Ctrl+колесо во вкладке «Текст» поворачивает выбранный оверлей.");
+        ui.label(t!("settings.typesetting.rotation_ctrl_wheel_label"));
+        ui.small(t!("settings.typesetting.rotation_ctrl_wheel_hint"));
 
         let mut mode = rotation_ctrl_wheel_mode();
         let previous = mode;
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut mode, RotationCtrlWheelMode::Vector, "Векторный")
+            ui.radio_value(&mut mode, RotationCtrlWheelMode::Vector, t!("settings.typesetting.rotation_mode_vector"))
                 .on_hover_text(
-                    "На уровне рендера текста. Менее удобный, но идеальная чёткость \
-                     после поворота.",
+                    t!("settings.typesetting.rotation_mode_vector_hint"),
                 );
-            ui.radio_value(&mut mode, RotationCtrlWheelMode::Raster, "Растровый")
-                .on_hover_text("Быстрее, но даёт менее чёткую картинку.");
+            ui.radio_value(&mut mode, RotationCtrlWheelMode::Raster, t!("settings.typesetting.rotation_mode_raster"))
+                .on_hover_text(t!("settings.typesetting.rotation_mode_raster_hint"));
         });
 
         if mode != previous {

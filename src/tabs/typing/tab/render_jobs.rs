@@ -316,7 +316,7 @@ impl TypingTextOverlayLayer {
                 self.loading_text_images_dir = None;
                 self.loaded_text_images_dir = None;
                 self.last_load_error =
-                    Some("Не удалось получить результат загрузки text_info.json.".to_string());
+                    Some(t!("typing.render.text_info_load_error").to_string());
                 self.cancel_active_edit_overlay_render();
                 self.edit_render_data_dirty = false;
                 self.last_selected_overlay_idx = None;
@@ -344,7 +344,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновый рендер текста завершился с ошибкой канала.".to_string(),
+                    t!("typing.render.create_overlay_channel_error").to_string(),
                 )),
             }
         };
@@ -409,7 +409,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err("Создание растрового слоя прервано (ошибка канала).".to_string()))
+                    Some(Err(t!("typing.render.create_raster_channel_error").to_string()))
                 }
             }
         };
@@ -528,7 +528,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err("Эффекты растра прерваны (ошибка канала).".to_string()))
+                    Some(Err(t!("typing.render.raster_effects_channel_error").to_string()))
                 }
             }
         };
@@ -630,7 +630,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновый рендер редактирования оверлея завершился с ошибкой канала."
+                    t!("typing.render.edit_overlay_channel_error")
                         .to_string(),
                 )),
             }
@@ -791,7 +791,7 @@ impl TypingTextOverlayLayer {
                     let Some(text_images_dir) = self.text_images_save_dir.clone() else {
                         self.set_create_error(
                             ctx,
-                            "Не найдена папка text_images для редактирования картинки.",
+                            t!("typing.render.text_images_dir_missing_image_error"),
                         );
                         return;
                     };
@@ -835,7 +835,7 @@ impl TypingTextOverlayLayer {
                 let Some(text_images_dir) = self.text_images_save_dir.clone() else {
                     self.set_create_error(
                         ctx,
-                        "Не найдена папка text_images для редактирования оверлея.",
+                        t!("typing.errors.text_images_dir_missing_overlay"),
                     );
                     return;
                 };
@@ -1133,7 +1133,7 @@ impl TypingTextOverlayLayer {
         let Some(text_images_dir) = self.text_images_save_dir.clone() else {
             self.set_create_error(
                 ctx,
-                "Не найдена папка text_images для редактирования оверлея.",
+                t!("typing.errors.text_images_dir_missing_overlay"),
             );
             return;
         };

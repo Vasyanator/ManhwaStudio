@@ -40,6 +40,9 @@ frames, while the one-shot tools use `shared_client().call(...)`.
   `inpaint.lama_v2` IPC calls (image+mask as concatenated request blob, result PNG in response
   blob). Exposes `lama_model_catalog`, `default_lama_model_filename`, and
   `ensure_lama_model_for_external` so other tools (SDXL 4-channel prefill) can reuse the catalog.
+  `LamaModelSpec.file_name` is the persisted selection identity; `display_key` is an i18n catalog
+  key resolved to a localized label via `LamaModelSpec::display_name()` at render time (the model
+  name is display-only and is free to localize, `docs/i18n_exclusions.md` §A5).
 - `sdxl.rs`: SDXL inpaint backend tool (IPC method `inpaint.sdxl`) with two channel modes.
   `nine_channel` uses a dedicated 9-channel inpaint model at full denoise; `four_channel` uses an
   ordinary SDXL checkpoint with a LaMa prefill (model chosen from `lama.rs`) and a moderate

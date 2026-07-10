@@ -237,14 +237,14 @@ impl ReversibleAction for PsEditOp {
         match self {
             PsEditOp::RasterPixels { label, .. } => label,
             PsEditOp::LayerLifecycle { dir, .. } => match dir {
-                LifecycleDir::Added => "Добавление слоя",
-                LifecycleDir::Removed => "Удаление слоя",
+                LifecycleDir::Added => t!("ps_editor.edit_op.add_layer"),
+                LifecycleDir::Removed => t!("ps_editor.edit_op.delete_layer"),
             },
             PsEditOp::FieldPatch { field, .. } => match field {
-                LayerFieldPatch::Visibility { .. } => "Видимость слоя",
-                LayerFieldPatch::Opacity { .. } => "Непрозрачность слоя",
-                LayerFieldPatch::Transform { .. } => "Трансформация слоя",
-                LayerFieldPatch::Deform { .. } => "Деформация слоя",
+                LayerFieldPatch::Visibility { .. } => t!("ps_editor.edit_op.layer_visibility"),
+                LayerFieldPatch::Opacity { .. } => t!("ps_editor.edit_op.layer_opacity"),
+                LayerFieldPatch::Transform { .. } => t!("ps_editor.edit_op.layer_transform"),
+                LayerFieldPatch::Deform { .. } => t!("ps_editor.edit_op.layer_deform"),
             },
         }
     }

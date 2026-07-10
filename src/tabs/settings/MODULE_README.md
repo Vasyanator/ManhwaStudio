@@ -60,7 +60,10 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `locale/` folder — scanned ONCE at widget construction, never per frame — each shown by its
   `_meta.name`; changing it persists `General.ui_language` (synchronously, like the memory-profile
   write) and live-installs that locale's catalog via `crate::locale_store::install_ui_locale`
-  (no restart).
+  (no restart). The shared widget also renders a SECOND surface for the typesetting-language
+  selector that `typesetting.rs` owns (so both languages are chosen side by side, and the setting is
+  reachable from the launcher). Both surfaces read/write the `ms_text_util::language` process-global
+  and persist through the same `save_text_language`, so they cannot drift apart.
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
 - `typesetting.rs`: "Тайп" pane for text-typesetting options: the app-wide
@@ -125,6 +128,14 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   choices, not accidental raw key captures.
 - Persisted settings errors should be surfaced or logged with context; do not silently replace real
   failures with fake success.
+- UI-visible strings are localized through the `ms-i18n` `t!` / `tf!` macros (crate-wide via
+  `#[macro_use] extern crate ms_i18n;` in `main.rs`); the Russian source lives in
+  `crates/ms-i18n/locales/{ru,en}.json`. Enum wire tokens (`AsideBubbleCompactMode::as_str`, …),
+  serde field names, and `user_config.json` keys stay byte-identical English/serde and must NOT be
+  routed through `t!` (see `docs/i18n_exclusions.md`). Any `WheelComboBox::from_label` /
+  `egui::CollapsingHeader::new` / `ui.collapsing` whose label is localized MUST carry a stable
+  `.id_salt(...)` (or be built as `CollapsingHeader::new(...).id_salt(...).show(...)`) so the widget
+  id does not follow the translated text (`docs/i18n_exclusions.md` §C).
 
 ## Editing map
 - To add or rename a settings pane, update `SettingsPane`, pane switcher/routing in `mod.rs`, and
@@ -142,7 +153,9 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   language), edit `typesetting.rs` and the matching persistence helper in `mod.rs`
   (`save_text_language` for the language). Runtime globals for these live outside settings
   (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`,
-  `ms_text_util::language`).
+  `ms_text_util::language`). The typesetting-language selector is duplicated in
+  `crate::general_settings_panel`; a change to its behavior must be mirrored there (both share the
+  catalog keys, the process-global, and `save_text_language` — only the egui `id_salt`s differ).
 - To change the collapsed effect-defaults / font-settings blocks in the "Тайп" pane, edit their
   widgets in `src/tabs/typing/panel/` (`effect_defaults.rs` / `font_settings.rs`); `typesetting.rs`
   only wraps each `ui()` in a `CollapsingHeader`.

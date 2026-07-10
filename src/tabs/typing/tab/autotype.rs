@@ -39,7 +39,7 @@ impl TypingTextOverlayLayer {
         let Some(clean_model) = self.clean_overlays_model.clone() else {
             self.set_create_error(
                 ctx,
-                "Авто-тайп недоступен: модель clean overlay не подключена.",
+                t!("typing.autotype.clean_overlay_unavailable_error"),
             );
             return;
         };
@@ -60,7 +60,7 @@ impl TypingTextOverlayLayer {
         ) else {
             self.set_create_error(
                 ctx,
-                "Авто-тайп: у оверлея не найден оптический центр (прозрачный слой).",
+                t!("typing.autotype.no_optical_center_error"),
             );
             return;
         };
@@ -121,7 +121,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновый авто-тайп завершился с ошибкой канала.".to_string(),
+                    t!("typing.autotype.channel_error").to_string(),
                 )),
             }
         };
@@ -170,13 +170,13 @@ impl TypingTextOverlayLayer {
         });
 
         if !result.detection.accepted {
-            self.set_create_error(ctx, format!("Авто-тайп: {}", result.detection.status));
+            self.set_create_error(ctx, tf!("typing.autotype.status", result = result.detection.status));
             return true;
         }
         let Some(target_center_uv) = result.detection.bubble_center_uv else {
             self.set_create_error(
                 ctx,
-                "Авто-тайп: пузырь найден без центра, выравнивание пропущено.",
+                t!("typing.autotype.bubble_without_center_status"),
             );
             return true;
         };

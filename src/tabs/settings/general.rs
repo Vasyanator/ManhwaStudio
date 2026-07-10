@@ -24,7 +24,7 @@ use ms_thread as thread;
 
 impl SettingsTabState {
     pub(super) fn draw_general(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Общие настройки");
+        ui.heading(t!("settings.general.heading"));
 
         // Studio-only: the "Текст" tab panel is locked to the vertical layout. The
         // launcher has no typing tab, so this enforcement stays in the studio wrapper
@@ -49,7 +49,7 @@ impl SettingsTabState {
                 ));
             }
         }
-        ui.label("Панель вкладки «Текст» использует только вертикальный формат.");
+        ui.label(t!("settings.general.typing_panel_vertical_only_hint"));
 
         ui.add_space(10.0);
         ui.separator();

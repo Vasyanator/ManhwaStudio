@@ -20,7 +20,7 @@ use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
 use crate::backend_ipc::{self, CallError};
 use crate::canvas::CanvasView;
 use crate::project::ProjectData;
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::widgets::WheelSlider;
 use crate::{ai_models, config};
 use eframe::egui;
@@ -66,7 +66,7 @@ impl AotInpaintTool {
         params: AotParams,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let width = image.size[0];
         let height = image.size[1];
@@ -94,18 +94,15 @@ impl AotInpaintTool {
         let (_response_header, out_bytes) =
             inpaint_call(backend_ipc::protocol::METHOD_INPAINT_AOT, header, &blob)?;
         if out_bytes.is_empty() {
-            return Err("AI backend не вернул PNG результата.".to_string());
+            return Err(t!("cleaning.inpaint.no_png_result_error").to_string());
         }
         let out_rgba = image::load_from_memory(&out_bytes)
-            .map_err(|err| format!("AI backend вернул повреждённый PNG: {err}"))?
+            .map_err(|err| tf!("cleaning.inpaint.corrupt_png_error", err = err))?
             .to_rgba8();
         let out_w = out_rgba.width() as usize;
         let out_h = out_rgba.height() as usize;
         if out_w != width || out_h != height {
-            return Err(format!(
-                "AI backend вернул неожиданный размер: {}x{} (ожидалось {}x{}).",
-                out_w, out_h, width, height
-            ));
+            return Err(tf!("cleaning.inpaint.unexpected_size_error", out_w = out_w, out_h = out_h, width = width, height = height));
         }
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [out_w, out_h],
@@ -120,7 +117,7 @@ impl CleaningTool for AotInpaintTool {
     }
 
     fn title(&self) -> &'static str {
-        "AI удаление (AOT)"
+        t!("cleaning.tools.aot.title")
     }
 
     fn pytorch_required(&self) -> bool {
@@ -133,7 +130,7 @@ impl CleaningTool for AotInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Обработка через Python AI backend (v2 IPC): метод inpaint.aot.");
+        ui.small(t!("cleaning.tools.aot.description_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -187,23 +184,26 @@ impl CleaningTool for AotInpaintTool {
             ctx,
             canvas,
             project,
-            "AI удаление (AOT)",
+            t!("cleaning.tools.aot.title"),
             {
                 let params = *params;
                 move |image, mask| Self::run_aot(image, mask, params)
             },
             move |ui| {
                 ui.separator();
-                ui.collapsing("Параметры AOT", |ui| {
-                    ui.add(
-                        WheelSlider::new(&mut params.inpaint_size, 256..=4096).text("inpaint_size"),
-                    );
-                });
-                if ui.small_button("Выгрузить AOT из backend").clicked() {
+                egui::CollapsingHeader::new(t!("cleaning.tools.aot.params_heading"))
+                    .id_salt("cleaning.tools.aot.params_heading")
+                    .show(ui, |ui| {
+                        ui.add(
+                            WheelSlider::new(&mut params.inpaint_size, 256..=4096)
+                                .text("inpaint_size"),
+                        );
+                    });
+                if ui.small_button(t!("cleaning.tools.aot.unload_button")).clicked() {
                     *unload_status =
                         match unload_call(backend_ipc::protocol::METHOD_INPAINT_AOT_UNLOAD) {
-                            Ok(_) => Some("Запрошена выгрузка AOT из памяти backend.".to_string()),
-                            Err(err) => Some(format!("Ошибка выгрузки: {err}")),
+                            Ok(_) => Some(t!("cleaning.tools.aot.unload_requested_status").to_string()),
+                            Err(err) => Some(tf!("cleaning.inpaint.unload_error", err = err)),
                         };
                 }
                 if let Some(status) = unload_status.as_ref() {
@@ -235,9 +235,9 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let width = image.size[0];
     let height = image.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина изображения слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота изображения слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
     for px in &image.pixels {
@@ -247,7 +247,7 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
     Ok(out)
 }
 
@@ -255,9 +255,9 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let width = mask.size[0];
     let height = mask.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина маски слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота маски слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
     for px in &mask.pixels {
@@ -266,7 +266,7 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG маски: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
     Ok(out)
 }
 
@@ -289,7 +289,7 @@ fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
 /// - `Interrupted` → transient abort surfaced to the status line.
 /// - `Transport`   → connect/framing failure (unified backend offline message).
 fn inpaint_call(method: &str, header: Value, blob: &[u8]) -> Result<(Value, Vec<u8>), String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call(method, header, blob, AOT_BACKEND_CALL_TIMEOUT)
         .map_err(map_inpaint_call_error)
@@ -307,10 +307,10 @@ fn unload_call(method: &str) -> Result<(), String> {
 fn map_inpaint_call_error(err: CallError) -> String {
     match err {
         CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
+        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
         // A transport failure means the backend is offline; surface the unified
         // offline message (matching device calls) instead of the raw error string.
-        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -407,12 +407,15 @@ mod tests {
             map_inpaint_call_error(CallError::Error("boom".to_string())),
             "boom"
         );
-        assert!(
-            map_inpaint_call_error(CallError::Interrupted("x".to_string())).contains("прерван")
+        // Pin the exact catalog key, not just that the payload survived: a mapping
+        // regression that picked a different message would still pass a `contains` check.
+        assert_eq!(
+            map_inpaint_call_error(CallError::Interrupted("MARKER".to_string())),
+            tf!("cleaning.inpaint.request_aborted_error", msg = "MARKER")
         );
         assert_eq!(
             map_inpaint_call_error(CallError::Transport("dead".to_string())),
-            AI_BACKEND_OFFLINE_ERROR
+            ai_backend_offline_error()
         );
     }
 }

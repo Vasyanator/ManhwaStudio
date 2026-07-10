@@ -29,8 +29,8 @@ pub enum I18nError {
     #[error("invalid locale tag {tag:?}: {reason}")]
     InvalidTag { tag: String, reason: &'static str },
 
-    /// The tag is syntactically valid but ships no embedded catalog (any tag
-    /// other than the compiled-in `en`/`ru`, including a custom on-disk tag that
+    /// The tag is syntactically valid but ships no embedded catalog (any tag outside
+    /// the compiled-in `en`/`ru`/`es`/`fr`/`pt`, including a custom on-disk tag that
     /// has no disk file to load from).
     #[error("no embedded catalog for locale tag {0}")]
     NoCatalog(String),

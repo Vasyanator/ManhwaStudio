@@ -34,7 +34,7 @@ impl MachineTranslatorBackend for DeeplMtBackend {
         _target_lang: &str,
         _texts: Vec<String>,
     ) -> Result<Vec<Result<String, String>>, String> {
-        Err("Перевод через DeepL недоступен в веб-версии.".to_string())
+        Err(t!("translation.mt.deepl.web_unavailable_error").to_string())
     }
 }
 
@@ -134,13 +134,9 @@ fn translate_single_text(
     let translations = result
         .get("translations")
         .and_then(Value::as_array)
-        .ok_or_else(|| "DeepL: ответ не содержит translations.".to_string())?;
+        .ok_or_else(|| t!("translation.mt.deepl.no_translations_error").to_string())?;
     if translations.len() != sentences.len() {
-        return Err(format!(
-            "DeepL: некорректный размер поля translations: ожидалось {}, получено {}.",
-            sentences.len(),
-            translations.len()
-        ));
+        return Err(tf!("translation.mt.deepl.translations_size_error", sentences = sentences.len(), translations = translations.len()));
     }
 
     let merged = translations
@@ -301,7 +297,7 @@ impl DeeplJsonRpcClient {
                 "id": self.id_number,
             });
             let payload_text = serialize_json_like_requests(&payload)
-                .map_err(|err| format!("DeepL {method}: ошибка сериализации JSON: {err}"))?;
+                .map_err(|err| tf!("translation.mt.deepl.serialize_error", method = method, err = err))?;
 
             let response = self
                 .agent
@@ -320,13 +316,13 @@ impl DeeplJsonRpcClient {
                 .send_string(&payload_text);
             let (status, body) = read_response(response)?;
             let value: Value = serde_json::from_str(&body)
-                .map_err(|err| format!("DeepL {method}: некорректный JSON: {err}"))?;
+                .map_err(|err| tf!("translation.mt.deepl.invalid_json_error", method = method, err = err))?;
 
             if status == 200 {
                 return value
                     .get("result")
                     .cloned()
-                    .ok_or_else(|| format!("DeepL {method}: отсутствует поле result."));
+                    .ok_or_else(|| tf!("translation.mt.deepl.missing_result_error", method = method));
             }
 
             let code = value
@@ -345,9 +341,7 @@ impl DeeplJsonRpcClient {
                 "DeepL API error {code} ({code_text}), HTTP {status}: {compact}"
             ));
         }
-        Err(format!(
-            "DeepL {method}: превышено число повторных попыток."
-        ))
+        Err(tf!("translation.mt.deepl.retries_exceeded_error", method = method))
     }
 
     fn refresh_client_state(&mut self) -> Result<(), String> {
@@ -362,7 +356,7 @@ impl DeeplJsonRpcClient {
             "id": initial_request_id(),
         });
         let payload_text = serialize_json_like_requests(&payload)
-            .map_err(|err| format!("DeepL getClientState: ошибка сериализации JSON: {err}"))?;
+            .map_err(|err| tf!("translation.mt.deepl.client_state_serialize_error", err = err))?;
         let response = self
             .agent
             .post(DEEPL_CLIENT_STATE_URL)
@@ -387,12 +381,12 @@ impl DeeplJsonRpcClient {
             return Err(format!("DeepL getClientState: HTTP {status}: {compact}"));
         }
         let value: Value = serde_json::from_str(&body)
-            .map_err(|err| format!("DeepL getClientState: некорректный JSON: {err}"))?;
+            .map_err(|err| tf!("translation.mt.deepl.client_state_invalid_json_error", err = err))?;
         if let Some(id) = value.get("id").and_then(Value::as_i64) {
             self.id_number = id;
             return Ok(());
         }
-        Err("DeepL getClientState: отсутствует поле id.".to_string())
+        Err(t!("translation.mt.deepl.client_state_missing_id_error").to_string())
     }
 }
 
@@ -417,14 +411,14 @@ fn read_response(response: Result<ureq::Response, ureq::Error>) -> Result<(u16, 
             let status = resp.status();
             let body = resp
                 .into_string()
-                .map_err(|err| format!("DeepL: ошибка чтения тела ответа: {err}"))?;
+                .map_err(|err| tf!("translation.mt.deepl.read_body_error", err = err))?;
             Ok((status, body))
         }
         Err(ureq::Error::Status(status, resp)) => {
             let body = resp.into_string().unwrap_or_default();
             Ok((status, body))
         }
-        Err(ureq::Error::Transport(err)) => Err(format!("DeepL: ошибка сети: {err}")),
+        Err(ureq::Error::Transport(err)) => Err(tf!("translation.mt.deepl.network_error", err = err)),
     }
 }
 

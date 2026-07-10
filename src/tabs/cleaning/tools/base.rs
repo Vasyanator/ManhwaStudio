@@ -898,15 +898,15 @@ impl RegionEditToolBase {
     }
 
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {
-        ui.label("Выделение: Shift+ЛКМ (прямоугольник)");
-        ui.small("Esc: отмена рамки");
+        ui.label(t!("cleaning.region.selection_hint"));
+        ui.small(t!("cleaning.region.esc_cancel_hint"));
         if let Some(mult) = self.selection_multiple
             && mult > 1
         {
-            ui.small(format!("Кратность выделения: {mult}px"));
+            ui.small(tf!("cleaning.region.selection_multiple_hint", mult = mult));
         }
         if self.pending_job_id.is_some() {
-            ui.small("Загрузка выделенной области...");
+            ui.small(t!("cleaning.region.loading_selection_status"));
         }
         if let Some(err) = self.load_error.as_ref() {
             ui.colored_label(Color32::from_rgb(255, 120, 120), err);
@@ -926,7 +926,7 @@ impl RegionEditToolBase {
             .add(
                 WheelSlider::new(&mut zoom, REGION_EDITOR_MIN_ZOOM..=REGION_EDITOR_MAX_ZOOM)
                     .logarithmic(true)
-                    .text("Зум"),
+                    .text(t!("cleaning.common.zoom_label")),
             )
             .changed()
         {
@@ -1078,10 +1078,10 @@ impl RegionEditToolBase {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(t!("cleaning.common.cancel_button")).clicked() {
                         *request_close = true;
                     }
-                    if ui.button("Применить").clicked() {
+                    if ui.button(t!("cleaning.common.apply_button")).clicked() {
                         *apply_clicked = true;
                     }
                 });
@@ -1173,9 +1173,9 @@ impl RegionEditToolBase {
                     ui.add_space(4.0);
                     ui.spinner();
                     ui.add_space(6.0);
-                    ui.label("Подготавливаю выделенную область...");
+                    ui.label(t!("cleaning.region.preparing_selection_status"));
                     ui.add_space(6.0);
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(t!("cleaning.common.cancel_button")).clicked() {
                         cancel_pending = true;
                     }
                 });
@@ -1200,7 +1200,7 @@ impl RegionEditToolBase {
                 keep_open = false;
             } else {
                 editor.status =
-                    Some("Не удалось вставить результат в слой clean overlay.".to_string());
+                    Some(t!("cleaning.region.insert_result_error").to_string());
             }
         }
         if cancel_pending {
@@ -1402,10 +1402,7 @@ impl RegionEditToolBase {
             .iter()
             .find(|page| page.idx == selection.page_idx)
         else {
-            self.load_error = Some(format!(
-                "Не найдена страница с idx={} для выделенного региона.",
-                selection.page_idx
-            ));
+            self.load_error = Some(tf!("cleaning.region.page_not_found_error", page_idx = selection.page_idx));
             return;
         };
 
@@ -1425,7 +1422,7 @@ impl RegionEditToolBase {
             self.load_error = None;
             self.force_center_after_load = true;
         } else {
-            self.load_error = Some("Не удалось отправить задачу загрузки региона.".to_string());
+            self.load_error = Some(t!("cleaning.region.load_dispatch_error").to_string());
             self.force_center_after_load = false;
         }
     }
@@ -1469,7 +1466,7 @@ impl RegionEditToolBase {
                 Err(TryRecvError::Disconnected) => {
                     self.pending_job_id = None;
                     self.load_error =
-                        Some("Поток загрузки region editor завершился неожиданно.".to_string());
+                        Some(t!("cleaning.region.loader_thread_crashed_error").to_string());
                     break;
                 }
             }
@@ -1696,8 +1693,8 @@ impl RegionMaskInpaintToolBase {
 
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {
         self.region_base.draw_ui_hint(ui);
-        ui.small("Окно: ЛКМ рисует маску, ПКМ/Shift+ЛКМ стирают маску.");
-        ui.small("Кнопки: Обработать / Переделать / Вернуть / Применить.");
+        ui.small(t!("cleaning.mask_editor.paint_erase_hint"));
+        ui.small(t!("cleaning.mask_editor.buttons_hint"));
     }
 
     pub fn set_space_pan_active(&mut self, active: bool) {
@@ -1830,7 +1827,7 @@ impl RegionMaskInpaintToolBase {
             window_title,
             |editor| {
                 if editor.status.is_none() {
-                    editor.status = Some("Нарисуйте маску и нажмите «Обработать».".to_string());
+                    editor.status = Some(t!("cleaning.mask_editor.draw_mask_hint").to_string());
                 }
             },
             |ui, editor, request_close, apply_clicked| {
@@ -1922,10 +1919,10 @@ impl RegionMaskInpaintToolBase {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("ЛКМ: рисовать | ПКМ/Shift+ЛКМ: стирать");
+                    ui.label(t!("cleaning.mask_editor.paint_erase_short_hint"));
                     let mut radius = brush_base.radius_px();
                     if ui
-                        .add(WheelSlider::new(&mut radius, 1..=200).text("Кисть"))
+                        .add(WheelSlider::new(&mut radius, 1..=200).text(t!("cleaning.common.brush_label")))
                         .changed()
                     {
                         brush_base.set_radius_px(radius);
@@ -1937,21 +1934,21 @@ impl RegionMaskInpaintToolBase {
                 });
                 if sample_mask_enabled {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Режим:");
+                        ui.label(t!("cleaning.mask_editor.mode_label"));
                         ui.selectable_value(
                             &mut editor_state.active_mask_target,
                             RegionInpaintMaskTarget::Inpaint,
-                            "Удаление",
+                            t!("cleaning.mask_editor.mask_mode_removal"),
                         );
                         ui.selectable_value(
                             &mut editor_state.active_mask_target,
                             RegionInpaintMaskTarget::Sample,
-                            "Пример",
+                            t!("cleaning.mask_editor.mask_mode_sample"),
                         );
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(Color32::from_rgb(255, 220, 0), "Жёлтая: удаление");
-                        ui.colored_label(Color32::from_rgb(90, 255, 130), "Зелёная: пример");
+                        ui.colored_label(Color32::from_rgb(255, 220, 0), t!("cleaning.mask_editor.legend_removal"));
+                        ui.colored_label(Color32::from_rgb(90, 255, 130), t!("cleaning.mask_editor.legend_sample"));
                     });
                 }
 
@@ -1967,7 +1964,7 @@ impl RegionMaskInpaintToolBase {
                 )
                 .show_header(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Параметры генерации маски");
+                        ui.label(t!("cleaning.mask_editor.mask_gen_params_heading"));
                         ui.add_space(8.0);
                         egui::ComboBox::from_id_salt(("mask_generation_method", editor.scroll_id))
                             .selected_text(mask_generation_params.method.label())
@@ -1989,7 +1986,7 @@ impl RegionMaskInpaintToolBase {
                                     response
                                 } else {
                                     response.on_disabled_hover_text(
-                                        egui::RichText::new("PyTorch не установлен")
+                                        egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
                                             .color(Color32::from_rgb(240, 102, 102)),
                                     )
                                 };
@@ -2011,7 +2008,7 @@ impl RegionMaskInpaintToolBase {
                                     response
                                 } else {
                                     response.on_disabled_hover_text(
-                                        egui::RichText::new("PyTorch не установлен")
+                                        egui::RichText::new(t!("cleaning.common.pytorch_not_installed_status"))
                                             .color(Color32::from_rgb(240, 102, 102)),
                                     )
                                 };
@@ -2025,7 +2022,7 @@ impl RegionMaskInpaintToolBase {
                 .body(|ui| {
                     ui.add(
                         WheelSlider::new(&mut mask_generation_params.dilate_size, 0..=30)
-                            .text("Расширение маски"),
+                            .text(t!("cleaning.common.mask_expand_label")),
                     );
                 });
                 draw_custom_ui(ui);
@@ -2058,37 +2055,37 @@ impl RegionMaskInpaintToolBase {
         }
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(can_generate_mask, egui::Button::new("Сгенерировать маску"))
+                .add_enabled(can_generate_mask, egui::Button::new(t!("cleaning.mask_editor.generate_mask_button")))
                 .on_hover_text(match (ai_backend_available, mask_generation_params.method) {
-                    (false, _) => "Недоступно: ИИ бэкенд не отвечает.".to_string(),
+                    (false, _) => t!("cleaning.mask_editor.backend_unavailable_status").to_string(),
                     (true, RegionMaskGenerationMethod::ComicTextDetector)
                         if !ai_backend_torch_available =>
                     {
-                        "PyTorch не установлен".to_string()
+                        t!("cleaning.common.pytorch_not_installed_status").to_string()
                     }
                     (true, RegionMaskGenerationMethod::Surya) if !ai_backend_torch_available => {
-                        "PyTorch не установлен".to_string()
+                        t!("cleaning.common.pytorch_not_installed_status").to_string()
                     }
-                    _ => "Отправить текущий регион в выбранный backend-детектор и заполнить маску найденным текстом.".to_string(),
+                    _ => t!("cleaning.mask_editor.send_region_hint").to_string(),
                 })
                 .clicked()
             {
                 Self::run_mask_generation(editor, editor_state, *mask_generation_params);
             }
             if ui
-                .add_enabled(can_run, egui::Button::new("Обработать"))
+                .add_enabled(can_run, egui::Button::new(t!("cleaning.mask_editor.process_button")))
                 .clicked()
             {
                 Self::run_processing(editor, editor_state, Arc::clone(&run), false);
             }
             if ui
-                .add_enabled(can_rerun, egui::Button::new("Переделать"))
+                .add_enabled(can_rerun, egui::Button::new(t!("cleaning.mask_editor.redo_button")))
                 .clicked()
             {
                 Self::run_processing(editor, editor_state, Arc::clone(&run), true);
             }
             if ui
-                .add_enabled(can_undo, egui::Button::new("Вернуть"))
+                .add_enabled(can_undo, egui::Button::new(t!("cleaning.mask_editor.revert_button")))
                 .clicked()
             {
                 Self::undo_processing(editor, editor_state);
@@ -2097,30 +2094,30 @@ impl RegionMaskInpaintToolBase {
                 ui.spinner();
                 if processing {
                     if ui
-                        .button("Отменить обработку")
-                        .on_hover_text("Прервать текущую фоновую операцию (HTTP-запрос к backend может всё ещё завершиться, но результат будет отброшен)")
+                        .button(t!("cleaning.mask_editor.cancel_processing_button"))
+                        .on_hover_text(t!("cleaning.mask_editor.cancel_processing_tooltip"))
                         .clicked()
                     {
                         editor_state.processing_rx = None;
-                        editor.status = Some("Обработка отменена.".to_string());
+                        editor.status = Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
                     }
                 } else if ui
-                    .button("Отменить генерацию")
-                    .on_hover_text("Прервать текущую генерацию маски (HTTP-запрос к backend может всё ещё завершиться, но результат будет отброшен)")
+                    .button(t!("cleaning.mask_editor.cancel_generation_button"))
+                    .on_hover_text(t!("cleaning.mask_editor.cancel_generation_tooltip"))
                     .clicked()
                 {
                     editor_state.mask_generation_rx = None;
-                    editor.status = Some("Генерация маски отменена.".to_string());
+                    editor.status = Some(t!("cleaning.mask_editor.generation_cancelled_status").to_string());
                 }
                 ui.separator();
             } else {
                 ui.separator();
             }
-            if ui.button("Отмена").clicked() {
+            if ui.button(t!("cleaning.common.cancel_button")).clicked() {
                 *request_close = true;
             }
             if ui
-                .add_enabled(can_run, egui::Button::new("Применить"))
+                .add_enabled(can_run, egui::Button::new(t!("cleaning.common.apply_button")))
                 .clicked()
             {
                 *apply_clicked = true;
@@ -2268,7 +2265,7 @@ impl RegionMaskInpaintToolBase {
         }
         let state = slot
             .as_mut()
-            .expect("RegionInpaintEditorState должен существовать после инициализации");
+            .expect(t!("cleaning.region.editor_state_missing_error"));
         if state.mask.size != editor.image.size {
             state.reset_masks(editor.image.size);
         }
@@ -2347,7 +2344,7 @@ impl RegionMaskInpaintToolBase {
             + ?Sized,
     {
         if editor_state.processing_rx.is_some() {
-            editor.status = Some("Обработка уже выполняется...".to_string());
+            editor.status = Some(t!("cleaning.mask_editor.processing_already_running_status").to_string());
             return;
         }
         let source = if use_rerun_source {
@@ -2360,7 +2357,7 @@ impl RegionMaskInpaintToolBase {
             })
         };
         let Some(source) = source else {
-            editor.status = Some("Нет сохранённого состояния для «Переделать».".to_string());
+            editor.status = Some(t!("cleaning.mask_editor.no_state_for_redo_status").to_string());
             return;
         };
 
@@ -2378,7 +2375,7 @@ impl RegionMaskInpaintToolBase {
             });
         });
         editor_state.processing_rx = Some(rx);
-        editor.status = Some("Обработка в фоне...".to_string());
+        editor.status = Some(t!("cleaning.mask_editor.processing_background_status").to_string());
     }
 
     fn run_mask_generation(
@@ -2387,7 +2384,7 @@ impl RegionMaskInpaintToolBase {
         params: RegionMaskGenerationParams,
     ) {
         if editor_state.processing_rx.is_some() || editor_state.mask_generation_rx.is_some() {
-            editor.status = Some("Фоновая операция уже выполняется...".to_string());
+            editor.status = Some(t!("cleaning.mask_editor.background_op_running_status").to_string());
             return;
         }
 
@@ -2398,7 +2395,7 @@ impl RegionMaskInpaintToolBase {
             let _ = tx.send(RegionMaskGenerationJobResult { result });
         });
         editor_state.mask_generation_rx = Some(rx);
-        editor.status = Some("Генерация маски в фоне...".to_string());
+        editor.status = Some(t!("cleaning.mask_editor.generating_mask_status").to_string());
     }
 
     fn poll_processing_result(
@@ -2422,16 +2419,13 @@ impl RegionMaskInpaintToolBase {
                         editor_state.rerun_source = Some(job.source);
                         editor_state.reset_masks(editor.image.size);
                         if prev_size != out_size {
-                            editor.status = Some(format!(
-                                "Внимание: размер после обработки изменился ({}x{} -> {}x{}).",
-                                prev_size[0], prev_size[1], out_size[0], out_size[1]
-                            ));
+                            editor.status = Some(tf!("cleaning.mask_editor.size_changed_warning", prev_w = prev_size[0], prev_h = prev_size[1], out_w = out_size[0], out_h = out_size[1]));
                         } else {
-                            editor.status = Some("Обработка завершена.".to_string());
+                            editor.status = Some(t!("cleaning.mask_editor.processing_done_status").to_string());
                         }
                     }
                     Err(err) => {
-                        editor.status = Some(format!("Ошибка обработки: {err}"));
+                        editor.status = Some(tf!("cleaning.mask_editor.processing_error", err = err));
                     }
                 }
             }
@@ -2441,7 +2435,7 @@ impl RegionMaskInpaintToolBase {
             Err(TryRecvError::Disconnected) => {
                 editor_state.processing_rx = None;
                 editor.status =
-                    Some("Обработка прервана: фоновой поток завершился неожиданно.".to_string());
+                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
             }
         }
         still_processing
@@ -2460,22 +2454,16 @@ impl RegionMaskInpaintToolBase {
                 match job.result {
                     Ok(mask) => {
                         if mask.size != editor.image.size {
-                            editor.status = Some(format!(
-                                "Ошибка генерации маски: backend вернул размер {}x{}, ожидалось {}x{}.",
-                                mask.size[0],
-                                mask.size[1],
-                                editor.image.size[0],
-                                editor.image.size[1]
-                            ));
+                            editor.status = Some(tf!("cleaning.mask_editor.mask_gen_size_error", mask_w = mask.size[0], mask_h = mask.size[1], expected_w = editor.image.size[0], expected_h = editor.image.size[1]));
                             return false;
                         }
                         editor_state.mask = mask;
                         editor_state.mask_texture_dirty = true;
                         editor_state.last_drag_px = None;
-                        editor.status = Some("Маска сгенерирована.".to_string());
+                        editor.status = Some(t!("cleaning.mask_editor.mask_generated_status").to_string());
                     }
                     Err(err) => {
-                        editor.status = Some(format!("Ошибка генерации маски: {err}"));
+                        editor.status = Some(tf!("cleaning.mask_editor.mask_gen_error", err = err));
                     }
                 }
                 false
@@ -2484,7 +2472,7 @@ impl RegionMaskInpaintToolBase {
             Err(TryRecvError::Disconnected) => {
                 editor_state.mask_generation_rx = None;
                 editor.status = Some(
-                    "Генерация маски прервана: фоновой поток завершился неожиданно.".to_string(),
+                    t!("cleaning.mask_editor.mask_gen_thread_crashed_error").to_string(),
                 );
                 false
             }
@@ -2496,7 +2484,7 @@ impl RegionMaskInpaintToolBase {
         editor_state: &mut RegionInpaintEditorState,
     ) {
         let Some(source) = editor_state.undo_stack.pop() else {
-            editor.status = Some("Нет состояния для отката.".to_string());
+            editor.status = Some(t!("cleaning.mask_editor.no_state_for_undo_status").to_string());
             return;
         };
         editor.image = source.image.clone();
@@ -2517,7 +2505,7 @@ impl RegionMaskInpaintToolBase {
         }
         editor_state.last_drag_px = None;
         editor_state.rerun_source = Some(source);
-        editor.status = Some("Возврат к состоянию до обработки.".to_string());
+        editor.status = Some(t!("cleaning.mask_editor.reverted_status").to_string());
     }
 
     fn generate_text_mask_from_ai(
@@ -2547,22 +2535,15 @@ impl RegionMaskInpaintToolBase {
             }
         };
         let mask_w = usize::try_from(mask_size[0])
-            .map_err(|_| format!("{method_label} backend вернул слишком большую ширину маски."))?;
+            .map_err(|_| tf!("cleaning.mask_editor.mask_width_too_large_error", method_label = method_label))?;
         let mask_h = usize::try_from(mask_size[1])
-            .map_err(|_| format!("{method_label} backend вернул слишком большую высоту маски."))?;
+            .map_err(|_| tf!("cleaning.mask_editor.mask_height_too_large_error", method_label = method_label))?;
         if [mask_w, mask_h] != image.size {
-            return Err(format!(
-                "{method_label} backend вернул размер маски {}x{}, ожидалось {}x{}.",
-                mask_w, mask_h, image.size[0], image.size[1]
-            ));
+            return Err(tf!("cleaning.mask_editor.mask_size_error", method_label = method_label, mask_w = mask_w, mask_h = mask_h, image = image.size[0], image_2 = image.size[1]));
         }
         let expected_len = mask_w.saturating_mul(mask_h);
         if expected_len != mask_alpha.len() {
-            return Err(format!(
-                "{method_label} backend вернул некорректную длину маски: {} вместо {}.",
-                mask_alpha.len(),
-                expected_len
-            ));
+            return Err(tf!("cleaning.mask_editor.mask_length_error", method_label = method_label, actual_len = mask_alpha.len(), expected_len = expected_len));
         }
         let mut mask = egui::ColorImage::filled([mask_w, mask_h], Color32::TRANSPARENT);
         for (dst, alpha) in mask.pixels.iter_mut().zip(mask_alpha) {
@@ -2678,7 +2659,7 @@ fn spawn_region_loader_thread() -> (
                         request.overlay_chunk,
                     )
                 } else {
-                    Err("Внутренняя ошибка кеша region editor.".to_string())
+                    Err(t!("cleaning.region.cache_internal_error").to_string())
                 }
             } else {
                 match decode_page_rgba(&request.page_path) {
@@ -2702,7 +2683,7 @@ fn spawn_region_loader_thread() -> (
                                 request.overlay_chunk,
                             )
                         } else {
-                            Err("Не удалось сохранить кеш страницы region editor.".to_string())
+                            Err(t!("cleaning.region.cache_save_error").to_string())
                         }
                     }
                     Err(err) => Err(err),
@@ -2721,7 +2702,7 @@ fn spawn_region_loader_thread() -> (
 
 fn decode_page_rgba(page_path: &PathBuf) -> Result<image::RgbaImage, String> {
     image::open(page_path)
-        .map_err(|err| format!("Не удалось открыть {}: {err}", page_path.display()))
+        .map_err(|err| tf!("cleaning.region.open_page_error", page_path = page_path.display(), err = err))
         .map(|img| img.to_rgba8())
 }
 
@@ -2735,16 +2716,13 @@ fn build_composited_region_image(
     let source_w = source_size[0];
     let source_h = source_size[1];
     if source_w == 0 || source_h == 0 || source_rect.w == 0 || source_rect.h == 0 {
-        return Err("Невалидный размер выделения региона.".to_string());
+        return Err(t!("cleaning.region.invalid_selection_size_error").to_string());
     }
 
     let base_w = base.width() as usize;
     let base_h = base.height() as usize;
     if base_w == 0 || base_h == 0 {
-        return Err(format!(
-            "Страница {} имеет пустой размер.",
-            page_path.display()
-        ));
+        return Err(tf!("cleaning.region.page_empty_size_error", page_path = page_path.display()));
     }
 
     let x0f = source_rect.x as f32 / source_w as f32;

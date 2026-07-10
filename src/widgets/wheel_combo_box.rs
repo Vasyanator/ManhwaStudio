@@ -96,6 +96,19 @@ impl WheelComboBox {
         }
     }
 
+    /// Overrides the widget's persistent id source with a stable salt, keeping the
+    /// visible label.
+    ///
+    /// `from_label` seeds the id from the label text, so a localized label makes the
+    /// id language-dependent and a live language switch resets popup state
+    /// (`docs/i18n_exclusions.md` §C). Chain `.id_salt("stable_key")` after
+    /// `from_label(t!("…"))` to keep the id language-independent.
+    #[inline]
+    pub fn id_salt(mut self, id_salt: impl std::hash::Hash + std::fmt::Debug) -> Self {
+        self.id_salt = Id::new(id_salt);
+        self
+    }
+
     #[inline]
     pub fn width(mut self, width: f32) -> Self {
         self.width = Some(width);

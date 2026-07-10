@@ -50,8 +50,8 @@ enum StampMode {
 impl StampMode {
     fn title(self) -> &'static str {
         match self {
-            Self::AltVersion => "Альтер версия",
-            Self::CurrentImage => "Текущая картинка",
+            Self::AltVersion => t!("cleaning.tools.stamp.mode_alt_version"),
+            Self::CurrentImage => t!("cleaning.tools.stamp.mode_current_image"),
         }
     }
 }
@@ -66,9 +66,9 @@ enum CurrentImageStampSource {
 impl CurrentImageStampSource {
     fn title(self) -> &'static str {
         match self {
-            Self::OriginalOnly => "Исходник",
-            Self::OverlayOnly => "Клин",
-            Self::OriginalAndOverlay => "Исходник + клин",
+            Self::OriginalOnly => t!("cleaning.tools.stamp.source_option"),
+            Self::OverlayOnly => t!("cleaning.tools.stamp.clean_option"),
+            Self::OriginalAndOverlay => t!("cleaning.tools.stamp.source_plus_clean_option"),
         }
     }
 }
@@ -173,19 +173,13 @@ impl Default for StampTool {
                         let rgba = decoded.to_rgba8();
                         let width = rgba.width() as usize;
                         if request.overlay_width > 0 && width != request.overlay_width {
-                            result.error = Some(format!(
-                                "Ширина источника ({width}px) не совпадает с overlay ({})",
-                                request.overlay_width
-                            ));
+                            result.error = Some(tf!("cleaning.tools.stamp.source_width_mismatch_error", width = width, request = request.overlay_width));
                         } else {
                             result.image = Some(Arc::new(rgba));
                         }
                     }
                     Err(error) => {
-                        result.error = Some(format!(
-                            "Не удалось открыть {}: {error}",
-                            request.path.display()
-                        ));
+                        result.error = Some(tf!("cleaning.tools.stamp.open_error", request = request.path.display(), error = error));
                     }
                 }
                 let _ = result_tx.send(result);
@@ -404,9 +398,9 @@ impl StampTool {
             self.source_load_pending = None;
             self.source_status_text = Some(match self.mode {
                 StampMode::AltVersion => {
-                    "Для текущей страницы нет файла в выбранной alt-версии.".to_string()
+                    t!("cleaning.tools.stamp.no_alt_file_status").to_string()
                 }
-                StampMode::CurrentImage => "Для текущей страницы нет исходного файла.".to_string(),
+                StampMode::CurrentImage => t!("cleaning.tools.stamp.no_source_file_status").to_string(),
             });
             return;
         };
@@ -441,7 +435,7 @@ impl StampTool {
         } else {
             self.source_load_pending = None;
             self.source_status_text =
-                Some("Не удалось отправить задачу фоновой загрузки alt-версии.".to_string());
+                Some(t!("cleaning.tools.stamp.alt_load_dispatch_error").to_string());
         }
     }
 
@@ -522,7 +516,7 @@ impl StampTool {
                 .is_some_and(|anchor| anchor.page_idx != point.page_idx)
         {
             self.source_status_text =
-                Some("ПКМ: поставьте точку штампа на текущей странице.".to_string());
+                Some(t!("cleaning.tools.stamp.set_stamp_point_page_hint").to_string());
             return false;
         }
         let source = if erase || !self.source_required_for_paint() {
@@ -532,7 +526,7 @@ impl StampTool {
         } else {
             self.queue_source_load_for_page_if_needed(point.page_idx, overlay_width);
             self.source_status_text =
-                Some("Кэш источника для текущей страницы ещё не готов.".to_string());
+                Some(t!("cleaning.tools.stamp.source_cache_not_ready_status").to_string());
             return false;
         };
 
@@ -657,7 +651,7 @@ impl StampTool {
                 );
             } else {
                 let Some(anchor) = self.source_anchor else {
-                    self.source_status_text = Some("ПКМ: поставьте точку штампа.".to_string());
+                    self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
                     return;
                 };
                 let Some(stroke_origin_overlay) = self.active_stroke_origin_overlay else {
@@ -814,7 +808,7 @@ impl StampTool {
             let Some(source) = self.source_image_for_page(start.page_idx, overlay_width) else {
                 self.queue_source_load_for_page_if_needed(start.page_idx, overlay_width);
                 self.source_status_text = Some(
-                    "Кэш альтернативной версии для текущей страницы ещё не готов.".to_string(),
+                    t!("cleaning.tools.stamp.alt_cache_not_ready_status").to_string(),
                 );
                 return;
             };
@@ -827,11 +821,11 @@ impl StampTool {
             if !self.source_ready_for_page(start.page_idx, overlay_width) {
                 self.queue_source_load_for_page_if_needed(start.page_idx, overlay_width);
                 self.source_status_text =
-                    Some("Кэш источника для текущей страницы ещё не готов.".to_string());
+                    Some(t!("cleaning.tools.stamp.source_cache_not_ready_status").to_string());
                 return;
             }
             let Some(anchor) = self.source_anchor else {
-                self.source_status_text = Some("ПКМ: поставьте точку штампа.".to_string());
+                self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
                 return;
             };
             build_rect_chunk_from_current_source(
@@ -1005,7 +999,7 @@ impl CleaningTool for StampTool {
     }
 
     fn title(&self) -> &'static str {
-        "Штамп"
+        t!("cleaning.tools.stamp.title")
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -1017,7 +1011,7 @@ impl CleaningTool for StampTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Режим");
+        ui.label(t!("cleaning.common.mode_label"));
         ui.horizontal(|ui| {
             if ui
                 .add(
@@ -1041,7 +1035,7 @@ impl CleaningTool for StampTool {
 
         match self.mode {
             StampMode::AltVersion => {
-                ui.label("Исходник");
+                ui.label(t!("cleaning.tools.stamp.source_option"));
                 let mut selected = self.selected_source_idx.map(|idx| idx + 1).unwrap_or(0);
                 WheelComboBox::from_id_salt("cleaning_stamp_source_dir")
                     .selected_text(
@@ -1065,7 +1059,7 @@ impl CleaningTool for StampTool {
                 }
             }
             StampMode::CurrentImage => {
-                ui.label("Источник пикселей");
+                ui.label(t!("cleaning.tools.stamp.pixel_source_label"));
                 ui.horizontal_wrapped(|ui| {
                     for source in [
                         CurrentImageStampSource::OriginalOnly,
@@ -1086,27 +1080,28 @@ impl CleaningTool for StampTool {
                 });
                 let mut rotation = self.rotation_degrees;
                 if ui
-                    .add(WheelSlider::new(&mut rotation, -180.0..=180.0).text("Поворот"))
+                    .add(WheelSlider::new(&mut rotation, -180.0..=180.0).text(t!("cleaning.common.rotation_label")))
                     .changed()
                 {
                     self.rotation_degrees = rotation.clamp(-180.0, 180.0);
                     self.cursor_texture = None;
                 }
-                ui.checkbox(&mut self.snap_anchor_position, "Округление позиции якоря");
+                ui.checkbox(&mut self.snap_anchor_position, t!("cleaning.tools.stamp.anchor_rounding_label"));
                 if let Some(anchor) = self.source_anchor {
-                    ui.small(format!(
-                        "Точка штампа: {:.1}, {:.1}",
-                        anchor.overlay_xy[0], anchor.overlay_xy[1]
+                    ui.small(tf!(
+                        "cleaning.tools.stamp.stamp_point_status",
+                        x = format!("{:.1}", anchor.overlay_xy[0]),
+                        y = format!("{:.1}", anchor.overlay_xy[1])
                     ));
                 } else {
-                    ui.small("ПКМ: поставить точку штампа.");
+                    ui.small(t!("cleaning.tools.stamp.place_stamp_point_hint"));
                 }
             }
         }
 
         let mut radius = self.brush_base.radius_px();
         if ui
-            .add(WheelSlider::new(&mut radius, 1..=200).text("Размер"))
+            .add(WheelSlider::new(&mut radius, 1..=200).text(t!("cleaning.common.size_label")))
             .changed()
         {
             self.brush_base.set_radius_px(radius);
@@ -1115,39 +1110,39 @@ impl CleaningTool for StampTool {
         let mut hardness = self.brush_base.hardness();
         let _ = ui.add(
             WheelSlider::new(&mut hardness, 0.0..=1.0)
-                .text("Жесткость")
+                .text(t!("cleaning.common.hardness_label"))
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
         let _ = self.brush_base.set_hardness(hardness);
 
         let mut preview = self.preview_opacity as i32;
         if ui
-            .add(WheelSlider::new(&mut preview, 0..=255).text("Превью"))
+            .add(WheelSlider::new(&mut preview, 0..=255).text(t!("cleaning.common.preview_label")))
             .changed()
         {
             self.preview_opacity = preview.clamp(0, 255) as u8;
         }
 
         ui.horizontal(|ui| {
-            ui.label("Смещение Y");
+            ui.label(t!("cleaning.tools.stamp.offset_y_label"));
             ui.add(WheelSpinBox::new(&mut self.y_offset).speed(1.0));
         });
 
         if self.mode == StampMode::AltVersion && self.selected_source_name().is_none() {
-            ui.small("Выберите папку в `alt_vers`.");
+            ui.small(t!("cleaning.tools.stamp.select_alt_folder_hint"));
         } else if self.source_loading_for_current_page() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.small("Кэш источника для текущей страницы загружается...");
+                ui.small(t!("cleaning.tools.stamp.source_cache_loading_status"));
             });
         } else if let Some(status) = self.source_status_text.as_ref() {
             ui.small(status);
         }
 
         ui.separator();
-        ui.small("ЛКМ: штамп, Shift+ЛКМ: временный ластик, Ctrl+ЛКМ: прямоугольник");
-        ui.small("Ctrl+Shift+ЛКМ: стереть прямоугольник, Shift+колесо/-/=: размер кисти");
-        ui.small("R+колесо: поворот 0.5°, Shift+R+колесо: поворот 2.5°");
+        ui.small(t!("cleaning.tools.stamp.controls_hint_1"));
+        ui.small(t!("cleaning.tools.stamp.controls_hint_2"));
+        ui.small(t!("cleaning.tools.stamp.controls_hint_3"));
     }
 
     fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
@@ -1193,7 +1188,7 @@ impl CleaningTool for StampTool {
             && self.source_anchor.is_none()
             && !point.modifiers.shift
         {
-            self.source_status_text = Some("ПКМ: поставьте точку штампа.".to_string());
+            self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
             return;
         }
         let _ = self.begin_scratch_stroke(canvas, point, self.effective_erase(point));

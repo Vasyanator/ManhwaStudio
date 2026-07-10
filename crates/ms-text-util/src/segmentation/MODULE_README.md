@@ -28,22 +28,43 @@ clone and switching languages does not reload TeX patterns.
   the `Segmenter` trait (hooks `binding_conservatism`, `hyphenate_word`,
   `hyphen_cost`, `is_hard_hyphen_boundary`; default `segment`/`build_segments`/
   `soft_hyphenate_overlong`/`split_segment_into_parts`), and the shared
-  `count_layout_units` / `build_line_text_and_units`.
+  `count_layout_units` / `build_line_text_and_units`. Also hosts the
+  **script-neutral binding primitives** (`normalize_binding_token`,
+  `is_single_letter_binding`, `is_numeric_measure_pair`) shared by the
+  Cyrillic-Slavic and Latin-Slavic `binding_conservatism`. They live here rather
+  than in `latin_common` so the Cyrillic engine does not depend on a Latin-named
+  module. The number+unit list is a script-agnostic Cyrillic+Latin superset. That
+  WIDENS the Russian engine on purpose: a Latin unit inside Russian text ("5 kg")
+  used to be a free break and now binds. This is the only intended Russian behavior
+  change from the extraction, and it is pinned by
+  `cyrillic_slavic::tests::russian_binds_a_latin_unit_after_the_shared_extraction`.
 - `dictionaries.rs`: `HyphenationDictionaries` — per-language TeX dictionary
   bundle (primary + one opposite-script fallback). `for_language(TextLanguage)`
   returns a thread-local-cached `Rc`. `breaks_for_word` returns group-sanitized
   break offsets; for Russian it reproduces the old `russian`→`EnglishUS` order.
 - `cyrillic_slavic.rs`: `CyrillicSlavicSegmenter`. Owns the historical Russian
   rules (ь/ъ/й line-start rule, one-letter/syllable rules, preposition/particle/
-  abbreviation/number-unit binding, `sanitize_breaks`, safe boundaries). Russian
-  output is byte-identical to the pre-refactor renderer (golden regression tests).
+  abbreviation binding, `sanitize_breaks`, safe boundaries). Russian output is
+  byte-identical to the pre-refactor renderer (golden regression tests), with the
+  single documented exception of the widened number+unit list above. The
+  preposition/particle binding lists are **dispatched per language** (Ru/Uk/Be/Sr)
+  via an exhaustive `TextLanguage` match; non-Cyrillic languages (never built here)
+  map to the empty list, never a panic. The Uk/Be/Sr lists are **best-effort,
+  pending native-speaker review** — they only change break COST, never correctness.
+  Number+unit and the single-letter orphan rule come from the shared `base` helpers.
 - `latin_common.rs`: shared Latin-script break helpers (sanitize, split validity,
   emergency boundary, `avoid_emergency_split`, `maybe_soft_hyphenate_word`,
   `hyphen_cost`). The "break only strictly between two letters" rule is what keeps
   a break away from an apostrophe (French `l'homme`) or opening punctuation
   (Spanish `¿ ¡`).
-- `romance.rs` / `english.rs` / `latin_slavic.rs`: thin group segmenters over
-  `latin_common`. Binding is `Safe` everywhere (no service-word gluing yet).
+- `romance.rs` / `english.rs`: thin group segmenters over `latin_common`. Binding
+  is `Safe` at every junction — a deliberate choice (see `romance.rs` header); the
+  `english.rs` `binding_is_always_safe` test pins it.
+- `latin_slavic.rs`: thin group segmenter over `latin_common`, but its
+  `binding_conservatism` marks two junctions `Reckless`: a one-letter preposition/
+  conjunction orphaned at a line end (Polish/Czech/Slovak/Slovenian/Croatian
+  typography) and a number+unit pair. Both are language-agnostic and reuse the
+  shared `base` primitives — no hand-authored per-language one-letter list.
 - `rules.rs`: group-dispatched break-boundary façade consumed by the renderer's
   runtime wrap (`dictionary_split_is_valid`, `emergency_boundary_is_safe`,
   `avoid_emergency_split`). Dispatches on the process-global language's group.

@@ -78,7 +78,7 @@ fn run_update_window_internal(mode: UpdateMode) -> Result<UpdateWindowOutcome, S
     };
 
     eframe::run_native(
-        "Обновление ManhwaStudio",
+        t!("installer.update.window_title"),
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -89,7 +89,7 @@ fn run_update_window_internal(mode: UpdateMode) -> Result<UpdateWindowOutcome, S
 
     let outcome = output
         .lock()
-        .map_err(|_| "не удалось прочитать результат окна обновления".to_string())?;
+        .map_err(|_| t!("installer.update.no_update_result_error").to_string())?;
     Ok(*outcome)
 }
 
@@ -153,10 +153,10 @@ impl UpdateApp {
             worker_rx: None,
             output,
             stage_progress: 0.0,
-            stage_label: "Ожидание".to_string(),
+            stage_label: t!("installer.update.waiting_stage").to_string(),
             overall_progress: 0.0,
-            overall_label: "Ожидание".to_string(),
-            current_operation: "Проверка обновлений".to_string(),
+            overall_label: t!("installer.update.waiting_stage").to_string(),
+            current_operation: t!("installer.update.checking_updates_stage").to_string(),
             console_lines: Vec::new(),
             torch_prompt: None,
             selected_torch_index: None,
@@ -203,7 +203,7 @@ impl UpdateApp {
         {
             self.pending_check = None;
             self.state = UpdateState::Error {
-                message: format!("Не удалось запустить проверку обновлений: {err}"),
+                message: tf!("installer.update.start_check_error", err = err),
             };
         }
     }
@@ -229,7 +229,7 @@ impl UpdateApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear_receiver = true;
                     self.state = UpdateState::Error {
-                        message: "Проверка обновлений завершилась ошибкой.".to_string(),
+                        message: t!("installer.update.check_failed_status").to_string(),
                     };
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -246,11 +246,11 @@ impl UpdateApp {
         self.worker_rx = Some(rx);
         self.page = UpdatePage::Running;
         self.state = UpdateState::Running;
-        self.current_operation = "Скачивание нового executable".to_string();
+        self.current_operation = t!("installer.update.downloading_executable_stage").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Подготовка".to_string();
+        self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = "Обновление бинарника".to_string();
+        self.overall_label = t!("installer.update.updating_binary_stage").to_string();
         self.console_lines.clear();
 
         let _ = thread::Builder::new()
@@ -263,11 +263,11 @@ impl UpdateApp {
         self.worker_rx = Some(rx);
         self.page = UpdatePage::Running;
         self.state = UpdateState::Running;
-        self.current_operation = "Проверка установленной копии".to_string();
+        self.current_operation = t!("installer.update.checking_installed_copy_stage").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Получение версии".to_string();
+        self.stage_label = t!("installer.update.getting_version_stage").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = format!("Обновление {}", target.root_dir.display());
+        self.overall_label = tf!("installer.update.updating_target_status", target = target.root_dir.display());
         self.console_lines.clear();
 
         let _ = thread::Builder::new()
@@ -281,11 +281,11 @@ impl UpdateApp {
         self.worker_rx = Some(rx);
         self.page = UpdatePage::Running;
         self.state = UpdateState::Running;
-        self.current_operation = "Продолжение обновления".to_string();
+        self.current_operation = t!("installer.update.continue_update_stage").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Подготовка".to_string();
+        self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = "Подготовка окружения".to_string();
+        self.overall_label = t!("installer.update.preparing_env_stage").to_string();
         self.torch_prompt = None;
         self.selected_torch_index = None;
 
@@ -327,8 +327,8 @@ impl UpdateApp {
                 UpdateWorkerEvent::TorchChoiceRequired(prompt) => {
                     self.page = UpdatePage::TorchChoice;
                     self.state = UpdateState::WaitingForTorchChoice;
-                    self.current_operation = "Выбор версии PyTorch".to_string();
-                    self.stage_label = "Выберите backend PyTorch".to_string();
+                    self.current_operation = t!("installer.update.stage_choose_pytorch").to_string();
+                    self.stage_label = t!("installer.update.choose_pytorch_backend_hint").to_string();
                     self.overall_label = prompt.summary.clone();
                     self.selected_torch_index = Some(prompt.recommended_index);
                     self.torch_prompt = Some(prompt);
@@ -339,33 +339,33 @@ impl UpdateApp {
                 } => {
                     self.page = UpdatePage::Check;
                     self.state = UpdateState::NoUpdate;
-                    self.current_operation = "Обновление не требуется".to_string();
+                    self.current_operation = t!("installer.update.no_update_needed_stage").to_string();
                     self.stage_progress = 1.0;
-                    self.stage_label = format!("Установлена версия {local_version}");
+                    self.stage_label = tf!("installer.update.installed_version_label", local_version = local_version);
                     self.overall_progress = 1.0;
-                    self.overall_label = format!("Последний релиз: {remote_version}");
+                    self.overall_label = tf!("installer.update.latest_release_label", remote_version = remote_version);
                 }
                 UpdateWorkerEvent::RelaunchStarted => {
                     self.state = UpdateState::Relaunching;
-                    self.current_operation = "Перезапуск в новую версию".to_string();
+                    self.current_operation = t!("installer.update.restart_to_new_version_stage").to_string();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 UpdateWorkerEvent::Finished(Ok(())) => {
                     self.page = UpdatePage::Completed;
                     self.state = UpdateState::Completed;
-                    self.current_operation = "Обновление завершено".to_string();
+                    self.current_operation = t!("installer.update.update_complete_stage").to_string();
                     self.stage_progress = 1.0;
-                    self.stage_label = "Готово".to_string();
+                    self.stage_label = t!("installer.common.ready").to_string();
                     self.overall_progress = 1.0;
-                    self.overall_label = "Можно выйти в лаунчер".to_string();
+                    self.overall_label = t!("installer.update.can_exit_to_launcher").to_string();
                 }
                 UpdateWorkerEvent::Finished(Err(err)) => {
                     self.page = UpdatePage::Running;
                     self.state = UpdateState::Error {
                         message: err.clone(),
                     };
-                    self.current_operation = "Ошибка обновления".to_string();
-                    self.stage_label = "Этап завершился ошибкой".to_string();
+                    self.current_operation = t!("installer.update.update_error_stage").to_string();
+                    self.stage_label = t!("installer.update.stage_failed").to_string();
                     self.overall_label = err;
                 }
             }
@@ -375,31 +375,31 @@ impl UpdateApp {
     fn draw_check_page(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(44.0);
-            ui.heading("Обновление ManhwaStudio");
+            ui.heading(t!("installer.update.window_title"));
             ui.add_space(8.0);
-            ui.label(format!("Текущая версия: {}", self.local_version));
+            ui.label(tf!("installer.update.current_version_label", arg = self.local_version));
             ui.add_space(18.0);
 
             match &self.state {
                 UpdateState::Checking => {
                     ui.spinner();
                     ui.add_space(8.0);
-                    ui.label("Проверяю доступность обновления...");
+                    ui.label(t!("installer.update.checking_update_status"));
                 }
                 UpdateState::NoUpdate => {
-                    ui.label("Обновлений нет.");
+                    ui.label(t!("installer.update.no_updates_status"));
                     ui.add_space(14.0);
-                    if ui.button("Выйти").clicked() {
+                    if ui.button(t!("installer.update.exit_button")).clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
                 UpdateState::Available { remote_version } => {
                     ui.colored_label(
                         egui::Color32::from_rgb(120, 220, 120),
-                        format!("Доступна новая версия: {remote_version}"),
+                        tf!("installer.update.new_version_available_status", remote_version = remote_version),
                     );
                     ui.add_space(14.0);
-                    if ui.button("Начать обновление").clicked() {
+                    if ui.button(t!("installer.update.start_update_button")).clicked() {
                         self.start_binary_update();
                     }
                 }
@@ -407,10 +407,10 @@ impl UpdateApp {
                     ui.colored_label(egui::Color32::from_rgb(235, 125, 125), message);
                     ui.add_space(14.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Повторить проверку").clicked() {
+                        if ui.button(t!("installer.update.retry_check_button")).clicked() {
                             self.start_check();
                         }
-                        if ui.button("Выйти").clicked() {
+                        if ui.button(t!("installer.update.exit_button")).clicked() {
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -425,7 +425,7 @@ impl UpdateApp {
 
     fn draw_running_page(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
-            ui.heading("Обновление ManhwaStudio");
+            ui.heading(t!("installer.update.window_title"));
             ui.add_space(10.0);
             ui.label(&self.current_operation);
             ui.add_space(8.0);
@@ -439,7 +439,7 @@ impl UpdateApp {
             if let UpdateState::Error { message } = &self.state {
                 ui.colored_label(egui::Color32::from_rgb(235, 125, 125), message);
                 ui.add_space(8.0);
-                if ui.button("Выйти").clicked() {
+                if ui.button(t!("installer.update.exit_button")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -462,7 +462,7 @@ impl UpdateApp {
         };
 
         ui.vertical(|ui| {
-            ui.heading("Обновление PyTorch");
+            ui.heading(t!("installer.update.pytorch_update_label"));
             ui.add_space(8.0);
             ui.label(prompt.summary);
             ui.add_space(12.0);
@@ -470,7 +470,7 @@ impl UpdateApp {
             let cpu_selected = self.selected_torch_index.is_none();
             if ui
                 .selectable_label(cpu_selected, "CPU PyTorch")
-                .on_hover_text("Установить CPU-вариант PyTorch")
+                .on_hover_text(t!("installer.update.install_cpu_pytorch_button"))
                 .clicked()
             {
                 self.selected_torch_index = None;
@@ -488,7 +488,7 @@ impl UpdateApp {
             }
 
             ui.add_space(14.0);
-            if ui.button("Продолжить обновление").clicked() {
+            if ui.button(t!("installer.update.continue_update_button")).clicked() {
                 let selection = self
                     .selected_torch_index
                     .and_then(|idx| prompt.options.get(idx).cloned())
@@ -502,11 +502,11 @@ impl UpdateApp {
     fn draw_completed_page(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(70.0);
-            ui.heading("Обновление завершено");
+            ui.heading(t!("installer.update.update_complete_stage"));
             ui.add_space(12.0);
-            ui.label("Можно выйти в лаунчер.");
+            ui.label(t!("installer.update.can_exit_to_launcher_period"));
             ui.add_space(18.0);
-            if ui.button("Выйти в лаунчер").clicked() {
+            if ui.button(t!("installer.update.exit_to_launcher_button")).clicked() {
                 if let Ok(mut outcome) = self.output.lock() {
                     *outcome = UpdateWindowOutcome::LaunchLauncher;
                 }
@@ -557,15 +557,15 @@ fn fetch_latest_app_release_tag() -> Result<String, String> {
 
     let response = req
         .call()
-        .map_err(|e| format!("Не удалось получить список релизов: {e}"))?;
+        .map_err(|e| tf!("installer.update.get_releases_error", e = e))?;
     let body = response
         .into_string()
-        .map_err(|e| format!("Не удалось прочитать список релизов: {e}"))?;
+        .map_err(|e| tf!("installer.update.read_releases_error", e = e))?;
     let releases: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Не удалось разобрать JSON релизов: {e}"))?;
+        .map_err(|e| tf!("installer.update.parse_releases_error", e = e))?;
     let releases = releases
         .as_array()
-        .ok_or_else(|| "GitHub вернул неожиданный формат списка релизов.".to_string())?;
+        .ok_or_else(|| t!("installer.update.unexpected_releases_format_error").to_string())?;
 
     for release in releases {
         let tag = release
@@ -597,10 +597,7 @@ fn fetch_latest_app_release_tag() -> Result<String, String> {
         }
     }
 
-    Err(format!(
-        "Не найден релиз с asset '{APP_ZIP_ASSET_NAME}' и '{}'.",
-        platform_binary_asset_name()
-    ))
+    Err(tf!("installer.update.no_release_with_assets_error", app_zip_asset_name = APP_ZIP_ASSET_NAME, platform_binary_asset_name = platform_binary_asset_name()))
 }
 
 /// Returns the GitHub release asset name for the current platform's executable.

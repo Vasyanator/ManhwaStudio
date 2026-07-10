@@ -266,19 +266,13 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Returns [`OrtRuntimeError::Io`] if the file cannot be opened or read.
 pub fn sha256_hex_of_file(path: &Path) -> Result<String, OrtRuntimeError> {
     let mut file = File::open(path).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось открыть файл для проверки контрольной суммы '{}': {err}",
-            path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.manifest.checksum_open_error", path = path.display(), err = err))
     })?;
     let mut hasher = Sha256::new();
     // `Sha256` implements `std::io::Write`, so the file is hashed in a streaming
     // pass without buffering the whole (up to ~65 MB) archive in memory.
     std::io::copy(&mut file, &mut hasher).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось прочитать файл при проверке контрольной суммы '{}': {err}",
-            path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.manifest.checksum_read_error", path = path.display(), err = err))
     })?;
     Ok(hex_lower(&hasher.finalize()))
 }

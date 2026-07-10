@@ -115,7 +115,7 @@ pub fn run_python_installer_window(
     };
 
     eframe::run_native(
-        "Установщик ManhwaStudio",
+        t!("installer.install.window_title"),
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(InstallerApp::new(
@@ -129,7 +129,7 @@ pub fn run_python_installer_window(
 
     let mut guard = shared_result
         .lock()
-        .map_err(|_| "не удалось получить результат установки".to_string())?;
+        .map_err(|_| t!("installer.install.no_install_result_error").to_string())?;
     Ok(guard.take().unwrap_or(InstallerOutcome::Cancelled))
 }
 
@@ -177,7 +177,7 @@ fn run_existing_windows_install_window(
 
     let mut guard = result_sink
         .lock()
-        .map_err(|_| "не удалось получить результат окна установленной копии".to_string())?;
+        .map_err(|_| t!("installer.install.no_installed_copy_result_error").to_string())?;
     Ok(guard
         .take()
         .unwrap_or(ExistingInstallAction::ExitCurrentCopy))
@@ -197,10 +197,7 @@ fn run_existing_install_reinstall_worker(
         .arg("--uninstall-signal-file")
         .arg(&signal_file);
     cmd.spawn().map_err(|e| {
-        format!(
-            "не удалось запустить удаление установленной копии '{}': {e}",
-            install.launcher_path.display()
-        )
+        tf!("installer.install.start_uninstall_error", install = install.launcher_path.display(), e = e)
     })?;
 
     let started_at = Instant::now();
@@ -216,11 +213,11 @@ fn run_existing_install_reinstall_worker(
             if let Some(error_text) = trimmed.strip_prefix("error:") {
                 return Err(error_text.trim().to_string());
             }
-            return Err(format!("неожиданный сигнал завершения удаления: {trimmed}"));
+            return Err(tf!("installer.install.unexpected_uninstall_signal_error", trimmed = trimmed));
         }
 
         if started_at.elapsed() > timeout {
-            return Err("удаление установленной копии не завершилось за 30 минут".to_string());
+            return Err(t!("installer.install.uninstall_timeout_error").to_string());
         }
 
         std::thread::sleep(Duration::from_millis(300));
@@ -247,10 +244,10 @@ fn find_existing_windows_install(
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
 
     if let Some(all_users) = query_registry_install_dir("HKLM")? {
-        candidates.push((all_users, "реестр HKLM".to_string()));
+        candidates.push((all_users, t!("installer.install.registry_hklm").to_string()));
     }
     if let Some(current_user) = query_registry_install_dir("HKCU")? {
-        candidates.push((current_user, "реестр HKCU".to_string()));
+        candidates.push((current_user, t!("installer.install.registry_hkcu").to_string()));
     }
     if let Some(app_path_dir) = query_registry_app_path_install_dir("HKLM")? {
         candidates.push((app_path_dir, "App Paths HKLM".to_string()));
@@ -259,10 +256,10 @@ fn find_existing_windows_install(
         candidates.push((app_path_dir, "App Paths HKCU".to_string()));
     }
     if let Ok(local_default) = default_local_install_dir() {
-        candidates.push((local_default, "стандартный путь пользователя".to_string()));
+        candidates.push((local_default, t!("installer.install.user_standard_path").to_string()));
     }
     if let Ok(all_users_default) = default_all_users_install_dir() {
-        candidates.push((all_users_default, "стандартный путь для всех".to_string()));
+        candidates.push((all_users_default, t!("installer.install.all_users_standard_path").to_string()));
     }
 
     let current_root_normalized = normalize_windows_path(current_root);
@@ -317,11 +314,7 @@ pub fn spawn_installed_program_copy(install_dir: &Path) -> Result<PathBuf, Strin
     cmd.current_dir(install_dir);
     apply_windows_no_window(&mut cmd);
     cmd.spawn().map_err(|e| {
-        format!(
-            "не удалось запустить установленную копию '{}' из '{}': {e}",
-            target_exe.display(),
-            install_dir.display()
-        )
+        tf!("installer.install.launch_installed_copy_error", target_exe = target_exe.display(), install_dir = install_dir.display(), e = e)
     })?;
     Ok(target_exe)
 }
@@ -354,11 +347,7 @@ pub(crate) fn resolve_installed_program_copy_path(install_dir: &Path) -> Result<
         .map(|p| format!("'{}'", p.display()))
         .collect::<Vec<_>>()
         .join(", ");
-    Err(format!(
-        "не найдена установленная копия программы в '{}'; проверены: {}",
-        install_dir.display(),
-        listed
-    ))
+    Err(tf!("installer.install.installed_copy_not_found_error", install_dir = install_dir.display(), listed = listed))
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -413,11 +402,7 @@ impl ExistingInstallApp {
         install: ExistingWindowsInstall,
         result_sink: Arc<Mutex<Option<ExistingInstallAction>>>,
     ) -> Self {
-        let status_text = format!(
-            "Найдена установленная копия: {} ({})",
-            install.install_dir.display(),
-            install.source_label
-        );
+        let status_text = tf!("installer.install.installed_copy_found_status", install = install.install_dir.display(), install_2 = install.source_label);
         Self {
             install,
             state: ExistingInstallUiState::Choice,
@@ -458,10 +443,7 @@ impl ExistingInstallApp {
         self.rx = Some(rx);
         self.state = ExistingInstallUiState::WaitingForReinstall;
         self.error_text = None;
-        self.status_text = format!(
-            "Удаляем установленную копию из '{}', затем вернёмся в режим установки...",
-            install.install_dir.display()
-        );
+        self.status_text = tf!("installer.install.removing_installed_copy_status", install = install.install_dir.display());
         let _ = ms_thread::Builder::new()
             .name("existing-install-reinstall".to_string())
             .spawn(move || {
@@ -494,7 +476,7 @@ impl eframe::App for ExistingInstallApp {
                 ExistingInstallEvent::ReinstallFinished(Err(err)) => {
                     self.state = ExistingInstallUiState::Error;
                     self.error_text = Some(err.clone());
-                    self.status_text = "Переустановка не была подготовлена".to_string();
+                    self.status_text = t!("installer.install.reinstall_not_prepared_error").to_string();
                 }
             }
         }
@@ -502,14 +484,11 @@ impl eframe::App for ExistingInstallApp {
         let mut close_window = false;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Программа уже установлена. Чем-то помочь?");
+                ui.heading(t!("installer.install.already_installed_prompt"));
             });
             ui.add_space(10.0);
-            ui.small(format!(
-                "Установленная копия: {}",
-                self.install.install_dir.display()
-            ));
-            ui.small(format!("Источник: {}", self.install.source_label));
+            ui.small(tf!("installer.install.installed_copy_label", arg = self.install.install_dir.display()));
+            ui.small(tf!("installer.install.source_label", arg = self.install.source_label));
             ui.add_space(8.0);
             ui.label(&self.status_text);
             if let Some(error_text) = &self.error_text {
@@ -521,7 +500,7 @@ impl eframe::App for ExistingInstallApp {
             match self.state {
                 ExistingInstallUiState::Choice | ExistingInstallUiState::Error => {
                     if ui
-                        .add_sized([280.0, 34.0], egui::Button::new("Запустить установленную"))
+                        .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.launch_installed_button")))
                         .clicked()
                     {
                         match self.launch_installed_copy() {
@@ -536,7 +515,7 @@ impl eframe::App for ExistingInstallApp {
                     if ui
                         .add_sized(
                             [280.0, 34.0],
-                            egui::Button::new("Создать ярлык на рабочем столе"),
+                            egui::Button::new(t!("installer.common.create_desktop_shortcut_button")),
                         )
                         .clicked()
                     {
@@ -552,7 +531,7 @@ impl eframe::App for ExistingInstallApp {
                     if ui
                         .add_sized(
                             [280.0, 34.0],
-                            egui::Button::new("Создать ярлык в меню пуск"),
+                            egui::Button::new(t!("installer.install.create_start_menu_shortcut_button")),
                         )
                         .clicked()
                     {
@@ -566,7 +545,7 @@ impl eframe::App for ExistingInstallApp {
                     }
                     ui.add_space(6.0);
                     if ui
-                        .add_sized([280.0, 34.0], egui::Button::new("Обновить установленную"))
+                        .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.update_installed_button")))
                         .clicked()
                     {
                         self.set_result(ExistingInstallAction::UpdateInstalled(
@@ -579,7 +558,7 @@ impl eframe::App for ExistingInstallApp {
                     }
                     ui.add_space(6.0);
                     if ui
-                        .add_sized([280.0, 34.0], egui::Button::new("Переустановить"))
+                        .add_sized([280.0, 34.0], egui::Button::new(t!("installer.install.reinstall_button")))
                         .clicked()
                     {
                         self.start_reinstall();
@@ -588,7 +567,7 @@ impl eframe::App for ExistingInstallApp {
                 ExistingInstallUiState::WaitingForReinstall => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Ожидаем завершения удаления установленной копии...");
+                        ui.label(t!("installer.install.waiting_uninstall_status"));
                     });
                 }
             }
@@ -645,11 +624,11 @@ impl InstallerApp {
             #[cfg(target_os = "windows")]
             create_windows_start_menu_shortcut: true,
             state: UiState::Idle,
-            current_operation: "Ожидание запуска".to_string(),
+            current_operation: t!("installer.install.waiting_start_status").to_string(),
             stage_progress: 0.0,
-            stage_label: "Этап не запущен".to_string(),
+            stage_label: t!("installer.install.stage_not_started").to_string(),
             overall_progress: 0.0,
-            overall_label: "Инициализация".to_string(),
+            overall_label: t!("installer.common.initialization").to_string(),
             console_lines: Vec::new(),
             rx: None,
             result_sink,
@@ -681,10 +660,7 @@ impl InstallerApp {
                 .unwrap_or_else(|| target_dir.clone());
             self.custom_install_base_dir_input = custom_base.to_string_lossy().to_string();
         }
-        self.console_lines.push(format!(
-            "[UAC] Продолжение установки в '{}'",
-            target_dir.display()
-        ));
+        self.console_lines.push(tf!("installer.install.uac_continuation_status", target_dir = target_dir.display()));
         self.show_dependency_profile_choice(target_dir);
     }
 
@@ -695,14 +671,11 @@ impl InstallerApp {
             InstallLocationChoice::Custom => {
                 let raw = self.custom_install_base_dir_input.trim();
                 if raw.is_empty() {
-                    return Err("папка установки не указана".to_string());
+                    return Err(t!("installer.install.install_dir_not_specified").to_string());
                 }
                 let base = PathBuf::from(raw);
                 if base.is_file() {
-                    return Err(format!(
-                        "указанный путь '{}' является файлом, а не папкой",
-                        base.display()
-                    ));
+                    return Err(tf!("installer.install.path_is_file_error", base = base.display()));
                 }
                 Ok(base.join(INSTALL_SUBDIR_NAME))
             }
@@ -748,23 +721,23 @@ impl InstallerApp {
 
                 if !created_paths.is_empty() {
                     self.current_operation =
-                        format!("Ярлыки созданы: {}", created_paths.join(" | "));
+                        tf!("installer.install.shortcuts_created_status", created_paths = created_paths.join(" | "));
                 } else if self.create_windows_desktop_shortcut
                     || self.create_windows_start_menu_shortcut
                 {
-                    self.current_operation = "Ярлыки не созданы".to_string();
+                    self.current_operation = t!("installer.install.shortcuts_not_created").to_string();
                 } else {
-                    self.current_operation = "Создание ярлыков пропущено".to_string();
+                    self.current_operation = t!("installer.install.shortcuts_skipped").to_string();
                 }
                 if self.create_windows_start_menu_shortcut
                     && is_windows_all_users_install_dir(&target_dir)
                 {
                     self.console_lines.push(
-                        "[Shortcut/StartMenu] Ярлык меню Пуск уже создан в all-users post-install."
+                        t!("installer.install.start_menu_already_created_log")
                             .to_string(),
                     );
                     if created_paths.is_empty() && !self.create_windows_desktop_shortcut {
-                        self.current_operation = "Ярлык меню Пуск уже создан".to_string();
+                        self.current_operation = t!("installer.install.start_menu_already_created").to_string();
                     }
                 }
             }
@@ -776,11 +749,11 @@ impl InstallerApp {
         self.rx = Some(rx);
         self.state = UiState::PreparingTorchChoice;
         self.install_target_dir = Some(install_target_dir.clone());
-        self.current_operation = "Проверка GPU / CUDA / ROCm...".to_string();
+        self.current_operation = t!("installer.install.checking_gpu_status").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Подготовка этапа PyTorch".to_string();
+        self.stage_label = t!("installer.install.stage_prepare_pytorch").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = format!("Целевая папка: {}", install_target_dir.display());
+        self.overall_label = tf!("installer.install.target_folder_label", install_target_dir = install_target_dir.display());
         self.torch_choice_prompt = None;
 
         let _ = ms_thread::Builder::new()
@@ -795,11 +768,11 @@ impl InstallerApp {
         self.rx = None;
         self.state = UiState::DependencyProfileChoice;
         self.install_target_dir = Some(install_target_dir.clone());
-        self.current_operation = "Выбор режима установки".to_string();
+        self.current_operation = t!("installer.install.stage_choose_install_mode").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Выберите быстрый или полный набор зависимостей".to_string();
+        self.stage_label = t!("installer.install.choose_deps_set_hint").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = format!("Целевая папка: {}", install_target_dir.display());
+        self.overall_label = tf!("installer.install.target_folder_label", install_target_dir = install_target_dir.display());
         self.torch_choice_prompt = None;
     }
 
@@ -815,11 +788,11 @@ impl InstallerApp {
         self.rx = Some(rx);
         self.state = UiState::Running;
         self.install_target_dir = Some(install_target_dir.clone());
-        self.current_operation = "Инициализация".to_string();
+        self.current_operation = t!("installer.common.initialization").to_string();
         self.stage_progress = 0.0;
-        self.stage_label = "Подготовка".to_string();
+        self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = format!("Установка в {}", install_target_dir.display());
+        self.overall_label = tf!("installer.install.installing_to_status", install_target_dir = install_target_dir.display());
         self.console_lines.clear();
         self.torch_choice_prompt = None;
         self.pending_ai_install_type = match dependency_profile {
@@ -894,19 +867,19 @@ impl eframe::App for InstallerApp {
                             );
                         } else {
                             self.state = UiState::Failed;
-                            self.current_operation = "Ошибка установки".to_string();
-                            self.stage_label = "Этап завершился ошибкой".to_string();
-                            self.overall_label = "не выбрана целевая папка установки".to_string();
+                            self.current_operation = t!("installer.install.install_error").to_string();
+                            self.stage_label = t!("installer.install.stage_failed").to_string();
+                            self.overall_label = t!("installer.install.no_target_folder_error").to_string();
                             self.set_result(InstallerOutcome::Failed(
-                                "не выбрана целевая папка установки".to_string(),
+                                t!("installer.install.no_target_folder_error").to_string(),
                             ));
                         }
                     }
                     TorchPreflightResult::Choose(prompt) => {
                         self.state = UiState::TorchChoice;
-                        self.current_operation = "Выбор версии PyTorch".to_string();
+                        self.current_operation = t!("installer.install.stage_choose_pytorch").to_string();
                         self.stage_progress = 0.0;
-                        self.stage_label = "Выберите wheel для GPU или оставьте CPU".to_string();
+                        self.stage_label = t!("installer.install.choose_pytorch_wheel_hint").to_string();
                         self.overall_progress = 0.0;
                         self.overall_label = prompt.summary.clone();
                         self.torch_choice_prompt = Some(prompt);
@@ -918,27 +891,22 @@ impl eframe::App for InstallerApp {
                             install_target_dir,
                             self.pending_ai_install_type,
                         ) {
-                            Ok(()) => self.console_lines.push(format!(
-                                "[Config] Тип ИИ установки сохранён: {}",
-                                self.pending_ai_install_type.as_str()
-                            )),
-                            Err(err) => self.console_lines.push(format!(
-                                "[Config] Не удалось сохранить тип ИИ установки: {err}"
-                            )),
+                            Ok(()) => self.console_lines.push(tf!("installer.install.ai_type_saved_log", arg = self.pending_ai_install_type.as_str())),
+                            Err(err) => self.console_lines.push(tf!("installer.install.ai_type_save_error_log", err = err)),
                         }
                     }
                     self.state = UiState::Completed;
-                    self.current_operation = "Установка завершена".to_string();
+                    self.current_operation = t!("installer.common.install_complete").to_string();
                     self.stage_progress = 1.0;
-                    self.stage_label = "Завершено".to_string();
+                    self.stage_label = t!("installer.install.finished").to_string();
                     self.overall_progress = 1.0;
-                    self.overall_label = "Готово".to_string();
+                    self.overall_label = t!("installer.common.ready").to_string();
                     self.set_result(InstallerOutcome::Completed);
                 }
                 InstallEvent::Finished(Err(err)) => {
                     self.state = UiState::Failed;
-                    self.current_operation = "Ошибка установки".to_string();
-                    self.stage_label = "Этап завершился ошибкой".to_string();
+                    self.current_operation = t!("installer.install.install_error").to_string();
+                    self.stage_label = t!("installer.install.stage_failed").to_string();
                     self.overall_label = err.clone();
                     self.set_result(InstallerOutcome::Failed(err));
                 }
@@ -962,21 +930,21 @@ impl eframe::App for InstallerApp {
                 |ui| match self.state {
                     UiState::Idle => {
                         ui.add_space((center_height * 0.20).max(8.0));
-                        ui.label("Выберите тип установки:");
+                        ui.label(t!("installer.install.choose_install_type_label"));
                         ui.radio_value(
                             &mut self.install_location_choice,
                             InstallLocationChoice::Local,
-                            "Установить локально",
+                            t!("installer.install.install_locally_option"),
                         );
                         ui.radio_value(
                             &mut self.install_location_choice,
                             InstallLocationChoice::AllUsers,
-                            "Установить для всех",
+                            t!("installer.install.install_all_users_option"),
                         );
                         ui.radio_value(
                             &mut self.install_location_choice,
                             InstallLocationChoice::Custom,
-                            "Другое место",
+                            t!("installer.install.install_other_location_option"),
                         );
 
                         if self.install_location_choice == InstallLocationChoice::Custom {
@@ -988,7 +956,7 @@ impl eframe::App for InstallerApp {
                                     )
                                     .desired_width((ui.available_width() - 140.0).max(180.0)),
                                 );
-                                if ui.button("Выбрать...").clicked() {
+                                if ui.button(t!("installer.install.choose_button")).clicked() {
                                     let dialog_dir =
                                         PathBuf::from(self.custom_install_base_dir_input.trim());
                                     let base_dir = if dialog_dir.is_dir() {
@@ -1009,15 +977,15 @@ impl eframe::App for InstallerApp {
                         ui.add_space(6.0);
                         match self.resolved_install_target_dir() {
                             Ok(target) => {
-                                ui.small(format!("Установится в: {}", target.display()));
+                                ui.small(tf!("installer.install.will_install_to_status", target = target.display()));
                                 if self.install_location_choice == InstallLocationChoice::AllUsers {
-                                    ui.small("Понадобится повышение прав.");
+                                    ui.small(t!("installer.install.elevation_needed_hint"));
                                 }
                             }
                             Err(err) => {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(220, 80, 80),
-                                    format!("Ошибка пути: {err}"),
+                                    tf!("installer.install.path_error", err = err),
                                 );
                             }
                         }
@@ -1025,7 +993,7 @@ impl eframe::App for InstallerApp {
                         ui.add_space((center_height * 0.15).max(12.0));
                         ui.horizontal_centered(|ui| {
                             if ui
-                                .add_sized([180.0, 40.0], egui::Button::new("Установить"))
+                                .add_sized([180.0, 40.0], egui::Button::new(t!("installer.install.install_button")))
                                 .clicked()
                             {
                                 requested_start_install = true;
@@ -1036,47 +1004,44 @@ impl eframe::App for InstallerApp {
                         ui.add_space((center_height * 0.28).max(12.0));
                         ui.horizontal_centered(|ui| {
                             ui.spinner();
-                            ui.label("Проверяем доступные GPU и версии CUDA/ROCm...");
+                            ui.label(t!("installer.install.checking_gpu_cuda_rocm_status"));
                         });
                     }
                     UiState::DependencyProfileChoice => {
                         ui.add_space((center_height * 0.16).max(8.0));
-                        ui.label("Выберите набор Python-зависимостей:");
+                        ui.label(t!("installer.install.choose_deps_set_label"));
                         ui.add_space(8.0);
                         if ui
-                            .add_sized([300.0, 38.0], egui::Button::new("Быстрая установка"))
+                            .add_sized([300.0, 38.0], egui::Button::new(t!("installer.install.fast_install_option")))
                             .clicked()
                         {
                             selected_dependency_profile = Some(InstallDependencyProfile::Fast);
                         }
-                        ui.small("Базовые зависимости без PyTorch и torch-зависимых AI-модулей.");
+                        ui.small(t!("installer.install.fast_install_desc"));
                         ui.add_space(12.0);
                         if ui
-                            .add_sized([300.0, 38.0], egui::Button::new("Полная установка"))
+                            .add_sized([300.0, 38.0], egui::Button::new(t!("installer.install.full_install_option")))
                             .clicked()
                         {
                             selected_dependency_profile = Some(InstallDependencyProfile::Full);
                         }
-                        ui.small("Выбор PyTorch, затем дополнительные torch-зависимости.");
+                        ui.small(t!("installer.install.full_install_desc"));
                     }
                     UiState::TorchChoice => {
                         if let Some(prompt) = &self.torch_choice_prompt {
-                            ui.label("Доступные wheels PyTorch:");
+                            ui.label(t!("installer.install.available_pytorch_wheels_label"));
                             ui.small(&prompt.summary);
                             if prompt.options.is_empty() {
                                 ui.add_space(8.0);
-                                ui.small("GPU-варианты не найдены, можно оставить CPU.");
+                                ui.small(t!("installer.install.no_gpu_variants_hint"));
                             } else {
                                 ui.add_space(8.0);
-                                ui.small(format!(
-                                    "Рекомендуется: {}",
-                                    prompt.options[prompt.recommended_index].label
-                                ));
+                                ui.small(tf!("installer.install.recommended_label", prompt = prompt.options[prompt.recommended_index].label));
                                 ui.add_space(8.0);
 
                                 for (idx, option) in prompt.options.iter().enumerate() {
                                     let title = if idx == prompt.recommended_index {
-                                        format!("{} (Рекомендуется)", option.label)
+                                        tf!("installer.install.option_recommended_marker", option = option.label)
                                     } else {
                                         option.label.clone()
                                     };
@@ -1093,7 +1058,7 @@ impl eframe::App for InstallerApp {
 
                         ui.add_space(10.0);
                         if ui
-                            .add_sized([260.0, 34.0], egui::Button::new("Оставить на CPU"))
+                            .add_sized([260.0, 34.0], egui::Button::new(t!("installer.install.keep_cpu_button")))
                             .clicked()
                         {
                             selected_torch_install = Some(TorchInstallSelection::SkipCpu);
@@ -1122,12 +1087,12 @@ impl eframe::App for InstallerApp {
                     UiState::Completed => {
                         ui.add_space((center_height * 0.25).max(12.0));
                         ui.horizontal_centered(|ui| {
-                            ui.heading("Установка завершена");
+                            ui.heading(t!("installer.common.install_complete"));
                         });
                         ui.add_space(10.0);
                         ui.horizontal_centered(|ui| {
                             if ui
-                                .add_sized([210.0, 36.0], egui::Button::new("Открыть"))
+                                .add_sized([210.0, 36.0], egui::Button::new(t!("installer.install.open_button")))
                                 .clicked()
                             {
                                 self.maybe_create_windows_shortcuts();
@@ -1148,24 +1113,24 @@ impl eframe::App for InstallerApp {
                             ui.vertical(|ui| {
                                 ui.checkbox(
                                     &mut self.invite_telegram,
-                                    "Подписаться на мой Telegram",
+                                    t!("installer.install.telegram_button"),
                                 );
-                                ui.checkbox(&mut self.invite_discord, "Зайти на сервер Discord");
+                                ui.checkbox(&mut self.invite_discord, t!("installer.install.discord_button"));
                                 #[cfg(target_os = "windows")]
                                 ui.checkbox(
                                     &mut self.create_windows_desktop_shortcut,
-                                    "Создать ярлык на рабочем столе",
+                                    t!("installer.common.create_desktop_shortcut_button"),
                                 );
                                 #[cfg(target_os = "windows")]
                                 ui.checkbox(
                                     &mut self.create_windows_start_menu_shortcut,
-                                    "Создать ярлык в меню Пуск",
+                                    t!("installer.install.create_start_menu_shortcut_button_caps"),
                                 );
                             });
                         });
                         ui.add_space(8.0);
                         ui.horizontal_centered(|ui| {
-                            if ui.button("Закрыть").clicked() {
+                            if ui.button(t!("installer.common.close_button")).clicked() {
                                 self.maybe_create_windows_shortcuts();
                                 finish_outcome = Some(InstallerOutcome::Completed);
                             }
@@ -1192,7 +1157,7 @@ impl eframe::App for InstallerApp {
                             ui.add_space(8.0);
                         }
                         ui.horizontal_centered(|ui| {
-                            if ui.button("Закрыть").clicked() {
+                            if ui.button(t!("installer.common.close_button")).clicked() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         });
@@ -1200,16 +1165,16 @@ impl eframe::App for InstallerApp {
                 },
             );
             ui.add_space(6.0);
-            ui.label(format!("Текущая операция: {}", self.current_operation));
+            ui.label(tf!("installer.install.current_operation_status", arg = self.current_operation));
             ui.add_space(4.0);
-            ui.label(format!("Этап: {}", self.stage_label));
+            ui.label(tf!("installer.install.stage_status", arg = self.stage_label));
             ui.add(egui::ProgressBar::new(self.stage_progress).show_percentage());
-            ui.small(format!(
-                "Прогресс этапа: {:.0}%",
-                self.stage_progress * 100.0
+            ui.small(tf!(
+                "installer.install.stage_progress_percent",
+                pct = format!("{:.0}", self.stage_progress * 100.0)
             ));
             ui.add_space(4.0);
-            ui.label("Общий прогресс установки");
+            ui.label(t!("installer.install.overall_progress_label"));
             ui.add(egui::ProgressBar::new(self.overall_progress).show_percentage());
             ui.small(&self.overall_label);
 
@@ -1227,11 +1192,11 @@ impl eframe::App for InstallerApp {
                 self.start_install(target_dir, InstallDependencyProfile::Full, selection);
             } else {
                 self.state = UiState::Failed;
-                self.current_operation = "Ошибка установки".to_string();
-                self.stage_label = "Этап завершился ошибкой".to_string();
-                self.overall_label = "не выбрана целевая папка установки".to_string();
+                self.current_operation = t!("installer.install.install_error").to_string();
+                self.stage_label = t!("installer.install.stage_failed").to_string();
+                self.overall_label = t!("installer.install.no_target_folder_error").to_string();
                 self.set_result(InstallerOutcome::Failed(
-                    "не выбрана целевая папка установки".to_string(),
+                    t!("installer.install.no_target_folder_error").to_string(),
                 ));
             }
         }
@@ -1251,11 +1216,11 @@ impl eframe::App for InstallerApp {
                 }
             } else {
                 self.state = UiState::Failed;
-                self.current_operation = "Ошибка установки".to_string();
-                self.stage_label = "Этап завершился ошибкой".to_string();
-                self.overall_label = "не выбрана целевая папка установки".to_string();
+                self.current_operation = t!("installer.install.install_error").to_string();
+                self.stage_label = t!("installer.install.stage_failed").to_string();
+                self.overall_label = t!("installer.install.no_target_folder_error").to_string();
                 self.set_result(InstallerOutcome::Failed(
-                    "не выбрана целевая папка установки".to_string(),
+                    t!("installer.install.no_target_folder_error").to_string(),
                 ));
             }
         }
@@ -1270,7 +1235,7 @@ impl eframe::App for InstallerApp {
                             }
                             Err(err) => {
                                 self.current_operation =
-                                    "Не удалось запросить повышение прав".to_string();
+                                    t!("installer.install.request_elevation_failed").to_string();
                                 self.overall_label = err;
                             }
                         }
@@ -1279,7 +1244,7 @@ impl eframe::App for InstallerApp {
                     }
                 }
                 Err(err) => {
-                    self.current_operation = "Ошибка пути установки".to_string();
+                    self.current_operation = t!("installer.install.install_path_error").to_string();
                     self.overall_label = err;
                 }
             }
@@ -1313,9 +1278,10 @@ fn persist_ai_install_type_for_install_target(
         config::user_config_defaults(),
     )
     .map_err(|err| {
-        format!(
-            "не удалось открыть user_config.json в '{}': {err:#}",
-            install_target_dir.display()
+        tf!(
+            "installer.install.open_config_error",
+            path = install_target_dir.display(),
+            err = format!("{err:#}")
         )
     })?;
     cfg.set_path(
@@ -1323,9 +1289,10 @@ fn persist_ai_install_type_for_install_target(
         serde_json::Value::String(install_type.as_str().to_string()),
     )
     .map_err(|err| {
-        format!(
-            "не удалось записать тип ИИ установки в '{}': {err:#}",
-            cfg.path.display()
+        tf!(
+            "installer.install.save_ai_type_error",
+            path = cfg.path.display(),
+            err = format!("{err:#}")
         )
     })
 }
@@ -1374,8 +1341,8 @@ impl UninstallApp {
         Self {
             rx,
             progress: 0.0,
-            status: "Подготовка удаления".to_string(),
-            detail: "Собираем план очистки...".to_string(),
+            status: t!("installer.install.prepare_uninstall_stage").to_string(),
+            detail: t!("installer.install.collecting_cleanup_plan_status").to_string(),
             error: None,
             close_after: None,
             result_sink,
@@ -1410,16 +1377,16 @@ impl eframe::App for UninstallApp {
                 UninstallEvent::Finished(result) => match result {
                     Ok(()) => {
                         self.progress = 1.0;
-                        self.status = "Удаление завершено".to_string();
+                        self.status = t!("installer.install.uninstall_complete_stage").to_string();
                         self.detail =
-                            "Окно закроется после передачи финальной очистки helper-процессу."
+                            t!("installer.install.uninstall_final_cleanup_hint")
                                 .to_string();
                         self.set_result(Ok(()));
                         self.close_after = Some(Instant::now() + Duration::from_millis(700));
                     }
                     Err(err) => {
                         self.error = Some(err.clone());
-                        self.status = "Ошибка удаления".to_string();
+                        self.status = t!("installer.install.uninstall_error").to_string();
                         self.detail = err.clone();
                         self.set_result(Err(err));
                     }
@@ -1429,7 +1396,7 @@ impl eframe::App for UninstallApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Удаление ManhwaStudio");
+                ui.heading(t!("installer.install.uninstall_window_title"));
             });
             ui.add_space(10.0);
             ui.label(&self.status);
@@ -1445,7 +1412,7 @@ impl eframe::App for UninstallApp {
                 ui.add_space(10.0);
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                 ui.add_space(8.0);
-                if ui.button("Закрыть").clicked() {
+                if ui.button(t!("installer.common.close_button")).clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -1490,7 +1457,7 @@ pub(super) fn run_windows_uninstall_window(
             let result = run_windows_uninstall_worker(current_exe, install_dir, &tx);
             let _ = tx.send(UninstallEvent::Finished(result));
         })
-        .map_err(|e| format!("не удалось запустить worker удаления: {e}"))?;
+        .map_err(|e| tf!("installer.install.start_uninstall_worker_error", e = e))?;
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([420.0, 150.0])
@@ -1507,7 +1474,7 @@ pub(super) fn run_windows_uninstall_window(
     };
 
     eframe::run_native(
-        "Удаление ManhwaStudio",
+        t!("installer.install.uninstall_window_title"),
         native_options,
         Box::new(move |_cc| Ok(Box::new(UninstallApp::new(rx, result_sink_for_app)))),
     )
@@ -1515,10 +1482,10 @@ pub(super) fn run_windows_uninstall_window(
 
     let mut guard = result_sink
         .lock()
-        .map_err(|_| "не удалось получить результат удаления".to_string())?;
+        .map_err(|_| t!("installer.install.no_uninstall_result_error").to_string())?;
     guard
         .take()
-        .unwrap_or_else(|| Err("окно удаления закрыто до завершения операции".to_string()))
+        .unwrap_or_else(|| Err(t!("installer.install.uninstall_window_closed_early_error").to_string()))
 }
 
 #[cfg(test)]

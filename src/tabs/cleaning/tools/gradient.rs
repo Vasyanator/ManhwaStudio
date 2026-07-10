@@ -56,7 +56,7 @@ impl Default for GradientFillTool {
 impl GradientFillTool {
     fn run(image: &egui::ColorImage, mask: &egui::ColorImage) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let w = image.size[0];
         let h = image.size[1];
@@ -95,7 +95,7 @@ impl CleaningTool for GradientFillTool {
     }
 
     fn title(&self) -> &'static str {
-        "Градиент"
+        t!("cleaning.tools.gradient.title")
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -104,8 +104,8 @@ impl CleaningTool for GradientFillTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Алгоритм: gradient scanlines в Lab + Poisson-согласование.");
-        ui.small("Shift+ЛКМ по canvas: выделить регион.");
+        ui.small(t!("cleaning.tools.gradient.description_hint"));
+        ui.small(t!("cleaning.tools.gradient.select_region_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -151,7 +151,7 @@ impl CleaningTool for GradientFillTool {
         project: &ProjectData,
     ) {
         self.inpaint_base
-            .draw_overlay_ui(ctx, canvas, project, "Градиентная заливка", Self::run);
+            .draw_overlay_ui(ctx, canvas, project, t!("cleaning.tools.gradient.overlay_title"), Self::run);
     }
 
     fn draw_cursor(

@@ -43,7 +43,7 @@ use crate::backend_ipc::{self, CallError};
 use crate::canvas::CanvasView;
 use crate::config;
 use crate::project::ProjectData;
-use crate::tabs::translation::backend_health::AI_BACKEND_OFFLINE_ERROR;
+use crate::tabs::translation::backend_health::ai_backend_offline_error;
 use crate::widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use image::{ColorType, ImageEncoder};
@@ -306,7 +306,7 @@ impl SdxlInpaintTool {
         progress: &Arc<Mutex<SdxlSharedProgress>>,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         let width = image.size[0];
         let height = image.size[1];
@@ -318,7 +318,7 @@ impl SdxlInpaintTool {
         }
         if cfg.settings.model_path.trim().is_empty() {
             return Err(
-                "Укажите путь к весам SDXL (ckpt/safetensors или HF-репозиторий).".to_string(),
+                t!("cleaning.tools.sdxl.weights_path_required_error").to_string(),
             );
         }
 
@@ -385,18 +385,15 @@ impl SdxlInpaintTool {
         }
         let (_response_header, out_bytes) = stream_result?;
         if out_bytes.is_empty() {
-            return Err("AI backend не вернул PNG результата.".to_string());
+            return Err(t!("cleaning.inpaint.no_png_result_error").to_string());
         }
         let out_rgba = image::load_from_memory(&out_bytes)
-            .map_err(|err| format!("AI backend вернул повреждённый PNG: {err}"))?
+            .map_err(|err| tf!("cleaning.inpaint.corrupt_png_error", err = err))?
             .to_rgba8();
         let out_w = out_rgba.width() as usize;
         let out_h = out_rgba.height() as usize;
         if out_w != width || out_h != height {
-            return Err(format!(
-                "AI backend вернул неожиданный размер: {}x{} (ожидалось {}x{}).",
-                out_w, out_h, width, height
-            ));
+            return Err(tf!("cleaning.inpaint.unexpected_size_error", out_w = out_w, out_h = out_h, width = width, height = height));
         }
         Ok(egui::ColorImage::from_rgba_unmultiplied(
             [out_w, out_h],
@@ -411,7 +408,7 @@ impl CleaningTool for SdxlInpaintTool {
     }
 
     fn title(&self) -> &'static str {
-        "AI удаление (SDXL Inpaint)"
+        t!("cleaning.tools.sdxl.title")
     }
 
     fn pytorch_required(&self) -> bool {
@@ -424,8 +421,8 @@ impl CleaningTool for SdxlInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Обработка через Python AI backend: inpaint.sdxl (v2 IPC).");
-        ui.small("9-канальная inpaint-модель или обычная SDXL + префилл LaMa (4-канальный режим).");
+        ui.small(t!("cleaning.tools.sdxl.description_hint"));
+        ui.small(t!("cleaning.tools.sdxl.mode_description_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -495,22 +492,22 @@ impl CleaningTool for SdxlInpaintTool {
             ctx,
             canvas,
             project,
-            "AI удаление (SDXL Inpaint)",
+            t!("cleaning.tools.sdxl.title"),
             move |image, mask| Self::run_sdxl(image, mask, &run_config, &run_progress),
             |ui| {
                 ui.separator();
                 draw_sdxl_progress_ui(ui, &ui_progress, preview_texture, preview_uploaded_seq);
-                egui::CollapsingHeader::new("Параметры генерации (SDXL)")
+                egui::CollapsingHeader::new(t!("cleaning.tools.sdxl.params_heading")).id_salt("cleaning.tools.sdxl.params_heading")
                     .id_salt("cleaning_sdxl_params_collapse")
                     .default_open(false)
                     .show(ui, |ui| {
                         changed |= draw_sdxl_params_ui(ui, mode, nine_channel, four_channel);
-                        if ui.small_button("Выгрузить SDXL из backend").clicked() {
+                        if ui.small_button(t!("cleaning.tools.sdxl.unload_button")).clicked() {
                             *unload_status = match unload_sdxl() {
                                 Ok(_) => {
-                                    Some("Запрошена выгрузка SDXL из памяти backend.".to_string())
+                                    Some(t!("cleaning.tools.sdxl.unload_requested_status").to_string())
                                 }
-                                Err(err) => Some(format!("Ошибка выгрузки: {err}")),
+                                Err(err) => Some(tf!("cleaning.inpaint.unload_error", err = err)),
                             };
                         }
                         if let Some(status) = unload_status.as_ref() {
@@ -554,19 +551,19 @@ fn draw_sdxl_params_ui(
     let mut changed = false;
 
     ui.horizontal(|ui| {
-        ui.label("Режим модели");
+        ui.label(t!("cleaning.tools.sdxl.model_mode_label"));
         let mode_label = match *mode {
-            SdxlMode::NineChannel => "9-канальная (inpaint)",
-            SdxlMode::FourChannel => "4-канальная (+LaMa)",
+            SdxlMode::NineChannel => t!("cleaning.tools.sdxl.mode_9ch"),
+            SdxlMode::FourChannel => t!("cleaning.tools.sdxl.mode_4ch"),
         };
         WheelComboBox::from_id_salt("cleaning_sdxl_mode_picker")
             .selected_text(mode_label)
             .show_ui(ui, |ui| {
                 changed |= ui
-                    .selectable_value(mode, SdxlMode::NineChannel, "9-канальная (inpaint)")
+                    .selectable_value(mode, SdxlMode::NineChannel, t!("cleaning.tools.sdxl.mode_9ch"))
                     .changed();
                 changed |= ui
-                    .selectable_value(mode, SdxlMode::FourChannel, "4-канальная (+LaMa)")
+                    .selectable_value(mode, SdxlMode::FourChannel, t!("cleaning.tools.sdxl.mode_4ch"))
                     .changed();
             });
     });
@@ -577,20 +574,20 @@ fn draw_sdxl_params_ui(
         SdxlMode::FourChannel => four_channel,
     };
 
-    ui.label("Путь к весам (ckpt / safetensors / папка diffusers / HF-репозиторий):");
+    ui.label(t!("cleaning.tools.sdxl.weights_path_label"));
     changed |= ui.text_edit_singleline(&mut settings.model_path).changed();
 
-    ui.label("Позитивный запрос:");
+    ui.label(t!("cleaning.tools.sdxl.positive_prompt_label"));
     changed |= ui
         .add(egui::TextEdit::multiline(&mut settings.positive_prompt).desired_rows(2))
         .changed();
-    ui.label("Негативный запрос:");
+    ui.label(t!("cleaning.tools.sdxl.negative_prompt_label"));
     changed |= ui
         .add(egui::TextEdit::multiline(&mut settings.negative_prompt).desired_rows(2))
         .changed();
 
     ui.horizontal(|ui| {
-        ui.label("Сэмплер");
+        ui.label(t!("cleaning.tools.sdxl.sampler_label"));
         WheelComboBox::from_id_salt("cleaning_sdxl_sampler_picker")
             .selected_text(settings.sampler.clone())
             .show_ui(ui, |ui| {
@@ -602,7 +599,7 @@ fn draw_sdxl_params_ui(
             });
     });
     changed |= ui
-        .add(WheelSlider::new(&mut settings.steps, 1..=150).text("Шаги"))
+        .add(WheelSlider::new(&mut settings.steps, 1..=150).text(t!("cleaning.common.steps_label")))
         .changed();
     changed |= ui
         .add(WheelSlider::new(&mut settings.cfg_scale, 1.0..=20.0).text("CFG"))
@@ -611,13 +608,13 @@ fn draw_sdxl_params_ui(
         .add(WheelSlider::new(&mut settings.denoise_strength, 0.0..=1.0).text("Denoise"))
         .changed();
     changed |= ui
-        .add(WheelSlider::new(&mut settings.mask_dilation, 0..=64).text("Расширение маски"))
+        .add(WheelSlider::new(&mut settings.mask_dilation, 0..=64).text(t!("cleaning.common.mask_expand_label")))
         .changed();
     changed |= ui
-        .add(WheelSlider::new(&mut settings.mask_blur, 0..=64).text("Размытие маски"))
+        .add(WheelSlider::new(&mut settings.mask_blur, 0..=64).text(t!("cleaning.tools.sdxl.mask_blur_label")))
         .changed();
     ui.horizontal(|ui| {
-        ui.label("Seed (-1 — случайный)");
+        ui.label(t!("cleaning.common.seed_label"));
         changed |= ui
             .add(egui::DragValue::new(&mut settings.seed).speed(1.0))
             .changed();
@@ -629,11 +626,11 @@ fn draw_sdxl_params_ui(
 
     if is_four_channel {
         ui.separator();
-        ui.label("Модель LaMa для префилла (4-канальный режим):");
+        ui.label(t!("cleaning.tools.sdxl.lama_prefill_model_label"));
         let selected_label = lama_model_catalog()
             .iter()
             .find(|spec| spec.file_name == settings.lama_model)
-            .map_or("Выберите модель", |spec| spec.display_name);
+            .map_or(t!("cleaning.common.select_model_placeholder"), |spec| spec.display_name());
         WheelComboBox::from_id_salt("cleaning_sdxl_lama_picker")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
@@ -641,7 +638,7 @@ fn draw_sdxl_params_ui(
                     changed |= draw_lama_choice(ui, &mut settings.lama_model, spec);
                 }
             });
-        ui.small("LaMa убирает текст из дырки до SDXL, denoise можно держать < 1.0.");
+        ui.small(t!("cleaning.tools.sdxl.lama_prefill_hint"));
     }
 
     changed
@@ -649,7 +646,7 @@ fn draw_sdxl_params_ui(
 
 /// Renders one selectable LaMa model row and reports whether it changed.
 fn draw_lama_choice(ui: &mut egui::Ui, selected: &mut String, spec: &LamaModelSpec) -> bool {
-    ui.selectable_value(selected, spec.file_name.to_string(), spec.display_name)
+    ui.selectable_value(selected, spec.file_name.to_string(), spec.display_name())
         .changed()
 }
 
@@ -700,13 +697,13 @@ fn draw_sdxl_progress_ui(
 
     if total > 0 {
         let fraction = (step.min(total) as f32 / total as f32).clamp(0.0, 1.0);
-        ui.add(egui::ProgressBar::new(fraction).text(format!("Шаг {step}/{total}")));
+        ui.add(egui::ProgressBar::new(fraction).text(tf!("cleaning.common.step_progress_status", step = step, total = total)));
     } else if active {
-        ui.add(egui::ProgressBar::new(0.0).text("Подготовка модели…"));
+        ui.add(egui::ProgressBar::new(0.0).text(t!("cleaning.tools.sdxl.preparing_model_status")));
     }
 
     if let Some(handle) = preview_texture.as_ref() {
-        ui.label("Предпросмотр латентов:");
+        ui.label(t!("cleaning.tools.sdxl.latent_preview_label"));
         let size = handle.size_vec2();
         let scale = if size.x > 0.0 {
             (360.0 / size.x).min(1.0)
@@ -749,7 +746,7 @@ fn sdxl_stream_call<F>(
 where
     F: FnMut(u32, u32, Option<egui::ColorImage>),
 {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     client
         .call_streaming(
             backend_ipc::protocol::METHOD_INPAINT_SDXL,
@@ -775,7 +772,7 @@ where
 /// Issues the v2 framed `inpaint.sdxl.unload` call (no fields, no blob) and
 /// confirms the backend reported `unloaded`.
 fn unload_sdxl() -> Result<(), String> {
-    let client = backend_ipc::shared_client().map_err(|_| AI_BACKEND_OFFLINE_ERROR.to_string())?;
+    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let (header, _blob) = client
         .call(
             backend_ipc::protocol::METHOD_INPAINT_SDXL_UNLOAD,
@@ -793,10 +790,10 @@ fn unload_sdxl() -> Result<(), String> {
 fn map_sdxl_call_error(err: CallError) -> String {
     match err {
         CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => format!("Запрос к AI backend прерван: {msg}"),
+        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
         // A transport failure means the backend is offline; surface the unified
         // offline message (matching device calls) instead of the raw error string.
-        CallError::Transport(_) => AI_BACKEND_OFFLINE_ERROR.to_string(),
+        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -830,20 +827,20 @@ fn save_sdxl_settings(persisted: &SdxlPersisted) -> Result<(), String> {
     let path = config::sdxl_inpaint_settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|err| format!("не удалось создать каталог настроек: {err}"))?;
+            .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
     }
     let raw = serde_json::to_string_pretty(persisted)
-        .map_err(|err| format!("не удалось сериализовать настройки SDXL: {err}"))?;
-    fs::write(&path, raw).map_err(|err| format!("не удалось записать настройки SDXL: {err}"))
+        .map_err(|err| tf!("cleaning.tools.sdxl.serialize_settings_error", err = err))?;
+    fs::write(&path, raw).map_err(|err| tf!("cleaning.tools.sdxl.write_settings_error", err = err))
 }
 
 fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let width = image.size[0];
     let height = image.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина изображения слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.image_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота изображения слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.image_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
     for px in &image.pixels {
@@ -853,7 +850,7 @@ fn encode_color_image_png_rgba(image: &egui::ColorImage) -> Result<Vec<u8>, Stri
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG изображения: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_image_error", err = err))?;
     Ok(out)
 }
 
@@ -861,9 +858,9 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let width = mask.size[0];
     let height = mask.size[1];
     let width_u32 =
-        u32::try_from(width).map_err(|_| "Ширина маски слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("cleaning.png.mask_width_too_large_error").to_string())?;
     let height_u32 =
-        u32::try_from(height).map_err(|_| "Высота маски слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("cleaning.png.mask_height_too_large_error").to_string())?;
 
     let mut raw = Vec::<u8>::with_capacity(width.saturating_mul(height));
     for px in &mask.pixels {
@@ -872,7 +869,7 @@ fn encode_mask_png_luma(mask: &egui::ColorImage) -> Result<Vec<u8>, String> {
     let mut out = Vec::<u8>::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(&raw, width_u32, height_u32, ColorType::L8.into())
-        .map_err(|err| format!("Не удалось закодировать PNG маски: {err}"))?;
+        .map_err(|err| tf!("cleaning.png.encode_mask_error", err = err))?;
     Ok(out)
 }
 
@@ -1058,10 +1055,15 @@ mod tests {
             map_sdxl_call_error(CallError::Error("boom".to_string())),
             "boom"
         );
-        assert!(map_sdxl_call_error(CallError::Interrupted("x".to_string())).contains("прерван"));
+        // Pin the exact catalog key, not just that the payload survived: a mapping
+        // regression that picked a different message would still pass a `contains` check.
+        assert_eq!(
+            map_sdxl_call_error(CallError::Interrupted("MARKER".to_string())),
+            tf!("cleaning.inpaint.request_aborted_error", msg = "MARKER")
+        );
         assert_eq!(
             map_sdxl_call_error(CallError::Transport("dead".to_string())),
-            AI_BACKEND_OFFLINE_ERROR
+            ai_backend_offline_error()
         );
     }
 }

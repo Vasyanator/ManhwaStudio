@@ -20,7 +20,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-const TAG_ALL: &str = "(все)";
+/// Label for the "all tags" filter option. It is both a display label and the `==`
+/// sentinel meaning "no tag filter". Runtime (not `const`) because `t!` is not const.
+/// The filter selection is session-only (never persisted), so a live UI-language switch
+/// merely re-seeds it on the next term reload.
+fn tag_all() -> &'static str {
+    t!("terms.list.tag_filter_all")
+}
 const MAX_NAME_LEN: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -107,8 +113,8 @@ impl TermEditorState {
 
     fn title(&self) -> &'static str {
         match self.mode {
-            EditorMode::Add => "Добавить термин",
-            EditorMode::Edit { .. } => "Редактировать термин",
+            EditorMode::Add => t!("terms.editor.title_add"),
+            EditorMode::Edit { .. } => t!("terms.editor.title_edit"),
         }
     }
 }
@@ -138,8 +144,8 @@ impl Default for TermsTabState {
         Self {
             loaded_terms_file: None,
             entries: Vec::new(),
-            tag_filter_values: vec![TAG_ALL.to_string()],
-            selected_tag_filter: TAG_ALL.to_string(),
+            tag_filter_values: vec![tag_all().to_string()],
+            selected_tag_filter: tag_all().to_string(),
             search_query: String::new(),
             editor: None,
             pending_overwrite: None,
@@ -156,7 +162,7 @@ impl TermsTabState {
         self.ensure_loaded(project);
 
         ui.vertical(|ui| {
-            ui.heading("Термины");
+            ui.heading(t!("terms.list.heading"));
             if let Some(msg) = &self.info_message {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
             }
@@ -165,15 +171,15 @@ impl TermsTabState {
             }
 
             ui.horizontal_wrapped(|ui| {
-                ui.label("Поиск:");
+                ui.label(t!("terms.list.search_label"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .desired_width(320.0)
-                        .hint_text("название, оригинал, теги или описание"),
+                        .hint_text(t!("terms.list.search_placeholder")),
                 );
 
                 ui.add_space(8.0);
-                ui.label("Тег:");
+                ui.label(t!("terms.list.tag_label"));
                 WheelComboBox::from_id_salt("terms_tag_filter")
                     .selected_text(self.selected_tag_filter.clone())
                     .show_ui(ui, |ui| {
@@ -182,13 +188,13 @@ impl TermsTabState {
                         }
                     });
 
-                if ui.button("Сбросить").clicked() {
+                if ui.button(t!("terms.list.reset_filter_button")).clicked() {
                     self.search_query.clear();
-                    self.selected_tag_filter = TAG_ALL.to_string();
+                    self.selected_tag_filter = tag_all().to_string();
                 }
 
                 ui.add_space(10.0);
-                if ui.button("Добавить").clicked() {
+                if ui.button(t!("terms.list.add_button")).clicked() {
                     self.error_message = None;
                     self.info_message = None;
                     self.editor = Some(TermEditorState::for_add(&self.tag_filter_values[1..]));
@@ -199,7 +205,7 @@ impl TermsTabState {
 
             let filtered = self.filtered_indices();
             if filtered.is_empty() {
-                ui.label("Ничего не найдено.");
+                ui.label(t!("terms.list.empty"));
             } else {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -226,10 +232,10 @@ impl TermsTabState {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&entry.name).strong().size(18.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Удалить").clicked() {
+                        if ui.button(t!("terms.card.delete_button")).clicked() {
                             self.pending_delete_name = Some(entry.name.clone());
                         }
-                        if ui.button("Редактировать").clicked() {
+                        if ui.button(t!("terms.card.edit_button")).clicked() {
                             self.editor = Some(TermEditorState::for_edit(
                                 entry,
                                 &self.tag_filter_values[1..],
@@ -246,13 +252,13 @@ impl TermsTabState {
                     entry.orig_name.trim()
                 };
                 ui.label(
-                    egui::RichText::new(format!("Оригинальное название: {orig}"))
+                    egui::RichText::new(tf!("terms.card.orig_name", orig = orig))
                         .italics()
                         .color(egui::Color32::GRAY),
                 );
                 if !entry.tags.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("Теги: {}", entry.tags.join(", ")))
+                        egui::RichText::new(tf!("terms.card.tags", tags = entry.tags.join(", ")))
                             .italics()
                             .color(egui::Color32::GRAY),
                     );
@@ -281,20 +287,20 @@ impl TermsTabState {
                 .default_size(egui::vec2(620.0, 580.0))
                 .collapsible(false)
                 .show(ctx, |ui| {
-                    ui.label("Название");
+                    ui.label(t!("terms.editor.name_label"));
                     ui.add(
                         egui::TextEdit::singleline(&mut editor.name).desired_width(f32::INFINITY),
                     );
 
                     ui.add_space(6.0);
-                    ui.label("Оригинальное название");
+                    ui.label(t!("terms.editor.orig_name_label"));
                     ui.add(
                         egui::TextEdit::singleline(&mut editor.orig_name)
                             .desired_width(f32::INFINITY),
                     );
 
                     ui.add_space(6.0);
-                    ui.label("Описание");
+                    ui.label(t!("terms.editor.description_label"));
                     ui.add(
                         egui::TextEdit::multiline(&mut editor.description)
                             .desired_width(f32::INFINITY)
@@ -302,11 +308,11 @@ impl TermsTabState {
                     );
 
                     ui.add_space(10.0);
-                    ui.label("Теги");
+                    ui.label(t!("terms.editor.tags_label"));
                     ui.horizontal(|ui| {
                         WheelComboBox::from_id_salt("terms_editor_tag_combo")
                             .selected_text(if editor.tag_input.is_empty() {
-                                "выбрать/ввести".to_string()
+                                t!("terms.editor.tags_combo_placeholder").to_string()
                             } else {
                                 editor.tag_input.clone()
                             })
@@ -317,10 +323,10 @@ impl TermsTabState {
                             });
                         ui.add(
                             egui::TextEdit::singleline(&mut editor.tag_input)
-                                .hint_text("новый тег")
+                                .hint_text(t!("terms.editor.new_tag_placeholder"))
                                 .desired_width(180.0),
                         );
-                        if ui.button("Добавить").clicked() {
+                        if ui.button(t!("terms.editor.add_tag_button")).clicked() {
                             let value = editor.tag_input.trim();
                             if !value.is_empty()
                                 && !editor
@@ -336,7 +342,7 @@ impl TermsTabState {
                     });
                     ui.add_space(4.0);
                     if editor.tags.is_empty() {
-                        ui.label(egui::RichText::new("Теги не выбраны").italics());
+                        ui.label(egui::RichText::new(t!("terms.editor.tags_empty")).italics());
                     } else {
                         let mut remove_idx = None;
                         ui.horizontal_wrapped(|ui| {
@@ -359,15 +365,15 @@ impl TermsTabState {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if matches!(editor.mode, EditorMode::Edit { .. })
-                            && ui.button("Удалить").clicked()
+                            && ui.button(t!("terms.editor.delete_button")).clicked()
                         {
                             delete_clicked = true;
                         }
                         ui.add_space(8.0);
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(t!("terms.editor.cancel_button")).clicked() {
                             editor.open = false;
                         }
-                        if ui.button("Сохранить").clicked() {
+                        if ui.button(t!("terms.editor.save_button")).clicked() {
                             save_clicked = true;
                         }
                     });
@@ -400,22 +406,19 @@ impl TermsTabState {
         let mut changed = false;
         if let Some(pending) = self.pending_overwrite.clone() {
             let mut keep_open = true;
-            egui::Window::new("Подтверждение перезаписи")
+            egui::Window::new(t!("terms.overwrite_dialog.title"))
                 .id(egui::Id::new("terms_overwrite_confirm"))
                 .open(&mut keep_open)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "«{}» уже существует. Перезаписать?",
-                        pending.entry.name
-                    ));
+                    ui.label(tf!("terms.overwrite_dialog.message", name = pending.entry.name));
                     ui.horizontal(|ui| {
-                        if ui.button("Да").clicked() {
+                        if ui.button(t!("terms.overwrite_dialog.yes_button")).clicked() {
                             self.pending_overwrite = None;
                             changed |= self.apply_pending_save(project, pending.clone());
                         }
-                        if ui.button("Нет").clicked() {
+                        if ui.button(t!("terms.overwrite_dialog.no_button")).clicked() {
                             self.pending_overwrite = None;
                         }
                     });
@@ -431,21 +434,19 @@ impl TermsTabState {
         let mut changed = false;
         if let Some(name) = self.pending_delete_name.clone() {
             let mut keep_open = true;
-            egui::Window::new("Удалить термин")
+            egui::Window::new(t!("terms.delete_dialog.title"))
                 .id(egui::Id::new("terms_delete_confirm"))
                 .open(&mut keep_open)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Точно удалить «{name}»? Это действие нельзя отменить."
-                    ));
+                    ui.label(tf!("terms.delete_dialog.message", name = name));
                     ui.horizontal(|ui| {
-                        if ui.button("Удалить").clicked() {
+                        if ui.button(t!("terms.delete_dialog.confirm_button")).clicked() {
                             self.pending_delete_name = None;
                             changed |= self.delete_term(project, &name);
                         }
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(t!("terms.delete_dialog.cancel_button")).clicked() {
                             self.pending_delete_name = None;
                         }
                     });
@@ -466,7 +467,7 @@ impl TermsTabState {
 
         let name = safe_name(&editor.name);
         if name.trim().is_empty() {
-            self.error_message = Some("Название не может быть пустым.".to_string());
+            self.error_message = Some(t!("terms.editor.name_empty_error").to_string());
             return false;
         }
 
@@ -529,30 +530,30 @@ impl TermsTabState {
         dedupe_and_sort_entries(&mut self.entries);
 
         if let Err(err) = save_entries(project, &self.entries) {
-            self.error_message = Some(format!("Не удалось сохранить terms.json: {err}"));
+            self.error_message = Some(tf!("terms.save.save_error", err = err));
             return false;
         }
 
         self.rebuild_tag_filters();
         self.editor = None;
-        self.info_message = Some("Термин сохранён.".to_string());
+        self.info_message = Some(t!("terms.save.saved").to_string());
         true
     }
 
     fn delete_term(&mut self, project: &ProjectData, name: &str) -> bool {
         let Some(idx) = self.find_entry_index(name) else {
-            self.error_message = Some("Термин уже удалён.".to_string());
+            self.error_message = Some(t!("terms.save.already_deleted").to_string());
             return false;
         };
         self.entries.remove(idx);
         dedupe_and_sort_entries(&mut self.entries);
         if let Err(err) = save_entries(project, &self.entries) {
-            self.error_message = Some(format!("Не удалось сохранить terms.json: {err}"));
+            self.error_message = Some(tf!("terms.save.save_error", err = err));
             return false;
         }
         self.rebuild_tag_filters();
         self.editor = None;
-        self.info_message = Some("Термин удалён.".to_string());
+        self.info_message = Some(t!("terms.save.deleted").to_string());
         true
     }
 
@@ -568,7 +569,7 @@ impl TermsTabState {
         }
         self.loaded_terms_file = Some(path);
         self.search_query.clear();
-        self.selected_tag_filter = TAG_ALL.to_string();
+        self.selected_tag_filter = tag_all().to_string();
         self.error_message = None;
         self.info_message = None;
         self.editor = None;
@@ -583,7 +584,7 @@ impl TermsTabState {
             Err(err) => {
                 self.entries.clear();
                 self.rebuild_tag_filters();
-                self.error_message = Some(format!("Не удалось загрузить термины: {err}"));
+                self.error_message = Some(tf!("terms.save.load_error", err = err));
             }
         }
     }
@@ -604,7 +605,7 @@ impl TermsTabState {
                 )
                 .to_lowercase();
                 let by_term = term.is_empty() || haystack.contains(&term);
-                let by_tag = selected_tag == TAG_ALL
+                let by_tag = selected_tag == tag_all()
                     || entry
                         .tags
                         .iter()
@@ -626,10 +627,10 @@ impl TermsTabState {
         }
         let mut values: Vec<String> = tags.into_iter().collect();
         values.sort_by_key(|v| v.to_lowercase());
-        values.insert(0, TAG_ALL.to_string());
+        values.insert(0, tag_all().to_string());
 
         if !values.contains(&self.selected_tag_filter) {
-            self.selected_tag_filter = TAG_ALL.to_string();
+            self.selected_tag_filter = tag_all().to_string();
         }
         self.tag_filter_values = values;
     }

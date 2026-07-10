@@ -48,7 +48,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                 #[cfg(not(target_arch = "wasm32"))]
                 ui.label(theme::hero_title("ManhwaStudio"));
                 #[cfg(target_arch = "wasm32")]
-                ui.label(theme::hero_title("ManhwaStudio: Веб демо"));
+                ui.label(theme::hero_title(t!("launcher.main.web_demo_title")));
                 ui.add_space(8.0);
 
                 ui.add_space(4.0);
@@ -63,7 +63,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                             // match `launcher::tutorial`).
                             let open_response = menu_button_response(
                                 ui,
-                                "Открыть главу",
+                                t!("launcher.main.open_chapter_button"),
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
                                             #[cfg(feature = "tutorial")]
@@ -74,7 +74,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                             }
                             let new_response = menu_button_response(
                                 ui,
-                                "Новая глава",
+                                t!("launcher.main.new_chapter_button"),
                                 RIGHT_COLUMN_BUTTON_WIDTH,
                             );
                             #[cfg(feature = "tutorial")]
@@ -87,7 +87,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
 
                             let import_response = menu_button_response(
                                 ui,
-                                "Импорт главы",
+                                t!("launcher.main.import_chapter_button"),
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
                             import_button_rect = Some(import_response.rect);
@@ -99,7 +99,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                             }
                             let export_response = menu_button_response(
                                 ui,
-                                "Экспорт главы",
+                                t!("launcher.main.export_chapter_button"),
                                 RIGHT_COLUMN_BUTTON_WIDTH,
                             );
                             #[cfg(feature = "tutorial")]
@@ -120,7 +120,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                 });
                 ui.add_space(12.0);
                 let settings_response =
-                    menu_button_response(ui, "Настройки", RIGHT_COLUMN_BUTTON_WIDTH);
+                    menu_button_response(ui, t!("launcher.main.settings_button"), RIGHT_COLUMN_BUTTON_WIDTH);
                 #[cfg(feature = "tutorial")]
                 app.tutorial.mark(tutorial::TARGET_SETTINGS, settings_response.rect);
                 if settings_response.clicked() {
@@ -164,7 +164,7 @@ fn ai_install_notice(install_type: config::AiInstallType) -> Option<AiInstallNot
     {
         let _ = install_type;
         Some(AiInstallNotice {
-            message: "ManhwaStudio написана на Rust, а не веб-языках, и сейчас работает через WebAssembly, что немножко через ж... .\n\nНестабильность веб-версии не отражает реальную стабильность десктопной программы.",
+            message: t!("launcher.main.web_demo_notice"),
             fill: Color32::from_rgba_premultiplied(22, 42, 72, 152),
             stroke: Color32::from_rgba_premultiplied(96, 152, 224, 168),
             text: Color32::from_rgb(206, 226, 255),
@@ -174,13 +174,13 @@ fn ai_install_notice(install_type: config::AiInstallType) -> Option<AiInstallNot
     {
         match install_type {
             config::AiInstallType::None => Some(AiInstallNotice {
-                message: "Программа не установлена и работает в автономном режиме. Использовать можно, но ИИ, и некоторые функции недоступны",
+                message: t!("launcher.main.offline_mode_notice"),
                 fill: Color32::from_rgba_premultiplied(96, 18, 22, 150),
                 stroke: Color32::from_rgba_premultiplied(238, 96, 104, 170),
                 text: Color32::from_rgb(255, 218, 220),
             }),
             config::AiInstallType::Base => Some(AiInstallNotice {
-                message: "Установлена облегченная версия программы, работает только часть ИИ возможностей. Для обновления до полной версии перейдите в Настройки > Обновить до полной версии",
+                message: t!("launcher.main.lite_version_notice"),
                 fill: Color32::from_rgba_premultiplied(104, 78, 16, 148),
                 stroke: Color32::from_rgba_premultiplied(236, 197, 76, 166),
                 text: Color32::from_rgb(255, 240, 184),
@@ -254,7 +254,7 @@ fn show_update_notice(
                     ui.set_width(UPDATE_NOTICE_WIDTH);
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new("Доступна новая версия")
+                            RichText::new(t!("launcher.main.update_available_heading"))
                                 .size(24.0)
                                 .strong()
                                 .color(Color32::from_rgb(120, 230, 120)),
@@ -266,7 +266,7 @@ fn show_update_notice(
                         )));
                         ui.add_space(10.0);
                         let button = egui::Button::new(
-                            RichText::new("Обновить")
+                            RichText::new(t!("launcher.main.update_button"))
                                 .size(17.0)
                                 .strong()
                                 .color(Color32::from_rgb(255, 248, 198)),
@@ -327,7 +327,7 @@ fn show_import_popup(
                     ui.vertical(|ui| {
                         if theme::launcher_button(
                             ui,
-                            "из .mschapter",
+                            t!("launcher.main.import_from_mschapter_option"),
                             egui::vec2(IMPORT_POPUP_WIDTH, BUTTON_HEIGHT),
                             true,
                         )
@@ -339,7 +339,7 @@ fn show_import_popup(
                         }
                         if theme::launcher_button(
                             ui,
-                            "из .psd",
+                            t!("launcher.main.import_from_psd_option"),
                             egui::vec2(IMPORT_POPUP_WIDTH, BUTTON_HEIGHT),
                             true,
                         )
@@ -379,10 +379,10 @@ mod tests {
 
         let none_notice =
             ai_install_notice(config::AiInstallType::None).expect("None should show red notice");
-        assert!(none_notice.message.contains("автономном режиме"));
+        assert_eq!(none_notice.message, t!("launcher.main.offline_mode_notice"));
 
         let base_notice =
             ai_install_notice(config::AiInstallType::Base).expect("Base should show yellow notice");
-        assert!(base_notice.message.contains("облегченная версия"));
+        assert_eq!(base_notice.message, t!("launcher.main.lite_version_notice"));
     }
 }

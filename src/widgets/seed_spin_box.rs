@@ -47,7 +47,7 @@ impl<'a> SeedSpinBox<'a> {
                     .prefix(self.prefix.as_str()),
             );
             changed |= drag.changed();
-            let random_button = ui.button("Случайный");
+            let random_button = ui.button(t!("widgets.seed_spin_box.random"));
             if random_button.clicked() {
                 *self.value = random_seed();
                 changed = true;

@@ -21,18 +21,27 @@ The UI-language selector lists the locales found in the on-disk `locale/` folder
 its `_meta.name`. Changing it persists `General.ui_language` and live-installs that
 locale's catalog (falling back to the embedded catalog), with no restart.
 
+The typesetting-language selector below it is a DUPLICATE surface for the same
+setting the "Тайп" settings pane owns (`TextTab.text_language`): two independent
+languages — interface vs. typeset text — are chosen next to each other here. Both
+surfaces read and write the process-global `ms_text_util::language`, which is the
+single source of truth, so they cannot drift out of sync.
+
 Key items:
 - `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values.
 - `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing.
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + memory-profile
-  combo + UI-language selector.
+  combo + UI-language selector + typesetting-language selector.
 */
 
+use crate::i18n_resolve::resolve_key;
 use crate::memory_manager::MemoryProfile;
 use crate::runtime_log;
 use crate::widgets::WheelComboBox;
+use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
+use ms_thread as thread;
 use std::path::PathBuf;
 
 /// Status line shown under the projects-directory editor.
@@ -173,13 +182,13 @@ pub fn draw_general_settings_panel(
     let mut outcome = GeneralSettingsOutcome::default();
 
     // Projects-directory editor (rich variant: text field + folder picker + save).
-    ui.label("Папка с проектами:");
+    ui.label(t!("settings.general.projects_dir_label"));
     let mut should_save = false;
     ui.horizontal_wrapped(|ui| {
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.projects_dir_input)
                 .desired_width(420.0)
-                .hint_text("Выберите папку с проектами"),
+                .hint_text(t!("settings.general.projects_dir_picker_title")),
         );
         // Editing the field clears a stale "saved" confirmation.
         if response.changed() {
@@ -191,21 +200,20 @@ pub fn draw_general_settings_panel(
         // The native OS folder picker exists only on desktop; on web there is no OS
         // directory to browse, so the button is omitted.
         #[cfg(not(target_arch = "wasm32"))]
-        if ui.button("Обзор").clicked() {
+        if ui.button(t!("settings.general.browse_button")).clicked() {
             pick_projects_dir(state);
         }
     });
 
     ui.small(
-        "Используется страницами «Открыть главу», «Импорт главы», «Экспорт главы», а также окнами \
-         «Новый проект» и PSD-импорт.",
+        t!("settings.general.projects_dir_hint"),
     );
 
     draw_status(ui, &state.status);
 
     let dirty = projects_dir_is_dirty(&state.projects_dir_input, &state.saved_projects_dir);
     if ui
-        .add_enabled(dirty, egui::Button::new("Сохранить папку проектов"))
+        .add_enabled(dirty, egui::Button::new(t!("settings.general.save_projects_dir_button")))
         .clicked()
     {
         should_save = true;
@@ -221,7 +229,7 @@ pub fn draw_general_settings_panel(
                 state.saved_projects_dir = normalized.clone();
                 state.projects_dir_input = normalized.clone();
                 state.status =
-                    GeneralSettingsStatus::Success("Папка проектов сохранена.".to_string());
+                    GeneralSettingsStatus::Success(t!("settings.general.projects_dir_saved").to_string());
                 outcome.projects_dir_saved = Some(PathBuf::from(normalized));
             }
             Err(err) => {
@@ -229,9 +237,7 @@ pub fn draw_general_settings_panel(
                     "[general-settings] failed to persist projects directory '{normalized}'; \
                      error={err}"
                 ));
-                state.status = GeneralSettingsStatus::Error(format!(
-                    "Не удалось сохранить папку проектов: {err}"
-                ));
+                state.status = GeneralSettingsStatus::Error(tf!("settings.general.projects_dir_save_error", err = err));
             }
         }
     }
@@ -239,8 +245,8 @@ pub fn draw_general_settings_panel(
     ui.separator();
 
     // Global memory-profile selector (applied to the runtime by the caller).
-    ui.label("Использование памяти:");
-    ui.small("Применяется сразу к общей политике кэшей изображений.");
+    ui.label(t!("settings.general.memory_profile_label"));
+    ui.small(t!("settings.general.memory_profile_hint"));
     let mut selected_profile = state.memory_profile;
     egui::ComboBox::from_id_salt("settings_memory_profile")
         .selected_text(selected_profile.display_name_ru())
@@ -263,7 +269,7 @@ pub fn draw_general_settings_panel(
                 selected_profile.as_config_str()
             ));
             state.status =
-                GeneralSettingsStatus::Error("Не удалось сохранить профиль памяти.".to_string());
+                GeneralSettingsStatus::Error(t!("settings.general.memory_profile_save_error").to_string());
         }
     }
 
@@ -271,8 +277,8 @@ pub fn draw_general_settings_panel(
 
     // Interface-language selector. Populated once from the on-disk `locale/` folder
     // (see `scan_locale_options`); changing it persists and live-installs the locale.
-    ui.label("Язык интерфейса:");
-    ui.small("Применяется сразу, без перезапуска.");
+    ui.label(t!("settings.general.ui_language_label"));
+    ui.small(t!("settings.general.ui_language_hint"));
     let previous_tag = state.ui_language_tag.clone();
     let selected_display = state
         .locale_options
@@ -283,7 +289,7 @@ pub fn draw_general_settings_panel(
     // mutably without also holding an immutable borrow of `state.locale_options`.
     let options = state.locale_options.clone();
     ui.horizontal_wrapped(|ui| {
-        WheelComboBox::from_label("Язык интерфейса")
+        WheelComboBox::from_label(t!("settings.general.ui_language_combo_label")).id_salt("settings.general.ui_language_combo_label")
             .selected_text(selected_display)
             .show_ui(ui, |ui| {
                 for option in &options {
@@ -299,7 +305,96 @@ pub fn draw_general_settings_panel(
         apply_ui_language_change(ui, state);
     }
 
+    ui.separator();
+
+    draw_text_language_setting(ui);
+
     outcome
+}
+
+/// Renders the typesetting-language selector: a `ScriptGroup` combo followed by the
+/// concrete `TextLanguage` combo within that group. Mirrors the "Тайп" settings
+/// pane's selector so the choice is also reachable from the launcher.
+///
+/// Holds no state: the process-global `ms_text_util::language::text_language()` is
+/// the single source of truth, so this widget and the "Тайп" pane always show the
+/// same value. Selecting a group switches to that group's first language. A change
+/// applies live (the typing tab's `facade.rs` observes `text_language()` each frame
+/// and re-runs font-coverage classification off-thread) and persists
+/// `TextTab.text_language` on a background thread.
+fn draw_text_language_setting(ui: &mut egui::Ui) {
+    ui.label(t!("settings.typesetting.text_language_label"));
+    ui.small(t!("settings.typesetting.text_language_hint"));
+
+    let current = text_language();
+    let current_group = current.group();
+
+    // Group combo: selecting a different group switches to that group's first language.
+    let mut selected_group = current_group;
+    ui.horizontal_wrapped(|ui| {
+        WheelComboBox::from_label(t!("settings.typesetting.script_group_label"))
+            .id_salt("settings.general.text_language_script_group")
+            .selected_text(resolve_key(current_group.name_key()))
+            .show_ui(ui, |ui| {
+                for group in ScriptGroup::all() {
+                    ui.selectable_value(&mut selected_group, group, resolve_key(group.name_key()));
+                }
+            });
+    });
+
+    // Language combo lists only the (possibly new) group's languages. When the group
+    // changed this frame, offer that group's first language as selected.
+    let mut selected_language = if selected_group == current_group {
+        current
+    } else {
+        selected_group.first_language()
+    };
+    ui.horizontal_wrapped(|ui| {
+        WheelComboBox::from_label(t!("settings.typesetting.language_label"))
+            .id_salt("settings.general.text_language_language")
+            .selected_text(resolve_key(selected_language.name_key()))
+            .show_ui(ui, |ui| {
+                for language in selected_group.languages() {
+                    ui.selectable_value(
+                        &mut selected_language,
+                        *language,
+                        resolve_key(language.name_key()),
+                    );
+                }
+            });
+    });
+
+    if selected_language != current {
+        // Apply live first so the change takes effect even if the disk write fails.
+        set_text_language(selected_language);
+        persist_text_language(selected_language);
+    }
+}
+
+/// Persists the chosen typesetting language to `TextTab.text_language` on a
+/// background thread (the GUI thread must never do disk I/O; see CLAUDE.md §5).
+///
+/// A failed spawn or a failed write is logged and nothing else: the live value has
+/// already been applied, so the UI stays consistent for this session and only the
+/// persistence is lost.
+fn persist_text_language(language: TextLanguage) {
+    let path = crate::config::user_config_path();
+    let tag = language.tag().to_string();
+    if let Err(err) = thread::Builder::new()
+        .name("general-settings-text-language-save".to_string())
+        .spawn(move || {
+            if let Err(err) = crate::tabs::settings::save_text_language(&path, &tag) {
+                runtime_log::log_error(format!(
+                    "[general-settings] failed to persist text language to {}; error={err}",
+                    path.display()
+                ));
+            }
+        })
+    {
+        runtime_log::log_error(format!(
+            "[general-settings] failed to start text language save thread; error={err}"
+        ));
+    }
 }
 
 /// Persists the newly selected UI-language tag and live-installs its catalog.
@@ -319,7 +414,7 @@ fn apply_ui_language_change(ui: &egui::Ui, state: &mut GeneralSettingsPanelState
             "[general-settings] failed to persist ui language '{tag}'; error={err}"
         ));
         state.status =
-            GeneralSettingsStatus::Error("Не удалось сохранить язык интерфейса.".to_string());
+            GeneralSettingsStatus::Error(t!("settings.general.ui_language_save_error").to_string());
     }
     install_selected_ui_locale(&tag);
     ui.ctx().request_repaint();
@@ -490,7 +585,7 @@ fn disk_locale_pairs() -> Vec<(String, Option<String>)> {
 fn draw_status(ui: &mut egui::Ui, status: &GeneralSettingsStatus) {
     match status {
         GeneralSettingsStatus::Idle => {
-            ui.small("Если поле пустое, автоматически используется путь по умолчанию.");
+            ui.small(t!("settings.general.projects_dir_empty_hint"));
         }
         GeneralSettingsStatus::Info(message) => {
             ui.small(message);
@@ -530,7 +625,7 @@ fn pick_projects_dir(state: &mut GeneralSettingsPanelState) {
     };
     state.projects_dir_input = normalize_projects_dir_value(&selected_dir.to_string_lossy());
     state.status =
-        GeneralSettingsStatus::Info("Папка выбрана. Нажмите «Сохранить папку проектов».".to_string());
+        GeneralSettingsStatus::Info(t!("settings.general.projects_dir_picked_hint").to_string());
 }
 
 /// Whether the normalized input differs from the last saved projects root (drives the
@@ -571,15 +666,15 @@ fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String
 
     let mut root = match std::fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str::<Value>(&raw)
-            .map_err(|err| format!("не удалось разобрать {}: {err}", path.display()))?,
+            .map_err(|err| tf!("settings.general.config_parse_error", path = path.display(), err = err))?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(err) => return Err(format!("не удалось прочитать {}: {err}", path.display())),
+        Err(err) => return Err(tf!("settings.general.config_read_error", path = path.display(), err = err)),
     };
     if !root.is_object() {
         root = Value::Object(Map::new());
     }
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("не удалось подготовить корень user_config.json".to_string());
+        return Err(t!("settings.general.config_root_error").to_string());
     };
     let mut general = root_obj
         .get("General")

@@ -135,37 +135,29 @@ impl NotesTabState {
             .map(|t| t.elapsed() <= COPY_FEEDBACK_DURATION)
             .unwrap_or(false)
         {
-            "Скопировано!"
+            t!("notes.prompt.copied")
         } else {
-            "Скопировать"
+            t!("notes.prompt.copy_button")
         };
         let save_label = if self
             .saved_at
             .map(|t| t.elapsed() <= SAVE_FEEDBACK_DURATION)
             .unwrap_or(false)
         {
-            "Сохранено!"
+            t!("notes.template.saved_flash")
         } else {
-            "Сохранить шаблон"
+            t!("notes.template.save_button")
         };
 
         ui.vertical(|ui| {
-            ui.heading("Заметки перевода");
+            ui.heading(t!("notes.heading"));
             if let Some(name) = &self.linked_character {
                 ui.label(
-                    egui::RichText::new(format!("Контекст из вкладки «Персонажи»: {name}")).strong(),
+                    egui::RichText::new(tf!("notes.character_context", name = name)).strong(),
                 );
             }
-            ui.small(format!(
-                "Ревизии: персонажи={} | термины={}",
-                self.characters_revision, self.terms_revision
-            ));
-            ui.small(format!(
-                "Шаблон: {}\nПерсонажи: {}\nТермины: {}",
-                project.paths.notes_file.display(),
-                project.paths.characters_dir.join("characters.json").display(),
-                project.paths.terms_file.display(),
-            ));
+            ui.small(tf!("notes.revisions", characters = self.characters_revision, terms = self.terms_revision));
+            ui.small(tf!("notes.paths_tooltip", template = project.paths.notes_file.display(), characters = project.paths.characters_dir.join("characters.json").display(), terms = project.paths.terms_file.display()));
 
             if let Some(msg) = &self.info_message {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
@@ -174,7 +166,7 @@ impl NotesTabState {
                 ui.colored_label(egui::Color32::from_rgb(230, 100, 100), err);
             }
             if self.compose_in_flight {
-                ui.small("Обновление предпросмотра...");
+                ui.small(t!("notes.prompt.updating"));
             }
 
             ui.separator();
@@ -182,12 +174,12 @@ impl NotesTabState {
                 ui.selectable_value(
                     &mut self.active_subtab,
                     NotesSubTab::Prompt,
-                    "Собранный промпт",
+                    t!("notes.tab.assembled_prompt"),
                 );
                 ui.selectable_value(
                     &mut self.active_subtab,
                     NotesSubTab::Template,
-                    "Шаблон (notes_file)",
+                    t!("notes.tab.template"),
                 );
             });
             ui.separator();
@@ -196,16 +188,16 @@ impl NotesTabState {
                 NotesSubTab::Prompt => {
                     ui.horizontal_wrapped(|ui| {
                         let toggled_char = ui
-                            .checkbox(&mut self.include_characters, "Вставлять персонажей")
+                            .checkbox(&mut self.include_characters, t!("notes.insert_characters_label"))
                             .changed();
                         let toggled_terms = ui
-                            .checkbox(&mut self.include_terms, "Вставлять термины")
+                            .checkbox(&mut self.include_terms, t!("notes.insert_terms_label"))
                             .changed();
                         if toggled_char || toggled_terms {
                             self.refresh_requested = true;
                             self.error_message = None;
                         }
-                        if ui.button("Обновить").clicked() {
+                        if ui.button(t!("notes.prompt.refresh_button")).clicked() {
                             self.refresh_requested = true;
                             self.error_message = None;
                         }
@@ -216,7 +208,7 @@ impl NotesTabState {
                     });
 
                     ui.small(
-                        "Шаблон использует {charas} и {terms}. Если плейсхолдер отсутствует, блок добавится в конец.",
+                        t!("notes.template.placeholder_hint"),
                     );
                     ui.add_space(6.0);
                     ui.add(
@@ -234,15 +226,15 @@ impl NotesTabState {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     egui::RichText::new(
-                                        "В шаблоне не найдены плейсхолдеры. Рекомендуется вставить {charas} и/или {terms}.",
+                                        t!("notes.template.no_placeholders_hint"),
                                     )
                                     .color(egui::Color32::from_rgb(210, 150, 40)),
                                 );
-                                if ui.button("Вставить {charas}").clicked() {
+                                if ui.button(t!("notes.template.insert_charas_button")).clicked() {
                                     insert_placeholder(&mut self.template_editor_text, "{charas}");
                                     self.editor_dirty = true;
                                 }
-                                if ui.button("Вставить {terms}").clicked() {
+                                if ui.button(t!("notes.template.insert_terms_button")).clicked() {
                                     insert_placeholder(&mut self.template_editor_text, "{terms}");
                                     self.editor_dirty = true;
                                 }
@@ -267,7 +259,7 @@ impl NotesTabState {
                                 self.saved_at = Some(Instant::now());
                             }
                         if self.editor_dirty {
-                            ui.small("Есть несохранённые изменения.");
+                            ui.small(t!("notes.template.unsaved_changes"));
                         }
                     });
                 }
@@ -342,14 +334,14 @@ impl NotesTabState {
             let chars = match load_characters_for_notes(&project_snapshot) {
                 Ok(v) => v,
                 Err(err) => {
-                    warnings.push(format!("Персонажи: {err}"));
+                    warnings.push(tf!("notes.compose.characters_error", err = err));
                     Vec::new()
                 }
             };
             let terms = match load_terms_for_notes(&project_snapshot) {
                 Ok(v) => v,
                 Err(err) => {
-                    warnings.push(format!("Термины: {err}"));
+                    warnings.push(tf!("notes.compose.terms_error", err = err));
                     Vec::new()
                 }
             };
@@ -382,7 +374,7 @@ impl NotesTabState {
             Err(mpsc::TryRecvError::Disconnected) => Some(ComposeResult {
                 preview_text: String::new(),
                 template_text: String::new(),
-                warnings: vec!["Поток сборки предпросмотра был прерван.".to_string()],
+                warnings: vec![t!("notes.compose.thread_interrupted").to_string()],
                 template_sig: FileSignature::default(),
                 chars_sig: FileSignature::default(),
                 terms_sig: FileSignature::default(),
@@ -403,10 +395,7 @@ impl NotesTabState {
         if result.warnings.is_empty() {
             self.error_message = None;
         } else {
-            self.error_message = Some(format!(
-                "Предпросмотр собран с предупреждениями: {}",
-                result.warnings.join("; ")
-            ));
+            self.error_message = Some(tf!("notes.compose.warnings", warnings = result.warnings.join("; ")));
         }
         ctx.request_repaint();
     }
@@ -449,7 +438,7 @@ impl NotesTabState {
             .write(path_str.as_ref(), self.template_editor_text.as_bytes())
             .map_err(|err| err.to_string())?;
         self.editor_dirty = false;
-        self.info_message = Some("Шаблон сохранён.".to_string());
+        self.info_message = Some(t!("notes.template.saved").to_string());
         self.error_message = None;
         self.refresh_requested = true;
         Ok(())
@@ -504,7 +493,7 @@ fn build_characters_block(entries: &[CharacterNoteEntry]) -> String {
     let mut items = entries.to_vec();
     items.sort_by_key(|entry| entry.name.to_lowercase());
 
-    let mut lines = vec!["## **Персонажи**".to_string(), String::new()];
+    let mut lines = vec![t!("notes.block.characters_heading").to_string(), String::new()];
     for item in items {
         if item.name.trim().is_empty() {
             continue;
@@ -512,15 +501,11 @@ fn build_characters_block(entries: &[CharacterNoteEntry]) -> String {
         if item.groups.is_empty() {
             lines.push(format!("**{}**", item.name.trim()));
         } else {
-            lines.push(format!(
-                "**{}** _(группы: {})_",
-                item.name.trim(),
-                item.groups.join(", ")
-            ));
+            lines.push(tf!("notes.block.character_line", name = item.name.trim(), groups = item.groups.join(", ")));
         }
         let desc = item.description.trim();
         if desc.is_empty() {
-            lines.push("(без описания)".to_string());
+            lines.push(t!("notes.block.no_description").to_string());
         } else {
             lines.push(desc.to_string());
         }
@@ -542,7 +527,7 @@ fn build_terms_block(entries: &[TermNoteEntry]) -> String {
     let mut items = entries.to_vec();
     items.sort_by_key(|entry| entry.name.to_lowercase());
 
-    let mut lines = vec!["## **Термины**".to_string(), String::new()];
+    let mut lines = vec![t!("notes.block.terms_heading").to_string(), String::new()];
     for item in items {
         let name = item.name.trim();
         if name.is_empty() {
@@ -551,14 +536,14 @@ fn build_terms_block(entries: &[TermNoteEntry]) -> String {
         lines.push(format!("**{name}**"));
         let orig = item.orig_name.trim();
         if !orig.is_empty() {
-            lines.push(format!("Оригинальное название: {orig}"));
+            lines.push(tf!("notes.block.term_orig_name", orig = orig));
         }
         let desc = item.description.trim();
         if !desc.is_empty() {
-            lines.push(format!("Описание: {desc}"));
+            lines.push(tf!("notes.block.term_description", desc = desc));
         }
         if !item.tags.is_empty() {
-            lines.push(format!("Теги: {}", item.tags.join(", ")));
+            lines.push(tf!("notes.block.term_tags", tags = item.tags.join(", ")));
         }
         lines.push(String::new());
     }

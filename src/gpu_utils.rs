@@ -473,19 +473,19 @@ pub fn probe_cuda_runtime() -> CudaRuntimeStatus {
     let available = nvidia_gpu && cuda12_runtime && cudnn9_runtime;
 
     let details = if available {
-        "Обнаружены видеокарта NVIDIA, CUDA 12.x и cuDNN 9.x.".to_string()
+        t!("gpu_utils.cuda_all_detected").to_string()
     } else {
         let mut missing = Vec::new();
         if !nvidia_gpu {
-            missing.push("видеокарта NVIDIA");
+            missing.push(t!("gpu_utils.missing_nvidia_gpu"));
         }
         if !cuda12_runtime {
-            missing.push("библиотека CUDA 12.x (cudart)");
+            missing.push(t!("gpu_utils.missing_cuda_lib"));
         }
         if !cudnn9_runtime {
-            missing.push("библиотека cuDNN 9.x");
+            missing.push(t!("gpu_utils.missing_cudnn_lib"));
         }
-        format!("Не найдено: {}.", missing.join(", "))
+        tf!("gpu_utils.not_found", missing = missing.join(", "))
     };
 
     CudaRuntimeStatus {
@@ -894,7 +894,7 @@ pub fn detect_apple_gpu() -> Option<String> {
         if let Some(name) = chipset.filter(|value| !value.is_empty()) {
             let mut extra = Vec::new();
             if let Some(cores) = cores.filter(|value| !value.is_empty()) {
-                extra.push(format!("{cores} ядер GPU"));
+                extra.push(tf!("gpu_utils.gpu_cores", cores = cores));
             }
             if let Some(metal) = metal.filter(|value| !value.is_empty()) {
                 extra.push(metal);

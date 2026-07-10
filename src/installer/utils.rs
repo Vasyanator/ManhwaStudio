@@ -237,26 +237,24 @@ pub(super) fn run_install_worker(
     let torch_deps_range = alloc_progress_range(&mut progress_cursor, 0.24);
     let windows_post_range = (progress_cursor, 1.0_f32);
 
-    let _ = tx.send(InstallEvent::Step("Подготовка директорий...".to_string()));
+    let _ = tx.send(InstallEvent::Step(t!("installer.utils.preparing_dirs_status").to_string()));
     prepare_install_root_dir(&root_dir)?;
     let installer_dir = root_dir.join("installer_files");
     fs::create_dir_all(&installer_dir)
-        .map_err(|e| format!("не удалось создать installer_files: {e}"))?;
+        .map_err(|e| tf!("installer.utils.create_installer_files_error", e = e))?;
     let downloads_dir = installer_dir.join("downloads");
     fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("не удалось создать installer_files/downloads: {e}"))?;
-    send_progress(tx, 1.0, "Подготовка", prep_range.1, "Подготовка завершена");
+        .map_err(|e| tf!("installer.utils.create_installer_downloads_error", e = e))?;
+    send_progress(tx, 1.0, t!("installer.common.preparation"), prep_range.1, t!("installer.utils.preparation_done"));
 
     let resolved_arch = detect_arch()?;
     let platform = detect_platform()?;
 
-    let _ = tx.send(InstallEvent::Step(format!(
-        "Поиск последней сборки uv для {platform}/{resolved_arch}..."
-    )));
+    let _ = tx.send(InstallEvent::Step(tf!("installer.utils.searching_uv_status", platform = platform, resolved_arch = resolved_arch)));
     let asset = fetch_latest_uv_asset(platform, &resolved_arch)?;
     let archive_path = downloads_dir.join(&asset.name);
 
-    let _ = tx.send(InstallEvent::Step(format!("Скачивание {}...", asset.name)));
+    let _ = tx.send(InstallEvent::Step(tf!("installer.utils.downloading_asset_status", asset = asset.name)));
     download_asset(
         &asset.browser_download_url,
         &archive_path,
@@ -269,26 +267,23 @@ pub(super) fn run_install_worker(
     let uv_dir = installer_dir.join("uv");
     if uv_dir.exists() {
         let _ = tx.send(InstallEvent::Step(
-            "Удаление предыдущего installer_files/uv...".to_string(),
+            t!("installer.utils.removing_old_uv_status").to_string(),
         ));
         fs::remove_dir_all(&uv_dir).map_err(|e| {
-            format!(
-                "не удалось очистить старую папку '{}': {e}",
-                uv_dir.display()
-            )
+            tf!("installer.utils.clear_old_uv_folder_error", uv_dir = uv_dir.display(), e = e)
         })?;
     }
     fs::create_dir_all(&uv_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_dir_error", uv_dir = uv_dir.display(), e = e))?;
 
     let _ = tx.send(InstallEvent::Step(
-        "Распаковка архива в installer_files/uv...".to_string(),
+        t!("installer.utils.extracting_uv_status").to_string(),
     ));
     extract_archive(
         &archive_path,
         &uv_dir,
         tx,
-        "Распаковка uv",
+        t!("installer.utils.extract_uv_stage"),
         lerp(python_range.0, python_range.1, 0.55),
         python_range.1,
     )?;
@@ -299,9 +294,9 @@ pub(super) fn run_install_worker(
     let uv_python_dir = uv_dir.join("python");
     let uv_cache_dir = uv_dir.join("cache");
     fs::create_dir_all(&uv_python_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_python_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_python_dir_error", uv_python_dir = uv_python_dir.display(), e = e))?;
     fs::create_dir_all(&uv_cache_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_cache_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_cache_dir_error", uv_cache_dir = uv_cache_dir.display(), e = e))?;
     let uv_python_dir_str = uv_python_dir.to_string_lossy().into_owned();
     let uv_cache_dir_str = uv_cache_dir.to_string_lossy().into_owned();
     let uv_env = [
@@ -309,14 +304,12 @@ pub(super) fn run_install_worker(
         ("UV_CACHE_DIR", uv_cache_dir_str.as_str()),
     ];
 
-    let _ = tx.send(InstallEvent::Step(format!(
-        "Установка Python {PYTHON_VERSION_REQUEST} через uv..."
-    )));
+    let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_python_status", python_version_request = PYTHON_VERSION_REQUEST)));
     run_command_with_retry(
         &uv_exe,
         &root_dir,
         &["python", "install", PYTHON_VERSION_REQUEST],
-        &format!("установка Python {PYTHON_VERSION_REQUEST} через uv"),
+        &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
         2,
         Some(tx),
         &uv_env,
@@ -325,19 +318,16 @@ pub(super) fn run_install_worker(
     let managed_venv_dir = installer_dir.join("venv");
     if managed_venv_dir.exists() {
         let _ = tx.send(InstallEvent::Step(
-            "Удаление предыдущего installer_files/venv...".to_string(),
+            t!("installer.utils.removing_old_venv_status").to_string(),
         ));
         fs::remove_dir_all(&managed_venv_dir).map_err(|e| {
-            format!(
-                "не удалось очистить старую папку '{}': {e}",
-                managed_venv_dir.display()
-            )
+            tf!("installer.utils.clear_old_venv_folder_error", managed_venv_dir = managed_venv_dir.display(), e = e)
         })?;
     }
 
     let managed_venv_dir_str = managed_venv_dir.to_string_lossy().into_owned();
     let _ = tx.send(InstallEvent::Step(
-        "Создание installer_files/venv через uv...".to_string(),
+        t!("installer.utils.creating_venv_status").to_string(),
     ));
     run_command_with_retry(
         &uv_exe,
@@ -348,7 +338,7 @@ pub(super) fn run_install_worker(
             PYTHON_VERSION_REQUEST,
             &managed_venv_dir_str,
         ],
-        "создание installer_files/venv через uv",
+        t!("installer.utils.create_venv_action"),
         2,
         Some(tx),
         &uv_env,
@@ -356,13 +346,13 @@ pub(super) fn run_install_worker(
     let python_exe = python_manager::resolve_python_executable_in_dir(&managed_venv_dir)?;
 
     let _ = tx.send(InstallEvent::Step(
-        "Поиск ManhwaStudio.zip в последнем релизе...".to_string(),
+        t!("installer.utils.searching_app_zip_status").to_string(),
     ));
     let app_asset = fetch_latest_app_zip_asset()?;
     let app_zip_path = downloads_dir.join(APP_ZIP_ASSET_NAME);
 
     let _ = tx.send(InstallEvent::Step(
-        "Скачивание ManhwaStudio.zip...".to_string(),
+        t!("installer.utils.downloading_app_zip_status").to_string(),
     ));
     download_asset(
         &app_asset.browser_download_url,
@@ -376,34 +366,28 @@ pub(super) fn run_install_worker(
     let app_extract_dir = downloads_dir.join("manhwastudio_extract");
     if app_extract_dir.exists() {
         fs::remove_dir_all(&app_extract_dir).map_err(|e| {
-            format!(
-                "не удалось очистить временную папку '{}': {e}",
-                app_extract_dir.display()
-            )
+            tf!("installer.utils.clear_temp_app_extract_error", app_extract_dir = app_extract_dir.display(), e = e)
         })?;
     }
     fs::create_dir_all(&app_extract_dir).map_err(|e| {
-        format!(
-            "не удалось создать временную папку '{}': {e}",
-            app_extract_dir.display()
-        )
+        tf!("installer.utils.create_temp_app_extract_error", app_extract_dir = app_extract_dir.display(), e = e)
     })?;
 
     let _ = tx.send(InstallEvent::Step(
-        "Распаковка ManhwaStudio.zip...".to_string(),
+        t!("installer.utils.extracting_app_zip_status").to_string(),
     ));
     extract_archive(
         &app_zip_path,
         &app_extract_dir,
         tx,
-        "Распаковка ManhwaStudio.zip",
+        t!("installer.utils.extract_app_zip_stage"),
         lerp(app_range.0, app_range.1, 0.50),
         lerp(app_range.0, app_range.1, 0.85),
     )?;
     flatten_single_root_dir(&app_extract_dir)?;
 
     let _ = tx.send(InstallEvent::Step(
-        "Копирование файлов ManhwaStudio в рабочую папку...".to_string(),
+        t!("installer.utils.copying_app_files_status").to_string(),
     ));
     merge_dir_contents(&app_extract_dir, &root_dir)?;
     write_embedded_app_icon(&root_dir)?;
@@ -411,26 +395,23 @@ pub(super) fn run_install_worker(
     send_progress(
         tx,
         1.0,
-        "Копирование файлов ManhwaStudio",
+        t!("installer.utils.copy_app_files_stage"),
         app_range.1,
-        "Файлы ManhwaStudio развернуты",
+        t!("installer.utils.app_files_deployed_status"),
     );
     fs::remove_dir_all(&app_extract_dir).map_err(|e| {
-        format!(
-            "не удалось удалить временную папку '{}': {e}",
-            app_extract_dir.display()
-        )
+        tf!("installer.utils.delete_temp_app_extract_error", app_extract_dir = app_extract_dir.display(), e = e)
     })?;
 
     let _ = tx.send(InstallEvent::Step(
-        "Установка базовых Python-зависимостей...".to_string(),
+        t!("installer.utils.installing_base_deps_status").to_string(),
     ));
     install_static_python_dependencies(DependencyInstallRequest {
         root_dir: &root_dir,
         pip_runner: &pip_runner,
         python_exe: &python_exe,
         tx,
-        label: "базовых зависимостей",
+        label: t!("installer.utils.base_deps_label"),
         dependencies: BASE_DEPENDENCIES,
         overall_start: base_deps_range.0,
         overall_end: base_deps_range.1,
@@ -441,16 +422,16 @@ pub(super) fn run_install_worker(
             send_progress(
                 tx,
                 1.0,
-                "PyTorch: быстрый режим",
+                t!("installer.utils.pytorch_fast_mode"),
                 torch_range.1,
-                "PyTorch и torch-зависимости пропущены",
+                t!("installer.utils.pytorch_skipped"),
             );
             send_progress(
                 tx,
                 1.0,
-                "Torch-зависимости: быстрый режим",
+                t!("installer.utils.torch_deps_fast_mode"),
                 torch_deps_range.1,
-                "Torch-зависимости пропущены",
+                t!("installer.utils.torch_deps_skipped"),
             );
         }
         InstallDependencyProfile::Full => {
@@ -478,7 +459,7 @@ pub(super) fn run_install_worker(
     }
 
     finalize_windows_post_install(&root_dir, tx, windows_post_range.0, windows_post_range.1)?;
-    send_progress(tx, 1.0, "Установка завершена", 1.0, "Установка завершена");
+    send_progress(tx, 1.0, t!("installer.common.install_complete"), 1.0, t!("installer.common.install_complete"));
 
     Ok(())
 }
@@ -490,10 +471,10 @@ pub(crate) fn run_torch_upgrade_worker(
     tx: &mpsc::Sender<InstallEvent>,
 ) -> Result<(), String> {
     let _ = tx.send(InstallEvent::Step(
-        "Подготовка Python-окружения для PyTorch...".to_string(),
+        t!("installer.utils.preparing_pytorch_env_status").to_string(),
     ));
     let python_exe = python_manager::resolve_python_executable(&root_dir)
-        .map_err(|err| format!("не удалось найти Python окружение для установки PyTorch: {err}"))?;
+        .map_err(|err| tf!("installer.utils.find_python_for_pytorch_error", err = err))?;
     let pip_runner = resolve_runtime_pip_runner(&root_dir, &python_exe);
     send_console_line(
         tx,
@@ -533,7 +514,7 @@ pub(crate) fn run_torch_upgrade_worker(
         )?;
     }
 
-    send_progress(tx, 1.0, "PyTorch установка завершена", 1.0, "Готово");
+    send_progress(tx, 1.0, t!("installer.utils.pytorch_install_complete"), 1.0, t!("installer.common.ready"));
     Ok(())
 }
 
@@ -619,7 +600,7 @@ fn run_update_binary_stage_inner(
     let current_exe = match target_executable {
         Some(executable) => executable.to_path_buf(),
         None => env::current_exe()
-            .map_err(|e| format!("не удалось определить путь текущего executable: {e}"))?,
+            .map_err(|e| tf!("installer.utils.determine_current_executable_error", e = e))?,
     };
     let local_version = query_executable_version(&current_exe, root_dir)?;
     send_update_console_line(
@@ -632,9 +613,9 @@ fn run_update_binary_stage_inner(
     );
 
     let _ = tx.send(UpdateWorkerEvent::Step(
-        "Проверка последнего релиза ManhwaStudio...".to_string(),
+        t!("installer.utils.checking_latest_release_status").to_string(),
     ));
-    send_update_progress(tx, 0.0, "Подготовка", 0.0, "Этап: обновление бинарника");
+    send_update_progress(tx, 0.0, t!("installer.common.preparation"), 0.0, t!("installer.utils.stage_update_binary"));
     let remote_version =
         fetch_latest_app_release_tag_with_required_asset(platform_binary_asset_name())?;
     if compare_version_strings(&remote_version, &local_version).is_le() {
@@ -644,13 +625,11 @@ fn run_update_binary_stage_inner(
         });
     }
 
-    let _ = tx.send(UpdateWorkerEvent::Step(format!(
-        "Доступна версия {remote_version}. Скачивание бинарника..."
-    )));
+    let _ = tx.send(UpdateWorkerEvent::Step(tf!("installer.utils.version_available_status", remote_version = remote_version)));
     let binary_asset = fetch_latest_app_asset_by_name(platform_binary_asset_name())?;
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", downloads_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
     let downloaded_binary = downloads_dir.join(format!("{}.update", binary_asset.name));
 
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
@@ -674,7 +653,7 @@ fn run_update_binary_stage_inner(
 
     #[cfg(target_os = "windows")]
     {
-        send_update_progress(tx, 1.0, "Бинарник скачан", 0.92, "Подготовка перезапуска");
+        send_update_progress(tx, 1.0, t!("installer.utils.binary_downloaded_status"), 0.92, t!("installer.utils.preparing_restart_status"));
         spawn_windows_update_replacement_script(root_dir, &downloaded_binary, &current_exe)?;
     }
     #[cfg(not(target_os = "windows"))]
@@ -686,9 +665,9 @@ fn run_update_binary_stage_inner(
     send_update_progress(
         tx,
         1.0,
-        "Перезапуск запущен",
+        t!("installer.utils.restart_started_status"),
         1.0,
-        "Перезапуск в новую версию",
+        t!("installer.utils.restart_to_new_version_status"),
     );
     Ok(UpdateBinaryStageOutcome::RelaunchStarted)
 }
@@ -732,9 +711,9 @@ fn run_update_continuation_stage_inner(
         send_update_progress(
             tx,
             1.0,
-            "PyTorch не требуется",
+            t!("installer.utils.pytorch_not_needed_status"),
             torch_range.1,
-            "Этап PyTorch пропущен",
+            t!("installer.utils.pytorch_stage_skipped"),
         );
     }
 
@@ -747,7 +726,7 @@ fn run_update_continuation_stage_inner(
         deps_range,
     )?;
     download_and_extract_app_archive_for_update(root_dir, tx, app_range)?;
-    send_update_progress(tx, 1.0, "Обновление завершено", 1.0, "Готово");
+    send_update_progress(tx, 1.0, t!("installer.utils.update_complete_status"), 1.0, t!("installer.common.ready"));
     Ok(UpdateContinuationOutcome::Completed)
 }
 
@@ -796,18 +775,10 @@ fn platform_executable_file_name() -> &'static str {
 fn query_executable_version(executable: &Path, root_dir: &Path) -> Result<String, String> {
     let (status, output) = run_command_streaming(executable, root_dir, &["--version"], None, &[])?;
     if !status.success() {
-        return Err(format!(
-            "не удалось получить версию '{}': команда --version завершилась с ошибкой\n{}",
-            executable.display(),
-            output.trim()
-        ));
+        return Err(tf!("installer.utils.get_version_error", executable = executable.display(), output = output.trim()));
     }
     parse_executable_version_output(&output).ok_or_else(|| {
-        format!(
-            "не удалось распознать версию из вывода '{} --version': {}",
-            executable.display(),
-            output.trim()
-        )
+        tf!("installer.utils.parse_version_error", executable = executable.display(), output = output.trim())
     })
 }
 
@@ -830,18 +801,11 @@ fn replace_unix_executable(downloaded_binary: &Path, current_exe: &Path) -> Resu
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(downloaded_binary, fs::Permissions::from_mode(0o755)).map_err(|e| {
-            format!(
-                "не удалось выставить executable permissions для '{}': {e}",
-                downloaded_binary.display()
-            )
+            tf!("installer.utils.set_exec_permissions_error", downloaded_binary = downloaded_binary.display(), e = e)
         })?;
     }
     fs::rename(downloaded_binary, current_exe).map_err(|e| {
-        format!(
-            "не удалось заменить executable '{}' файлом '{}': {e}",
-            current_exe.display(),
-            downloaded_binary.display()
-        )
+        tf!("installer.utils.replace_executable_error", current_exe = current_exe.display(), downloaded_binary = downloaded_binary.display(), e = e)
     })
 }
 
@@ -850,10 +814,7 @@ fn spawn_continue_update_process(root_dir: &Path, executable: &Path) -> Result<(
     let mut cmd = Command::new(executable);
     cmd.current_dir(root_dir).arg("--continue-update");
     cmd.spawn().map_err(|e| {
-        format!(
-            "не удалось запустить '{}' --continue-update: {e}",
-            executable.display()
-        )
+        tf!("installer.utils.launch_continue_update_error", executable = executable.display(), e = e)
     })?;
     Ok(())
 }
@@ -888,16 +849,13 @@ fn spawn_windows_update_replacement_script(
         root = root_dir.display(),
     );
     fs::write(&script_path, script)
-        .map_err(|e| format!("не удалось записать '{}': {e}", script_path.display()))?;
+        .map_err(|e| tf!("installer.utils.write_script_error", script_path = script_path.display(), e = e))?;
     let mut cmd = Command::new("cmd");
     apply_windows_no_window(&mut cmd);
     cmd.current_dir(root_dir).args(["/C", "start", "", "/MIN"]);
     cmd.arg(&script_path);
     cmd.spawn().map_err(|e| {
-        format!(
-            "не удалось запустить replacement script '{}': {e}",
-            script_path.display()
-        )
+        tf!("installer.utils.run_replacement_script_error", script_path = script_path.display(), e = e)
     })?;
     Ok(())
 }
@@ -925,14 +883,11 @@ fn ensure_uv_managed_python_environment(
 
     if !has_uv_managed_venv {
         let _ = tx.send(UpdateWorkerEvent::Step(
-            "Создание нового installer_files/venv через uv...".to_string(),
+            t!("installer.utils.creating_new_venv_status").to_string(),
         ));
         if managed_venv_dir.exists() {
             fs::remove_dir_all(&managed_venv_dir).map_err(|e| {
-                format!(
-                    "не удалось удалить старое окружение '{}': {e}",
-                    managed_venv_dir.display()
-                )
+                tf!("installer.utils.remove_old_env_error", managed_venv_dir = managed_venv_dir.display(), e = e)
             })?;
         }
         let uv_env = build_uv_env(root_dir)?;
@@ -940,7 +895,7 @@ fn ensure_uv_managed_python_environment(
             &uv_exe,
             root_dir,
             &["python", "install", PYTHON_VERSION_REQUEST],
-            &format!("установка Python {PYTHON_VERSION_REQUEST} через uv"),
+            &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
             2,
             None,
             &uv_env.as_env_slice(),
@@ -950,7 +905,7 @@ fn ensure_uv_managed_python_environment(
             &uv_exe,
             root_dir,
             &["venv", "--python", PYTHON_VERSION_REQUEST, &venv_dir],
-            "создание installer_files/venv через uv",
+            t!("installer.utils.create_venv_action"),
             2,
             None,
             &uv_env.as_env_slice(),
@@ -961,9 +916,9 @@ fn ensure_uv_managed_python_environment(
     send_update_progress(
         tx,
         1.0,
-        "Python окружение готово",
+        t!("installer.utils.python_env_ready"),
         overall_range.1,
-        "Python окружение готово",
+        t!("installer.utils.python_env_ready"),
     );
     Ok((uv_exe, python_exe))
 }
@@ -987,9 +942,9 @@ fn build_uv_env(root_dir: &Path) -> Result<UvEnv, String> {
     let uv_python_dir = uv_root.join("python");
     let uv_cache_dir = uv_root.join("cache");
     fs::create_dir_all(&uv_python_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_python_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_python_dir_error", uv_python_dir = uv_python_dir.display(), e = e))?;
     fs::create_dir_all(&uv_cache_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_cache_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_cache_dir_error", uv_cache_dir = uv_cache_dir.display(), e = e))?;
     Ok(UvEnv {
         python_dir: uv_python_dir.to_string_lossy().into_owned(),
         cache_dir: uv_cache_dir.to_string_lossy().into_owned(),
@@ -1006,18 +961,18 @@ fn ensure_uv_runtime(
     if uv_dir.is_dir()
         && let Ok(uv_exe) = resolve_uv_executable(&uv_dir)
     {
-        send_update_progress(tx, 1.0, "uv уже установлен", overall_end, "uv готов");
+        send_update_progress(tx, 1.0, t!("installer.utils.uv_already_installed"), overall_end, t!("installer.utils.uv_ready"));
         return Ok(uv_exe);
     }
 
     let _ = tx.send(UpdateWorkerEvent::Step(
-        "Скачивание uv для обновления окружения...".to_string(),
+        t!("installer.utils.downloading_uv_for_update_status").to_string(),
     ));
     fs::create_dir_all(&uv_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_dir_error", uv_dir = uv_dir.display(), e = e))?;
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", downloads_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
     let asset = fetch_latest_uv_asset(detect_platform()?, &detect_arch()?)?;
     let archive_path = downloads_dir.join(&asset.name);
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
@@ -1031,15 +986,15 @@ fn ensure_uv_runtime(
     )?;
     if uv_dir.exists() {
         fs::remove_dir_all(&uv_dir)
-            .map_err(|e| format!("не удалось очистить '{}': {e}", uv_dir.display()))?;
+            .map_err(|e| tf!("installer.utils.clear_uv_dir_error", uv_dir = uv_dir.display(), e = e))?;
     }
     fs::create_dir_all(&uv_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", uv_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_uv_dir_error", uv_dir = uv_dir.display(), e = e))?;
     extract_archive(
         &archive_path,
         &uv_dir,
         &install_tx,
-        "Распаковка uv",
+        t!("installer.utils.extract_uv_stage"),
         lerp(overall_start, overall_end, 0.55),
         overall_end,
     )?;
@@ -1075,9 +1030,9 @@ fn maybe_update_torch(
         send_update_progress(
             tx,
             1.0,
-            "PyTorch уже актуален",
+            t!("installer.utils.pytorch_already_current_status"),
             overall_range.1,
-            "Этап PyTorch завершён",
+            t!("installer.utils.pytorch_stage_done"),
         );
         return Ok(UpdateContinuationOutcome::Completed);
     }
@@ -1140,9 +1095,9 @@ fn install_missing_dependencies_for_update(
         send_update_progress(
             tx,
             1.0,
-            "Python зависимости актуальны",
+            t!("installer.utils.python_deps_current_status"),
             overall_range.1,
-            "Зависимости актуальны",
+            t!("installer.utils.deps_current_status"),
         );
         return Ok(());
     }
@@ -1152,24 +1107,22 @@ fn install_missing_dependencies_for_update(
     for (idx, dep) in missing.iter().enumerate() {
         let start_ratio = idx as f32 / total;
         let end_ratio = (idx + 1) as f32 / total;
-        let _ = tx.send(UpdateWorkerEvent::Step(format!(
-            "Установка отсутствующей зависимости: {dep}"
-        )));
+        let _ = tx.send(UpdateWorkerEvent::Step(tf!("installer.utils.installing_missing_dep_status", dep = dep)));
         run_pip_install_with_retry(
             pip_runner,
             python_exe,
             root_dir,
             &[*dep],
-            &format!("установка отсутствующей зависимости '{dep}'"),
+            &tf!("installer.utils.install_missing_dep_action", dep = dep),
             3,
             Some(&install_tx),
         )?;
         send_update_progress(
             tx,
             end_ratio,
-            format!("Установлено: {dep}"),
+            tf!("installer.utils.installed_dep_status", dep = dep),
             lerp(overall_range.0, overall_range.1, end_ratio),
-            format!("Зависимости: {}/{}", idx + 1, missing.len()),
+            tf!("installer.utils.deps_progress", idx = idx + 1, missing = missing.len()),
         );
         if start_ratio == 0.0 {
             send_update_console_line(tx, "[Update] Missing dependencies are being installed");
@@ -1184,11 +1137,11 @@ fn download_and_extract_app_archive_for_update(
     overall_range: (f32, f32),
 ) -> Result<(), String> {
     let _ = tx.send(UpdateWorkerEvent::Step(
-        "Скачивание ManhwaStudio.zip...".to_string(),
+        t!("installer.utils.downloading_app_zip_status").to_string(),
     ));
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", downloads_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
     let app_asset = fetch_latest_app_zip_asset()?;
     let archive_path = downloads_dir.join(&app_asset.name);
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
@@ -1204,15 +1157,15 @@ fn download_and_extract_app_archive_for_update(
     let staging_dir = root_dir.join("installer_files").join("update_extract");
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)
-            .map_err(|e| format!("не удалось очистить '{}': {e}", staging_dir.display()))?;
+            .map_err(|e| tf!("installer.utils.clear_staging_dir_error", staging_dir = staging_dir.display(), e = e))?;
     }
     fs::create_dir_all(&staging_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", staging_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_staging_dir_error", staging_dir = staging_dir.display(), e = e))?;
     extract_archive(
         &archive_path,
         &staging_dir,
         &install_tx,
-        "Распаковка ManhwaStudio.zip",
+        t!("installer.utils.extract_app_zip_stage"),
         lerp(overall_range.0, overall_range.1, 0.45),
         lerp(overall_range.0, overall_range.1, 0.82),
     )?;
@@ -1223,9 +1176,9 @@ fn download_and_extract_app_archive_for_update(
     send_update_progress(
         tx,
         1.0,
-        "Архив приложения распакован",
+        t!("installer.utils.app_archive_extracted_status"),
         overall_range.1,
-        "Файлы приложения обновлены",
+        t!("installer.utils.app_files_updated_status"),
     );
     Ok(())
 }
@@ -1242,10 +1195,7 @@ fn remove_staged_platform_binary(staging_dir: &Path) -> Result<(), String> {
     let binary_path = staging_dir.join(platform_executable_file_name());
     if binary_path.is_file() {
         fs::remove_file(&binary_path).map_err(|e| {
-            format!(
-                "не удалось удалить staged executable '{}': {e}",
-                binary_path.display()
-            )
+            tf!("installer.utils.delete_staged_executable_error", binary_path = binary_path.display(), e = e)
         })?;
     }
     Ok(())
@@ -1279,10 +1229,7 @@ fn freeze_installed_packages(
     send_update_console_line(tx, format!("$ {} {}", executable.display(), args.join(" ")));
     let (status, output) = run_command_streaming(executable, root_dir, &args_ref, None, &[])?;
     if !status.success() {
-        return Err(format!(
-            "uv pip freeze завершился ошибкой:\n{}",
-            output.trim()
-        ));
+        return Err(tf!("installer.utils.uv_pip_freeze_error", output = output.trim()));
     }
     Ok(parse_pip_freeze_packages(&output))
 }
@@ -1369,10 +1316,7 @@ enum VersionPart {
 
 fn prepare_install_root_dir(root_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(root_dir).map_err(|e| {
-        format!(
-            "не удалось создать папку установки '{}': {e}",
-            root_dir.display()
-        )
+        tf!("installer.utils.create_install_dir_error", root_dir = root_dir.display(), e = e)
     })?;
     prepare_windows_install_root_acl(root_dir)
 }
@@ -1405,30 +1349,23 @@ fn copy_launcher_to_install_dir(
     let source = match launcher_exe_path {
         Some(path) => path.to_path_buf(),
         None => env::current_exe()
-            .map_err(|e| format!("не удалось определить путь текущего exe: {e}"))?,
+            .map_err(|e| tf!("installer.utils.determine_current_exe_error", e = e))?,
     };
     let file_name = source
         .file_name()
-        .ok_or_else(|| format!("не удалось получить имя файла для '{}'", source.display()))?;
+        .ok_or_else(|| tf!("installer.utils.get_filename_error", source = source.display()))?;
     let target = target_root.join(file_name);
 
     if paths_point_to_same_file(&source, &target) {
         send_console_line(
             tx,
-            format!(
-                "текущий exe уже находится в целевой папке: '{}'",
-                target.display()
-            ),
+            tf!("installer.utils.exe_already_in_target_error", target = target.display()),
         );
         return Ok(());
     }
 
     fs::copy(&source, &target).map_err(|e| {
-        format!(
-            "не удалось скопировать текущий exe '{}' -> '{}': {e}",
-            source.display(),
-            target.display()
-        )
+        tf!("installer.utils.copy_exe_error", source = source.display(), target = target.display(), e = e)
     })?;
 
     if let Ok(meta) = fs::metadata(&source) {
@@ -1437,11 +1374,7 @@ fn copy_launcher_to_install_dir(
 
     send_console_line(
         tx,
-        format!(
-            "Скопирован текущий exe: '{}' -> '{}'",
-            source.display(),
-            target.display()
-        ),
+        tf!("installer.utils.copied_exe_log", source = source.display(), target = target.display()),
     );
     Ok(())
 }
@@ -1476,10 +1409,7 @@ pub(super) fn load_embedded_icon_data() -> Option<egui::IconData> {
 fn write_embedded_app_icon(target_root: &Path) -> Result<(), String> {
     let icon_path = target_root.join("app_icon_512.png");
     fs::write(&icon_path, EMBEDDED_APP_ICON_PNG).map_err(|e| {
-        format!(
-            "не удалось записать встроенную иконку '{}': {e}",
-            icon_path.display()
-        )
+        tf!("installer.utils.write_icon_error", icon_path = icon_path.display(), e = e)
     })
 }
 
@@ -1493,7 +1423,7 @@ pub(super) fn default_local_install_dir() -> Result<PathBuf, String> {
                     .map(PathBuf::from)
                     .map(|p| p.join("AppData").join("Roaming"))
             })
-            .ok_or_else(|| "не удалось определить AppData\\Roaming".to_string())?;
+            .ok_or_else(|| t!("installer.utils.appdata_not_found_error").to_string())?;
         return Ok(base.join(INSTALL_SUBDIR_NAME));
     }
 
@@ -1515,7 +1445,7 @@ pub(super) fn default_local_install_dir() -> Result<PathBuf, String> {
     }
 
     #[allow(unreachable_code)]
-    Err("неподдерживаемая ОС".to_string())
+    Err(t!("installer.utils.unsupported_os_error").to_string())
 }
 
 pub(super) fn default_all_users_install_dir() -> Result<PathBuf, String> {
@@ -1538,14 +1468,14 @@ pub(super) fn default_all_users_install_dir() -> Result<PathBuf, String> {
     }
 
     #[allow(unreachable_code)]
-    Err("неподдерживаемая ОС".to_string())
+    Err(t!("installer.utils.unsupported_os_error").to_string())
 }
 
 #[cfg(not(target_os = "windows"))]
 fn home_dir_path() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "не удалось определить домашнюю папку пользователя".to_string())
+        .ok_or_else(|| t!("installer.utils.home_dir_not_found_error").to_string())
 }
 
 pub(super) fn has_write_access_for_install(target_dir: &Path) -> bool {
@@ -1634,7 +1564,7 @@ pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Resu
 
 #[cfg(target_os = "macos")]
 pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| format!("не удалось определить путь exe: {e}"))?;
+    let exe = env::current_exe().map_err(|e| tf!("installer.utils.determine_exe_error", e = e))?;
     let cmd = format!(
         "cd {} && {} --continue-install --continue-install-target {}",
         shell_quote(root_dir),
@@ -1649,13 +1579,13 @@ pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Resu
         .arg("-e")
         .arg(script)
         .spawn()
-        .map_err(|e| format!("не удалось запросить повышение прав через osascript: {e}"))?;
+        .map_err(|e| tf!("installer.utils.osascript_elevation_error", e = e))?;
     Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "windows")))]
 pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| format!("не удалось определить путь exe: {e}"))?;
+    let exe = env::current_exe().map_err(|e| tf!("installer.utils.determine_exe_error", e = e))?;
 
     let pkexec_result = Command::new("pkexec")
         .current_dir(root_dir)
@@ -1675,13 +1605,13 @@ pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Resu
         .arg("--continue-install-target")
         .arg(target_dir)
         .spawn()
-        .map_err(|e| format!("не удалось запросить повышение прав через sudo/pkexec: {e}"))?;
+        .map_err(|e| tf!("installer.utils.sudo_elevation_error", e = e))?;
     Ok(())
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
 pub(super) fn relaunch_self_elevated(_root_dir: &Path, _target_dir: &Path) -> Result<(), String> {
-    Err("запрос повышения прав не поддерживается на этой ОС".to_string())
+    Err(t!("installer.utils.elevation_unsupported_os_error").to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -1689,7 +1619,7 @@ fn relaunch_self_elevated_with_args(root_dir: &Path, args: &str) -> Result<(), S
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let exe = env::current_exe().map_err(|e| format!("не удалось определить путь exe: {e}"))?;
+    let exe = env::current_exe().map_err(|e| tf!("installer.utils.determine_exe_error", e = e))?;
     let verb = to_wide("runas");
     let exe_w = to_wide(exe.to_string_lossy().as_ref());
     let args_w = to_wide(args);
@@ -1705,7 +1635,7 @@ fn relaunch_self_elevated_with_args(root_dir: &Path, args: &str) -> Result<(), S
         )
     };
     if (result as isize) <= 32 {
-        return Err("система отклонила запуск с повышением прав (UAC)".to_string());
+        return Err(t!("installer.utils.uac_denied_error").to_string());
     }
     Ok(())
 }
@@ -1718,7 +1648,7 @@ pub fn run_windows_create_start_menu_shortcut_for_install(
     if create_start_menu_shortcut_requires_elevation(install_dir) {
         if continue_create_start_menu_shortcut {
             return Err(
-                "Создание ярлыка меню Пуск было перезапущено с флагом продолжения, но права администратора не получены."
+                t!("installer.utils.start_menu_no_admin_error")
                     .to_string(),
             );
         }
@@ -1736,7 +1666,7 @@ pub fn run_windows_create_start_menu_shortcut_for_install(
     _install_dir: &Path,
     _continue_create_start_menu_shortcut: bool,
 ) -> Result<(), String> {
-    Err("Создание ярлыка меню Пуск не поддерживается на этой ОС".to_string())
+    Err(t!("installer.utils.start_menu_unsupported_os_error").to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -1779,7 +1709,7 @@ fn build_windows_uninstall_args(
 #[cfg(target_os = "windows")]
 pub(super) fn create_windows_desktop_shortcut(install_dir: &Path) -> Result<PathBuf, String> {
     let desktop_dir = windows_desktop_dir()
-        .ok_or_else(|| "не удалось определить Desktop для создания ярлыка".to_string())?;
+        .ok_or_else(|| t!("installer.utils.desktop_not_found_error").to_string())?;
     let shortcut_path = desktop_dir.join("ManhwaStudio.lnk");
     create_windows_shortcut_at(install_dir, &shortcut_path)?;
     Ok(shortcut_path)
@@ -1798,10 +1728,7 @@ fn create_windows_shortcut_at(install_dir: &Path, shortcut_path: &Path) -> Resul
     let launcher_path = resolve_windows_launcher_target(install_dir)?;
     if let Some(parent) = shortcut_path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "не удалось создать папку ярлыка '{}': {e}",
-                parent.display()
-            )
+            tf!("installer.utils.create_shortcut_folder_error", parent = parent.display(), e = e)
         })?;
     }
     // Берём иконку из самого exe (PE-ресурс), чтобы Windows гарантированно подхватывал её.
@@ -1828,13 +1755,10 @@ fn create_windows_shortcut_at(install_dir: &Path, shortcut_path: &Path) -> Resul
         .arg("-Command")
         .arg(script)
         .status()
-        .map_err(|e| format!("не удалось запустить PowerShell для создания ярлыка: {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_powershell_shortcut_error", e = e))?;
 
     if !status.success() {
-        return Err(format!(
-            "PowerShell завершился с кодом {} при создании ярлыка",
-            status.code().unwrap_or(-1)
-        ));
+        return Err(tf!("installer.utils.powershell_shortcut_exit_error", status = status.code().unwrap_or(-1)));
     }
 
     Ok(())
@@ -1856,10 +1780,7 @@ pub(super) fn resolve_windows_launcher_target(install_dir: &Path) -> Result<Path
         return Ok(fallback);
     }
 
-    Err(format!(
-        "не найден исполняемый файл лаунчера в '{}'",
-        install_dir.display()
-    ))
+    Err(tf!("installer.utils.launcher_exe_not_found_error", install_dir = install_dir.display()))
 }
 
 #[cfg(target_os = "windows")]
@@ -1873,52 +1794,49 @@ fn finalize_windows_post_install(
         send_progress(
             tx,
             1.0,
-            "Windows интеграция: не требуется",
+            t!("installer.utils.windows_integration_not_needed_stage"),
             overall_end,
-            "All-users интеграция не требуется",
+            t!("installer.utils.all_users_integration_not_needed_status"),
         );
         return Ok(());
     }
 
     let launcher_path = resolve_windows_launcher_target(root_dir)?;
     let _ = tx.send(InstallEvent::Step(
-        "Windows: настройка реестра и ярлыка в меню Пуск...".to_string(),
+        t!("installer.utils.windows_integration_setup_status").to_string(),
     ));
     send_progress(
         tx,
         0.10,
-        "Windows интеграция: подготовка",
+        t!("installer.utils.windows_integration_prepare_stage"),
         lerp_progress(overall_start, overall_end, 0.10),
-        "Подготовка post-install интеграции",
+        t!("installer.utils.prepare_postinstall_status"),
     );
 
     register_windows_install_in_registry(root_dir, &launcher_path)?;
     send_console_line(
         tx,
-        "Добавлены записи реестра: App Paths + Uninstall (HKLM)".to_string(),
+        t!("installer.utils.registry_entries_added_log").to_string(),
     );
     send_progress(
         tx,
         0.75,
-        "Windows интеграция: реестр",
+        t!("installer.utils.windows_integration_registry_stage"),
         lerp_progress(overall_start, overall_end, 0.75),
-        "Реестр обновлён",
+        t!("installer.utils.registry_updated_status"),
     );
 
     let start_menu_shortcut = create_windows_start_menu_shortcut(root_dir)?;
     send_console_line(
         tx,
-        format!(
-            "Создан ярлык меню Пуск: '{}'",
-            start_menu_shortcut.display()
-        ),
+        tf!("installer.utils.start_menu_shortcut_created_log", start_menu_shortcut = start_menu_shortcut.display()),
     );
     send_progress(
         tx,
         1.0,
-        "Windows интеграция: завершено",
+        t!("installer.utils.windows_integration_done_stage"),
         overall_end,
-        "Реестр и меню Пуск настроены",
+        t!("installer.utils.registry_start_menu_configured_status"),
     );
 
     Ok(())
@@ -1934,9 +1852,9 @@ fn finalize_windows_post_install(
     send_progress(
         tx,
         1.0,
-        "Windows интеграция: пропуск",
+        t!("installer.utils.windows_integration_skip_stage"),
         overall_end,
-        "Windows интеграция не применяется",
+        t!("installer.utils.windows_integration_not_applied_status"),
     );
     Ok(())
 }
@@ -1980,7 +1898,7 @@ pub(super) fn create_windows_start_menu_shortcut(install_dir: &Path) -> Result<P
     let programs_dir = windows_start_menu_programs_dir(is_windows_all_users_install_dir(
         install_dir,
     ))
-    .ok_or_else(|| "не удалось определить папку меню Пуск для создания ярлыка".to_string())?;
+    .ok_or_else(|| t!("installer.utils.start_menu_folder_not_found_error").to_string())?;
     let shortcut_path = programs_dir.join("ManhwaStudio.lnk");
     create_windows_shortcut_at(install_dir, &shortcut_path)?;
     Ok(shortcut_path)
@@ -2020,12 +1938,9 @@ fn grant_windows_users_modify_acl_with_inheritance(install_dir: &Path) -> Result
         .arg("/C")
         .arg("/Q")
         .status()
-        .map_err(|e| format!("не удалось запустить icacls: {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_icacls_error", e = e))?;
     if !status.success() {
-        return Err(format!(
-            "icacls завершился с кодом {} при настройке прав установки",
-            status.code().unwrap_or(-1)
-        ));
+        return Err(tf!("installer.utils.icacls_exit_error", status = status.code().unwrap_or(-1)));
     }
     Ok(())
 }
@@ -2102,13 +2017,9 @@ fn reg_add_string_value(
         .arg(value_data)
         .arg("/f")
         .status()
-        .map_err(|e| format!("не удалось запустить reg add для '{key}': {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_reg_add_key_error", key = key, e = e))?;
     if !status.success() {
-        return Err(format!(
-            "reg add завершился с кодом {} для ключа '{}'",
-            status.code().unwrap_or(-1),
-            key
-        ));
+        return Err(tf!("installer.utils.reg_add_key_exit_error", status = status.code().unwrap_or(-1), key = key));
     }
     Ok(())
 }
@@ -2128,14 +2039,9 @@ fn reg_add_u32_value(key: &str, value_name: &str, value_data: u32) -> Result<(),
         .arg(value_data.to_string())
         .arg("/f")
         .status()
-        .map_err(|e| format!("не удалось запустить reg add для '{key}/{value_name}': {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_reg_add_value_error", key = key, value_name = value_name, e = e))?;
     if !status.success() {
-        return Err(format!(
-            "reg add завершился с кодом {} для '{}\\{}'",
-            status.code().unwrap_or(-1),
-            key,
-            value_name
-        ));
+        return Err(tf!("installer.utils.reg_add_value_exit_error", status = status.code().unwrap_or(-1), key = key, value_name = value_name));
     }
     Ok(())
 }
@@ -2156,7 +2062,7 @@ pub(super) fn reg_query_string_value(
 
     let output = cmd
         .output()
-        .map_err(|e| format!("не удалось запустить reg query для '{key}': {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_reg_query_error", key = key, e = e))?;
     if !output.status.success() {
         // Registry probing is best-effort. On localized Windows builds `reg query`
         // uses different "not found" strings, so treat an empty/non-matching result
@@ -2205,16 +2111,16 @@ pub fn run_windows_uninstall_from_current_exe(
     uninstall_signal_file: Option<&Path>,
 ) -> Result<(), String> {
     let current_exe =
-        env::current_exe().map_err(|e| format!("не удалось определить путь exe: {e}"))?;
+        env::current_exe().map_err(|e| tf!("installer.utils.determine_exe_error", e = e))?;
     let install_dir = current_exe
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| "не удалось определить папку установленной программы".to_string())?;
+        .ok_or_else(|| t!("installer.utils.installed_program_folder_not_found_error").to_string())?;
 
     if uninstall_requires_elevation(&install_dir) {
         if continue_uninstall {
             return Err(
-                "Удаление было перезапущено с флагом продолжения, но права администратора не получены."
+                t!("installer.utils.uninstall_no_admin_error")
                     .to_string(),
             );
         }
@@ -2236,7 +2142,7 @@ pub fn run_windows_uninstall_from_current_exe(
     _continue_uninstall: bool,
     _uninstall_signal_file: Option<&Path>,
 ) -> Result<(), String> {
-    Err("Windows uninstall не поддерживается на этой ОС".to_string())
+    Err(t!("installer.utils.uninstall_unsupported_os_error").to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -2286,13 +2192,13 @@ pub(super) fn run_windows_uninstall_worker(
     send_uninstall_progress(
         tx,
         0.05,
-        "Подготовка удаления",
-        format!("Папка установки: {}", install_dir.display()),
+        t!("installer.utils.prepare_uninstall_stage"),
+        tf!("installer.utils.install_folder_label", install_dir = install_dir.display()),
     );
 
     match remove_windows_shortcuts_for_install(&install_dir) {
         Ok(()) => {
-            send_uninstall_progress(tx, 0.18, "Удаляем ярлыки", "Desktop и Start Menu очищены.");
+            send_uninstall_progress(tx, 0.18, t!("installer.utils.removing_shortcuts_stage"), t!("installer.utils.shortcuts_cleaned_status"));
         }
         Err(err) if !is_running_elevated() => {
             crate::runtime_log::log_warn(format!(
@@ -2301,8 +2207,8 @@ pub(super) fn run_windows_uninstall_worker(
             send_uninstall_progress(
                 tx,
                 0.18,
-                "Удаляем ярлыки",
-                "Недоступные системные ярлыки пропущены без прав администратора.",
+                t!("installer.utils.removing_shortcuts_stage"),
+                t!("installer.utils.system_shortcuts_skipped_status"),
             );
         }
         Err(err) => return Err(err),
@@ -2313,8 +2219,8 @@ pub(super) fn run_windows_uninstall_worker(
             send_uninstall_progress(
                 tx,
                 0.30,
-                "Удаляем записи системы",
-                "Registry cleanup завершён.",
+                t!("installer.utils.removing_registry_stage"),
+                t!("installer.utils.registry_cleanup_done_status"),
             );
         }
         Err(err) if !is_running_elevated() => {
@@ -2324,8 +2230,8 @@ pub(super) fn run_windows_uninstall_worker(
             send_uninstall_progress(
                 tx,
                 0.30,
-                "Удаляем записи системы",
-                "Недоступные системные записи реестра пропущены без прав администратора.",
+                t!("installer.utils.removing_registry_stage"),
+                t!("installer.utils.system_registry_skipped_status"),
             );
         }
         Err(err) => return Err(err),
@@ -2336,15 +2242,15 @@ pub(super) fn run_windows_uninstall_worker(
     send_uninstall_progress(
         tx,
         0.94,
-        "Запускаем финальную очистку",
-        "Планируем самоудаление exe и папки после завершения процесса.",
+        t!("installer.utils.final_cleanup_stage"),
+        t!("installer.utils.schedule_self_delete_status"),
     );
     schedule_windows_self_delete(&current_exe, &install_dir)?;
     send_uninstall_progress(
         tx,
         1.0,
-        "Удаление завершено",
-        "Helper-процесс принял финальную очистку.",
+        t!("installer.utils.uninstall_complete_stage"),
+        t!("installer.utils.helper_accepted_cleanup_status"),
     );
     Ok(())
 }
@@ -2358,7 +2264,7 @@ fn reg_delete_tree_if_exists(key: &str) -> Result<(), String> {
         .arg(key)
         .arg("/f")
         .output()
-        .map_err(|e| format!("не удалось запустить reg delete для '{key}': {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_reg_delete_error", key = key, e = e))?;
     if output.status.success() {
         return Ok(());
     }
@@ -2373,11 +2279,7 @@ fn reg_delete_tree_if_exists(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!(
-        "reg delete завершился с кодом {} для '{}'",
-        output.status.code().unwrap_or(-1),
-        key
-    ))
+    Err(tf!("installer.utils.reg_delete_exit_error", output = output.status.code().unwrap_or(-1), key = key))
 }
 
 #[cfg(target_os = "windows")]
@@ -2387,10 +2289,7 @@ fn write_uninstall_signal_file(
 ) -> Result<(), String> {
     if let Some(parent) = signal_file.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "не удалось создать папку для файла сигнала '{}': {e}",
-                parent.display()
-            )
+            tf!("installer.utils.create_signal_file_folder_error", parent = parent.display(), e = e)
         })?;
     }
     let payload = match result {
@@ -2398,10 +2297,7 @@ fn write_uninstall_signal_file(
         Err(err) => format!("error: {err}"),
     };
     fs::write(signal_file, payload).map_err(|e| {
-        format!(
-            "не удалось записать файл сигнала удаления '{}': {e}",
-            signal_file.display()
-        )
+        tf!("installer.utils.write_uninstall_signal_error", signal_file = signal_file.display(), e = e)
     })
 }
 
@@ -2412,20 +2308,14 @@ fn remove_install_dir_contents_except_path_with_progress(
     tx: &mpsc::Sender<UninstallEvent>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(install_dir).map_err(|e| {
-        format!(
-            "не удалось прочитать папку '{}': {e}",
-            install_dir.display()
-        )
+        tf!("installer.utils.read_install_dir_error", install_dir = install_dir.display(), e = e)
     })?;
 
     let mut targets = Vec::new();
     let mut total_nodes = 0_u64;
     for entry in entries {
         let entry = entry.map_err(|e| {
-            format!(
-                "не удалось прочитать содержимое папки '{}': {e}",
-                install_dir.display()
-            )
+            tf!("installer.utils.read_install_dir_contents_error", install_dir = install_dir.display(), e = e)
         })?;
         let path = entry.path();
         if normalize_windows_path(&path) == normalize_windows_path(keep_path) {
@@ -2439,8 +2329,8 @@ fn remove_install_dir_contents_except_path_with_progress(
         send_uninstall_progress(
             tx,
             0.90,
-            "Удаляем файлы программы",
-            "Дополнительных файлов для удаления не осталось.",
+            t!("installer.utils.removing_files_stage"),
+            t!("installer.utils.no_more_files_status"),
         );
         return Ok(());
     }
@@ -2453,8 +2343,8 @@ fn remove_install_dir_contents_except_path_with_progress(
     send_uninstall_progress(
         tx,
         0.90,
-        "Удаляем файлы программы",
-        format!("Удалено объектов: {removed_nodes}/{total_nodes}."),
+        t!("installer.utils.removing_files_stage"),
+        tf!("installer.utils.removed_objects_status", removed_nodes = removed_nodes, total_nodes = total_nodes),
     );
     Ok(())
 }
@@ -2462,15 +2352,15 @@ fn remove_install_dir_contents_except_path_with_progress(
 #[cfg(target_os = "windows")]
 fn count_removable_nodes(path: &Path) -> Result<u64, String> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", path.display()))?;
+        .map_err(|e| tf!("installer.utils.read_path_error", path = path.display(), e = e))?;
     let file_type = metadata.file_type();
     if file_type.is_dir() {
         let mut total = 1_u64;
         for entry in fs::read_dir(path)
-            .map_err(|e| format!("не удалось прочитать папку '{}': {e}", path.display()))?
+            .map_err(|e| tf!("installer.utils.read_folder_path_error", path = path.display(), e = e))?
         {
             let child = entry
-                .map_err(|e| format!("не удалось прочитать содержимое '{}': {e}", path.display()))?
+                .map_err(|e| tf!("installer.utils.read_contents_path_error", path = path.display(), e = e))?
                 .path();
             total += count_removable_nodes(&child)?;
         }
@@ -2488,22 +2378,22 @@ fn remove_path_recursive_with_progress(
     tx: &mpsc::Sender<UninstallEvent>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", path.display()))?;
+        .map_err(|e| tf!("installer.utils.read_path_error", path = path.display(), e = e))?;
     let file_type = metadata.file_type();
     if file_type.is_dir() {
         for entry in fs::read_dir(path)
-            .map_err(|e| format!("не удалось прочитать папку '{}': {e}", path.display()))?
+            .map_err(|e| tf!("installer.utils.read_folder_path_error", path = path.display(), e = e))?
         {
             let child = entry
-                .map_err(|e| format!("не удалось прочитать содержимое '{}': {e}", path.display()))?
+                .map_err(|e| tf!("installer.utils.read_contents_path_error", path = path.display(), e = e))?
                 .path();
             remove_path_recursive_with_progress(&child, removed_nodes, total_nodes, tx)?;
         }
         fs::remove_dir(path)
-            .map_err(|e| format!("не удалось удалить папку '{}': {e}", path.display()))?;
+            .map_err(|e| tf!("installer.utils.remove_folder_error", path = path.display(), e = e))?;
     } else {
         fs::remove_file(path)
-            .map_err(|e| format!("не удалось удалить файл '{}': {e}", path.display()))?;
+            .map_err(|e| tf!("installer.utils.remove_file_error", path = path.display(), e = e))?;
     }
 
     *removed_nodes += 1;
@@ -2519,8 +2409,8 @@ fn remove_path_recursive_with_progress(
     send_uninstall_progress(
         tx,
         lerp_progress(0.40, 0.90, delete_progress),
-        "Удаляем файлы программы",
-        format!("Удаляем: {file_name} ({removed_nodes}/{total_nodes})"),
+        t!("installer.utils.removing_files_stage"),
+        tf!("installer.utils.removing_file_progress", file_name = file_name, removed_nodes = removed_nodes, total_nodes = total_nodes),
     );
     Ok(())
 }
@@ -2532,10 +2422,10 @@ pub(super) fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     }
     if path.is_dir() {
         fs::remove_dir_all(path)
-            .map_err(|e| format!("не удалось удалить папку '{}': {e}", path.display()))?;
+            .map_err(|e| tf!("installer.utils.remove_folder_error", path = path.display(), e = e))?;
     } else {
         fs::remove_file(path)
-            .map_err(|e| format!("не удалось удалить файл '{}': {e}", path.display()))?;
+            .map_err(|e| tf!("installer.utils.remove_file_error", path = path.display(), e = e))?;
     }
     Ok(())
 }
@@ -2576,7 +2466,7 @@ fn schedule_windows_self_delete(current_exe: &Path, install_dir: &Path) -> Resul
         .arg("-Command")
         .arg(script)
         .spawn()
-        .map_err(|e| format!("не удалось запустить финальную очистку удаления: {e}"))?;
+        .map_err(|e| tf!("installer.utils.run_final_cleanup_error", e = e))?;
     Ok(())
 }
 
@@ -2617,7 +2507,7 @@ fn detect_platform() -> Result<Platform, String> {
         "windows" => Ok(Platform::Windows),
         "macos" => Ok(Platform::Macos),
         "linux" => Ok(Platform::Linux),
-        other => Err(format!("неподдерживаемая ОС '{other}'")),
+        other => Err(tf!("installer.utils.unsupported_os_named_error", other = other)),
     }
 }
 
@@ -2625,7 +2515,7 @@ pub(super) fn detect_arch() -> Result<String, String> {
     match env::consts::ARCH {
         "x86_64" => Ok("x86_64".to_string()),
         "aarch64" => Ok("aarch64".to_string()),
-        other => Err(format!("неподдерживаемая архитектура '{other}'")),
+        other => Err(tf!("installer.utils.unsupported_arch_error", other = other)),
     }
 }
 
@@ -2652,9 +2542,9 @@ fn resolve_uv_executable(uv_dir: &Path) -> Result<PathBuf, String> {
     }
 
     let nested: Vec<_> = fs::read_dir(uv_dir)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", uv_dir.display()))?
+        .map_err(|e| tf!("installer.utils.read_uv_dir_error", uv_dir = uv_dir.display(), e = e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("ошибка чтения '{}': {e}", uv_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.read_uv_dir_io_error", uv_dir = uv_dir.display(), e = e))?;
 
     for entry in nested {
         let path = entry.path();
@@ -2669,10 +2559,7 @@ fn resolve_uv_executable(uv_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    Err(format!(
-        "не удалось найти uv executable в '{}'",
-        uv_dir.display()
-    ))
+    Err(tf!("installer.utils.uv_executable_not_found_error", uv_dir = uv_dir.display()))
 }
 
 enum PipInstallRunner {
@@ -2746,21 +2633,21 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
     let total_units = (dependencies.len() + 1).max(1) as f32;
 
     let _ = tx.send(InstallEvent::Step(
-        "Обновление pip / wheel / setuptools...".to_string(),
+        t!("installer.utils.updating_pip_status").to_string(),
     ));
     send_progress(
         tx,
         0.0,
-        "Обновление pip",
+        t!("installer.utils.updating_pip_stage"),
         overall_start,
-        format!("Этап: установка {label}"),
+        tf!("installer.utils.stage_installing_label", label = label),
     );
     run_pip_install_with_retry(
         pip_runner,
         python_exe,
         root_dir,
         &["--upgrade", "pip", "wheel", "setuptools"],
-        "обновление pip/wheel/setuptools",
+        t!("installer.utils.update_pip_action"),
         1,
         Some(tx),
     )?;
@@ -2769,20 +2656,20 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
     send_progress(
         tx,
         completed_units / total_units,
-        "Обновление pip завершено",
+        t!("installer.utils.update_pip_done_status"),
         lerp(overall_start, overall_end, completed_units / total_units),
-        format!("Этап: установка {label}"),
+        tf!("installer.utils.stage_installing_label", label = label),
     );
 
     for dep in dependencies {
         let stage_start = completed_units / total_units;
-        let _ = tx.send(InstallEvent::Step(format!("Установка зависимости: {dep}")));
+        let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_dep_status", dep = dep)));
         send_progress(
             tx,
             stage_start,
-            format!("Установка: {dep}"),
+            tf!("installer.utils.install_short_dep_status", dep = dep),
             lerp(overall_start, overall_end, stage_start),
-            format!("Этап: установка {label}"),
+            tf!("installer.utils.stage_installing_label", label = label),
         );
 
         run_pip_install_with_retry(
@@ -2790,7 +2677,7 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
             python_exe,
             root_dir,
             &[*dep],
-            &format!("установка зависимости '{dep}'"),
+            &tf!("installer.utils.install_dep_action", dep = dep),
             3,
             Some(tx),
         )?;
@@ -2800,9 +2687,9 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
         send_progress(
             tx,
             ratio,
-            format!("Установлено: {dep}"),
+            tf!("installer.utils.installed_dep_status", dep = dep),
             lerp(overall_start, overall_end, ratio),
-            format!("Этап: установка {label}"),
+            tf!("installer.utils.stage_installing_label", label = label),
         );
     }
 
@@ -2823,7 +2710,7 @@ fn install_torch_python_dependencies(
         pip_runner,
         python_exe,
         tx,
-        label: "torch-зависимостей",
+        label: t!("installer.utils.torch_deps_label"),
         dependencies: TORCH_DEPENDENCIES,
         overall_start,
         overall_end: if install_cuda_extra_packages {
@@ -2857,14 +2744,14 @@ fn install_cuda_paddle_packages(
 ) -> Result<(), String> {
     let cuda_packages = ["paddlepaddle-gpu==3.3.0", "nvidia-cuda-cccl-cu12"];
     let _ = tx.send(InstallEvent::Step(
-        "Установка CUDA-пакетов PaddlePaddle (без зависимостей)...".to_string(),
+        t!("installer.utils.installing_paddle_cuda_status").to_string(),
     ));
     send_progress(
         tx,
         0.0,
-        format!("Установка: {} + {}", cuda_packages[0], cuda_packages[1]),
+        tf!("installer.utils.installing_two_packages_status", cuda_packages = cuda_packages[0], cuda_packages_2 = cuda_packages[1]),
         overall_start,
-        "Этап: CUDA-пакеты PaddlePaddle",
+        t!("installer.utils.stage_paddle_cuda"),
     );
     run_pip_install_with_retry(
         pip_runner,
@@ -2877,16 +2764,16 @@ fn install_cuda_paddle_packages(
             cuda_packages[0],
             cuda_packages[1],
         ],
-        "установка CUDA-пакетов PaddlePaddle",
+        t!("installer.utils.install_paddle_cuda_action"),
         3,
         Some(tx),
     )?;
     send_progress(
         tx,
         1.0,
-        "Установлены CUDA-пакеты PaddlePaddle",
+        t!("installer.utils.paddle_cuda_installed_status"),
         overall_end,
-        "Этап CUDA-пакетов PaddlePaddle завершён",
+        t!("installer.utils.paddle_cuda_stage_done_status"),
     );
     Ok(())
 }
@@ -2907,21 +2794,21 @@ fn install_python_dependencies_from_requirements_file(
         (requirements.len() + 2 + usize::from(install_cuda_extra_packages)).max(2) as f32;
 
     let _ = tx.send(InstallEvent::Step(
-        "Обновление pip / wheel / setuptools...".to_string(),
+        t!("installer.utils.updating_pip_status").to_string(),
     ));
     send_progress(
         tx,
         0.0,
-        "Обновление pip",
+        t!("installer.utils.updating_pip_stage"),
         overall_start,
-        "Этап: установка зависимостей",
+        t!("installer.utils.stage_install_deps"),
     );
     run_uv_pip_install_with_retry(
         uv_exe,
         python_exe,
         root_dir,
         &["--upgrade", "pip", "wheel", "setuptools"],
-        "обновление pip/wheel/setuptools",
+        t!("installer.utils.update_pip_action"),
         1,
         Some(tx),
     )?;
@@ -2929,20 +2816,20 @@ fn install_python_dependencies_from_requirements_file(
     send_progress(
         tx,
         completed_units / total_units,
-        "Обновление pip завершено",
+        t!("installer.utils.update_pip_done_status"),
         lerp(overall_start, overall_end, completed_units / total_units),
-        "Этап: установка зависимостей",
+        t!("installer.utils.stage_install_deps"),
     );
 
     for dep in requirements {
         let stage_start = completed_units / total_units;
-        let _ = tx.send(InstallEvent::Step(format!("Установка зависимости: {dep}")));
+        let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_dep_status", dep = dep)));
         send_progress(
             tx,
             stage_start,
-            format!("Установка: {dep}"),
+            tf!("installer.utils.install_short_dep_status", dep = dep),
             lerp(overall_start, overall_end, stage_start),
-            "Этап: установка зависимостей",
+            t!("installer.utils.stage_install_deps"),
         );
 
         run_uv_pip_install_with_retry(
@@ -2950,7 +2837,7 @@ fn install_python_dependencies_from_requirements_file(
             python_exe,
             root_dir,
             &[dep.as_str()],
-            &format!("установка зависимости '{dep}'"),
+            &tf!("installer.utils.install_dep_action", dep = dep),
             3,
             Some(tx),
         )?;
@@ -2960,9 +2847,9 @@ fn install_python_dependencies_from_requirements_file(
         send_progress(
             tx,
             ratio,
-            format!("Установлено: {dep}"),
+            tf!("installer.utils.installed_dep_status", dep = dep),
             lerp(overall_start, overall_end, ratio),
-            "Этап: установка зависимостей",
+            t!("installer.utils.stage_install_deps"),
         );
     }
 
@@ -2970,14 +2857,14 @@ fn install_python_dependencies_from_requirements_file(
         let cuda_packages = ["paddlepaddle-gpu==3.3.0", "nvidia-cuda-cccl-cu12"];
         let stage_start = completed_units / total_units;
         let _ = tx.send(InstallEvent::Step(
-            "Установка CUDA-пакетов PaddlePaddle (без зависимостей)...".to_string(),
+            t!("installer.utils.installing_paddle_cuda_status").to_string(),
         ));
         send_progress(
             tx,
             stage_start,
-            format!("Установка: {} + {}", cuda_packages[0], cuda_packages[1]),
+            tf!("installer.utils.installing_two_packages_status", cuda_packages = cuda_packages[0], cuda_packages_2 = cuda_packages[1]),
             lerp(overall_start, overall_end, stage_start),
-            "Этап: установка зависимостей",
+            t!("installer.utils.stage_install_deps"),
         );
         run_uv_pip_install_with_retry(
             uv_exe,
@@ -2990,7 +2877,7 @@ fn install_python_dependencies_from_requirements_file(
                 cuda_packages[0],
                 cuda_packages[1],
             ],
-            "установка CUDA-пакетов PaddlePaddle",
+            t!("installer.utils.install_paddle_cuda_action"),
             3,
             Some(tx),
         )?;
@@ -2999,30 +2886,28 @@ fn install_python_dependencies_from_requirements_file(
         send_progress(
             tx,
             ratio,
-            "Установлены CUDA-пакеты PaddlePaddle",
+            t!("installer.utils.paddle_cuda_installed_status"),
             lerp(overall_start, overall_end, ratio),
-            "Этап: установка зависимостей",
+            t!("installer.utils.stage_install_deps"),
         );
     }
 
     let pinned_dep = "protobuf==3.20.3";
     let stage_start = completed_units / total_units;
-    let _ = tx.send(InstallEvent::Step(format!(
-        "Установка фиксированной зависимости: {pinned_dep}"
-    )));
+    let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_pinned_dep_status", pinned_dep = pinned_dep)));
     send_progress(
         tx,
         stage_start,
-        format!("Установка: {pinned_dep}"),
+        tf!("installer.utils.install_short_pinned_status", pinned_dep = pinned_dep),
         lerp(overall_start, overall_end, stage_start),
-        "Этап: установка зависимостей",
+        t!("installer.utils.stage_install_deps"),
     );
     run_uv_pip_install_with_retry(
         uv_exe,
         python_exe,
         root_dir,
         &[pinned_dep],
-        &format!("установка зависимости '{pinned_dep}'"),
+        &tf!("installer.utils.install_pinned_action", pinned_dep = pinned_dep),
         3,
         Some(tx),
     )?;
@@ -3031,9 +2916,9 @@ fn install_python_dependencies_from_requirements_file(
     send_progress(
         tx,
         ratio,
-        format!("Установлено: {pinned_dep}"),
+        tf!("installer.utils.installed_pinned_dep_status", pinned_dep = pinned_dep),
         lerp(overall_start, overall_end, ratio),
-        "Этап: установка зависимостей",
+        t!("installer.utils.stage_install_deps"),
     );
 
     Ok(())
@@ -3050,13 +2935,13 @@ fn install_torch_stage(
 ) -> Result<(), String> {
     match selection {
         TorchInstallSelection::SkipCpu => {
-            let _ = tx.send(InstallEvent::Step("Установка CPU PyTorch...".to_string()));
+            let _ = tx.send(InstallEvent::Step(t!("installer.utils.installing_cpu_pytorch_status").to_string()));
             send_progress(
                 tx,
                 0.0,
                 "PyTorch: CPU",
                 overall_start,
-                "Этап: установка PyTorch",
+                t!("installer.utils.stage_install_pytorch"),
             );
 
             let torch_spec = format!("torch=={TORCH_VERSION}");
@@ -3071,7 +2956,7 @@ fn install_torch_stage(
                     &torch_spec,
                     &torchvision_spec,
                 ],
-                "установка CPU PyTorch",
+                t!("installer.utils.install_cpu_pytorch_action"),
                 3,
                 Some(tx),
             )?;
@@ -3079,23 +2964,20 @@ fn install_torch_stage(
             send_progress(
                 tx,
                 1.0,
-                "PyTorch: установлено (CPU)",
+                t!("installer.utils.pytorch_installed_cpu_status"),
                 overall_end,
-                "Этап PyTorch завершён",
+                t!("installer.utils.pytorch_stage_done"),
             );
             Ok(())
         }
         TorchInstallSelection::InstallGpu(option) => {
-            let _ = tx.send(InstallEvent::Step(format!(
-                "Установка PyTorch для {}...",
-                option.label
-            )));
+            let _ = tx.send(InstallEvent::Step(tf!("installer.utils.installing_pytorch_status", option = option.label)));
             send_progress(
                 tx,
                 0.0,
                 format!("PyTorch: {}", option.label),
                 overall_start,
-                "Этап: установка PyTorch",
+                t!("installer.utils.stage_install_pytorch"),
             );
 
             let torch_spec = format!("torch=={TORCH_VERSION}");
@@ -3116,7 +2998,7 @@ fn install_torch_stage(
                 python_exe,
                 root_dir,
                 &args_ref,
-                &format!("установка PyTorch ({})", option.label),
+                &tf!("installer.utils.install_pytorch_action", option = option.label),
                 3,
                 Some(tx),
             )?;
@@ -3124,9 +3006,9 @@ fn install_torch_stage(
             send_progress(
                 tx,
                 1.0,
-                format!("PyTorch: установлено ({})", option.label),
+                tf!("installer.utils.pytorch_installed_status", option = option.label),
                 overall_end,
-                "Этап PyTorch завершён",
+                t!("installer.utils.pytorch_stage_done"),
             );
             Ok(())
         }
@@ -3136,7 +3018,7 @@ fn install_torch_stage(
 pub(crate) fn detect_torch_preflight() -> TorchPreflightResult {
     if cfg!(target_os = "macos") {
         return TorchPreflightResult::Skip {
-            reason: "macOS обнаружен, этап установки GPU-колёс PyTorch пропущен".to_string(),
+            reason: t!("installer.utils.macos_skip_gpu_wheels_status").to_string(),
         };
     }
 
@@ -3144,7 +3026,7 @@ pub(crate) fn detect_torch_preflight() -> TorchPreflightResult {
     let has_amd_linux = cfg!(target_os = "linux") && detect_amd_gpu_linux();
     if !has_nvidia && !has_amd_linux {
         return TorchPreflightResult::Skip {
-            reason: "GPU NVIDIA/AMD не обнаружен, оставляем CPU-версию PyTorch".to_string(),
+            reason: t!("installer.utils.no_gpu_keep_cpu_status").to_string(),
         };
     }
 
@@ -3158,7 +3040,7 @@ pub(crate) fn detect_torch_preflight() -> TorchPreflightResult {
             detected.push(format!("NVIDIA SM {capability}"));
         } else {
             failures.push(
-                "NVIDIA найден, но Compute Capability (SM) не определилась; ограничения SM не применены"
+                t!("installer.utils.nvidia_no_sm_status")
                     .to_string(),
             );
         }
@@ -3169,18 +3051,14 @@ pub(crate) fn detect_torch_preflight() -> TorchPreflightResult {
                 && let Some(capability) = cuda_capability
             {
                 if capability < RuntimeVersion::new(6, 1) {
-                    failures.push(format!(
-                        "NVIDIA SM {capability} < 6.1, GPU-установка PyTorch отключена (только CPU)"
-                    ));
+                    failures.push(tf!("installer.utils.nvidia_sm_too_low_error", capability = capability));
                 } else if capability < RuntimeVersion::new(7, 5) {
-                    failures.push(format!(
-                            "NVIDIA SM {capability} < 7.5: доступна только CUDA 12.6, но runtime CUDA ниже 12.6"
-                        ));
+                    failures.push(tf!("installer.utils.nvidia_sm_cuda_mismatch_error", capability = capability));
                 }
             }
             options.extend(cuda_options);
         } else {
-            failures.push("NVIDIA найден, но версия CUDA не определилась".to_string());
+            failures.push(t!("installer.utils.nvidia_no_cuda_version_status").to_string());
         }
     }
 
@@ -3189,27 +3067,24 @@ pub(crate) fn detect_torch_preflight() -> TorchPreflightResult {
             detected.push(format!("ROCm {rocm_version}"));
             options.extend(build_rocm_torch_options(rocm_version));
         } else {
-            failures.push("AMD найден, но версия ROCm не определилась".to_string());
+            failures.push(t!("installer.utils.amd_no_rocm_version_status").to_string());
         }
     }
 
     if options.is_empty() {
         let reason = if !failures.is_empty() {
-            format!(
-                "{}. Пропускаем этап PyTorch и оставляем CPU.",
-                failures.join("; ")
-            )
+            tf!("installer.utils.skip_pytorch_cpu_status", failures = failures.join("; "))
         } else {
-            "Версия CUDA/ROCm ниже минимально поддерживаемых wheel, оставляем CPU.".to_string()
+            t!("installer.utils.cuda_rocm_below_min_status").to_string()
         };
         return TorchPreflightResult::Skip { reason };
     }
 
     let recommended_index = choose_recommended_torch_option(&options);
     let summary = if detected.is_empty() {
-        "Доступны GPU-варианты PyTorch.".to_string()
+        t!("installer.utils.gpu_variants_available_status").to_string()
     } else {
-        format!("Обнаружено: {}.", detected.join(", "))
+        tf!("installer.utils.detected_status", detected = detected.join(", "))
     };
 
     TorchPreflightResult::Choose(TorchChoicePrompt {
@@ -3288,7 +3163,7 @@ fn load_requirements_lines(path: &Path) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let content = fs::read_to_string(path)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", path.display()))?;
+        .map_err(|e| tf!("installer.utils.read_path_error", path = path.display(), e = e))?;
 
     let lines = content
         .lines()
@@ -3362,7 +3237,7 @@ fn run_command_with_retry(
         if let Some(tx) = tx {
             send_console_line(tx, format!("$ {} {}", executable.display(), args.join(" ")));
             if attempts > 1 {
-                send_console_line(tx, format!("Попытка {attempt}/{attempts}: {action_name}"));
+                send_console_line(tx, tf!("installer.utils.retry_attempt_status", attempt = attempt, attempts = attempts, action_name = action_name));
             }
         }
 
@@ -3377,7 +3252,7 @@ fn run_command_with_retry(
             if let Some(tx) = tx {
                 send_console_line(
                     tx,
-                    format!("Повтор установки из-за ошибки ({action_name})..."),
+                    tf!("installer.utils.retry_after_error_status", action_name = action_name),
                 );
             }
             std::thread::sleep(Duration::from_millis(600));
@@ -3385,9 +3260,7 @@ fn run_command_with_retry(
         }
     }
 
-    Err(format!(
-        "Не удалось выполнить {action_name} после {attempts} попыток.\nСообщение pip:\n{last_output}"
-    ))
+    Err(tf!("installer.utils.action_failed_after_retries_error", action_name = action_name, attempts = attempts, last_output = last_output))
 }
 
 fn run_command_streaming(
@@ -3413,12 +3286,12 @@ fn run_command_streaming(
     }
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("не удалось запустить '{}': {e}", executable.display()))?;
+        .map_err(|e| tf!("installer.utils.run_executable_error", executable = executable.display(), e = e))?;
 
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "не удалось получить stdout процесса".to_string())?;
+        .ok_or_else(|| t!("installer.utils.no_process_stdout_error").to_string())?;
     let tx_out = tx.cloned();
     let out_handle = ms_thread::spawn(move || stream_reader_lines(stdout, tx_out));
     let err_handle = child.stderr.take().map(|stderr| {
@@ -3428,14 +3301,14 @@ fn run_command_streaming(
 
     let status = child
         .wait()
-        .map_err(|e| format!("ошибка ожидания завершения Python-процесса: {e}"))?;
+        .map_err(|e| tf!("installer.utils.wait_python_process_error", e = e))?;
     let out_text = out_handle
         .join()
-        .map_err(|_| "ошибка join stdout reader".to_string())?;
+        .map_err(|_| t!("installer.utils.join_stdout_reader_error").to_string())?;
     let err_text = match err_handle {
         Some(handle) => handle
             .join()
-            .map_err(|_| "ошибка join stderr reader".to_string())?,
+            .map_err(|_| t!("installer.utils.join_stderr_reader_error").to_string())?,
         None => String::new(),
     };
 
@@ -3496,7 +3369,7 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
         apply_windows_no_window(&mut cmd);
         cmd.arg("/C").arg("start").arg("").arg(url);
         cmd.spawn()
-            .map_err(|e| format!("не удалось открыть URL '{url}': {e}"))?;
+            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
         return Ok(());
     }
 
@@ -3505,7 +3378,7 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
         Command::new("open")
             .arg(url)
             .spawn()
-            .map_err(|e| format!("не удалось открыть URL '{url}': {e}"))?;
+            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
         return Ok(());
     }
 
@@ -3514,12 +3387,12 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
         Command::new("xdg-open")
             .arg(url)
             .spawn()
-            .map_err(|e| format!("не удалось открыть URL '{url}': {e}"))?;
+            .map_err(|e| tf!("installer.utils.open_url_error", url = url, e = e))?;
         return Ok(());
     }
 
     #[allow(unreachable_code)]
-    Err(format!("неподдерживаемая ОС для открытия URL '{}'", url))
+    Err(tf!("installer.utils.open_url_unsupported_os_error", url = url))
 }
 
 fn lerp(start: f32, end: f32, t: f32) -> f32 {
@@ -3545,12 +3418,12 @@ fn fetch_latest_uv_asset(platform: Platform, arch: &str) -> Result<GithubAsset, 
 
     let response = req
         .call()
-        .map_err(|e| format!("не удалось получить релиз uv: {e}"))?;
+        .map_err(|e| tf!("installer.utils.get_uv_release_error", e = e))?;
     let body = response
         .into_string()
-        .map_err(|e| format!("не удалось прочитать релиз uv: {e}"))?;
+        .map_err(|e| tf!("installer.utils.read_uv_release_error", e = e))?;
     let release: GithubRelease = serde_json::from_str(&body)
-        .map_err(|e| format!("не удалось распарсить JSON релиза uv: {e}"))?;
+        .map_err(|e| tf!("installer.utils.parse_uv_release_error", e = e))?;
 
     select_uv_asset(&release.assets, platform, arch)
 }
@@ -3586,12 +3459,12 @@ fn fetch_latest_app_release_with_asset(asset_name: &str) -> Result<(String, Gith
 
     let response = req
         .call()
-        .map_err(|e| format!("не удалось получить список релизов ManhwaStudio: {e}"))?;
+        .map_err(|e| tf!("installer.utils.get_releases_error", e = e))?;
     let body = response
         .into_string()
-        .map_err(|e| format!("не удалось прочитать список релизов ManhwaStudio: {e}"))?;
+        .map_err(|e| tf!("installer.utils.read_releases_error", e = e))?;
     let releases: Vec<GithubReleaseListItem> = serde_json::from_str(&body)
-        .map_err(|e| format!("не удалось распарсить JSON релизов ManhwaStudio: {e}"))?;
+        .map_err(|e| tf!("installer.utils.parse_releases_error", e = e))?;
 
     for release in releases {
         let tag = release
@@ -3612,10 +3485,7 @@ fn fetch_latest_app_release_with_asset(asset_name: &str) -> Result<(String, Gith
         }
     }
 
-    Err(format!(
-        "не найден asset '{}' в релизах ManhwaStudio",
-        asset_name
-    ))
+    Err(tf!("installer.utils.asset_not_found_error", asset_name = asset_name))
 }
 
 fn select_uv_asset(
@@ -3634,9 +3504,7 @@ fn select_uv_asset(
         .find(|asset| asset.name.eq_ignore_ascii_case(&expected_name))
         .cloned()
         .ok_or_else(|| {
-            format!(
-                "не найдена подходящая сборка uv для {platform}/{arch}; ожидается asset '{expected_name}'"
-            )
+            tf!("installer.utils.uv_build_not_found_error", platform = platform, arch = arch, expected_name = expected_name)
         })
 }
 
@@ -3664,14 +3532,14 @@ fn download_asset(
 
     let response = req
         .call()
-        .map_err(|e| format!("не удалось скачать {label_prefix}: {e}"))?;
+        .map_err(|e| tf!("installer.utils.download_error", label_prefix = label_prefix, e = e))?;
     let total = response
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let mut reader = response.into_reader();
     let mut file = File::create(dst_path)
-        .map_err(|e| format!("не удалось создать '{}': {e}", dst_path.display()))?;
+        .map_err(|e| tf!("installer.utils.create_dst_path_error", dst_path = dst_path.display(), e = e))?;
 
     let mut downloaded: u64 = 0;
     let mut buf = vec![0_u8; 256 * 1024];
@@ -3679,12 +3547,12 @@ fn download_asset(
     loop {
         let read = reader
             .read(&mut buf)
-            .map_err(|e| format!("ошибка чтения HTTP-потока: {e}"))?;
+            .map_err(|e| tf!("installer.utils.read_http_stream_error", e = e))?;
         if read == 0 {
             break;
         }
         file.write_all(&buf[..read])
-            .map_err(|e| format!("ошибка записи '{}': {e}", dst_path.display()))?;
+            .map_err(|e| tf!("installer.utils.write_dst_path_error", dst_path = dst_path.display(), e = e))?;
         downloaded += read as u64;
 
         if last_emit.elapsed() >= Duration::from_millis(120) {
@@ -3706,20 +3574,20 @@ fn download_asset(
                     format!("{label_prefix}: {}", format_bytes(downloaded))
                 },
                 progress_start + stage_progress.clamp(0.0, 1.0) * (progress_end - progress_start),
-                format!("Скачивание {label_prefix}"),
+                tf!("installer.utils.downloading_progress", label_prefix = label_prefix),
             );
             last_emit = Instant::now();
         }
     }
     file.flush()
-        .map_err(|e| format!("ошибка финализации файла '{}': {e}", dst_path.display()))?;
+        .map_err(|e| tf!("installer.utils.finalize_file_error", dst_path = dst_path.display(), e = e))?;
 
     send_progress(
         tx,
         1.0,
-        format!("Скачивание {label_prefix} завершено"),
+        tf!("installer.utils.download_done_progress", label_prefix = label_prefix),
         progress_end,
-        format!("Скачивание {label_prefix} завершено"),
+        tf!("installer.utils.download_done_progress", label_prefix = label_prefix),
     );
     Ok(())
 }
@@ -3740,13 +3608,13 @@ fn extract_archive(
 
     if lower.ends_with(".tar.zst") {
         let file = File::open(archive_path)
-            .map_err(|e| format!("не удалось открыть '{}': {e}", archive_path.display()))?;
+            .map_err(|e| tf!("installer.utils.open_archive_error", archive_path = archive_path.display(), e = e))?;
         let decoder = zstd::stream::read::Decoder::new(file)
-            .map_err(|e| format!("не удалось открыть zstd-декодер: {e}"))?;
+            .map_err(|e| tf!("installer.utils.open_zstd_decoder_error", e = e))?;
         send_progress(
             tx,
             0.0,
-            format!("{label_prefix}: подготовка"),
+            tf!("installer.utils.archive_preparing_progress", label_prefix = label_prefix),
             overall_start,
             label_prefix,
         );
@@ -3754,18 +3622,18 @@ fn extract_archive(
         send_progress(
             tx,
             1.0,
-            format!("{label_prefix}: завершено"),
+            tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
             overall_end,
-            format!("{label_prefix}: завершено"),
+            tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
         );
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
         let file = File::open(archive_path)
-            .map_err(|e| format!("не удалось открыть '{}': {e}", archive_path.display()))?;
+            .map_err(|e| tf!("installer.utils.open_archive_error", archive_path = archive_path.display(), e = e))?;
         let decoder = GzDecoder::new(file);
         send_progress(
             tx,
             0.0,
-            format!("{label_prefix}: подготовка"),
+            tf!("installer.utils.archive_preparing_progress", label_prefix = label_prefix),
             overall_start,
             label_prefix,
         );
@@ -3773,9 +3641,9 @@ fn extract_archive(
         send_progress(
             tx,
             1.0,
-            format!("{label_prefix}: завершено"),
+            tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
             overall_end,
-            format!("{label_prefix}: завершено"),
+            tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
         );
     } else if lower.ends_with(".zip") {
         extract_zip(
@@ -3787,10 +3655,7 @@ fn extract_archive(
             overall_end,
         )?;
     } else {
-        return Err(format!(
-            "неподдерживаемый формат архива: {}",
-            archive_path.display()
-        ));
+        return Err(tf!("installer.utils.unsupported_archive_format_error", archive_path = archive_path.display()));
     }
 
     Ok(())
@@ -3800,12 +3665,12 @@ fn extract_tar<R: Read>(reader: R, target_dir: &Path) -> Result<(), String> {
     let mut archive = Archive::new(reader);
     let entries = archive
         .entries()
-        .map_err(|e| format!("ошибка чтения tar-entries: {e}"))?;
+        .map_err(|e| tf!("installer.utils.read_tar_entries_error", e = e))?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| format!("ошибка tar-entry: {e}"))?;
+        let mut entry = entry.map_err(|e| tf!("installer.utils.tar_entry_error", e = e))?;
         entry
             .unpack_in(target_dir)
-            .map_err(|e| format!("ошибка распаковки tar-entry: {e}"))?;
+            .map_err(|e| tf!("installer.utils.extract_tar_entry_error", e = e))?;
     }
     Ok(())
 }
@@ -3819,15 +3684,15 @@ fn extract_zip(
     overall_end: f32,
 ) -> Result<(), String> {
     let file = File::open(archive_path)
-        .map_err(|e| format!("не удалось открыть '{}': {e}", archive_path.display()))?;
+        .map_err(|e| tf!("installer.utils.open_archive_error", archive_path = archive_path.display(), e = e))?;
     let mut zip =
-        ZipArchive::new(file).map_err(|e| format!("не удалось открыть ZIP-архив: {e}"))?;
+        ZipArchive::new(file).map_err(|e| tf!("installer.utils.open_zip_archive_error", e = e))?;
 
     let total = zip.len().max(1);
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
-            .map_err(|e| format!("ошибка чтения ZIP entry {i}: {e}"))?;
+            .map_err(|e| tf!("installer.utils.read_zip_entry_error", i = i, e = e))?;
         let rel = match entry.enclosed_name() {
             Some(path) => path.to_path_buf(),
             None => continue,
@@ -3836,17 +3701,17 @@ fn extract_zip(
 
         if entry.is_dir() {
             fs::create_dir_all(&out_path)
-                .map_err(|e| format!("не удалось создать каталог '{}': {e}", out_path.display()))?;
+                .map_err(|e| tf!("installer.utils.create_out_dir_error", out_path = out_path.display(), e = e))?;
         } else {
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    format!("не удалось создать каталог '{}': {e}", parent.display())
+                    tf!("installer.utils.create_parent_dir_error", parent = parent.display(), e = e)
                 })?;
             }
             let mut out = File::create(&out_path)
-                .map_err(|e| format!("не удалось создать '{}': {e}", out_path.display()))?;
+                .map_err(|e| tf!("installer.utils.create_out_path_error", out_path = out_path.display(), e = e))?;
             std::io::copy(&mut entry, &mut out)
-                .map_err(|e| format!("ошибка распаковки '{}': {e}", out_path.display()))?;
+                .map_err(|e| tf!("installer.utils.extract_out_path_error", out_path = out_path.display(), e = e))?;
         }
 
         #[cfg(unix)]
@@ -3871,9 +3736,9 @@ fn extract_zip(
     send_progress(
         tx,
         1.0,
-        format!("{label_prefix}: завершено"),
+        tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
         overall_end,
-        format!("{label_prefix}: завершено"),
+        tf!("installer.utils.archive_done_progress", label_prefix = label_prefix),
     );
 
     Ok(())
@@ -3944,9 +3809,9 @@ fn sanitize_windows_archive_path_component(component: &str) -> String {
 
 fn flatten_single_root_dir(target_dir: &Path) -> Result<(), String> {
     let entries: Vec<_> = fs::read_dir(target_dir)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", target_dir.display()))?
+        .map_err(|e| tf!("installer.utils.read_target_dir_error", target_dir = target_dir.display(), e = e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("ошибка чтения содержимого '{}': {e}", target_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.read_target_dir_contents_error", target_dir = target_dir.display(), e = e))?;
 
     if entries.len() != 1 {
         return Ok(());
@@ -3955,16 +3820,16 @@ fn flatten_single_root_dir(target_dir: &Path) -> Result<(), String> {
     let only = &entries[0];
     let file_type = only
         .file_type()
-        .map_err(|e| format!("ошибка stat '{}': {e}", only.path().display()))?;
+        .map_err(|e| tf!("installer.utils.stat_only_error", only = only.path().display(), e = e))?;
     if !file_type.is_dir() {
         return Ok(());
     }
 
     let nested_root = only.path();
     let nested_entries: Vec<_> = fs::read_dir(&nested_root)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", nested_root.display()))?
+        .map_err(|e| tf!("installer.utils.read_nested_root_error", nested_root = nested_root.display(), e = e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("ошибка чтения содержимого '{}': {e}", nested_root.display()))?;
+        .map_err(|e| tf!("installer.utils.read_nested_root_contents_error", nested_root = nested_root.display(), e = e))?;
 
     for entry in nested_entries {
         let from = entry.path();
@@ -3972,68 +3837,60 @@ fn flatten_single_root_dir(target_dir: &Path) -> Result<(), String> {
         if to.exists() {
             if to.is_dir() {
                 fs::remove_dir_all(&to)
-                    .map_err(|e| format!("не удалось удалить '{}': {e}", to.display()))?;
+                    .map_err(|e| tf!("installer.utils.remove_to_error", to = to.display(), e = e))?;
             } else {
                 fs::remove_file(&to)
-                    .map_err(|e| format!("не удалось удалить '{}': {e}", to.display()))?;
+                    .map_err(|e| tf!("installer.utils.remove_to_error", to = to.display(), e = e))?;
             }
         }
         fs::rename(&from, &to).map_err(|e| {
-            format!(
-                "не удалось переместить '{}' -> '{}': {e}",
-                from.display(),
-                to.display()
-            )
+            tf!("installer.utils.move_from_to_error", from = from.display(), to = to.display(), e = e)
         })?;
     }
 
     fs::remove_dir_all(&nested_root)
-        .map_err(|e| format!("не удалось удалить '{}': {e}", nested_root.display()))?;
+        .map_err(|e| tf!("installer.utils.remove_nested_root_error", nested_root = nested_root.display(), e = e))?;
     Ok(())
 }
 
 fn merge_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dst_dir)
-        .map_err(|e| format!("не удалось создать '{}': {e}", dst_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.create_dst_dir_error", dst_dir = dst_dir.display(), e = e))?;
 
     let entries: Vec<_> = fs::read_dir(src_dir)
-        .map_err(|e| format!("не удалось прочитать '{}': {e}", src_dir.display()))?
+        .map_err(|e| tf!("installer.utils.read_src_dir_error", src_dir = src_dir.display(), e = e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("ошибка чтения '{}': {e}", src_dir.display()))?;
+        .map_err(|e| tf!("installer.utils.read_src_dir_io_error", src_dir = src_dir.display(), e = e))?;
 
     for entry in entries {
         let src_path = entry.path();
         let dst_path = dst_dir.join(entry.file_name());
         let file_type = entry
             .file_type()
-            .map_err(|e| format!("ошибка stat '{}': {e}", src_path.display()))?;
+            .map_err(|e| tf!("installer.utils.stat_src_path_error", src_path = src_path.display(), e = e))?;
 
         if file_type.is_dir() {
             merge_dir_contents(&src_path, &dst_path)?;
             fs::remove_dir_all(&src_path)
-                .map_err(|e| format!("не удалось удалить '{}': {e}", src_path.display()))?;
+                .map_err(|e| tf!("installer.utils.remove_src_path_error", src_path = src_path.display(), e = e))?;
             continue;
         }
 
         if dst_path.exists() {
             if dst_path.is_dir() {
                 fs::remove_dir_all(&dst_path)
-                    .map_err(|e| format!("не удалось удалить '{}': {e}", dst_path.display()))?;
+                    .map_err(|e| tf!("installer.utils.remove_dst_path_error", dst_path = dst_path.display(), e = e))?;
             } else {
                 fs::remove_file(&dst_path)
-                    .map_err(|e| format!("не удалось удалить '{}': {e}", dst_path.display()))?;
+                    .map_err(|e| tf!("installer.utils.remove_dst_path_error", dst_path = dst_path.display(), e = e))?;
             }
         } else if let Some(parent) = dst_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("не удалось создать '{}': {e}", parent.display()))?;
+                .map_err(|e| tf!("installer.utils.create_parent_path_error", parent = parent.display(), e = e))?;
         }
 
         fs::rename(&src_path, &dst_path).map_err(|e| {
-            format!(
-                "не удалось переместить '{}' -> '{}': {e}",
-                src_path.display(),
-                dst_path.display()
-            )
+            tf!("installer.utils.move_src_dst_error", src_path = src_path.display(), dst_path = dst_path.display(), e = e)
         })?;
     }
 

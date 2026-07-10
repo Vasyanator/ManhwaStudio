@@ -1138,29 +1138,29 @@ impl TypingTextOverlayLayer {
             .unwrap_or(false);
         resp.context_menu(|menu_ui| {
             if self.selected_raster_idx != Some(idx) {
-                menu_ui.label("Выделите слой ЛКМ.");
+                menu_ui.label(t!("typing.context_menu.select_layer_hint"));
                 return;
             }
             if !is_transform_mode {
-                if menu_ui.button("Войти в режим трансформации").clicked() {
+                if menu_ui.button(t!("typing.context_menu.enter_transform_mode")).clicked() {
                     *out_enter_transform = Some(idx);
                     menu_ui.close();
                 }
             } else {
-                if menu_ui.button("Выйти из режима трансформации").clicked() {
+                if menu_ui.button(t!("typing.context_menu.exit_transform_mode")).clicked() {
                     *out_exit_transform = true;
                     menu_ui.close();
                 }
-                if menu_ui.button("Сбросить трансформацию").clicked() {
+                if menu_ui.button(t!("typing.context_menu.reset_transform")).clicked() {
                     *out_reset_transform = Some(idx);
                     menu_ui.close();
                 }
             }
             menu_ui.separator();
             let toggle_label = if mask_clip_on {
-                "Выключить обрезание маской"
+                t!("typing.context_menu.disable_mask_clip")
             } else {
-                "Включить обрезание маской"
+                t!("typing.context_menu.enable_mask_clip")
             };
             if menu_ui.button(toggle_label).clicked() {
                 *out_toggle_mask_clip = Some(idx);
@@ -1168,7 +1168,7 @@ impl TypingTextOverlayLayer {
             }
             menu_ui.separator();
             menu_ui.horizontal(|row| {
-                row.label("Порядок");
+                row.label(t!("typing.context_menu.order"));
                 if row.button("▲").clicked() {
                     *out_move_z = Some((idx, true));
                 }
@@ -1177,7 +1177,7 @@ impl TypingTextOverlayLayer {
                 }
             });
             menu_ui.separator();
-            if menu_ui.button("Удалить слой").clicked() {
+            if menu_ui.button(t!("typing.context_menu.delete_layer")).clicked() {
                 *out_delete = Some(idx);
                 menu_ui.close();
             }

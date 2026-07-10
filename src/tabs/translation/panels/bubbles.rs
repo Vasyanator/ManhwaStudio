@@ -52,8 +52,20 @@ fn pick_image_bubble_file() -> Option<PathBuf> {
     None
 }
 
-pub const FOOTER_NO_CHARACTER: &str = "(не указан)";
-pub const FOOTER_NO_CHARACTERS: &str = "(нет персонажей)";
+/// Display placeholder + sentinel for "no character selected" in the footer
+/// picker. Runtime (not `const`) because `t!` is not const. Never persisted:
+/// callers filter these values out before storing a character name.
+#[must_use]
+pub fn footer_no_character() -> &'static str {
+    t!("translation.bubbles.footer_no_character")
+}
+
+/// Display placeholder + sentinel for "no characters available". Runtime (not
+/// `const`) because `t!` is not const; never persisted (filtered before save).
+#[must_use]
+pub fn footer_no_characters() -> &'static str {
+    t!("translation.bubbles.footer_no_characters")
+}
 const BUBBLES_PANEL_TEXT_DEBOUNCE_SECS: f64 = 0.30;
 
 #[derive(Debug, Clone)]
@@ -75,9 +87,9 @@ enum BubblesSearchScope {
 impl BubblesSearchScope {
     fn title(self) -> &'static str {
         match self {
-            BubblesSearchScope::All => "Везде",
-            BubblesSearchScope::Original => "Оригинал",
-            BubblesSearchScope::Translation => "Перевод",
+            BubblesSearchScope::All => t!("translation.bubbles.search_scope_everywhere"),
+            BubblesSearchScope::Original => t!("translation.common.original_label"),
+            BubblesSearchScope::Translation => t!("translation.common.translation_label"),
         }
     }
 }
@@ -282,7 +294,7 @@ impl BubblesPanelState {
         }
 
         ui.horizontal(|ui| {
-            if ui.button("Обновить").clicked() {
+            if ui.button(t!("translation.common.refresh_button")).clicked() {
                 self.editor.clear();
                 self.pending_text_flush_at.clear();
                 self.visible_cache_dirty = true;
@@ -305,12 +317,12 @@ impl BubblesPanelState {
                 .as_ref()
                 .cloned()
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "Все персонажи".to_string());
+                .unwrap_or_else(|| t!("translation.bubbles.all_characters").to_string());
             WheelComboBox::from_id_salt("translation_bubbles_panel_character_filter")
                 .selected_text(character_title)
                 .width(170.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.filters_draft.character, None, "Все персонажи");
+                    ui.selectable_value(&mut self.filters_draft.character, None, t!("translation.bubbles.all_characters"));
                     for name in &character_options {
                         ui.selectable_value(
                             &mut self.filters_draft.character,
@@ -346,24 +358,24 @@ impl BubblesPanelState {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filters_draft.query)
                     .desired_width(180.0)
-                    .hint_text("Поиск..."),
+                    .hint_text(t!("translation.bubbles.search_placeholder")),
             );
 
             let page_title = self
                 .filters_draft
                 .page
-                .map(|idx| format!("Страница #{}", idx + 1))
-                .unwrap_or_else(|| "Все страницы".to_string());
+                .map(|idx| tf!("translation.bubbles.page_number", idx = idx + 1))
+                .unwrap_or_else(|| t!("translation.bubbles.all_pages").to_string());
             WheelComboBox::from_id_salt("translation_bubbles_panel_page_filter")
                 .selected_text(page_title)
                 .width(140.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.filters_draft.page, None, "Все страницы");
+                    ui.selectable_value(&mut self.filters_draft.page, None, t!("translation.bubbles.all_pages"));
                     for idx in 0..project.pages.len() {
                         ui.selectable_value(
                             &mut self.filters_draft.page,
                             Some(idx),
-                            format!("Страница #{}", idx + 1),
+                            tf!("translation.bubbles.page_number", idx = idx + 1),
                         );
                     }
                 });
@@ -391,11 +403,7 @@ impl BubblesPanelState {
         ui.separator();
         self.ensure_visible_cache(project);
 
-        ui.label(format!(
-            "Показано пузырей: {} / {}",
-            self.visible_cache.len(),
-            project.bubbles.len()
-        ));
+        ui.label(tf!("translation.bubbles.visible_count_status", shown = self.visible_cache.len(), total = project.bubbles.len()));
         ui.add_space(4.0);
 
         let now_s = ctx.input(|i| i.time);
@@ -463,14 +471,14 @@ impl BubblesPanelState {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if placed {
-                            ui.strong(format!("Изображение #{}", bubble.img_idx.saturating_add(1)));
+                            ui.strong(tf!("translation.bubbles.image_number", bubble = bubble.img_idx.saturating_add(1)));
                         } else {
-                            ui.colored_label(Color32::from_rgb(208, 84, 62), "Не привязан");
+                            ui.colored_label(Color32::from_rgb(208, 84, 62), t!("translation.bubbles.not_bound"));
                         }
                         ui.label(format!("#{}", bubble_id));
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Класс:");
+                        ui.label(t!("translation.bubbles.class_label"));
                         if ui
                             .selectable_label(bubble_class == BubbleClass::Text, "TextBubble")
                             .clicked()
@@ -491,7 +499,7 @@ impl BubblesPanelState {
                     let translated_resp = ui.add(
                         egui::TextEdit::multiline(&mut editor.text)
                             .desired_rows(3)
-                            .hint_text("Перевод"),
+                            .hint_text(t!("translation.common.translation_label")),
                     );
                     if translated_resp.changed() {
                         translation_changed = true;
@@ -500,11 +508,11 @@ impl BubblesPanelState {
                     }
 
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Оригинал:").small());
+                    ui.label(egui::RichText::new(t!("translation.bubbles.original_field_label")).small());
                     let original_resp = ui.add(
                         egui::TextEdit::multiline(&mut editor.original_text)
                             .desired_rows(2)
-                            .hint_text("Оригинальный текст..."),
+                            .hint_text(t!("translation.bubbles.original_placeholder")),
                     );
                     if original_resp.changed() {
                         original_changed = true;
@@ -514,7 +522,7 @@ impl BubblesPanelState {
 
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Порядок:");
+                        ui.label(t!("translation.bubbles.order_label"));
                         let mut bubble_order = editor.bubble_order;
                         let order_resp = ui.add(
                             WheelSpinBox::new(&mut bubble_order)
@@ -549,9 +557,9 @@ impl BubblesPanelState {
                     } else {
                         ui.horizontal_wrapped(|ui| {
                             let known_resp = ui
-                                .checkbox(&mut editor.is_known_character, "И.П.")
+                                .checkbox(&mut editor.is_known_character, t!("translation.bubbles.nominative_case_label"))
                                 .on_hover_text(
-                                    "Использовать готовые имена персонажей, или ввести своё.",
+                                    t!("translation.bubbles.character_name_hint"),
                                 );
                             if known_resp.changed() {
                                 queue_footer_patch(
@@ -566,7 +574,7 @@ impl BubblesPanelState {
                                 if editor.is_known_character {
                                     if panel_ctx.character_names.is_empty() {
                                         editor.character_name.clear();
-                                    } else if editor.character_name == FOOTER_NO_CHARACTERS
+                                    } else if editor.character_name == footer_no_characters()
                                         || !panel_ctx
                                             .character_names
                                             .iter()
@@ -575,7 +583,7 @@ impl BubblesPanelState {
                                         editor.character_name =
                                             panel_ctx.character_names[0].clone();
                                     }
-                                    if editor.character_name == FOOTER_NO_CHARACTERS {
+                                    if editor.character_name == footer_no_characters() {
                                         editor.character_name.clear();
                                     }
                                 }
@@ -599,7 +607,7 @@ impl BubblesPanelState {
                         ui.horizontal_wrapped(|ui| {
                             if editor.is_known_character {
                                 if panel_ctx.character_names.is_empty() {
-                                    ui.label(FOOTER_NO_CHARACTERS);
+                                    ui.label(footer_no_characters());
                                 } else {
                                     let mut selected_name = editor.character_name.clone();
                                     WheelComboBox::from_id_salt((
@@ -607,7 +615,7 @@ impl BubblesPanelState {
                                         bubble_id,
                                     ))
                                     .selected_text(if selected_name.trim().is_empty() {
-                                        FOOTER_NO_CHARACTER.to_string()
+                                        footer_no_character().to_string()
                                     } else {
                                         selected_name.clone()
                                     })
@@ -652,7 +660,7 @@ impl BubblesPanelState {
 
                                 if ui
                                     .small_button("↻")
-                                    .on_hover_text("Обновить список персонажей из characters.json")
+                                    .on_hover_text(t!("translation.bubbles.refresh_characters_tooltip"))
                                     .clicked()
                                 {
                                     *panel_ctx.pending_characters_refresh = true;
@@ -660,7 +668,7 @@ impl BubblesPanelState {
 
                                 let clarification_resp = ui.add(
                                     egui::TextEdit::singleline(&mut editor.clarification)
-                                        .hint_text("Уточнение...")
+                                        .hint_text(t!("translation.bubbles.clarification_placeholder"))
                                         .desired_width(150.0),
                                 );
                                 if clarification_resp.changed() {
@@ -677,7 +685,7 @@ impl BubblesPanelState {
                             } else {
                                 let character_resp = ui.add(
                                     egui::TextEdit::singleline(&mut editor.character_name)
-                                        .hint_text("Имя персонажа...")
+                                        .hint_text(t!("translation.bubbles.character_name_placeholder"))
                                         .desired_width(180.0),
                                 );
                                 if character_resp.changed() {
@@ -700,19 +708,19 @@ impl BubblesPanelState {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
                         let move_btn = if canvas.is_bubble_move_mode_active(bubble_id) {
-                            "Отменить перемещение"
+                            t!("translation.bubbles.cancel_move_button")
                         } else if placed {
-                            "Переместить"
+                            t!("translation.bubbles.move_button")
                         } else {
-                            "Разместить"
+                            t!("translation.bubbles.place_button")
                         };
                         if ui.small_button(move_btn).clicked() {
                             move_clicked = true;
                         }
-                        if ui.small_button("Перевести").clicked() {
+                        if ui.small_button(t!("translation.common.translate_button")).clicked() {
                             translate_clicked = true;
                         }
-                        if ui.small_button("Удалить").clicked() {
+                        if ui.small_button(t!("translation.common.delete_button")).clicked() {
                             delete_clicked = true;
                         }
                     });
@@ -720,24 +728,24 @@ impl BubblesPanelState {
                 .response;
 
             card_response.context_menu(|ui| {
-                if ui.button("Копировать оригинал").clicked() {
+                if ui.button(t!("translation.common.copy_original_button")).clicked() {
                     copy_original_clicked = true;
                     ui.close();
                 }
-                if ui.button("Копировать перевод").clicked() {
+                if ui.button(t!("translation.common.copy_translation_button")).clicked() {
                     copy_translation_clicked = true;
                     ui.close();
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(allow_paste, egui::Button::new("Вставить в оригинал"))
+                    .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_original_button")))
                     .clicked()
                 {
                     paste_original_clicked = true;
                     ui.close();
                 }
                 if ui
-                    .add_enabled(allow_paste, egui::Button::new("Вставить в перевод"))
+                    .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_translation_button")))
                     .clicked()
                 {
                     paste_translation_clicked = true;
@@ -862,21 +870,21 @@ impl BubblesPanelState {
             }
             WheelComboBox::from_id_salt(("image_bubble_source_type", bubble_id))
                 .selected_text(if source_type == "page_crop" {
-                    "Вырезка из страницы"
+                    t!("translation.bubbles.image_source_page_crop")
                 } else {
-                    "Сторонняя картинка"
+                    t!("translation.common.image_source_external")
                 })
                 .width(190.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut source_type,
                         "external".to_string(),
-                        "Сторонняя картинка",
+                        t!("translation.common.image_source_external"),
                     );
                     ui.selectable_value(
                         &mut source_type,
                         "page_crop".to_string(),
-                        "Вырезка из страницы",
+                        t!("translation.bubbles.image_source_page_crop"),
                     );
                 });
             if bubble_extra_string(&bubble.extra, "image_source_type") != source_type {
@@ -909,7 +917,7 @@ impl BubblesPanelState {
             }
 
             if source_type == "external" {
-                if ui.small_button("Вставить картинку из буфера").clicked()
+                if ui.small_button(t!("translation.common.paste_image_button")).clicked()
                 {
                     match save_clipboard_image_for_bubble(project, bubble_id) {
                         Ok(path) => queue_footer_patch(
@@ -923,7 +931,7 @@ impl BubblesPanelState {
                         Err(err) => *image_error = Some(err),
                     }
                 }
-                if ui.small_button("Выбрать файл").clicked()
+                if ui.small_button(t!("translation.common.choose_file_button")).clicked()
                     && let Some(path) = pick_image_bubble_file()
                 {
                     match copy_external_image_for_bubble(project, bubble_id, &path) {
@@ -939,7 +947,7 @@ impl BubblesPanelState {
                     }
                 }
             } else {
-                ui.label("Страница:");
+                ui.label(t!("translation.bubbles.page_field_label"));
                 let mut page_number = bubble_extra_i32(
                     &bubble.extra,
                     "crop_page_idx",
@@ -975,7 +983,7 @@ impl BubblesPanelState {
             .add(
                 egui::TextEdit::multiline(&mut description)
                     .desired_rows(2)
-                    .hint_text("Описание"),
+                    .hint_text(t!("translation.common.description_label")),
             )
             .changed()
         {
@@ -1219,19 +1227,19 @@ fn save_clipboard_image_for_bubble(
 ) -> Result<PathBuf, String> {
     let clipboard_image = paste_image::read_image_from_clipboard()?;
     let width = u32::try_from(clipboard_image.width)
-        .map_err(|_| "картинка из буфера слишком широкая".to_string())?;
+        .map_err(|_| t!("translation.image_io.clipboard_too_wide_error").to_string())?;
     let height = u32::try_from(clipboard_image.height)
-        .map_err(|_| "картинка из буфера слишком высокая".to_string())?;
+        .map_err(|_| t!("translation.image_io.clipboard_too_tall_error").to_string())?;
     let Some(image) = image::RgbaImage::from_raw(width, height, clipboard_image.rgba) else {
-        return Err("буфер картинки не соответствует ширине и высоте".to_string());
+        return Err(t!("translation.image_io.clipboard_size_mismatch_error").to_string());
     };
     let dir = image_bubbles_dir(project);
     fs::create_dir_all(&dir)
-        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
     let path = dir.join(format!("image_bubble_{bubble_id}.png"));
     image
         .save(&path)
-        .map_err(|err| format!("не удалось сохранить {}: {err}", path.display()))?;
+        .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
     Ok(path)
 }
 
@@ -1241,11 +1249,11 @@ fn copy_external_image_for_bubble(
     source: &Path,
 ) -> Result<PathBuf, String> {
     if !source.is_file() {
-        return Err(format!("файл не найден: {}", source.display()));
+        return Err(tf!("translation.image_io.file_not_found_error", source = source.display()));
     }
     let dir = image_bubbles_dir(project);
     fs::create_dir_all(&dir)
-        .map_err(|err| format!("не удалось создать каталог {}: {err}", dir.display()))?;
+        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
     let ext = source
         .extension()
         .and_then(|value| value.to_str())
@@ -1253,11 +1261,7 @@ fn copy_external_image_for_bubble(
         .unwrap_or("png");
     let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
     fs::copy(source, &path).map_err(|err| {
-        format!(
-            "не удалось скопировать {} в {}: {err}",
-            source.display(),
-            path.display()
-        )
+        tf!("translation.image_io.copy_error", source = source.display(), path = path.display(), err = err)
     })?;
     Ok(path)
 }

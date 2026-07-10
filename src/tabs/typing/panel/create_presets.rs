@@ -26,13 +26,13 @@ impl TypingCreatePanelState {
         }
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Пресеты").strong());
+                ui.label(egui::RichText::new(t!("typing.presets.section_heading")).strong());
                 let mut names: Vec<String> = self.presets_by_name.keys().cloned().collect();
                 names.sort();
                 let selected_text = self
                     .selected_preset_name
                     .as_deref()
-                    .unwrap_or(TEXT_PRESET_NONE_LABEL);
+                    .unwrap_or(text_preset_none_label());
                 let prev_selected = self.selected_preset_name.clone();
                 let preset_len = names.len() + 1;
                 let mut preset_idx = self
@@ -41,11 +41,11 @@ impl TypingCreatePanelState {
                     .and_then(|selected| names.iter().position(|name| name == selected))
                     .map(|idx| idx + 1)
                     .unwrap_or(0);
-                let preset_combo = WheelComboBox::from_label("Текущий пресет")
+                let preset_combo = WheelComboBox::from_label(t!("typing.presets.current_preset_combo_id")).id_salt("typing.presets.current_preset_combo_id")
                     .selected_text(selected_text)
                     .show_ui_with_wheel(ui, |ui| {
                         if ui
-                            .selectable_label(preset_idx == 0, TEXT_PRESET_NONE_LABEL)
+                            .selectable_label(preset_idx == 0, text_preset_none_label())
                             .clicked()
                         {
                             preset_idx = 0;
@@ -75,11 +75,11 @@ impl TypingCreatePanelState {
                 let preset_name_resp = ui.add(
                     egui::TextEdit::singleline(&mut self.preset_name_input)
                         .id_salt("typing_preset_name_input")
-                        .hint_text("Сохранить пресет")
+                        .hint_text(t!("typing.presets.save_preset_button"))
                         .desired_width((ui.available_width() - 96.0).max(120.0)),
                 );
                 self.track_text_input(&preset_name_resp);
-                if ui.button("Сохранить").clicked() {
+                if ui.button(t!("typing.presets.save_button")).clicked() {
                     self.save_current_preset();
                 }
             });
@@ -314,15 +314,12 @@ impl TypingCreatePanelState {
 /// reloads coverage whenever the typesetting language changes.
 fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
     let language = ms_text_util::language::text_language();
-    let language_name = language.display_name();
-    let script_name = language.group().script_display_name();
+    // The crate hands us catalog keys (it is GUI-free); resolve them here.
+    let language_name = crate::i18n_resolve::resolve_key(language.name_key());
+    let script_name = crate::i18n_resolve::resolve_key(language.group().script_name_key());
     match coverage.support {
         FontLanguageSupport::Full => None,
-        FontLanguageSupport::Unsupported => Some(format!(
-            "Шрифт не поддерживает нужную систему письма ({script_name}) для языка \
-             «{language_name}». Текст этим шрифтом не отобразится и будет заменён другим \
-             шрифтом."
-        )),
+        FontLanguageSupport::Unsupported => Some(tf!("typing.font_coverage.unsupported_tooltip", script_name = script_name, language_name = language_name)),
         FontLanguageSupport::Partial => {
             const MAX_SHOWN: usize = 15;
             let shown: String = coverage
@@ -336,13 +333,11 @@ fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
                 .join(" ");
             let extra = coverage.missing.len().saturating_sub(MAX_SHOWN);
             let list = if extra > 0 {
-                format!("{shown} … (и ещё {extra})")
+                tf!("typing.font_coverage.more_chars_tooltip", shown = shown, extra = extra)
             } else {
                 shown
             };
-            Some(format!(
-                "Шрифт частично поддерживает язык «{language_name}». Не хватает символов: {list}."
-            ))
+            Some(tf!("typing.font_coverage.partial_tooltip", language_name = language_name, list = list))
         }
     }
 }

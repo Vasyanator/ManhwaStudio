@@ -18,7 +18,10 @@ already prepared textures, but must not block the GUI thread with project scans,
 model/backend calls, text rendering, export, or synchronous save-heavy workflows.
 
 ## Files and submodules
-- `mod.rs`: tab module wiring, `AppTab` values, tab order, and localized tab titles.
+- `mod.rs`: tab module wiring, `AppTab` values, tab order, and the two accessors kept
+  deliberately distinct — `AppTab::key()` (stable English persistence id, byte-stable
+  across releases and UI languages; the `General.enabled_tabs` config keys) and
+  `AppTab::title()` (localized display label). See `docs/i18n_exclusions.md` §B1.
 - `translation/`: OCR, text detection, machine translation, translation-side bubble editing, and
   translation-specific canvas hooks.
 - `cleaning/`: clean-overlay editing tools, quick text cleanup, mask loading, and cleaning canvas
@@ -37,8 +40,9 @@ model/backend calls, text rendering, export, or synchronous save-heavy workflows
 - `wiki.rs`: local Markdown wiki viewer with worker-based scan, document load, and image decode.
 
 ## Contracts and invariants
-- `AppTab::ALL`, `AppTab::title`, and root app tab routing must stay in sync when adding or
-  removing tabs.
+- `AppTab::ALL`, `AppTab::key`, `AppTab::title`, and root app tab routing must stay in sync when
+  adding or removing tabs. `key()` is the persistence contract (used by `config.rs` to build the
+  `General.enabled_tabs` defaults) and must never be localized; `title()` is display-only.
 - Canvas behavior shared across tabs belongs in `src/canvas/`; tab-specific behavior should use
   hooks or narrow typed APIs instead of duplicating canvas state machines.
 - Durable chapter data must flow through `ProjectData`, shared models, or explicit project path

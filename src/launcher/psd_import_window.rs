@@ -47,7 +47,6 @@ use ms_thread as thread;
 use web_time::Duration;
 use zip::ZipArchive;
 
-const WINDOW_TITLE: &str = "Импорт из PSD";
 const TOP_BUTTON_SIZE: egui::Vec2 = egui::vec2(196.0, 34.0);
 const ACTION_BUTTON_SIZE: egui::Vec2 = egui::vec2(176.0, 36.0);
 const SIDE_PANEL_MIN_WIDTH: f32 = 340.0;
@@ -57,9 +56,17 @@ const PREVIEW_BACKGROUND: Color32 = Color32::from_rgb(18, 18, 20);
 const ERROR_COLOR: Color32 = Color32::from_rgb(214, 104, 104);
 const SUCCESS_COLOR: Color32 = Color32::from_rgb(72, 170, 102);
 const WARNING_COLOR: Color32 = Color32::from_rgb(214, 170, 92);
-const TYPE_SKIP: &str = "Не импортировать";
-const TYPE_SOURCE: &str = "Исходник";
-const TYPE_CLEAN: &str = "Клин";
+// Import-type option labels. Runtime accessors (not `const`) because `t!` is not `const`.
+// These are display labels only; the persisted import type is the `ImportType` enum.
+fn type_skip() -> &'static str {
+    t!("launcher.psd_import.dont_import_option")
+}
+fn type_source() -> &'static str {
+    t!("launcher.psd_import.source_option")
+}
+fn type_clean() -> &'static str {
+    t!("launcher.psd_import.clean_option")
+}
 const ROW_TITLE_MIN_WIDTH: f32 = 120.0;
 const ROW_SIZE_WIDTH: f32 = 72.0;
 const ROW_PAGE_WIDTH: f32 = 104.0;
@@ -237,7 +244,7 @@ impl PsdImportWindowState {
     pub fn new(projects_root: PathBuf) -> Self {
         let mut state = Self {
             projects_root: projects_root.clone(),
-            source_summary: "PSD источник не выбран".to_string(),
+            source_summary: t!("launcher.psd_import.no_psd_source").to_string(),
             warnings: Vec::new(),
             rows: Vec::new(),
             available_pages: Vec::new(),
@@ -252,7 +259,7 @@ impl PsdImportWindowState {
             title_input: String::new(),
             chapter_input: String::new(),
             title_combo: EditableComboBox::new("launcher_psd_import_title")
-                .with_hint_text("Выберите тайтл или введите новый")
+                .with_hint_text(t!("launcher.psd_import.title_input_hint"))
                 .with_desired_text_width(360.0),
             catalog: ProjectCatalogController::new(projects_root),
             catalog_snapshot: ProjectCatalogSnapshot {
@@ -337,7 +344,8 @@ impl PsdImportWindowState {
 
     fn show_embedded(&mut self, ctx: &Context) -> bool {
         let mut keep_open = true;
-        egui::Window::new(WINDOW_TITLE)
+        egui::Window::new(t!("launcher.psd_import.window_title"))
+            .id(egui::Id::new("launcher.psd_import.window_title"))
             .open(&mut keep_open)
             .default_size(egui::vec2(1360.0, 820.0))
             .min_width(1120.0)
@@ -361,7 +369,7 @@ impl PsdImportWindowState {
                     .stroke(Stroke::new(1.0, WARNING_COLOR))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("Предупреждения")
+                            RichText::new(t!("launcher.psd_import.warnings_label"))
                                 .strong()
                                 .color(WARNING_COLOR),
                         );
@@ -401,15 +409,15 @@ impl PsdImportWindowState {
 
     fn show_top_bar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
-            if button_sized(ui, "Открыть PSD/ZIP...", TOP_BUTTON_SIZE, !self.is_busy()).clicked()
+            if button_sized(ui, t!("launcher.psd_import.open_psd_zip_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
                 self.pick_files();
             }
-            if button_sized(ui, "Открыть папку с PSD", TOP_BUTTON_SIZE, !self.is_busy()).clicked()
+            if button_sized(ui, t!("launcher.psd_import.open_psd_folder_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
                 self.pick_folder();
             }
-            if button_sized(ui, "Поменять фон и клин", TOP_BUTTON_SIZE, !self.is_busy()).clicked()
+            if button_sized(ui, t!("launcher.psd_import.swap_source_clean_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
                 self.swap_source_and_clean();
             }
@@ -419,12 +427,12 @@ impl PsdImportWindowState {
     }
 
     fn show_rows_table(&mut self, ui: &mut Ui) {
-        ui.heading("Слои");
-        ui.label(RichText::new("Назначьте для каждой страницы исходник и клин.").small());
+        ui.heading(t!("launcher.psd_import.layers_label"));
+        ui.label(RichText::new(t!("launcher.psd_import.assign_hint")).small());
         if has_fully_skipped_document(&self.rows) {
             ui.colored_label(
                 WARNING_COLOR,
-                "Один или несколько загруженных psd файлов не были обработаны автоматически. Пожалуйста, назначьте исходник и клин вручную.",
+                t!("launcher.psd_import.manual_assign_hint"),
             );
         }
         ui.add_space(6.0);
@@ -433,7 +441,7 @@ impl PsdImportWindowState {
             .stroke(Stroke::new(1.0, Color32::from_rgb(56, 56, 62)))
             .show(ui, |ui| {
                 if self.rows.is_empty() {
-                    ui.label("Слои ещё не загружены.");
+                    ui.label(t!("launcher.psd_import.layers_not_loaded"));
                     return;
                 }
 
@@ -450,19 +458,19 @@ impl PsdImportWindowState {
                     .show(ui, |ui| {
                         ui.add_sized(
                             [title_width, 22.0],
-                            egui::Label::new(RichText::new("Картинка").strong()),
+                            egui::Label::new(RichText::new(t!("launcher.psd_import.col_image")).strong()),
                         );
                         ui.add_sized(
                             [ROW_SIZE_WIDTH, 22.0],
-                            egui::Label::new(RichText::new("Размер").strong()),
+                            egui::Label::new(RichText::new(t!("launcher.psd_import.col_size")).strong()),
                         );
                         ui.add_sized(
                             [ROW_PAGE_WIDTH, 22.0],
-                            egui::Label::new(RichText::new("Страница").strong()),
+                            egui::Label::new(RichText::new(t!("launcher.psd_import.col_page")).strong()),
                         );
                         ui.add_sized(
                             [ROW_TYPE_WIDTH, 22.0],
-                            egui::Label::new(RichText::new("Тип").strong()),
+                            egui::Label::new(RichText::new(t!("launcher.psd_import.col_type")).strong()),
                         );
                         ui.end_row();
 
@@ -510,17 +518,17 @@ impl PsdImportWindowState {
                     ui.selectable_value(
                         &mut self.rows[row_index].import_type,
                         LayerImportType::Skip,
-                        TYPE_SKIP,
+                        type_skip(),
                     );
                     ui.selectable_value(
                         &mut self.rows[row_index].import_type,
                         LayerImportType::Source,
-                        TYPE_SOURCE,
+                        type_source(),
                     );
                     ui.selectable_value(
                         &mut self.rows[row_index].import_type,
                         LayerImportType::Clean,
-                        TYPE_CLEAN,
+                        type_clean(),
                     );
                 });
         });
@@ -573,8 +581,8 @@ impl PsdImportWindowState {
     }
 
     fn show_save_block(&mut self, ui: &mut Ui) {
-        ui.heading("Сохранить главу");
-        ui.label("Тайтл");
+        ui.heading(t!("launcher.psd_import.save_chapter_label"));
+        ui.label(t!("launcher.common.title_label"));
         let title_changed = ui
             .scope(|ui| {
                 self.title_combo
@@ -586,7 +594,7 @@ impl PsdImportWindowState {
             clear_success_status(&mut self.status);
         }
 
-        ui.label("Глава");
+        ui.label(t!("launcher.common.chapter_label"));
         let chapter_response = ui.add_sized(
             [360.0, ui.spacing().interact_size.y.max(32.0)],
             egui::TextEdit::singleline(&mut self.chapter_input),
@@ -600,9 +608,9 @@ impl PsdImportWindowState {
         } else {
             let chapters = chapters_for_title(&self.catalog_snapshot, &self.title_input);
             let joined = if chapters.is_empty() {
-                "Существующие главы не найдены".to_string()
+                t!("launcher.psd_import.no_existing_chapters").to_string()
             } else {
-                format!("Существующие главы: {}", chapters.join(", "))
+                tf!("launcher.psd_import.existing_chapters_label", chapters = chapters.join(", "))
             };
             ui.label(RichText::new(joined).small().color(Color32::from_gray(180)));
         }
@@ -613,16 +621,16 @@ impl PsdImportWindowState {
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let can_import = self.can_import();
-            if button_sized(ui, "Сохранить и открыть", ACTION_BUTTON_SIZE, can_import).clicked()
+            if button_sized(ui, t!("launcher.common.save_and_open_button"), ACTION_BUTTON_SIZE, can_import).clicked()
             {
                 self.start_import(true);
             }
-            if button_sized(ui, "Сохранить", ACTION_BUTTON_SIZE, can_import).clicked() {
+            if button_sized(ui, t!("launcher.common.save_button"), ACTION_BUTTON_SIZE, can_import).clicked() {
                 self.start_import(false);
             }
             if button_sized(
                 ui,
-                "Обновить",
+                t!("launcher.common.refresh_button"),
                 egui::vec2(112.0, 36.0),
                 !self.catalog.is_loading(),
             )
@@ -637,16 +645,16 @@ impl PsdImportWindowState {
     fn show_status(&self, ui: &mut Ui) {
         match &self.status {
             ImportStatus::Idle => {
-                ui.label(RichText::new("Готово к импорту PSD.").small());
+                ui.label(RichText::new(t!("launcher.psd_import.ready_status")).small());
             }
             ImportStatus::LoadingCatalog => {
-                ui.label(RichText::new("Считываем список тайтлов...").small());
+                ui.label(RichText::new(t!("launcher.common.reading_titles_status")).small());
             }
             ImportStatus::Scanning => {
-                ui.label(RichText::new("Читаем PSD и строим список слоёв...").small());
+                ui.label(RichText::new(t!("launcher.psd_import.reading_psd_status")).small());
             }
             ImportStatus::Importing => {
-                ui.label(RichText::new("Импортируем выбранные слои...").small());
+                ui.label(RichText::new(t!("launcher.psd_import.importing_layers_status")).small());
             }
             ImportStatus::Success(message) => {
                 ui.colored_label(SUCCESS_COLOR, message);
@@ -658,7 +666,7 @@ impl PsdImportWindowState {
     }
 
     fn show_preview_panel(&mut self, ui: &mut Ui) {
-        ui.heading("Предпросмотр");
+        ui.heading(t!("launcher.psd_import.preview_label"));
         ui.add_space(8.0);
         let outer_rect = ui.available_rect_before_wrap();
         ui.allocate_rect(outer_rect, Sense::hover());
@@ -688,10 +696,7 @@ impl PsdImportWindowState {
                             Some(row) => {
                                 ui.label(RichText::new(Self::format_row_title_for(row)).strong());
                                 ui.label(
-                                    RichText::new(format!(
-                                        "{}x{}  |  страница {}",
-                                        row.size.0, row.size.1, row.page
-                                    ))
+                                    RichText::new(tf!("launcher.psd_import.preview_size_page", row = row.size.0, row_2 = row.size.1, row_3 = row.page))
                                     .small()
                                     .color(Color32::from_gray(180)),
                                 );
@@ -735,25 +740,25 @@ impl PsdImportWindowState {
                                 } else {
                                     match &self.preview_status {
                                         PreviewStatus::Idle => {
-                                            ui.label("Выберите слой для предпросмотра.");
+                                            ui.label(t!("launcher.psd_import.select_layer_for_preview"));
                                         }
                                         PreviewStatus::Loading(row_key)
                                             if row_key == &row.row_key =>
                                         {
                                             ui.spinner();
-                                            ui.label("Рендерим выбранный слой...");
+                                            ui.label(t!("launcher.psd_import.rendering_layer_status"));
                                         }
                                         PreviewStatus::Error(message) => {
                                             ui.colored_label(ERROR_COLOR, message);
                                         }
                                         _ => {
-                                            ui.label("Предпросмотр ещё не загружен.");
+                                            ui.label(t!("launcher.psd_import.preview_not_loaded"));
                                         }
                                     }
                                 }
                             }
                             None => {
-                                ui.label("Откройте PSD/ZIP и выберите слой.");
+                                ui.label(t!("launcher.psd_import.open_psd_select_layer_hint"));
                             }
                         }
                     });
@@ -863,7 +868,7 @@ impl PsdImportWindowState {
     /// Reports the missing capability instead of opening a dialog.
     #[cfg(target_arch = "wasm32")]
     fn pick_files(&mut self) {
-        self.status = ImportStatus::Error("Выбор файлов недоступен в веб-версии.".to_string());
+        self.status = ImportStatus::Error(t!("launcher.psd_import.select_files_web_unsupported").to_string());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -880,7 +885,7 @@ impl PsdImportWindowState {
     /// Web stub twin of `pick_files` for the folder picker.
     #[cfg(target_arch = "wasm32")]
     fn pick_folder(&mut self) {
-        self.status = ImportStatus::Error("Выбор папки недоступен в веб-версии.".to_string());
+        self.status = ImportStatus::Error(t!("launcher.psd_import.select_folder_web_unsupported").to_string());
     }
 
     fn start_scan(&mut self, request: ScanRequest) {
@@ -900,7 +905,7 @@ impl PsdImportWindowState {
         self.preview_scroll_y = 0.0;
         self.preview_scroll_by_page.clear();
         self.preview_container_width = None;
-        self.source_summary = "Читаем PSD источник...".to_string();
+        self.source_summary = t!("launcher.psd_import.reading_psd_source_status").to_string();
         self.status = ImportStatus::Scanning;
 
         let (tx, rx) = mpsc::channel();
@@ -919,7 +924,7 @@ impl PsdImportWindowState {
                 "[launcher-psd] failed to spawn scan worker thread: {err}"
             ));
             self.status =
-                ImportStatus::Error("Не удалось запустить импорт PSD в фоне.".to_string());
+                ImportStatus::Error(t!("launcher.psd_import.start_import_bg_error").to_string());
             self.pending_scan = None;
         }
     }
@@ -950,7 +955,7 @@ impl PsdImportWindowState {
                             error.log_message
                         ));
                         self.status = ImportStatus::Error(error.user_message);
-                        self.source_summary = "PSD источник не выбран".to_string();
+                        self.source_summary = t!("launcher.psd_import.no_psd_source").to_string();
                     }
                 }
             }
@@ -959,7 +964,7 @@ impl PsdImportWindowState {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.status =
-                    ImportStatus::Error("Фоновая загрузка PSD неожиданно завершилась.".to_string());
+                    ImportStatus::Error(t!("launcher.psd_import.psd_load_bg_error").to_string());
             }
         }
     }
@@ -997,7 +1002,7 @@ impl PsdImportWindowState {
                 "[launcher-psd] failed to spawn preview worker thread: {err}"
             ));
             self.preview_status =
-                PreviewStatus::Error("Не удалось запустить рендер предпросмотра.".to_string());
+                PreviewStatus::Error(t!("launcher.psd_import.start_preview_render_error").to_string());
             self.pending_preview = None;
         }
     }
@@ -1041,7 +1046,7 @@ impl PsdImportWindowState {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.preview_status = PreviewStatus::Error(
-                    "Фоновый рендер предпросмотра неожиданно завершился.".to_string(),
+                    t!("launcher.psd_import.preview_render_bg_error").to_string(),
                 );
             }
         }
@@ -1051,11 +1056,11 @@ impl PsdImportWindowState {
         let title = self.title_input.trim().to_string();
         let chapter = self.chapter_input.trim().to_string();
         if title.is_empty() || chapter.is_empty() {
-            self.status = ImportStatus::Error("Укажите тайтл и главу.".to_string());
+            self.status = ImportStatus::Error(t!("launcher.psd_import.specify_title_chapter_error").to_string());
             return;
         }
         if self.rows.is_empty() {
-            self.status = ImportStatus::Error("Сначала откройте PSD источник.".to_string());
+            self.status = ImportStatus::Error(t!("launcher.psd_import.open_psd_source_first").to_string());
             return;
         }
         for row_index in 0..self.rows.len() {
@@ -1069,7 +1074,7 @@ impl PsdImportWindowState {
             return;
         }
         let Some(documents) = self.loaded_documents.clone() else {
-            self.status = ImportStatus::Error("PSD документы ещё не загружены.".to_string());
+            self.status = ImportStatus::Error(t!("launcher.psd_import.psd_docs_not_loaded").to_string());
             return;
         };
 
@@ -1115,7 +1120,7 @@ impl PsdImportWindowState {
             ));
             self.pending_import = None;
             self.open_after_save_requested = false;
-            self.status = ImportStatus::Error("Не удалось запустить сохранение PSD.".to_string());
+            self.status = ImportStatus::Error(t!("launcher.psd_import.start_save_error").to_string());
         }
     }
 
@@ -1128,10 +1133,7 @@ impl PsdImportWindowState {
                 ctx.request_repaint();
                 match result.result {
                     Ok(response) => {
-                        self.status = ImportStatus::Success(format!(
-                            "Сохранено страниц: {}",
-                            response.saved_pages
-                        ));
+                        self.status = ImportStatus::Success(tf!("launcher.psd_import.saved_pages_status", response = response.saved_pages));
                         if self.open_after_save_requested {
                             self.queued_open = Some(OpenProjectSelection {
                                 project_dir: response.project_dir.clone(),
@@ -1160,7 +1162,7 @@ impl PsdImportWindowState {
                 self.open_after_save_requested = false;
                 self.queued_open = None;
                 self.status =
-                    ImportStatus::Error("Фоновый импорт PSD неожиданно завершился.".to_string());
+                    ImportStatus::Error(t!("launcher.psd_import.save_bg_error").to_string());
             }
         }
     }
@@ -1186,9 +1188,9 @@ impl PsdImportWindowState {
             }
             Some(ProjectCatalogEvent::WorkerDisconnected) => {
                 self.catalog_error =
-                    Some("Фоновая загрузка списка проектов неожиданно завершилась.".to_string());
+                    Some(t!("launcher.psd_import.load_projects_bg_error").to_string());
                 self.status =
-                    ImportStatus::Error("Не удалось обновить список проектов.".to_string());
+                    ImportStatus::Error(t!("launcher.psd_import.refresh_projects_error").to_string());
             }
             None => {}
         }
@@ -1229,7 +1231,7 @@ impl PsdImportWindowState {
         let row = self
             .rows
             .get(row_index)
-            .ok_or_else(|| "Строка PSD больше не существует.".to_string())?;
+            .ok_or_else(|| t!("launcher.psd_import.psd_row_gone").to_string())?;
         if row.import_type == LayerImportType::Skip {
             return Ok(());
         }
@@ -1242,17 +1244,10 @@ impl PsdImportWindowState {
                 continue;
             }
             if other.size != row.size {
-                return Err(format!(
-                    "Нельзя назначить страницу {}: размер {}x{} не совпадает с уже назначенными на этой странице ({}x{}).",
-                    row.page, row.size.0, row.size.1, other.size.0, other.size.1
-                ));
+                return Err(tf!("launcher.psd_import.page_size_mismatch_error", row = row.page, row_2 = row.size.0, row_3 = row.size.1, other = other.size.0, other_2 = other.size.1));
             }
             if other.import_type == row.import_type {
-                return Err(format!(
-                    "На странице {} уже есть '{}'.",
-                    row.page,
-                    row.import_type.label()
-                ));
+                return Err(tf!("launcher.psd_import.page_already_has_type_error", row = row.page, row_2 = row.import_type.label()));
             }
         }
         Ok(())
@@ -1262,16 +1257,16 @@ impl PsdImportWindowState {
         let row = self
             .rows
             .get(row_index)
-            .ok_or_else(|| "Строка PSD больше не существует.".to_string())?;
+            .ok_or_else(|| t!("launcher.psd_import.psd_row_gone").to_string())?;
         let Some(input) = self.page_inputs.get(&row.row_key) else {
             return Ok(());
         };
         let trimmed = input.trim();
         let page = trimmed
             .parse::<u32>()
-            .map_err(|_| "Страница должна быть положительным числом.".to_string())?;
+            .map_err(|_| t!("launcher.psd_import.page_must_be_positive").to_string())?;
         if page == 0 {
-            return Err("Страница должна быть не меньше 1.".to_string());
+            return Err(t!("launcher.psd_import.page_min_one").to_string());
         }
         if let Some(row) = self.rows.get_mut(row_index) {
             row.page = page;
@@ -1313,15 +1308,12 @@ impl PsdImportWindowState {
                 continue;
             }
             if row.page == 0 {
-                return Err("Страница должна быть не меньше 1.".to_string());
+                return Err(t!("launcher.psd_import.page_min_one").to_string());
             }
             imported_rows += 1;
             if let Some(existing) = page_sizes.get(&row.page) {
                 if *existing != row.size {
-                    return Err(format!(
-                        "На странице {} есть импортируемые слои разных размеров.",
-                        row.page
-                    ));
+                    return Err(tf!("launcher.psd_import.page_mixed_sizes_error", row = row.page));
                 }
             } else {
                 page_sizes.insert(row.page, row.size);
@@ -1329,18 +1321,12 @@ impl PsdImportWindowState {
             match row.import_type {
                 LayerImportType::Source => {
                     if !pages_with_source.insert(row.page) {
-                        return Err(format!(
-                            "На странице {} назначено несколько '{}'.",
-                            row.page, TYPE_SOURCE
-                        ));
+                        return Err(tf!("launcher.psd_import.page_multiple_source_error", row = row.page, TYPE_SOURCE = type_source()));
                     }
                 }
                 LayerImportType::Clean => {
                     if !pages_with_clean.insert(row.page) {
-                        return Err(format!(
-                            "На странице {} назначено несколько '{}'.",
-                            row.page, TYPE_CLEAN
-                        ));
+                        return Err(tf!("launcher.psd_import.page_multiple_clean_error", row = row.page, TYPE_CLEAN = type_clean()));
                     }
                 }
                 LayerImportType::Skip => {}
@@ -1348,7 +1334,7 @@ impl PsdImportWindowState {
         }
 
         if imported_rows == 0 {
-            return Err("Нечего импортировать: все строки отключены.".to_string());
+            return Err(t!("launcher.psd_import.nothing_to_import").to_string());
         }
 
         Ok(())
@@ -1399,9 +1385,9 @@ impl PsdImportWindowState {
 impl LayerImportType {
     fn label(self) -> &'static str {
         match self {
-            Self::Skip => TYPE_SKIP,
-            Self::Source => TYPE_SOURCE,
-            Self::Clean => TYPE_CLEAN,
+            Self::Skip => type_skip(),
+            Self::Source => type_source(),
+            Self::Clean => type_clean(),
         }
     }
 }
@@ -1436,17 +1422,14 @@ fn build_document_rows(
         // Flattened PSD: no usable layers. Fall back to the merged composite image
         // so the document still imports as a single source page.
         let Some(composite) = document.composite.as_ref() else {
-            warnings.push(format!(
-                "{}: плоский PSD без слоёв и без растровых данных, пропущен.",
-                document.file_name
-            ));
+            warnings.push(tf!("launcher.psd_import.flat_psd_skipped", document = document.file_name));
             return Vec::new();
         };
         return vec![PsdLayerRow {
             row_key: format!("{document_index}:composite"),
             file_name: document.file_name.clone(),
             page: document.page,
-            layer_title: TYPE_SOURCE.to_string(),
+            layer_title: type_source().to_string(),
             size: (composite.width, composite.height),
             // Explicitly typed as source; this is the only row for the document so
             // `auto_assign_types` (which only acts on exactly one source/clean pair)
@@ -1470,7 +1453,7 @@ fn run_scan_worker(request: ScanRequest) -> Result<ScanResponse, WorkerError> {
 
     if documents.is_empty() {
         return Err(WorkerError {
-            user_message: "PSD файлы не найдены.".to_string(),
+            user_message: t!("launcher.psd_import.no_psd_files").to_string(),
             log_message: "scan produced zero PSD documents".to_string(),
         });
     }
@@ -1484,7 +1467,7 @@ fn run_scan_worker(request: ScanRequest) -> Result<ScanResponse, WorkerError> {
     let source_summary = if documents.len() == 1 {
         documents[0].file_name.clone()
     } else {
-        format!("Загружено PSD: {}", documents.len())
+        tf!("launcher.psd_import.loaded_psd_count", documents = documents.len())
     };
 
     let shared_documents = Arc::new(documents);
@@ -1509,7 +1492,7 @@ fn scan_selected_files(
 ) -> Result<Vec<LoadedPsdDocument>, WorkerError> {
     if paths.is_empty() {
         return Err(WorkerError {
-            user_message: "Не выбраны PSD файлы.".to_string(),
+            user_message: t!("launcher.psd_import.no_psd_files_selected").to_string(),
             log_message: "file picker returned no paths".to_string(),
         });
     }
@@ -1521,17 +1504,14 @@ fn scan_selected_files(
         match lowercase_ext(&path).as_deref() {
             Some("psd") => psd_files.push(path),
             Some("zip" | "rar") => archive_files.push(path),
-            Some("psb") => warnings.push(format!(
-                "{}: формат PSB не поддерживается Rust importer и пропущен.",
-                path.display()
-            )),
+            Some("psb") => warnings.push(tf!("launcher.psd_import.psb_unsupported_path", path = path.display())),
             _ => unsupported.push(path),
         }
     }
 
     if !unsupported.is_empty() {
         return Err(WorkerError {
-            user_message: "Выбраны неподдерживаемые файлы.".to_string(),
+            user_message: t!("launcher.psd_import.unsupported_files_selected").to_string(),
             log_message: format!(
                 "unsupported files: {}",
                 unsupported
@@ -1545,14 +1525,14 @@ fn scan_selected_files(
 
     if !archive_files.is_empty() && !psd_files.is_empty() {
         return Err(WorkerError {
-            user_message: "Можно выбрать либо PSD файлы, либо один архив.".to_string(),
+            user_message: t!("launcher.psd_import.select_psd_or_archive").to_string(),
             log_message: "mixed PSD files and archives in one selection".to_string(),
         });
     }
 
     if archive_files.len() > 1 {
         return Err(WorkerError {
-            user_message: "Можно выбрать только один архив.".to_string(),
+            user_message: t!("launcher.psd_import.select_one_archive").to_string(),
             log_message: "multiple archives selected".to_string(),
         });
     }
@@ -1566,7 +1546,7 @@ fn scan_selected_files(
     sorted.sort_by_key(|path| path.as_os_str().to_owned());
     for path in sorted {
         let bytes = fs::read(&path).map_err(|err| WorkerError {
-            user_message: "Не удалось открыть PSD файл.".to_string(),
+            user_message: t!("launcher.psd_import.open_psd_file_error").to_string(),
             log_message: format!("failed to read '{}': {err}", path.display()),
         })?;
         let file_name = path
@@ -1592,17 +1572,14 @@ fn scan_folder(
     for entry in walk_dir(&path)? {
         match lowercase_ext(&entry).as_deref() {
             Some("psd") => found.push(entry),
-            Some("psb") => warnings.push(format!(
-                "{}: формат PSB не поддерживается Rust importer и пропущен.",
-                entry.display()
-            )),
+            Some("psb") => warnings.push(tf!("launcher.psd_import.psb_unsupported_entry", entry = entry.display())),
             _ => {}
         }
     }
 
     if found.is_empty() {
         return Err(WorkerError {
-            user_message: "В выбранной папке PSD файлы не найдены.".to_string(),
+            user_message: t!("launcher.psd_import.no_psd_in_folder").to_string(),
             log_message: format!("no psd files in '{}'", path.display()),
         });
     }
@@ -1611,7 +1588,7 @@ fn scan_folder(
     let mut documents = Vec::new();
     for entry in found {
         let bytes = fs::read(&entry).map_err(|err| WorkerError {
-            user_message: "Не удалось открыть PSD файл.".to_string(),
+            user_message: t!("launcher.psd_import.open_psd_file_error").to_string(),
             log_message: format!("failed to read '{}': {err}", entry.display()),
         })?;
         let file_name = entry
@@ -1634,18 +1611,18 @@ fn scan_zip_archive(
     warnings: &mut Vec<String>,
 ) -> Result<Vec<LoadedPsdDocument>, WorkerError> {
     let file = File::open(zip_path).map_err(|err| WorkerError {
-        user_message: "Не удалось открыть ZIP архив.".to_string(),
+        user_message: t!("launcher.psd_import.open_zip_error").to_string(),
         log_message: format!("failed to open zip '{}': {err}", zip_path.display()),
     })?;
     let mut archive = ZipArchive::new(file).map_err(|err| WorkerError {
-        user_message: "Не удалось прочитать ZIP архив.".to_string(),
+        user_message: t!("launcher.psd_import.read_zip_error").to_string(),
         log_message: format!("failed to parse zip '{}': {err}", zip_path.display()),
     })?;
 
     let mut entries = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|err| WorkerError {
-            user_message: "Не удалось прочитать ZIP архив.".to_string(),
+            user_message: t!("launcher.psd_import.read_zip_error").to_string(),
             log_message: format!("failed to read zip entry {index}: {err}"),
         })?;
         if !entry.is_file() {
@@ -1653,11 +1630,7 @@ fn scan_zip_archive(
         }
         let name = entry.name().replace('\\', "/");
         if name.to_ascii_lowercase().ends_with(".psb") {
-            warnings.push(format!(
-                "{}: файл '{}' внутри ZIP имеет формат PSB и пропущен.",
-                zip_path.display(),
-                name
-            ));
+            warnings.push(tf!("launcher.psd_import.zip_psb_skipped", zip_path = zip_path.display(), name = name));
             continue;
         }
         if !name.to_ascii_lowercase().ends_with(".psd") {
@@ -1665,7 +1638,7 @@ fn scan_zip_archive(
         }
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|err| WorkerError {
-            user_message: "Не удалось распаковать PSD из ZIP.".to_string(),
+            user_message: t!("launcher.psd_import.extract_psd_from_zip_error").to_string(),
             log_message: format!("failed to read zip member '{name}': {err}"),
         })?;
         entries.push((name, bytes));
@@ -1673,7 +1646,7 @@ fn scan_zip_archive(
 
     if entries.is_empty() {
         return Err(WorkerError {
-            user_message: "В ZIP архиве PSD файлы не найдены.".to_string(),
+            user_message: t!("launcher.psd_import.no_psd_in_zip").to_string(),
             log_message: format!("no psd entries found in '{}'", zip_path.display()),
         });
     }
@@ -1726,18 +1699,14 @@ fn scan_rar_archive_from_temp_dir(
     for entry in walk_dir(extract_dir)? {
         match lowercase_ext(&entry).as_deref() {
             Some("psd") => found.push(entry),
-            Some("psb") => warnings.push(format!(
-                "{}: файл '{}' внутри RAR имеет формат PSB и пропущен.",
-                rar_path.display(),
-                entry.display()
-            )),
+            Some("psb") => warnings.push(tf!("launcher.psd_import.rar_psb_skipped", rar_path = rar_path.display(), entry = entry.display())),
             _ => {}
         }
     }
 
     if found.is_empty() {
         return Err(WorkerError {
-            user_message: "В RAR архиве PSD файлы не найдены.".to_string(),
+            user_message: t!("launcher.psd_import.no_psd_in_rar").to_string(),
             log_message: format!("no psd entries found in rar '{}'", rar_path.display()),
         });
     }
@@ -1746,7 +1715,7 @@ fn scan_rar_archive_from_temp_dir(
     let mut documents = Vec::new();
     for entry in found {
         let bytes = fs::read(&entry).map_err(|err| WorkerError {
-            user_message: "Не удалось распаковать PSD из RAR.".to_string(),
+            user_message: t!("launcher.psd_import.extract_psd_from_rar_error").to_string(),
             log_message: format!(
                 "failed to read extracted rar member '{}': {err}",
                 entry.display()
@@ -1781,7 +1750,7 @@ fn scan_archive(
         Some("zip") => scan_zip_archive(archive_path, warnings),
         Some("rar") => scan_rar_archive(archive_path, warnings),
         _ => Err(WorkerError {
-            user_message: "Поддерживаются только ZIP и RAR архивы.".to_string(),
+            user_message: t!("launcher.psd_import.only_zip_rar_supported").to_string(),
             log_message: format!("unsupported archive '{}'", archive_path.display()),
         }),
     }
@@ -1798,7 +1767,7 @@ fn create_temp_extract_dir() -> Result<PathBuf, WorkerError> {
         timestamp
     ));
     fs::create_dir_all(&dir).map_err(|err| WorkerError {
-        user_message: "Не удалось подготовить временную папку для архива.".to_string(),
+        user_message: t!("launcher.psd_import.prepare_temp_dir_error").to_string(),
         log_message: format!("failed to create temp dir '{}': {err}", dir.display()),
     })?;
     Ok(dir)
@@ -1813,7 +1782,7 @@ fn extract_archive_with_commands(
     _commands: &[&str],
 ) -> Result<(), WorkerError> {
     Err(WorkerError {
-        user_message: "Распаковка архивов недоступна в веб-версии.".to_string(),
+        user_message: t!("launcher.psd_import.extract_web_unsupported").to_string(),
         log_message: format!(
             "archive extraction via external tools is unavailable on the web build for '{}'",
             path.display()
@@ -1874,7 +1843,7 @@ fn extract_archive_with_commands(
 
     Err(WorkerError {
         user_message:
-            "Не удалось распаковать архив. Нужен совместимый `rar`, `unrar`, `unar`, `7z` или `7za`."
+            t!("launcher.psd_import.extract_archive_tool_error")
                 .to_string(),
         log_message: format!("no extractor succeeded for '{}'", path.display()),
     })
@@ -1899,7 +1868,7 @@ fn load_document_from_bytes(
         ..Default::default()
     };
     let psd = read_psd(&bytes, &options).map_err(|err| WorkerError {
-        user_message: format!("Не удалось прочитать PSD '{}'.", file_name),
+        user_message: tf!("launcher.psd_import.read_psd_error", file_name = file_name),
         log_message: format!("failed to parse psd '{file_name}': {err}"),
     })?;
 
@@ -1909,10 +1878,7 @@ fn load_document_from_bytes(
         collect_leaf_layers(children, &mut layers, &mut has_groups);
     }
     if has_groups {
-        warnings.push(format!(
-            "{}: обнаружены группы. Импорт работает только с простыми плоскими слоями; порядок и иерархия групп могут быть неточными.",
-            file_name
-        ));
+        warnings.push(tf!("launcher.psd_import.groups_warning", file_name = file_name));
     }
 
     // Keep the composite only as a fallback for flattened PSDs; when real layers
@@ -1959,7 +1925,7 @@ fn collect_leaf_layers(layers: &[Layer], out: &mut Vec<DecodedLayer>, has_groups
             .name
             .clone()
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "Без имени".to_string());
+            .unwrap_or_else(|| t!("launcher.psd_import.unnamed_layer").to_string());
         out.push(DecodedLayer { name, image });
     }
 }
@@ -2118,11 +2084,11 @@ fn run_import_worker(
     let src_dir = chapter_dir.join("src");
     let clean_dir = chapter_dir.join("clean_layers");
     fs::create_dir_all(&src_dir).map_err(|err| WorkerError {
-        user_message: "Не удалось создать папку src.".to_string(),
+        user_message: t!("launcher.psd_import.create_src_folder_error").to_string(),
         log_message: format!("failed to create '{}': {err}", src_dir.display()),
     })?;
     fs::create_dir_all(&clean_dir).map_err(|err| WorkerError {
-        user_message: "Не удалось создать папку clean_layers.".to_string(),
+        user_message: t!("launcher.psd_import.create_clean_layers_error").to_string(),
         log_message: format!("failed to create '{}': {err}", clean_dir.display()),
     })?;
 
@@ -2148,7 +2114,7 @@ fn run_import_worker(
             image
                 .save(src_dir.join(&filename))
                 .map_err(|err| WorkerError {
-                    user_message: "Не удалось сохранить исходник страницы.".to_string(),
+                    user_message: t!("launcher.psd_import.save_source_error").to_string(),
                     log_message: format!(
                         "failed to save source page {page} as '{filename}': {err}"
                     ),
@@ -2159,7 +2125,7 @@ fn run_import_worker(
             image
                 .save(clean_dir.join(&filename))
                 .map_err(|err| WorkerError {
-                    user_message: "Не удалось сохранить клин страницы.".to_string(),
+                    user_message: t!("launcher.psd_import.save_clean_error").to_string(),
                     log_message: format!("failed to save clean page {page} as '{filename}': {err}"),
                 })?;
         }
@@ -2177,7 +2143,7 @@ fn run_import_worker(
 fn import_filename_for_page(page: u32) -> Result<String, WorkerError> {
     let Some(file_index) = page.checked_sub(1) else {
         return Err(WorkerError {
-            user_message: "Номер страницы должен быть не меньше 1.".to_string(),
+            user_message: t!("launcher.psd_import.page_number_min_one").to_string(),
             log_message: format!("invalid one-based page number: {page}"),
         });
     };
@@ -2190,14 +2156,14 @@ fn render_layer_rgba(
     source: LayerSource,
 ) -> Result<RgbaImage, WorkerError> {
     let document = documents.get(document_index).ok_or_else(|| WorkerError {
-        user_message: "PSD документ больше не доступен.".to_string(),
+        user_message: t!("launcher.psd_import.psd_doc_gone").to_string(),
         log_message: format!("missing document index {document_index}"),
     })?;
 
     let (image, label) = match source {
         LayerSource::Layer(layer_index) => {
             let layer = document.layers.get(layer_index).ok_or_else(|| WorkerError {
-                user_message: "PSD слой больше не доступен.".to_string(),
+                user_message: t!("launcher.psd_import.psd_layer_gone").to_string(),
                 log_message: format!(
                     "missing layer index {layer_index} in document '{}'",
                     document.file_name
@@ -2207,7 +2173,7 @@ fn render_layer_rgba(
         }
         LayerSource::Composite => {
             let composite = document.composite.as_ref().ok_or_else(|| WorkerError {
-                user_message: "Плоский PSD не содержит растровых данных.".to_string(),
+                user_message: t!("launcher.psd_import.flat_psd_no_raster").to_string(),
                 log_message: format!(
                     "empty composite rgba buffer for document '{}'",
                     document.file_name
@@ -2222,7 +2188,7 @@ fn render_layer_rgba(
     // for `RgbaImage`, which needs to own its buffer.
     let pixels = image.data.as_ref().clone();
     RgbaImage::from_raw(width, height, pixels).ok_or_else(|| WorkerError {
-        user_message: "Не удалось собрать растровый слой PSD.".to_string(),
+        user_message: t!("launcher.psd_import.assemble_raster_error").to_string(),
         log_message: format!(
             "invalid rgba buffer for document '{}' {label}",
             document.file_name
@@ -2239,7 +2205,7 @@ fn build_preview_texture_tiles(
     let height = image.height() as usize;
     if width == 0 || height == 0 {
         return Err(WorkerError {
-            user_message: "PSD слой пустой и не может быть показан.".to_string(),
+            user_message: t!("launcher.psd_import.psd_layer_empty").to_string(),
             log_message: "preview image has zero width or height".to_string(),
         });
     }
@@ -2300,12 +2266,12 @@ fn walk_dir(root: &Path) -> Result<Vec<PathBuf>, WorkerError> {
     let mut files = Vec::new();
     while let Some(dir) = stack.pop() {
         let entries = fs::read_dir(&dir).map_err(|err| WorkerError {
-            user_message: "Не удалось прочитать папку с PSD.".to_string(),
+            user_message: t!("launcher.psd_import.read_psd_folder_error").to_string(),
             log_message: format!("failed to read dir '{}': {err}", dir.display()),
         })?;
         for entry_result in entries {
             let entry = entry_result.map_err(|err| WorkerError {
-                user_message: "Не удалось прочитать папку с PSD.".to_string(),
+                user_message: t!("launcher.psd_import.read_psd_folder_error").to_string(),
                 log_message: format!("failed to read dir entry in '{}': {err}", dir.display()),
             })?;
             let path = entry.path();

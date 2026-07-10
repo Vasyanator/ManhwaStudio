@@ -204,10 +204,10 @@ fn pick_source(kind: OpenSourceKind) -> Option<PathBuf> {
     match kind {
         OpenSourceKind::Folder => FileDialog::new().pick_folder(),
         OpenSourceKind::File => FileDialog::new()
-            .add_filter("Поддерживаемые файлы", SUPPORTED_DIALOG_EXTENSIONS)
-            .add_filter("Изображения", IMAGE_DIALOG_EXTENSIONS)
+            .add_filter(t!("launcher.new_project.source.supported_files_filter"), SUPPORTED_DIALOG_EXTENSIONS)
+            .add_filter(t!("launcher.new_project.source.images_filter"), IMAGE_DIALOG_EXTENSIONS)
             .add_filter("HTML", HTML_DIALOG_EXTENSIONS)
-            .add_filter("Архивы", ARCHIVE_DIALOG_EXTENSIONS)
+            .add_filter(t!("launcher.new_project.source.archives_filter"), ARCHIVE_DIALOG_EXTENSIONS)
             .pick_file(),
     }
 }
@@ -249,7 +249,7 @@ fn spawn_source_loader(
             ));
             if tx
                 .send(SourceLoadWorkerEvent::Finished(Err(SourceLoadError {
-                    user_message: "Не удалось запустить импорт источника.".to_string(),
+                    user_message: t!("launcher.new_project.source.start_import_error").to_string(),
                     log_message: format!(
                         "failed to spawn source loader for '{}': {err}",
                         path.display()
@@ -284,7 +284,7 @@ fn load_source(
 
     if batch.images.is_empty() {
         return Err(SourceLoadError {
-            user_message: "Не удалось получить изображения из выбранного источника.".to_string(),
+            user_message: t!("launcher.new_project.source.no_images_from_source_error").to_string(),
             log_message: format!("source '{}' produced zero images", path.display()),
         });
     }
@@ -323,7 +323,7 @@ fn load_from_folder(
 ) -> Result<ImportedImageBatch, SourceLoadError> {
     if !folder.is_dir() {
         return Err(SourceLoadError {
-            user_message: "Выбранный путь не является папкой.".to_string(),
+            user_message: t!("launcher.new_project.source.path_not_folder_error").to_string(),
             log_message: format!("'{}' is not a directory", folder.display()),
         });
     }
@@ -337,7 +337,7 @@ fn load_from_folder(
         let images = load_images_from_html(&html_path, &resources_folder, progress_tx)?;
         if images.is_empty() {
             return Err(SourceLoadError {
-                user_message: "Не удалось открыть изображения из сохранённой веб-страницы."
+                user_message: t!("launcher.new_project.source.open_saved_webpage_error")
                     .to_string(),
                 log_message: format!(
                     "saved webpage '{}' did not produce decodable images",
@@ -358,7 +358,7 @@ fn load_from_folder(
     }
     if candidates.is_empty() {
         return Err(SourceLoadError {
-            user_message: "Не удалось открыть изображения из папки.".to_string(),
+            user_message: t!("launcher.new_project.source.open_folder_images_error").to_string(),
             log_message: format!("folder '{}' has no matching files", folder.display()),
         });
     }
@@ -366,7 +366,7 @@ fn load_from_folder(
     let (images, skipped_files) = decode_images_from_paths(candidates, progress_tx);
     if images.is_empty() {
         return Err(SourceLoadError {
-            user_message: "Не удалось открыть изображения из папки.".to_string(),
+            user_message: t!("launcher.new_project.source.open_folder_images_error").to_string(),
             log_message: format!("folder '{}' has no decodable images", folder.display()),
         });
     }
@@ -384,7 +384,7 @@ fn load_from_file(
 ) -> Result<ImportedImageBatch, SourceLoadError> {
     if !path.is_file() {
         return Err(SourceLoadError {
-            user_message: "Выбранный путь не является файлом.".to_string(),
+            user_message: t!("launcher.new_project.source.path_not_file_error").to_string(),
             log_message: format!("'{}' is not a file", path.display()),
         });
     }
@@ -396,7 +396,7 @@ fn load_from_file(
             total: 1,
         });
         let image = decode_image_path(path).map_err(|err| SourceLoadError {
-            user_message: "Не удалось открыть изображение.".to_string(),
+            user_message: t!("launcher.new_project.source.open_image_error").to_string(),
             log_message: format!("failed to decode image '{}': {err}", path.display()),
         })?;
         return Ok(ImportedImageBatch {
@@ -416,7 +416,7 @@ fn load_from_file(
         let images = load_images_from_html(path, &resources_folder, progress_tx)?;
         if images.is_empty() {
             return Err(SourceLoadError {
-                user_message: "Не удалось открыть изображения из HTML.".to_string(),
+                user_message: t!("launcher.new_project.source.open_html_images_error").to_string(),
                 log_message: format!("html '{}' produced zero images", path.display()),
             });
         }
@@ -431,7 +431,7 @@ fn load_from_file(
         let images = load_images_from_archive(path, progress_tx)?;
         if images.is_empty() {
             return Err(SourceLoadError {
-                user_message: "Не удалось найти изображения в архиве.".to_string(),
+                user_message: t!("launcher.new_project.source.no_images_in_archive_error").to_string(),
                 log_message: format!("archive '{}' produced zero images", path.display()),
             });
         }
@@ -443,7 +443,7 @@ fn load_from_file(
     }
 
     Err(SourceLoadError {
-        user_message: "Этот формат файла пока не поддерживается.".to_string(),
+        user_message: t!("launcher.new_project.source.unsupported_format_error").to_string(),
         log_message: format!("unsupported file format '{}'", path.display()),
     })
 }
@@ -453,7 +453,7 @@ fn collect_folder_candidates(
     extra_patterns: &str,
 ) -> Result<Vec<PathBuf>, SourceLoadError> {
     let entries = fs::read_dir(folder).map_err(|err| SourceLoadError {
-        user_message: "Не удалось открыть папку с изображениями.".to_string(),
+        user_message: t!("launcher.new_project.source.open_image_folder_error").to_string(),
         log_message: format!("read_dir failed for '{}': {err}", folder.display()),
     })?;
 
@@ -501,7 +501,7 @@ fn collect_folder_candidates(
 
 fn list_resource_like_files(folder: &Path) -> Result<Vec<PathBuf>, SourceLoadError> {
     let entries = fs::read_dir(folder).map_err(|err| SourceLoadError {
-        user_message: "Не удалось открыть папку с изображениями.".to_string(),
+        user_message: t!("launcher.new_project.source.open_image_folder_error").to_string(),
         log_message: format!("read_dir failed for '{}': {err}", folder.display()),
     })?;
     let mut matches = Vec::new();
@@ -578,7 +578,7 @@ fn parse_saved_webpage_images(
     resources_folder: &Path,
 ) -> Result<Vec<PathBuf>, SourceLoadError> {
     let html_bytes = fs::read(html_path).map_err(|err| SourceLoadError {
-        user_message: "Не удалось прочитать HTML файл.".to_string(),
+        user_message: t!("launcher.new_project.source.read_html_error").to_string(),
         log_message: format!("failed to read html '{}': {err}", html_path.display()),
     })?;
     let html = String::from_utf8_lossy(&html_bytes);
@@ -757,18 +757,18 @@ fn load_images_from_zip(
     progress_tx: &Sender<SourceLoadWorkerEvent>,
 ) -> Result<Vec<ImportedImage>, SourceLoadError> {
     let file = File::open(path).map_err(|err| SourceLoadError {
-        user_message: "Не удалось открыть ZIP архив.".to_string(),
+        user_message: t!("launcher.new_project.source.open_zip_error").to_string(),
         log_message: format!("failed to open zip '{}': {err}", path.display()),
     })?;
     let mut archive = zip::ZipArchive::new(file).map_err(|err| SourceLoadError {
-        user_message: "Не удалось прочитать ZIP архив.".to_string(),
+        user_message: t!("launcher.new_project.source.read_zip_error").to_string(),
         log_message: format!("failed to read zip '{}': {err}", path.display()),
     })?;
 
     let mut names = Vec::new();
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|err| SourceLoadError {
-            user_message: "Не удалось прочитать ZIP архив.".to_string(),
+            user_message: t!("launcher.new_project.source.read_zip_error").to_string(),
             log_message: format!(
                 "failed to access zip entry {index} in '{}': {err}",
                 path.display()
@@ -794,7 +794,7 @@ fn load_images_from_zip(
             total,
         });
         let mut file = archive.by_name(&name).map_err(|err| SourceLoadError {
-            user_message: "Не удалось прочитать ZIP архив.".to_string(),
+            user_message: t!("launcher.new_project.source.read_zip_error").to_string(),
             log_message: format!(
                 "failed to open zip entry '{}' in '{}': {err}",
                 name,
@@ -821,7 +821,7 @@ fn load_images_from_tar(
     progress_tx: &Sender<SourceLoadWorkerEvent>,
 ) -> Result<Vec<ImportedImage>, SourceLoadError> {
     let file = File::open(path).map_err(|err| SourceLoadError {
-        user_message: "Не удалось открыть TAR архив.".to_string(),
+        user_message: t!("launcher.new_project.source.open_tar_error").to_string(),
         log_message: format!("failed to open tar '{}': {err}", path.display()),
     })?;
     let ext = lowercase_path(path);
@@ -832,21 +832,21 @@ fn load_images_from_tar(
     };
     let mut archive = tar::Archive::new(archive_reader);
     let entries = archive.entries().map_err(|err| SourceLoadError {
-        user_message: "Не удалось прочитать TAR архив.".to_string(),
+        user_message: t!("launcher.new_project.source.read_tar_error").to_string(),
         log_message: format!("failed to list tar entries in '{}': {err}", path.display()),
     })?;
 
     let mut records = Vec::new();
     for entry in entries {
         let mut entry = entry.map_err(|err| SourceLoadError {
-            user_message: "Не удалось прочитать TAR архив.".to_string(),
+            user_message: t!("launcher.new_project.source.read_tar_error").to_string(),
             log_message: format!("failed to read tar entry in '{}': {err}", path.display()),
         })?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
         let entry_path = entry.path().map_err(|err| SourceLoadError {
-            user_message: "Не удалось прочитать TAR архив.".to_string(),
+            user_message: t!("launcher.new_project.source.read_tar_error").to_string(),
             log_message: format!("failed to get tar path in '{}': {err}", path.display()),
         })?;
         let name = entry_path.to_string_lossy().to_string();
@@ -923,7 +923,7 @@ fn create_temp_extract_dir() -> Result<PathBuf, SourceLoadError> {
         timestamp
     ));
     fs::create_dir_all(&dir).map_err(|err| SourceLoadError {
-        user_message: "Не удалось подготовить временную папку для архива.".to_string(),
+        user_message: t!("launcher.new_project.source.prepare_temp_dir_error").to_string(),
         log_message: format!("failed to create temp dir '{}': {err}", dir.display()),
     })?;
     Ok(dir)
@@ -938,7 +938,7 @@ fn extract_archive_with_commands(
     _commands: &[&str],
 ) -> Result<(), SourceLoadError> {
     Err(SourceLoadError {
-        user_message: "Распаковка архивов недоступна в веб-версии.".to_string(),
+        user_message: t!("launcher.new_project.source.extract_web_unsupported").to_string(),
         log_message: format!(
             "archive extraction via external tools is unavailable on the web build for '{}'",
             path.display()
@@ -999,7 +999,7 @@ fn extract_archive_with_commands(
 
     Err(SourceLoadError {
         user_message:
-            "Не удалось распаковать архив. Нужен совместимый `rar`, `unrar`, `unar`, `7z` или `7za`."
+            t!("launcher.new_project.source.extract_archive_tool_error")
                 .to_string(),
         log_message: format!("no extractor succeeded for '{}'", path.display()),
     })
@@ -1013,7 +1013,7 @@ fn load_images_from_extracted_dir(
     if images.is_empty() {
         let mut subdirs = fs::read_dir(root_dir)
             .map_err(|err| SourceLoadError {
-                user_message: "Не удалось прочитать распакованный архив.".to_string(),
+                user_message: t!("launcher.new_project.source.read_extracted_error").to_string(),
                 log_message: format!("read_dir failed for '{}': {err}", root_dir.display()),
             })?
             .filter_map(Result::ok)
@@ -1043,7 +1043,7 @@ fn collect_images_recursive(root: &Path) -> Result<Vec<PathBuf>, SourceLoadError
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
         let entries = fs::read_dir(&path).map_err(|err| SourceLoadError {
-            user_message: "Не удалось прочитать распакованный архив.".to_string(),
+            user_message: t!("launcher.new_project.source.read_extracted_error").to_string(),
             log_message: format!("read_dir failed for '{}': {err}", path.display()),
         })?;
         for entry in entries {
@@ -1071,7 +1071,7 @@ fn collect_images_recursive(root: &Path) -> Result<Vec<PathBuf>, SourceLoadError
 
 fn list_images_sorted(folder: &Path) -> Result<Vec<PathBuf>, SourceLoadError> {
     let entries = fs::read_dir(folder).map_err(|err| SourceLoadError {
-        user_message: "Не удалось прочитать папку с изображениями.".to_string(),
+        user_message: t!("launcher.new_project.source.read_image_folder_error").to_string(),
         log_message: format!("read_dir failed for '{}': {err}", folder.display()),
     })?;
     let mut images = Vec::new();

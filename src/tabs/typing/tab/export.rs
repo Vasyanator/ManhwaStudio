@@ -29,7 +29,7 @@ pub(super) fn export_typing_pages_to_folder(
     // Route directory creation through the storage seam (web build writes to its virtual store).
     crate::storage::storage()
         .create_dir_all(output_dir.to_string_lossy().as_ref())
-        .map_err(|err| format!("Не удалось создать папку {}: {err}", output_dir.display()))?;
+        .map_err(|err| tf!("typing.errors.create_output_dir_error", output_dir = output_dir.display(), err = err))?;
     let total = jobs.len();
     if jobs.is_empty() {
         return Ok(TypingExportResult {
@@ -115,18 +115,12 @@ pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), 
                     image::ColorType::Rgba8.into(),
                 )
                 .map_err(|err| {
-                    format!(
-                        "Не удалось сохранить страницу {}: {err}",
-                        job.output_path.display()
-                    )
+                    tf!("typing.errors.save_page_error", job = job.output_path.display(), err = err)
                 })?;
             crate::storage::storage()
                 .write(job.output_path.to_string_lossy().as_ref(), &buf)
                 .map_err(|err| {
-                    format!(
-                        "Не удалось сохранить страницу {}: {err}",
-                        job.output_path.display()
-                    )
+                    tf!("typing.errors.save_page_error", job = job.output_path.display(), err = err)
                 })
         }
         TypingExportFormat::Psd => {
@@ -134,10 +128,7 @@ pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), 
             crate::storage::storage()
                 .write(job.output_path.to_string_lossy().as_ref(), &bytes)
                 .map_err(|err| {
-                    format!(
-                        "Не удалось сохранить страницу {}: {err}",
-                        job.output_path.display()
-                    )
+                    tf!("typing.errors.save_page_error", job = job.output_path.display(), err = err)
                 })
         }
     }
@@ -196,17 +187,11 @@ pub(super) fn load_clean_overlay_rgba_from_disk(
     let bytes = crate::storage::storage()
         .read(path_str.as_ref())
         .map_err(|err| {
-            format!(
-                "Не удалось открыть clean overlay {}: {err}",
-                clean_overlay_path.display()
-            )
+            tf!("typing.errors.open_clean_overlay_error", clean_overlay_path = clean_overlay_path.display(), err = err)
         })?;
     let clean = image::load_from_memory(&bytes)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть clean overlay {}: {err}",
-                clean_overlay_path.display()
-            )
+            tf!("typing.errors.open_clean_overlay_error", clean_overlay_path = clean_overlay_path.display(), err = err)
         })?
         .to_rgba8();
     Ok(Some(clean))
@@ -506,7 +491,7 @@ impl TypingTextOverlayLayer {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.export_rx = None;
-                    let err = "Фоновый экспорт завершился с ошибкой канала.".to_string();
+                    let err = t!("typing.export.channel_error").to_string();
                     self.export_status = TypingExportUiStatus::Error {
                         message: err.clone(),
                     };
@@ -528,11 +513,11 @@ impl TypingTextOverlayLayer {
         export_format: TypingExportFormat,
     ) {
         if self.export_rx.is_some() {
-            self.set_create_error(ctx, "Экспорт уже выполняется.");
+            self.set_create_error(ctx, t!("typing.export.already_running_error"));
             return;
         }
         if project.pages.is_empty() {
-            self.set_create_error(ctx, "В проекте нет страниц для экспорта.");
+            self.set_create_error(ctx, t!("typing.export.no_pages_error"));
             return;
         }
         crate::trace_log!(
@@ -692,17 +677,11 @@ pub(in crate::tabs::typing) fn flatten_typing_export_page_rgba(
     let page_bytes = crate::storage::storage()
         .read(page_path_str.as_ref())
         .map_err(|err| {
-            format!(
-                "Не удалось открыть страницу {}: {err}",
-                job.page_path.display()
-            )
+            tf!("typing.errors.open_page_error", job = job.page_path.display(), err = err)
         })?;
     let mut base = image::load_from_memory(&page_bytes)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть страницу {}: {err}",
-                job.page_path.display()
-            )
+            tf!("typing.errors.open_page_error", job = job.page_path.display(), err = err)
         })?
         .to_rgba8();
     let base_w = base.width() as usize;

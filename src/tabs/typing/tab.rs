@@ -223,18 +223,18 @@ enum TypingDeformMode {
 impl TypingDeformMode {
     fn label(self) -> &'static str {
         match self {
-            Self::Perspective => "Перспектива",
-            Self::Bend => "Изгиб",
-            Self::Frame => "Рамка",
-            Self::Grid => "Сетка",
-            Self::Bulge => "Выпуклость",
-            Self::Pinch => "Впуклость",
-            Self::Push => "Сдвиг",
-            Self::Twirl => "Закрутка",
-            Self::Restore => "Восстановление",
-            Self::Smooth => "Разгладить",
-            Self::Stretch => "Растянуть",
-            Self::Fold => "Складка",
+            Self::Perspective => t!("typing.deform.mode_perspective"),
+            Self::Bend => t!("typing.deform.mode_bend"),
+            Self::Frame => t!("typing.deform.mode_frame"),
+            Self::Grid => t!("typing.deform.mode_grid"),
+            Self::Bulge => t!("typing.deform.mode_bulge"),
+            Self::Pinch => t!("typing.deform.mode_pucker"),
+            Self::Push => t!("typing.deform.mode_shift"),
+            Self::Twirl => t!("typing.deform.mode_twirl"),
+            Self::Restore => t!("typing.deform.mode_restore"),
+            Self::Smooth => t!("typing.deform.mode_smooth"),
+            Self::Stretch => t!("typing.deform.mode_stretch"),
+            Self::Fold => t!("typing.deform.mode_fold"),
         }
     }
 
@@ -888,7 +888,7 @@ impl CanvasHooks for TypingHooks<'_> {
         let Some(rect_coords) = bubble_rect_coords(bubble) else {
             return;
         };
-        if ui.small_button("Создать текст").clicked() {
+        if ui.small_button(t!("typing.canvas.create_text_button")).clicked() {
             self.pending_create_text_from_bubble = Some(BubbleCreateTextRequest {
                 page_idx: bubble.img_idx,
                 rect_coords,
@@ -910,7 +910,7 @@ impl CanvasHooks for TypingHooks<'_> {
         let text_width = ui.fonts_mut(|fonts| {
             fonts
                 .layout_job(egui::text::LayoutJob::simple(
-                    "Создать текст".to_owned(),
+                    t!("typing.canvas.create_text_button").to_owned(),
                     font_id.clone(),
                     text_color,
                     f32::INFINITY,

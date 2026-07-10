@@ -62,7 +62,7 @@ pub struct ClipboardImage {
 /// this returns a clear error instead of a fake success.
 #[cfg(target_arch = "wasm32")]
 pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
-    Err("буфер обмена изображений недоступен в веб-версии".to_string())
+    Err(t!("paste_image.web_unavailable").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -77,9 +77,7 @@ pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
             {
                 match read_image_from_clipboard_linux_fallback() {
                     Ok(image) => Ok(image),
-                    Err(fallback_error) => Err(format!(
-                        "{primary_error}. Linux fallback тоже не сработал: {fallback_error}"
-                    )),
+                    Err(fallback_error) => Err(tf!("paste_image.linux_fallback_failed", primary_error = primary_error, fallback_error = fallback_error)),
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -119,7 +117,7 @@ fn read_image_from_clipboard_arboard_alternatives() -> Result<ClipboardImage, St
         return Ok(image);
     }
 
-    Err("альтернативные представления буфера не содержат путь к изображению".to_string())
+    Err(t!("paste_image.no_image_path").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -129,17 +127,14 @@ fn validate_rgba_image(
     rgba: Vec<u8>,
 ) -> Result<ClipboardImage, String> {
     if width == 0 || height == 0 {
-        return Err("в буфере изображение нулевого размера".to_string());
+        return Err(t!("paste_image.zero_size").to_string());
     }
     let expected_len = width
         .checked_mul(height)
         .and_then(|pixel_count| pixel_count.checked_mul(4))
-        .ok_or_else(|| "слишком большой размер изображения в буфере".to_string())?;
+        .ok_or_else(|| t!("paste_image.too_large").to_string())?;
     if rgba.len() != expected_len {
-        return Err(format!(
-            "неподдерживаемый формат буфера: ожидалось {expected_len} байт RGBA, получено {}",
-            rgba.len()
-        ));
+        return Err(tf!("paste_image.unsupported_format", expected_len = expected_len, rgba = rgba.len()));
     }
     Ok(ClipboardImage {
         width,
@@ -151,7 +146,7 @@ fn validate_rgba_image(
 #[cfg(not(target_arch = "wasm32"))]
 fn read_image_from_path(path: &Path) -> Result<ClipboardImage, String> {
     let decoded = image::open(path)
-        .map_err(|err| format!("не удалось открыть изображение '{}': {err}", path.display()))?
+        .map_err(|err| tf!("paste_image.open_error", path = path.display(), err = err))?
         .to_rgba8();
     validate_rgba_image(
         usize::try_from(decoded.width()).unwrap_or(usize::MAX),
@@ -267,10 +262,7 @@ fn read_image_from_clipboard_linux_fallback() -> Result<ClipboardImage, String> 
     }
 
     if errors.is_empty() {
-        Err(format!(
-            "не удалось получить изображение из буфера через Linux clipboard helpers (session: {})",
-            session.as_str()
-        ))
+        Err(tf!("paste_image.linux_helpers_failed", session = session.as_str()))
     } else {
         Err(format!(
             "session: {}; {}",
@@ -321,7 +313,7 @@ fn has_non_empty_env_var(name: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn decode_image_from_memory(bytes: &[u8]) -> Result<ClipboardImage, String> {
     let decoded = image::load_from_memory(bytes)
-        .map_err(|err| format!("не удалось декодировать изображение из буфера: {err}"))?
+        .map_err(|err| tf!("paste_image.decode_error", err = err))?
         .to_rgba8();
     validate_rgba_image(
         usize::try_from(decoded.width()).unwrap_or(usize::MAX),
@@ -397,7 +389,7 @@ where
                     Err(error) => last_error = Some(format!("{binary} {mime_type}: {error}")),
                 }
             }
-            Err(error) => return Err(format!("{binary} недоступен: {error}")),
+            Err(error) => return Err(tf!("paste_image.binary_unavailable", binary = binary, error = error)),
         }
     }
 
@@ -413,7 +405,7 @@ fn query_wl_paste_mime_types() -> Result<Vec<String>, String> {
     let output = Command::new("wl-paste")
         .args(["--list-types"])
         .output()
-        .map_err(|err| format!("wl-paste недоступен: {err}"))?;
+        .map_err(|err| tf!("paste_image.wl_paste_unavailable", err = err))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -425,7 +417,7 @@ fn query_xclip_mime_types() -> Result<Vec<String>, String> {
     let output = Command::new("xclip")
         .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
         .output()
-        .map_err(|err| format!("xclip недоступен: {err}"))?;
+        .map_err(|err| tf!("paste_image.xclip_unavailable", err = err))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -437,7 +429,7 @@ fn query_xsel_mime_types() -> Result<Vec<String>, String> {
     let output = Command::new("xsel")
         .args(["--clipboard", "--output", "--mime-type", "TARGETS"])
         .output()
-        .map_err(|err| format!("xsel недоступен: {err}"))?;
+        .map_err(|err| tf!("paste_image.xsel_unavailable", err = err))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }

@@ -30,26 +30,26 @@ impl TypingCreatePanelState {
         id_salt: &'static str,
     ) {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new("Расширенные параметры")
+        egui::CollapsingHeader::new(t!("typing.advanced.section_header")).id_salt("typing.advanced.section_header")
             .id_salt((id_salt, self.preview_enabled))
             .default_open(false)
             .show(ui, |ui| {
                 let prev_mode = self.text_line_mode;
-                let line_mode_combo = WheelComboBox::from_label("Строка")
+                let line_mode_combo = WheelComboBox::from_label(t!("typing.advanced.line_mode_combo_label")).id_salt("typing.advanced.line_mode_combo_label")
                     .selected_text(match self.text_line_mode {
-                        TextLineMode::Horizontal => "Горизонтальная",
-                        TextLineMode::Vertical => "Вертикальная",
+                        TextLineMode::Horizontal => t!("typing.params.line_mode_horizontal"),
+                        TextLineMode::Vertical => t!("typing.params.line_mode_vertical"),
                     })
                     .show_ui_with_wheel(ui, |ui| {
                         ui.selectable_value(
                             &mut self.text_line_mode,
                             TextLineMode::Horizontal,
-                            "Горизонтальная",
+                            t!("typing.params.line_mode_horizontal"),
                         );
                         ui.selectable_value(
                             &mut self.text_line_mode,
                             TextLineMode::Vertical,
-                            "Вертикальная",
+                            t!("typing.params.line_mode_vertical"),
                         );
                     });
                 mark_hscroll_block_on_hover(
@@ -64,21 +64,21 @@ impl TypingCreatePanelState {
                 }
                 if self.text_line_mode == TextLineMode::Vertical {
                     let prev_direction = self.vertical_line_direction;
-                    let direction_combo = WheelComboBox::from_label("Расположение строк")
+                    let direction_combo = WheelComboBox::from_label(t!("typing.advanced.line_arrangement_combo_label")).id_salt("typing.advanced.line_arrangement_combo_label")
                         .selected_text(match self.vertical_line_direction {
-                            VerticalLineDirection::LeftToRight => "Слева направо",
-                            VerticalLineDirection::RightToLeft => "Справа налево",
+                            VerticalLineDirection::LeftToRight => t!("typing.params.direction_left_to_right"),
+                            VerticalLineDirection::RightToLeft => t!("typing.params.direction_right_to_left"),
                         })
                         .show_ui_with_wheel(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.vertical_line_direction,
                                 VerticalLineDirection::LeftToRight,
-                                "Слева направо",
+                                t!("typing.params.direction_left_to_right"),
                             );
                             ui.selectable_value(
                                 &mut self.vertical_line_direction,
                                 VerticalLineDirection::RightToLeft,
-                                "Справа налево",
+                                t!("typing.params.direction_right_to_left"),
                             );
                         });
                     mark_hscroll_block_on_hover(
@@ -95,29 +95,29 @@ impl TypingCreatePanelState {
                 }
 
                 let prev_layout_mode = self.text_layout_mode;
-                let layout_mode_combo = WheelComboBox::from_label("Раскладка")
+                let layout_mode_combo = WheelComboBox::from_label(t!("typing.advanced.layout_combo_label")).id_salt("typing.advanced.layout_combo_label")
                     .selected_text(match self.text_layout_mode {
-                        TextLayoutMode::Normal => "Стандартный",
-                        TextLayoutMode::Formula => "Формула",
-                        TextLayoutMode::Shape => "Форма",
-                        TextLayoutMode::CustomRasterLines => "Кастомный: векторные линии",
-                        TextLayoutMode::CustomVectorLines => "Кастомный: векторные линии",
+                        TextLayoutMode::Normal => t!("typing.advanced.layout_kind_standard"),
+                        TextLayoutMode::Formula => t!("typing.advanced.layout_kind_formula"),
+                        TextLayoutMode::Shape => t!("typing.advanced.layout_kind_shape"),
+                        TextLayoutMode::CustomRasterLines => t!("typing.advanced.layout_kind_vector_lines"),
+                        TextLayoutMode::CustomVectorLines => t!("typing.advanced.layout_kind_vector_lines"),
                     })
                     .show_ui_with_wheel(ui, |ui| {
                         ui.selectable_value(
                             &mut self.text_layout_mode,
                             TextLayoutMode::Normal,
-                            "Стандартный",
+                            t!("typing.advanced.layout_kind_standard"),
                         );
                         ui.selectable_value(
                             &mut self.text_layout_mode,
                             TextLayoutMode::Formula,
-                            "Формула",
+                            t!("typing.advanced.layout_kind_formula"),
                         );
                         ui.selectable_value(
                             &mut self.text_layout_mode,
                             TextLayoutMode::CustomVectorLines,
-                            "Кастомный: векторные линии",
+                            t!("typing.advanced.layout_kind_vector_lines"),
                         );
                     });
                 mark_hscroll_block_on_hover(
@@ -151,7 +151,7 @@ impl TypingCreatePanelState {
                     TextLayoutMode::CustomVectorLines => {
                         ui.add_space(4.0);
                         ui.label(
-                            "Для управления векторной кастомной раскладкой войдите в этот режим через меню ЛКМ",
+                            t!("typing.advanced.vector_layout_hint"),
                         );
                     }
                 }
@@ -167,14 +167,14 @@ impl TypingCreatePanelState {
         ui.add_space(4.0);
         let mut formula_direct_edit_changed = false;
         ui.horizontal(|ui| {
-            ui.label("Пресет:");
+            ui.label(t!("typing.advanced.formula_preset_label"));
             let mut names: Vec<String> = self.formula_presets_by_name.keys().cloned().collect();
             names.sort();
             let prev_selected = self.selected_formula_preset_name.clone();
             let selected_text = self
                 .selected_formula_preset_name
                 .as_deref()
-                .unwrap_or(TEXT_PRESET_NONE_LABEL);
+                .unwrap_or(text_preset_none_label());
             let preset_len = names.len() + 1;
             let mut preset_idx = self
                 .selected_formula_preset_name
@@ -187,7 +187,7 @@ impl TypingCreatePanelState {
                     .selected_text(selected_text)
                     .show_ui_with_wheel(ui, |ui| {
                         if ui
-                            .selectable_label(preset_idx == 0, TEXT_PRESET_NONE_LABEL)
+                            .selectable_label(preset_idx == 0, text_preset_none_label())
                             .clicked()
                         {
                             preset_idx = 0;
@@ -218,18 +218,18 @@ impl TypingCreatePanelState {
             let preset_name_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.formula_preset_name_input)
                     .id_salt(("typing_formula_preset_name_input", self.preview_enabled))
-                    .hint_text("Сохранить пресет")
+                    .hint_text(t!("typing.presets.save_preset_button"))
                     .desired_width((ui.available_width() - 96.0).max(120.0)),
             );
             self.track_text_input(&preset_name_resp);
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &preset_name_resp);
-            if ui.button("Сохранить").clicked() {
+            if ui.button(t!("typing.presets.save_button")).clicked() {
                 self.save_current_formula_preset();
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label("Формула:");
+            ui.label(t!("typing.advanced.formula_label"));
             let x_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.formula_layout.x_expr)
                     .hint_text("x(t, ...)")
@@ -242,7 +242,7 @@ impl TypingCreatePanelState {
 
             let swap_resp = ui
                 .small_button("⇄")
-                .on_hover_text("Поменять выражения X и Y местами.");
+                .on_hover_text(t!("typing.advanced.swap_xy_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &swap_resp);
             if swap_resp.clicked() {
                 self.swap_formula_xy_expressions();
@@ -279,15 +279,15 @@ impl TypingCreatePanelState {
         });
 
         if self.formula_help_open {
-            ui.label("Переменные: t/u/i/n/s/line/line_t/line_n/w/fs/a..h/pi/tau/math_e");
-            ui.label("Функции: sin cos tan asin acos atan atan2 sqrt abs exp ln log min max clamp pow rad deg floor ceil round sign.");
-            ui.label("`t` пробегает диапазон [t_start..t_end], `rot` задаётся в радианах.");
-            ui.label("Символы теперь раскладываются по длине кривой: короткая строка центрируется на участке, длинная сжимается в его длину.");
+            ui.label(t!("typing.advanced.formula_variables_hint"));
+            ui.label(t!("typing.advanced.formula_functions_hint"));
+            ui.label(t!("typing.advanced.formula_t_range_hint"));
+            ui.label(t!("typing.advanced.formula_curve_length_hint"));
         }
 
         let tangent_resp = ui.checkbox(
             &mut self.formula_layout.use_tangent_rotation,
-            "Поворот по касательной",
+            t!("typing.advanced.tangent_rotation"),
         );
         mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &tangent_resp);
         formula_direct_edit_changed |= tangent_resp.changed();
@@ -297,19 +297,19 @@ impl TypingCreatePanelState {
             let t_start_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.t_start)
                     .speed(0.01)
-                    .prefix("Старт t "),
+                    .prefix(t!("typing.advanced.formula_t_start_label")),
             );
             let t_start_resp =
-                t_start_resp.on_hover_text("Начало диапазона параметра t для формулы.");
+                t_start_resp.on_hover_text(t!("typing.advanced.formula_t_start_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &t_start_resp);
             formula_direct_edit_changed |= t_start_resp.changed();
             *changed |= t_start_resp.changed();
             let t_end_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.t_end)
                     .speed(0.01)
-                    .prefix("Конец t "),
+                    .prefix(t!("typing.advanced.formula_t_end_label")),
             );
-            let t_end_resp = t_end_resp.on_hover_text("Конец диапазона параметра t для формулы.");
+            let t_end_resp = t_end_resp.on_hover_text(t!("typing.advanced.formula_t_end_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &t_end_resp);
             formula_direct_edit_changed |= t_end_resp.changed();
             *changed |= t_end_resp.changed();
@@ -318,20 +318,20 @@ impl TypingCreatePanelState {
             let offset_x_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.offset_x_px)
                     .speed(1.0)
-                    .prefix("Сдвиг X "),
+                    .prefix(t!("typing.advanced.formula_offset_x_label")),
             );
             let offset_x_resp =
-                offset_x_resp.on_hover_text("Сдвиг всей траектории по горизонтали в пикселях.");
+                offset_x_resp.on_hover_text(t!("typing.advanced.formula_offset_x_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &offset_x_resp);
             formula_direct_edit_changed |= offset_x_resp.changed();
             *changed |= offset_x_resp.changed();
             let offset_y_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.offset_y_px)
                     .speed(1.0)
-                    .prefix("Сдвиг Y "),
+                    .prefix(t!("typing.advanced.formula_offset_y_label")),
             );
             let offset_y_resp =
-                offset_y_resp.on_hover_text("Сдвиг всей траектории по вертикали в пикселях.");
+                offset_y_resp.on_hover_text(t!("typing.advanced.formula_offset_y_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &offset_y_resp);
             formula_direct_edit_changed |= offset_y_resp.changed();
             *changed |= offset_y_resp.changed();
@@ -340,18 +340,18 @@ impl TypingCreatePanelState {
             let scale_x_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.scale_x)
                     .speed(0.01)
-                    .prefix("Масштаб X "),
+                    .prefix(t!("typing.advanced.formula_scale_x_label")),
             );
-            let scale_x_resp = scale_x_resp.on_hover_text("Масштабирует формулу по оси X.");
+            let scale_x_resp = scale_x_resp.on_hover_text(t!("typing.advanced.formula_scale_x_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &scale_x_resp);
             formula_direct_edit_changed |= scale_x_resp.changed();
             *changed |= scale_x_resp.changed();
             let scale_y_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.scale_y)
                     .speed(0.01)
-                    .prefix("Масштаб Y "),
+                    .prefix(t!("typing.advanced.formula_scale_y_label")),
             );
-            let scale_y_resp = scale_y_resp.on_hover_text("Масштабирует формулу по оси Y.");
+            let scale_y_resp = scale_y_resp.on_hover_text(t!("typing.advanced.formula_scale_y_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &scale_y_resp);
             formula_direct_edit_changed |= scale_y_resp.changed();
             *changed |= scale_y_resp.changed();
@@ -363,7 +363,7 @@ impl TypingCreatePanelState {
             &mut formula_direct_edit_changed,
         );
 
-        ui.label("Константы формулы (a..h):");
+        ui.label(t!("typing.advanced.formula_constants_label"));
         egui::Grid::new(("typing_formula_vars_grid", self.preview_enabled)).show(ui, |ui| {
             for idx in 0..TEXT_FORMULA_USER_VAR_COUNT {
                 ui.label(format!("{} =", (b'a' + idx as u8) as char));
@@ -393,7 +393,7 @@ impl TypingCreatePanelState {
     ) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Форма:");
+            ui.label(t!("typing.advanced.shape_combo_label"));
             let prev_kind = self.shape_layout_kind;
             let mut kind_idx = match self.shape_layout_kind {
                 TypingShapeLayoutKind::Arc => 0,
@@ -406,21 +406,21 @@ impl TypingCreatePanelState {
             let combo_resp =
                 WheelComboBox::from_id_salt(("typing_shape_layout_kind", self.preview_enabled))
                     .selected_text(match self.shape_layout_kind {
-                        TypingShapeLayoutKind::Arc => "Дуга",
-                        TypingShapeLayoutKind::Circle => "Круг / эллипс",
-                        TypingShapeLayoutKind::Spiral => "Спираль",
-                        TypingShapeLayoutKind::Polygon => "Многоугольник",
-                        TypingShapeLayoutKind::Zigzag => "Зигзаг",
-                        TypingShapeLayoutKind::SCurve => "S-кривая",
+                        TypingShapeLayoutKind::Arc => t!("typing.advanced.shape_kind_arc"),
+                        TypingShapeLayoutKind::Circle => t!("typing.advanced.shape_kind_circle"),
+                        TypingShapeLayoutKind::Spiral => t!("typing.advanced.shape_kind_spiral"),
+                        TypingShapeLayoutKind::Polygon => t!("typing.advanced.shape_kind_polygon"),
+                        TypingShapeLayoutKind::Zigzag => t!("typing.advanced.shape_kind_zigzag"),
+                        TypingShapeLayoutKind::SCurve => t!("typing.advanced.shape_kind_scurve"),
                     })
                     .show_ui_with_wheel(ui, |ui| {
                         for (idx, label) in [
-                            "Дуга",
-                            "Круг / эллипс",
-                            "Спираль",
-                            "Многоугольник",
-                            "Зигзаг",
-                            "S-кривая",
+                            t!("typing.advanced.shape_kind_arc"),
+                            t!("typing.advanced.shape_kind_circle"),
+                            t!("typing.advanced.shape_kind_spiral"),
+                            t!("typing.advanced.shape_kind_polygon"),
+                            t!("typing.advanced.shape_kind_zigzag"),
+                            t!("typing.advanced.shape_kind_scurve"),
                         ]
                         .iter()
                         .enumerate()
@@ -450,7 +450,7 @@ impl TypingCreatePanelState {
         match self.shape_layout_kind {
             TypingShapeLayoutKind::Arc => {
                 ui.horizontal(|ui| {
-                    ui.label("Ориентация:");
+                    ui.label(t!("typing.advanced.orientation_label"));
                     let prev_orientation = self.arc_shape_layout.orientation;
                     let mut orientation_idx = match self.arc_shape_layout.orientation {
                         TypingArcOrientation::Horizontal => 0,
@@ -495,29 +495,29 @@ impl TypingCreatePanelState {
 
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.arc_shape_layout.length_px, 32.0..=2000.0)
-                        .text("Длина"),
+                        .text(t!("typing.advanced.shape_length_label")),
                 );
                 let width_resp =
-                    width_resp.on_hover_text("Длина дуги по основной оси раскладки текста.");
+                    width_resp.on_hover_text(t!("typing.advanced.arc_length_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.arc_shape_layout.amplitude_px, -800.0..=800.0)
-                        .text("Амплитуда"),
+                        .text(t!("typing.advanced.shape_amplitude_label")),
                 );
                 let height_resp = height_resp.on_hover_text(
-                    "Насколько дуга отклоняется от основной оси. Отрицательное значение переворачивает форму.",
+                    t!("typing.advanced.arc_amplitude_tooltip"),
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
 
                 let freq_resp = ui.add(
                     WheelSlider::new(&mut self.arc_shape_layout.frequency, 0.25..=6.0)
-                        .text("Частота"),
+                        .text(t!("typing.advanced.shape_frequency_label")),
                 );
                 let freq_resp = freq_resp.on_hover_text(
-                    "Сколько полуволн укладывается по ширине. 1.0 даёт обычную дугу, больше 1.0 превращает её в волну.",
+                    t!("typing.advanced.arc_frequency_tooltip"),
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &freq_resp);
                 *changed |= freq_resp.changed();
@@ -525,136 +525,136 @@ impl TypingCreatePanelState {
             TypingShapeLayoutKind::Circle => {
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.circle_shape_layout.width_px, 32.0..=2000.0)
-                        .text("Ширина"),
+                        .text(t!("typing.advanced.shape_width_label")),
                 );
                 let width_resp =
-                    width_resp.on_hover_text("Горизонтальный диаметр круга или эллипса.");
+                    width_resp.on_hover_text(t!("typing.advanced.circle_width_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.circle_shape_layout.height_px, 32.0..=2000.0)
-                        .text("Высота"),
+                        .text(t!("typing.advanced.shape_height_label")),
                 );
                 let height_resp = height_resp
-                    .on_hover_text("Вертикальный диаметр. Если равен ширине, получится круг.");
+                    .on_hover_text(t!("typing.advanced.circle_height_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
             }
             TypingShapeLayoutKind::Spiral => {
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.spiral_shape_layout.width_px, 32.0..=2000.0)
-                        .text("Ширина"),
+                        .text(t!("typing.advanced.shape_width_label")),
                 );
                 let width_resp =
-                    width_resp.on_hover_text("Внешний диаметр спирали по горизонтали.");
+                    width_resp.on_hover_text(t!("typing.advanced.spiral_width_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.spiral_shape_layout.height_px, 32.0..=2000.0)
-                        .text("Высота"),
+                        .text(t!("typing.advanced.shape_height_label")),
                 );
                 let height_resp =
-                    height_resp.on_hover_text("Внешний диаметр спирали по вертикали.");
+                    height_resp.on_hover_text(t!("typing.advanced.spiral_height_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
 
                 let turns_resp = ui.add(
                     WheelSlider::new(&mut self.spiral_shape_layout.turns, 0.25..=8.0)
-                        .text("Обороты"),
+                        .text(t!("typing.advanced.spiral_turns_label")),
                 );
                 let turns_resp =
-                    turns_resp.on_hover_text("Сколько витков проходит текст от центра к краю.");
+                    turns_resp.on_hover_text(t!("typing.advanced.spiral_turns_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &turns_resp);
                 *changed |= turns_resp.changed();
 
                 let inner_resp = ui.add(
                     WheelSlider::new(&mut self.spiral_shape_layout.inner_ratio, 0.0..=0.95)
-                        .text("Внутр. радиус"),
+                        .text(t!("typing.advanced.spiral_inner_radius_label")),
                 );
                 let inner_resp =
-                    inner_resp.on_hover_text("Насколько большой зазор оставлять в центре спирали.");
+                    inner_resp.on_hover_text(t!("typing.advanced.spiral_inner_radius_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &inner_resp);
                 *changed |= inner_resp.changed();
             }
             TypingShapeLayoutKind::Polygon => {
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.polygon_shape_layout.width_px, 32.0..=2000.0)
-                        .text("Ширина"),
+                        .text(t!("typing.advanced.shape_width_label")),
                 );
-                let width_resp = width_resp.on_hover_text("Горизонтальный размер многоугольника.");
+                let width_resp = width_resp.on_hover_text(t!("typing.advanced.polygon_width_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.polygon_shape_layout.height_px, 32.0..=2000.0)
-                        .text("Высота"),
+                        .text(t!("typing.advanced.shape_height_label")),
                 );
-                let height_resp = height_resp.on_hover_text("Вертикальный размер многоугольника.");
+                let height_resp = height_resp.on_hover_text(t!("typing.advanced.polygon_height_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
 
                 let sides_resp = ui.add(
-                    WheelSlider::new(&mut self.polygon_shape_layout.sides, 3..=12).text("Стороны"),
+                    WheelSlider::new(&mut self.polygon_shape_layout.sides, 3..=12).text(t!("typing.advanced.polygon_sides_label")),
                 );
                 let sides_resp =
-                    sides_resp.on_hover_text("Количество сторон у регулярного многоугольника.");
+                    sides_resp.on_hover_text(t!("typing.advanced.polygon_sides_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &sides_resp);
                 *changed |= sides_resp.changed();
             }
             TypingShapeLayoutKind::Zigzag => {
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.zigzag_shape_layout.width_px, 32.0..=2000.0)
-                        .text("Ширина"),
+                        .text(t!("typing.advanced.shape_width_label")),
                 );
-                let width_resp = width_resp.on_hover_text("Длина зигзага по горизонтали.");
+                let width_resp = width_resp.on_hover_text(t!("typing.advanced.zigzag_width_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.zigzag_shape_layout.height_px, -800.0..=800.0)
-                        .text("Высота"),
+                        .text(t!("typing.advanced.shape_height_label")),
                 );
                 let height_resp = height_resp.on_hover_text(
-                    "Амплитуда зубцов. Отрицательное значение переворачивает зигзаг.",
+                    t!("typing.advanced.zigzag_height_tooltip"),
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
 
                 let segments_resp = ui.add(
                     WheelSlider::new(&mut self.zigzag_shape_layout.segments, 0.5..=12.0)
-                        .text("Сегменты"),
+                        .text(t!("typing.advanced.zigzag_segments_label")),
                 );
                 let segments_resp =
-                    segments_resp.on_hover_text("Сколько зубцов поместится по ширине.");
+                    segments_resp.on_hover_text(t!("typing.advanced.zigzag_segments_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &segments_resp);
                 *changed |= segments_resp.changed();
             }
             TypingShapeLayoutKind::SCurve => {
                 let width_resp = ui.add(
                     WheelSlider::new(&mut self.s_curve_shape_layout.width_px, 32.0..=2000.0)
-                        .text("Ширина"),
+                        .text(t!("typing.advanced.shape_width_label")),
                 );
-                let width_resp = width_resp.on_hover_text("Длина S-кривой по горизонтали.");
+                let width_resp = width_resp.on_hover_text(t!("typing.advanced.scurve_width_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &width_resp);
                 *changed |= width_resp.changed();
 
                 let height_resp = ui.add(
                     WheelSlider::new(&mut self.s_curve_shape_layout.height_px, -800.0..=800.0)
-                        .text("Высота"),
+                        .text(t!("typing.advanced.shape_height_label")),
                 );
                 let height_resp = height_resp.on_hover_text(
-                    "Амплитуда S-кривой. Отрицательное значение переворачивает форму.",
+                    t!("typing.advanced.scurve_height_tooltip"),
                 );
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &height_resp);
                 *changed |= height_resp.changed();
 
                 let bends_resp = ui.add(
                     WheelSlider::new(&mut self.s_curve_shape_layout.bends, 0.5..=4.0)
-                        .text("Изгибы"),
+                        .text(t!("typing.advanced.scurve_curves_label")),
                 );
-                let bends_resp = bends_resp.on_hover_text("Сколько S-петель проходит по ширине.");
+                let bends_resp = bends_resp.on_hover_text(t!("typing.advanced.scurve_curves_tooltip"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &bends_resp);
                 *changed |= bends_resp.changed();
             }
@@ -663,7 +663,7 @@ impl TypingCreatePanelState {
         let mut shape_changed = false;
         let tangent_resp = ui.checkbox(
             &mut self.formula_layout.use_tangent_rotation,
-            "Поворот по касательной",
+            t!("typing.advanced.tangent_rotation"),
         );
         mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &tangent_resp);
         shape_changed |= tangent_resp.changed();
@@ -687,10 +687,10 @@ impl TypingCreatePanelState {
             let normal_resp = ui.add(
                 WheelSpinBox::new(&mut self.formula_layout.normal_offset_px)
                     .speed(0.5)
-                    .prefix("Отступ "),
+                    .prefix(t!("typing.advanced.spacing_offset_label")),
             );
             let normal_resp = normal_resp.on_hover_text(
-                "Сдвиг текста по нормали к линии: наружу или внутрь относительно траектории.",
+                t!("typing.advanced.spacing_offset_tooltip"),
             );
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &normal_resp);
             *local_changed |= normal_resp.changed();
@@ -699,10 +699,10 @@ impl TypingCreatePanelState {
                 WheelSpinBox::new(&mut self.formula_layout.letter_spacing_mul)
                     .range(0.0..=8.0)
                     .speed(0.01)
-                    .prefix("Трекинг "),
+                    .prefix(t!("typing.advanced.spacing_tracking_label")),
             );
             let spacing_resp = spacing_resp
-                .on_hover_text("Множитель реального шага между символами вдоль линии формулы.");
+                .on_hover_text(t!("typing.advanced.spacing_tracking_tooltip"));
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &spacing_resp);
             *local_changed |= spacing_resp.changed();
             *changed |= spacing_resp.changed();
@@ -712,10 +712,10 @@ impl TypingCreatePanelState {
                 WheelSpinBox::new(&mut self.formula_layout.letter_spacing_px)
                     .speed(0.25)
                     .range(-1000.0..=1000.0)
-                    .prefix("Интервал "),
+                    .prefix(t!("typing.advanced.spacing_interval_label")),
             );
             let spacing_px_resp = spacing_px_resp.on_hover_text(
-                "Дополнительное расстояние в пикселях, прибавляется к шагу между символами после tracking.",
+                t!("typing.advanced.spacing_interval_tooltip"),
             );
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &spacing_px_resp);
             *local_changed |= spacing_px_resp.changed();
@@ -742,7 +742,7 @@ impl TypingCreatePanelState {
         // Заголовок «Изначальный текст»: ▼ если развёрнут, ◀ если свёрнут.
         let source_arrow = if show_formed { "◀" } else { "▼" };
         if ui
-            .selectable_label(!show_formed, format!("Изначальный текст {source_arrow}"))
+            .selectable_label(!show_formed, tf!("typing.advanced.source_text_accordion", source_arrow = source_arrow))
             .clicked()
             && show_formed
         {
@@ -796,7 +796,7 @@ impl TypingCreatePanelState {
         // Заголовок «Сформированный текст»: ▲ если развёрнут (поле над ним), ◀ если свёрнут.
         let formed_arrow = if show_formed { "▲" } else { "◀" };
         if ui
-            .selectable_label(show_formed, format!("Сформированный текст {formed_arrow}"))
+            .selectable_label(show_formed, tf!("typing.advanced.formed_text_accordion", formed_arrow = formed_arrow))
             .clicked()
             && !show_formed
             && !self.formed_text.trim().is_empty()
@@ -815,7 +815,7 @@ impl TypingCreatePanelState {
     pub(super) fn draw_advanced_form_buttons(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Продвинутая форма текста").clicked() {
+            if ui.button(t!("typing.advanced.advanced_form_button")).clicked() {
                 self.advanced_form_open = true;
                 self.advanced_form_cache = None;
                 self.advanced_form_centered = false;
@@ -823,7 +823,7 @@ impl TypingCreatePanelState {
             // «Вернуть исходный» просто очищает сформированный текст и
             // разворачивает исходный.
             let has_formed = !self.formed_text.is_empty();
-            let revert = ui.add_enabled(has_formed, egui::Button::new("Вернуть исходный"));
+            let revert = ui.add_enabled(has_formed, egui::Button::new(t!("typing.advanced.restore_source_button")));
             if revert.clicked() {
                 self.formed_text.clear();
                 self.advanced_text_show_formed = false;
@@ -1035,7 +1035,7 @@ impl TypingCreatePanelState {
         let mut new_group = current_group;
         let mut clicked: Option<usize> = None;
 
-        let mut window = egui::Window::new("Продвинутая форма текста")
+        let mut window = egui::Window::new(t!("typing.advanced.advanced_form_window_title")).id(egui::Id::new("typing.advanced.advanced_form_window_title"))
             .open(&mut open)
             .resizable(true)
             // Над панелями параметров/действий (они на `Order::Foreground`).
@@ -1052,15 +1052,20 @@ impl TypingCreatePanelState {
                 ui.set_opacity(0.0);
             }
             ui.small(
-                "Перебор вариантов переноса. Это не финальный рендер — \
-                 просто чёрный текст на белом с висящей пунктуацией.",
+                t!("typing.advanced.form_preview_hint"),
             );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label("Форма:");
+                ui.label(t!("typing.advanced.form_shape_label"));
                 for preset in TextFormPreset::all() {
+                    // The crate returns a key for the prose preset and a literal
+                    // ASCII shape for the others; resolve the key, paint the shape.
+                    let label = match preset.label() {
+                        PresetLabel::Key(key) => crate::i18n_resolve::resolve_key(key),
+                        PresetLabel::Shape(shape) => shape,
+                    };
                     if ui
-                        .selectable_label(preset == current_preset, preset.label())
+                        .selectable_label(preset == current_preset, label)
                         .clicked()
                     {
                         new_preset = preset;
@@ -1072,9 +1077,9 @@ impl TypingCreatePanelState {
                 Some(cache) if !cache.forms.is_empty() => {
                     if cache.group_counts.len() > 1 {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label("Переносов слов:");
+                            ui.label(t!("typing.advanced.form_hyphenation_label"));
                             if ui
-                                .selectable_label(current_group.is_none(), "Все")
+                                .selectable_label(current_group.is_none(), t!("typing.advanced.form_hyphenation_all"))
                                 .clicked()
                             {
                                 new_group = None;
@@ -1095,14 +1100,14 @@ impl TypingCreatePanelState {
                     // Диапазонные фильтры: число строк и ширина строки.
                     let has_line = advanced_form_range_row(
                         ui,
-                        "Строк:",
+                        t!("typing.advanced.form_lines_label"),
                         "",
                         &mut line_range,
                         cache.line_bounds,
                     );
                     let has_width = advanced_form_range_row(
                         ui,
-                        "Ширина (усл.):",
+                        t!("typing.advanced.form_width_label"),
                         "",
                         &mut width_range,
                         cache.width_bounds,
@@ -1117,19 +1122,19 @@ impl TypingCreatePanelState {
                     if has_peak {
                         ui.add(
                             WheelSlider::new(&mut peak_max, 0..=peak_bound)
-                                .text("Длиннее базы не более чем на")
+                                .text(t!("typing.advanced.form_longer_than_base_label"))
                                 .suffix("%"),
                         );
                         ui.horizontal(|ui| {
-                            ui.label("База пиковости:");
+                            ui.label(t!("typing.advanced.form_peakiness_base_label"));
                             if ui
-                                .selectable_label(peak_base == PeakBase::Min, "минимум")
+                                .selectable_label(peak_base == PeakBase::Min, t!("typing.advanced.form_peakiness_min"))
                                 .clicked()
                             {
                                 peak_base = PeakBase::Min;
                             }
                             if ui
-                                .selectable_label(peak_base == PeakBase::Median, "медиана")
+                                .selectable_label(peak_base == PeakBase::Median, t!("typing.advanced.form_peakiness_median"))
                                 .clicked()
                             {
                                 peak_base = PeakBase::Median;
@@ -1143,7 +1148,7 @@ impl TypingCreatePanelState {
                     if has_uneven {
                         ui.add(
                             WheelSlider::new(&mut uneven_max, 0..=uneven_bound)
-                                .text("Неравномерность не более")
+                                .text(t!("typing.advanced.form_unevenness_label"))
                                 .suffix("%"),
                         );
                     }
@@ -1153,15 +1158,16 @@ impl TypingCreatePanelState {
                     let has_conservatism = cache.conservatism_bound > Conservatism::Safe;
                     if has_conservatism {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label("Отрыв служебных слов:");
+                            ui.label(t!("typing.advanced.form_orphan_words_label"));
                             for level in Conservatism::all() {
                                 if level > cache.conservatism_bound {
                                     break;
                                 }
                                 let text = if level == Conservatism::Safe {
-                                    "нет".to_string()
+                                    t!("typing.advanced.form_orphan_words_none").to_string()
                                 } else {
-                                    format!("+ {}", level.label())
+                                    // Crate hands a catalog key; resolve to active-locale label.
+                                    format!("+ {}", crate::i18n_resolve::resolve_key(level.label_key()))
                                 };
                                 if ui
                                     .selectable_label(conservatism_max == level, text)
@@ -1173,7 +1179,7 @@ impl TypingCreatePanelState {
                         });
                     }
                     if (has_line || has_width || has_peak || has_uneven || has_conservatism)
-                        && ui.small_button("Сбросить фильтры").clicked()
+                        && ui.small_button(t!("typing.advanced.form_reset_filters_button")).clicked()
                     {
                         line_range = cache.line_bounds;
                         width_range = cache.width_bounds;
@@ -1195,12 +1201,12 @@ impl TypingCreatePanelState {
                     let visible = cache.forms.iter().filter(|form| passes(form)).count();
                     let shown = visible.min(ADVANCED_FORM_DISPLAY_LIMIT);
                     let mut status = if shown < visible {
-                        format!("Вариантов: {visible}, показаны первые {shown}.")
+                        tf!("typing.advanced.form_variants_shown_status", visible = visible, shown = shown)
                     } else {
-                        format!("Вариантов: {visible}.")
+                        tf!("typing.advanced.form_variants_status", visible = visible)
                     };
                     if cache.truncated {
-                        status.push_str(" Перебор форм неполный (достигнут предел).");
+                        status.push_str(t!("typing.advanced.form_variants_incomplete_status"));
                     }
                     ui.small(status);
                     ui.add_space(4.0);
@@ -1227,10 +1233,10 @@ impl TypingCreatePanelState {
                         });
                 }
                 Some(_) => {
-                    ui.label("Нет вариантов, удовлетворяющих этой форме.");
+                    ui.label(t!("typing.advanced.form_no_variants_status"));
                 }
                 None => {
-                    ui.label("Введите текст, чтобы подобрать формы.");
+                    ui.label(t!("typing.advanced.form_enter_text_status"));
                 }
             }
         });

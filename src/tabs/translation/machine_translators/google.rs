@@ -60,7 +60,7 @@ impl MachineTranslatorBackend for GoogleMtBackend {
         _target_lang: &str,
         _texts: Vec<String>,
     ) -> Result<Vec<Result<String, String>>, String> {
-        Err("Перевод через Google недоступен в веб-версии.".to_string())
+        Err(t!("translation.mt.google.web_unavailable_error").to_string())
     }
 }
 

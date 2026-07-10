@@ -37,7 +37,7 @@ impl TypingCreatePanelState {
                 if let Some(missing) = self.missing_font.clone() {
                     ui.colored_label(
                         Color32::from_rgb(240, 110, 110),
-                        format!("⚠ Шрифт «{missing}» не найден среди доступных."),
+                        tf!("typing.edit.font_missing_warning", missing = missing),
                     );
                     ui.add_space(4.0);
                 }
@@ -53,7 +53,7 @@ impl TypingCreatePanelState {
                 let selection_mode = self.inline_selection_context().is_some();
                 ui.add_enabled_ui(!selection_mode && !font_missing, |ui| {
                     let width_resp = ui
-                        .add(WheelSlider::new(&mut self.width_px, 16..=4096).text("Ширина (px)"));
+                        .add(WheelSlider::new(&mut self.width_px, 16..=4096).text(t!("typing.params.width_px_label")));
                     mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &width_resp);
                     changed |= width_resp.changed();
                     if let Some(steps) = wheel_steps_if_hovered(ui, &width_resp) {
@@ -61,7 +61,7 @@ impl TypingCreatePanelState {
                     }
 
                     let scale_resp = ui.add(
-                        WheelSlider::new(&mut self.overlay_scale, 0.05..=20.0).text("Масштаб"),
+                        WheelSlider::new(&mut self.overlay_scale, 0.05..=20.0).text(t!("typing.params.scale_label")),
                     );
                     mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &scale_resp);
                     changed |= scale_resp.changed();
@@ -77,7 +77,7 @@ impl TypingCreatePanelState {
 
                     let angle_resp = ui.add(
                         WheelSlider::new(&mut self.overlay_rotation_deg, -180.0..=180.0)
-                            .text("Угол (°)"),
+                            .text(t!("typing.params.angle_label")),
                     );
                     mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &angle_resp);
                     changed |= angle_resp.changed();
@@ -103,7 +103,7 @@ impl TypingCreatePanelState {
                 if selection_mode {
                     ui.add_space(4.0);
                     ui.small(
-                        "При выделении `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Выравнивание`, `Bold`, `Italic`, `Не разрывать` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
+                        t!("typing.edit.inline_tags_hint"),
                     );
                 }
             });
@@ -181,7 +181,7 @@ impl TypingCreatePanelState {
                                         ui.set_width(ui.available_width());
                                         ui.set_min_width(ui.available_width());
                                         ui.set_max_width(ui.available_width());
-                                        ui.label(egui::RichText::new("Шрифт").strong());
+                                        ui.label(egui::RichText::new(t!("typing.params.font_label")).strong());
                                         ui.horizontal(|ui| {
                                             let prev_font_idx = self.selected_font_idx;
                                             let selected_font_text = inline_style
@@ -192,7 +192,7 @@ impl TypingCreatePanelState {
                                                         .get(self.selected_font_idx)
                                                         .map(|font| font.label.as_str())
                                                 })
-                                                .unwrap_or("<шрифт>");
+                                                .unwrap_or(t!("typing.params.font_placeholder"));
                                             let mut font_idx = inline_style
                                                 .as_ref()
                                                 .and_then(|style| {
@@ -203,7 +203,7 @@ impl TypingCreatePanelState {
                                                 })
                                                 .unwrap_or(self.selected_font_idx);
                                             let font_count = self.fonts.len();
-                                            let font_combo = WheelComboBox::from_label("Шрифт")
+                                            let font_combo = WheelComboBox::from_label(t!("typing.edit.font_combo_id")).id_salt("typing.edit.font_combo_id")
                                                 .selected_text(selected_font_text)
                                                 .show_ui_with_wheel(ui, |ui| {
                                                     for idx in 0..self.fonts.len() {
@@ -322,7 +322,7 @@ impl TypingCreatePanelState {
                                                             &mut self.width_px,
                                                             16..=4096,
                                                         )
-                                                        .text("Ширина (px)"),
+                                                        .text(t!("typing.params.width_px_label")),
                                                     );
                                                     mark_hscroll_block_on_hover(
                                                         &mut block_hscroll_by_hovered_param,
@@ -346,7 +346,7 @@ impl TypingCreatePanelState {
                                                             &mut self.overlay_scale,
                                                             0.05..=20.0,
                                                         )
-                                                        .text("Масштаб"),
+                                                        .text(t!("typing.params.scale_label")),
                                                     );
                                                     mark_hscroll_block_on_hover(
                                                         &mut block_hscroll_by_hovered_param,
@@ -370,7 +370,7 @@ impl TypingCreatePanelState {
                                                             &mut self.overlay_rotation_deg,
                                                             -180.0..=180.0,
                                                         )
-                                                        .text("Угол (°)"),
+                                                        .text(t!("typing.params.angle_label")),
                                                     );
                                                     mark_hscroll_block_on_hover(
                                                         &mut block_hscroll_by_hovered_param,
@@ -410,7 +410,7 @@ impl TypingCreatePanelState {
                                                             &mut font_size_px,
                                                             1.0..=256.0,
                                                         )
-                                                        .text("Размер (px)")
+                                                        .text(t!("typing.params.size_px_label"))
                                                         .wheel_step(1.0),
                                                     );
                                                     changed |= font_size_resp.changed();
@@ -421,7 +421,7 @@ impl TypingCreatePanelState {
                                                             &mut self.font_size_px,
                                                             1.0..=256.0,
                                                         )
-                                                        .text("Размер (px)")
+                                                        .text(t!("typing.params.size_px_label"))
                                                         .wheel_step(1.0),
                                                     );
                                                     changed |= font_size_resp.changed();
@@ -438,7 +438,7 @@ impl TypingCreatePanelState {
                                                         .unwrap_or(self.line_spacing);
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Межстрочный отступ",
+                                                        t!("typing.params.line_spacing_label"),
                                                         &mut line_spacing,
                                                         PxOrPercentRowCfg {
                                                             range: -300.0..=300.0,
@@ -451,16 +451,16 @@ impl TypingCreatePanelState {
                                                     style.line_spacing = Some(line_spacing);
 
                                                     ui.horizontal(|ui| {
-                                                        ui.label("Кернинг");
+                                                        ui.label(t!("typing.params.kerning_label"));
                                                         // Read-only global kerning-mode indicator; Optical not offered.
                                                         ui.add_enabled(
                                                             false,
-                                                            egui::Button::new("Метрический")
+                                                            egui::Button::new(t!("typing.params.kerning_metric"))
                                                                 .selected(self.kerning_mode == KerningMode::Fixed),
                                                         );
                                                         ui.add_enabled(
                                                             false,
-                                                            egui::Button::new("Авто")
+                                                            egui::Button::new(t!("typing.params.kerning_auto"))
                                                                 .selected(self.kerning_mode == KerningMode::Auto),
                                                         );
                                                     });
@@ -470,7 +470,7 @@ impl TypingCreatePanelState {
                                                         .unwrap_or(self.kerning);
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Кернинг",
+                                                        t!("typing.params.kerning_label"),
                                                         &mut kerning,
                                                         PxOrPercentRowCfg {
                                                             range: -300.0..=300.0,
@@ -487,7 +487,7 @@ impl TypingCreatePanelState {
                                                         .unwrap_or([self.glyph_width, self.glyph_height]);
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Высота символа",
+                                                        t!("typing.params.char_height_label"),
                                                         &mut stretching[1],
                                                         PxOrPercentRowCfg {
                                                             range: 1.0..=300.0,
@@ -499,7 +499,7 @@ impl TypingCreatePanelState {
                                                     );
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Ширина символа",
+                                                        t!("typing.params.char_width_label"),
                                                         &mut stretching[0],
                                                         PxOrPercentRowCfg {
                                                             range: 1.0..=300.0,
@@ -519,7 +519,7 @@ impl TypingCreatePanelState {
                                                 } else {
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Межстрочный отступ",
+                                                        t!("typing.params.line_spacing_label"),
                                                         &mut self.line_spacing,
                                                         PxOrPercentRowCfg {
                                                             range: -300.0..=300.0,
@@ -530,14 +530,14 @@ impl TypingCreatePanelState {
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
                                                     ui.horizontal(|ui| {
-                                                        ui.label("Кернинг");
+                                                        ui.label(t!("typing.params.kerning_label"));
                                                         // Optical is implemented but not offered here; only Fixed/Auto are user-selectable.
-                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Fixed, "Метрический").changed();
-                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Auto, "Авто").changed();
+                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Fixed, t!("typing.params.kerning_metric")).changed();
+                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Auto, t!("typing.params.kerning_auto")).changed();
                                                     });
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Кернинг",
+                                                        t!("typing.params.kerning_label"),
                                                         &mut self.kerning,
                                                         PxOrPercentRowCfg {
                                                             range: -300.0..=300.0,
@@ -549,7 +549,7 @@ impl TypingCreatePanelState {
                                                     );
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Высота символа",
+                                                        t!("typing.params.char_height_label"),
                                                         &mut self.glyph_height,
                                                         PxOrPercentRowCfg {
                                                             range: 1.0..=300.0,
@@ -561,7 +561,7 @@ impl TypingCreatePanelState {
                                                     );
                                                     px_or_percent_param_row(
                                                         ui,
-                                                        "Ширина символа",
+                                                        t!("typing.params.char_width_label"),
                                                         &mut self.glyph_width,
                                                         PxOrPercentRowCfg {
                                                             range: 1.0..=300.0,
@@ -601,19 +601,19 @@ impl TypingCreatePanelState {
                                         }
 
                                         let prev_shape = self.text_shape;
-                                        let shape_combo = WheelComboBox::from_label("Форма")
+                                        let shape_combo = WheelComboBox::from_label(t!("typing.edit.shape_combo_id")).id_salt("typing.edit.shape_combo_id")
                                             .selected_text(match self.text_shape {
-                                                TextShape::Free => "Свободно",
+                                                TextShape::Free => t!("typing.params.shape_free_option"),
                                                 TextShape::Rectangle => "[  ]",
                                                 TextShape::Oval => "(  )",
                                                 TextShape::Hexagon => "<  >",
-                                                TextShape::SoftPeak => "Мягкая",
+                                                TextShape::SoftPeak => t!("typing.params.shape_soft_option"),
                                             })
                                             .show_ui_with_wheel(ui, |ui| {
                                                 ui.selectable_value(
                                                     &mut self.text_shape,
                                                     TextShape::Free,
-                                                    "Свободно",
+                                                    t!("typing.params.shape_free_option"),
                                                 );
                                                 ui.selectable_value(
                                                     &mut self.text_shape,
@@ -633,7 +633,7 @@ impl TypingCreatePanelState {
                                                 ui.selectable_value(
                                                     &mut self.text_shape,
                                                     TextShape::SoftPeak,
-                                                    "Мягкая",
+                                                    t!("typing.params.shape_soft_option"),
                                                 );
                                             });
                                         mark_hscroll_block_on_hover(
@@ -649,7 +649,7 @@ impl TypingCreatePanelState {
                                         }
 
                                         let prev_wrap_mode = self.text_wrap_mode;
-                                        let wrap_combo = WheelComboBox::from_label("Перенос")
+                                        let wrap_combo = WheelComboBox::from_label(t!("typing.edit.wrap_combo_id")).id_salt("typing.edit.wrap_combo_id")
                                             .selected_text(text_wrap_mode_label(
                                                 self.text_wrap_mode,
                                             ))
@@ -694,7 +694,7 @@ impl TypingCreatePanelState {
                                         }
 
                                         let prev_anti_aliasing = self.anti_aliasing;
-                                        let aa_combo = WheelComboBox::from_label("Сглаживание")
+                                        let aa_combo = WheelComboBox::from_label(t!("typing.edit.antialias_combo_id")).id_salt("typing.edit.antialias_combo_id")
                                             .selected_text(anti_aliasing_label(self.anti_aliasing))
                                             .show_ui_with_wheel(ui, |ui| {
                                                 ui.selectable_value(
@@ -740,7 +740,7 @@ impl TypingCreatePanelState {
                                             self.moderate_trees_checkbox_enabled(),
                                             egui::Checkbox::new(
                                                 &mut self.allow_moderate_trees,
-                                                "Разрешить умеренные ёлки",
+                                                t!("typing.params.allow_moderate_herringbone"),
                                             ),
                                         );
                                         changed |= moderate_trees_resp.changed();
@@ -754,7 +754,7 @@ impl TypingCreatePanelState {
                                                     &mut self.shape_min_width_percent,
                                                     5.0..=100.0,
                                                 )
-                                                .text("Минимальная ширина (%)"),
+                                                .text(t!("typing.params.min_width_percent_label")),
                                             );
                                             mark_hscroll_block_on_hover(
                                                 &mut block_hscroll_by_hovered_param,
@@ -776,7 +776,7 @@ impl TypingCreatePanelState {
                                         if self.text_shape == TextShape::SoftPeak {
                                             let variant_resp = ui.add(
                                                 WheelSlider::new(&mut self.shape_variant, 1..=9)
-                                                    .text("Вариант формы"),
+                                                    .text(t!("typing.params.shape_variant_label")),
                                             );
                                             mark_hscroll_block_on_hover(
                                                 &mut block_hscroll_by_hovered_param,
@@ -816,7 +816,7 @@ impl TypingCreatePanelState {
 
                                             let mut no_break = style.no_break;
                                             let no_break_resp =
-                                                ui.checkbox(&mut no_break, "Не разрывать");
+                                                ui.checkbox(&mut no_break, t!("typing.params.no_break"));
                                             mark_hscroll_block_on_hover(
                                                 &mut block_hscroll_by_hovered_param,
                                                 &no_break_resp,
@@ -841,7 +841,7 @@ impl TypingCreatePanelState {
                                         }
                                         let hanging_punct_resp = ui.checkbox(
                                             &mut self.hanging_punctuation,
-                                            "Висящая пунктуация",
+                                            t!("typing.params.hanging_punctuation"),
                                         );
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
@@ -850,7 +850,7 @@ impl TypingCreatePanelState {
                                         changed |= hanging_punct_resp.changed();
                                         let trim_spaces_resp = ui.checkbox(
                                             &mut self.trim_extra_spaces,
-                                            "Удалять лишние пробелы",
+                                            t!("typing.params.strip_extra_spaces"),
                                         );
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
@@ -859,7 +859,7 @@ impl TypingCreatePanelState {
                                         changed |= trim_spaces_resp.changed();
                                         let sentence_nl_resp = ui.checkbox(
                                             &mut self.new_line_after_sentence,
-                                            "Новая строка после конца предложения",
+                                            t!("typing.params.newline_after_sentence"),
                                         );
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
@@ -868,7 +868,7 @@ impl TypingCreatePanelState {
                                         changed |= sentence_nl_resp.changed();
                                         let uppercase_text_resp = ui.checkbox(
                                             &mut self.uppercase_text,
-                                            "Всё в верхнем регистре",
+                                            t!("typing.params.all_uppercase"),
                                         );
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
@@ -877,7 +877,7 @@ impl TypingCreatePanelState {
                                         changed |= uppercase_text_resp.changed();
                                         let inline_tags_resp = ui.checkbox(
                                             &mut self.enable_inline_style_tags,
-                                            "Парсить теги <b>/<i> в тексте",
+                                            t!("typing.params.parse_bi_tags"),
                                         );
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
@@ -901,7 +901,7 @@ impl TypingCreatePanelState {
             if selection_mode {
                 ui.add_space(4.0);
                 ui.small(
-                    "При выделении `Цвет`, `Шрифт`, `Размер`, `Межстрочный отступ`, `Кернинг`, `Высота/Ширина символа`, `Выравнивание`, `Bold`, `Italic`, `Не разрывать` и `Смещение X/Y` меняют inline-теги; остальные параметры редактируют базовый стиль.",
+                    t!("typing.edit.inline_tags_hint_with_color"),
                 );
             }
 
@@ -1119,7 +1119,7 @@ impl TypingCreatePanelState {
     ) -> TypingInlineTagStyle {
         let base_font_label = self
             .font_label_by_idx(self.selected_font_idx)
-            .unwrap_or_else(|| "<шрифт>".to_string());
+            .unwrap_or_else(|| t!("typing.params.font_placeholder").to_string());
         TypingInlineTagStyle {
             bold: selection.style.bold || self.force_bold,
             italic: selection.style.italic || self.force_italic,

@@ -257,14 +257,13 @@ impl EffectDefaultsEditorState {
         self.ensure_initialized();
 
         ui.label(
-            "Значения по умолчанию для эффектов. Новая карточка эффекта создаётся с этими \
-             параметрами. «Сбросить к встроенным» возвращает заводские значения.",
+            t!("typing.effect_defaults.description_hint"),
         );
         ui.add_space(4.0);
 
         let any_override = self.entries.iter().any(|entry| entry.has_override);
         if ui
-            .add_enabled(any_override, egui::Button::new("Сбросить все"))
+            .add_enabled(any_override, egui::Button::new(t!("typing.effect_defaults.reset_all_button")))
             .clicked()
         {
             for entry in &mut self.entries {
@@ -301,7 +300,7 @@ impl EffectDefaultsEditorState {
                     if ui
                         .add_enabled(
                             self.entries[idx].has_override,
-                            egui::Button::new("Сбросить к встроенным"),
+                            egui::Button::new(t!("typing.effect_defaults.reset_to_builtin_button")),
                         )
                         .clicked()
                     {

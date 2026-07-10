@@ -297,7 +297,7 @@ impl TypingMaskLayer {
             Err(TryRecvError::Disconnected) => {
                 self.loading_rx = None;
                 self.loading_project_dir = None;
-                self.set_error(ctx, "Не удалось получить результат загрузки масок.");
+                self.set_error(ctx, t!("typing.mask.load_result_error"));
                 true
             }
         }
@@ -312,7 +312,7 @@ impl TypingMaskLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновое сохранение маски завершилось с ошибкой канала.".to_string(),
+                    t!("typing.mask.save_channel_error").to_string(),
                 )),
             }
         };
@@ -340,7 +340,7 @@ impl TypingMaskLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновая заливка маски завершилась с ошибкой канала.".to_string(),
+                    t!("typing.mask.fill_channel_error").to_string(),
                 )),
             }
         };
@@ -359,7 +359,7 @@ impl TypingMaskLayer {
                 {
                     self.set_error(
                         ctx,
-                        "Результат заливки устарел: размер маски страницы изменился.",
+                        t!("typing.mask.fill_result_stale_error"),
                     );
                     return true;
                 }
@@ -418,8 +418,8 @@ impl TypingMaskLayer {
                 ui.set_min_width(MASK_PANEL_WIDTH_PX);
                 ui.set_max_width(MASK_PANEL_WIDTH_PX);
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Маска обрезки").strong());
-                    ui.label(format!("Страница: {}", current_page_idx.saturating_add(1)));
+                    ui.label(egui::RichText::new(t!("typing.mask.panel_title")).strong());
+                    ui.label(tf!("typing.mask.page_status", current_page_idx = current_page_idx.saturating_add(1)));
                     if !self.fill_mode {
                         let mut radius = self.mask_brush.radius_px();
                         if ui
@@ -429,7 +429,7 @@ impl TypingMaskLayer {
                                     MASK_BRUSH_SLIDER_MIN_RADIUS_PX
                                         ..=MASK_BRUSH_SLIDER_MAX_RADIUS_PX,
                                 )
-                                .text("Кисть (px)"),
+                                .text(t!("typing.mask.brush_px_label")),
                             )
                             .changed()
                         {
@@ -443,16 +443,16 @@ impl TypingMaskLayer {
                                 &mut tolerance,
                                 MASK_FILL_TOLERANCE_MIN..=MASK_FILL_TOLERANCE_MAX,
                             )
-                            .text("Допуск цвета"),
+                            .text(t!("typing.mask.color_tolerance_label")),
                         )
                         .changed()
                     {
                         self.fill_tolerance = tolerance;
                     }
                     let fill_button_label = if self.fill_mode {
-                        "Отменить заливку"
+                        t!("typing.mask.undo_fill_button")
                     } else {
-                        "Заливка маски"
+                        t!("typing.mask.fill_button")
                     };
                     if ui.button(fill_button_label).clicked() {
                         self.fill_mode = !self.fill_mode;
@@ -463,22 +463,22 @@ impl TypingMaskLayer {
                         ctx.request_repaint();
                     }
                     if self.fill_job_rx.is_some() {
-                        ui.label("Заливка: обработка...");
+                        ui.label(t!("typing.mask.fill_processing_status"));
                     }
                     let clear_enabled = self.masks.contains_key(&current_page_idx);
                     if ui
-                        .add_enabled(clear_enabled, egui::Button::new("Очистить маску страницы"))
+                        .add_enabled(clear_enabled, egui::Button::new(t!("typing.mask.clear_page_button")))
                         .clicked()
                     {
                         self.clear_mask_page(current_page_idx);
                     }
                     ui.separator();
                     if self.fill_mode {
-                        ui.label("ЛКМ: залить область по цвету");
-                        ui.label("Курсор: крестик");
+                        ui.label(t!("typing.mask.hint_fill_by_color"));
+                        ui.label(t!("typing.mask.hint_cursor_crosshair"));
                     } else {
-                        ui.label("ЛКМ: рисовать");
-                        ui.label("ПКМ или Shift+ЛКМ: стирать");
+                        ui.label(t!("typing.mask.hint_draw"));
+                        ui.label(t!("typing.mask.hint_erase"));
                     }
                     if let Some((message, _)) = self.status_error.as_ref() {
                         ui.separator();
@@ -849,12 +849,12 @@ impl TypingMaskLayer {
         scene_pos: Pos2,
     ) -> Result<(), String> {
         let Some(mask) = self.ensure_mask_for_paint(page_idx, image_rect, zoom) else {
-            return Err("Не удалось подготовить маску страницы для заливки.".to_string());
+            return Err(t!("typing.mask.prepare_page_error").to_string());
         };
         let Some((seed_xf, seed_yf)) =
             scene_to_mask_px(image_rect, mask.width, mask.height, scene_pos)
         else {
-            return Err("Точка заливки вне области страницы.".to_string());
+            return Err(t!("typing.mask.fill_point_outside_error").to_string());
         };
         let seed_x = seed_xf
             .round()
@@ -866,7 +866,7 @@ impl TypingMaskLayer {
         let height = mask.height;
         let mask_data = mask.data.clone();
         let Some(overlays_model) = self.overlays_model.as_ref().cloned() else {
-            return Err("Кэш clean overlay недоступен: модель не подключена.".to_string());
+            return Err(t!("typing.mask.clean_overlay_unavailable_error").to_string());
         };
         let tolerance = self.fill_tolerance;
 
@@ -1165,20 +1165,20 @@ fn flood_fill_mask_from_seed(
     source_rgba: Vec<u8>,
 ) -> Result<TypingMaskFillJobResult, String> {
     if width == 0 || height == 0 {
-        return Err("Нельзя выполнить заливку: размер страницы равен 0.".to_string());
+        return Err(t!("typing.mask.fill_zero_page_error").to_string());
     }
     let expected_mask = width.saturating_mul(height);
     if mask_data.len() != expected_mask {
         return Err(
-            "Нельзя выполнить заливку: размер маски не совпадает с размером страницы.".to_string(),
+            t!("typing.mask.fill_mask_size_mismatch_error").to_string(),
         );
     }
     let expected_rgba = expected_mask.saturating_mul(4);
     if source_rgba.len() != expected_rgba {
-        return Err("Нельзя выполнить заливку: размер кэшированного изображения не совпадает с размером маски.".to_string());
+        return Err(t!("typing.mask.fill_cache_size_mismatch_error").to_string());
     }
     if seed_x >= width || seed_y >= height {
-        return Err("Нельзя выполнить заливку: точка вне границ страницы.".to_string());
+        return Err(t!("typing.mask.fill_point_out_of_bounds_error").to_string());
     }
 
     let seed_idx = seed_y.saturating_mul(width).saturating_add(seed_x);
@@ -1266,11 +1266,11 @@ fn build_fill_source_from_cache_model(
 ) -> Result<Vec<u8>, String> {
     let mut locked = model
         .lock()
-        .map_err(|_| "Не удалось получить доступ к кэшу clean overlay.".to_string())?;
+        .map_err(|_| t!("typing.errors.clean_overlay_cache_unavailable").to_string())?;
 
     let Some(page_rgba) = locked.cached_page_rgba(page_idx) else {
         return Err(
-            "Страница ещё не готова в кэше. Подождите загрузку и повторите заливку.".to_string(),
+            t!("typing.mask.page_not_ready_error").to_string(),
         );
     };
 
@@ -1452,7 +1452,7 @@ fn load_masks_from_text_images_dir(
     let mut pages = Vec::<TypingMaskLoadedPage>::new();
     let entries = store
         .read_dir(dir_str.as_ref())
-        .map_err(|err| format!("Не удалось прочитать {}: {err}", text_images_dir.display()))?;
+        .map_err(|err| tf!("typing.mask.read_dir_error", text_images_dir = text_images_dir.display(), err = err))?;
     for entry in entries {
         if entry.is_dir {
             continue;
@@ -1498,10 +1498,7 @@ fn save_masks_to_text_images_dir(
     let store = crate::storage::storage();
     let dir_str = text_images_dir.to_string_lossy();
     store.create_dir_all(dir_str.as_ref()).map_err(|err| {
-        format!(
-            "Не удалось создать папку {}: {err}",
-            text_images_dir.display()
-        )
+        tf!("typing.mask.create_dir_error", text_images_dir = text_images_dir.display(), err = err)
     })?;
     for page in pages {
         if page.width == 0 || page.height == 0 {
@@ -1526,10 +1523,10 @@ fn save_masks_to_text_images_dir(
                 page.height as u32,
                 image::ColorType::Rgba8.into(),
             )
-            .map_err(|err| format!("Не удалось сохранить {}: {err}", out_path.display()))?;
+            .map_err(|err| tf!("typing.mask.save_error", out_path = out_path.display(), err = err))?;
         store
             .write(out_path.to_string_lossy().as_ref(), &buf)
-            .map_err(|err| format!("Не удалось сохранить {}: {err}", out_path.display()))?;
+            .map_err(|err| tf!("typing.mask.save_error", out_path = out_path.display(), err = err))?;
     }
     Ok(())
 }

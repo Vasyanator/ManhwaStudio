@@ -54,7 +54,12 @@ pub enum BuildCategory {
 pub struct OrtBuild {
     /// Stable slug, e.g. `"cpu"`, `"cuda13"`. Shared with the manifest `build` field.
     pub slug: &'static str,
-    /// Human-readable Russian name shown in the panel.
+    /// Panel display label. For most builds this is a plain product name (never
+    /// localized — `"CPU"`, `"CUDA 12 + TensorRT"`, …). When the label needs
+    /// localization it instead holds a catalog KEY, resolved by
+    /// [`OrtBuild::display_label`] (a plain product name is never a catalog key, so
+    /// the lookup misses and falls back to the literal). Read it via `display_label`,
+    /// not directly, so the localized case is handled.
     pub display_name: &'static str,
     /// The onnxruntime release version this build ships (e.g. `"1.27.0"`).
     pub onnx_version: &'static str,
@@ -147,7 +152,9 @@ static BUILDS: &[OrtBuild] = &[
     },
     OrtBuild {
         slug: "qnn",
-        display_name: "QNN (Qualcomm, только Snapdragon)",
+        // A catalog KEY, not a literal: `t!` cannot run in this const array, so the
+        // label is localized at read time by `OrtBuild::display_label`.
+        display_name: "onnx_runtime.builds.qnn_label",
         // Informational: the QNN EP ships only for Windows-on-ARM (Snapdragon) and is
         // NOT runnable on x86_64. No binary is offered here (no manifest entry, no EP);
         // this row exists solely so the panel can list it under "Недоступные".
@@ -157,6 +164,19 @@ static BUILDS: &[OrtBuild] = &[
         platforms: &[],
     },
 ];
+
+impl OrtBuild {
+    /// The localized panel label for this build.
+    ///
+    /// `display_name` is either a plain product name or a catalog key (see the field
+    /// docs). Resolving through `ms_i18n::lookup` with a fallback to the literal
+    /// handles both: a product name is never a catalog key, so it falls through
+    /// unchanged, while a key resolves to its localized value.
+    #[must_use]
+    pub fn display_label(&self) -> &'static str {
+        ms_i18n::lookup(self.display_name).unwrap_or(self.display_name)
+    }
+}
 
 /// The full ONNX Runtime build catalog in panel display order.
 #[must_use]

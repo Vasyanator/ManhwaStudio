@@ -34,7 +34,7 @@ impl TypingTextOverlayLayer {
                     .show(ui, |ui| {
                         ui.visuals_mut().override_text_color =
                             Some(Color32::from_rgb(255, 235, 235));
-                        ui.label(egui::RichText::new("Режим деформации").strong());
+                        ui.label(egui::RichText::new(t!("typing.deform.panel_heading")).strong());
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
                             for mode in [
@@ -59,7 +59,7 @@ impl TypingTextOverlayLayer {
                             TypingDeformMode::Frame | TypingDeformMode::Grid
                         ) {
                             ui.add_space(6.0);
-                            ui.label("Плотность точек");
+                            ui.label(t!("typing.deform.point_density_label"));
                             ui.horizontal_wrapped(|ui| {
                                 let max_side_points = TEXT_OVERLAY_DEFORM_SURFACE_COLS
                                     .min(TEXT_OVERLAY_DEFORM_SURFACE_ROWS);
@@ -71,7 +71,7 @@ impl TypingTextOverlayLayer {
                                     );
                                 }
                             });
-                            ui.checkbox(&mut self.pull_neighbor_handles, "Тянуть соседние ручки");
+                            ui.checkbox(&mut self.pull_neighbor_handles, t!("typing.deform.drag_neighbors"));
                         }
                         if self.deform_mode.is_brush_mode() {
                             ui.add_space(6.0);
@@ -80,14 +80,14 @@ impl TypingTextOverlayLayer {
                                     &mut self.deform_tool_settings.brush_radius_px,
                                     16.0..=280.0,
                                 )
-                                .text("Радиус"),
+                                .text(t!("typing.deform.radius_label")),
                             );
                             ui.add(
                                 WheelSlider::new(
                                     &mut self.deform_tool_settings.brush_strength,
                                     0.05..=1.5,
                                 )
-                                .text("Сила"),
+                                .text(t!("typing.deform.strength_label")),
                             );
                         }
                     });
@@ -160,11 +160,17 @@ impl TypingTextOverlayLayer {
         // Representative glyph width + row height from the current font/spacing (not magic numbers).
         // egui's `Fonts*::glyph_width`/`row_height` need a &mut view (only `Painter`/`Ui` text
         // measuring gives it), so measure a 10-glyph run via a galley and divide.
+        //
+        // NOT localizable: this is a measurement probe, not a label. Its length must stay exactly
+        // `PROBE_GLYPHS` or `char_px` below is wrong, and a locale file is user-editable — routing
+        // it through `t!` would let a translation silently break this panel's layout.
+        const MEASURE_PROBE: &str = "oooooooooo";
+        const PROBE_GLYPHS: f32 = 10.0;
         let font_id = egui::TextStyle::Body.resolve(&ui.ctx().global_style());
         let probe = ui.ctx().fonts_mut(|f| {
-            f.layout_no_wrap("оооооооооо".to_string(), font_id.clone(), Color32::WHITE)
+            f.layout_no_wrap(MEASURE_PROBE.to_string(), font_id.clone(), Color32::WHITE)
         });
-        let char_px = (probe.rect.width() / 10.0).max(1.0);
+        let char_px = (probe.rect.width() / PROBE_GLYPHS).max(1.0);
         let line_height = probe.rect.height().max(1.0);
         // A row is a line plus the vertical item spacing between rows.
         let row_height = (line_height + ui.ctx().global_style().spacing.item_spacing.y).max(1.0);
@@ -198,7 +204,7 @@ impl TypingTextOverlayLayer {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         if ordered_rows.is_empty() {
-                            ui.weak("Нет слоёв на этой странице.");
+                            ui.weak(t!("typing.layers.no_layers_hint"));
                         }
                         for row in &ordered_rows {
                             match *row {
@@ -217,12 +223,12 @@ impl TypingTextOverlayLayer {
                                                 .unwrap_or("");
                                             let preview = text_preview_label(text, max_chars);
                                             if preview.is_empty() {
-                                                "Текст".to_string()
+                                                t!("typing.layers.text_row_label").to_string()
                                             } else {
-                                                format!("Текст ({preview})")
+                                                tf!("typing.layers.text_row_with_preview_label", preview = preview)
                                             }
                                         }
-                                        TypingOverlayKind::Image => "Картинка".to_string(),
+                                        TypingOverlayKind::Image => t!("typing.layers.image_row_label").to_string(),
                                     };
                                     let selected = self.selected_overlay_idx == Some(ov_idx);
                                     ui.horizontal(|ui| {
@@ -330,7 +336,7 @@ impl TypingTextOverlayLayer {
                         ui.set_width(panel_width);
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("Редактирование раскладки")
+                                egui::RichText::new(t!("typing.layout_editor.mode_heading"))
                                     .strong()
                                     .color(Color32::from_rgb(245, 245, 255)),
                             );
@@ -338,7 +344,7 @@ impl TypingTextOverlayLayer {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     let exit = egui::Button::new(
-                                        egui::RichText::new("Выйти").strong().color(Color32::WHITE),
+                                        egui::RichText::new(t!("typing.layout_editor.exit_button")).strong().color(Color32::WHITE),
                                     )
                                     .fill(Color32::from_rgb(180, 38, 38));
                                     if ui.add(exit).clicked() {
@@ -357,7 +363,7 @@ impl TypingTextOverlayLayer {
                             if ui
                                 .selectable_label(
                                     mode == TypingLayoutEditorMode::Editing,
-                                    "Редактирование",
+                                    t!("typing.layout_editor.edit_mode_tab"),
                                 )
                                 .clicked()
                             {
@@ -366,7 +372,7 @@ impl TypingTextOverlayLayer {
                             if ui
                                 .selectable_label(
                                     mode == TypingLayoutEditorMode::Preview,
-                                    "Предпросмотр",
+                                    t!("typing.layout_editor.preview_mode_tab"),
                                 )
                                 .clicked()
                             {
@@ -377,7 +383,7 @@ impl TypingTextOverlayLayer {
                         // control live inside this panel, but only in Editing mode.
                         if editing {
                             ui.separator();
-                            ui.label(egui::RichText::new("Векторные").strong());
+                            ui.label(egui::RichText::new(t!("typing.layout_editor.vector_mode_tab")).strong());
                             egui::ScrollArea::vertical()
                                 .max_height(360.0)
                                 .show(ui, |ui| {
@@ -386,7 +392,7 @@ impl TypingTextOverlayLayer {
                                     }
                                 });
                             ui.separator();
-                            ui.label("Прозрачность превью");
+                            ui.label(t!("typing.layout_editor.preview_opacity_label"));
                             if let Some(editor) = self.layout_editor.as_mut() {
                                 ui.add(
                                     egui::Slider::new(&mut editor.preview_opacity, 0.0..=1.0)
@@ -445,7 +451,7 @@ impl TypingTextOverlayLayer {
             .filter(|lines| !lines.is_empty())
             .unwrap_or_else(|| {
                 vec![TypingLayoutEditorLine {
-                    label: "Строка 1".to_string(),
+                    label: t!("typing.layout_editor.line_first_label").to_string(),
                     points: Vec::new(),
                     corner_smoothing_px: 0.0,
                     text_direction: TextVectorLineTextDirection::LeftToRight,
@@ -514,17 +520,17 @@ impl TypingTextOverlayLayer {
             .as_ref()
             .and_then(|render_data| render_data_with_vector_layout(render_data, &vector_layout))
         else {
-            self.set_create_error(ctx, "Не удалось обновить параметры векторной раскладки.");
+            self.set_create_error(ctx, t!("typing.layout_editor.update_vector_params_error"));
             return;
         };
         let Some(render_params) = text_render_params_from_render_data(&render_data_json) else {
-            self.set_create_error(ctx, "Не удалось собрать параметры рендера предпросмотра.");
+            self.set_create_error(ctx, t!("typing.layout_editor.build_preview_params_error"));
             return;
         };
         let Some(text_images_dir) = self.text_images_save_dir.clone() else {
             self.set_create_error(
                 ctx,
-                "Не найдена папка text_images для предпросмотра раскладки.",
+                t!("typing.layout_editor.text_images_dir_missing_error"),
             );
             return;
         };

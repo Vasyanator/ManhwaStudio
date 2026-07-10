@@ -68,7 +68,9 @@ impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Error(msg) => write!(f, "{msg}"),
-            CallError::Interrupted(msg) => write!(f, "Запрос прерван: {msg}"),
+            CallError::Interrupted(msg) => {
+                write!(f, "{}", tf!("backend_ipc.client.interrupted", msg = msg))
+            }
             CallError::Transport(msg) => write!(f, "{msg}"),
         }
     }
@@ -89,7 +91,11 @@ mod wasm_stub {
     use std::sync::mpsc::{self, Receiver};
     use web_time::Duration;
 
-    const WEB_UNAVAILABLE: &str = "AI backend недоступен в веб-версии.";
+    /// Web-stub transport error message. A runtime accessor because
+    /// `const _: &str = t!(...)` cannot call the catalog lookup in a const context.
+    fn web_unavailable() -> String {
+        t!("backend_ipc.client.web_unavailable").to_string()
+    }
 
     /// Web stub for the framed IPC client. Holds no connection; every request
     /// fails with a transport error.
@@ -99,7 +105,7 @@ mod wasm_stub {
     impl BackendClient {
         /// Web stub: there is no backend process to connect to.
         pub fn connect() -> Result<Self, String> {
-            Err(WEB_UNAVAILABLE.to_string())
+            Err(web_unavailable())
         }
 
         /// Web stub: no handshake ever runs, so there is no backend version.
@@ -122,7 +128,7 @@ mod wasm_stub {
             _blob: &[u8],
             _timeout: Duration,
         ) -> Result<(Value, Vec<u8>), CallError> {
-            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+            Err(CallError::Transport(web_unavailable()))
         }
 
         /// Web stub: streaming requests cannot be issued without a backend.
@@ -134,7 +140,7 @@ mod wasm_stub {
             _on_progress: impl FnMut(&Value, &[u8]),
             _timeout: Duration,
         ) -> Result<(Value, Vec<u8>), CallError> {
-            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+            Err(CallError::Transport(web_unavailable()))
         }
 
         /// Web stub: no request can be started, so no handle is returned.
@@ -144,12 +150,12 @@ mod wasm_stub {
             _header_fields: Value,
             _blob: &[u8],
         ) -> Result<CallHandle, String> {
-            Err(WEB_UNAVAILABLE.to_string())
+            Err(web_unavailable())
         }
 
         /// Web stub: there is no in-flight request to cancel.
         pub fn cancel(&self, _id: u64) -> Result<(), String> {
-            Err(WEB_UNAVAILABLE.to_string())
+            Err(web_unavailable())
         }
 
         /// Web stub: returns an immediately-closed receiver (no events on web).
@@ -175,12 +181,12 @@ mod wasm_stub {
 
         /// Web stub: nothing to cancel.
         pub fn cancel(&self) -> Result<(), String> {
-            Err(WEB_UNAVAILABLE.to_string())
+            Err(web_unavailable())
         }
 
         /// Web stub: no terminal frame will ever arrive.
         pub fn wait(self, _timeout: Duration) -> Result<(Value, Vec<u8>), CallError> {
-            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+            Err(CallError::Transport(web_unavailable()))
         }
 
         /// Web stub: no terminal frame will ever arrive.
@@ -189,13 +195,13 @@ mod wasm_stub {
             _on_progress: impl FnMut(&Value, &[u8]),
             _timeout: Duration,
         ) -> Result<(Value, Vec<u8>), CallError> {
-            Err(CallError::Transport(WEB_UNAVAILABLE.to_string()))
+            Err(CallError::Transport(web_unavailable()))
         }
     }
 
     /// Web stub: no process-wide client can be connected on the browser target.
     pub fn shared_client() -> Result<BackendClient, String> {
-        Err(WEB_UNAVAILABLE.to_string())
+        Err(web_unavailable())
     }
 }
 
@@ -346,10 +352,10 @@ impl BackendClient {
         {
             let mut wh = write_half;
             write_frame(&mut wh, &protocol::hello_header(), &[])
-                .map_err(|err| format!("Не удалось отправить hello backend: {err}"))?;
+                .map_err(|err| tf!("backend_ipc.client.hello_send_error", err = err))?;
 
             let hello = read_frame(&mut read_half)
-                .map_err(|err| format!("Не удалось прочитать hello backend: {err}"))?;
+                .map_err(|err| tf!("backend_ipc.client.hello_read_error", err = err))?;
             verify_hello(&hello.header)?;
             if let Some(ver) = hello
                 .header
@@ -381,7 +387,7 @@ impl BackendClient {
             self.shared.alive.store(false, Ordering::SeqCst);
             *self.shared.write_half.lock().unwrap() = None;
             *self.shared.shutdown_handle.lock().unwrap() = None;
-            return Err(format!("Не удалось запустить reader-поток backend: {err}"));
+            return Err(tf!("backend_ipc.client.reader_thread_error", err = err));
         }
 
         crate::runtime_log::log_info(format!(
@@ -638,7 +644,7 @@ impl CallHandle {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break Err(CallError::Transport(
-                        "Reader-поток backend завершился до ответа.".to_string(),
+                        t!("backend_ipc.client.reader_ended_before_reply").to_string(),
                     ));
                 }
             }
@@ -685,9 +691,7 @@ fn drain_terminal_after_timeout(
             Err(_) => break,
         }
     }
-    Err(CallError::Transport(format!(
-        "Тайм-аут ожидания ответа backend (id {id})."
-    )))
+    Err(CallError::Transport(tf!("backend_ipc.client.reply_timeout", id = id)))
 }
 
 /// Writes a frame on a [`Shared`]'s write half, mapping a write failure to a
@@ -696,7 +700,7 @@ fn drain_terminal_after_timeout(
 fn write_locked_shared(shared: &Arc<Shared>, header: &Value, blob: &[u8]) -> Result<(), String> {
     let mut guard = shared.write_half.lock().unwrap();
     let Some(stream) = guard.as_mut() else {
-        return Err("Соединение с backend закрыто.".to_string());
+        return Err(t!("backend_ipc.client.connection_closed").to_string());
     };
     match write_frame(stream, header, blob) {
         Ok(()) => Ok(()),
@@ -723,12 +727,15 @@ fn verify_hello(header: &Value) -> Result<(), String> {
         let msg = header
             .get(protocol::HEADER_ERROR)
             .and_then(Value::as_str)
-            .unwrap_or("протокольная ошибка при handshake");
-        return Err(format!("Backend отклонил handshake: {msg}"));
+            .unwrap_or(t!("backend_ipc.client.handshake_protocol_error"));
+        return Err(tf!("backend_ipc.client.handshake_rejected", msg = msg));
     }
     if kind != Some(protocol::KIND_HELLO) {
-        return Err(format!(
-            "Ожидался hello от backend, получено kind={kind:?}."
+        // `{kind:?}` is a debug format the extraction tool cannot express as a `tf!`
+        // placeholder, so pre-format it into a named arg by hand.
+        return Err(tf!(
+            "backend_ipc.client.hello_unexpected_kind",
+            kind = format!("{kind:?}")
         ));
     }
     let server_v = header
@@ -736,10 +743,7 @@ fn verify_hello(header: &Value) -> Result<(), String> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if server_v != u64::from(protocol::PROTOCOL_VERSION) {
-        return Err(format!(
-            "Несовместимая версия протокола backend: сервер {server_v}, клиент {}.",
-            protocol::PROTOCOL_VERSION
-        ));
+        return Err(tf!("backend_ipc.client.protocol_version_mismatch", server_v = server_v, protocol = protocol::PROTOCOL_VERSION));
     }
     Ok(())
 }
@@ -754,7 +758,7 @@ fn interpret_terminal(frame: Frame) -> Result<(Value, Vec<u8>), CallError> {
         let msg = header
             .get(protocol::HEADER_ERROR)
             .and_then(Value::as_str)
-            .unwrap_or("протокольная ошибка backend")
+            .unwrap_or(t!("backend_ipc.client.protocol_error"))
             .to_string();
         return Err(CallError::Transport(msg));
     }
@@ -769,14 +773,14 @@ fn interpret_terminal(frame: Frame) -> Result<(Value, Vec<u8>), CallError> {
             header
                 .get(protocol::HEADER_ERROR)
                 .and_then(Value::as_str)
-                .unwrap_or("прервано")
+                .unwrap_or(t!("backend_ipc.client.aborted"))
                 .to_string(),
         )),
         _ => Err(CallError::Error(
             header
                 .get(protocol::HEADER_ERROR)
                 .and_then(Value::as_str)
-                .unwrap_or("неизвестная ошибка backend")
+                .unwrap_or(t!("backend_ipc.client.unknown_error"))
                 .to_string(),
         )),
     }
@@ -856,7 +860,7 @@ fn route_frame(shared: &Arc<Shared>, frame: Frame) {
                     .header
                     .get(protocol::HEADER_ERROR)
                     .and_then(Value::as_str)
-                    .unwrap_or("протокольная ошибка backend (id 0)")
+                    .unwrap_or(t!("backend_ipc.client.protocol_error_id0"))
                     .to_string();
                 crate::runtime_log::log_warn(format!("[backend_ipc] {msg}"));
                 teardown(shared, &msg);
@@ -920,9 +924,7 @@ fn teardown(shared: &Arc<Shared>, reason: &str) {
         pending.drain().map(|(_, tx)| tx).collect()
     };
     for tx in drained {
-        let _ = tx.send(RouterMsg::Transport(format!(
-            "Соединение с backend разорвано: {reason}"
-        )));
+        let _ = tx.send(RouterMsg::Transport(tf!("backend_ipc.client.connection_lost", reason = reason)));
     }
 }
 

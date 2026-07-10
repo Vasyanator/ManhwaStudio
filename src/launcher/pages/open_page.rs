@@ -32,7 +32,6 @@ use ms_thread as thread;
 const LAST_OPEN_TITLE_KEY: &str = "open_page_last_title";
 const LAST_OPEN_CHAPTERS_BY_TITLE_KEY: &str = "open_page_last_chapters_by_title";
 const LEGACY_LAST_OPEN_CHAPTER_KEY: &str = "open_page_last_chapter";
-const NO_PROJECTS_MESSAGE: &str = "Проектов нет. Чтобы создать проект, перейдите в \"Новая глава\"";
 
 #[derive(Debug)]
 pub struct OpenPageState {
@@ -136,10 +135,10 @@ impl OpenPageState {
                         theme::card_frame().show(ui, |ui| {
                             ui.set_max_width(480.0);
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("Открыть главу").size(24.0).strong());
+                                ui.label(RichText::new(t!("launcher.open_page.heading")).size(24.0).strong());
                                 ui.add_space(14.0);
 
-                                ui.label(theme::status("Тайтл:", theme::TEXT_MUTED));
+                                ui.label(theme::status(t!("launcher.open_page.title_label"), theme::TEXT_MUTED));
                                 let mut title_changed = false;
                                 ui.scope(|ui| {
                                     ui.set_style(theme::combo_box_style(ui.style().as_ref()));
@@ -176,7 +175,7 @@ impl OpenPageState {
                                         self.selected_title.is_some(),
                                         egui::Checkbox::new(
                                             &mut decoration,
-                                            "Использовать тайтл как декорацию в меню",
+                                            t!("launcher.open_page.use_title_as_decor_check"),
                                         ),
                                     )
                                     .changed()
@@ -185,7 +184,7 @@ impl OpenPageState {
                                 }
 
                                 ui.add_space(10.0);
-                                ui.label(theme::status("Глава:", theme::TEXT_MUTED));
+                                ui.label(theme::status(t!("launcher.open_page.chapter_label"), theme::TEXT_MUTED));
                                 let mut chapter_changed = false;
                                 ui.scope(|ui| {
                                     ui.set_style(theme::combo_box_style(ui.style().as_ref()));
@@ -225,9 +224,7 @@ impl OpenPageState {
                                             ui.set_width(432.0);
                                             ui.horizontal(|ui| {
                                                 ui.label(
-                                                    RichText::new(format!(
-                                                        "Незавершённая сессия: «{unsaved_name}»"
-                                                    ))
+                                                    RichText::new(tf!("launcher.open_page.unsaved_session_label", unsaved_name = unsaved_name))
                                                     .color(egui::Color32::from_rgb(255, 210, 40)),
                                                 );
                                                 ui.with_layout(
@@ -235,7 +232,7 @@ impl OpenPageState {
                                                     |ui| {
                                                         if theme::launcher_button(
                                                             ui,
-                                                            "Восстановить",
+                                                            t!("launcher.open_page.restore_button"),
                                                             egui::vec2(130.0, 26.0),
                                                             true,
                                                         )
@@ -269,7 +266,7 @@ impl OpenPageState {
                                 if let Some(project_dir) = self.selected_project_dir() {
                                     ui.label(theme::footer(&project_dir.display().to_string()));
                                 } else {
-                                    ui.label(theme::footer("Выберите тайтл и главу."));
+                                    ui.label(theme::footer(t!("launcher.common.select_title_chapter_error")));
                                 }
 
                                 ui.add_space(8.0);
@@ -280,7 +277,7 @@ impl OpenPageState {
                                     let can_open = self.can_open();
                                     if theme::launcher_button(
                                         ui,
-                                        "Открыть",
+                                        t!("launcher.open_page.open_button"),
                                         egui::vec2(118.0, 36.0),
                                         can_open,
                                     )
@@ -290,7 +287,7 @@ impl OpenPageState {
                                     }
                                     if theme::launcher_button(
                                         ui,
-                                        "Обновить",
+                                        t!("launcher.common.refresh_button"),
                                         egui::vec2(118.0, 36.0),
                                         true,
                                     )
@@ -436,10 +433,7 @@ impl OpenPageState {
 
         if let Err(err) = spawn_result {
             self.pending_refresh = None;
-            self.status = OpenPageStatus::RefreshError(format!(
-                "Не удалось запустить обновление списка проектов: {}",
-                err
-            ));
+            self.status = OpenPageStatus::RefreshError(tf!("launcher.open_page.start_refresh_error", err = err));
         }
     }
 
@@ -457,9 +451,9 @@ impl OpenPageState {
                     self.status = if let Some(error_message) = result.error_message {
                         OpenPageStatus::RefreshError(error_message)
                     } else if self.titles.is_empty() {
-                        OpenPageStatus::Empty(NO_PROJECTS_MESSAGE.to_string())
+                        OpenPageStatus::Empty(t!("launcher.open_page.no_projects_hint").to_string())
                     } else if self.chapters.is_empty() {
-                        OpenPageStatus::Empty("Для выбранного тайтла не найдено глав.".to_string())
+                        OpenPageStatus::Empty(t!("launcher.open_page.no_chapters_for_title").to_string())
                     } else {
                         OpenPageStatus::Validating
                     };
@@ -474,7 +468,7 @@ impl OpenPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     should_clear = true;
                     self.status = OpenPageStatus::RefreshError(
-                        "Проверка списка проектов завершилась ошибкой.".to_string(),
+                        t!("launcher.open_page.refresh_failed").to_string(),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -487,7 +481,7 @@ impl OpenPageState {
 
     fn start_validation_for_current_selection(&mut self) {
         let Some(selection) = self.current_selection() else {
-            self.status = OpenPageStatus::Empty("Выберите тайтл и главу.".to_string());
+            self.status = OpenPageStatus::Empty(t!("launcher.common.select_title_chapter_error").to_string());
             return;
         };
 
@@ -510,13 +504,13 @@ impl OpenPageState {
         if let Err(err) = spawn_result {
             self.pending_validation = None;
             self.status =
-                OpenPageStatus::Invalid(format!("Не удалось запустить проверку главы: {}", err));
+                OpenPageStatus::Invalid(tf!("launcher.open_page.start_check_error", err = err));
         }
     }
 
     fn start_open_current_selection(&mut self) -> Option<PageNavAction> {
         let Some(selection) = self.current_selection() else {
-            self.status = OpenPageStatus::Empty("Выберите тайтл и главу.".to_string());
+            self.status = OpenPageStatus::Empty(t!("launcher.common.select_title_chapter_error").to_string());
             return None;
         };
 
@@ -532,10 +526,7 @@ impl OpenPageState {
             .spawn(move || {
                 let cleanup_result = if unsaved_dir.exists() {
                     fs::remove_dir_all(&unsaved_dir).map_err(|err| {
-                        format!(
-                            "Не удалось удалить временную главу {}: {err}",
-                            unsaved_dir.display()
-                        )
+                        tf!("launcher.open_page.delete_temp_chapter_error", unsaved_dir = unsaved_dir.display(), err = err)
                     })
                 } else {
                     Ok(())
@@ -572,10 +563,7 @@ impl OpenPageState {
 
         if let Err(err) = spawn_result {
             self.pending_open = None;
-            self.status = OpenPageStatus::Invalid(format!(
-                "Не удалось запустить очистку временной главы: {}",
-                err
-            ));
+            self.status = OpenPageStatus::Invalid(tf!("launcher.open_page.start_cleanup_error", err = err));
         }
 
         None
@@ -601,7 +589,7 @@ impl OpenPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     should_clear = true;
                     self.status = OpenPageStatus::Invalid(
-                        "Проверка выбранной главы завершилась ошибкой.".to_string(),
+                        t!("launcher.open_page.check_chapter_failed").to_string(),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -628,7 +616,7 @@ impl OpenPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     should_clear = true;
                     self.status =
-                        OpenPageStatus::Invalid("Открытие главы завершилось ошибкой.".to_string());
+                        OpenPageStatus::Invalid(t!("launcher.open_page.open_chapter_failed").to_string());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -678,11 +666,7 @@ fn build_refresh_result(
                 selected_title: None,
                 chapters: Vec::new(),
                 selected_chapter: None,
-                error_message: Some(format!(
-                    "Не удалось прочитать папку проектов '{}': {}",
-                    projects_root.display(),
-                    err
-                )),
+                error_message: Some(tf!("launcher.common.read_projects_folder_error", projects_root = projects_root.display(), err = err)),
             };
         }
     };
@@ -760,7 +744,7 @@ fn show_status(ui: &mut Ui, status: &OpenPageStatus) {
     match status {
         OpenPageStatus::Loading => {
             ui.label(theme::status(
-                "Загрузка списка тайтлов...",
+                t!("launcher.open_page.loading_titles_status"),
                 theme::TEXT_MUTED,
             ));
         }
@@ -775,22 +759,19 @@ fn show_status(ui: &mut Ui, status: &OpenPageStatus) {
         }
         OpenPageStatus::Validating => {
             ui.label(theme::status(
-                "Проверка структуры папки и изображений...",
+                t!("launcher.open_page.checking_structure_status"),
                 theme::TEXT_MUTED,
             ));
         }
         OpenPageStatus::Opening => {
             ui.label(theme::status(
-                "Очищаем найденную временную главу перед открытием...",
+                t!("launcher.open_page.cleaning_temp_status"),
                 theme::TEXT_MUTED,
             ));
         }
         OpenPageStatus::Ready { image_count } => {
             ui.label(theme::status(
-                &format!(
-                    "Готово к открытию: найдено {} изображений в src.",
-                    image_count
-                ),
+                &tf!("launcher.open_page.ready_to_open_status", image_count = image_count),
                 theme::STATUS_SUCCESS,
             ));
         }

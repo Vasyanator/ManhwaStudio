@@ -90,7 +90,7 @@ impl AiBackendProcessSnapshot {
     pub fn new(auto_start: bool) -> Self {
         Self {
             running: false,
-            status: "Процесс не запущен.".to_string(),
+            status: t!("ai_backend.supervisor.process_not_started").to_string(),
             auto_start,
             updated_at: None,
             logs: VecDeque::new(),
@@ -100,7 +100,7 @@ impl AiBackendProcessSnapshot {
     pub fn disabled(auto_start: bool) -> Self {
         Self {
             running: false,
-            status: "Управление запуском отключено (--no-ai).".to_string(),
+            status: t!("ai_backend.supervisor.launch_disabled_no_ai").to_string(),
             auto_start,
             updated_at: None,
             logs: VecDeque::new(),
@@ -376,11 +376,11 @@ fn spawn_ai_backend_process_worker(
             update_process_status(
                 &snapshot,
                 false,
-                format!("Не удалось автозапустить backend: {err}"),
+                tf!("ai_backend.supervisor.autostart_failed_status", err = err),
             );
             append_process_log(
                 &snapshot,
-                format!("[manager] Ошибка автозапуска backend: {err}"),
+                tf!("ai_backend.supervisor.autostart_failed_log", err = err),
             );
         }
 
@@ -404,7 +404,7 @@ fn spawn_ai_backend_process_worker(
             poll_backend_exit(&snapshot, &mut child);
         }
 
-        stop_ai_backend_process(&mut child, &snapshot, "Приложение закрывается.");
+        stop_ai_backend_process(&mut child, &snapshot, t!("ai_backend.supervisor.app_closing"));
     });
 
     AiBackendProcessRuntime { tx, thread }
@@ -421,26 +421,26 @@ fn handle_process_command(
     match command {
         AiBackendProcessCommand::Start => {
             if let Err(err) = start_ai_backend_process(child, snapshot, output_tx) {
-                update_process_status(snapshot, false, format!("Ошибка запуска backend: {err}"));
-                append_process_log(snapshot, format!("[manager] Ошибка запуска backend: {err}"));
+                update_process_status(snapshot, false, tf!("ai_backend.supervisor.start_failed_status", err = err));
+                append_process_log(snapshot, tf!("ai_backend.supervisor.start_failed_log", err = err));
             }
             false
         }
         AiBackendProcessCommand::Stop => {
-            stop_ai_backend_process(child, snapshot, "Остановлено пользователем.");
+            stop_ai_backend_process(child, snapshot, t!("ai_backend.supervisor.stopped_by_user"));
             false
         }
         AiBackendProcessCommand::Restart => {
-            stop_ai_backend_process(child, snapshot, "Перезапуск по запросу пользователя.");
+            stop_ai_backend_process(child, snapshot, t!("ai_backend.supervisor.restart_by_user"));
             if let Err(err) = start_ai_backend_process(child, snapshot, output_tx) {
                 update_process_status(
                     snapshot,
                     false,
-                    format!("Ошибка перезапуска backend: {err}"),
+                    tf!("ai_backend.supervisor.restart_failed_status", err = err),
                 );
                 append_process_log(
                     snapshot,
-                    format!("[manager] Ошибка перезапуска backend: {err}"),
+                    tf!("ai_backend.supervisor.restart_failed_log", err = err),
                 );
             }
             false
@@ -448,22 +448,22 @@ fn handle_process_command(
         AiBackendProcessCommand::SetAutoStart(enabled) => {
             set_autostart_value(snapshot, enabled);
             match save_ai_backend_autostart(user_settings_file, enabled) {
-                Ok(()) => append_process_log(
-                    snapshot,
-                    format!(
-                        "[settings] Автозапуск backend {}",
-                        if enabled {
-                            "включен"
-                        } else {
-                            "выключен"
-                        }
-                    ),
-                ),
+                Ok(()) => {
+                    // The state word is localized separately from the message
+                    // template so both words live in the catalog as their own keys.
+                    let state_word = if enabled {
+                        t!("ai_backend.supervisor.autostart_enabled_word")
+                    } else {
+                        t!("ai_backend.supervisor.autostart_disabled_word")
+                    };
+                    append_process_log(
+                        snapshot,
+                        tf!("ai_backend.supervisor.autostart_changed_log", arg = state_word),
+                    )
+                }
                 Err(err) => append_process_log(
                     snapshot,
-                    format!(
-                        "[settings] Не удалось сохранить автозапуск backend ({enabled}): {err}"
-                    ),
+                    tf!("ai_backend.supervisor.autostart_save_failed_log", enabled = enabled, err = err),
                 ),
             }
             false
@@ -482,23 +482,20 @@ fn start_ai_backend_process(
         match existing.try_wait() {
             Ok(None) => {
                 let pid = existing.id();
-                update_process_status(snapshot, true, format!("Backend уже запущен (PID {pid})."));
+                update_process_status(snapshot, true, tf!("ai_backend.supervisor.already_running", pid = pid));
                 return Ok(());
             }
             Ok(Some(status)) => {
                 append_process_log(
                     snapshot,
-                    format!(
-                        "[manager] Обнаружен уже завершенный backend: {}",
-                        format_exit_code(status.code())
-                    ),
+                    tf!("ai_backend.supervisor.detected_exited_log", format_exit_code = format_exit_code(status.code())),
                 );
                 *child = None;
             }
             Err(err) => {
                 append_process_log(
                     snapshot,
-                    format!("[manager] Ошибка проверки состояния процесса: {err}"),
+                    tf!("ai_backend.supervisor.state_check_failed_log", err = err),
                 );
                 *child = None;
             }
@@ -508,10 +505,7 @@ fn start_ai_backend_process(
     let app_dir = config::program_dir();
     let backend_script = app_dir.join("ai_backend.py");
     if !backend_script.is_file() {
-        return Err(format!(
-            "в директории приложения '{}' не найден ai_backend.py",
-            app_dir.display()
-        ));
+        return Err(tf!("ai_backend.supervisor.script_not_found", app_dir = app_dir.display()));
     }
 
     let python = python_manager::resolve_python_executable(&app_dir)?;
@@ -561,11 +555,7 @@ fn start_ai_backend_process(
     python_manager::apply_windows_no_window(&mut command);
 
     let mut spawned = python_manager::spawn_kill_with_parent(command).map_err(|err| {
-        format!(
-            "не удалось запустить backend через '{}' ({})",
-            python.display(),
-            err
-        )
+        tf!("ai_backend.supervisor.spawn_failed", python = python.display(), err = err)
     })?;
 
     let pid = spawned.id();
@@ -586,14 +576,10 @@ fn start_ai_backend_process(
         ),
     };
 
-    update_process_status(snapshot, true, format!("Backend запущен (PID {pid})."));
+    update_process_status(snapshot, true, tf!("ai_backend.supervisor.started_status", pid = pid));
     append_process_log(
         snapshot,
-        format!(
-            "[manager] Запуск ai_backend.py через '{}' (cwd '{}', pid {pid}, {transport_desc})",
-            python.display(),
-            app_dir.display()
-        ),
+        tf!("ai_backend.supervisor.starting_log", python = python.display(), app_dir = app_dir.display(), pid = pid, transport_desc = transport_desc),
     );
 
     if let Some(stdout) = stdout {
@@ -601,12 +587,12 @@ fn start_ai_backend_process(
         // it can publish the endpoint once the backend reports its port.
         spawn_backend_output_reader("stdout", stdout, output_tx.clone(), ws_token);
     } else {
-        append_process_log(snapshot, "[manager] stdout backend недоступен.".to_string());
+        append_process_log(snapshot, t!("ai_backend.supervisor.stdout_unavailable_log").to_string());
     }
     if let Some(stderr) = stderr {
         spawn_backend_output_reader("stderr", stderr, output_tx.clone(), None);
     } else {
-        append_process_log(snapshot, "[manager] stderr backend недоступен.".to_string());
+        append_process_log(snapshot, t!("ai_backend.supervisor.stderr_unavailable_log").to_string());
     }
 
     Ok(())
@@ -622,7 +608,7 @@ fn stop_ai_backend_process(
         update_process_status(
             snapshot,
             false,
-            "Процесс backend уже остановлен.".to_string(),
+            t!("ai_backend.supervisor.already_stopped").to_string(),
         );
         return;
     };
@@ -630,13 +616,13 @@ fn stop_ai_backend_process(
     let pid = running_child.id();
     append_process_log(
         snapshot,
-        format!("[manager] Остановка backend (pid {pid}): {reason}"),
+        tf!("ai_backend.supervisor.stopping_log", pid = pid, reason = reason),
     );
 
     if let Err(err) = running_child.kill() {
         append_process_log(
             snapshot,
-            format!("[manager] Не удалось отправить kill backend (pid {pid}): {err}"),
+            tf!("ai_backend.supervisor.kill_failed_log", pid = pid, err = err),
         );
     }
 
@@ -645,17 +631,14 @@ fn stop_ai_backend_process(
             update_process_status(
                 snapshot,
                 false,
-                format!(
-                    "Backend остановлен (pid {pid}, {}).",
-                    format_exit_code(status.code())
-                ),
+                tf!("ai_backend.supervisor.stopped_status", pid = pid, format_exit_code = format_exit_code(status.code())),
             );
         }
         Err(err) => {
             update_process_status(
                 snapshot,
                 false,
-                format!("Backend завершился с ошибкой ожидания (pid {pid}): {err}"),
+                tf!("ai_backend.supervisor.wait_error_status", pid = pid, err = err),
             );
         }
     }
@@ -677,17 +660,11 @@ fn poll_backend_exit(
             update_process_status(
                 snapshot,
                 false,
-                format!(
-                    "Backend завершился (pid {pid}, {}).",
-                    format_exit_code(status.code())
-                ),
+                tf!("ai_backend.supervisor.exited_status", pid = pid, format_exit_code = format_exit_code(status.code())),
             );
             append_process_log(
                 snapshot,
-                format!(
-                    "[manager] Backend завершился сам (pid {pid}, {}).",
-                    format_exit_code(status.code())
-                ),
+                tf!("ai_backend.supervisor.exited_self_log", pid = pid, format_exit_code = format_exit_code(status.code())),
             );
             *child = None;
         }
@@ -695,11 +672,11 @@ fn poll_backend_exit(
             update_process_status(
                 snapshot,
                 false,
-                format!("Ошибка проверки backend-процесса: {err}"),
+                tf!("ai_backend.supervisor.poll_error_status", err = err),
             );
             append_process_log(
                 snapshot,
-                format!("[manager] Ошибка try_wait backend-процесса: {err}"),
+                tf!("ai_backend.supervisor.try_wait_error_log", err = err),
             );
             *child = None;
         }
@@ -791,16 +768,20 @@ fn drain_backend_output(
                 append_process_log(snapshot, format!("[stderr] {line}"));
             }
             AiBackendOutputEvent::StreamError(stream, err) => {
-                append_process_log(snapshot, format!("[manager] Ошибка чтения {stream}: {err}"));
+                append_process_log(snapshot, tf!("ai_backend.supervisor.stream_read_error_log", stream = stream, err = err));
             }
             AiBackendOutputEvent::WsPortParseError(line) => {
-                // Structured warning (per logging policy) plus a UI-visible manager
-                // line. The backend keeps running; the client simply cannot connect
-                // until a valid port line arrives.
-                let warning =
-                    format!("Не удалось разобрать порт WS backend из строки stdout: {line}");
-                crate::runtime_log::log_warn(format!("[ai_backend_supervisor] {warning}"));
-                append_process_log(snapshot, format!("[manager] {warning}"));
+                // The backend keeps running; the client simply cannot connect until a
+                // valid port line arrives. The structured warning stays a stable literal
+                // so logs remain grep-able across locales (logging policy); only the
+                // UI-visible manager line (shown in the backend-output panel) is localized.
+                crate::runtime_log::log_warn(format!(
+                    "[ai_backend_supervisor] Не удалось разобрать порт WS backend из строки stdout: {line}"
+                ));
+                append_process_log(
+                    snapshot,
+                    tf!("ai_backend.supervisor.ws_port_parse_error_log", line = line),
+                );
             }
         }
     }
@@ -874,8 +855,8 @@ fn set_autostart_value(snapshot: &Arc<Mutex<AiBackendProcessSnapshot>>, auto_sta
 
 #[cfg(not(target_arch = "wasm32"))]
 fn format_exit_code(code: Option<i32>) -> String {
-    code.map(|value| format!("код выхода {value}"))
-        .unwrap_or_else(|| "завершён сигналом".to_string())
+    code.map(|value| tf!("ai_backend.supervisor.exit_code", value = value))
+        .unwrap_or_else(|| t!("ai_backend.supervisor.exit_signal").to_string())
 }
 
 pub fn load_ai_backend_autostart(user_settings_file: &Path) -> bool {

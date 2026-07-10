@@ -10,7 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use ms_thread::{self as thread, JoinHandle};
 
-const GROUP_ALL: &str = "(все)";
+/// Label for the "all groups" filter option. It is both a display label and the `==`
+/// sentinel meaning "no group filter". Runtime (not `const`) because `t!` is not const.
+/// The filter selection is session-only (never persisted), so a live UI-language switch
+/// merely re-seeds it on the next character reload.
+fn group_all() -> &'static str {
+    t!("characters.list.group_filter_all")
+}
 const CARD_THUMB_SIDE_PX: u32 = 192;
 const EDITOR_PREVIEW_SIDE_PX: f32 = 320.0;
 const MAX_NAME_LEN: usize = 64;
@@ -120,8 +126,8 @@ impl CharacterEditorState {
 
     fn title(&self) -> &'static str {
         match self.mode {
-            EditorMode::Add => "Добавить персонажа",
-            EditorMode::Edit { .. } => "Редактировать персонажа",
+            EditorMode::Add => t!("characters.editor.title_add"),
+            EditorMode::Edit { .. } => t!("characters.editor.title_edit"),
         }
     }
 }
@@ -196,8 +202,8 @@ impl Default for CharactersTabState {
         Self {
             loaded_chars_dir: None,
             entries: Vec::new(),
-            groups_filter_values: vec![GROUP_ALL.to_string()],
-            selected_group_filter: GROUP_ALL.to_string(),
+            groups_filter_values: vec![group_all().to_string()],
+            selected_group_filter: group_all().to_string(),
             search_query: String::new(),
             editor: None,
             pending_overwrite: None,
@@ -258,7 +264,7 @@ impl CharactersTabState {
 
         let mut actions = Vec::new();
         ui.vertical(|ui| {
-            ui.heading("Персонажи");
+            ui.heading(t!("characters.list.heading"));
             if let Some(msg) = &self.info_message {
                 ui.colored_label(egui::Color32::LIGHT_GREEN, msg);
             }
@@ -267,15 +273,15 @@ impl CharactersTabState {
             }
 
             ui.horizontal_wrapped(|ui| {
-                ui.label("Поиск:");
+                ui.label(t!("characters.list.search_label"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
                         .desired_width(320.0)
-                        .hint_text("имя, группа или описание"),
+                        .hint_text(t!("characters.list.search_placeholder")),
                 );
 
                 ui.add_space(8.0);
-                ui.label("Группа:");
+                ui.label(t!("characters.list.group_label"));
                 WheelComboBox::from_id_salt("characters_group_filter")
                     .selected_text(self.selected_group_filter.clone())
                     .show_ui(ui, |ui| {
@@ -288,13 +294,13 @@ impl CharactersTabState {
                         }
                     });
 
-                if ui.button("Сбросить").clicked() {
+                if ui.button(t!("characters.list.reset_filter_button")).clicked() {
                     self.search_query.clear();
-                    self.selected_group_filter = GROUP_ALL.to_string();
+                    self.selected_group_filter = group_all().to_string();
                 }
 
                 ui.add_space(10.0);
-                if ui.button("Добавить").clicked() {
+                if ui.button(t!("characters.list.add_button")).clicked() {
                     self.error_message = None;
                     self.info_message = None;
                     self.editor = Some(CharacterEditorState::for_add(
@@ -307,7 +313,7 @@ impl CharactersTabState {
 
             let filtered = self.filtered_indices();
             if filtered.is_empty() {
-                ui.label("Ничего не найдено.");
+                ui.label(t!("characters.list.empty"));
             } else {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -367,7 +373,7 @@ impl CharactersTabState {
                                     egui::Layout::top_down_justified(egui::Align::Center),
                                     |ui| {
                                         ui.centered_and_justified(|ui| {
-                                            ui.label("Загрузка...");
+                                            ui.label(t!("characters.card.thumbnail_loading"));
                                         });
                                     },
                                 );
@@ -378,7 +384,7 @@ impl CharactersTabState {
                                     egui::Layout::top_down_justified(egui::Align::Center),
                                     |ui| {
                                         ui.centered_and_justified(|ui| {
-                                            ui.label("Нет\nизображения");
+                                            ui.label(t!("characters.card.thumbnail_none"));
                                         });
                                     },
                                 );
@@ -389,14 +395,14 @@ impl CharactersTabState {
                                     egui::Layout::top_down_justified(egui::Align::Center),
                                     |ui| {
                                         ui.centered_and_justified(|ui| {
-                                            ui.label("Ошибка");
+                                            ui.label(t!("characters.card.thumbnail_error"));
                                         });
                                     },
                                 );
                             }
                         }
 
-                        if ui.button("Редактировать").clicked() {
+                        if ui.button(t!("characters.card.edit_button")).clicked() {
                             self.editor = Some(CharacterEditorState::for_edit(
                                 entry,
                                 &image_path_for(project, &entry.name),
@@ -405,7 +411,7 @@ impl CharactersTabState {
                             self.error_message = None;
                             self.info_message = None;
                         }
-                        if ui.button("В заметки").clicked() {
+                        if ui.button(t!("characters.card.to_notes_button")).clicked() {
                             action = Some(CharactersTabAction::OpenNotesForCharacter(
                                 entry.name.clone(),
                             ));
@@ -418,7 +424,7 @@ impl CharactersTabState {
                         ui.label(egui::RichText::new(&entry.name).strong().size(18.0));
                         if !entry.groups.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!("Группы: {}", entry.groups.join(", ")))
+                                egui::RichText::new(tf!("characters.card.groups", groups = entry.groups.join(", ")))
                                     .italics()
                                     .color(egui::Color32::GRAY),
                             );
@@ -458,13 +464,13 @@ impl CharactersTabState {
                 .default_size(egui::vec2(560.0, 700.0))
                 .collapsible(false)
                 .show(ctx, |ui| {
-                    ui.label("Имя");
+                    ui.label(t!("characters.editor.name_label"));
                     ui.add(
                         egui::TextEdit::singleline(&mut editor.name).desired_width(f32::INFINITY),
                     );
 
                     ui.add_space(6.0);
-                    ui.label("Описание");
+                    ui.label(t!("characters.editor.description_label"));
                     ui.add(
                         egui::TextEdit::multiline(&mut editor.description)
                             .desired_width(f32::INFINITY)
@@ -472,11 +478,11 @@ impl CharactersTabState {
                     );
 
                     ui.add_space(10.0);
-                    ui.label("Группы");
+                    ui.label(t!("characters.editor.groups_label"));
                     ui.horizontal(|ui| {
                         WheelComboBox::from_id_salt("characters_editor_group_combo")
                             .selected_text(if editor.group_input.is_empty() {
-                                "выбрать/ввести".to_string()
+                                t!("characters.editor.groups_combo_placeholder").to_string()
                             } else {
                                 editor.group_input.clone()
                             })
@@ -491,10 +497,10 @@ impl CharactersTabState {
                             });
                         ui.add(
                             egui::TextEdit::singleline(&mut editor.group_input)
-                                .hint_text("новая группа")
+                                .hint_text(t!("characters.editor.new_group_placeholder"))
                                 .desired_width(180.0),
                         );
-                        if ui.button("Добавить").clicked() {
+                        if ui.button(t!("characters.editor.add_group_button")).clicked() {
                             let value = editor.group_input.trim();
                             if !value.is_empty()
                                 && !editor
@@ -510,7 +516,7 @@ impl CharactersTabState {
                     });
                     ui.add_space(4.0);
                     if editor.groups.is_empty() {
-                        ui.label(egui::RichText::new("Группы не выбраны").italics());
+                        ui.label(egui::RichText::new(t!("characters.editor.groups_empty")).italics());
                     } else {
                         let mut remove_idx = None;
                         ui.horizontal_wrapped(|ui| {
@@ -531,14 +537,14 @@ impl CharactersTabState {
                     }
 
                     ui.separator();
-                    ui.label("Изображение");
+                    ui.label(t!("characters.editor.image_label"));
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut editor.image_path_input)
                                 .desired_width(340.0)
-                                .hint_text("Путь к файлу изображения"),
+                                .hint_text(t!("characters.editor.image_path_placeholder")),
                         );
-                        if ui.button("Загрузить").clicked() {
+                        if ui.button(t!("characters.editor.image_load_button")).clicked() {
                             match load_image_from_path(Path::new(editor.image_path_input.trim())) {
                                 Ok(img) => {
                                     editor.pending_image = Some(img);
@@ -550,30 +556,30 @@ impl CharactersTabState {
                                 }
                                 Err(err) => {
                                     load_image_error =
-                                        Some(format!("Не удалось загрузить изображение: {err}"));
+                                        Some(tf!("characters.editor.image_load_error", err = err));
                                 }
                             }
                         }
                         if ui
-                            .add_enabled(!clipboard_busy, egui::Button::new("Вставить из буфера"))
+                            .add_enabled(!clipboard_busy, egui::Button::new(t!("characters.editor.image_paste_button")))
                             .clicked()
                         {
                             request_clipboard_paste = true;
                         }
                     });
                     if clipboard_busy {
-                        ui.small("Чтение изображения из буфера...");
+                        ui.small(t!("characters.editor.image_paste_reading"));
                     }
 
                     ui.horizontal(|ui| {
-                        if ui.button("Сбросить новое изображение").clicked()
+                        if ui.button(t!("characters.editor.image_reset_new_button")).clicked()
                         {
                             editor.pending_image = None;
                             editor.pending_texture = None;
                             editor.pending_image_rev = editor.pending_image_rev.saturating_add(1);
                         }
                         if matches!(editor.mode, EditorMode::Edit { .. })
-                            && ui.button("Удалить текущее изображение").clicked()
+                            && ui.button(t!("characters.editor.image_delete_current_button")).clicked()
                         {
                             editor.remove_image = true;
                             editor.pending_image = None;
@@ -586,21 +592,21 @@ impl CharactersTabState {
                     draw_editor_preview(ui, ctx, editor);
                     ui.checkbox(
                         &mut editor.open_notes_after_save,
-                        "После сохранения перейти в заметки этого персонажа",
+                        t!("characters.editor.go_to_notes_after_save_label"),
                     );
 
                     ui.separator();
                     ui.horizontal(|ui| {
                         if matches!(editor.mode, EditorMode::Edit { .. })
-                            && ui.button("Удалить").clicked()
+                            && ui.button(t!("characters.editor.delete_button")).clicked()
                         {
                             delete_clicked = true;
                         }
                         ui.add_space(8.0);
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(t!("characters.editor.cancel_button")).clicked() {
                             editor.open = false;
                         }
-                        if ui.button("Сохранить").clicked() {
+                        if ui.button(t!("characters.editor.save_button")).clicked() {
                             save_clicked = true;
                         }
                     });
@@ -643,22 +649,19 @@ impl CharactersTabState {
         let mut action = None;
         if let Some(pending) = self.pending_overwrite.clone() {
             let mut keep_window = true;
-            egui::Window::new("Подтверждение перезаписи")
+            egui::Window::new(t!("characters.overwrite_dialog.title"))
                 .id(egui::Id::new("characters_overwrite_confirm"))
                 .open(&mut keep_window)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "«{}» уже существует. Перезаписать?",
-                        pending.entry.name
-                    ));
+                    ui.label(tf!("characters.overwrite_dialog.message", name = pending.entry.name));
                     ui.horizontal(|ui| {
-                        if ui.button("Да").clicked() {
+                        if ui.button(t!("characters.overwrite_dialog.yes_button")).clicked() {
                             self.pending_overwrite = None;
                             action = self.apply_pending_save(project, pending.clone());
                         }
-                        if ui.button("Нет").clicked() {
+                        if ui.button(t!("characters.overwrite_dialog.no_button")).clicked() {
                             self.pending_overwrite = None;
                         }
                     });
@@ -678,19 +681,19 @@ impl CharactersTabState {
         let mut action = None;
         if let Some(name) = self.pending_delete_name.clone() {
             let mut keep_window = true;
-            egui::Window::new("Удалить персонажа")
+            egui::Window::new(t!("characters.delete_dialog.title"))
                 .id(egui::Id::new("characters_delete_confirm"))
                 .open(&mut keep_window)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!("Точно удалить «{name}»?"));
+                    ui.label(tf!("characters.delete_dialog.message", name = name));
                     ui.horizontal(|ui| {
-                        if ui.button("Удалить").clicked() {
+                        if ui.button(t!("characters.delete_dialog.confirm_button")).clicked() {
                             self.pending_delete_name = None;
                             action = self.delete_character(project, &name);
                         }
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(t!("characters.delete_dialog.cancel_button")).clicked() {
                             self.pending_delete_name = None;
                         }
                     });
@@ -709,7 +712,7 @@ impl CharactersTabState {
 
         let safe = safe_name(&editor.name);
         if safe.trim().is_empty() {
-            self.error_message = Some("Имя персонажа не может быть пустым.".to_string());
+            self.error_message = Some(t!("characters.editor.name_empty_error").to_string());
             return None;
         }
         let pending = PendingSave {
@@ -770,7 +773,7 @@ impl CharactersTabState {
         dedupe_and_sort_entries(&mut self.entries);
 
         if let Err(err) = save_entries(project, &self.entries) {
-            self.error_message = Some(format!("Не удалось сохранить characters.json: {err}"));
+            self.error_message = Some(tf!("characters.save.save_error", err = err));
             return None;
         }
 
@@ -799,7 +802,7 @@ impl CharactersTabState {
         if let Some(image) = pending.pending_image {
             if let Err(err) = save_color_image_png(&target_image_path, &image) {
                 self.error_message =
-                    Some(format!("Не удалось сохранить изображение персонажа: {err}"));
+                    Some(tf!("characters.save.image_save_error", err = err));
             } else {
                 self.clear_thumbnail(&new_name);
             }
@@ -807,7 +810,7 @@ impl CharactersTabState {
 
         self.rebuild_group_filters();
         self.editor = None;
-        self.info_message = Some("Персонаж сохранён.".to_string());
+        self.info_message = Some(t!("characters.save.saved").to_string());
 
         if pending.open_notes_after_save {
             return Some(CharactersTabAction::OpenNotesForCharacter(new_name));
@@ -834,13 +837,13 @@ impl CharactersTabState {
         name: &str,
     ) -> Option<CharactersTabAction> {
         let Some(idx) = self.find_entry_index(name) else {
-            self.error_message = Some("Персонаж уже удалён.".to_string());
+            self.error_message = Some(t!("characters.save.already_deleted").to_string());
             return None;
         };
         self.entries.remove(idx);
         dedupe_and_sort_entries(&mut self.entries);
         if let Err(err) = save_entries(project, &self.entries) {
-            self.error_message = Some(format!("Не удалось сохранить characters.json: {err}"));
+            self.error_message = Some(tf!("characters.save.save_error", err = err));
             return None;
         }
         let image_path = image_path_for(project, name);
@@ -848,7 +851,7 @@ impl CharactersTabState {
         let _ = crate::storage::storage().remove_file(image_path_str.as_ref());
         self.clear_thumbnail(name);
         self.rebuild_group_filters();
-        self.info_message = Some("Персонаж удалён.".to_string());
+        self.info_message = Some(t!("characters.save.deleted").to_string());
         self.editor = None;
         Some(CharactersTabAction::CharactersChanged)
     }
@@ -865,7 +868,7 @@ impl CharactersTabState {
         }
         self.loaded_chars_dir = Some(chars_dir);
         self.search_query.clear();
-        self.selected_group_filter = GROUP_ALL.to_string();
+        self.selected_group_filter = group_all().to_string();
         self.error_message = None;
         self.info_message = None;
         self.editor = None;
@@ -883,7 +886,7 @@ impl CharactersTabState {
             Err(err) => {
                 self.entries.clear();
                 self.rebuild_group_filters();
-                self.error_message = Some(format!("Не удалось загрузить персонажей: {err}"));
+                self.error_message = Some(tf!("characters.save.load_error", err = err));
             }
         }
     }
@@ -900,10 +903,10 @@ impl CharactersTabState {
         }
         let mut values: Vec<String> = groups.into_iter().collect();
         values.sort_by_key(|v| v.to_lowercase());
-        values.insert(0, GROUP_ALL.to_string());
+        values.insert(0, group_all().to_string());
 
         if !values.contains(&self.selected_group_filter) {
-            self.selected_group_filter = GROUP_ALL.to_string();
+            self.selected_group_filter = group_all().to_string();
         }
         self.groups_filter_values = values;
     }
@@ -923,7 +926,7 @@ impl CharactersTabState {
                 )
                 .to_lowercase();
                 let by_term = term.is_empty() || haystack.contains(&term);
-                let by_group = selected_group == GROUP_ALL
+                let by_group = selected_group == group_all()
                     || entry
                         .groups
                         .iter()
@@ -1023,7 +1026,7 @@ impl CharactersTabState {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(ClipboardImageResult {
                 decoded: None,
-                error: Some("Поток чтения буфера обмена был прерван.".to_string()),
+                error: Some(t!("characters.clipboard.thread_interrupted").to_string()),
             }),
         };
         let Some(result) = result else {
@@ -1043,11 +1046,9 @@ impl CharactersTabState {
                 editor.remove_image = false;
             }
             self.error_message = None;
-            self.info_message = Some("Изображение вставлено из буфера обмена.".to_string());
+            self.info_message = Some(t!("characters.clipboard.image_pasted").to_string());
         } else if let Some(err) = result.error {
-            self.error_message = Some(format!(
-                "Не удалось вставить изображение из буфера обмена: {err}"
-            ));
+            self.error_message = Some(tf!("characters.clipboard.paste_error", err = err));
         }
     }
 
@@ -1077,14 +1078,14 @@ fn draw_editor_preview(ui: &mut egui::Ui, ctx: &egui::Context, editor: &mut Char
             }
             if let Some(tex) = editor.pending_texture.as_ref() {
                 ui.add(egui::Image::new((tex.id(), size)));
-                ui.label("Будет сохранено в PNG после нажатия «Сохранить».");
+                ui.label(t!("characters.editor.preview_will_save"));
                 return;
             }
         }
         if editor.remove_image {
-            ui.label("Текущее изображение будет удалено.");
+            ui.label(t!("characters.editor.preview_will_delete"));
         } else {
-            ui.label("Новое изображение не выбрано.");
+            ui.label(t!("characters.editor.preview_none_selected"));
         }
     });
 }

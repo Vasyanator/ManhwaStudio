@@ -33,7 +33,7 @@ impl SettingsTabState {
     pub(super) fn draw_hotkeys(&mut self, ui: &mut egui::Ui, hotkeys_v2: &mut InputManagerV2) {
         self.handle_hotkey_capture(ui, hotkeys_v2);
 
-        ui.heading("Настраиваемые горячие клавиши");
+        ui.heading(t!("settings.hotkeys.heading"));
         let mut configurable_commands = hotkeys_v2.commands().to_vec();
         configurable_commands.sort_by(|a, b| {
             hotkey_scope_sort_key(a.scope)
@@ -43,7 +43,7 @@ impl SettingsTabState {
                 .then_with(|| a.id.cmp(&b.id))
         });
         if configurable_commands.is_empty() {
-            ui.label("Пока нет хоткеев, поддерживающих переназначение.");
+            ui.label(t!("settings.hotkeys.none_configurable"));
         } else {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -82,7 +82,7 @@ impl SettingsTabState {
         let is_capturing = self.hotkey_capture_command_id.as_deref() == Some(command.id.as_str());
         let shortcut_text = hotkeys_v2
             .shortcut_text(ui.ctx(), &command.id)
-            .unwrap_or_else(|| "Не назначено".to_string());
+            .unwrap_or_else(|| t!("settings.hotkeys.unassigned").to_string());
 
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
@@ -93,7 +93,7 @@ impl SettingsTabState {
                 ui.small(format_scope_v2(command.scope));
                 if command.active_when_input {
                     ui.separator();
-                    ui.small("Работает во время ввода текста");
+                    ui.small(t!("settings.hotkeys.works_while_typing"));
                 }
             });
             ui.small(format!("id: {}", command.id));
@@ -102,12 +102,12 @@ impl SettingsTabState {
             ui.horizontal_wrapped(|ui| {
                 if is_capturing {
                     if hotkey_requires_modifier_only(&command.id) {
-                        ui.label("Выберите модификатор. Эти команды работают только как удерживаемый режим мыши. Esc - отмена.");
+                        ui.label(t!("settings.hotkeys.capture_modifier_hint"));
                     } else {
                         ui.label(
-                            "Нажмите клавишу или комбинацию. Для одиночных модификаторов используйте Ctrl/Alt/Shift ниже. Esc - отмена.",
+                            t!("settings.hotkeys.capture_shortcut_hint"),
                         );
-                        if ui.button("Оставить пустым").clicked() {
+                        if ui.button(t!("settings.hotkeys.leave_empty_button")).clicked() {
                             if let Some(binding) = hotkeys_v2.clear_binding(&command.id) {
                                 self.persist_hotkey_override(command.id.clone(), binding);
                             }
@@ -138,15 +138,15 @@ impl SettingsTabState {
                         }
                         self.hotkey_capture_command_id = None;
                     }
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(t!("settings.hotkeys.cancel_button")).clicked() {
                         self.hotkey_capture_command_id = None;
                     }
-                } else if ui.button("Изменить").clicked() {
+                } else if ui.button(t!("settings.hotkeys.edit_button")).clicked() {
                     self.hotkey_capture_command_id = Some(command.id.clone());
                     ui.ctx().request_repaint();
                 }
 
-                if ui.button("Сбросить").clicked()
+                if ui.button(t!("settings.hotkeys.reset_button")).clicked()
                     && let Some(binding) = hotkeys_v2.reset_to_default(&command.id) {
                         self.persist_hotkey_reset(command.id.clone(), binding);
                     }
@@ -168,7 +168,11 @@ impl SettingsTabState {
 
         match scope {
             HotkeyScopeV2::Tab(AppTab::Translation) => {
-                egui::CollapsingHeader::new("Вкладка перевода")
+                egui::CollapsingHeader::new(t!(
+                    "settings.hotkeys.translation_scope_title"
+                ))
+                    // Keep the pre-existing stable id_salt: the header id must not
+                    // depend on the (now localized) label text (exclusions §C).
                     .id_salt("settings_hotkeys_translation_scope")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -199,8 +203,8 @@ impl SettingsTabState {
                 }
                 ui.heading(section);
                 if section == "OCR" {
-                    ui.small("Ниже настраиваются два modifier-only режима для ЛКМ.");
-                    ui.small("Быстрое распознавание запускает OCR сразу, продвинутое открывает отдельное окно.");
+                    ui.small(t!("settings.hotkeys.modifier_modes_hint"));
+                    ui.small(t!("settings.hotkeys.recognition_modes_hint"));
                     ui.add_space(4.0);
                 }
                 active_section = Some(section);
@@ -303,8 +307,8 @@ fn hotkey_requires_modifier_only(command_id: &str) -> bool {
 
 fn format_scope_v2(scope: HotkeyScopeV2) -> String {
     match scope {
-        HotkeyScopeV2::Global => "Область: глобально".to_string(),
-        HotkeyScopeV2::Tab(tab) => format!("Область: {}", tab.title()),
+        HotkeyScopeV2::Global => t!("settings.hotkeys.scope_global").to_string(),
+        HotkeyScopeV2::Tab(tab) => tf!("settings.hotkeys.scope_tab", tab = tab.title()),
     }
 }
 
@@ -317,8 +321,8 @@ fn hotkey_scope_sort_key(scope: HotkeyScopeV2) -> (u8, String) {
 
 fn scope_group_title(scope: HotkeyScopeV2) -> String {
     match scope {
-        HotkeyScopeV2::Global => "Глобальные команды".to_string(),
-        HotkeyScopeV2::Tab(AppTab::Translation) => "Вкладка перевода".to_string(),
-        HotkeyScopeV2::Tab(tab) => format!("Вкладка: {}", tab.title()),
+        HotkeyScopeV2::Global => t!("settings.hotkeys.global_scope_title").to_string(),
+        HotkeyScopeV2::Tab(AppTab::Translation) => t!("settings.hotkeys.translation_scope_title").to_string(),
+        HotkeyScopeV2::Tab(tab) => tf!("settings.hotkeys.tab_scope_title", tab = tab.title()),
     }
 }

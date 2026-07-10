@@ -705,7 +705,7 @@ fn spawn_advanced_command(
         ));
         let send_result = tx.send(AdvancedDownloadWorkerEvent::Finished(Err(
             AdvancedDownloadError {
-                user_message: "Не удалось запустить продвинутый выкачиватель.".to_string(),
+                user_message: t!("launcher.adv_dl.start_error").to_string(),
                 log_message: format!("failed to spawn advanced downloader worker: {err}"),
             },
         )));
@@ -735,7 +735,7 @@ fn run_advanced_command(
     match command {
         AdvancedCommand::OpenUrl { browser, url } => {
             let normalized = normalize_http_url(url).map_err(|err| AdvancedDownloadError {
-                user_message: "Ссылка для браузера выглядит некорректной.".to_string(),
+                user_message: t!("launcher.adv_dl.invalid_url_error").to_string(),
                 log_message: format!("invalid advanced downloader url '{url}': {err}"),
             })?;
             daemon
@@ -745,7 +745,7 @@ fn run_advanced_command(
                     "url": normalized,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось отправить команду браузеру.".to_string(),
+                    user_message: t!("launcher.adv_dl.send_command_error").to_string(),
                     log_message: format!("failed to write open_url command: {err}"),
                 })?;
 
@@ -815,7 +815,7 @@ fn run_advanced_command(
                     "max_parallel": max_parallel,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить выкачивание из браузера.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_browser_download_error").to_string(),
                     log_message: format!("failed to write fetch command: {err}"),
                 })?;
 
@@ -883,7 +883,7 @@ fn run_advanced_command(
                     "cancel_file": cancel_file.display().to_string(),
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить автоподбор ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_autofind_error").to_string(),
                     log_message: format!("failed to write fetch_auto_links command: {err}"),
                 })?;
 
@@ -948,7 +948,7 @@ fn run_advanced_command(
                     "max_parallel": max_parallel,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить фоновый сбор ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_bg_collect_error").to_string(),
                     log_message: format!("failed to write start_link_collect command: {err}"),
                 })?;
 
@@ -1008,7 +1008,7 @@ fn run_advanced_command(
                     "max_parallel": max_parallel,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить фоновый автосбор ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_bg_autocollect_error").to_string(),
                     log_message: format!("failed to write start_auto_link_collect command: {err}"),
                 })?;
 
@@ -1064,7 +1064,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось получить статус сбора ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.collect_status_error").to_string(),
                     log_message: format!("failed to write link_collect_status command: {err}"),
                 })?;
 
@@ -1118,7 +1118,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось завершить сбор ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.finish_collect_error").to_string(),
                     log_message: format!("failed to write stop_link_collect command: {err}"),
                 })?;
 
@@ -1184,7 +1184,7 @@ fn run_advanced_command(
                     "cancel_file": cancel_file.display().to_string(),
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось завершить автосбор ссылок.".to_string(),
+                    user_message: t!("launcher.adv_dl.finish_autocollect_error").to_string(),
                     log_message: format!("failed to write stop_auto_link_collect command: {err}"),
                 })?;
 
@@ -1243,7 +1243,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить скачивание canvas.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_canvas_download_error").to_string(),
                     log_message: format!("failed to write fetch_canvas command: {err}"),
                 })?;
 
@@ -1305,7 +1305,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить перехват в браузере.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_intercept_error").to_string(),
                     log_message: format!("failed to write start_intercept command: {err}"),
                 })?;
 
@@ -1361,7 +1361,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось получить статус перехвата Canvas.".to_string(),
+                    user_message: t!("launcher.adv_dl.canvas_intercept_status_error").to_string(),
                     log_message: format!("failed to write intercept_status command: {err}"),
                 })?;
 
@@ -1415,7 +1415,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось завершить перехват в браузере.".to_string(),
+                    user_message: t!("launcher.adv_dl.finish_intercept_error").to_string(),
                     log_message: format!("failed to write stop_intercept command: {err}"),
                 })?;
 
@@ -1473,7 +1473,7 @@ fn run_advanced_command(
         AdvancedCommand::StartDeepIntercept { browser } => {
             if backend != AdvancedBrowserBackend::Cloak {
                 return Err(AdvancedDownloadError {
-                    user_message: "Глубокий перехват доступен только для CloakBrowser.".to_string(),
+                    user_message: t!("launcher.adv_dl.deep_intercept_cloak_only_error").to_string(),
                     log_message: "deep intercept requested for non-Cloak backend".to_string(),
                 });
             }
@@ -1483,7 +1483,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось запустить глубокий перехват.".to_string(),
+                    user_message: t!("launcher.adv_dl.start_deep_intercept_error").to_string(),
                     log_message: format!("failed to write start_deep_intercept command: {err}"),
                 })?;
 
@@ -1535,7 +1535,7 @@ fn run_advanced_command(
                     "browser": browser,
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось получить статус глубокого перехвата.".to_string(),
+                    user_message: t!("launcher.adv_dl.deep_intercept_status_error").to_string(),
                     log_message: format!("failed to write deep_intercept_status command: {err}"),
                 })?;
 
@@ -1589,7 +1589,7 @@ fn run_advanced_command(
                     "cancel_file": cancel_file.display().to_string(),
                 }))
                 .map_err(|err| AdvancedDownloadError {
-                    user_message: "Не удалось завершить глубокий перехват.".to_string(),
+                    user_message: t!("launcher.adv_dl.finish_deep_intercept_error").to_string(),
                     log_message: format!("failed to write stop_deep_intercept command: {err}"),
                 })?;
 
@@ -1701,7 +1701,7 @@ fn ensure_python_daemon<'daemon>(
     }
 
     slot.as_mut().ok_or_else(|| AdvancedDownloadError {
-        user_message: "Не удалось подключиться к browser helper.".to_string(),
+        user_message: t!("launcher.adv_dl.browser_helper_connect_error").to_string(),
         log_message: "python daemon slot remained empty after start".to_string(),
     })
 }
@@ -1729,8 +1729,7 @@ fn ensure_backend_client() -> Result<backend_ipc::BackendClient, AdvancedDownloa
         }
         if web_time::Instant::now() >= deadline {
             return Err(AdvancedDownloadError {
-                user_message: "ИИ бэкенд не запущен. Запустите его в настройках, чтобы \
-                    пользоваться браузерным выкачивателем."
+                user_message: t!("launcher.adv_dl.backend_not_running_error")
                     .to_string(),
                 log_message: "browser command requested but AI backend is not connectable"
                     .to_string(),
@@ -1825,11 +1824,11 @@ impl PythonDaemon {
     /// the single terminal event), mirroring the old line-per-payload stdio read.
     fn read_payload(&mut self) -> Result<Value, AdvancedDownloadError> {
         let rx = self.frames.as_ref().ok_or_else(|| AdvancedDownloadError {
-            user_message: "Браузерный выкачиватель не запущен.".to_string(),
+            user_message: t!("launcher.adv_dl.downloader_not_running_error").to_string(),
             log_message: "read_payload called with no in-flight browser command".to_string(),
         })?;
         rx.recv().map_err(|_| AdvancedDownloadError {
-            user_message: "Браузерный выкачиватель неожиданно завершился.".to_string(),
+            user_message: t!("launcher.adv_dl.downloader_exited_error").to_string(),
             log_message: "browser ipc frame channel closed before a terminal event".to_string(),
         })
     }
@@ -1850,9 +1849,9 @@ fn progress_frame_from_header(header: &Value) -> Value {
 fn browser_error_frame(err: CallError) -> Value {
     let (user_message, log_message) = match err {
         CallError::Error(msg) => (msg.clone(), msg),
-        CallError::Interrupted(msg) => ("Операция отменена.".to_string(), msg),
+        CallError::Interrupted(msg) => (t!("launcher.adv_dl.operation_cancelled").to_string(), msg),
         CallError::Transport(msg) => (
-            "ИИ бэкенд недоступен. Запустите его в настройках.".to_string(),
+            t!("launcher.adv_dl.backend_unavailable_error").to_string(),
             msg,
         ),
     };
@@ -1971,7 +1970,7 @@ fn parse_daemon_event(payload: Value) -> Result<DaemonEvent, AdvancedDownloadErr
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .ok_or_else(|| AdvancedDownloadError {
-                    user_message: "Python helper не вернул папку с изображениями.".to_string(),
+                    user_message: t!("launcher.adv_dl.helper_no_image_dir_error").to_string(),
                     log_message: format!("missing output_dir in result payload: {payload}"),
                 })?;
             Ok(DaemonEvent::Result {
@@ -1993,7 +1992,7 @@ fn parse_daemon_event(payload: Value) -> Result<DaemonEvent, AdvancedDownloadErr
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .ok_or_else(|| AdvancedDownloadError {
-                    user_message: "Python helper не вернул папку с автокандидатами.".to_string(),
+                    user_message: t!("launcher.adv_dl.helper_no_autocandidate_dir_error").to_string(),
                     log_message: format!("missing output_dir in auto_result payload: {payload}"),
                 })?;
             Ok(DaemonEvent::AutoResult {
@@ -2010,7 +2009,7 @@ fn parse_daemon_event(payload: Value) -> Result<DaemonEvent, AdvancedDownloadErr
             user_message: payload
                 .get("user_message")
                 .and_then(Value::as_str)
-                .unwrap_or("Продвинутый выкачиватель завершился с ошибкой.")
+                .unwrap_or(t!("launcher.adv_dl.downloader_failed_error"))
                 .to_string(),
             log_message: payload
                 .get("log_message")
@@ -2031,7 +2030,7 @@ fn parse_daemon_event(payload: Value) -> Result<DaemonEvent, AdvancedDownloadErr
                 .to_string(),
         }),
         _ => Err(AdvancedDownloadError {
-            user_message: "Python helper вернул неизвестное событие.".to_string(),
+            user_message: t!("launcher.adv_dl.helper_unknown_event_error").to_string(),
             log_message: format!("unknown daemon event payload: {payload}"),
         }),
     }
@@ -2047,7 +2046,7 @@ fn parse_auto_downloaded_items(
 ) -> Result<Vec<AutoDownloadedItem>, AdvancedDownloadError> {
     let Some(items) = payload.get("items").and_then(Value::as_array) else {
         return Err(AdvancedDownloadError {
-            user_message: "Python helper не вернул список автокандидатов.".to_string(),
+            user_message: t!("launcher.adv_dl.helper_no_autocandidate_list_error").to_string(),
             log_message: format!("missing items in auto_result payload: {payload}"),
         });
     };
@@ -2070,7 +2069,7 @@ fn parse_auto_downloaded_items(
             .to_string();
         if url.is_empty() || file_name.is_empty() {
             return Err(AdvancedDownloadError {
-                user_message: "Python helper вернул неполные данные автокандидата.".to_string(),
+                user_message: t!("launcher.adv_dl.helper_incomplete_autocandidate_error").to_string(),
                 log_message: format!("invalid auto candidate item: {item}"),
             });
         }
@@ -2141,9 +2140,7 @@ pub fn advanced_downloader_version_warning_message(
     studio_version: &str,
     downloader_version: &str,
 ) -> String {
-    format!(
-        "Версии студии и Python-выкачивателя не соответствуют: {studio_version}/{downloader_version}. Возможна некорректная работа."
-    )
+    tf!("launcher.adv_dl.version_mismatch_warning", studio_version = studio_version, downloader_version = downloader_version)
 }
 
 fn stage_name_to_static(stage: &str) -> &'static str {
@@ -2179,7 +2176,7 @@ fn log_daemon_line(level: &str, message: &str) {
 fn load_ribbon_pages_from_dir(dir: &Path) -> Result<Vec<RibbonPage>, AdvancedDownloadError> {
     let mut files = fs::read_dir(dir)
         .map_err(|err| AdvancedDownloadError {
-            user_message: "Не удалось прочитать результаты выкачивания.".to_string(),
+            user_message: t!("launcher.adv_dl.read_results_error").to_string(),
             log_message: format!(
                 "failed to read advanced downloader output dir '{}': {err}",
                 dir.display()
@@ -2194,7 +2191,7 @@ fn load_ribbon_pages_from_dir(dir: &Path) -> Result<Vec<RibbonPage>, AdvancedDow
     let mut images = Vec::with_capacity(files.len());
     for path in files {
         let image = image::open(&path).map_err(|err| AdvancedDownloadError {
-            user_message: "Не удалось открыть одну из скачанных картинок.".to_string(),
+            user_message: t!("launcher.adv_dl.open_downloaded_image_error").to_string(),
             log_message: format!(
                 "failed to decode advanced downloader image '{}': {err}",
                 path.display()
@@ -2210,7 +2207,7 @@ fn load_ribbon_pages_from_dir(dir: &Path) -> Result<Vec<RibbonPage>, AdvancedDow
 
     if images.is_empty() {
         return Err(AdvancedDownloadError {
-            user_message: "Продвинутый выкачиватель не нашёл подходящих изображений.".to_string(),
+            user_message: t!("launcher.adv_dl.no_suitable_images_error").to_string(),
             log_message: format!(
                 "advanced downloader output dir '{}' contained no images",
                 dir.display()
@@ -2228,7 +2225,7 @@ fn load_auto_candidate_set_from_dir(
 ) -> Result<AdvancedAutoCandidateSet, AdvancedDownloadError> {
     if downloaded_items.is_empty() {
         return Err(AdvancedDownloadError {
-            user_message: "Автоподбор не нашёл изображений для проверки.".to_string(),
+            user_message: t!("launcher.adv_dl.autofind_no_images_error").to_string(),
             log_message: format!(
                 "auto candidate result for '{source_url}' contained no downloaded items"
             ),
@@ -2239,7 +2236,7 @@ fn load_auto_candidate_set_from_dir(
     for (id, item) in downloaded_items.into_iter().enumerate() {
         let path = dir.join(&item.file_name);
         let image = image::open(&path).map_err(|err| AdvancedDownloadError {
-            user_message: "Не удалось открыть одну из картинок автоподбора.".to_string(),
+            user_message: t!("launcher.adv_dl.open_autofind_image_error").to_string(),
             log_message: format!(
                 "failed to decode auto candidate '{}': {err}",
                 path.display()
@@ -2455,7 +2452,7 @@ pub fn build_pages_from_auto_candidates(
         })
         .collect::<Vec<_>>();
     if images.is_empty() {
-        return Err("Все картинки автоподбора удалены.".to_string());
+        return Err(t!("launcher.adv_dl.autofind_all_removed").to_string());
     }
     Ok(build_ribbon_pages(images))
 }
@@ -2666,7 +2663,11 @@ mod tests {
     fn formats_advanced_downloader_version_warning() {
         assert_eq!(
             advanced_downloader_version_warning_message("3.4.0", "3.3.0"),
-            "Версии студии и Python-выкачивателя не соответствуют: 3.4.0/3.3.0. Возможна некорректная работа."
+            tf!(
+                "launcher.adv_dl.version_mismatch_warning",
+                studio_version = "3.4.0",
+                downloader_version = "3.3.0"
+            )
         );
     }
 

@@ -193,49 +193,43 @@ pub fn draw_ai_backend_panel(
     #[cfg(not(target_arch = "wasm32"))]
     draw_ai_runtime_section(ui, state);
 
-    ui.label(format!(
-        "Адрес сервиса (сокет): {}",
-        backend_ipc::backend_socket_path().display()
-    ));
+    ui.label(tf!("ai_backend.service_address_label", backend_ipc = backend_ipc::backend_socket_path().display()));
 
     if !ai_enabled {
         ui.colored_label(
             egui::Color32::from_rgb(225, 180, 60),
-            "Статус: отключено (--no-ai)",
+            t!("ai_backend.status_disabled_no_ai"),
         );
     } else if snapshot.connected {
-        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), "Статус: подключено");
+        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), t!("ai_backend.status_connected"));
     } else {
-        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), "Статус: недоступно");
+        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), t!("ai_backend.status_unavailable"));
     }
 
-    ui.label(format!("Детали: {}", snapshot.details));
+    ui.label(tf!("ai_backend.status_details", snapshot = snapshot.details));
     if let Some(checked_at) = snapshot.checked_at {
-        ui.small(format!(
-            "Последняя проверка: {} сек назад",
-            checked_at.elapsed().as_secs()
-        ));
+        ui.small(tf!("ai_backend.last_check_seconds_ago", checked_at = checked_at.elapsed().as_secs()));
     } else {
-        ui.small("Последняя проверка: ещё не выполнялась");
+        ui.small(t!("ai_backend.last_check_never"));
     }
 
     if ui
-        .add_enabled(ai_enabled, egui::Button::new("Проверить сейчас"))
+        .add_enabled(ai_enabled, egui::Button::new(t!("ai_backend.check_now_button")))
         .clicked()
     {
         handle.send_probe(AiBackendProbeCommand::CheckNow);
     }
 
     ui.separator();
-    ui.heading("Запуск backend");
+    ui.heading(t!("ai_backend.process_launch_heading"));
     if !ai_enabled {
-        ui.small("Запуск процесса отключен флагом --no-ai.");
+        ui.small(t!("ai_backend.process_launch_disabled_no_ai"));
     }
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(
                 ai_enabled && !process.running(),
-                egui::Button::new("Запустить"),
+                egui::Button::new(t!("ai_backend.start_button")),
             )
             .clicked()
         {
@@ -245,7 +239,7 @@ pub fn draw_ai_backend_panel(
         if ui
             .add_enabled(
                 ai_enabled && process.running(),
-                egui::Button::new("Остановить"),
+                egui::Button::new(t!("ai_backend.stop_button")),
             )
             .clicked()
         {
@@ -253,7 +247,7 @@ pub fn draw_ai_backend_panel(
             handle.send_probe(AiBackendProbeCommand::CheckNow);
         }
         if ui
-            .add_enabled(ai_enabled, egui::Button::new("Перезапустить"))
+            .add_enabled(ai_enabled, egui::Button::new(t!("ai_backend.restart_button")))
             .clicked()
         {
             handle.send_process(AiBackendProcessCommand::Restart);
@@ -265,7 +259,7 @@ pub fn draw_ai_backend_panel(
     if ui
         .add_enabled(
             ai_enabled,
-            egui::Checkbox::new(&mut auto_start, "Запускать автоматически"),
+            egui::Checkbox::new(&mut auto_start, t!("ai_backend.autostart_checkbox")),
         )
         .changed()
     {
@@ -273,28 +267,25 @@ pub fn draw_ai_backend_panel(
     }
 
     if process.running() {
-        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), "Процесс: запущен");
+        ui.colored_label(egui::Color32::from_rgb(42, 168, 88), t!("ai_backend.process_running"));
     } else {
-        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), "Процесс: остановлен");
+        ui.colored_label(egui::Color32::from_rgb(208, 84, 62), t!("ai_backend.process_stopped"));
     }
-    ui.small(format!("Статус процесса: {}", process.status()));
+    ui.small(tf!("ai_backend.process_status_label", process = process.status()));
     if let Some(updated_at) = process.updated_at() {
-        ui.small(format!(
-            "Последнее событие процесса: {} сек назад",
-            updated_at.elapsed().as_secs()
-        ));
+        ui.small(tf!("ai_backend.process_last_event_seconds_ago", updated_at = updated_at.elapsed().as_secs()));
     } else {
-        ui.small("Событий процесса пока не было.");
+        ui.small(t!("ai_backend.process_no_events"));
     }
 
-    ui.label("Вывод backend:");
+    ui.label(t!("ai_backend.output_heading"));
     egui::ScrollArea::vertical()
         .id_salt("ai_backend_process_logs")
         .max_height(220.0)
         .stick_to_bottom(true)
         .show(ui, |ui| {
             if process.logs().is_empty() {
-                ui.small("Лог пуст.");
+                ui.small(t!("ai_backend.log_empty"));
             } else {
                 for line in process.logs() {
                     ui.monospace(line);
@@ -303,7 +294,7 @@ pub fn draw_ai_backend_panel(
         });
 
     ui.separator();
-    ui.heading("Устройство вычислений");
+    ui.heading(t!("ai_backend.compute_device_heading"));
 
     // PyTorch device selection: Torch models ALWAYS run on the Python backend (some
     // models are not ONNX-exportable), so this stays backend-gated.
@@ -316,23 +307,20 @@ pub fn draw_ai_backend_panel(
     draw_onnx_and_models_section(ui, handle, state, &snapshot, ai_enabled);
 
     ui.separator();
-    ui.heading("Диагностика CUDA/ROCm");
+    ui.heading(t!("ai_backend.cuda_rocm_diagnostics_heading"));
     if ui
         .add_enabled(
             ai_enabled && snapshot.connected,
-            egui::Button::new("Проверить CUDA/ROCm"),
+            egui::Button::new(t!("ai_backend.cuda_rocm_check_button")),
         )
         .clicked()
     {
         handle.send_probe(AiBackendProbeCommand::RefreshCudaDiagnostics);
     }
     if let Some(checked_at) = snapshot.cuda_checked_at {
-        ui.small(format!(
-            "Последняя диагностика: {} сек назад",
-            checked_at.elapsed().as_secs()
-        ));
+        ui.small(tf!("ai_backend.last_diagnostics_seconds_ago", checked_at = checked_at.elapsed().as_secs()));
     } else {
-        ui.small("Диагностика ещё не запускалась.");
+        ui.small(t!("ai_backend.diagnostics_never"));
     }
     egui::ScrollArea::vertical()
         .id_salt("ai_backend_cuda_diagnostics")
@@ -344,10 +332,10 @@ pub fn draw_ai_backend_panel(
     ui.separator();
     if ai_enabled {
         ui.small(
-            "Проверка соединения, запуск процесса и вывод логов выполняются в отдельных потоках.",
+            t!("ai_backend.threads_hint"),
         );
     } else {
-        ui.small("Проверка отключена флагом --no-ai.");
+        ui.small(t!("ai_backend.check_disabled_no_ai"));
     }
 }
 
@@ -364,7 +352,7 @@ fn draw_torch_device_controls(
     ai_enabled: bool,
 ) {
     if !ai_enabled {
-        ui.small("Управление устройством PyTorch отключено флагом --no-ai.");
+        ui.small(t!("ai_backend.pytorch_device_disabled_no_ai"));
         return;
     }
 
@@ -395,7 +383,7 @@ fn draw_torch_device_controls(
 
     ui.horizontal_wrapped(|ui| {
         let selected_text = if state.selected_backend_device.trim().is_empty() {
-            "нет данных".to_string()
+            t!("ai_backend.no_data").to_string()
         } else {
             snapshot
                 .device_options
@@ -406,7 +394,7 @@ fn draw_torch_device_controls(
         };
 
         ui.add_enabled_ui(snapshot.connected && torch_available, |ui| {
-            WheelComboBox::from_label("Устройство PyTorch")
+            WheelComboBox::from_label(t!("ai_backend.pytorch_device_combo_label")).id_salt("ai_backend.pytorch_device_combo_label")
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for option in &snapshot.device_options {
@@ -422,7 +410,7 @@ fn draw_torch_device_controls(
         if ui
             .add_enabled(
                 snapshot.connected && torch_available,
-                egui::Button::new("Обновить список"),
+                egui::Button::new(t!("ai_backend.refresh_list_button")),
             )
             .clicked()
         {
@@ -434,7 +422,7 @@ fn draw_torch_device_controls(
             && !state.selected_backend_device.trim().is_empty()
             && snapshot.selected_device.as_deref() != Some(state.selected_backend_device.as_str());
         if ui
-            .add_enabled(can_apply, egui::Button::new("Установить"))
+            .add_enabled(can_apply, egui::Button::new(t!("ai_backend.pytorch_set_device_button")))
             .clicked()
         {
             handle.send_probe(AiBackendProbeCommand::SetDevice(
@@ -450,11 +438,11 @@ fn draw_torch_device_controls(
             .find(|option| &option.id == current)
             .map(|option| option.label.clone())
             .unwrap_or_else(|| current.clone());
-        ui.small(format!("Текущее устройство PyTorch: {current_label}"));
+        ui.small(tf!("ai_backend.pytorch_current_device", current_label = current_label));
     }
     ui.small(format!("PyTorch: {}", snapshot.device_details));
     if !torch_available {
-        ui.colored_label(egui::Color32::from_rgb(240, 102, 102), "PyTorch не установлен");
+        ui.colored_label(egui::Color32::from_rgb(240, 102, 102), t!("ai_backend.pytorch_not_installed"));
     }
 }
 
@@ -486,10 +474,10 @@ fn draw_onnx_and_models_section(
     let config_read = state.onnx_config.lock().ok().and_then(|guard| guard.clone());
 
     ui.separator();
-    ui.label("ONNX Runtime (нативный и бэкенд)");
+    ui.label(t!("ai_backend.onnx_runtime_heading"));
 
     let (Some(caps), Some(config_read)) = (caps, config_read) else {
-        ui.small("Загрузка возможностей ONNX Runtime…");
+        ui.small(t!("ai_backend.onnx_caps_loading"));
         return;
     };
 
@@ -530,7 +518,7 @@ fn draw_onnx_and_models_section(
             .selected_onnx_device_id
             .clone()
             .unwrap_or_else(|| "0".to_string());
-        ui.small(format!("Бэкенд ONNX: {current_provider} / {current_device}"));
+        ui.small(tf!("ai_backend.onnx_backend_current", current_provider = current_provider, current_device = current_device));
     }
     ui.small(format!("ONNX: {}", snapshot.onnx_details));
 
@@ -581,7 +569,7 @@ fn draw_backend_provider_selection(
             .find(|option| option.token == state.selected_onnx_provider)
             .map(|option| provider_display_label(option, runtime, snapshot.connected))
             .unwrap_or_else(|| state.selected_onnx_provider.clone());
-        WheelComboBox::from_label("Провайдер ONNX")
+        WheelComboBox::from_label(t!("ai_backend.onnx_provider_combo_label")).id_salt("ai_backend.onnx_provider_combo_label")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 for option in &options {
@@ -614,7 +602,7 @@ fn draw_backend_provider_selection(
             .map(|device| device.label.clone())
             .unwrap_or_else(|| state.selected_onnx_device_id.clone());
         ui.add_enabled_ui(devices.len() > 1, |ui| {
-            WheelComboBox::from_label("Устройство ONNX")
+            WheelComboBox::from_label(t!("ai_backend.onnx_device_combo_label")).id_salt("ai_backend.onnx_device_combo_label")
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
                     for device in &devices {
@@ -652,9 +640,9 @@ fn draw_backend_provider_selection(
     // Explain, under the Backend runtime, why the selected provider may not run as-is.
     if let (Some(option), Some(crate::config::AiRuntime::Backend)) = (selected_option, runtime) {
         if !snapshot.connected {
-            ui.small("ИИ-бэкенд офлайн: выбор вступит в силу после запуска бэкенда.");
+            ui.small(t!("ai_backend.offline_selection_hint"));
         } else if !option.backend_available {
-            ui.small("Выбранный провайдер сейчас не сообщён ИИ-бэкендом и недоступен.");
+            ui.small(t!("ai_backend.provider_not_reported_hint"));
         }
     }
 }
@@ -722,18 +710,18 @@ fn draw_native_build_selection(
 
     ui.horizontal_wrapped(|ui| {
         let selected_label = build_display_label(&state.selected_onnx_build, &availability);
-        WheelComboBox::from_label("Билд")
+        WheelComboBox::from_label(t!("ai_backend.build_combo_label")).id_salt("ai_backend.build_combo_label")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
-                render_build_group(ui, state, "Базовые", &groups.basic, &availability);
-                render_build_group(ui, state, "Специфичные", &groups.specific, &availability);
+                render_build_group(ui, state, t!("ai_backend.build_group_basic"), &groups.basic, &availability);
+                render_build_group(ui, state, t!("ai_backend.build_group_specific"), &groups.specific, &availability);
                 // Unavailable builds sit at the bottom: still selectable for a forced
                 // download, EXCEPT the informational QNN entry (no binary, no EP).
-                render_build_group(ui, state, "Недоступные", &groups.unavailable, &availability);
+                render_build_group(ui, state, t!("ai_backend.build_group_unavailable"), &groups.unavailable, &availability);
             });
     });
     ui.small(
-        "«Билд» выбирает, какую сборку ONNX Runtime нативный рантайм скачивает и загружает.",
+        t!("ai_backend.build_hint"),
     );
 
     // A build change resets the EP to the build's headline (first) EP so the EP/device
@@ -801,7 +789,7 @@ fn draw_native_build_selection(
             .map(|device| device.label.clone())
             .unwrap_or_else(|| state.selected_onnx_device_id.clone());
         ui.add_enabled_ui(devices.len() > 1, |ui| {
-            WheelComboBox::from_label("Устройство")
+            WheelComboBox::from_label(t!("ai_backend.build_device_combo_label")).id_salt("ai_backend.build_device_combo_label")
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
                     for device in &devices {
@@ -849,7 +837,7 @@ fn draw_native_build_selection(
     }
 
     if !selected_available {
-        ui.small("Эта сборка недоступна на данной системе; её можно скачать принудительно.");
+        ui.small(t!("ai_backend.build_unavailable_hint"));
     }
 
     // onnxruntime auto-download progress for the selected build (worker-reported).
@@ -868,10 +856,10 @@ fn draw_model_manager(
     snapshot: &AiBackendHealthSnapshot,
 ) {
     ui.separator();
-    ui.label("Менеджер моделей");
+    ui.label(t!("ai_backend.model_manager_heading"));
     let slider_response = ui.add(
         egui::Slider::new(&mut state.selected_max_loaded_models, 1..=10)
-            .text("Максимум одновременно загруженных моделей"),
+            .text(t!("ai_backend.max_loaded_models_label")),
     );
     if slider_response.changed() {
         spawn_save_max_loaded_models(state.selected_max_loaded_models);
@@ -882,7 +870,7 @@ fn draw_model_manager(
         }
     }
     if snapshot.connected {
-        ui.small(format!("Текущий лимит в backend: {}", snapshot.max_loaded_models));
+        ui.small(tf!("ai_backend.backend_current_limit", snapshot = snapshot.max_loaded_models));
     }
 }
 
@@ -938,11 +926,11 @@ fn draw_onnx_and_models_section(
 
     ui.horizontal_wrapped(|ui| {
         let selected_provider = if state.selected_onnx_provider.trim().is_empty() {
-            "нет данных".to_string()
+            t!("ai_backend.no_data").to_string()
         } else {
             state.selected_onnx_provider.clone()
         };
-        WheelComboBox::from_label("Провайдер ONNX")
+        WheelComboBox::from_label(t!("ai_backend.onnx_provider_combo_label_backend")).id_salt("ai_backend.onnx_provider_combo_label_backend")
             .selected_text(selected_provider)
             .show_ui(ui, |ui| {
                 for provider in &snapshot.available_onnx_providers {
@@ -959,7 +947,7 @@ fn draw_onnx_and_models_section(
             && (snapshot.selected_onnx_provider.as_deref()
                 != Some(state.selected_onnx_provider.as_str()));
         if ui
-            .add_enabled(can_apply_provider, egui::Button::new("Применить провайдер"))
+            .add_enabled(can_apply_provider, egui::Button::new(t!("ai_backend.apply_provider_button")))
             .clicked()
         {
             handle.send_probe(AiBackendProbeCommand::SetOnnxDevice {
@@ -971,7 +959,7 @@ fn draw_onnx_and_models_section(
 
     ui.horizontal_wrapped(|ui| {
         let selected_text = if state.selected_onnx_device_id.trim().is_empty() {
-            "нет данных".to_string()
+            t!("ai_backend.no_data").to_string()
         } else {
             snapshot
                 .onnx_devices_by_provider
@@ -982,7 +970,7 @@ fn draw_onnx_and_models_section(
                 .map(|option| option.label.clone())
                 .unwrap_or_else(|| state.selected_onnx_device_id.clone())
         };
-        WheelComboBox::from_label("Устройство ONNX")
+        WheelComboBox::from_label(t!("ai_backend.onnx_device_combo_label_backend")).id_salt("ai_backend.onnx_device_combo_label_backend")
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
                 for option in snapshot
@@ -1002,7 +990,7 @@ fn draw_onnx_and_models_section(
             && !state.selected_onnx_provider.trim().is_empty()
             && !state.selected_onnx_device_id.trim().is_empty();
         if ui
-            .add_enabled(can_apply_device, egui::Button::new("Установить ONNX"))
+            .add_enabled(can_apply_device, egui::Button::new(t!("ai_backend.apply_onnx_button")))
             .clicked()
         {
             handle.send_probe(AiBackendProbeCommand::SetOnnxDevice {
@@ -1014,18 +1002,18 @@ fn draw_onnx_and_models_section(
 
     ui.small(format!("ONNX: {}", snapshot.onnx_details));
     ui.separator();
-    ui.label("Менеджер моделей");
+    ui.label(t!("ai_backend.model_manager_heading"));
     let slider_response = ui.add_enabled(
         snapshot.connected,
         egui::Slider::new(&mut state.selected_max_loaded_models, 1..=10)
-            .text("Максимум одновременно загруженных моделей"),
+            .text(t!("ai_backend.max_loaded_models_label")),
     );
     if slider_response.changed() {
         handle.send_probe(AiBackendProbeCommand::SetMaxLoadedModels(
             state.selected_max_loaded_models,
         ));
     }
-    ui.small(format!("Текущий лимит в backend: {}", snapshot.max_loaded_models));
+    ui.small(tf!("ai_backend.backend_current_limit", snapshot = snapshot.max_loaded_models));
 }
 
 /// Backend-reported ONNX providers + device lists folded into the offline native
@@ -1124,7 +1112,7 @@ fn build_onnx_provider_options(
             backend_available: false,
             devices: vec![OnnxDeviceOptionUi {
                 id: "0".to_string(),
-                label: "По умолчанию".to_string(),
+                label: t!("ai_backend.device_default").to_string(),
             }],
         });
     } else {
@@ -1159,7 +1147,7 @@ fn build_onnx_provider_options(
     let webgpu_devices = if webgpu_devices.is_empty() {
         vec![OnnxDeviceOptionUi {
             id: "0".to_string(),
-            label: "По умолчанию".to_string(),
+            label: t!("ai_backend.device_default").to_string(),
         }]
     } else {
         webgpu_devices
@@ -1306,7 +1294,7 @@ fn provider_runtime_state(
             if !option.native_capable {
                 ProviderRuntimeState {
                     usable: false,
-                    suffix: Some("(только ИИ-бэкенд)"),
+                    suffix: Some(t!("ai_backend.provider_backend_only_suffix")),
                 }
             } else if option.native_available {
                 ProviderRuntimeState {
@@ -1316,7 +1304,7 @@ fn provider_runtime_state(
             } else {
                 ProviderRuntimeState {
                     usable: false,
-                    suffix: Some("(недоступно)"),
+                    suffix: Some(t!("ai_backend.provider_unavailable_suffix")),
                 }
             }
         }
@@ -1329,7 +1317,7 @@ fn provider_runtime_state(
             } else if backend_connected {
                 ProviderRuntimeState {
                     usable: false,
-                    suffix: Some("(недоступно)"),
+                    suffix: Some(t!("ai_backend.provider_unavailable_suffix")),
                 }
             } else {
                 ProviderRuntimeState {
@@ -1513,12 +1501,12 @@ fn partition_builds(availability: &BuildAvailability) -> BuildGroups {
 #[cfg(not(target_arch = "wasm32"))]
 fn build_display_label(slug: &str, availability: &BuildAvailability) -> String {
     let name = crate::onnx_runtime::builds::build_by_slug(slug)
-        .map(|build| build.display_name)
+        .map(|build| build.display_label())
         .unwrap_or(slug);
     if build_slug_available(slug, availability) {
         name.to_string()
     } else {
-        format!("{name} (недоступно)")
+        tf!("ai_backend.device_unavailable_suffix", name = name)
     }
 }
 
@@ -1619,14 +1607,14 @@ fn ep_device_options(ep: ms_onnx::ExecutionProvider, caps: &OnnxCaps) -> Vec<Onn
     };
     match ep {
         ExecutionProvider::DirectMl => indexed(&caps.directml_accelerators, "GPU 0"),
-        ExecutionProvider::WebGpu => indexed(&caps.webgpu_adapters, "По умолчанию"),
+        ExecutionProvider::WebGpu => indexed(&caps.webgpu_adapters, t!("ai_backend.device_default")),
         ExecutionProvider::Cuda | ExecutionProvider::TensorRt => vec![OnnxDeviceOptionUi {
             id: "0".to_string(),
             label: "GPU 0".to_string(),
         }],
         ExecutionProvider::Cpu | ExecutionProvider::CoreMl => vec![OnnxDeviceOptionUi {
             id: "0".to_string(),
-            label: "По умолчанию".to_string(),
+            label: t!("ai_backend.device_default").to_string(),
         }],
         // OpenVINO selects a device by TYPE string, persisted verbatim to
         // `ai_onnx_device_id` (the native path routes it via `with_device_type`).
@@ -1832,10 +1820,9 @@ fn draw_build_action_button(
     match action {
         OrtBuildAction::Retry => {
             if ui
-                .button("Повторить попытку ORT")
+                .button(t!("ai_backend.ort_retry_button"))
                 .on_hover_text(
-                    "Сбрасывает защиту после аварийной загрузки ONNX Runtime, чтобы снова \
-                     попробовать нативный рантайм без перезапуска приложения.",
+                    t!("ai_backend.ort_retry_tooltip"),
                 )
                 .clicked()
             {
@@ -1844,10 +1831,9 @@ fn draw_build_action_button(
         }
         OrtBuildAction::LoadOtherBuild => {
             if ui
-                .button("Загрузить другую сборку ort")
+                .button(t!("ai_backend.ort_load_other_build_button"))
                 .on_hover_text(
-                    "Скачивает выбранную сборку ONNX Runtime и сбрасывает защиту, чтобы \
-                     следующий запуск нативного рантайма загрузил её.",
+                    t!("ai_backend.ort_load_other_build_tooltip"),
                 )
                 .clicked()
             {
@@ -1860,7 +1846,7 @@ fn draw_build_action_button(
         OrtBuildAction::RestartNote => {
             ui.colored_label(
                 egui::Color32::from_rgb(225, 180, 60),
-                "Перезапустите программу для применения изменений",
+                t!("ai_backend.restart_required_note"),
             );
         }
     }
@@ -1969,11 +1955,11 @@ fn start_onnx_config_read(state: &mut AiBackendPanelState) {
 #[cfg(not(target_arch = "wasm32"))]
 fn ort_stage_label_ru(stage: OrtDownloadStage) -> &'static str {
     match stage {
-        OrtDownloadStage::Probing => "Проверка",
-        OrtDownloadStage::Downloading => "Скачивание",
-        OrtDownloadStage::Verifying => "Проверка целостности",
-        OrtDownloadStage::Extracting => "Распаковка",
-        OrtDownloadStage::Done => "Готово",
+        OrtDownloadStage::Probing => t!("ai_backend.ort_stage_probe"),
+        OrtDownloadStage::Downloading => t!("ai_backend.ort_stage_download"),
+        OrtDownloadStage::Verifying => t!("ai_backend.ort_stage_verify"),
+        OrtDownloadStage::Extracting => t!("ai_backend.ort_stage_extract"),
+        OrtDownloadStage::Done => t!("ai_backend.ort_stage_done"),
     }
 }
 
@@ -2039,9 +2025,12 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
                     }
                 }
                 Err(err) => {
+                    // `status.error` is user-facing, so it uses the localized Display;
+                    // the log uses Debug (stable English variant name) to stay grep-able
+                    // regardless of the selected UI language.
                     status.error = Some(err.to_string());
                     crate::runtime_log::log_warn(format!(
-                        "[ai-backend-panel] onnxruntime download failed for build '{build}': {err}"
+                        "[ai-backend-panel] onnxruntime download failed for build '{build}': {err:?}"
                     ));
                 }
             }
@@ -2072,7 +2061,7 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
     if let Some(error) = error {
         ui.colored_label(
             egui::Color32::from_rgb(208, 84, 62),
-            format!("Не удалось подготовить ONNX Runtime: {error}"),
+            tf!("ai_backend.ort_prepare_error", error = error),
         );
         return;
     }
@@ -2083,7 +2072,7 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
     if done || progress.map(|p| p.stage) == Some(OrtDownloadStage::Done) {
         ui.colored_label(
             egui::Color32::from_rgb(42, 168, 88),
-            "Библиотека ONNX Runtime готова.",
+            t!("ai_backend.ort_ready"),
         );
         return;
     }
@@ -2114,7 +2103,7 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Подготовка ONNX Runtime…");
+                    ui.label(t!("ai_backend.ort_preparing"));
                 });
             }
         }
@@ -2173,19 +2162,15 @@ fn spawn_save_max_loaded_models(value: u32) {
 fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState) {
     use crate::config::AiRuntime;
 
-    ui.heading("ONNX-инференс");
+    ui.heading(t!("ai_backend.onnx_inference_heading"));
     ui.small(
-        "Выберите, где выполнять ONNX-модели: через ИИ-бэкенд (Python) или нативно \
-         (Rust ONNX Runtime, прямо в приложении). Нативный путь сейчас покрывает OCR MangaOCR \
-         и PaddleOCR, а также детекцию текста PaddleOCR; остальные ONNX-операции продолжают идти \
-         через бэкенд.",
+        t!("ai_backend.onnx_inference_hint"),
     );
     ui.small(
-        "Torch-модели всегда выполняются на ИИ-бэкенде (часть моделей не экспортируется в ONNX).",
+        t!("ai_backend.torch_backend_only_hint"),
     );
     ui.small(
-        "Смена рантайма или провайдера вступает в силу только после перезапуска приложения: \
-         окружение и библиотека onnxruntime фиксируются в процессе один раз.",
+        t!("ai_backend.runtime_change_restart_hint"),
     );
 
     // Kick off a one-shot background read of the current runtime so the GUI thread
@@ -2217,11 +2202,11 @@ fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState) {
         .and_then(|guard| *guard);
     match current_runtime {
         None => {
-            ui.small("Загрузка текущего рантайма…");
+            ui.small(t!("ai_backend.runtime_loading"));
         }
         Some(runtime) => {
             let mut selected = runtime;
-            WheelComboBox::from_label("ONNX-инференс")
+            WheelComboBox::from_label(t!("ai_backend.onnx_inference_combo_label")).id_salt("ai_backend.onnx_inference_combo_label")
                 .selected_text(ai_runtime_label(selected))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -2254,8 +2239,8 @@ fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState) {
 #[cfg(not(target_arch = "wasm32"))]
 fn ai_runtime_label(runtime: crate::config::AiRuntime) -> &'static str {
     match runtime {
-        crate::config::AiRuntime::Backend => "Через ИИ-бэкенд (Python)",
-        crate::config::AiRuntime::Native => "Нативно (Rust ONNX Runtime)",
+        crate::config::AiRuntime::Backend => t!("ai_backend.runtime_backend_option"),
+        crate::config::AiRuntime::Native => t!("ai_backend.runtime_native_option"),
     }
 }
 
@@ -2550,7 +2535,7 @@ mod tests {
         // Under Native: shown, NOT usable, marked backend-only.
         let native = provider_runtime_state(migraphx, AiRuntime::Native, true);
         assert!(!native.usable);
-        assert_eq!(native.suffix, Some("(только ИИ-бэкенд)"));
+        assert_eq!(native.suffix, Some(t!("ai_backend.provider_backend_only_suffix")));
 
         // Under Backend (connected): usable, no suffix — the core regression fix.
         let backend_state = provider_runtime_state(migraphx, AiRuntime::Backend, true);
@@ -2604,7 +2589,7 @@ mod tests {
         assert!(cuda.native_capable && !cuda.native_available);
         let state = provider_runtime_state(cuda, AiRuntime::Native, false);
         assert!(!state.usable);
-        assert_eq!(state.suffix, Some("(недоступно)"));
+        assert_eq!(state.suffix, Some(t!("ai_backend.provider_unavailable_suffix")));
     }
 
     /// WebGPU is offered on every desktop OS, and its `native_available` follows the
@@ -2648,7 +2633,7 @@ mod tests {
             assert!(webgpu.native_capable && !webgpu.native_available);
             let state = provider_runtime_state(webgpu, AiRuntime::Native, false);
             assert!(!state.usable);
-            assert_eq!(state.suffix, Some("(недоступно)"));
+            assert_eq!(state.suffix, Some(t!("ai_backend.provider_unavailable_suffix")));
         }
     }
 
@@ -2666,7 +2651,7 @@ mod tests {
         };
         let state = provider_runtime_state(&option, AiRuntime::Backend, true);
         assert!(!state.usable);
-        assert_eq!(state.suffix, Some("(недоступно)"));
+        assert_eq!(state.suffix, Some(t!("ai_backend.provider_unavailable_suffix")));
     }
 
     /// WebGPU's device list is built from the enumerated adapters: one device per
@@ -2710,7 +2695,7 @@ mod tests {
             .expect("webgpu listed");
         assert_eq!(webgpu.devices.len(), 1);
         assert_eq!(webgpu.devices[0].id, "0");
-        assert_eq!(webgpu.devices[0].label, "По умолчанию");
+        assert_eq!(webgpu.devices[0].label, t!("ai_backend.device_default"));
     }
 
     /// Availability flags partition builds into Базовые / Специфичные / Недоступные:

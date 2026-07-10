@@ -38,18 +38,12 @@ const DOWNLOAD_PARALLELISM: usize = 8;
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36";
 
-pub const SUPPORTED_SITES_TOOLTIP: &str = "\
-Поддерживаемые сайты:\n\
-comic.naver.com\n\
-webtoons.com\n\
-m.webtoons.com\n\
-mangadex.org\n\
-natomanga.com\n\
-readcomiconline.li\n\
-comicfury.com\n\
-hecomicseries.com\n\
-kuaikanmanhua.com\n\
-bato.to";
+/// Supported-sites tooltip for the quick downloader. Runtime accessor (not `const`)
+/// because `t!` is not `const`.
+#[must_use]
+pub fn supported_sites_tooltip() -> &'static str {
+    t!("launcher.new_project.quick_dl.supported_sites_hint")
+}
 
 #[derive(Debug)]
 struct PendingQuickDownload {
@@ -191,7 +185,7 @@ fn spawn_quick_download(url: String) -> Receiver<QuickDownloadWorkerEvent> {
             if tx
                 .send(QuickDownloadWorkerEvent::Finished(Err(
                     QuickDownloadError {
-                        user_message: "Не удалось запустить быстрый выкачиватель.".to_string(),
+                        user_message: t!("launcher.new_project.quick_dl.start_error").to_string(),
                         log_message: format!("failed to spawn quick downloader for '{url}': {err}"),
                     },
                 )))
@@ -211,13 +205,13 @@ fn load_quick_download(
     progress_tx: &Sender<QuickDownloadWorkerEvent>,
 ) -> Result<LoadedQuickDownload, QuickDownloadError> {
     let normalized = normalize_http_url(url).map_err(|err| QuickDownloadError {
-        user_message: "Ссылка для быстрого выкачивателя выглядит некорректной.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.invalid_url_error").to_string(),
         log_message: format!("invalid quick download url '{url}': {err}"),
     })?;
     let plan = build_site_download_plan(&normalized)?;
     if plan.image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "На странице не удалось найти изображения главы.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.no_chapter_images_error").to_string(),
             log_message: format!("quick downloader found zero images for '{normalized}'"),
         });
     }
@@ -258,7 +252,7 @@ fn build_site_download_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
     }
 
     Err(QuickDownloadError {
-        user_message: "Этот сайт пока не поддерживается быстрым выкачивателем.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.site_unsupported_error").to_string(),
         log_message: format!("unsupported quick download host '{host}' for '{url}'"),
     })
 }
@@ -302,18 +296,18 @@ fn download_images_ordered(
 fn download_image(url: &str, referer: Option<&str>) -> Result<DynamicImage, QuickDownloadError> {
     let bytes = fetch_bytes(url, referer)?;
     image::load_from_memory(&bytes).map_err(|err| QuickDownloadError {
-        user_message: "Не удалось декодировать одну из загруженных картинок.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.decode_image_error").to_string(),
         log_message: format!("failed to decode downloaded image '{url}': {err}"),
     })
 }
 
 fn comic_naver_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     let title_id = query_param(url, "titleId").ok_or_else(|| QuickDownloadError {
-        user_message: "Ссылка Naver должна содержать titleId.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.naver_no_titleid_error").to_string(),
         log_message: format!("naver url '{url}' has no titleId"),
     })?;
     let episode_no = query_param(url, "no").ok_or_else(|| QuickDownloadError {
-        user_message: "Ссылка Naver должна содержать номер главы.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.naver_no_chapter_error").to_string(),
         log_message: format!("naver url '{url}' has no no parameter"),
     })?;
     let html = fetch_text(url, None)?;
@@ -348,7 +342,7 @@ fn bato_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     }
     if image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "Не удалось найти изображения главы на bato.to.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.batoto_no_images_error").to_string(),
             log_message: format!("bato page '{url}' has no image urls"),
         });
     }
@@ -363,7 +357,7 @@ fn webtoons_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
         url.to_string()
     } else {
         let title_no = query_param(url, "title_no").ok_or_else(|| QuickDownloadError {
-            user_message: "Ссылка Webtoons должна содержать title_no.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.webtoons_no_titleno_error").to_string(),
             log_message: format!("webtoons url '{url}' has no title_no"),
         })?;
         let webtoon_type = if url.contains("/canvas/") || url.contains("/challenge/") {
@@ -380,7 +374,7 @@ fn webtoons_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
             .and_then(|result| result.get("episodeList"))
             .and_then(Value::as_array)
             .ok_or_else(|| QuickDownloadError {
-                user_message: "Не удалось получить список эпизодов Webtoons.".to_string(),
+                user_message: t!("launcher.new_project.quick_dl.webtoons_no_episodes_error").to_string(),
                 log_message: format!("webtoons api '{api_url}' returned no episodeList"),
             })?;
         let last_viewer_link = episodes
@@ -388,7 +382,7 @@ fn webtoons_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
             .and_then(|episode| episode.get("viewerLink"))
             .and_then(Value::as_str)
             .ok_or_else(|| QuickDownloadError {
-                user_message: "Не удалось определить эпизод для скачивания.".to_string(),
+                user_message: t!("launcher.new_project.quick_dl.webtoons_no_episode_error").to_string(),
                 log_message: format!("webtoons api '{api_url}' returned malformed viewerLink"),
             })?;
         format!("https://www.webtoons.com{last_viewer_link}")
@@ -415,7 +409,7 @@ fn webtoons_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     image_urls = dedupe_preserve(image_urls);
     if image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "Не удалось найти изображения эпизода Webtoons.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.webtoons_no_episode_images_error").to_string(),
             log_message: format!("webtoons chapter '{chapter_url}' has no image urls"),
         });
     }
@@ -430,7 +424,7 @@ fn mangadex_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
         id
     } else {
         let manga_id = path_segment_after(url, "title").ok_or_else(|| QuickDownloadError {
-            user_message: "Ссылка MangaDex должна вести на тайтл или главу.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.mangadex_bad_url_error").to_string(),
             log_message: format!("mangadex url '{url}' is neither title nor chapter"),
         })?;
         pick_latest_mangadex_chapter(&manga_id)?
@@ -442,25 +436,25 @@ fn mangadex_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
         json.get("baseUrl")
             .and_then(Value::as_str)
             .ok_or_else(|| QuickDownloadError {
-                user_message: "MangaDex не вернул адрес сервера главы.".to_string(),
+                user_message: t!("launcher.new_project.quick_dl.mangadex_no_server_error").to_string(),
                 log_message: format!("mangadex at-home '{api_url}' has no baseUrl"),
             })?;
     let chapter = json.get("chapter").ok_or_else(|| QuickDownloadError {
-        user_message: "MangaDex не вернул данные главы.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.mangadex_no_chapter_data_error").to_string(),
         log_message: format!("mangadex at-home '{api_url}' has no chapter field"),
     })?;
     let hash = chapter
         .get("hash")
         .and_then(Value::as_str)
         .ok_or_else(|| QuickDownloadError {
-            user_message: "MangaDex не вернул hash главы.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.mangadex_no_hash_error").to_string(),
             log_message: format!("mangadex at-home '{api_url}' has no hash"),
         })?;
     let data = chapter
         .get("data")
         .and_then(Value::as_array)
         .ok_or_else(|| QuickDownloadError {
-            user_message: "MangaDex не вернул список страниц главы.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.mangadex_no_pages_error").to_string(),
             log_message: format!("mangadex at-home '{api_url}' has no chapter.data"),
         })?;
     let image_urls = data
@@ -481,7 +475,7 @@ fn natomanga_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
         let html = fetch_text(url, None)?;
         let chapters = collect_anchor_hrefs_containing(&html, url, "/chapter/");
         chapters.last().cloned().ok_or_else(|| QuickDownloadError {
-            user_message: "Не удалось получить список глав NatoManga.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.natomanga_no_chapters_error").to_string(),
             log_message: format!("natomanga series '{url}' has no chapter urls"),
         })?
     };
@@ -514,14 +508,14 @@ fn readcomiconline_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadErro
             .get(1)
             .cloned()
             .ok_or_else(|| QuickDownloadError {
-                user_message: "Ссылка ReadComicOnline выглядит неполной.".to_string(),
+                user_message: t!("launcher.new_project.quick_dl.readcomic_incomplete_url_error").to_string(),
                 log_message: format!("readcomiconline url '{url}' has not enough segments"),
             })?;
         let list_url = format!("https://readcomiconline.li/Comic/{comic_id}");
         let html = fetch_text(&list_url, None)?;
         let chapters = collect_anchor_hrefs_containing(&html, &list_url, "/Comic/");
         chapters.last().cloned().ok_or_else(|| QuickDownloadError {
-            user_message: "Не удалось получить список глав комикса.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.comic_no_chapters_error").to_string(),
             log_message: format!("readcomiconline list '{list_url}' has no chapters"),
         })?
     } else {
@@ -551,7 +545,7 @@ fn readcomiconline_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadErro
 
     if image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "Не удалось найти страницы ReadComicOnline.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.readcomic_no_pages_error").to_string(),
             log_message: format!("readcomiconline chapter '{chapter_url}' has no lstImages"),
         });
     }
@@ -563,7 +557,7 @@ fn readcomiconline_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadErro
 
 fn comicfury_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     let comic_id = comicfury_id(url).ok_or_else(|| QuickDownloadError {
-        user_message: "Не удалось определить комикс ComicFury по ссылке.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.comicfury_no_comic_error").to_string(),
         log_message: format!("comicfury url '{url}' has no comic id"),
     })?;
 
@@ -580,7 +574,7 @@ fn comicfury_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
             .last()
             .cloned()
             .ok_or_else(|| QuickDownloadError {
-                user_message: "Не удалось получить список глав ComicFury.".to_string(),
+                user_message: t!("launcher.new_project.quick_dl.comicfury_no_chapters_error").to_string(),
                 log_message: format!("comicfury archive '{archive_url}' has no chapter urls"),
             })?
     };
@@ -602,7 +596,7 @@ fn comicfury_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     image_urls = dedupe_preserve(image_urls);
     if image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "Не удалось найти изображения ComicFury.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.comicfury_no_images_error").to_string(),
             log_message: format!("comicfury chapter '{chapter_url}' has no matching images"),
         });
     }
@@ -618,7 +612,7 @@ fn kuaikan_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
         let mut chapters = collect_https_json_strings(&html);
         chapters.retain(|item| item.contains("/webs/comic-next/"));
         chapters.last().cloned().ok_or_else(|| QuickDownloadError {
-            user_message: "Не удалось получить список глав Kuaikan.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.kuaikan_no_chapters_error").to_string(),
             log_message: format!("kuaikan topic '{url}' has no chapter urls"),
         })?
     } else {
@@ -630,7 +624,7 @@ fn kuaikan_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadError> {
     image_urls = dedupe_preserve(image_urls);
     if image_urls.is_empty() {
         return Err(QuickDownloadError {
-            user_message: "Не удалось найти изображения Kuaikan.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.kuaikan_no_images_error").to_string(),
             log_message: format!("kuaikan chapter '{chapter_url}' has no image urls"),
         });
     }
@@ -663,7 +657,7 @@ fn pick_latest_mangadex_chapter(manga_id: &str) -> Result<String, QuickDownloadE
         }
     }
     Err(QuickDownloadError {
-        user_message: "Не удалось найти главы MangaDex для этого тайтла.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.mangadex_no_title_chapters_error").to_string(),
         log_message: format!("mangadex manga '{manga_id}' has no chapters"),
     })
 }
@@ -673,7 +667,7 @@ fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, QuickDownloadE
     let response = make_request(url, referer)?
         .into_string()
         .map_err(|err| QuickDownloadError {
-            user_message: "Не удалось прочитать ответ сайта.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.read_response_error").to_string(),
             log_message: format!("failed to read text response from '{url}': {err}"),
         })?;
     Ok(response)
@@ -684,7 +678,7 @@ fn fetch_text(url: &str, referer: Option<&str>) -> Result<String, QuickDownloadE
 #[cfg(target_arch = "wasm32")]
 fn fetch_text(_url: &str, _referer: Option<&str>) -> Result<String, QuickDownloadError> {
     Err(QuickDownloadError {
-        user_message: "Загрузка глав недоступна в веб-версии.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.download_web_unsupported").to_string(),
         log_message: "quick download HTTP client is not available on the web build".to_string(),
     })
 }
@@ -695,7 +689,7 @@ fn fetch_bytes(url: &str, referer: Option<&str>) -> Result<Vec<u8>, QuickDownloa
     let mut reader = response.into_reader();
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|err| QuickDownloadError {
-        user_message: "Не удалось скачать одну из страниц.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.download_page_error").to_string(),
         log_message: format!("failed to read binary response from '{url}': {err}"),
     })?;
     Ok(bytes)
@@ -705,7 +699,7 @@ fn fetch_bytes(url: &str, referer: Option<&str>) -> Result<Vec<u8>, QuickDownloa
 #[cfg(target_arch = "wasm32")]
 fn fetch_bytes(_url: &str, _referer: Option<&str>) -> Result<Vec<u8>, QuickDownloadError> {
     Err(QuickDownloadError {
-        user_message: "Загрузка глав недоступна в веб-версии.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.download_web_unsupported").to_string(),
         log_message: "quick download HTTP client is not available on the web build".to_string(),
     })
 }
@@ -713,7 +707,7 @@ fn fetch_bytes(_url: &str, _referer: Option<&str>) -> Result<Vec<u8>, QuickDownl
 fn fetch_json_value(url: &str, referer: Option<&str>) -> Result<Value, QuickDownloadError> {
     let text = fetch_text(url, referer)?;
     serde_json::from_str::<Value>(&text).map_err(|err| QuickDownloadError {
-        user_message: "Сайт вернул неожиданный JSON-ответ.".to_string(),
+        user_message: t!("launcher.new_project.quick_dl.unexpected_json_error").to_string(),
         log_message: format!("failed to parse json from '{url}': {err}; body={text}"),
     })
 }
@@ -733,12 +727,12 @@ fn make_request(url: &str, referer: Option<&str>) -> Result<ureq::Response, Quic
         ureq::Error::Status(status, response) => {
             let body = response.into_string().unwrap_or_default();
             QuickDownloadError {
-                user_message: format!("Сайт вернул ошибку {status} при загрузке главы."),
+                user_message: tf!("launcher.new_project.quick_dl.site_error_status", status = status),
                 log_message: format!("request '{url}' failed with status {status}; body={body}"),
             }
         }
         ureq::Error::Transport(transport) => QuickDownloadError {
-            user_message: "Не удалось подключиться к сайту для загрузки главы.".to_string(),
+            user_message: t!("launcher.new_project.quick_dl.connect_error").to_string(),
             log_message: format!("request '{url}' failed: {transport}"),
         },
     })

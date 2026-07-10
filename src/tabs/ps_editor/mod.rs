@@ -342,8 +342,8 @@ enum ClipMode {
 impl ClipMode {
     fn verb(self) -> &'static str {
         match self {
-            ClipMode::Copy => "Скопировать",
-            ClipMode::Cut => "Вырезать",
+            ClipMode::Copy => t!("ps_editor.clip.copy_verb"),
+            ClipMode::Cut => t!("ps_editor.clip.cut_verb"),
         }
     }
 }
@@ -1109,7 +1109,7 @@ impl PsEditorTabState {
                 layer_uid: uid,
                 diff: Arc::new(diff),
                 dir: ApplyDirection::Forward,
-                label: "Кисть".to_string(),
+                label: t!("ps_editor.edit_op.brush_stroke").to_string(),
             }),
             Err(err) => {
                 crate::runtime_log::log_warn(format!(
@@ -1678,7 +1678,7 @@ impl PsEditorTabState {
     fn draw_top_bar(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
         egui::Panel::top("ps_editor_top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Страница:");
+                ui.label(t!("ps_editor.top_bar.page_label"));
                 let page_indices: Vec<usize> = project.pages.iter().map(|p| p.idx).collect();
                 let current = self.active_page_idx.or(self.requested_page_idx);
                 let current_pos =
@@ -1711,21 +1711,24 @@ impl PsEditorTabState {
 
                 ui.separator();
                 // Both refit using the real canvas rect, resolved in `draw_canvas`.
-                if ui.button("Вписать").clicked() {
+                if ui.button(t!("ps_editor.top_bar.fit_button")).clicked() {
                     self.viewport.invalidate();
                 }
                 if ui.button("100%").clicked() {
                     self.pending_actual_size = true;
                 }
-                ui.label(format!("Зум: {:.0}%", self.viewport.zoom() * 100.0));
+                ui.label(tf!(
+                    "ps_editor.top_bar.zoom",
+                    percent = format!("{:.0}", self.viewport.zoom() * 100.0)
+                ));
 
                 if self.pending_job_id.is_some() {
                     ui.spinner();
-                    ui.label("Загрузка страницы…");
+                    ui.label(t!("ps_editor.top_bar.loading_page"));
                 }
                 if self.raster_effects_state.is_some() {
                     ui.spinner();
-                    ui.label("Применение эффектов…");
+                    ui.label(t!("ps_editor.top_bar.applying_effects"));
                 }
                 if let Some(err) = &self.load_error {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);
@@ -1740,7 +1743,7 @@ impl PsEditorTabState {
             .resizable(false)
             .default_size(220.0)
             .show(ui, |ui| {
-                ui.heading("Инструменты");
+                ui.heading(t!("ps_editor.toolbar.tools_heading"));
                 for index in 0..self.tools.len() {
                     let selected = index == self.active_tool_idx;
                     let title = self.tools[index].title();
@@ -1749,14 +1752,14 @@ impl PsEditorTabState {
                     }
                 }
                 ui.separator();
-                ui.heading("Параметры");
+                ui.heading(t!("ps_editor.toolbar.options_heading"));
                 self.tools[self.active_tool_idx].options_ui(ui);
 
                 ui.separator();
-                if ui.button("Выделить слой полностью").clicked() {
+                if ui.button(t!("ps_editor.toolbar.select_whole_layer")).clicked() {
                     self.select_active_layer_fully();
                 }
-                if ui.button("Снять выделение").clicked() {
+                if ui.button(t!("ps_editor.toolbar.clear_selection")).clicked() {
                     self.clear_selection();
                 }
             });
@@ -1820,17 +1823,17 @@ impl PsEditorTabState {
     /// borrow of `self.stack` / `self.text_layers`.
     fn layers_panel_body(&mut self, ui: &mut egui::Ui) -> PanelActions {
         let mut actions = PanelActions::default();
-        ui.heading("Слои");
+        ui.heading(t!("ps_editor.layers_panel.heading"));
         if self.stack.is_none() {
-            ui.label("Нет загруженной страницы.");
+            ui.label(t!("ps_editor.layers_panel.no_page"));
             return actions;
         }
 
         ui.horizontal(|ui| {
-            if ui.button("➕ Слой").clicked() {
+            if ui.button(t!("ps_editor.layers_panel.add_layer_button")).clicked() {
                 actions.add_layer = true;
             }
-            if ui.button("📁 Группа").clicked() {
+            if ui.button(t!("ps_editor.layers_panel.add_group_button")).clicked() {
                 actions.new_empty_group = true;
             }
         });
@@ -1898,7 +1901,7 @@ impl PsEditorTabState {
                             let l = stack.layer(*id);
                             (
                                 None,
-                                l.map_or_else(|| "слой".into(), |l| l.name.clone()),
+                                l.map_or_else(|| t!("ps_editor.layers_panel.leaf_fallback_layer").into(), |l| l.name.clone()),
                                 l.is_some_and(|l| l.visible),
                                 true,
                             )
@@ -1907,7 +1910,7 @@ impl PsEditorTabState {
                             let l = stack.layer(*id);
                             (
                                 Some(RowSel::Raster(*id)),
-                                l.map_or_else(|| "растр".into(), |l| l.name.clone()),
+                                l.map_or_else(|| t!("ps_editor.layers_panel.leaf_fallback_raster").into(), |l| l.name.clone()),
                                 l.is_some_and(|l| l.visible),
                                 false,
                             )
@@ -1918,7 +1921,7 @@ impl PsEditorTabState {
                             // tab; fall back to the stored node name when the overlay has no text. The
                             // `🅣` icon is added later in `draw_leaf_row`, so it is omitted here.
                             let name = t.map_or_else(
-                                || "текст".into(),
+                                || t!("ps_editor.layers_panel.leaf_fallback_text").into(),
                                 |t| {
                                     let preview = crate::tabs::typing::text_preview_label(
                                         &t.text_content,
@@ -1927,7 +1930,7 @@ impl PsEditorTabState {
                                     if preview.is_empty() {
                                         t.name.clone()
                                     } else {
-                                        format!("Текст ({preview})")
+                                        tf!("ps_editor.layers_panel.text_preview", preview = preview)
                                     }
                                 },
                             );
@@ -1989,7 +1992,7 @@ impl PsEditorTabState {
         egui::Popup::context_menu(&resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                if ui.button("🗑 Удалить группу").clicked() {
+                if ui.button(t!("ps_editor.layers_panel.delete_group_button")).clicked() {
                     actions.group_op = Some(GroupOp::DeleteGroup(header.uid.clone()));
                     egui::Popup::close_all(ui.ctx());
                 }
@@ -2066,7 +2069,7 @@ impl PsEditorTabState {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 if !group_list.is_empty() {
-                    ui.menu_button("Переместить в группу", |ui| {
+                    ui.menu_button(t!("ps_editor.layers_panel.move_to_group"), |ui| {
                         for (uid, name) in group_list {
                             if ui.button(format!("📁 {name}")).clicked() {
                                 actions.group_op = Some(GroupOp::MoveTo(uid.clone()));
@@ -2075,11 +2078,11 @@ impl PsEditorTabState {
                         }
                     });
                 }
-                if ui.button("Создать группу из выделенного").clicked() {
+                if ui.button(t!("ps_editor.layers_panel.create_group_from_selection")).clicked() {
                     actions.group_op = Some(GroupOp::NewFromSelection);
                     egui::Popup::close_all(ui.ctx());
                 }
-                if ui.button("Вынести из группы").clicked() {
+                if ui.button(t!("ps_editor.layers_panel.remove_from_group")).clicked() {
                     actions.group_op = Some(GroupOp::Ungroup);
                     egui::Popup::close_all(ui.ctx());
                 }
@@ -2121,7 +2124,7 @@ impl PsEditorTabState {
     /// raster, pin / rasterize for a text, opacity / delete for a group.
     fn draw_active_controls(&self, ui: &mut egui::Ui, actions: &mut PanelActions) {
         let Some(primary) = self.panel_primary.clone() else {
-            ui.label("Выберите слой");
+            ui.label(t!("ps_editor.active_controls.select_layer_hint"));
             return;
         };
         let Some(stack) = self.stack.as_ref() else {
@@ -2135,7 +2138,7 @@ impl PsEditorTabState {
                 ui.label(format!("▦ {}", layer.name));
                 let mut opacity = layer.opacity;
                 if ui
-                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text("Непрозр."))
+                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text(t!("ps_editor.active_controls.opacity_label")))
                     .changed()
                 {
                     actions.opacity_raster = Some((id, opacity));
@@ -2153,14 +2156,14 @@ impl PsEditorTabState {
                     let mergeable = self.is_mergeable(id);
                     if ui
                         .add_enabled(mergeable, egui::Button::new("⤓").small())
-                        .on_hover_text("Слить вниз")
+                        .on_hover_text(t!("ps_editor.active_controls.merge_down"))
                         .clicked()
                     {
                         actions.merge_req = Some(id);
                     }
                     if ui
                         .add(egui::Button::new("fx").small())
-                        .on_hover_text("Эффекты (растрировать в слой)")
+                        .on_hover_text(t!("ps_editor.active_controls.effects_rasterize"))
                         .clicked()
                     {
                         actions.open_effects = Some(id);
@@ -2169,8 +2172,8 @@ impl PsEditorTabState {
                     // render into the base pixels and clear the chain so it becomes directly editable.
                     if !layer.effects.is_empty()
                         && ui
-                            .add(egui::Button::new("Запечь").small())
-                            .on_hover_text("Запечь эффекты в пиксели (станет редактируемым)")
+                            .add(egui::Button::new(t!("ps_editor.active_controls.bake_button")).small())
+                            .on_hover_text(t!("ps_editor.active_controls.bake_tooltip"))
                             .clicked()
                     {
                         actions.bake_req = Some(id);
@@ -2187,14 +2190,14 @@ impl PsEditorTabState {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(if text.pinned { "📌" } else { "📍" }).small())
-                        .on_hover_text("Закрепить по Z")
+                        .on_hover_text(t!("ps_editor.active_controls.pin_z"))
                         .clicked()
                     {
                         actions.text_op = Some((index, TextLayerOp::TogglePin));
                     }
                     if ui
                         .add(egui::Button::new("⊞").small())
-                        .on_hover_text("Запечь в слой")
+                        .on_hover_text(t!("ps_editor.active_controls.bake_into_layer"))
                         .clicked()
                     {
                         actions.text_op = Some((index, TextLayerOp::Rasterize));
@@ -2217,12 +2220,12 @@ impl PsEditorTabState {
                 ui.label(format!("📁 {}", group.name));
                 let mut opacity = group.opacity;
                 if ui
-                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text("Непрозр."))
+                    .add(crate::widgets::WheelSlider::new(&mut opacity, 0.0..=1.0).text(t!("ps_editor.active_controls.opacity_label")))
                     .changed()
                 {
                     actions.group_op = Some(GroupOp::GroupOpacity(uid.clone(), opacity));
                 }
-                if ui.add(egui::Button::new("🗑 Удалить группу").small()).clicked() {
+                if ui.add(egui::Button::new(t!("ps_editor.layers_panel.delete_group_button")).small()).clicked() {
                     actions.group_op = Some(GroupOp::DeleteGroup(uid));
                 }
             }
@@ -2302,6 +2305,8 @@ impl PsEditorTabState {
             && let Some(stack) = self.stack.as_mut()
         {
             let n = stack.groups().len() + 1;
+            // Persisted group name (round-trips to `layers.json`); stable literal, not
+            // localized. See docs/i18n_exclusions.md §A (persisted layer/group names).
             let gid = stack.add_group(format!("Группа {n}"));
             crate::trace_log!(cat::PS_EDITOR, "panel new_empty_group gid={}", gid);
         }
@@ -2842,6 +2847,8 @@ impl PsEditorTabState {
             GroupOp::NewFromSelection => {
                 let n = self.stack.as_ref().map_or(0, |s| s.groups().len()) + 1;
                 let uid = uuid::Uuid::new_v4().to_string();
+                // Persisted group name (round-trips to `layers.json`); stable literal.
+                // See docs/i18n_exclusions.md §A (persisted layer/group names).
                 let name = format!("Группа {n}");
                 edit.new_groups.push(persist::GroupMeta {
                     uid: uid.clone(),
@@ -3042,12 +3049,12 @@ impl PsEditorTabState {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
-        egui::Window::new("Эффекты слоя")
+        egui::Window::new(t!("ps_editor.effects_editor.window_title")).id(egui::Id::new("ps_editor.effects_editor.window_title"))
             .collapsible(false)
             .resizable(true)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("Цепочка эффектов (JSON, как в тайпе):");
+                ui.label(t!("ps_editor.effects_editor.chain_label"));
                 if let Some((_, text)) = self.effects_editor.as_mut() {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -3057,15 +3064,15 @@ impl PsEditorTabState {
                     );
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Применить").clicked() {
+                    if ui.button(t!("ps_editor.effects_editor.apply_button")).clicked() {
                         apply = true;
                     }
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(t!("ps_editor.effects_editor.cancel_button")).clicked() {
                         cancel = true;
                     }
                 });
                 ui.small(
-                    r#"Напр.: [{"type":"shadow","offset_x":4,"offset_y":4,"blur":3,"color":[0,0,0,200]}]"#,
+                    t!("ps_editor.effects_editor.example_hint"),
                 );
             });
 
@@ -3181,7 +3188,7 @@ impl PsEditorTabState {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
-                    Some(Err("Эффекты растра прерваны (ошибка канала).".to_string()))
+                    Some(Err(t!("ps_editor.effects.raster_interrupted").to_string()))
                 }
             }
         };
@@ -3413,6 +3420,8 @@ impl PsEditorTabState {
                 let new_id = self
                     .stack
                     .as_mut()
+                    // Persisted raster-layer name (round-trips to `layers.json`); stable
+                    // literal, not localized. See docs/i18n_exclusions.md §A.
                     .map(|s| s.add_raster_layer_image(format!("Запечён: {name}"), image, transform));
                 // The doc is the sole text writer: removing the Text node and flushing drops it from
                 // `layers.json` (a migrated page ignores the stale `text_info.json` entry, so the
@@ -3441,7 +3450,7 @@ impl PsEditorTabState {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Страница не загружена",
+                t!("ps_editor.canvas.no_page"),
                 egui::FontId::proportional(16.0),
                 Color32::from_gray(160),
             );
@@ -4070,13 +4079,13 @@ impl PsEditorTabState {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 if !has_selection {
-                    ui.label("Нет выделения");
+                    ui.label(t!("ps_editor.selection_menu.no_selection"));
                     return;
                 }
-                ui.menu_button("Копировать", |ui| {
+                ui.menu_button(t!("ps_editor.selection_menu.copy"), |ui| {
                     self.clip_op_submenu(ui, ClipMode::Copy, project)
                 });
-                ui.menu_button("Вырезать", |ui| {
+                ui.menu_button(t!("ps_editor.selection_menu.cut"), |ui| {
                     self.clip_op_submenu(ui, ClipMode::Cut, project)
                 });
             });
@@ -4086,7 +4095,7 @@ impl PsEditorTabState {
     fn clip_op_submenu(&mut self, ui: &mut egui::Ui, mode: ClipMode, project: &ProjectData) {
         let touched = self.clip_touched_layers.clone();
         if ui
-            .add_enabled(!touched.is_empty(), egui::Button::new("Из верхнего слоя"))
+            .add_enabled(!touched.is_empty(), egui::Button::new(t!("ps_editor.selection_menu.clip_from_top_layer")))
             .clicked()
         {
             if let Some(&top) = touched.last() {
@@ -4094,10 +4103,10 @@ impl PsEditorTabState {
             }
             egui::Popup::close_all(ui.ctx());
         }
-        ui.menu_button("Из слоя/слоёв…", |ui| {
+        ui.menu_button(t!("ps_editor.selection_menu.clip_from_layers"), |ui| {
             self.clip_layer_picker(ui, mode, &touched, project);
         });
-        if ui.button("Из всех слоёв").clicked() {
+        if ui.button(t!("ps_editor.selection_menu.clip_from_all_layers")).clicked() {
             let all: Vec<LayerId> = self
                 .stack
                 .as_ref()
@@ -4117,7 +4126,7 @@ impl PsEditorTabState {
         project: &ProjectData,
     ) {
         if touched.is_empty() {
-            ui.label("Выделение не затрагивает слои");
+            ui.label(t!("ps_editor.selection_menu.no_layers_touched"));
             return;
         }
         // Display top-to-bottom (reverse of the bottom-to-top stack order).
@@ -4126,7 +4135,7 @@ impl PsEditorTabState {
                 .stack
                 .as_ref()
                 .and_then(|stack| stack.layer(id))
-                .map_or_else(|| format!("Слой {id}"), |layer| layer.name.clone());
+                .map_or_else(|| tf!("ps_editor.selection_menu.layer_fallback", id = id), |layer| layer.name.clone());
             let mut checked = self.clip_selected_layers.contains(&id);
             if ui.checkbox(&mut checked, name).changed() {
                 if checked {
@@ -4526,6 +4535,8 @@ fn clip_into_new_layer(
     }
 
     let name = match mode {
+        // Persisted raster-layer names (round-trip to `layers.json`); stable literals,
+        // not localized. See docs/i18n_exclusions.md §A (persisted layer/group names).
         ClipMode::Copy => "Копия".to_string(),
         ClipMode::Cut => "Вырезка".to_string(),
     };

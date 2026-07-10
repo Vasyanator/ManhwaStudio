@@ -228,7 +228,7 @@ pub(super) fn draw_on_top_for_page(
                                 .hint_text(if show_original_fallback {
                                     ""
                                 } else {
-                                    "Перевод"
+                                    t!("canvas.bubble.translation_label")
                                 })
                                 .desired_width(field_size.x)
                                 .desired_rows(1)
@@ -375,7 +375,7 @@ pub(super) fn draw_on_top_for_page(
             let orig_resp = with_bubble_text_font(&mut original_ui, |ui| {
                 SpellcheckedTextEdit::multiline(&mut new_original)
                     .id_salt(("on_top_original", bid))
-                    .hint_text("Оригинал")
+                    .hint_text(t!("canvas.bubble.original_label"))
                     .desired_width(original_field_width)
                     .desired_rows(1)
                     .spellcheck_enabled(
@@ -449,11 +449,11 @@ pub(super) fn draw_on_top_for_page(
             footer_ui.set_max_width(footer_zone.width());
             footer_ui.set_min_height(footer_zone.height());
             footer_ui.horizontal_wrapped(|ui| {
-                if ui.small_button("Перевести").clicked() {
+                if ui.small_button(t!("canvas.bubble.translate_button")).clicked() {
                     want_translate = true;
                     interacted_with_bubble = true;
                 }
-                if ui.small_button("Удалить").clicked() {
+                if ui.small_button(t!("canvas.bubble.delete_button")).clicked() {
                     want_delete = true;
                     interacted_with_bubble = true;
                 }

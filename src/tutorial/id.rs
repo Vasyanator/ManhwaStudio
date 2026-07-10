@@ -79,17 +79,17 @@ impl TutorialId {
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
-            TutorialId::LauncherMain => "Главное меню лаунчера",
-            TutorialId::NewProject => "Окно новой главы",
-            TutorialId::StudioBase => "Обзор редактора",
-            TutorialId::StudioTranslation => "Вкладка перевода",
-            TutorialId::StudioCleaning => "Вкладка клининга",
-            TutorialId::StudioTyping => "Вкладка тайпинга",
-            TutorialId::StudioPsEditor => "PS-редактор",
-            TutorialId::StudioCharacters => "Вкладка персонажей",
-            TutorialId::StudioTerms => "Вкладка терминов",
-            TutorialId::StudioNotes => "Вкладка заметок",
-            TutorialId::StudioWiki => "Вкладка вики",
+            TutorialId::LauncherMain => t!("tutorial.title.launcher_main"),
+            TutorialId::NewProject => t!("tutorial.title.new_project"),
+            TutorialId::StudioBase => t!("tutorial.title.studio_base"),
+            TutorialId::StudioTranslation => t!("tutorial.title.studio_translation"),
+            TutorialId::StudioCleaning => t!("tutorial.title.studio_cleaning"),
+            TutorialId::StudioTyping => t!("tutorial.title.studio_typing"),
+            TutorialId::StudioPsEditor => t!("tutorial.title.ps_editor"),
+            TutorialId::StudioCharacters => t!("tutorial.title.studio_characters"),
+            TutorialId::StudioTerms => t!("tutorial.title.studio_terms"),
+            TutorialId::StudioNotes => t!("tutorial.title.studio_notes"),
+            TutorialId::StudioWiki => t!("tutorial.title.studio_wiki"),
         }
     }
 

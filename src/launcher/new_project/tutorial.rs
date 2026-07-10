@@ -64,19 +64,17 @@ pub fn steps() -> Vec<TutorialStep<NpTutorialCtx>> {
     vec![
         // ---- Intro: fork on how to present the window ----
         TutorialStep::message(
-            "Обучение — окно новой главы",
-            "Показать наглядно на тестовой главе (скачаю, сошью, нарежу и обработаю \
-             реальную главу) — или просто рассказать про кнопки без обработки?",
+            t!("launcher.new_project.tutorial.intro_title"),
+            t!("launcher.new_project.tutorial.intro_message"),
         )
         .id("np_intro")
-        .choice("Показать наглядно", "np_vis_download")
-        .choice("Просто рассказать", "np_exp_simple"),
+        .choice(t!("launcher.new_project.tutorial.show_live_choice"), "np_vis_download")
+        .choice(t!("launcher.new_project.tutorial.just_tell_choice"), "np_exp_simple"),
         // ================= VISUAL BRANCH =================
         TutorialStep::new(
             [TARGET_TEST_DOWNLOAD],
-            "Скачивание тестовой главы",
-            "Нажимаю «Скачать тестовую главу» — качаю пример с comic.naver.com. \
-             Это может занять время, дождёмся загрузки.",
+            t!("launcher.new_project.tutorial.download_title"),
+            t!("launcher.new_project.tutorial.download_message"),
         )
         .id("np_vis_download")
         .on_enter(|c: &mut NpTutorialCtx| {
@@ -86,9 +84,8 @@ pub fn steps() -> Vec<TutorialStep<NpTutorialCtx>> {
         .await_gate(|g| !g.ctx.busy),
         TutorialStep::new(
             [TARGET_STITCH],
-            "Склейка и нарезка",
-            "Глава скачана. Теперь склеиваю вебтун-ленту и автоматически нарезаю \
-             её на страницы.",
+            t!("launcher.new_project.tutorial.stitch_title"),
+            t!("launcher.new_project.tutorial.stitch_message"),
         )
         .id("np_vis_stitch")
         .on_enter(|c: &mut NpTutorialCtx| {
@@ -100,9 +97,8 @@ pub fn steps() -> Vec<TutorialStep<NpTutorialCtx>> {
         .await_gate(|g| !g.ctx.busy),
         TutorialStep::new(
             [TARGET_WAIFU],
-            "Обработка через waifu2x",
-            "Прогоняю страницы через waifu2x — шумоподавление и апскейл. Так же \
-             доступен Reline рядом в этой секции.",
+            t!("launcher.new_project.tutorial.waifu2x_title"),
+            t!("launcher.new_project.tutorial.waifu2x_message"),
         )
         .id("np_vis_waifu")
         .on_enter(|c: &mut NpTutorialCtx| {
@@ -112,56 +108,46 @@ pub fn steps() -> Vec<TutorialStep<NpTutorialCtx>> {
         })
         .await_gate(|g| !g.ctx.busy),
         TutorialStep::message(
-            "Готово!",
-            "Тестовая глава скачана, сшита, нарезана и обработана. Отсюда её можно \
-             сохранить как проект или экспортировать. Не обязательно сохранять — \
-             окно можно использовать просто для выкачки и обработки.",
+            t!("launcher.new_project.tutorial.done_title"),
+            t!("launcher.new_project.tutorial.done_message"),
         )
         .id("np_vis_done")
         .finish(),
         // ================= EXPLAIN BRANCH =================
         TutorialStep::new(
             [TARGET_MODE_TABS],
-            "Простой режим",
-            "В простом режиме всё идёт по шагам — импорт, склейка, обработка, \
-             сохранение. Обычно этого достаточно. Давайте посмотрим полную панель \
-             со всеми инструментами сразу.",
+            t!("launcher.new_project.tutorial.simple_mode_title"),
+            t!("launcher.new_project.tutorial.simple_mode_message"),
         )
         .id("np_exp_simple"),
         TutorialStep::new(
             [TARGET_IMPORT],
-            "Импорт",
-            "Открыть папку или файл, вставить из буфера, режим захвата экрана — \
-             сюда попадают исходники главы.",
+            t!("launcher.new_project.tutorial.import_title"),
+            t!("launcher.new_project.tutorial.import_message"),
         )
         .id("np_exp_import")
         .on_enter(|c: &mut NpTutorialCtx| c.commands.push(NpTutorialCommand::SwitchToFull)),
         TutorialStep::new(
             [TARGET_QUICK],
-            "Выкачиватели",
-            "Быстрый выкачиватель качает главу по ссылке с поддерживаемых сайтов. \
-             Ниже — продвинутый: выкачка через подконтрольный браузер (Selenium \
-             или CloakBrowser) для сложных случаев.",
+            t!("launcher.new_project.tutorial.downloaders_title"),
+            t!("launcher.new_project.tutorial.downloaders_message"),
         )
         .id("np_exp_quick"),
         TutorialStep::new(
             [TARGET_STITCH],
-            "Сшивание и нарезка",
-            "Склейка вебтун-ленты в одно полотно и нарезка обратно на страницы — \
-             автоматически или с ручной расстановкой линий реза.",
+            t!("launcher.new_project.tutorial.stitch_split_title"),
+            t!("launcher.new_project.tutorial.stitch_split_message"),
         )
         .id("np_exp_stitch"),
         TutorialStep::new(
             [TARGET_WAIFU],
-            "Обработка изображений",
-            "waifu2x и Reline — шумоподавление и апскейл страниц перед переводом.",
+            t!("launcher.new_project.tutorial.processing_title"),
+            t!("launcher.new_project.tutorial.processing_message"),
         )
         .id("np_exp_process"),
         TutorialStep::message(
-            "Это всё",
-            "Полная панель даёт доступ ко всем инструментам сразу. Обработанную \
-             главу можно сохранить как проект или использовать окно просто как \
-             комбайн для выкачки и предобработки.",
+            t!("launcher.new_project.tutorial.finish_title"),
+            t!("launcher.new_project.tutorial.finish_message"),
         )
         .id("np_exp_done")
         .finish(),

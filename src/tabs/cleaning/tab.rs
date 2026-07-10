@@ -106,7 +106,11 @@ const AUTOCLEAN_MIN_EDGE_RATIO: f32 = 0.16;
 const AUTOCLEAN_BOX_INK_LIMIT: f32 = 0.45;
 /// Объединять компоненты текста, чьи пиксели в пределах стольких пикселей.
 const AUTOCLEAN_CLUSTER_SLACK: usize = 4;
-const SAVE_HINT_TEXT: &str = "Сохранение...";
+/// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
+#[must_use]
+fn save_hint_text() -> &'static str {
+    t!("cleaning.tab.saving_status")
+}
 const FLOATING_PANEL_MARGIN: f32 = 12.0;
 /// Дополнительный отступ панели инструментов от правого края вьюпорта, чтобы
 /// плавающее окно не перекрывало вертикальный скроллбар холста.
@@ -126,7 +130,7 @@ enum UnevenBackgroundTool {
 impl UnevenBackgroundTool {
     fn title(self) -> &'static str {
         match self {
-            Self::NoProcessing => "Не обрабатывать",
+            Self::NoProcessing => t!("cleaning.tab.no_processing_title"),
         }
     }
 }
@@ -616,14 +620,14 @@ impl CleaningTabState {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut overlays_visible, "Показать слой");
-                            if ui.button("Очистить текущий слой").clicked() {
+                            ui.checkbox(&mut overlays_visible, t!("cleaning.tab.show_layer_button"));
+                            if ui.button(t!("cleaning.tab.clear_current_layer_button")).clicked() {
                                 clear_page = true;
                             }
                             if ui
                                 .add_enabled(
                                     !self.save_job_in_progress,
-                                    egui::Button::new("Сохранить клин"),
+                                    egui::Button::new(t!("cleaning.tab.save_clean_button")),
                                 )
                                 .clicked()
                             {
@@ -631,7 +635,7 @@ impl CleaningTabState {
                             }
                         });
                         ui.horizontal(|ui| {
-                            let quick_button = ui.button("Быстрый клин найденного текста");
+                            let quick_button = ui.button(t!("cleaning.tab.quick_clean_heading"));
                             if quick_button.clicked() {
                                 toggle_quick_clean_panel = true;
                             }
@@ -643,14 +647,14 @@ impl CleaningTabState {
                                 |ui| {
                                     if self.save_job_in_progress {
                                         ui.spinner();
-                                        ui.label(SAVE_HINT_TEXT);
+                                        ui.label(save_hint_text());
                                     }
                                 },
                             );
                         });
 
-                        ui.small("ЛКМ: рисование, Shift+ЛКМ: стирание");
-                        ui.small("Space+drag: прокрутка холста, -=/: размер кисти");
+                        ui.small(t!("cleaning.tab.paint_erase_hint"));
+                        ui.small(t!("cleaning.tab.scroll_brush_hint"));
                         if !self.save_job_in_progress
                             && let Some(status) = self.save_status_text.as_ref()
                         {
@@ -695,7 +699,7 @@ impl CleaningTabState {
                 .max(canvas_rect.left() + FLOATING_PANEL_MARGIN),
             canvas_rect.top() + FLOATING_PANEL_MARGIN,
         );
-        let window = egui::Window::new("Инструменты клина")
+        let window = egui::Window::new(t!("cleaning.tab.tools_heading")).id(egui::Id::new("cleaning.tab.tools_heading"))
             .id(egui::Id::new("cleaning_tool_floating_panel"))
             .default_pos(tool_panel_default_pos)
             .default_width(CLEANING_TOOL_PANEL_DEFAULT_WIDTH)
@@ -704,14 +708,14 @@ impl CleaningTabState {
             .show(ctx, |ui| {
                 self.draw_tool_button_group(
                     ui,
-                    "Кисти",
+                    t!("cleaning.tab.brushes_label"),
                     &BRUSH_TOOL_INDICES,
                     &mut activate_tool_idx,
                 );
                 ui.add_space(6.0);
                 self.draw_tool_button_group(
                     ui,
-                    "Удаление под маской",
+                    t!("cleaning.tab.mask_removal_label"),
                     &MASK_REMOVAL_TOOL_INDICES,
                     &mut activate_tool_idx,
                 );
@@ -794,7 +798,7 @@ impl CleaningTabState {
         let mut panel_open = self.quick_text_mask_panel_open;
         let mut run_current_page = false;
         let mut run_all_pages = false;
-        let window = egui::Window::new("Быстрый клин найденного текста")
+        let window = egui::Window::new(t!("cleaning.tab.quick_clean_heading")).id(egui::Id::new("cleaning.tab.quick_clean_heading"))
             .id(egui::Id::new("cleaning_quick_text_mask_panel"))
             .default_pos(canvas_rect.left_top() + egui::vec2(1080.0, 12.0))
             .collapsible(true)
@@ -802,19 +806,16 @@ impl CleaningTabState {
             .open(&mut panel_open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Радиус расползания маски").on_hover_text(
-                        "Насколько далеко маска «расползается» вдоль выбивающихся из \
-                             однородного фона штрихов (хвосты букв и т.п.), пока её край не \
-                             станет однородным. На столько же она может отступить от пика, \
-                             если расползание не помогло.",
+                    ui.label(t!("cleaning.tab.mask_spread_radius_label")).on_hover_text(
+                        t!("cleaning.tab.mask_spread_radius_hint"),
                     );
                     ui.add(
                         WheelSlider::new(&mut self.quick_clean_spread_radius_px, 0..=128)
-                            .suffix(" пикс"),
+                            .suffix(t!("cleaning.tab.pixels_suffix")),
                     );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Инструмент обработки неравномерного фона");
+                    ui.label(t!("cleaning.tab.uneven_background_tool_label"));
                     WheelComboBox::from_id_salt("quick-clean-uneven-bg-tool")
                         .selected_text(self.quick_clean_uneven_background_tool.title())
                         .show_ui(ui, |ui| {
@@ -830,7 +831,7 @@ impl CleaningTabState {
                     if ui
                         .add_enabled(
                             !self.quick_clean_job_in_progress,
-                            egui::Button::new("Заклинить текущую страницу"),
+                            egui::Button::new(t!("cleaning.tab.clean_current_page_button")),
                         )
                         .clicked()
                     {
@@ -839,7 +840,7 @@ impl CleaningTabState {
                     if ui
                         .add_enabled(
                             !self.quick_clean_job_in_progress,
-                            egui::Button::new("Заклинить все страницы"),
+                            egui::Button::new(t!("cleaning.tab.clean_all_pages_button")),
                         )
                         .clicked()
                     {
@@ -849,7 +850,7 @@ impl CleaningTabState {
                 if self.text_mask_load_in_progress {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.small("Загрузка маски из text_detection...");
+                        ui.small(t!("cleaning.tab.mask_loading_status"));
                     });
                 } else if let Some(status) = self.text_mask_load_status.as_ref() {
                     ui.small(status);
@@ -858,24 +859,15 @@ impl CleaningTabState {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.small("Быстрый клин выполняется...");
+                        ui.small(t!("cleaning.tab.quick_clean_running_status"));
                     });
                 }
                 if self.quick_clean_progress.total_pages > 0 {
                     let progress = (self.quick_clean_progress.done_pages as f32
                         / self.quick_clean_progress.total_pages as f32)
                         .clamp(0.0, 1.0);
-                    ui.add(egui::ProgressBar::new(progress).text(format!(
-                        "Страницы: {}/{}",
-                        self.quick_clean_progress.done_pages, self.quick_clean_progress.total_pages
-                    )));
-                    ui.small(format!(
-                        "Области: заполнено {}, пропущено {}, ошибок страниц {}, без маски {}",
-                        self.quick_clean_progress.regions_filled,
-                        self.quick_clean_progress.regions_skipped,
-                        self.quick_clean_progress.failed_pages,
-                        self.quick_clean_progress.missing_masks
-                    ));
+                    ui.add(egui::ProgressBar::new(progress).text(tf!("cleaning.tab.pages_progress_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages)));
+                    ui.small(tf!("cleaning.tab.regions_progress_status", filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, page_errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
                 }
                 if let Some(status) = self.quick_clean_status_text.as_ref() {
                     ui.small(status);
@@ -914,7 +906,7 @@ impl CleaningTabState {
             return;
         }
         if missing_indices.is_empty() {
-            self.text_mask_load_status = Some("Маска уже загружена.".to_string());
+            self.text_mask_load_status = Some(t!("cleaning.tab.mask_already_loaded_status").to_string());
             return;
         }
 
@@ -923,7 +915,7 @@ impl CleaningTabState {
         self.text_mask_load_rx = Some(rx);
         self.text_mask_load_in_progress = true;
         self.text_mask_load_status =
-            Some("Пробую загрузить маску из text_detection...".to_string());
+            Some(t!("cleaning.tab.mask_load_attempt_status").to_string());
         thread::spawn(move || {
             let _ = tx.send(load_text_masks_from_storage(&storage_dir, &missing_indices));
         });
@@ -940,7 +932,7 @@ impl CleaningTabState {
                 self.text_mask_load_in_progress = false;
                 self.text_mask_load_rx = None;
                 self.text_mask_load_status =
-                    Some("Загрузка маски прервана: канал закрыт.".to_string());
+                    Some(t!("cleaning.tab.mask_load_aborted_status").to_string());
                 return;
             }
         };
@@ -963,20 +955,13 @@ impl CleaningTabState {
                         applied = applied.saturating_add(1);
                     }
                 }
-                self.text_mask_load_status = Some(format!(
-                    "Загрузка маски: загружено {}/{} (в хранилище: {}, пропущено: {}, ошибок: {}).",
-                    applied,
-                    result
+                self.text_mask_load_status = Some(tf!("cleaning.tab.mask_load_progress_status", applied = applied, total = result
                         .loaded
                         .saturating_add(result.missing)
-                        .saturating_add(result.failed),
-                    result.loaded,
-                    result.missing,
-                    result.failed
-                ));
+                        .saturating_add(result.failed), loaded = result.loaded, missing = result.missing, failed = result.failed));
             }
             Err(error) => {
-                self.text_mask_load_status = Some(format!("Ошибка загрузки маски: {error}"));
+                self.text_mask_load_status = Some(tf!("cleaning.tab.mask_load_error", error = error));
             }
         }
     }
@@ -987,7 +972,7 @@ impl CleaningTabState {
         }
         let Some(model) = self.overlays_model.as_ref().cloned() else {
             self.save_status_text =
-                Some("Сохранение недоступно: модель оверлеев не подключена.".to_string());
+                Some(t!("cleaning.tab.save_unavailable_no_model_error").to_string());
             return;
         };
         let save_dir = project.paths.clean_layers_dir.clone();
@@ -997,14 +982,14 @@ impl CleaningTabState {
                 self.save_job_in_progress = false;
                 self.save_job_rx = None;
                 self.save_status_text =
-                    Some("Не удалось получить lock модели оверлеев.".to_string());
+                    Some(t!("cleaning.tab.overlay_model_lock_error").to_string());
                 return;
             }
         };
         let (tx, rx) = mpsc::channel::<Result<(), String>>();
         self.save_job_rx = Some(rx);
         self.save_job_in_progress = true;
-        self.save_status_text = Some("Сохранение клина...".to_string());
+        self.save_status_text = Some(t!("cleaning.tab.saving_clean_status").to_string());
 
         thread::spawn(move || {
             let result = save_clean_overlay_snapshots(&save_dir, &overlay_snapshots);
@@ -1020,18 +1005,18 @@ impl CleaningTabState {
             Ok(Ok(())) => {
                 self.save_job_in_progress = false;
                 self.save_job_rx = None;
-                self.save_status_text = Some("Клин сохранён в папку clean_layers.".to_string());
+                self.save_status_text = Some(t!("cleaning.tab.clean_saved_status").to_string());
             }
             Ok(Err(err)) => {
                 self.save_job_in_progress = false;
                 self.save_job_rx = None;
-                self.save_status_text = Some(format!("Ошибка сохранения клина: {err}"));
+                self.save_status_text = Some(tf!("cleaning.tab.save_clean_error", err = err));
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.save_job_in_progress = false;
                 self.save_job_rx = None;
-                self.save_status_text = Some("Сохранение прервано: канал закрыт.".to_string());
+                self.save_status_text = Some(t!("cleaning.tab.save_aborted_status").to_string());
             }
         }
     }
@@ -1041,12 +1026,12 @@ impl CleaningTabState {
             return;
         }
         if page_indices.is_empty() {
-            self.quick_clean_status_text = Some("Нет страниц для обработки.".to_string());
+            self.quick_clean_status_text = Some(t!("cleaning.tab.no_pages_error").to_string());
             return;
         }
         if self.overlays_model.is_none() {
             self.quick_clean_status_text =
-                Some("Быстрый клин недоступен: модель оверлеев не подключена.".to_string());
+                Some(t!("cleaning.tab.quick_clean_unavailable_no_model_error").to_string());
             return;
         }
         let text_mask_model = self.text_mask_model.as_ref().cloned();
@@ -1075,7 +1060,7 @@ impl CleaningTabState {
             });
         }
         if tasks.is_empty() {
-            self.quick_clean_status_text = Some("Нет доступных страниц для обработки.".to_string());
+            self.quick_clean_status_text = Some(t!("cleaning.tab.no_available_pages_error").to_string());
             return;
         }
 
@@ -1085,7 +1070,7 @@ impl CleaningTabState {
         self.quick_clean_job_rx = Some(rx);
         self.quick_clean_job_in_progress = true;
         self.quick_clean_progress = QuickTextCleanProgress::default();
-        self.quick_clean_status_text = Some("Запущен быстрый клин...".to_string());
+        self.quick_clean_status_text = Some(t!("cleaning.tab.quick_clean_started_status").to_string());
 
         thread::spawn(move || {
             let _ = tx.send(QuickTextCleanJobEvent::Started {
@@ -1156,7 +1141,7 @@ impl CleaningTabState {
                         ..QuickTextCleanProgress::default()
                     };
                     self.quick_clean_status_text =
-                        Some("Быстрый клин: чтение страниц и анализ маски...".to_string());
+                        Some(t!("cleaning.tab.quick_clean_reading_status").to_string());
                 }
                 Ok(QuickTextCleanJobEvent::PageProcessed(result)) => {
                     self.quick_clean_progress.done_pages =
@@ -1184,26 +1169,12 @@ impl CleaningTabState {
                     if let Some(patch) = result.patch {
                         self.apply_quick_text_patch_to_overlay(result.page_idx, patch);
                     }
-                    self.quick_clean_status_text = Some(format!(
-                        "Быстрый клин: страница {} обработана (областей: {}, заполнено: {}, пропущено: {}).",
-                        result.page_idx,
-                        result.regions_total,
-                        result.regions_filled,
-                        result.regions_skipped
-                    ));
+                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_page_done_status", page = result.page_idx, regions = result.regions_total, filled = result.regions_filled, skipped = result.regions_skipped));
                 }
                 Ok(QuickTextCleanJobEvent::Finished) => {
                     self.quick_clean_job_in_progress = false;
                     self.quick_clean_job_rx = None;
-                    self.quick_clean_status_text = Some(format!(
-                        "Быстрый клин завершён: страниц {}/{}, заполнено областей {}, пропущено {}, ошибок {}, без маски {}.",
-                        self.quick_clean_progress.done_pages,
-                        self.quick_clean_progress.total_pages,
-                        self.quick_clean_progress.regions_filled,
-                        self.quick_clean_progress.regions_skipped,
-                        self.quick_clean_progress.failed_pages,
-                        self.quick_clean_progress.missing_masks
-                    ));
+                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_finished_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages, filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1211,7 +1182,7 @@ impl CleaningTabState {
                     self.quick_clean_job_in_progress = false;
                     self.quick_clean_job_rx = None;
                     self.quick_clean_status_text =
-                        Some("Быстрый клин прерван: канал job закрыт.".to_string());
+                        Some(t!("cleaning.tab.quick_clean_aborted_status").to_string());
                     break;
                 }
             }
@@ -1743,10 +1714,7 @@ fn run_quick_text_clean_on_page_impl(
     let page_idx = task.page_idx;
     let base_rgba = image::open(&task.page_path)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть страницу {}: {err}",
-                task.page_path.display()
-            )
+            tf!("cleaning.tab.open_page_error", path = task.page_path.display(), err = err)
         })?
         .to_rgba8();
     let width = base_rgba.width() as usize;
@@ -2739,12 +2707,12 @@ fn save_clean_overlay_snapshots(
     snapshots: &[(String, Arc<image::RgbaImage>)],
 ) -> Result<(), String> {
     std::fs::create_dir_all(save_dir)
-        .map_err(|err| format!("Не удалось создать папку {}: {err}", save_dir.display()))?;
+        .map_err(|err| tf!("cleaning.tab.create_dir_error", dir = save_dir.display(), err = err))?;
     for (stem, image) in snapshots {
         let dst = save_dir.join(format!("{stem}.png"));
         image
             .save(&dst)
-            .map_err(|err| format!("Не удалось сохранить клин {}: {err}", dst.display()))?;
+            .map_err(|err| tf!("cleaning.tab.save_clean_file_error", path = dst.display(), err = err))?;
     }
     Ok(())
 }

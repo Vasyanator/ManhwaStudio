@@ -69,15 +69,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Errors from probing, downloading, verifying, or extracting ONNX Runtime.
 ///
-/// Every variant carries a user-facing Russian message (matching `ms-onnx`'s
-/// style) via `#[error]`; the wrapped strings add diagnostic context for logs.
-#[derive(Debug, thiserror::Error)]
+/// `Display` is hand-written (see the `impl` below) and localized through the
+/// `ms-i18n` catalog (`onnx_runtime.error.*` keys), so the user-facing message
+/// follows the selected UI language instead of a compile-time Russian literal.
+/// `Debug` (derived) stays a stable English variant name and is what the log sites
+/// format, keeping logs language-independent and grep-able. Wrapped strings add
+/// diagnostic context, rendered inline through the frame's `Display`.
+#[derive(Debug)]
 pub enum OrtRuntimeError {
     /// No manifest row exists for this platform/build (e.g. a GPU build not shipped
     /// on this OS). This is a hard error, never a silent CPU substitution.
-    #[error(
-        "Для платформы {os}/{arch} и сборки «{build}» нет записи о библиотеке ONNX Runtime."
-    )]
     NoManifestEntry {
         /// Normalized OS key that was looked up.
         os: &'static str,
@@ -88,12 +89,10 @@ pub enum OrtRuntimeError {
     },
 
     /// The archive could not be downloaded (network/transport/HTTP status).
-    #[error("Не удалось скачать библиотеку ONNX Runtime. {0}")]
     Download(String),
 
     /// The downloaded archive's SHA256 did not match the pinned value; the file
     /// is deleted and resolution is aborted.
-    #[error("Контрольная сумма архива ONNX Runtime не совпала (ожидалось {expected}, получено {actual}).")]
     ChecksumMismatch {
         /// Expected lowercase hex digest from the manifest.
         expected: String,
@@ -102,17 +101,51 @@ pub enum OrtRuntimeError {
     },
 
     /// The archive could not be opened or unpacked.
-    #[error("Не удалось распаковать архив ONNX Runtime. {0}")]
     Extraction(String),
 
     /// The expected onnxruntime library was not found inside the archive.
-    #[error("Библиотека ONNX Runtime не найдена в архиве (ожидался элемент «{0}»).")]
     DylibNotFoundInArchive(String),
 
     /// A filesystem operation (create dir, write, rename, remove) failed.
-    #[error("Ошибка файловой системы при подготовке ONNX Runtime. {0}")]
     Io(String),
 }
+
+impl std::fmt::Display for OrtRuntimeError {
+    /// Renders the localized user-facing message for the active UI language via
+    /// `ms-i18n` (`onnx_runtime.error.*`), interpolating each wrapped detail so the
+    /// old derived `#[error]` information is preserved. The `match` is exhaustive so
+    /// a new variant forces a new catalog key here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoManifestEntry { os, arch, build } => f.write_str(&tf!(
+                "onnx_runtime.error.no_manifest_entry",
+                os = os,
+                arch = arch,
+                build = build
+            )),
+            Self::Download(detail) => {
+                f.write_str(&tf!("onnx_runtime.error.download", detail = detail))
+            }
+            Self::ChecksumMismatch { expected, actual } => f.write_str(&tf!(
+                "onnx_runtime.error.checksum_mismatch",
+                expected = expected,
+                actual = actual
+            )),
+            Self::Extraction(detail) => {
+                f.write_str(&tf!("onnx_runtime.error.extraction", detail = detail))
+            }
+            Self::DylibNotFoundInArchive(member) => {
+                f.write_str(&tf!("onnx_runtime.error.dylib_not_found", member = member))
+            }
+            Self::Io(detail) => f.write_str(&tf!("onnx_runtime.error.io", detail = detail)),
+        }
+    }
+}
+
+// No variant wraps another error (all carry Strings or plain fields), so the
+// default `source()` (None) is correct; the impl is required so this type can be an
+// `Error` source for `NativeRuntimeError`.
+impl std::error::Error for OrtRuntimeError {}
 
 /// Coarse stage of an ONNX Runtime resolution, reported via the progress callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,17 +256,11 @@ pub fn resolve_or_download_ort_dylib(
     }
 
     fs::create_dir_all(&dir).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось создать каталог '{}': {err}",
-            dir.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.create_dir_error", dir = dir.display(), err = err))
     })?;
     let download_dir = dir.join(".download");
     fs::create_dir_all(&download_dir).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось создать каталог загрузки '{}': {err}",
-            download_dir.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.create_download_dir_error", download_dir = download_dir.display(), err = err))
     })?;
 
     // Primary source: the onnxruntime archive itself. Its `dylib_member` is renamed
@@ -338,7 +365,7 @@ fn member_file_name(member: &str) -> Result<PathBuf, OrtRuntimeError> {
         .file_name()
         .map(PathBuf::from)
         .ok_or_else(|| {
-            OrtRuntimeError::Extraction(format!("некорректный путь элемента архива '{member}'"))
+            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.invalid_member_path", member = member))
         })
 }
 
@@ -445,10 +472,7 @@ fn download_to(
 ) -> Result<(), OrtRuntimeError> {
     if partial_path.exists() {
         fs::remove_file(partial_path).map_err(|err| {
-            OrtRuntimeError::Io(format!(
-                "не удалось удалить прежний временный файл '{}': {err}",
-                partial_path.display()
-            ))
+            OrtRuntimeError::Io(tf!("onnx_runtime.download.remove_temp_error", partial_path = partial_path.display(), err = err))
         })?;
     }
 
@@ -468,10 +492,7 @@ fn download_to(
 
     let mut reader = response.into_reader();
     let mut output = File::create(partial_path).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось создать файл архива '{}': {err}",
-            partial_path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.create_archive_error", partial_path = partial_path.display(), err = err))
     })?;
 
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
@@ -479,14 +500,14 @@ fn download_to(
     let mut last_emit: u64 = 0;
     loop {
         let read = reader.read(&mut buffer).map_err(|err| {
-            OrtRuntimeError::Download(format!("Ошибка чтения данных с '{url}': {err}"))
+            OrtRuntimeError::Download(tf!("onnx_runtime.download.read_error", url = url, err = err))
         })?;
         if read == 0 {
             break;
         }
         output.write_all_chunk(&buffer[..read], partial_path)?;
         let read_u64 = u64::try_from(read).map_err(|err| {
-            OrtRuntimeError::Download(format!("некорректный размер блока {read}: {err}"))
+            OrtRuntimeError::Download(tf!("onnx_runtime.download.invalid_chunk_size", read = read, err = err))
         })?;
         downloaded = downloaded.saturating_add(read_u64);
         // Throttle: only report every PROGRESS_EMIT_INTERVAL_BYTES to avoid
@@ -502,11 +523,7 @@ fn download_to(
     emit(progress, OrtDownloadStage::Downloading, downloaded, total);
 
     fs::rename(partial_path, final_path).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось переместить архив '{}' в '{}': {err}",
-            partial_path.display(),
-            final_path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.move_archive_error", partial_path = partial_path.display(), final_path = final_path.display(), err = err))
     })?;
     Ok(())
 }
@@ -521,10 +538,7 @@ impl ChunkWrite for File {
     fn write_all_chunk(&mut self, chunk: &[u8], path: &Path) -> Result<(), OrtRuntimeError> {
         use std::io::Write;
         self.write_all(chunk).map_err(|err| {
-            OrtRuntimeError::Io(format!(
-                "не удалось записать данные в '{}': {err}",
-                path.display()
-            ))
+            OrtRuntimeError::Io(tf!("onnx_runtime.download.write_error", path = path.display(), err = err))
         })
     }
 }
@@ -533,23 +547,15 @@ impl ChunkWrite for File {
 fn flush_file(file: &mut File, path: &Path) -> Result<(), OrtRuntimeError> {
     use std::io::Write;
     file.flush().map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось сохранить файл '{}': {err}",
-            path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.save_error", path = path.display(), err = err))
     })
 }
 
 /// Maps a `ureq` download error to a typed, user-facing [`OrtRuntimeError::Download`].
 fn download_error(url: &str, err: ureq::Error) -> OrtRuntimeError {
     match err {
-        ureq::Error::Status(status, response) => OrtRuntimeError::Download(format!(
-            "Сервер вернул HTTP {status} для '{url}': {}",
-            response.status_text()
-        )),
-        ureq::Error::Transport(transport) => OrtRuntimeError::Download(format!(
-            "Проверьте подключение к интернету. Ошибка соединения с '{url}': {transport}"
-        )),
+        ureq::Error::Status(status, response) => OrtRuntimeError::Download(tf!("onnx_runtime.download.http_error", status = status, url = url, response = response.status_text())),
+        ureq::Error::Transport(transport) => OrtRuntimeError::Download(tf!("onnx_runtime.download.connection_error", url = url, transport = transport)),
     }
 }
 
@@ -572,17 +578,14 @@ fn extract_wanted(
     match archive {
         manifest::ArchiveKind::Zip => {
             let file = File::open(archive_path).map_err(|err| {
-                OrtRuntimeError::Extraction(format!(
-                    "не удалось открыть '{}': {err}",
-                    archive_path.display()
-                ))
+                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = archive_path.display(), err = err))
             })?;
             let mut zip = ZipArchive::new(file).map_err(|err| {
-                OrtRuntimeError::Extraction(format!("не удалось прочитать ZIP-архив: {err}"))
+                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_read_error", err = err))
             })?;
             for index in 0..zip.len() {
                 let mut file_in_zip = zip.by_index(index).map_err(|err| {
-                    OrtRuntimeError::Extraction(format!("ошибка чтения ZIP-элемента {index}: {err}"))
+                    OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zip_entry_error", index = index, err = err))
                 })?;
                 let name = file_in_zip.name().to_string();
                 if let Some(out_path) = wanted.get(name.as_str()) {
@@ -596,22 +599,16 @@ fn extract_wanted(
         }
         manifest::ArchiveKind::TarGz => {
             let file = File::open(archive_path).map_err(|err| {
-                OrtRuntimeError::Extraction(format!(
-                    "не удалось открыть '{}': {err}",
-                    archive_path.display()
-                ))
+                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = archive_path.display(), err = err))
             })?;
             extract_tar_members(GzDecoder::new(file), wanted, &mut found)?;
         }
         manifest::ArchiveKind::TarZst => {
             let file = File::open(archive_path).map_err(|err| {
-                OrtRuntimeError::Extraction(format!(
-                    "не удалось открыть '{}': {err}",
-                    archive_path.display()
-                ))
+                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.open_archive_error", archive_path = archive_path.display(), err = err))
             })?;
             let decoder = zstd::stream::read::Decoder::new(file).map_err(|err| {
-                OrtRuntimeError::Extraction(format!("не удалось открыть zstd-декодер: {err}"))
+                OrtRuntimeError::Extraction(tf!("onnx_runtime.download.zstd_open_error", err = err))
             })?;
             extract_tar_members(decoder, wanted, &mut found)?;
         }
@@ -637,14 +634,14 @@ fn extract_tar_members<R: Read>(
 ) -> Result<(), OrtRuntimeError> {
     let mut archive = TarArchive::new(reader);
     let entries = archive.entries().map_err(|err| {
-        OrtRuntimeError::Extraction(format!("не удалось прочитать tar-архив: {err}"))
+        OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_read_error", err = err))
     })?;
     for entry in entries {
         let mut entry = entry.map_err(|err| {
-            OrtRuntimeError::Extraction(format!("ошибка чтения tar-элемента: {err}"))
+            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_entry_error", err = err))
         })?;
         let path = entry.path().map_err(|err| {
-            OrtRuntimeError::Extraction(format!("некорректный путь tar-элемента: {err}"))
+            OrtRuntimeError::Extraction(tf!("onnx_runtime.download.tar_invalid_path", err = err))
         })?;
         // Normalize separators and strip a leading `./`. GNU-tar-packed archives store
         // members as `./onnxruntime-.../lib/...` (the onnxruntime 1.27.0 macOS archives
@@ -670,23 +667,14 @@ fn extract_tar_members<R: Read>(
 fn write_stream<R: Read>(reader: &mut R, out_path: &Path) -> Result<(), OrtRuntimeError> {
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
-            OrtRuntimeError::Io(format!(
-                "не удалось создать каталог '{}': {err}",
-                parent.display()
-            ))
+            OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_dir_error", parent = parent.display(), err = err))
         })?;
     }
     let mut output = File::create(out_path).map_err(|err| {
-        OrtRuntimeError::Io(format!(
-            "не удалось создать файл '{}': {err}",
-            out_path.display()
-        ))
+        OrtRuntimeError::Io(tf!("onnx_runtime.download.extract_create_file_error", out_path = out_path.display(), err = err))
     })?;
     std::io::copy(reader, &mut output).map_err(|err| {
-        OrtRuntimeError::Extraction(format!(
-            "не удалось распаковать элемент в '{}': {err}",
-            out_path.display()
-        ))
+        OrtRuntimeError::Extraction(tf!("onnx_runtime.download.extract_element_error", out_path = out_path.display(), err = err))
     })?;
     Ok(())
 }

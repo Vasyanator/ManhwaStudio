@@ -327,7 +327,7 @@ impl BatchExecutor {
 
         if self.nodes_by_id.is_empty() {
             return Err(ExecError::new(
-                "Граф пуст. Добавьте узлы перед запуском.",
+                t!("launcher.batch.exec.empty_graph_error"),
                 "executor: empty graph",
             ));
         }
@@ -341,7 +341,7 @@ impl BatchExecutor {
 
         if start_nodes.is_empty() {
             return Err(ExecError::new(
-                "В графе нет стартовых узлов (Старт (число) / Старт (строка)).",
+                t!("launcher.batch.exec.no_start_nodes_error"),
                 "executor: no start nodes",
             ));
         }
@@ -390,7 +390,7 @@ impl BatchExecutor {
                     steps += 1;
                     if steps > max_steps {
                         return Err(ExecError::new(
-                            "Превышен лимит шагов. Проверьте граф на зацикливание.",
+                            t!("launcher.batch.exec.step_limit_error"),
                             format!("executor: step limit {max_steps} reached"),
                         ));
                     }
@@ -452,7 +452,7 @@ impl BatchExecutor {
             NodeParams::StartNumber { start, step, end } => {
                 if *step == 0 {
                     return Err(ExecError::new(
-                        format!("Узел '{}': шаг не может быть 0.", node.params.title()),
+                        tf!("launcher.batch.exec.step_zero_error", node = node.params.title()),
                         "start_number: step=0",
                     ));
                 }
@@ -466,7 +466,7 @@ impl BatchExecutor {
                         break;
                     }
                     let _ = self.tx.send(ExecutorEvent::Progress {
-                        message: format!("{}: индекс {value}", node.params.title()),
+                        message: tf!("launcher.batch.exec.index_value_status", node = node.params.title(), value = value),
                         node_id: Some(node.id),
                     });
                     let mut map = HashMap::new();
@@ -478,16 +478,13 @@ impl BatchExecutor {
             NodeParams::StartString { path } => {
                 if path.as_os_str().is_empty() {
                     return Err(ExecError::new(
-                        format!(
-                            "Узел '{}': не указан путь к txt-файлу.",
-                            node.params.title()
-                        ),
+                        tf!("launcher.batch.exec.no_txt_path_error", node = node.params.title()),
                         "start_string: empty path",
                     ));
                 }
                 let content = std::fs::read_to_string(path).map_err(|err| {
                     ExecError::new(
-                        format!("Не удалось прочитать файл '{}'.", path.display()),
+                        tf!("launcher.batch.exec.read_file_error", path = path.display()),
                         format!("start_string: read '{}': {err}", path.display()),
                     )
                 })?;
@@ -498,7 +495,7 @@ impl BatchExecutor {
                     }
                     self.check_cancelled()?;
                     let _ = self.tx.send(ExecutorEvent::Progress {
-                        message: format!("{}: строка {}", node.params.title(), idx + 1),
+                        message: tf!("launcher.batch.exec.line_status", node = node.params.title(), idx = idx + 1),
                         node_id: Some(node.id),
                     });
                     let mut map = HashMap::new();
@@ -508,7 +505,7 @@ impl BatchExecutor {
             }
             _ => {
                 return Err(ExecError::new(
-                    format!("Узел '{}' не является стартовым.", node.params.title()),
+                    tf!("launcher.batch.exec.not_start_node_error", node = node.params.title()),
                     "iterate_start_node: not a start node",
                 ));
             }
@@ -528,7 +525,7 @@ impl BatchExecutor {
     ) -> Result<HashMap<String, DataValue>, ExecError> {
         self.check_cancelled()?;
         let _ = self.tx.send(ExecutorEvent::Progress {
-            message: format!("[Цикл {cycle_id}] {}", node.params.title()),
+            message: tf!("launcher.batch.exec.cycle_prefix", cycle_id = cycle_id, node = node.params.title()),
             node_id: Some(node.id),
         });
 
@@ -579,7 +576,7 @@ impl BatchExecutor {
                     .to_owned();
                 if url.is_empty() {
                     return Err(ExecError::new(
-                        format!("Узел '{}': вход 'URL' пустой.", node.params.title()),
+                        tf!("launcher.batch.exec.url_input_empty_error", node = node.params.title()),
                         "quick_downloader: empty URL",
                     ));
                 }
@@ -601,7 +598,7 @@ impl BatchExecutor {
                     .to_owned();
                 if url.is_empty() {
                     return Err(ExecError::new(
-                        format!("Узел '{}': вход 'URL' пустой.", node.params.title()),
+                        tf!("launcher.batch.exec.url_input_empty_error", node = node.params.title()),
                         "open_url: empty URL",
                     ));
                 }
@@ -835,7 +832,7 @@ impl BatchExecutor {
             })
             .map_err(|err| {
                 ExecError::new(
-                    "Не удалось запустить фоновое выполнение узла.",
+                    t!("launcher.batch.exec.start_bg_node_error"),
                     format!("executor: failed to spawn node worker: {err}"),
                 )
             })?;
@@ -846,7 +843,7 @@ impl BatchExecutor {
                 Err(mpsc::RecvTimeoutError::Timeout) => self.check_cancelled()?,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(ExecError::new(
-                        "Фоновый worker узла завершился неожиданно.",
+                        t!("launcher.batch.exec.bg_worker_exited_error"),
                         "executor: node worker disconnected unexpectedly",
                     ));
                 }
@@ -870,7 +867,7 @@ impl BatchExecutor {
     #[cfg(target_arch = "wasm32")]
     fn download_images_blocking(url: &str) -> Result<Vec<RgbaImage>, ExecError> {
         Err(ExecError::new(
-            "Загрузка изображений недоступна в веб-версии.",
+            t!("launcher.batch.exec.image_download_web_unsupported"),
             format!("quick_downloader: HTTP client unavailable on web build for '{url}'"),
         ))
     }
@@ -894,7 +891,7 @@ impl BatchExecutor {
             .call()
             .map_err(|err| {
                 ExecError::new(
-                    format!("Не удалось загрузить URL: {url}"),
+                    tf!("launcher.batch.exec.url_load_error", url = url),
                     format!("quick_downloader: GET '{url}': {err}"),
                 )
             })?;
@@ -902,14 +899,14 @@ impl BatchExecutor {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).map_err(|err| {
             ExecError::new(
-                "Ошибка чтения загруженных данных.",
+                t!("launcher.batch.exec.read_downloaded_data_error"),
                 format!("quick_downloader: read body: {err}"),
             )
         })?;
 
         let img = image::load_from_memory(&bytes).map_err(|err| {
             ExecError::new(
-                "Не удалось декодировать скачанное изображение.",
+                t!("launcher.batch.exec.decode_downloaded_image_error"),
                 format!("quick_downloader: decode image: {err}"),
             )
         })?;
@@ -927,7 +924,7 @@ impl BatchExecutor {
         }
         std::fs::create_dir_all(folder).map_err(|err| {
             ExecError::new(
-                format!("Не удалось создать папку '{}'.", folder.display()),
+                tf!("launcher.batch.exec.create_folder_error", folder = folder.display()),
                 format!("save_folder: create_dir_all '{}': {err}", folder.display()),
             )
         })?;
@@ -939,7 +936,7 @@ impl BatchExecutor {
             img.save_with_format(&out_path, ImageFormat::Png)
                 .map_err(|err| {
                     ExecError::new(
-                        format!("Не удалось сохранить '{filename}'."),
+                        tf!("launcher.batch.exec.save_file_error", filename = filename),
                         format!("save_folder: save '{}': {err}", out_path.display()),
                     )
                 })?;
@@ -969,7 +966,7 @@ impl BatchExecutor {
         crate::launcher::new_project::stitching::run_stitch_split_sync(input, options).map_err(
             |err| {
                 ExecError::new(
-                    "Ошибка склейки/нарезки изображений.",
+                    t!("launcher.batch.exec.stitch_cut_error"),
                     format!("stitch_split: {err}"),
                 )
             },
@@ -995,7 +992,7 @@ impl BatchExecutor {
             .collect();
 
         crate::launcher::new_project::waifu2x::run_waifu2x_sync(input, options)
-            .map_err(|err| ExecError::new("Ошибка запуска waifu2x.", format!("waifu2x: {err}")))
+            .map_err(|err| ExecError::new(t!("launcher.batch.exec.waifu2x_start_error"), format!("waifu2x: {err}")))
     }
 
     // ── Browser automation ────────────────────────────────────────────────────
@@ -1004,7 +1001,7 @@ impl BatchExecutor {
         if self.browser_daemon.is_none() {
             self.browser_daemon = Some(BrowserDaemon::spawn().map_err(|err| {
                 ExecError::new(
-                    "Не удалось запустить Python daemon для браузера.",
+                    t!("launcher.batch.exec.browser_daemon_start_error"),
                     format!("browser_daemon: spawn: {err}"),
                 )
             })?);
@@ -1030,7 +1027,7 @@ impl BatchExecutor {
             .map_err(|err| match err {
                 BrowserRpcError::Cancelled => ExecError::cancelled(),
                 BrowserRpcError::Message(err) => ExecError::new(
-                    format!("Не удалось открыть URL '{url}' в браузере."),
+                    tf!("launcher.batch.exec.open_url_error", url = url),
                     format!("open_url: daemon rpc: {err}"),
                 ),
             })?;
@@ -1050,7 +1047,7 @@ impl BatchExecutor {
             .map_err(|err| match err {
                 BrowserRpcError::Cancelled => ExecError::cancelled(),
                 BrowserRpcError::Message(err) => ExecError::new(
-                    "Не удалось прокрутить страницу.",
+                    t!("launcher.batch.exec.scroll_page_error"),
                     format!("scroll_page: daemon rpc: {err}"),
                 ),
             })?;
@@ -1077,7 +1074,7 @@ impl BatchExecutor {
             .map_err(|err| match err {
                 BrowserRpcError::Cancelled => ExecError::cancelled(),
                 BrowserRpcError::Message(err) => ExecError::new(
-                    "Не удалось получить изображения из браузера.",
+                    t!("launcher.batch.exec.browser_get_images_error"),
                     format!("fetch_from_browser: daemon rpc: {err}"),
                 ),
             })?;
@@ -1089,14 +1086,14 @@ impl BatchExecutor {
             .map(PathBuf::from)
             .ok_or_else(|| {
                 ExecError::new(
-                    "Браузерный daemon не вернул output_dir.",
+                    t!("launcher.batch.exec.browser_no_output_dir_error"),
                     "fetch_from_browser: missing output_dir in response",
                 )
             })?;
 
         load_images_from_dir(&output_dir).map_err(|err| {
             ExecError::new(
-                "Не удалось загрузить изображения из временной папки браузера.",
+                t!("launcher.batch.exec.browser_temp_load_error"),
                 format!(
                     "fetch_from_browser: load from '{}': {err}",
                     output_dir.display()

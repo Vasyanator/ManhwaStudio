@@ -168,7 +168,7 @@ pub fn spawn_ai_computations_probe(
 
     if let Err(err) = spawn_result {
         let (fallback_tx, fallback_rx) = mpsc::channel();
-        let message = format!("Не удалось запустить фоновую проверку ИИ окружения: {err}");
+        let message = tf!("ai_install.probe_spawn_error", err = err);
         if fallback_tx.send(Err(message)).is_err() {
             runtime_log::log_warn("[ai-install-probe] failed to send probe spawn error");
         }
@@ -183,7 +183,7 @@ pub fn spawn_ai_computations_probe(
 /// typed error instead of a fabricated report.
 #[cfg(target_arch = "wasm32")]
 pub fn collect_ai_computations_report(_app_dir: &Path) -> Result<AiComputationsReport, String> {
-    Err("Проверка ИИ окружения недоступна в веб-версии.".to_string())
+    Err(t!("ai_install.probe_web_unavailable").to_string())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -214,7 +214,7 @@ pub fn collect_ai_computations_report(app_dir: &Path) -> Result<AiComputationsRe
 
     let output = command
         .output()
-        .map_err(|err| format!("Не удалось запустить Python для проверки ИИ пакетов: {err}"))?;
+        .map_err(|err| tf!("ai_install.python_spawn_error", err = err))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
@@ -223,10 +223,7 @@ pub fn collect_ai_computations_report(app_dir: &Path) -> Result<AiComputationsRe
             output.status,
             stderr.trim()
         ));
-        return Err(format!(
-            "Проверка ИИ пакетов завершилась с ошибкой: {}",
-            stderr.trim()
-        ));
+        return Err(tf!("ai_install.probe_failed", stderr = stderr.trim()));
     }
 
     parse_ai_probe_output(&stdout)
@@ -237,16 +234,10 @@ pub fn parse_ai_probe_output(stdout: &str) -> Result<AiComputationsReport, Strin
         let trimmed = line.trim_start();
         trimmed.starts_with('{') && trimmed.contains("\"torch\"")
     }) else {
-        return Err(format!(
-            "Python не вернул JSON проверки ИИ пакетов. Ответ: {}",
-            stdout.trim()
-        ));
+        return Err(tf!("ai_install.no_json_response", stdout = stdout.trim()));
     };
     let raw: RawAiProbeReport = serde_json::from_str(json_line.trim()).map_err(|err| {
-        format!(
-            "Python вернул некорректный JSON проверки ИИ пакетов: {err}. Ответ: {}",
-            stdout.trim()
-        )
+        tf!("ai_install.invalid_json_response", err = err, stdout = stdout.trim())
     })?;
 
     Ok(AiComputationsReport {
@@ -336,7 +327,7 @@ fn ai_probe_shell_script(
         ));
     } else {
         commands.push(shell_echo_command(
-            "Локальное Python-окружение не найдено; используем python из текущего PATH.",
+            t!("ai_install.no_local_env_using_path"),
         ));
     }
     commands.push(ai_probe_python_command());

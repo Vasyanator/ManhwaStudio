@@ -65,18 +65,18 @@ impl AiRequirement {
     #[must_use]
     pub fn disabled_reason(self, caps: &AiCaps) -> &'static str {
         match self {
-            AiRequirement::Backend => "ИИ бэкенд недоступен.",
+            AiRequirement::Backend => t!("widgets.ai_button.backend_unavailable"),
             AiRequirement::Torch => {
                 // Torch lives in the backend: if the backend itself is unreachable,
                 // that is the more specific (root) cause to report.
                 if caps.backend == Some(true) {
-                    "Требуется PyTorch."
+                    t!("widgets.ai_button.requires_pytorch")
                 } else {
-                    "ИИ бэкенд недоступен."
+                    t!("widgets.ai_button.backend_unavailable")
                 }
             }
-            AiRequirement::Onnx => "Требуется onnxruntime.",
-            AiRequirement::TorchOrOnnx => "Требуется PyTorch или onnxruntime.",
+            AiRequirement::Onnx => t!("widgets.ai_button.requires_onnxruntime"),
+            AiRequirement::TorchOrOnnx => t!("widgets.ai_button.requires_pytorch_or_onnxruntime"),
         }
     }
 }

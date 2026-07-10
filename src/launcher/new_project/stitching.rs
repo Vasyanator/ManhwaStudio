@@ -209,7 +209,7 @@ fn spawn_stitch_worker(request: StitchRequest) -> Receiver<StitchWorkerEvent> {
             ));
             if tx
                 .send(StitchWorkerEvent::Finished(Err(StitchError {
-                    user_message: "Не удалось запустить склейку/нарезку.".to_string(),
+                    user_message: t!("launcher.new_project.stitch.start_error").to_string(),
                     log_message: format!("failed to spawn stitch worker: {err}"),
                 })))
                 .is_err()
@@ -246,7 +246,7 @@ fn stitch_split(
 ) -> Result<StitchSuccess, StitchError> {
     if images.is_empty() {
         return Err(stitch_error(
-            "Сначала откройте папку или скачайте главу.",
+            t!("launcher.new_project.open_or_download_chapter_error"),
             "stitch requested with zero images",
         ));
     }
@@ -266,7 +266,7 @@ fn stitch_split(
     let (tape, cuts) =
         build_stitched_tape_and_cuts(&rgba_images, options, progress_tx).map_err(|err| {
             stitch_error(
-                "Не удалось выполнить склейку и нарезку.",
+                t!("launcher.new_project.stitch.stitch_cut_error"),
                 format!("stitch_split failed: {err}"),
             )
         })?;
@@ -276,7 +276,7 @@ fn stitch_split(
             let _ = send_stitch_progress(progress_tx, "split", 0, 1);
             let segments = split_tape_by_cuts(&tape, &cuts).map_err(|err| {
                 stitch_error(
-                    "Не удалось нарезать склеенную ленту.",
+                    t!("launcher.new_project.stitch.cut_ribbon_error"),
                     format!("split_tape_by_cuts failed: {err}"),
                 )
             })?;
@@ -338,7 +338,7 @@ fn stitch_heterogeneous_bottoms(
 ) -> Result<StitchSuccess, StitchError> {
     if images.is_empty() {
         return Err(stitch_error(
-            "Сначала откройте папку или скачайте главу.",
+            t!("launcher.new_project.open_or_download_chapter_error"),
             "heterogeneous-bottom stitch requested with zero images",
         ));
     }
@@ -410,7 +410,7 @@ fn apply_manual_cuts_to_pages(
         cuts.push(tape_height);
         let segments = split_tape_by_cuts(&image.image, &cuts).map_err(|err| {
             stitch_error(
-                "Не удалось нарезать ленту по выбранным линиям.",
+                t!("launcher.new_project.stitch.cut_by_lines_error"),
                 format!(
                     "apply_manual_cuts_to_pages failed on page '{}' at index {page_index}: {err}",
                     image.name
@@ -432,7 +432,7 @@ fn apply_manual_cuts_to_pages(
 
     if imported.is_empty() {
         return Err(stitch_error(
-            "По текущим линиям не удалось получить сегменты.",
+            t!("launcher.new_project.stitch.no_segments_error"),
             "manual cuts across pages produced zero segments",
         ));
     }
@@ -451,14 +451,14 @@ fn cut_like_reference(
 ) -> Result<StitchSuccess, StitchError> {
     if images.is_empty() {
         return Err(stitch_error(
-            "Сначала откройте папку или скачайте главу.",
+            t!("launcher.new_project.open_or_download_chapter_error"),
             "cut_like_reference requested with zero source images",
         ));
     }
 
     let reference_images = load_reference_images(reference_dir, progress_tx).map_err(|err| {
         stitch_error(
-            "Не удалось загрузить пример главы для нарезки.",
+            t!("launcher.new_project.stitch.load_example_error"),
             format!(
                 "failed to load reference images from '{}': {err}",
                 reference_dir.display()
@@ -467,7 +467,7 @@ fn cut_like_reference(
     })?;
     if reference_images.is_empty() {
         return Err(stitch_error(
-            "В выбранной папке нет изображений для примера главы.",
+            t!("launcher.new_project.stitch.example_no_images_error"),
             format!(
                 "reference dir '{}' does not contain supported images",
                 reference_dir.display()
@@ -485,7 +485,7 @@ fn cut_like_reference(
         .is_some_and(|first| reference_widths.iter().any(|width| *width != first))
     {
         return Err(stitch_error(
-            "Картинки примера главы должны иметь одинаковую ширину.",
+            t!("launcher.new_project.stitch.example_width_mismatch_error"),
             format!(
                 "reference dir '{}' contains mixed widths: {:?}",
                 reference_dir.display(),
@@ -505,7 +505,7 @@ fn cut_like_reference(
     let reference_total = reference_heights.iter().sum::<usize>();
     if reference_total == 0 {
         return Err(stitch_error(
-            "Пример главы оказался пустым.",
+            t!("launcher.new_project.stitch.example_empty_error"),
             format!(
                 "reference dir '{}' produced zero total height",
                 reference_dir.display()
@@ -526,7 +526,7 @@ fn cut_like_reference(
     let superframes = stitch_sequence(&normalized);
     if superframes.is_empty() {
         return Err(stitch_error(
-            "Не удалось сшить текущую ленту перед нарезкой.",
+            t!("launcher.new_project.stitch.stitch_before_cut_error"),
             "cut_like_reference produced zero superframes",
         ));
     }
@@ -543,7 +543,7 @@ fn cut_like_reference(
         .sum::<usize>();
     if tape_height == 0 {
         return Err(stitch_error(
-            "Склеенная лента оказалась пустой.",
+            t!("launcher.new_project.stitch.stitched_empty_error"),
             "cut_like_reference stitched tape height is zero",
         ));
     }
@@ -551,7 +551,7 @@ fn cut_like_reference(
     let _ = send_stitch_progress(progress_tx, "compose", 0, superframes.len().max(1));
     let mut tape = compose_superframes(&superframes, progress_tx).map_err(|err| {
         stitch_error(
-            "Не удалось собрать склеенную ленту перед нарезкой.",
+            t!("launcher.new_project.stitch.assemble_stitched_error"),
             format!("failed to compose stitched tape for reference cut: {err}"),
         )
     })?;
@@ -590,7 +590,7 @@ fn cut_like_reference(
 
     if segments.is_empty() {
         return Err(stitch_error(
-            "Не удалось разрезать ленту по примеру главы.",
+            t!("launcher.new_project.stitch.cut_by_example_error"),
             format!(
                 "reference cut produced zero segments for '{}'",
                 reference_dir.display()

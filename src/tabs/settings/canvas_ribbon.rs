@@ -61,8 +61,8 @@ impl SettingsTabState {
             .id_salt("settings_canvas_ribbon_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.heading("Лента");
-                ui.small("Эти настройки общие для вкладок «Перевод», «Клининг» и «Текст».");
+                ui.heading(t!("settings.canvas_ribbon.heading"));
+                ui.small(t!("settings.canvas_ribbon.shared_tabs_hint"));
                 ui.add_space(8.0);
 
                 let active_preset = ComicType::from_canvas_preset_fields(
@@ -71,7 +71,7 @@ impl SettingsTabState {
                 );
                 let mut selected_preset = active_preset;
                 ui.horizontal(|ui| {
-                    ui.label("Пресет настроек");
+                    ui.label(t!("settings.canvas_ribbon.preset_label"));
                     ComboBox::from_id_salt("settings_canvas_ribbon_preset")
                         .selected_text(selected_preset.display_name())
                         .show_ui(ui, |ui| {
@@ -93,7 +93,7 @@ impl SettingsTabState {
                         });
                 });
                 ui.small(
-                    "При ручном изменении параметров пресета он автоматически переключится на «Свой».",
+                    t!("settings.canvas_ribbon.preset_custom_hint"),
                 );
                 if selected_preset != active_preset
                     && let Some((aside_compact_mode, separate_pages)) =
@@ -106,41 +106,41 @@ impl SettingsTabState {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Стандартный тип пузырей во вкладке перевода").on_hover_text(
-                        "Новые пузыри и стандартные пузыри создаются этого типа",
+                    ui.label(t!("settings.canvas_ribbon.default_bubble_type_translation_label")).on_hover_text(
+                        t!("settings.canvas_ribbon.default_bubble_type_translation_hint"),
                     );
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.editable_bubble_type,
                             BubbleType::Aside.as_str().to_string(),
-                            "Сбоку",
+                            t!("settings.canvas_ribbon.bubble_type_aside"),
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.editable_bubble_type,
                             BubbleType::OnTop.as_str().to_string(),
-                            "Поверх",
+                            t!("settings.canvas_ribbon.bubble_type_on_top"),
                         )
                         .changed();
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("Стандартный тип пузырей во вкладках клина и текста").on_hover_text(
-                        "Стандартные пузыри в этих вкладках отображаются этим типом",
+                    ui.label(t!("settings.canvas_ribbon.default_bubble_type_other_label")).on_hover_text(
+                        t!("settings.canvas_ribbon.default_bubble_type_other_hint"),
                     );
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.readonly_bubble_type,
                             BubbleType::Aside.as_str().to_string(),
-                            "Сбоку",
+                            t!("settings.canvas_ribbon.bubble_type_aside"),
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.readonly_bubble_type,
                             BubbleType::OnTop.as_str().to_string(),
-                            "Поверх",
+                            t!("settings.canvas_ribbon.bubble_type_on_top"),
                         )
                         .changed();
                 });
@@ -148,46 +148,52 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.auto_insert_last_character,
-                        "Автоматически вставлять последнего персонажа",
+                        t!("settings.canvas_ribbon.auto_insert_last_character_label"),
                     )
                     .on_hover_text(
-                        "При создании нового пузыря автоматически подставляет последнего использованного персонажа",
+                        t!("settings.canvas_ribbon.auto_insert_last_character_hint"),
                     )
                     .changed();
 
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.spellcheck_original,
-                        "Проверять орфографию в оригинале",
+                        t!("settings.canvas_ribbon.spellcheck_original_label"),
                     )
                     .changed();
 
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.spellcheck_translation,
-                        "Проверять орфографию в переводе",
+                        t!("settings.canvas_ribbon.spellcheck_translation_label"),
                     )
                     .changed();
 
-                ui.collapsing("Кастомные слова для орфографии", |ui| {
-                    ui.small("По одному слову на строку. Оба списка исключают слова из орфографии.");
-                    ui.label("Общие исключения");
+                // `ui.collapsing` derives its id from the header text, so a
+                // localized label would make the id language-dependent (exclusions
+                // §C). Use the explicit `CollapsingHeader` builder with a stable
+                // `id_salt` instead; the body is unchanged.
+                egui::CollapsingHeader::new(t!("settings.canvas_ribbon.custom_spellcheck_words_header"))
+                    .id_salt("settings.canvas_ribbon.custom_spellcheck_words_header")
+                    .show(ui, |ui| {
+                    ui.small(t!("settings.canvas_ribbon.custom_spellcheck_words_hint"));
+                    ui.label(t!("settings.canvas_ribbon.shared_exclusions_label"));
                     changed |= ui
                         .add(
                             egui::TextEdit::multiline(&mut self.spellcheck_custom_words)
                                 .desired_rows(6)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("Например:\nWebtoon\nМанхва\nOCR"),
+                                .hint_text(t!("settings.canvas_ribbon.shared_exclusions_placeholder")),
                         )
                         .changed();
                     ui.add_space(8.0);
-                    ui.label("Исключения проекта");
+                    ui.label(t!("settings.canvas_ribbon.project_exclusions_label"));
                     changed |= ui
                         .add(
                             egui::TextEdit::multiline(&mut self.project_spellcheck_custom_words)
                                 .desired_rows(6)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("Например:\nМурим\nЧхонма\nЧонгук"),
+                                .hint_text(t!("settings.canvas_ribbon.project_exclusions_placeholder")),
                         )
                         .changed();
                 });
@@ -195,133 +201,111 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.scale_bubbles,
-                        "Растягивать боковые пузыри",
+                        t!("settings.canvas_ribbon.aside_stretch_label"),
                     )
-                    .on_hover_text(concat!(
-                        "Если включено, пузыри не будут выезжать за границы экрана, ",
-                        "пока они между мин и макс шириной. \n",
-                        "Если выключено, то пузыри всегда минимальной ширины"
-                    ))
+                    .on_hover_text(t!("settings.canvas_ribbon.aside_stretch_hint"))
                     .changed();
 
-                ui.label("Уменьшить боковые пузыри во вкладке перевода:");
+                ui.label(t!("settings.canvas_ribbon.aside_compact_label"));
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_compact_mode,
                             AsideBubbleCompactMode::None.as_str().to_string(),
-                            "Нет",
-                        ).on_hover_text("Весь интерфейс пузыря показывается всегда")
+                            t!("settings.canvas_ribbon.option_none"),
+                        ).on_hover_text(t!("settings.canvas_ribbon.aside_compact_none_hint"))
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_compact_mode,
                             AsideBubbleCompactMode::Moderate.as_str().to_string(),
-                            "Умеренно",
-                        ).on_hover_text(concat!(
-                            "Пока пузырь не в фокусе, показывается только строка оригинала и перевода.\n",
-                            "Если пузырь в фокусе, он раскрывается, появляются кнопки, номер и персонаж."
-                        ))
+                            t!("settings.canvas_ribbon.aside_compact_moderate"),
+                        ).on_hover_text(t!("settings.canvas_ribbon.aside_compact_moderate_hint"))
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_compact_mode,
                             AsideBubbleCompactMode::Strong.as_str().to_string(),
-                            "Сильно",
-                        ).on_hover_text(concat!(
-                            "Пока пузырь не в фокусе, показывается только строка перевода. Или оригинала, если перевод пустой.\n",
-                            "Если пузырь в фокусе, он раскрывается, появляются обе строки, кнопки, номер и персонаж."
-                        ))
+                            t!("settings.canvas_ribbon.aside_compact_strong"),
+                        ).on_hover_text(t!("settings.canvas_ribbon.aside_compact_strong_hint"))
                         .changed();
                 });
 
-                ui.label("Сторона боковых пузырей:");
+                ui.label(t!("settings.canvas_ribbon.aside_side_label"));
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_side_mode,
                             AsideBubbleSideMode::Auto.as_str().to_string(),
-                            "Авто",
+                            t!("settings.canvas_ribbon.aside_side_auto"),
                         )
                         .on_hover_text(
-                            "Пузырь показывается слева или справа в зависимости от положения на странице",
+                            t!("settings.canvas_ribbon.aside_side_auto_hint"),
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_side_mode,
                             AsideBubbleSideMode::Left.as_str().to_string(),
-                            "Слева",
+                            t!("settings.canvas_ribbon.aside_side_left"),
                         )
-                        .on_hover_text("Все боковые пузыри показываются слева от страницы")
+                        .on_hover_text(t!("settings.canvas_ribbon.aside_side_left_hint"))
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.aside_side_mode,
                             AsideBubbleSideMode::Right.as_str().to_string(),
-                            "Справа",
+                            t!("settings.canvas_ribbon.aside_side_right"),
                         )
-                        .on_hover_text("Все боковые пузыри показываются справа от страницы")
+                        .on_hover_text(t!("settings.canvas_ribbon.aside_side_right_hint"))
                         .changed();
                 });
 
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.aside_second_column,
-                        "Вторая колонка боковых пузырей",
+                        t!("settings.canvas_ribbon.aside_second_column_label"),
                     )
-                    .on_hover_text(concat!(
-                        "Когда сбоку от ленты хватает места, чтобы обе колонки целиком поместились ",
-                        "в экране, боковые пузыри этой стороны раскладываются в две колонки: ближнюю ",
-                        "к ленте и дальнюю. Режим выключается раньше, чем дальние пузыри выйдут за ",
-                        "край экрана.\n",
-                        "Левая и правая стороны включаются независимо, в зависимости от свободного ",
-                        "места при горизонтальной прокрутке.\n",
-                        "Ближние пузыри в приоритете: дальняя колонка используется только там, где ",
-                        "пузыри начинают слипаться. Дальние держат линию ровной, а ближние немного ",
-                        "расступаются, чтобы линия проходила между ними.\n",
-                        "Если «Растягивать боковые пузыри» выключено, обе колонки минимальной ширины ",
-                        "и жмутся ближе к ленте."
-                    ))
+                    .on_hover_text(t!("settings.canvas_ribbon.aside_second_column_hint"))
                     .changed();
 
-                ui.label("Раскрытие пузырей типа \"Поверх\":");
+                ui.label(t!("settings.canvas_ribbon.on_top_focus_label"));
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.on_top_focus_mode,
                             OnTopFocusMode::Around.as_str().to_string(),
-                            "Вокруг",
+                            t!("settings.canvas_ribbon.on_top_focus_around"),
                         )
-                        .on_hover_text("При фокусе пузырь типа «Поверх» остаётся поверх страницы. \n Строка оригинала появляется сверху, а персонаж и кнопки снизу.")
+                        .on_hover_text(t!("settings.canvas_ribbon.on_top_focus_around_hint"))
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.on_top_focus_mode,
                             OnTopFocusMode::Aside.as_str().to_string(),
-                            "Сбоку",
+                            t!("settings.canvas_ribbon.bubble_type_aside"),
                         )
-                        .on_hover_text("При фокусе пузырь типа «Поверх» временно раскрывается как боковой")
+                        .on_hover_text(t!("settings.canvas_ribbon.on_top_focus_aside_hint"))
                         .changed();
                 });
 
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut self.canvas_settings.aside_scale_pct, 25..=300)
-                            .text("Размер боковых пузырей (%)"),
+                            .text(t!("settings.canvas_ribbon.aside_scale_label")),
                     )
                     .changed();
 
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut self.canvas_settings.bubble_min_width, 40.0..=5000.0)
-                            .text("Мин. ширина боковых пузырей"),
+                            .text(t!("settings.canvas_ribbon.aside_min_width_label")),
                     )
                     .changed();
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut self.canvas_settings.bubble_max_width, 40.0..=5000.0)
-                            .text("Макс. ширина боковых пузырей"),
+                            .text(t!("settings.canvas_ribbon.aside_max_width_label")),
                     )
                     .changed();
                 if self.canvas_settings.bubble_max_width < self.canvas_settings.bubble_min_width {
@@ -334,20 +318,20 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.separate_pages,
-                        "Разделять страницы",
+                        t!("settings.canvas_ribbon.separate_pages_label"),
                     )
                     .changed();
                 changed |= ui
                     .add_enabled(
                         self.canvas_settings.separate_pages,
                         WheelSlider::new(&mut self.canvas_settings.page_spacing, 0.0..=5000.0)
-                            .text("Межстраничный отступ"),
+                            .text(t!("settings.canvas_ribbon.page_spacing_label")),
                     )
                     .changed();
                 changed |= ui
                     .add(
                         WheelSlider::new(&mut self.canvas_settings.edge_margin, 0.0..=5000.0)
-                            .text("Отступ сверху/снизу"),
+                            .text(t!("settings.canvas_ribbon.edge_margin_label")),
                     )
                     .changed();
 
@@ -356,43 +340,43 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.tabs_autosync_enabled,
-                        "Автосинхронизация между вкладками",
+                        t!("settings.canvas_ribbon.autosync_tabs_label"),
                     )
                     .changed();
                 changed |= ui
-                    .checkbox(&mut self.canvas_settings.cache_pages, "Кэшировать страницы")
+                    .checkbox(&mut self.canvas_settings.cache_pages, t!("settings.canvas_ribbon.cache_pages_label"))
                     .changed();
 
                 ui.separator();
 
-                ui.label("Отображение статуса перевода на скроллбаре:");
+                ui.label(t!("settings.canvas_ribbon.scrollbar_status_label"));
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.translation_status_display,
                             TranslationStatusDisplay::None.as_str().to_string(),
-                            "Нет",
+                            t!("settings.canvas_ribbon.option_none"),
                         )
-                        .on_hover_text("Скроллбар не показывает статус перевода пузырей")
+                        .on_hover_text(t!("settings.canvas_ribbon.scrollbar_status_none_hint"))
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.translation_status_display,
                             TranslationStatusDisplay::UntilNext.as_str().to_string(),
-                            "До следующего пузыря",
+                            t!("settings.canvas_ribbon.scrollbar_status_until_next"),
                         )
                         .on_hover_text(
-                            "Каждый пузырь красит полосу от себя до следующего пузыря: красную, пока перевод пустой, синюю — когда заполнен",
+                            t!("settings.canvas_ribbon.scrollbar_status_until_next_hint"),
                         )
                         .changed();
                     changed |= ui
                         .selectable_value(
                             &mut self.canvas_settings.translation_status_display,
                             TranslationStatusDisplay::Marks.as_str().to_string(),
-                            "Метками",
+                            t!("settings.canvas_ribbon.scrollbar_status_marks"),
                         )
                         .on_hover_text(
-                            "Каждый пузырь отмечается тонкой полоской на своей позиции: красной, пока перевод пустой, синей — когда заполнен",
+                            t!("settings.canvas_ribbon.scrollbar_status_marks_hint"),
                         )
                         .changed();
                 });
@@ -413,24 +397,24 @@ impl SettingsTabState {
             Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_min_height(BUBBLE_STATUS_BLOCK_HEIGHT_PX);
 
-                ui.heading("Статус пузырей");
+                ui.heading(t!("settings.canvas_ribbon.bubble_status_heading"));
                 ui.small(
-                    "Правила применяются сверху вниз. Первое совпавшее условие задаёт тип и цвет рамки пузыря.",
+                    t!("settings.canvas_ribbon.bubble_status_hint"),
                 );
                 ui.add_space(6.0);
 
                 changed |= ui
                     .checkbox(
                         &mut self.canvas_settings.show_bubble_status,
-                        "Отображать статус пузырей",
+                        t!("settings.canvas_ribbon.bubble_status_show_label"),
                     )
                     .on_hover_text(
-                        "Показывает рамку у editable aside/on_top пузырей по настраиваемым условиям",
+                        t!("settings.canvas_ribbon.bubble_status_show_hint"),
                     )
                     .changed();
 
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Сбросить на стандартный пресет").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.bubble_status_reset_button")).clicked() {
                         self.canvas_settings.bubble_status_rules = default_bubble_status_rules();
                         self.dragged_bubble_condition_node = None;
                         changed = true;
@@ -474,30 +458,30 @@ impl SettingsTabState {
 
                                         ui.vertical(|ui| {
                                             ui.set_min_height(RULE_CARD_HEIGHT_PX);
-                                            ui.strong(format!("Условие {}", idx + 1));
+                                            ui.strong(tf!("settings.canvas_ribbon.rule_index", idx = idx + 1));
                                             ui.small(rule.condition.summary());
                                             ui.add_space(8.0);
-                                            ui.label("Порядок");
+                                            ui.label(t!("settings.canvas_ribbon.rule_order_label"));
                                             if ui
-                                                .add_enabled(idx > 0, egui::Button::new("Вверх"))
+                                                .add_enabled(idx > 0, egui::Button::new(t!("settings.canvas_ribbon.rule_move_up_button")))
                                                 .clicked()
                                             {
                                                 move_from = Some(idx);
                                                 move_to = Some(idx - 1);
                                             }
                                             if ui
-                                                .add_enabled(can_move_down, egui::Button::new("Вниз"))
+                                                .add_enabled(can_move_down, egui::Button::new(t!("settings.canvas_ribbon.rule_move_down_button")))
                                                 .clicked()
                                             {
                                                 move_from = Some(idx);
                                                 move_to = Some(idx + 1);
                                             }
-                                            if ui.button("Удалить").clicked() {
+                                            if ui.button(t!("settings.canvas_ribbon.rule_delete_button")).clicked() {
                                                 remove_idx = Some(idx);
                                             }
 
                                             ui.add_space(8.0);
-                                            ui.label("Обводка");
+                                            ui.label(t!("settings.canvas_ribbon.rule_border_label"));
                                             changed |= draw_border_kind_selector(
                                                 ui,
                                                 &format!("rule_{}_border_kind", rule.id),
@@ -620,7 +604,7 @@ fn draw_condition_card(
                 let dragging_this = dragged_node
                     .as_ref()
                     .is_some_and(|dragged| dragged.rule_id == rule_id && dragged.path == path);
-                let header = draw_condition_drag_bar(ui, "Поле", dragging_this);
+                let header = draw_condition_drag_bar(ui, t!("settings.canvas_ribbon.condition_field"), dragging_this);
                 changed |= draw_field_pill(
                     ui,
                     &format!("field_{rule_id}_{path:?}"),
@@ -659,10 +643,10 @@ fn draw_condition_card(
                     .is_some_and(|dragged| dragged.rule_id == rule_id && dragged.path == path);
                 let items_len = items.len();
                 draw_operator_condition_body(ui, dragging_this, |ui| {
-                    let header = draw_condition_drag_bar(ui, "И", dragging_this);
+                    let header = draw_condition_drag_bar(ui, t!("settings.canvas_ribbon.condition_and"), dragging_this);
                     drag_started = header.drag_started;
                     clear_requested = header.clear_requested;
-                    ui.label(RichText::new("Все условия должны совпасть").color(Color32::WHITE));
+                    ui.label(RichText::new(t!("settings.canvas_ribbon.condition_all_hint")).color(Color32::WHITE));
                     ui.add_space(4.0);
                     for (child_idx, child) in items.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
@@ -680,19 +664,19 @@ fn draw_condition_card(
                                     pending_drop,
                                 );
                             });
-                            if items_len > 2 && ui.small_button("Удалить слот").clicked()
+                            if items_len > 2 && ui.small_button(t!("settings.canvas_ribbon.condition_remove_slot_button")).clicked()
                             {
                                 remove_child_idx = Some(child_idx);
                             }
                         });
                         if child_idx + 1 < items_len {
                             ui.add_space(4.0);
-                            ui.label(RichText::new("И").color(Color32::WHITE));
+                            ui.label(RichText::new(t!("settings.canvas_ribbon.condition_and")).color(Color32::WHITE));
                             ui.add_space(4.0);
                         }
                     }
                     ui.add_space(6.0);
-                    if ui.small_button("Добавить пустой слот").clicked() {
+                    if ui.small_button(t!("settings.canvas_ribbon.condition_add_slot_button")).clicked() {
                         items.push(BubbleStatusCondition::Empty);
                         changed = true;
                     }
@@ -732,10 +716,10 @@ fn draw_condition_card(
                     .is_some_and(|dragged| dragged.rule_id == rule_id && dragged.path == path);
                 let items_len = items.len();
                 draw_operator_condition_body(ui, dragging_this, |ui| {
-                    let header = draw_condition_drag_bar(ui, "ИЛИ", dragging_this);
+                    let header = draw_condition_drag_bar(ui, t!("settings.canvas_ribbon.condition_or"), dragging_this);
                     drag_started = header.drag_started;
                     clear_requested = header.clear_requested;
-                    ui.label(RichText::new("Достаточно любого условия").color(Color32::WHITE));
+                    ui.label(RichText::new(t!("settings.canvas_ribbon.condition_any_hint")).color(Color32::WHITE));
                     ui.add_space(4.0);
                     for (child_idx, child) in items.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
@@ -753,19 +737,19 @@ fn draw_condition_card(
                                     pending_drop,
                                 );
                             });
-                            if items_len > 2 && ui.small_button("Удалить слот").clicked()
+                            if items_len > 2 && ui.small_button(t!("settings.canvas_ribbon.condition_remove_slot_button")).clicked()
                             {
                                 remove_child_idx = Some(child_idx);
                             }
                         });
                         if child_idx + 1 < items_len {
                             ui.add_space(4.0);
-                            ui.label(RichText::new("ИЛИ").color(Color32::WHITE));
+                            ui.label(RichText::new(t!("settings.canvas_ribbon.condition_or")).color(Color32::WHITE));
                             ui.add_space(4.0);
                         }
                     }
                     ui.add_space(6.0);
-                    if ui.small_button("Добавить пустой слот").clicked() {
+                    if ui.small_button(t!("settings.canvas_ribbon.condition_add_slot_button")).clicked() {
                         items.push(BubbleStatusCondition::Empty);
                         changed = true;
                     }
@@ -803,10 +787,10 @@ fn draw_condition_card(
                     .as_ref()
                     .is_some_and(|dragged| dragged.rule_id == rule_id && dragged.path == path);
                 draw_operator_condition_body(ui, dragging_this, |ui| {
-                    let header = draw_condition_drag_bar(ui, "НЕ", dragging_this);
+                    let header = draw_condition_drag_bar(ui, t!("settings.canvas_ribbon.condition_not"), dragging_this);
                     drag_started = header.drag_started;
                     clear_requested = header.clear_requested;
-                    ui.label(RichText::new("Инвертирует вложенное условие").color(Color32::WHITE));
+                    ui.label(RichText::new(t!("settings.canvas_ribbon.condition_not_hint")).color(Color32::WHITE));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add_space(10.0);
@@ -859,7 +843,7 @@ fn draw_condition_drag_bar(ui: &mut Ui, title: &str, dragging_this: bool) -> Con
         let drag = draw_drag_handle(ui, dragging_this);
         drag_started = drag.drag_started();
         ui.add_space(4.0);
-        let clear_label = "Удалить";
+        let clear_label = t!("settings.canvas_ribbon.condition_clear_button");
         if ui.small_button(clear_label).clicked() {
             clear_requested = true;
         }
@@ -897,44 +881,44 @@ fn draw_empty_slot_card(
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_min_width(CONDITION_BLOCK_MIN_WIDTH_PX - 16.0);
-            ui.label(RichText::new("Пустой слот").color(Color32::WHITE));
+            ui.label(RichText::new(t!("settings.canvas_ribbon.empty_slot_title")).color(Color32::WHITE));
             ui.label(
-                RichText::new("Перетащите сюда блок или выберите тип условия.")
+                RichText::new(t!("settings.canvas_ribbon.empty_slot_hint"))
                     .color(Color32::WHITE),
             );
             ComboBox::from_id_salt(("empty_slot_choice", rule_id, path.to_vec()))
                 .width(INLINE_SLOT_MIN_WIDTH_PX + 44.0)
-                .selected_text("Выбрать")
+                .selected_text(t!("settings.canvas_ribbon.empty_slot_choose_button"))
                 .show_ui(ui, |ui| {
-                    if ui.button("Перевод заполнен").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_translation_filled")).clicked() {
                         *condition =
                             BubbleStatusCondition::Field(BubbleStatusField::TranslationFilled);
                         changed = true;
                         ui.close();
                     }
-                    if ui.button("Оригинал заполнен").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_original_filled")).clicked() {
                         *condition =
                             BubbleStatusCondition::Field(BubbleStatusField::OriginalFilled);
                         changed = true;
                         ui.close();
                     }
-                    if ui.button("Персонаж заполнен").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_character_filled")).clicked() {
                         *condition =
                             BubbleStatusCondition::Field(BubbleStatusField::CharacterFilled);
                         changed = true;
                         ui.close();
                     }
-                    if ui.button("Группа И").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_group_and")).clicked() {
                         *condition = BubbleStatusCondition::All(empty_group_slots());
                         changed = true;
                         ui.close();
                     }
-                    if ui.button("Группа ИЛИ").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_group_or")).clicked() {
                         *condition = BubbleStatusCondition::Any(empty_group_slots());
                         changed = true;
                         ui.close();
                     }
-                    if ui.button("НЕ").clicked() {
+                    if ui.button(t!("settings.canvas_ribbon.condition_not")).clicked() {
                         *condition =
                             BubbleStatusCondition::Not(Box::new(BubbleStatusCondition::Empty));
                         changed = true;
@@ -994,9 +978,9 @@ fn draw_drop_highlight_if_needed(
 
 fn draw_drag_handle(ui: &mut Ui, dragging_this: bool) -> egui::Response {
     let label = if dragging_this {
-        "Перетаскивается"
+        t!("settings.canvas_ribbon.condition_drag_handle_active")
     } else {
-        "Перетащить"
+        t!("settings.canvas_ribbon.condition_drag_handle")
     };
     ui.add(
         egui::Button::new(label)
@@ -1142,9 +1126,9 @@ fn get_condition_mut<'a>(
 
 fn field_dropdown_label(field: BubbleStatusField) -> &'static str {
     match field {
-        BubbleStatusField::TranslationFilled => "Перевод заполнен",
-        BubbleStatusField::OriginalFilled => "Оригинал заполнен",
-        BubbleStatusField::CharacterFilled => "Персонаж заполнен",
+        BubbleStatusField::TranslationFilled => t!("settings.canvas_ribbon.condition_translation_filled"),
+        BubbleStatusField::OriginalFilled => t!("settings.canvas_ribbon.condition_original_filled"),
+        BubbleStatusField::CharacterFilled => t!("settings.canvas_ribbon.condition_character_filled"),
     }
 }
 
@@ -1193,11 +1177,11 @@ fn draw_dragged_condition_preview(
 
 fn dragged_condition_title(condition: &BubbleStatusCondition) -> &'static str {
     match condition {
-        BubbleStatusCondition::Empty => "Поле",
-        BubbleStatusCondition::Field(_) => "Поле",
-        BubbleStatusCondition::All(_) => "И",
-        BubbleStatusCondition::Any(_) => "ИЛИ",
-        BubbleStatusCondition::Not(_) => "НЕ",
+        BubbleStatusCondition::Empty => t!("settings.canvas_ribbon.condition_field"),
+        BubbleStatusCondition::Field(_) => t!("settings.canvas_ribbon.condition_field"),
+        BubbleStatusCondition::All(_) => t!("settings.canvas_ribbon.condition_and"),
+        BubbleStatusCondition::Any(_) => t!("settings.canvas_ribbon.condition_or"),
+        BubbleStatusCondition::Not(_) => t!("settings.canvas_ribbon.condition_not"),
     }
 }
 #[allow(dead_code)]

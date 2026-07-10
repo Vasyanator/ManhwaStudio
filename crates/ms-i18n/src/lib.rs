@@ -146,46 +146,98 @@ macro_rules! tp {
     }};
 }
 
+/// Process-global lock serializing every test in this crate that mutates the
+/// active-catalog slot (`ACTIVE` in `catalog.rs`). The macro tests here and the
+/// `install`/`set_locale` tests in `catalog.rs` share one `ArcSwap`, so they must
+/// not run concurrently or one test's assertion could observe another's catalog.
+#[cfg(test)]
+pub(crate) static ACTIVE_CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires [`ACTIVE_CATALOG_TEST_LOCK`], ignoring poisoning.
+///
+/// A failing assertion inside the critical section poisons the mutex, which would then
+/// fail every other test that shares it with an unrelated `PoisonError` and bury the one
+/// real failure. The guarded data is `()`, so there is no invariant a panic could have
+/// broken — recovering is safe and keeps failures reported at their true site.
+#[cfg(test)]
+pub(crate) fn lock_active_catalog_for_test() -> std::sync::MutexGuard<'static, ()> {
+    ACTIVE_CATALOG_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::catalog::Catalog;
     use crate::locale::LocaleTag;
-    use std::sync::Mutex;
-
-    // The macros drive the process-global catalog; serialize against other
-    // global-state tests in this crate is handled per-module, but macro tests
-    // here have their own lock since they set the locale.
-    static MACRO_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::Arc;
 
     /// Parses a tag for tests (all literals here are valid).
     fn tag(s: &str) -> LocaleTag {
         LocaleTag::parse(s).expect("test tag is valid")
     }
 
+    /// Installs a self-contained English fixture catalog so these macro tests never
+    /// depend on the shipped locale JSON — deleting or renaming a product key can
+    /// never break them.
+    fn install_en_fixture() {
+        let en = Catalog::from_json_str(
+            &tag("en"),
+            r#"{
+                "fixture.greeting": "Hello",
+                "fixture.save_error": "Save failed: {err}",
+                "fixture.chars": { "one": "{n} character", "other": "{n} characters" }
+            }"#,
+        )
+        .expect("en fixture parses");
+        crate::install(en);
+    }
+
+    /// Installs a self-contained Russian fixture catalog (with an English fallback)
+    /// exercising the CLDR one/few/many/other plural forms.
+    fn install_ru_fixture() {
+        let en = Catalog::from_json_str(
+            &tag("en"),
+            r#"{ "fixture.chars": { "one": "{n} character", "other": "{n} characters" } }"#,
+        )
+        .expect("en fixture parses");
+        let ru = Catalog::from_json_str(
+            &tag("ru"),
+            r#"{ "fixture.chars": { "one": "{n} символ", "few": "{n} символа", "many": "{n} символов", "other": "{n} символа" } }"#,
+        )
+        .expect("ru fixture parses")
+        .with_fallback(Arc::new(en));
+        crate::install(ru);
+    }
+
     #[test]
     fn t_returns_translation_or_key() {
-        let _guard = MACRO_TEST_LOCK.lock().unwrap();
-        crate::set_locale(&tag("en")).unwrap();
-        assert_eq!(t!("tab.settings"), "Settings");
+        let _guard = crate::lock_active_catalog_for_test();
+        install_en_fixture();
+        assert_eq!(t!("fixture.greeting"), "Hello");
         // Unknown key falls back to the key text.
         assert_eq!(t!("no.such.key"), "no.such.key");
     }
 
     #[test]
     fn tf_interpolates_and_never_panics_on_missing_arg() {
-        let _guard = MACRO_TEST_LOCK.lock().unwrap();
-        crate::set_locale(&tag("en")).unwrap();
-        assert_eq!(tf!("app.save_error", err = "disk full"), "Save failed: disk full");
+        let _guard = crate::lock_active_catalog_for_test();
+        install_en_fixture();
+        assert_eq!(
+            tf!("fixture.save_error", err = "disk full"),
+            "Save failed: disk full"
+        );
         // Missing argument leaves the placeholder intact, no panic.
-        assert_eq!(tf!("app.save_error"), "Save failed: {err}");
+        assert_eq!(tf!("fixture.save_error"), "Save failed: {err}");
     }
 
     #[test]
     fn tp_selects_plural_form_and_interpolates() {
-        let _guard = MACRO_TEST_LOCK.lock().unwrap();
-        crate::set_locale(&tag("en")).unwrap();
-        assert_eq!(tp!("wiki.chars", 1_usize), "1 character");
-        assert_eq!(tp!("wiki.chars", 5_i32), "5 characters");
-        crate::set_locale(&tag("ru")).unwrap();
-        assert_eq!(tp!("wiki.chars", 2_u64), "2 символа");
+        let _guard = crate::lock_active_catalog_for_test();
+        install_en_fixture();
+        assert_eq!(tp!("fixture.chars", 1_usize), "1 character");
+        assert_eq!(tp!("fixture.chars", 5_i32), "5 characters");
+        install_ru_fixture();
+        assert_eq!(tp!("fixture.chars", 2_u64), "2 символа");
     }
 }

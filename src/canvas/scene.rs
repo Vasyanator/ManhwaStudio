@@ -1179,7 +1179,7 @@ impl CanvasView {
                     ui.close();
                 }
                 if ui
-                    .add_enabled(self.editable, egui::Button::new("Создать ImageBubble"))
+                    .add_enabled(self.editable, egui::Button::new(t!("canvas.page_menu.create_image_bubble")))
                     .clicked()
                 {
                     if !self.create_image_bubble_from_canvas_context_menu(ui.ctx(), project) {
@@ -1194,7 +1194,7 @@ impl CanvasView {
                 if ui
                     .add_enabled(
                         self.editable && self.bubble_runtime.copied_bubble_data.is_some(),
-                        egui::Button::new("Вставить пузырь"),
+                        egui::Button::new(t!("canvas.page_menu.paste_bubble")),
                     )
                     .clicked()
                 {
@@ -1214,7 +1214,7 @@ impl CanvasView {
                 if ui
                     .add_enabled(
                         self.editable,
-                        egui::Button::new("Вставить в новый пузырь (оригинал)"),
+                        egui::Button::new(t!("canvas.page_menu.paste_new_bubble_original")),
                     )
                     .clicked()
                 {
@@ -1234,7 +1234,7 @@ impl CanvasView {
                 if ui
                     .add_enabled(
                         self.editable,
-                        egui::Button::new("Вставить в новый пузырь (перевод)"),
+                        egui::Button::new(t!("canvas.page_menu.paste_new_bubble_translation")),
                     )
                     .clicked()
                 {
@@ -1312,9 +1312,9 @@ impl CanvasView {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     let toggle_hint = if self.state.controls_panel_collapsed {
-                        "Нажмите, чтобы развернуть панель"
+                        t!("canvas.controls.expand_panel_tooltip")
                     } else {
-                        "Нажмите, чтобы свернуть панель"
+                        t!("canvas.controls.collapse_panel_tooltip")
                     };
                     let toggle_icon = if self.state.controls_panel_collapsed {
                         "▶"
@@ -1338,10 +1338,10 @@ impl CanvasView {
                     ui.add_space(2.0);
                     ui.label(zoom_text);
                     ui.add_space(4.0);
-                    ui.checkbox(&mut self.state.show_bubbles, "Показывать пузыри");
+                    ui.checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
                     ui.add(
                         WheelSlider::new(&mut self.state.bubble_opacity, 0.0..=1.0)
-                            .text("Прозрачность пузырей"),
+                            .text(t!("canvas.controls.bubble_opacity")),
                     );
                 });
             });
@@ -1350,8 +1350,8 @@ impl CanvasView {
 
     fn create_bubble_context_menu_label(&self) -> String {
         match self.create_bubble_shortcut_hint.as_deref() {
-            Some(shortcut) if !shortcut.is_empty() => format!("Создать пузырь ({shortcut})"),
-            _ => "Создать пузырь".to_string(),
+            Some(shortcut) if !shortcut.is_empty() => tf!("canvas.page_menu.create_bubble_shortcut", shortcut = shortcut),
+            _ => t!("canvas.page_menu.create_bubble").to_string(),
         }
     }
 }

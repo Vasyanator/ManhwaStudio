@@ -34,7 +34,12 @@ fallback) -> `install` swaps the `ArcSwap` -> `t!/tf!/tp!` -> `lookup`/
 - `locales/`: embedded locale JSON (flat dotted keys; `_meta` reserved; values are
   strings, or plural objects with CLDR `one`/`few`/`many`/`other`, `other` required).
 - `tests/key_validation.rs`: scans the repo for `t!`/`tf!`/`tp!` keys and checks them
-  against `en.json`; also checks `ru.json ⊆ en.json`.
+  against `en.json`; checks `ru.json ⊆ en.json`; via `meta_holds_only_name`, that every
+  locale file's `_meta` holds exactly the field `name`; and via
+  `every_catalog_key_is_referenced_in_src`, that no ORPHAN key survives — every catalog
+  key must appear as a bare `"key"` literal somewhere under `src/` (a permissive
+  "quoted-key-text present" match, so runtime key-tables that hold keys as literals are
+  not false-positives).
 
 ## Contracts and invariants
 - **`t!` is hot-path safe**: no lock, no allocation. It returns `&'static str`
@@ -46,7 +51,13 @@ fallback) -> `install` swaps the `ArcSwap` -> `t!/tf!/tp!` -> `lookup`/
 - **Fallback**: every non-`en` catalog carries an `en` fallback; lookups walk it.
 - **`en` is the reference**: `ru` must not contain a key absent from `en`
   (enforced by `key_validation.rs`).
-- **`_meta` is reserved**: never exposed as a translatable key.
+- **`_meta` holds exactly one field, `name`**: never exposed as a translatable key,
+  and never stores derived state. "Untranslated" is DERIVED, not stored — a value equal
+  to the Russian source is untranslated (list them with
+  `tools/i18n_extract.py --untranslated <tag>`). `tests/key_validation.rs` fails the
+  build on any `_meta` field other than `name`, so a write-only field cannot rot. Because
+  English is seeded from the Russian source, `en.json` mixes real English (a few keys such
+  as `app.tab.settings`, `wiki.chars`) with Russian placeholders until translations land.
 - **No egui/tokio/image**; deps are `serde_json`, `arc-swap`, `thiserror`.
 - **Identity is OPEN, plural rules are CLOSED**. `LocaleTag` is a validated string,
   so ANY `<tag>.json` (custom languages included) loads; `set_locale(&LocaleTag)` is

@@ -137,14 +137,14 @@ pub(super) fn px_or_percent_param_row(
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if ui
                     .selectable_label(!want_percent, "X")
-                    .on_hover_text("Пиксели")
+                    .on_hover_text(t!("typing.params.unit_pixels"))
                     .clicked()
                 {
                     want_percent = false;
                 }
                 if ui
                     .selectable_label(want_percent, "X%")
-                    .on_hover_text("Проценты от размера шрифта")
+                    .on_hover_text(t!("typing.params.unit_percent_of_font"))
                     .clicked()
                 {
                     want_percent = true;
@@ -376,11 +376,11 @@ pub(super) fn parse_text_wrap_mode_str(raw: &str) -> Option<TextWrapMode> {
 
 pub(super) fn text_wrap_mode_label(mode: TextWrapMode) -> &'static str {
     match mode {
-        TextWrapMode::None => "Нет",
-        TextWrapMode::WholeWords => "Слова целиком",
-        TextWrapMode::Minimal => "Минимальный перенос",
-        TextWrapMode::Moderate => "Умеренный перенос",
-        TextWrapMode::Aggressive => "Активный перенос",
+        TextWrapMode::None => t!("typing.params.wrap_none"),
+        TextWrapMode::WholeWords => t!("typing.params.wrap_whole_words"),
+        TextWrapMode::Minimal => t!("typing.params.wrap_minimal"),
+        TextWrapMode::Moderate => t!("typing.params.wrap_moderate"),
+        TextWrapMode::Aggressive => t!("typing.params.wrap_active"),
     }
 }
 
@@ -400,11 +400,11 @@ pub(super) fn parse_anti_aliasing_str(raw: &str) -> Option<AntiAliasingMode> {
 /// Russian UI label for an anti-aliasing mode.
 pub(super) fn anti_aliasing_label(mode: AntiAliasingMode) -> &'static str {
     match mode {
-        AntiAliasingMode::None => "Без сглаживания",
-        AntiAliasingMode::Sharp => "Резкое",
-        AntiAliasingMode::Crisp => "Чёткое",
-        AntiAliasingMode::Strong => "Насыщенное",
-        AntiAliasingMode::Smooth => "Плавное",
+        AntiAliasingMode::None => t!("typing.params.antialias_none"),
+        AntiAliasingMode::Sharp => t!("typing.params.antialias_sharp"),
+        AntiAliasingMode::Crisp => t!("typing.params.antialias_crisp"),
+        AntiAliasingMode::Strong => t!("typing.params.antialias_rich"),
+        AntiAliasingMode::Smooth => t!("typing.params.antialias_smooth"),
     }
 }
 

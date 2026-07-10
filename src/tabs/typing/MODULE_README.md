@@ -402,6 +402,17 @@ saving, and export.
   `width * height`. Public helpers should reject invalid sizes instead of panicking.
 - Any new executable runtime logic in this module needs focused tests or an explicit
   documented reason if testing is not currently practical.
+- UI strings are localized through `ms-i18n` (`t!`/`tf!`, keys under `typing.*`), NOT
+  hardcoded Russian. Two classes stay as stable Russian LITERALS because they are DATA,
+  not chrome (see `docs/i18n_exclusions.md`): (1) the built-in formula-preset NAMES in
+  `panel/presets_io.rs` (§A1 — they are persisted `TextTab.formula_presets` map keys),
+  and (2) the PSD export LAYER NAMES in `psd_export.rs` (§A5 — written verbatim into the
+  exported `.psd`, so the export format must not depend on the interface language). Each
+  such site carries a justifying comment. Do not route them through the catalog.
+- Widget-id-deriving calls that show a localized label (`WheelComboBox::from_label`,
+  `CollapsingHeader::new`, `egui::Window::new`) must seed a stable, language-independent
+  id (`.id_salt("typing.…")` / `egui::Id::new`). `egui::ComboBox` has no `id_salt()`
+  builder — use `ComboBox::new(id_salt, label)`.
 
 ## Storage and external boundaries
 - Persistent text assets are under `ProjectPaths::text_images_dir`.

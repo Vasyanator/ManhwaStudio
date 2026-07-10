@@ -28,7 +28,7 @@ impl TypingTextOverlayLayer {
                 Ok(result) => Some(Ok(result)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(
-                    "Фоновое сохранение text_info.json завершилось с ошибкой канала.".to_string(),
+                    t!("typing.persist.text_info_channel_error").to_string(),
                 )),
             }
         };

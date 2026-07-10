@@ -88,7 +88,7 @@ impl Default for MtPanelOptions {
             ai_api_key_edit: String::new(),
             ai_api_key_configured: None,
             ai_api_models: Vec::new(),
-            ai_api_account_status: "Нажмите обновить.".to_string(),
+            ai_api_account_status: t!("translation.common.press_refresh_status").to_string(),
             ai_api_status: String::new(),
             ai_api_system_instruction: "You are a manga/comic translation engine. Translate faithfully into Russian. Since the text was recognized using OCR, there may be errors, and the English text is often in uppercase. Do not preserve line breaks; write the translation in normal text, not in all caps. Preserve tone, names, honorifics, jokes, and speaker intent. Return only valid JSON with id and translation.".to_string(),
             ai_sort_mode: AiMtSortMode::Height,
@@ -143,17 +143,29 @@ pub struct MtPanelActions {
 #[derive(Debug, Clone, Copy)]
 struct MtLanguage {
     code: &'static str,
+    /// Display label source: either a stable i18n catalog key (resolved at render
+    /// time) or a plain English literal for languages without a catalog entry.
+    /// The wire `code` is the persisted identity, so the label is free to localize.
     title: &'static str,
+}
+
+impl MtLanguage {
+    /// Localized display label. Runtime (not `const`) because `t!` is not const;
+    /// a catalog miss (plain-literal titles) falls back to the stored string.
+    #[must_use]
+    fn title(&self) -> &'static str {
+        ms_i18n::lookup(self.title).unwrap_or(self.title)
+    }
 }
 
 const MT_SOURCE_LANGUAGES: &[MtLanguage] = &[
     MtLanguage {
         code: "auto",
-        title: "Автоопределение",
+        title: "translation.mt_panel.auto_detect_lang",
     },
     MtLanguage {
         code: "ru",
-        title: "Русский",
+        title: "translation.ocr_langs.russian",
     },
     MtLanguage {
         code: "en",
@@ -232,7 +244,7 @@ const MT_SOURCE_LANGUAGES: &[MtLanguage] = &[
 const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
     MtLanguage {
         code: "ru",
-        title: "Русский",
+        title: "translation.ocr_langs.russian",
     },
     MtLanguage {
         code: "en",
@@ -318,17 +330,17 @@ pub fn draw_machine_translation_panel(
 ) -> MtPanelActions {
     let mut actions = MtPanelActions::default();
 
-    ui.heading("Настройки машинного перевода");
+    ui.heading(t!("translation.mt_panel.settings_heading"));
     ui.horizontal_wrapped(|ui| {
         actions.options_changed |= ui
             .selectable_value(
                 &mut options.active_tab,
                 MtPanelTab::Machine,
-                "Машинный перевод",
+                t!("translation.mt_panel.machine_tab"),
             )
             .changed();
         actions.options_changed |= ui
-            .selectable_value(&mut options.active_tab, MtPanelTab::AiApi, "ИИ (API)")
+            .selectable_value(&mut options.active_tab, MtPanelTab::AiApi, t!("translation.mt_panel.ai_api_tab"))
             .changed();
     });
     ui.separator();
@@ -357,21 +369,21 @@ fn draw_mt_stop_notice(ui: &mut egui::Ui, stop_notice: &mut Option<MtStopNotice>
     ui.separator();
     ui.colored_label(
         egui::Color32::from_rgb(240, 200, 60),
-        "Перевод остановлен, вероятно у вас закончились кредиты или исчерпан лимит.",
+        t!("translation.mt_panel.stopped_credits_notice"),
     );
     let mut toggle = false;
     let mut dismiss = false;
     let mut copy = false;
     ui.horizontal_wrapped(|ui| {
         let toggle_label = if expanded {
-            "Скрыть полную ошибку"
+            t!("translation.mt_panel.hide_full_error_button")
         } else {
-            "Показать полную ошибку"
+            t!("translation.mt_panel.show_full_error_button")
         };
         toggle = ui.button(toggle_label).clicked();
-        dismiss = ui.button("Скрыть уведомление").clicked();
+        dismiss = ui.button(t!("translation.mt_panel.hide_notice_button")).clicked();
         if expanded {
-            copy = ui.button("Копировать").clicked();
+            copy = ui.button(t!("translation.common.copy_button")).clicked();
         }
     });
     if expanded {
@@ -412,13 +424,13 @@ fn draw_machine_tab(
 
     actions.options_changed |= draw_lang_combo(
         ui,
-        "Исходный язык",
+        t!("translation.common.source_lang_label"),
         &mut options.source_lang,
         MT_SOURCE_LANGUAGES,
     );
     actions.options_changed |= draw_lang_combo(
         ui,
-        "Целевой язык",
+        t!("translation.common.target_lang_label"),
         &mut options.target_lang,
         MT_TARGET_LANGUAGES,
     );
@@ -426,19 +438,19 @@ fn draw_machine_tab(
     ui.separator();
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(!busy, egui::Button::new("Перевести всё"))
+            .add_enabled(!busy, egui::Button::new(t!("translation.mt_panel.translate_all_button")))
             .clicked()
         {
             actions.start_all = true;
         }
         if ui
-            .add_enabled(!busy, egui::Button::new("Перевести на текущей странице"))
+            .add_enabled(!busy, egui::Button::new(t!("translation.mt_panel.translate_current_page_button")))
             .clicked()
         {
             actions.start_page = true;
         }
         if ui
-            .add_enabled(can_cancel, egui::Button::new("Отменить перевод"))
+            .add_enabled(can_cancel, egui::Button::new(t!("translation.mt_panel.cancel_translation_button")))
             .clicked()
         {
             actions.cancel = true;
@@ -471,7 +483,7 @@ fn draw_ai_api_tab(
             ui,
             options,
             AiMtPanelSection::Connection,
-            "Сервис, ключ и инструкция",
+            t!("translation.mt_panel.service_key_instruction_heading"),
         );
         if options.ai_open_section == AiMtPanelSection::Connection {
             egui::ScrollArea::vertical()
@@ -486,7 +498,7 @@ fn draw_ai_api_tab(
             ui,
             options,
             AiMtPanelSection::Translation,
-            "Параметры перевода",
+            t!("translation.mt_panel.translation_params_heading"),
         );
         if options.ai_open_section == AiMtPanelSection::Translation {
             egui::ScrollArea::vertical()
@@ -500,29 +512,29 @@ fn draw_ai_api_tab(
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             let page_button =
-                ui.add_enabled(!busy, egui::Button::new("Перевести текущую страницу"));
+                ui.add_enabled(!busy, egui::Button::new(t!("translation.mt_panel.translate_current_page_short_button")));
             if page_button.clicked() {
                 actions.start_page = true;
             }
             // Debug: right-click reveals the exact first request for this scope without sending it.
             page_button.context_menu(|ui| {
-                if ui.button("Отобразить полный запрос").clicked() {
+                if ui.button(t!("translation.mt_panel.show_full_request_button")).clicked() {
                     actions.preview_request_page = true;
                     ui.close();
                 }
             });
-            let all_button = ui.add_enabled(!busy, egui::Button::new("Перевести всё"));
+            let all_button = ui.add_enabled(!busy, egui::Button::new(t!("translation.mt_panel.translate_all_button")));
             if all_button.clicked() {
                 actions.start_all = true;
             }
             all_button.context_menu(|ui| {
-                if ui.button("Отобразить полный запрос").clicked() {
+                if ui.button(t!("translation.mt_panel.show_full_request_button")).clicked() {
                     actions.preview_request_all = true;
                     ui.close();
                 }
             });
             if ui
-                .add_enabled(can_cancel, egui::Button::new("Отменить перевод"))
+                .add_enabled(can_cancel, egui::Button::new(t!("translation.mt_panel.cancel_translation_button")))
                 .clicked()
             {
                 actions.cancel = true;
@@ -537,20 +549,12 @@ fn draw_ai_api_tab(
 fn draw_translation_progress_status(ui: &mut egui::Ui, progress: Option<MtPanelProgress>) {
     ui.colored_label(
         egui::Color32::from_rgb(255, 172, 66),
-        "Перевод выполняется...",
+        t!("translation.mt_panel.translating_status"),
     );
     if let Some(progress) = progress {
-        ui.small(format!(
-            "Готово: {}/{}. Ошибок: {}.",
-            progress.translated, progress.total, progress.errors
-        ));
+        ui.small(tf!("translation.mt_panel.progress_status", done = progress.translated, total = progress.total, errors = progress.errors));
         if progress.context_budget_chars > 0 {
-            ui.small(format!(
-                "Контекст: {}/{}. Обрезано реплик: {}.",
-                format_context_chars(progress.context_used_chars),
-                format_context_chars(progress.context_budget_chars),
-                progress.pruned_replicas
-            ));
+            ui.small(tf!("translation.mt_panel.context_status", used = format_context_chars(progress.context_used_chars), budget = format_context_chars(progress.context_budget_chars), pruned = progress.pruned_replicas));
         }
     }
 }
@@ -588,19 +592,19 @@ fn draw_ai_connection_section(
 ) {
     actions.options_changed |= draw_lang_combo(
         ui,
-        "Исходный язык",
+        t!("translation.common.source_lang_label"),
         &mut options.source_lang,
         MT_SOURCE_LANGUAGES,
     );
     actions.options_changed |= draw_lang_combo(
         ui,
-        "Целевой язык",
+        t!("translation.common.target_lang_label"),
         &mut options.target_lang,
         MT_TARGET_LANGUAGES,
     );
 
     let old_service = options.ai_api_service;
-    ui.label("Сервис");
+    ui.label(t!("translation.common.service_label"));
     WheelComboBox::from_id_salt("translation_mt_ai_api_service")
         .selected_text(options.ai_api_service.label())
         .show_ui(ui, |ui| {
@@ -615,7 +619,7 @@ fn draw_ai_connection_section(
         options.ai_api_key_edit.clear();
         options.ai_api_key_configured = None;
         options.ai_api_models.clear();
-        options.ai_api_account_status = "Нажмите обновить.".to_string();
+        options.ai_api_account_status = t!("translation.common.press_refresh_status").to_string();
         options.ai_api_status.clear();
         actions.options_changed = true;
         actions.refresh_ai_api_metadata = true;
@@ -623,12 +627,12 @@ fn draw_ai_connection_section(
 
     ui.horizontal_wrapped(|ui| {
         let key_state = match options.ai_api_key_configured {
-            Some(true) => "key сохранен",
-            Some(false) => "key не задан",
-            None => "key не проверен",
+            Some(true) => t!("translation.common.key_saved_status"),
+            Some(false) => t!("translation.common.key_not_set_status"),
+            None => t!("translation.common.key_unverified_status"),
         };
         ui.small(key_state);
-        if ui.small_button("Обновить").clicked() {
+        if ui.small_button(t!("translation.common.refresh_button")).clicked() {
             actions.refresh_ai_api_metadata = true;
         }
     });
@@ -640,10 +644,10 @@ fn draw_ai_connection_section(
             .desired_width(max_width),
     );
     ui.horizontal_wrapped(|ui| {
-        if ui.small_button("Сохранить").clicked() {
+        if ui.small_button(t!("translation.common.save_button")).clicked() {
             actions.save_ai_api_key = true;
         }
-        if ui.small_button("Удалить").clicked() {
+        if ui.small_button(t!("translation.common.delete_button")).clicked() {
             actions.clear_ai_api_key = true;
         }
     });
@@ -651,7 +655,7 @@ fn draw_ai_connection_section(
         ui.small(options.ai_api_status.clone());
     }
 
-    ui.label("Модель");
+    ui.label(t!("translation.common.model_label"));
     WheelComboBox::from_id_salt("translation_mt_ai_api_model")
         .selected_text(compact_middle(&options.ai_api_model, 42))
         .show_ui(ui, |ui| {
@@ -674,10 +678,10 @@ fn draw_ai_connection_section(
         )
         .changed();
 
-    ui.label("Баланс и лимиты");
+    ui.label(t!("translation.common.balance_limits_label"));
     ui.small(options.ai_api_account_status.clone());
 
-    ui.label("Системная инструкция");
+    ui.label(t!("translation.common.system_instruction_label"));
     actions.options_changed |= ui
         .add(
             egui::TextEdit::multiline(&mut options.ai_api_system_instruction)
@@ -692,39 +696,39 @@ fn draw_ai_translation_section(
     options: &mut MtPanelOptions,
     actions: &mut MtPanelActions,
 ) {
-    ui.label("Сортировка пузырей");
+    ui.label(t!("translation.mt_panel.bubble_sort_label"));
     ui.horizontal_wrapped(|ui| {
         actions.options_changed |= ui
-            .radio_value(&mut options.ai_sort_mode, AiMtSortMode::Height, "По высоте")
+            .radio_value(&mut options.ai_sort_mode, AiMtSortMode::Height, t!("translation.mt_panel.sort_by_height"))
             .changed();
         actions.options_changed |= ui
-            .radio_value(&mut options.ai_sort_mode, AiMtSortMode::Number, "По номеру")
+            .radio_value(&mut options.ai_sort_mode, AiMtSortMode::Number, t!("translation.mt_panel.sort_by_number"))
             .changed();
     });
     actions.options_changed |= ui
         .checkbox(
             &mut options.ai_use_character_names,
-            "Использовать имена персонажей",
+            t!("translation.common.use_character_names_label"),
         )
         .changed();
     actions.options_changed |= ui
         .checkbox(
             &mut options.ai_use_notes_prompt,
-            "Использовать промпт из заметок перевода",
+            t!("translation.mt_panel.use_notes_prompt_label"),
         )
         .changed();
     if !options.ai_use_notes_prompt {
         actions.options_changed |= ui
-            .checkbox(&mut options.ai_include_characters, "Добавлять персонажей")
+            .checkbox(&mut options.ai_include_characters, t!("translation.mt_panel.add_characters_label"))
             .changed();
         actions.options_changed |= ui
-            .checkbox(&mut options.ai_include_terms, "Добавлять термины")
+            .checkbox(&mut options.ai_include_terms, t!("translation.mt_panel.add_terms_label"))
             .changed();
     }
     actions.options_changed |= ui
         .checkbox(
             &mut options.ai_include_existing_translation,
-            "Включить существующий перевод в контекст",
+            t!("translation.mt_panel.include_existing_translation_label"),
         )
         .changed();
     let selected_model_is_multimodal = is_likely_multimodal_model(&options.ai_api_model);
@@ -734,7 +738,7 @@ fn draw_ai_translation_section(
         actions.options_changed = true;
     }
 
-    ui.label("Режим перевода");
+    ui.label(t!("translation.mt_panel.translation_mode_label"));
     ui.horizontal_wrapped(|ui| {
         if ui
             .selectable_label(
@@ -761,7 +765,7 @@ fn draw_ai_translation_section(
     });
     if !selected_model_is_multimodal {
         ui.small(
-            "Режим «Только картинки» и пузыри с картинками доступны только для мультимодальных моделей.",
+            t!("translation.mt_panel.images_only_multimodal_hint"),
         );
     }
 
@@ -769,7 +773,7 @@ fn draw_ai_translation_section(
     if images_only {
         // Each ImageBubble gets the full chapter context up to it; pick whether that context shows
         // the source originals or the existing translations.
-        ui.label("Контекст главы");
+        ui.label(t!("translation.mt_panel.chapter_context_label"));
         ui.horizontal_wrapped(|ui| {
             actions.options_changed |= ui
                 .radio_value(
@@ -796,7 +800,7 @@ fn draw_ai_translation_section(
                 selected_model_is_multimodal,
                 egui::Checkbox::new(
                     &mut options.ai_include_image_bubbles,
-                    "Включить пузыри с картинками",
+                    t!("translation.mt_panel.include_image_bubbles_label"),
                 ),
             )
             .changed();
@@ -805,7 +809,7 @@ fn draw_ai_translation_section(
     // Image detail applies whenever images are actually sent: always in ImagesOnly, or when the
     // normal mode includes image bubbles.
     if images_only || options.ai_include_image_bubbles {
-        ui.label("Детализация картинки");
+        ui.label(t!("translation.mt_panel.image_detail_label"));
         WheelComboBox::from_id_salt("translation_mt_ai_image_detail")
             .selected_text(options.ai_image_detail.title())
             .show_ui(ui, |ui| {
@@ -820,7 +824,7 @@ fn draw_ai_translation_section(
     // Batch size only matters for the normal batched mode (ImagesOnly sends one image per request).
     if !images_only {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Реплик за раз");
+            ui.label(t!("translation.mt_panel.replicas_per_batch_label"));
             actions.options_changed |= ui
                 .add(
                     egui::DragValue::new(&mut options.ai_batch_size)
@@ -830,7 +834,7 @@ fn draw_ai_translation_section(
                 .changed();
         });
     }
-    ui.label("Размышление");
+    ui.label(t!("translation.mt_panel.reasoning_label"));
     WheelComboBox::from_id_salt("translation_mt_ai_reasoning")
         .selected_text(options.ai_reasoning.title())
         .show_ui(ui, |ui| {
@@ -841,7 +845,7 @@ fn draw_ai_translation_section(
             }
         });
     ui.horizontal_wrapped(|ui| {
-        ui.label("Контекст");
+        ui.label(t!("translation.mt_panel.context_label"));
         actions.options_changed |= ui
             .add(egui::Slider::new(
                 &mut options.ai_context_limit_percent,
@@ -854,7 +858,7 @@ fn draw_ai_translation_section(
 
 fn draw_service_combo(ui: &mut egui::Ui, selected: &mut MtService) -> bool {
     let mut changed = false;
-    WheelComboBox::from_label("Сервис")
+    WheelComboBox::from_label(t!("translation.common.service_label")).id_salt("translation.common.service_label")
         .selected_text(selected.title())
         .show_ui(ui, |ui| {
             for service in MtService::all() {
@@ -882,7 +886,7 @@ fn draw_lang_combo(
         .show_ui(ui, |ui| {
             for lang in langs {
                 changed |= ui
-                    .selectable_value(selected_code, lang.code.to_string(), lang.title)
+                    .selectable_value(selected_code, lang.code.to_string(), lang.title())
                     .changed();
             }
         });
@@ -905,7 +909,7 @@ fn language_title<'a>(code: &str, langs: &'a [MtLanguage]) -> Option<&'a str> {
     langs
         .iter()
         .find(|lang| lang.code.eq_ignore_ascii_case(code))
-        .map(|lang| lang.title)
+        .map(|lang| lang.title())
 }
 
 fn compact_middle(text: &str, max_chars: usize) -> String {

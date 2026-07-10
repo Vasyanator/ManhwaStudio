@@ -294,7 +294,7 @@ impl AdvancedRecognitionWindow {
                 selection,
                 page_path,
             }))
-            .map_err(|_| "Не удалось запустить подготовку области распознавания.".to_string())
+            .map_err(|_| t!("translation.adv_rec.prepare_failed_error").to_string())
     }
 
     pub fn is_open(&self) -> bool {
@@ -304,7 +304,7 @@ impl AdvancedRecognitionWindow {
     pub fn set_request_running(&mut self, request_id: u64) {
         if let Some(session) = self.session.as_mut() {
             session.active_request_id = Some(request_id);
-            session.status = Some("Распознавание выполняется...".to_string());
+            session.status = Some(t!("translation.adv_rec.recognizing_status").to_string());
         }
     }
 
@@ -317,7 +317,7 @@ impl AdvancedRecognitionWindow {
         }
         session.active_request_id = None;
         session.text = text;
-        session.status = Some("Распознавание завершено.".to_string());
+        session.status = Some(t!("translation.adv_rec.recognition_done_status").to_string());
         true
     }
 
@@ -382,7 +382,7 @@ impl AdvancedRecognitionWindow {
             let mut keep_open = true;
             let mut action = None;
             let mut request_close = false;
-            let shown = egui::Window::new("Продвинутое распознавание")
+            let shown = egui::Window::new(t!("translation.recognition.advanced_title")).id(egui::Id::new("translation.recognition.advanced_title"))
                 .id(egui::Id::new(("translation_adv_rec", self.session_id)))
                 .fixed_size(window_size)
                 .current_pos(window_pos)
@@ -413,7 +413,7 @@ impl AdvancedRecognitionWindow {
             let window_pos = adv_rec_window_pos(prev_window_rect, loading_size, viewport, false);
             let mut keep_open = true;
             let mut close_clicked = false;
-            let shown = egui::Window::new("Продвинутое распознавание")
+            let shown = egui::Window::new(t!("translation.recognition.advanced_title")).id(egui::Id::new("translation.recognition.advanced_title"))
                 .id(egui::Id::new(("translation_adv_rec_loading", job_id)))
                 .fixed_size(loading_size)
                 .current_pos(window_pos)
@@ -425,9 +425,9 @@ impl AdvancedRecognitionWindow {
                         ui.add_space(4.0);
                         ui.spinner();
                         ui.add_space(6.0);
-                        ui.label("Подготавливаю выделенную область...");
+                        ui.label(t!("translation.common.preparing_selection_status"));
                         ui.add_space(6.0);
-                        if ui.button("Отмена").clicked() {
+                        if ui.button(t!("translation.common.cancel_button")).clicked() {
                             close_clicked = true;
                         }
                     });
@@ -446,7 +446,7 @@ impl AdvancedRecognitionWindow {
             let window_pos = adv_rec_window_pos(prev_window_rect, error_size, viewport, true);
             let mut keep_open = true;
             let mut close_clicked = false;
-            let shown = egui::Window::new("Продвинутое распознавание")
+            let shown = egui::Window::new(t!("translation.recognition.advanced_title")).id(egui::Id::new("translation.recognition.advanced_title"))
                 .id(egui::Id::new("translation_adv_rec_error"))
                 .fixed_size(error_size)
                 .current_pos(window_pos)
@@ -456,7 +456,7 @@ impl AdvancedRecognitionWindow {
                 .show(ctx, |ui| {
                     ui.label(error);
                     ui.add_space(8.0);
-                    if ui.button("Закрыть").clicked() {
+                    if ui.button(t!("translation.adv_rec.close_button")).clicked() {
                         close_clicked = true;
                     }
                 });
@@ -535,7 +535,7 @@ impl AdvancedRecognitionWindow {
                     self.pending_job_id = None;
                     self.session = None;
                     self.load_error = Some(
-                        "Поток подготовки окна распознавания завершился неожиданно.".to_string(),
+                        t!("translation.adv_rec.loader_thread_crashed_error").to_string(),
                     );
                     break;
                 }
@@ -575,7 +575,7 @@ fn draw_adv_rec_window_contents(
                     .step_by(1.0)
                     .wheel_step(1.0)
                     .fixed_decimals(0)
-                    .text("Поворот"),
+                    .text(t!("translation.common.rotation_label")),
             )
             .changed()
         {
@@ -593,7 +593,7 @@ fn draw_adv_rec_window_contents(
             .add(
                 WheelSlider::new(&mut zoom, ADV_REC_MIN_ZOOM..=ADV_REC_MAX_ZOOM)
                     .logarithmic(true)
-                    .text("Зум"),
+                    .text(t!("translation.common.zoom_label")),
             )
             .changed()
         {
@@ -613,7 +613,7 @@ fn draw_adv_rec_window_contents(
     ensure_adv_rec_texture(session, ui.ctx());
 
     ui.horizontal(|ui| {
-        let brush_button = ui.add(egui::Button::new("Кисть").selected(session.brush_enabled));
+        let brush_button = ui.add(egui::Button::new(t!("translation.common.brush_label")).selected(session.brush_enabled));
         if brush_button.clicked() {
             session.brush_enabled = !session.brush_enabled;
             reset_adv_rec_brush_stroke(session);
@@ -621,19 +621,19 @@ fn draw_adv_rec_window_contents(
         color_picker::color_edit_button_srgba(ui, &mut session.brush_color, Alpha::OnlyBlend);
         let mut radius = session.brush.radius_px();
         if ui
-            .add(WheelSlider::new(&mut radius, 1..=200).text("Размер"))
+            .add(WheelSlider::new(&mut radius, 1..=200).text(t!("translation.common.size_label")))
             .changed()
         {
             session.brush.set_radius_px(radius);
         }
         ui.add(
             WheelSlider::new(&mut session.brush_hardness, 0.0..=1.0)
-                .text("Жесткость")
+                .text(t!("translation.common.hardness_label"))
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
     });
     ui.small(
-        "ЛКМ: выделить область для быстрого OCR. Кисть: ЛКМ рисует, ПКМ или Shift+ЛКМ стирают.",
+        t!("translation.adv_rec.controls_hint"),
     );
 
     let preview_size = session.zoomed_image_size();
@@ -668,9 +668,9 @@ fn draw_adv_rec_window_contents(
     ui.separator();
     let can_recognize = session.active_request_id.is_none();
     let recognize_label = if session.active_request_id.is_some() {
-        "Распознаю..."
+        t!("translation.adv_rec.recognizing_short_status")
     } else {
-        "Распознать"
+        t!("translation.adv_rec.recognize_button")
     };
     if ui
         .add_enabled(can_recognize, egui::Button::new(recognize_label))
@@ -692,27 +692,28 @@ fn draw_adv_rec_window_contents(
         ui.small(" ");
     }
 
-    ui.label(format!(
-        "Последнее распознавание: {}",
-        if session.last_quick_result.trim().is_empty() {
-            "нет".to_string()
-        } else {
-            session.last_quick_result.clone()
-        }
+    let last_recognition = if session.last_quick_result.trim().is_empty() {
+        t!("translation.adv_rec.none_value").to_string()
+    } else {
+        session.last_quick_result.clone()
+    };
+    ui.label(tf!(
+        "translation.adv_rec.last_recognition_label",
+        text = last_recognition
     ));
 
     ui.add(
         egui::TextEdit::multiline(&mut session.text)
             .desired_rows(6)
-            .hint_text("Результат распознавания появится здесь"),
+            .hint_text(t!("translation.adv_rec.result_placeholder")),
     );
 
     ui.separator();
     ui.horizontal(|ui| {
-        if ui.button("Отмена").clicked() {
+        if ui.button(t!("translation.common.cancel_button")).clicked() {
             *request_close = true;
         }
-        if ui.button("Создать пузырь").clicked() {
+        if ui.button(t!("translation.adv_rec.create_bubble_button")).clicked() {
             *request_close = true;
             action = Some(AdvancedRecognitionAction::CreateBubble {
                 page_idx: session.selection.page_idx,
@@ -1075,7 +1076,7 @@ fn encode_adv_rec_image_override_png(
     let mut cursor = Cursor::new(Vec::new());
     image
         .write_to(&mut cursor, ImageFormat::Png)
-        .map_err(|err| format!("Не удалось сериализовать изображение OCR: {err}"))?;
+        .map_err(|err| tf!("translation.adv_rec.serialize_image_error", err = err))?;
     Ok(Some(cursor.into_inner()))
 }
 
@@ -1085,9 +1086,9 @@ fn encode_adv_rec_selection_png(
 ) -> Result<Vec<u8>, String> {
     let (x0, y0, x1, y1) = selection
         .pixel_rect(session.preview_base_image.size)
-        .ok_or_else(|| "Не удалось определить границы выделения.".to_string())?;
+        .ok_or_else(|| t!("translation.adv_rec.selection_bounds_error").to_string())?;
     if x1 <= x0 || y1 <= y0 {
-        return Err("Слишком маленькое выделение для OCR.".to_string());
+        return Err(t!("translation.adv_rec.selection_too_small_error").to_string());
     }
 
     let crop_w = x1 - x0 + 1;
@@ -1113,7 +1114,7 @@ fn encode_adv_rec_selection_png(
     let mut cursor = Cursor::new(Vec::new());
     image
         .write_to(&mut cursor, ImageFormat::Png)
-        .map_err(|err| format!("Не удалось сериализовать выделение OCR: {err}"))?;
+        .map_err(|err| tf!("translation.adv_rec.serialize_selection_error", err = err))?;
     Ok(cursor.into_inner())
 }
 
@@ -1145,12 +1146,12 @@ fn adv_rec_overlay_crop_has_pixels(
 
 fn composite_adv_rec_image(base: &ColorImage, overlay: &ColorImage) -> Result<RgbImage, String> {
     if base.size != overlay.size {
-        return Err("Размер overlay не совпадает с изображением OCR.".to_string());
+        return Err(t!("translation.adv_rec.overlay_size_mismatch_error").to_string());
     }
     let width = u32::try_from(base.size[0])
-        .map_err(|_| "Ширина изображения OCR слишком большая.".to_string())?;
+        .map_err(|_| t!("translation.adv_rec.image_width_too_large_error").to_string())?;
     let height = u32::try_from(base.size[1])
-        .map_err(|_| "Высота изображения OCR слишком большая.".to_string())?;
+        .map_err(|_| t!("translation.adv_rec.image_height_too_large_error").to_string())?;
     let mut out = RgbImage::new(width, height);
     for (idx, pixel) in out.pixels_mut().enumerate() {
         let base_px = base.pixels[idx];
@@ -1182,12 +1183,12 @@ fn composite_adv_rec_image_crop(
     height: usize,
 ) -> Result<RgbImage, String> {
     if base.size != overlay.size {
-        return Err("Размер overlay не совпадает с изображением OCR.".to_string());
+        return Err(t!("translation.adv_rec.overlay_size_mismatch_error").to_string());
     }
     let out_w =
-        u32::try_from(width).map_err(|_| "Ширина выделения OCR слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("translation.adv_rec.selection_width_too_large_error").to_string())?;
     let out_h =
-        u32::try_from(height).map_err(|_| "Высота выделения OCR слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("translation.adv_rec.selection_height_too_large_error").to_string())?;
     let src_w = base.size[0];
     let mut out = RgbImage::new(out_w, out_h);
     for dy in 0..height {
@@ -1201,9 +1202,9 @@ fn composite_adv_rec_image_crop(
             let inv_alpha = 1.0 - alpha;
             out.put_pixel(
                 u32::try_from(dx)
-                    .map_err(|_| "Координата выделения OCR слишком большая.".to_string())?,
+                    .map_err(|_| t!("translation.adv_rec.selection_coord_too_large_error").to_string())?,
                 u32::try_from(dy)
-                    .map_err(|_| "Координата выделения OCR слишком большая.".to_string())?,
+                    .map_err(|_| t!("translation.adv_rec.selection_coord_too_large_error").to_string())?,
                 image::Rgb([
                     (base_r as f32 * inv_alpha + overlay_r as f32 * alpha)
                         .round()
@@ -1229,9 +1230,9 @@ fn color_image_crop_to_rgba_image(
     height: usize,
 ) -> Result<RgbaImage, String> {
     let out_w =
-        u32::try_from(width).map_err(|_| "Ширина выделения OCR слишком большая.".to_string())?;
+        u32::try_from(width).map_err(|_| t!("translation.adv_rec.selection_width_too_large_error").to_string())?;
     let out_h =
-        u32::try_from(height).map_err(|_| "Высота выделения OCR слишком большая.".to_string())?;
+        u32::try_from(height).map_err(|_| t!("translation.adv_rec.selection_height_too_large_error").to_string())?;
     let src_w = image.size[0];
     let mut out = RgbaImage::new(out_w, out_h);
     for dy in 0..height {
@@ -1240,9 +1241,9 @@ fn color_image_crop_to_rgba_image(
             let [r, g, b, a] = image.pixels[src_idx].to_srgba_unmultiplied();
             out.put_pixel(
                 u32::try_from(dx)
-                    .map_err(|_| "Координата выделения OCR слишком большая.".to_string())?,
+                    .map_err(|_| t!("translation.adv_rec.selection_coord_too_large_error").to_string())?,
                 u32::try_from(dy)
-                    .map_err(|_| "Координата выделения OCR слишком большая.".to_string())?,
+                    .map_err(|_| t!("translation.adv_rec.selection_coord_too_large_error").to_string())?,
                 image::Rgba([r, g, b, a]),
             );
         }
@@ -1525,7 +1526,7 @@ fn spawn_adv_rec_loader_thread() -> (
                         &request.page_path,
                     )
                 } else {
-                    Err("Внутренняя ошибка кеша области распознавания.".to_string())
+                    Err(t!("translation.adv_rec.cache_internal_error").to_string())
                 }
             } else {
                 match image::open(&request.page_path) {
@@ -1537,10 +1538,7 @@ fn spawn_adv_rec_loader_thread() -> (
                             &request.page_path,
                         )
                     }
-                    Err(err) => Err(format!(
-                        "Не удалось открыть изображение для распознавания.\nПуть: {}\nОшибка: {err}",
-                        request.page_path.display()
-                    )),
+                    Err(err) => Err(tf!("translation.adv_rec.open_image_error", request = request.page_path.display(), err = err)),
                 }
             };
             if result_tx
@@ -1565,10 +1563,7 @@ fn crop_page_image_to_color_image(
 ) -> Result<ColorImage, String> {
     let (img_w, img_h) = source.dimensions();
     if img_w == 0 || img_h == 0 {
-        return Err(format!(
-            "Пустое изображение для распознавания: {}",
-            page_path.display()
-        ));
+        return Err(tf!("translation.adv_rec.empty_image_error", page_path = page_path.display()));
     }
 
     let [u1, v1, u2, v2] = normalized_uv(uv_rect);
@@ -1577,7 +1572,7 @@ fn crop_page_image_to_color_image(
     let x2 = ((u2 * img_w as f32).ceil() as u32).min(img_w);
     let y2 = ((v2 * img_h as f32).ceil() as u32).min(img_h);
     if x2 <= x1 || y2 <= y1 {
-        return Err("Выделение слишком маленькое для подготовки окна распознавания.".to_string());
+        return Err(t!("translation.adv_rec.selection_too_small_window_error").to_string());
     }
 
     let crop = source.crop_imm(x1, y1, x2 - x1, y2 - y1).to_rgba8();
@@ -1765,13 +1760,13 @@ fn sample_rotated_color_pixel(
 
 fn color_image_to_rgba_image(image: &ColorImage) -> Result<RgbaImage, String> {
     let width = u32::try_from(image.size[0])
-        .map_err(|_| "Ширина изображения OCR слишком большая.".to_string())?;
+        .map_err(|_| t!("translation.adv_rec.image_width_too_large_error").to_string())?;
     let height = u32::try_from(image.size[1])
-        .map_err(|_| "Высота изображения OCR слишком большая.".to_string())?;
+        .map_err(|_| t!("translation.adv_rec.image_height_too_large_error").to_string())?;
     let mut raw = Vec::with_capacity(image.pixels.len().saturating_mul(4));
     for pixel in &image.pixels {
         raw.extend_from_slice(&pixel.to_srgba_unmultiplied());
     }
     RgbaImage::from_raw(width, height, raw)
-        .ok_or_else(|| "Не удалось собрать RGBA-изображение для OCR.".to_string())
+        .ok_or_else(|| t!("translation.adv_rec.build_rgba_error").to_string())
 }

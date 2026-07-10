@@ -17,6 +17,7 @@ avoiding the stringly-typed dict approach of the Python implementation.
 */
 
 use image::RgbaImage;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ impl DataType {
         match self {
             Self::Int => "int",
             Self::Str => "str",
-            Self::ImageList => "список картинок",
+            Self::ImageList => t!("launcher.batch.image_list_type"),
         }
     }
 
@@ -73,8 +74,22 @@ impl SocketKind {
 /// Static description of one socket on a node template.
 #[derive(Debug, Clone)]
 pub struct SocketSpec {
-    /// Human-readable name displayed in the UI.
-    pub name: &'static str,
+    /// **Serialized identifier only** — NOT a display label. `Graph::to_json` writes it as
+    /// an edge's `src_socket`/`dst_socket`, `from_json` resolves edges by it (`socket_spec`),
+    /// and `executor.rs` looks runtime values up by it. The graph format is documented as
+    /// compatible with the Python `version=1` format, so this must NEVER be localized — a
+    /// translated name orphans every saved graph and breaks Python interop (see
+    /// `docs/i18n_exclusions.md` §A2).
+    ///
+    /// It is a `Cow` so static node templates borrow a `&'static str` (allocation-free) while
+    /// dynamic sockets (`node_defs::socket_specs_for_node`) own a user-authored `String`
+    /// without leaking. The painted label is `label_key`, not this field.
+    pub name: Cow<'static, str>,
+    /// Catalog key for the UI label painted on the node (`canvas.rs`). `Some(key)` paints
+    /// `t!(key)`; `None` paints `name` verbatim. Fixed template sockets carry a key so the
+    /// editor localizes them; dynamic user-authored sockets (string-template placeholders,
+    /// variable nodes) carry `None` and show their raw name.
+    pub label_key: Option<&'static str>,
     pub is_input: bool,
     pub kind: SocketKind,
     /// Allow more than one connection to this socket (fan-in for exec, multi-source for data).
@@ -82,39 +97,63 @@ pub struct SocketSpec {
 }
 
 impl SocketSpec {
-    pub fn exec_in(name: &'static str) -> Self {
+    pub fn exec_in(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            name,
+            name: name.into(),
+            label_key: None,
             is_input: true,
             kind: SocketKind::Exec,
             allow_multiple: true,
         }
     }
 
-    pub fn exec_out(name: &'static str) -> Self {
+    pub fn exec_out(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
-            name,
+            name: name.into(),
+            label_key: None,
             is_input: false,
             kind: SocketKind::Exec,
             allow_multiple: false,
         }
     }
 
-    pub fn data_in(name: &'static str, dt: DataType) -> Self {
+    pub fn data_in(name: impl Into<Cow<'static, str>>, dt: DataType) -> Self {
         Self {
-            name,
+            name: name.into(),
+            label_key: None,
             is_input: true,
             kind: SocketKind::Data(dt),
             allow_multiple: false,
         }
     }
 
-    pub fn data_out(name: &'static str, dt: DataType) -> Self {
+    pub fn data_out(name: impl Into<Cow<'static, str>>, dt: DataType) -> Self {
         Self {
-            name,
+            name: name.into(),
+            label_key: None,
             is_input: false,
             kind: SocketKind::Data(dt),
             allow_multiple: false,
+        }
+    }
+
+    /// Attach a catalog key for the painted label. Chained after a constructor for fixed
+    /// template sockets; dynamic sockets omit it and display their raw `name`.
+    #[must_use]
+    pub fn with_label(mut self, label_key: &'static str) -> Self {
+        self.label_key = Some(label_key);
+        self
+    }
+
+    /// The text to paint for this socket in the editor: the localized `label_key` when
+    /// present, otherwise the raw `name` (which is the wire identifier). `ms_i18n::lookup`
+    /// is a wait-free, allocation-free catalog read, so this is safe on the egui paint path
+    /// (unlike `tf!`/`tp!`, which allocate). Never localizes the wire identifier itself.
+    #[must_use]
+    pub fn display_label(&self) -> &str {
+        match self.label_key {
+            Some(key) => ms_i18n::lookup(key).unwrap_or(key),
+            None => self.name.as_ref(),
         }
     }
 }
@@ -256,19 +295,19 @@ impl NodeParams {
     /// Human-readable title shown in the node header.
     pub fn title(&self) -> &'static str {
         match self {
-            Self::StartNumber { .. } => "Старт (число)",
-            Self::StartString { .. } => "Старт (строка)",
-            Self::StringTemplate { .. } => "Шаблон строки",
-            Self::QuickDownloader => "Быстрая загрузка",
-            Self::OpenUrl { .. } => "Открыть URL",
-            Self::ScrollPage => "Прокрутить страницу",
-            Self::FetchFromBrowser { .. } => "Получить из браузера",
-            Self::StitchSplit { .. } => "Склейка / Нарезка",
+            Self::StartNumber { .. } => t!("launcher.batch.node_number_start_title"),
+            Self::StartString { .. } => t!("launcher.batch.node_string_start_title"),
+            Self::StringTemplate { .. } => t!("launcher.batch.node_string_template_title"),
+            Self::QuickDownloader => t!("launcher.batch.node_quick_download_title"),
+            Self::OpenUrl { .. } => t!("launcher.batch.node_open_url_title"),
+            Self::ScrollPage => t!("launcher.batch.node_scroll_page_title"),
+            Self::FetchFromBrowser { .. } => t!("launcher.batch.node_browser_fetch_title"),
+            Self::StitchSplit { .. } => t!("launcher.batch.node_stitch_cut_title"),
             Self::Waifu2x { .. } => "Waifu2x",
-            Self::SaveFolder { .. } => "Сохранить в папку",
-            Self::VariableRead { .. } => "Чтение переменной",
-            Self::VariableWrite { .. } => "Запись переменной",
-            Self::End => "Конец",
+            Self::SaveFolder { .. } => t!("launcher.batch.node_save_folder_title"),
+            Self::VariableRead { .. } => t!("launcher.batch.node_read_variable_title"),
+            Self::VariableWrite { .. } => t!("launcher.batch.node_write_variable_title"),
+            Self::End => t!("launcher.batch.node_end_title"),
         }
     }
 

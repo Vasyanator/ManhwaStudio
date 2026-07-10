@@ -52,6 +52,12 @@ panel state/UI, font loading, and coverage; edit `render_next/` for the renderer
   typing panel draws — no explicit invalidation call from the settings UI is required.
 
 ## Contracts and invariants
+- The built-in formula-preset NAMES in `presets_io.rs::default_text_tab_formula_presets`
+  (all eleven: `"Дуга (мягкая)"`, `"Наклонная линия"`, `"Волна"`, `"Спираль"`,
+  `"Экспонента"`, `"Парабола"`, `"Пульс"`, `"Лемниската"`, `"Сердце"`, `"Капля"`,
+  `"Вертикальная волна"`) are persisted `TextTab.formula_presets` map keys, NOT UI labels.
+  They stay byte-identical Russian literals and are never localized (`docs/i18n_exclusions.md`
+  §A1); translating one would double every user's built-in presets via `merge_missing`.
 - Font loading and coverage classification must stay off the GUI thread
   (`spawn_font_reload` worker); `draw` only detects the change and dispatches it.
 - Coverage classification is UI-free; only `create_presets.rs` maps a result to

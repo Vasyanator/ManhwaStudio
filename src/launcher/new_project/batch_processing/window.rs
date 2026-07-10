@@ -104,29 +104,29 @@ impl BatchProcessingWindowState {
         // ── Top toolbar ────────────────────────────────────────────────────
         egui::Panel::top("bp_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Сохранить").clicked() {
+                if ui.button(t!("launcher.batch.save_graph_button")).clicked() {
                     self.save_graph(ctx);
                 }
-                if ui.button("Загрузить").clicked() {
+                if ui.button(t!("launcher.batch.load_graph_button")).clicked() {
                     self.load_graph(ctx);
                 }
                 ui.separator();
                 let run_enabled = !self.is_running;
                 if ui
-                    .add_enabled(run_enabled, egui::Button::new("▶ Запустить"))
+                    .add_enabled(run_enabled, egui::Button::new(t!("launcher.batch.run_button")))
                     .clicked()
                 {
                     self.begin_run();
                 }
                 let stop_enabled = self.is_running;
                 if ui
-                    .add_enabled(stop_enabled, egui::Button::new("■ Стоп"))
+                    .add_enabled(stop_enabled, egui::Button::new(t!("launcher.batch.stop_button")))
                     .clicked()
                 {
                     self.stop_flag.store(true, Ordering::Relaxed);
                 }
                 ui.separator();
-                if ui.button("✕ Закрыть").clicked() {
+                if ui.button(t!("launcher.batch.close_button")).clicked() {
                     keep_open = false;
                 }
             });
@@ -139,7 +139,7 @@ impl BatchProcessingWindowState {
                 ui.horizontal_centered(|ui| {
                     if self.is_running {
                         ui.spinner();
-                        ui.label("Выполняется...");
+                        ui.label(t!("launcher.batch.running_status"));
                         ui.separator();
                     }
                     if !self.status_message.is_empty() {
@@ -158,11 +158,11 @@ impl BatchProcessingWindowState {
             .exact_size(LEFT_PANEL_WIDTH)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.left_tab == 0, "Ноды").clicked() {
+                    if ui.selectable_label(self.left_tab == 0, t!("launcher.batch.nodes_palette_title")).clicked() {
                         self.left_tab = 0;
                     }
                     if ui
-                        .selectable_label(self.left_tab == 1, "Переменные")
+                        .selectable_label(self.left_tab == 1, t!("launcher.batch.variables_title"))
                         .clicked()
                     {
                         self.left_tab = 1;
@@ -209,7 +209,7 @@ impl BatchProcessingWindowState {
             }
         });
         ui.separator();
-        ui.label(RichText::new("Двойной клик — добавить ноду").small().weak());
+        ui.label(RichText::new(t!("launcher.batch.add_node_hint")).small().weak());
     }
 
     fn add_node_from_key(&mut self, key: &str) {
@@ -229,14 +229,14 @@ impl BatchProcessingWindowState {
     fn show_variables_panel(&mut self, ui: &mut Ui) {
         // Add form.
         ui.group(|ui| {
-            ui.label("Новая переменная");
+            ui.label(t!("launcher.batch.new_variable_title"));
             ui.text_edit_singleline(&mut self.var_form_name);
 
-            egui::ComboBox::from_label("Тип")
+            egui::ComboBox::new("launcher.batch.variable_type_label", t!("launcher.batch.variable_type_label"))
                 .selected_text(match self.var_form_type {
                     DataType::Int => "int",
                     DataType::Str => "str",
-                    DataType::ImageList => "список картинок",
+                    DataType::ImageList => t!("launcher.batch.image_list_type"),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.var_form_type, DataType::Int, "int");
@@ -244,13 +244,13 @@ impl BatchProcessingWindowState {
                     ui.selectable_value(
                         &mut self.var_form_type,
                         DataType::ImageList,
-                        "список картинок",
+                        t!("launcher.batch.image_list_type"),
                     );
                 });
 
-            ui.checkbox(&mut self.var_form_persist, "Сохранять между циклами");
+            ui.checkbox(&mut self.var_form_persist, t!("launcher.batch.keep_between_cycles"));
 
-            if ui.button("Добавить").clicked() {
+            if ui.button(t!("launcher.batch.add_button")).clicked() {
                 let name = self.var_form_name.trim().to_owned();
                 if !name.is_empty() && self.graph.variables.iter().all(|v| v.name != name) {
                     self.graph.add_variable(GraphVariable {
@@ -295,7 +295,7 @@ impl BatchProcessingWindowState {
                         }
                         if ui
                             .small_button("W")
-                            .on_hover_text("Добавить ноду Запись")
+                            .on_hover_text(t!("launcher.batch.add_write_node_button"))
                             .clicked()
                             && NodeParams::default_for_key("variable_write").is_some()
                         {
@@ -306,7 +306,7 @@ impl BatchProcessingWindowState {
                         }
                         if ui
                             .small_button("R")
-                            .on_hover_text("Добавить ноду Чтение")
+                            .on_hover_text(t!("launcher.batch.add_read_node_button"))
                             .clicked()
                             && NodeParams::default_for_key("variable_read").is_some()
                         {
@@ -339,7 +339,7 @@ impl BatchProcessingWindowState {
                     ) {
                         Ok(_) => {}
                         Err(err) => {
-                            self.set_status(format!("Нельзя подключить: {err}"), true);
+                            self.set_status(tf!("launcher.batch.connect_error", err = err), true);
                         }
                     }
                 }
@@ -363,7 +363,7 @@ impl BatchProcessingWindowState {
         self.executor_rx = Some(spawn_executor(snapshot, stop_flag));
         self.is_running = true;
         self.active_node_id = None;
-        self.set_status("Запуск...", false);
+        self.set_status(t!("launcher.batch.run_starting_status"), false);
     }
 
     fn poll_executor(&mut self, ctx: &egui::Context) {
@@ -383,7 +383,7 @@ impl BatchProcessingWindowState {
                 ctx.request_repaint();
                 self.is_running = false;
                 self.active_node_id = None;
-                self.set_status("Выполнение остановлено.", false);
+                self.set_status(t!("launcher.batch.run_stopped_status"), false);
             }
             Ok(ExecutorEvent::Completed {
                 cycles,
@@ -396,11 +396,7 @@ impl BatchProcessingWindowState {
                 self.is_running = false;
                 self.active_node_id = None;
                 self.set_status(
-                    format!(
-                        "Готово. Циклов: {cycles}, узлов: {nodes_executed}, \
-                         конечных: {end_hits}, скачано: {downloaded_images}, \
-                         сохранено: {saved_images}."
-                    ),
+                    tf!("launcher.batch.run_done_summary", cycles = cycles, nodes_executed = nodes_executed, end_hits = end_hits, downloaded_images = downloaded_images, saved_images = saved_images),
                     false,
                 );
             }
@@ -432,7 +428,7 @@ impl BatchProcessingWindowState {
     /// `std::fs`; neither is available in the browser. Reports the missing capability.
     #[cfg(target_arch = "wasm32")]
     fn save_graph(&mut self, _ctx: &egui::Context) {
-        self.set_status("Сохранение графа недоступно в веб-версии.", true);
+        self.set_status(t!("launcher.batch.save_web_unsupported"), true);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -441,7 +437,7 @@ impl BatchProcessingWindowState {
             Some(p.clone())
         } else {
             rfd::FileDialog::new()
-                .add_filter("Граф обработки (JSON)", &["json"])
+                .add_filter(t!("launcher.batch.graph_file_filter"), &["json"])
                 .save_file()
         };
         if let Some(path) = path {
@@ -450,18 +446,18 @@ impl BatchProcessingWindowState {
                 Ok(text) => match std::fs::write(&path, text) {
                     Ok(()) => {
                         self.save_path = Some(path);
-                        self.set_status("Граф сохранён.", false);
+                        self.set_status(t!("launcher.batch.graph_saved_status"), false);
                     }
                     Err(err) => {
                         crate::runtime_log::log_error(format!(
                             "[batch-processing] save graph to '{}': {err}",
                             path.display()
                         ));
-                        self.set_status(format!("Не удалось сохранить файл: {err}"), true);
+                        self.set_status(tf!("launcher.batch.save_file_error", err = err), true);
                     }
                 },
                 Err(err) => {
-                    self.set_status(format!("Ошибка сериализации: {err}"), true);
+                    self.set_status(tf!("launcher.batch.serialize_error", err = err), true);
                 }
             }
         }
@@ -471,13 +467,13 @@ impl BatchProcessingWindowState {
     /// `std::fs`; neither is available in the browser. Reports the missing capability.
     #[cfg(target_arch = "wasm32")]
     fn load_graph(&mut self, _ctx: &egui::Context) {
-        self.set_status("Загрузка графа недоступна в веб-версии.", true);
+        self.set_status(t!("launcher.batch.load_web_unsupported"), true);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn load_graph(&mut self, _ctx: &egui::Context) {
         let path = rfd::FileDialog::new()
-            .add_filter("Граф обработки (JSON)", &["json"])
+            .add_filter(t!("launcher.batch.graph_file_filter"), &["json"])
             .pick_file();
         if let Some(path) = path {
             match std::fs::read_to_string(&path) {
@@ -487,22 +483,22 @@ impl BatchProcessingWindowState {
                             self.graph = model;
                             self.canvas = CanvasState::new();
                             self.save_path = Some(path);
-                            self.set_status("Граф загружен.", false);
+                            self.set_status(t!("launcher.batch.graph_loaded_status"), false);
                         }
                         Err(err) => {
                             crate::runtime_log::log_error(format!(
                                 "[batch-processing] parse graph from '{}': {err}",
                                 path.display()
                             ));
-                            self.set_status(format!("Ошибка загрузки графа: {err}"), true);
+                            self.set_status(tf!("launcher.batch.load_graph_error", err = err), true);
                         }
                     },
                     Err(err) => {
-                        self.set_status(format!("Неверный JSON: {err}"), true);
+                        self.set_status(tf!("launcher.batch.invalid_json_error", err = err), true);
                     }
                 },
                 Err(err) => {
-                    self.set_status(format!("Не удалось прочитать файл: {err}"), true);
+                    self.set_status(tf!("launcher.batch.read_file_error", err = err), true);
                 }
             }
         }

@@ -25,7 +25,7 @@ impl TypingCreatePanelState {
         let mut block_hscroll_by_hovered_param = false;
         ui.vertical(|ui| {
             let scale_resp =
-                ui.add(WheelSlider::new(&mut self.overlay_scale, 0.05..=20.0).text("Масштаб"));
+                ui.add(WheelSlider::new(&mut self.overlay_scale, 0.05..=20.0).text(t!("typing.params.scale_label")));
             mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &scale_resp);
             changed |= scale_resp.changed();
             if let Some(steps) = wheel_steps_if_hovered(ui, &scale_resp) {
@@ -33,7 +33,7 @@ impl TypingCreatePanelState {
             }
 
             let angle_resp = ui.add(
-                WheelSlider::new(&mut self.overlay_rotation_deg, -180.0..=180.0).text("Угол (°)"),
+                WheelSlider::new(&mut self.overlay_rotation_deg, -180.0..=180.0).text(t!("typing.params.angle_label")),
             );
             mark_hscroll_block_on_hover(&mut block_hscroll_by_hovered_param, &angle_resp);
             changed |= angle_resp.changed();
@@ -414,7 +414,7 @@ impl TypingCreatePanelState {
                             .to_string()
                     })
                 })
-                .unwrap_or_else(|| "<неизвестный шрифт>".to_string());
+                .unwrap_or_else(|| t!("typing.params.font_unknown_placeholder").to_string());
             self.missing_font = Some(name);
         }
     }
@@ -425,7 +425,7 @@ impl TypingCreatePanelState {
         }
         let Some(params) = self.build_render_params() else {
             self.render_in_flight = false;
-            self.status_line = format!("Шрифты не найдены в {}", self.fonts_dir.display());
+            self.status_line = tf!("typing.errors.fonts_not_found", arg = self.fonts_dir.display());
             return;
         };
 
@@ -447,12 +447,12 @@ impl TypingCreatePanelState {
         match self.request_tx.send(job) {
             Ok(()) => {
                 self.render_in_flight = true;
-                self.status_line = "Рендер в фоне...".to_string();
+                self.status_line = t!("typing.preview.rendering_status").to_string();
             }
             Err(err) => {
                 crate::trace_log!(cat::SYNC, "preview_render dispatch send_err token={} err={}", self.latest_token, err);
                 self.render_in_flight = false;
-                self.status_line = format!("Не удалось отправить задачу рендера: {err}");
+                self.status_line = tf!("typing.preview.render_dispatch_error", err = err);
             }
         }
     }
@@ -498,14 +498,14 @@ impl TypingCreatePanelState {
                         ));
                     }
                     self.status_line = if image.warnings.is_empty() {
-                        "Рендер завершён".to_string()
+                        t!("typing.preview.render_done_status").to_string()
                     } else {
-                        format!("Рендер с предупреждением: {}", image.warnings.join("; "))
+                        tf!("typing.preview.render_warning_status", image = image.warnings.join("; "))
                     };
                 }
                 Err(err) => {
                     crate::trace_log!(cat::SYNC, "preview_render result=err token={} err={}", result.token, err);
-                    self.status_line = format!("Ошибка рендера: {err}");
+                    self.status_line = tf!("typing.preview.render_error_status", err = err);
                 }
             }
         }

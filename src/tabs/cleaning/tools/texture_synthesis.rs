@@ -73,10 +73,10 @@ impl TextureSynthesisInpaintTool {
         params: TextureSynthesisParams,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
-            return Err("Размер изображения и маски не совпадает.".to_string());
+            return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
         }
         if sample_mask.as_ref().is_some_and(|m| m.size != image.size) {
-            return Err("Размер маски примера не совпадает с изображением.".to_string());
+            return Err(t!("cleaning.tools.texture_synthesis.sample_mask_mismatch_error").to_string());
         }
         let width = image.size[0];
         let height = image.size[1];
@@ -90,8 +90,8 @@ impl TextureSynthesisInpaintTool {
         let (src_rgba, inpaint_mask_rgba, sample_method_rgba) =
             build_ts_inputs(image, mask, sample_mask)?;
         let dims = ts::Dims::new(
-            u32::try_from(width).map_err(|_| "Ширина региона слишком большая.".to_string())?,
-            u32::try_from(height).map_err(|_| "Высота региона слишком большая.".to_string())?,
+            u32::try_from(width).map_err(|_| t!("cleaning.tools.texture_synthesis.region_width_too_large_error").to_string())?,
+            u32::try_from(height).map_err(|_| t!("cleaning.tools.texture_synthesis.region_height_too_large_error").to_string())?,
         );
 
         let inpaint_mask_dyn = ts::image::DynamicImage::ImageRgba8(inpaint_mask_rgba.clone());
@@ -119,13 +119,10 @@ impl TextureSynthesisInpaintTool {
         let out_w = out.width() as usize;
         let out_h = out.height() as usize;
         if out_w == 0 || out_h == 0 {
-            return Err("texture-synthesis вернул пустое изображение.".to_string());
+            return Err(t!("cleaning.tools.texture_synthesis.empty_result_error").to_string());
         }
         if out_w != width || out_h != height {
-            return Err(format!(
-                "texture-synthesis вернул неожиданный размер: {}x{} (ожидалось {}x{}).",
-                out_w, out_h, width, height
-            ));
+            return Err(tf!("cleaning.tools.texture_synthesis.unexpected_size_error", out_w = out_w, out_h = out_h, width = width, height = height));
         }
 
         Ok(egui::ColorImage::from_rgba_unmultiplied(
@@ -141,7 +138,7 @@ impl CleaningTool for TextureSynthesisInpaintTool {
     }
 
     fn title(&self) -> &'static str {
-        "Синтез текстур"
+        t!("cleaning.tools.texture_synthesis.title")
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
@@ -150,9 +147,9 @@ impl CleaningTool for TextureSynthesisInpaintTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
-        ui.small("Inpaint через crate texture-synthesis.");
-        ui.small("Жёлтая маска: дыра. Зелёная маска: область примера.");
-        ui.small("Параметры доступны в окне выделенной области.");
+        ui.small(t!("cleaning.tools.texture_synthesis.description_hint"));
+        ui.small(t!("cleaning.tools.texture_synthesis.mask_legend_hint"));
+        ui.small(t!("cleaning.tools.texture_synthesis.params_in_window_hint"));
     }
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
@@ -213,54 +210,54 @@ impl CleaningTool for TextureSynthesisInpaintTool {
                 RegionEditToolBase::draw_region_editor_collapsible_section(
                     ui,
                     "texture_synthesis_params",
-                    "Параметры синтеза текстур",
+                    t!("cleaning.tools.texture_synthesis.params_heading"),
                     false,
                     |ui| {
-                        ui.add(WheelSlider::new(&mut params.seed, 0..=u64::MAX).text("Сид"))
+                        ui.add(WheelSlider::new(&mut params.seed, 0..=u64::MAX).text(t!("cleaning.tools.texture_synthesis.seed_label")))
                             .on_hover_text(
-                                "Фиксирует случайность генерации. Одинаковый сид даёт повторяемый результат.",
+                                t!("cleaning.tools.texture_synthesis.seed_hint"),
                             );
                         ui.add(
                             WheelSlider::new(&mut params.nearest_neighbors, 1..=128)
-                                .text("Соседи"),
+                                .text(t!("cleaning.tools.texture_synthesis.neighbors_label")),
                         )
                         .on_hover_text(
-                            "Сколько ближайших патчей учитывать при подборе текстуры. Больше — стабильнее, но медленнее.",
+                            t!("cleaning.tools.texture_synthesis.neighbors_hint"),
                         );
                         ui.add(
                             WheelSlider::new(&mut params.random_sample_locations, 1..=256)
-                                .text("Случайные образцы"),
+                                .text(t!("cleaning.tools.texture_synthesis.random_samples_label")),
                         )
                         .on_hover_text(
-                            "Сколько случайных точек дополнительно проверять на каждом шаге синтеза.",
+                            t!("cleaning.tools.texture_synthesis.random_samples_hint"),
                         );
                         ui.add(
                             WheelSlider::new(&mut params.backtrack_stages, 1..=10)
-                                .text("Этапы отката"),
+                                .text(t!("cleaning.tools.texture_synthesis.backtrack_stages_label")),
                         )
                         .on_hover_text(
-                            "Количество проходов с откатом для исправления неудачных участков.",
+                            t!("cleaning.tools.texture_synthesis.backtrack_stages_hint"),
                         );
                         ui.add(
                             WheelSlider::new(&mut params.backtrack_percent, 0.0..=1.0)
-                                .text("Доля отката"),
+                                .text(t!("cleaning.tools.texture_synthesis.backtrack_fraction_label")),
                         )
                         .on_hover_text(
-                            "Какую часть уже синтезированных пикселей можно пересчитать во время отката.",
+                            t!("cleaning.tools.texture_synthesis.backtrack_fraction_hint"),
                         );
                         ui.add(
                             WheelSlider::new(&mut params.cauchy_dispersion, 0.0..=1.0)
-                                .text("Дисперсия Коши"),
+                                .text(t!("cleaning.tools.texture_synthesis.cauchy_dispersion_label")),
                         )
                         .on_hover_text(
-                            "Ширина случайного разброса при выборе кандидатов. Больше — разнообразнее, но менее стабильно.",
+                            t!("cleaning.tools.texture_synthesis.cauchy_dispersion_hint"),
                         );
                         ui.add(
                             WheelSlider::new(&mut params.max_thread_count, 1..=128)
-                                .text("Макс. потоков"),
+                                .text(t!("cleaning.tools.texture_synthesis.max_threads_label")),
                         )
                         .on_hover_text(
-                            "Ограничение числа рабочих потоков. Больше потоков ускоряет обработку на многоядерных CPU.",
+                            t!("cleaning.tools.texture_synthesis.max_threads_hint"),
                         );
                     },
                 );
@@ -301,14 +298,14 @@ fn build_ts_inputs(
     let width = image.size[0];
     let height = image.size[1];
     if image.size != mask.size {
-        return Err("Размер изображения и маски не совпадает.".to_string());
+        return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
     }
     if sample_mask.as_ref().is_some_and(|m| m.size != image.size) {
-        return Err("Размер маски примера не совпадает с изображением.".to_string());
+        return Err(t!("cleaning.tools.texture_synthesis.sample_mask_mismatch_error").to_string());
     }
 
-    let w_u32 = u32::try_from(width).map_err(|_| "Ширина региона слишком большая.".to_string())?;
-    let h_u32 = u32::try_from(height).map_err(|_| "Высота региона слишком большая.".to_string())?;
+    let w_u32 = u32::try_from(width).map_err(|_| t!("cleaning.tools.texture_synthesis.region_width_too_large_error").to_string())?;
+    let h_u32 = u32::try_from(height).map_err(|_| t!("cleaning.tools.texture_synthesis.region_height_too_large_error").to_string())?;
 
     let mut src_raw = Vec::<u8>::with_capacity(width.saturating_mul(height).saturating_mul(4));
     let mut inpaint_mask_raw =
@@ -354,24 +351,23 @@ fn build_ts_inputs(
     }
     if fill_count >= width.saturating_mul(height) {
         return Err(
-            "Маска полностью покрывает регион: оставьте хотя бы немного опорных пикселей."
+            t!("cleaning.tools.texture_synthesis.mask_covers_all_error")
                 .to_string(),
         );
     }
     if has_custom_sample_mask && allowed_sample_count == 0 {
         return Err(
-            "Зелёная маска примера не содержит допустимых пикселей вне дыры. \
-             Добавьте область примера за пределами удаляемой зоны."
+            t!("cleaning.tools.texture_synthesis.sample_mask_empty_error")
                 .to_string(),
         );
     }
 
     let src_img = ts::image::RgbaImage::from_raw(w_u32, h_u32, src_raw)
-        .ok_or_else(|| "Не удалось собрать source image для texture-synthesis.".to_string())?;
+        .ok_or_else(|| t!("cleaning.tools.texture_synthesis.build_source_error").to_string())?;
     let inpaint_mask_img = ts::image::RgbaImage::from_raw(w_u32, h_u32, inpaint_mask_raw)
-        .ok_or_else(|| "Не удалось собрать mask image для texture-synthesis.".to_string())?;
+        .ok_or_else(|| t!("cleaning.tools.texture_synthesis.build_mask_error").to_string())?;
     let sample_method_img = ts::image::RgbaImage::from_raw(w_u32, h_u32, sample_method_raw)
-        .ok_or_else(|| "Не удалось собрать sample mask image для texture-synthesis.".to_string())?;
+        .ok_or_else(|| t!("cleaning.tools.texture_synthesis.build_sample_mask_error").to_string())?;
 
     Ok((src_img, inpaint_mask_img, sample_method_img))
 }

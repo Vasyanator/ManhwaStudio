@@ -218,32 +218,32 @@ impl SettingsTabState {
 
     pub fn draw(&mut self, ui: &mut egui::Ui, hotkeys_v2: &mut InputManagerV2) {
         let process_running = self.ai_backend_handle.process_snapshot().running();
-        ui.heading("Настройки");
+        ui.heading(t!("settings.nav.title"));
         ui.horizontal_wrapped(|ui| {
             let selected = self.active_pane == SettingsPane::General;
-            if ui.selectable_label(selected, "Общие настройки").clicked() {
+            if ui.selectable_label(selected, t!("settings.nav.general")).clicked() {
                 self.active_pane = SettingsPane::General;
             }
             let selected = self.active_pane == SettingsPane::CanvasRibbon;
-            if ui.selectable_label(selected, "Лента и пузыри").clicked() {
+            if ui.selectable_label(selected, t!("settings.nav.canvas_ribbon")).clicked() {
                 self.active_pane = SettingsPane::CanvasRibbon;
             }
             let selected = self.active_pane == SettingsPane::Typesetting;
-            if ui.selectable_label(selected, "Тайп").clicked() {
+            if ui.selectable_label(selected, t!("settings.nav.typesetting")).clicked() {
                 self.active_pane = SettingsPane::Typesetting;
             }
             let selected = self.active_pane == SettingsPane::AiBackend;
-            if ui.selectable_label(selected, "ИИ бэкенд").clicked() {
+            if ui.selectable_label(selected, t!("settings.nav.ai_backend")).clicked() {
                 self.active_pane = SettingsPane::AiBackend;
             }
             let selected = self.active_pane == SettingsPane::Hotkeys;
-            if ui.selectable_label(selected, "Горячие клавиши").clicked() {
+            if ui.selectable_label(selected, t!("settings.nav.hotkeys")).clicked() {
                 self.active_pane = SettingsPane::Hotkeys;
             }
             #[cfg(feature = "tutorial")]
             {
                 let selected = self.active_pane == SettingsPane::Tutorials;
-                if ui.selectable_label(selected, "Обучение").clicked() {
+                if ui.selectable_label(selected, t!("settings.nav.tutorials")).clicked() {
                     self.active_pane = SettingsPane::Tutorials;
                 }
             }
@@ -561,8 +561,10 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
 /// Serialized on the process-wide `config::lock_user_config_write()` so a
 /// background/GUI-thread saver never clobbers the ORT load-guard marker; a
 /// targeted read-modify-write preserves every unrelated key. Meant to run off the
-/// GUI thread (spawned from the "Тайп" pane). Returns a user-facing error string.
-pub(super) fn save_text_language(user_settings_file: &Path, tag: &str) -> Result<(), String> {
+/// GUI thread; spawned from the "Тайп" pane and from the shared
+/// `crate::general_settings_panel` widget, which offers the same selector.
+/// Returns a user-facing error string.
+pub(crate) fn save_text_language(user_settings_file: &Path, tag: &str) -> Result<(), String> {
     let _write_guard = config::lock_user_config_write();
     let mut root = if user_settings_file.exists() {
         match fs::read_to_string(user_settings_file) {
@@ -615,7 +617,7 @@ pub fn save_ai_runtime(
     let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
     };
     let mut general_obj = root_obj
         .get("General")
@@ -662,7 +664,7 @@ pub fn save_onnx_provider_device(
     let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
     };
     let mut general_obj = root_obj
         .get("General")
@@ -708,7 +710,7 @@ pub fn save_onnx_build(user_settings_file: &Path, build_slug: &str) -> Result<()
     let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
     };
     let mut general_obj = root_obj
         .get("General")
@@ -744,7 +746,7 @@ pub fn save_max_loaded_models(
     let _write_guard = config::lock_user_config_write();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
     };
     let mut general_obj = root_obj
         .get("General")
@@ -831,16 +833,10 @@ fn read_user_config_root(user_settings_file: &Path) -> Result<Value, String> {
     let mut root = if user_settings_file.exists() {
         match fs::read_to_string(user_settings_file) {
             Ok(raw) => serde_json::from_str::<Value>(&raw).map_err(|err| {
-                format!(
-                    "Не удалось разобрать {}: {err}",
-                    user_settings_file.display()
-                )
+                tf!("settings.config_io.parse_error", user_settings_file = user_settings_file.display(), err = err)
             })?,
             Err(err) => {
-                return Err(format!(
-                    "Не удалось прочитать {}: {err}",
-                    user_settings_file.display()
-                ));
+                return Err(tf!("settings.config_io.read_error", user_settings_file = user_settings_file.display(), err = err));
             }
         }
     } else {
@@ -871,7 +867,7 @@ fn write_ort_load_state(
     let file_pre_existed = user_settings_file.exists();
     let mut root = read_user_config_root(user_settings_file)?;
     let Some(root_obj) = root.as_object_mut() else {
-        return Err("Не удалось подготовить корень user_config.json.".to_string());
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
     };
     let mut general_obj = root_obj
         .get("General")
@@ -919,16 +915,10 @@ fn write_ort_load_state(
         .write(true)
         .open(user_settings_file)
         .map_err(|err| {
-            format!(
-                "Не удалось открыть {} для сброса на диск: {err}",
-                user_settings_file.display()
-            )
+            tf!("settings.config_io.open_for_fsync_error", user_settings_file = user_settings_file.display(), err = err)
         })?;
     file.sync_all().map_err(|err| {
-        format!(
-            "Не удалось сбросить {} на диск (fsync): {err}",
-            user_settings_file.display()
-        )
+        tf!("settings.config_io.fsync_error", user_settings_file = user_settings_file.display(), err = err)
     })?;
     // For an in-place overwrite of a pre-existing file the directory entry is
     // unchanged, so flushing the file contents alone is durable. A FRESH create,
@@ -1076,6 +1066,38 @@ mod ort_guard_tests {
                 attempted: true,
                 succeeded: false
             }
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_text_language_round_trips_and_preserves_unrelated_keys() {
+        let path = temp_config_path("text_language");
+        let _ = fs::remove_file(&path);
+
+        // A pre-existing sibling key in the same section must survive the targeted
+        // read-modify-write: two panes (Тайп + the shared general widget) call this.
+        save_hanging_punctuation(&path, "«»").expect("seed punctuation");
+        save_text_language(&path, ms_text_util::language::TextLanguage::Pl.tag())
+            .expect("save language");
+
+        let root = read_root(&path);
+        let text_tab = root
+            .get("TextTab")
+            .and_then(Value::as_object)
+            .expect("TextTab present");
+        assert_eq!(
+            text_tab
+                .get(config::TEXT_TAB_TEXT_LANGUAGE_KEY)
+                .and_then(Value::as_str),
+            Some(ms_text_util::language::TextLanguage::Pl.tag())
+        );
+        assert_eq!(
+            text_tab
+                .get(config::TEXT_TAB_HANGING_PUNCTUATION_KEY)
+                .and_then(Value::as_str),
+            Some("«»")
         );
 
         let _ = fs::remove_file(&path);

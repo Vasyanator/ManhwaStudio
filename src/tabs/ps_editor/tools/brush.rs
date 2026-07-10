@@ -65,7 +65,7 @@ impl PsTool for BrushTool {
     }
 
     fn title(&self) -> &'static str {
-        "Кисть"
+        t!("ps_editor.tools.brush_title")
     }
 
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
@@ -175,7 +175,7 @@ impl PsTool for BrushTool {
 
     fn options_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Цвет:");
+            ui.label(t!("ps_editor.tools.brush_color_label"));
             let mut rgb = [self.color.r(), self.color.g(), self.color.b()];
             if ui.color_edit_button_srgb(&mut rgb).changed() {
                 self.color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
@@ -183,12 +183,12 @@ impl PsTool for BrushTool {
         });
         let mut radius = self.brush.radius_px();
         if ui
-            .add(crate::widgets::WheelSlider::new(&mut radius, 1..=200).text("Размер"))
+            .add(crate::widgets::WheelSlider::new(&mut radius, 1..=200).text(t!("ps_editor.tools.brush_size_label")))
             .changed()
         {
             self.brush.set_radius_px(radius);
         }
-        ui.checkbox(&mut self.erase, "Ластик");
+        ui.checkbox(&mut self.erase, t!("ps_editor.tools.brush_eraser_label"));
     }
 }
 

@@ -32,6 +32,14 @@ Main flow:
     windows_subsystem = "windows"
 )]
 
+// Bring the `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`) into crate-wide
+// scope so migrated call sites can use the bare macro names the extraction tool
+// (`tools/i18n_extract.py`) emits and the `ms-i18n` key-validation test scans for.
+// A single crate-root `#[macro_use]` avoids a per-file `use ms_i18n::{t, tf, tp};`
+// across the hundreds of UI files the localization migration touches.
+#[macro_use]
+extern crate ms_i18n;
+
 mod ai_backend_capabilities;
 mod ai_backend_panel;
 mod ai_backend_supervisor;
@@ -45,6 +53,7 @@ mod canvas;
 mod config;
 mod general_settings_panel;
 pub mod gpu_utils;
+mod i18n_resolve;
 mod input_manager_v2;
 mod input_util;
 mod installer;
@@ -693,7 +702,7 @@ impl MissingPythonEnvPromptApp {
 
     fn choose_custom_update_target(&mut self, ctx: &egui::Context) {
         let Some(folder) = rfd::FileDialog::new()
-            .set_title("Выберите папку установки ManhwaStudio")
+            .set_title(t!("startup.custom_update.folder_picker_title"))
             .pick_folder()
         else {
             return;
@@ -724,10 +733,10 @@ impl eframe::App for MissingPythonEnvPromptApp {
         let ctx = &ctx;
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Программа не установлена");
+                ui.heading(t!("startup.install_prompt.title"));
                 ui.add_space(8.0);
                 ui.label(
-                    "Выполнить установку сейчас или обновить установленную копию в другой папке?",
+                    t!("startup.install_prompt.message"),
                 );
                 if let Some(error_text) = &self.error_text {
                     ui.add_space(8.0);
@@ -735,7 +744,7 @@ impl eframe::App for MissingPythonEnvPromptApp {
                 }
                 ui.add_space(14.0);
                 if ui
-                    .add_sized([360.0, 34.0], egui::Button::new("Установить"))
+                    .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.install_button")))
                     .clicked()
                 {
                     self.set_output_and_close(MissingPythonEnvAction::Install, ctx);
@@ -744,7 +753,7 @@ impl eframe::App for MissingPythonEnvPromptApp {
                 if ui
                     .add_sized(
                         [360.0, 34.0],
-                        egui::Button::new("Обновить программу в кастомном месте установки"),
+                        egui::Button::new(t!("startup.install_prompt.update_custom_button")),
                     )
                     .clicked()
                 {
@@ -752,7 +761,7 @@ impl eframe::App for MissingPythonEnvPromptApp {
                 }
                 ui.add_space(6.0);
                 if ui
-                    .add_sized([360.0, 34.0], egui::Button::new("Открыть базовый лаунчер"))
+                    .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.open_basic_launcher_button")))
                     .clicked()
                 {
                     self.set_output_and_close(MissingPythonEnvAction::LaunchLauncher, ctx);
@@ -794,7 +803,7 @@ fn run_startup_installer(
 fn show_startup_error_dialog(message: &str) {
     runtime_log::log_error(format!("startup error dialog shown: {message}"));
     let _ = rfd::MessageDialog::new()
-        .set_title("ManhwaStudio - Ошибка запуска")
+        .set_title(t!("startup.error_dialog.title"))
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
         .set_level(rfd::MessageLevel::Error)
@@ -818,9 +827,7 @@ fn open_launcher_with_optional_update_check(
     let action = decide_pre_launch_action(app_dir)?;
     if action == PreLaunchAction::RunUpdaterAndExit {
         if let Err(err) = spawn_python_update_and_exit(app_dir) {
-            let message = format!(
-                "Не удалось запустить update.py: {err}\n\nЗапускаю лаунчер без обновления."
-            );
+            let message = tf!("startup.update_py_launch_error", err = err);
             show_startup_error_dialog(&message);
         } else {
             return Ok(None);
@@ -1071,7 +1078,7 @@ impl UpdateCheckApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     should_clear_receiver = true;
                     self.state = UpdateCheckUiState::Error {
-                        message: "Проверка обновлений завершилась ошибкой.".to_string(),
+                        message: t!("startup.update_check.failed").to_string(),
                     };
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -1095,20 +1102,20 @@ impl eframe::App for UpdateCheckApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Проверка обновлений");
+                ui.heading(t!("startup.update_check.heading"));
                 ui.add_space(8.0);
-                ui.label(format!("Локальная версия: {}", self.local_version));
+                ui.label(tf!("startup.update_check.local_version", arg = self.local_version));
                 ui.add_space(10.0);
 
                 match &self.state {
                     UpdateCheckUiState::Checking => {
                         ui.spinner();
-                        ui.label("Проверяю последний релиз ManhwaStudio на GitHub...");
+                        ui.label(t!("startup.update_check.checking"));
                     }
                     UpdateCheckUiState::UpdateAvailable { remote_version } => {
                         ui.colored_label(
                             egui::Color32::from_rgb(120, 210, 120),
-                            format!("Доступна новая версия: {remote_version}"),
+                            tf!("startup.update_check.new_version_available", remote_version = remote_version),
                         );
                     }
                     UpdateCheckUiState::Error { message } => {
@@ -1119,18 +1126,18 @@ impl eframe::App for UpdateCheckApp {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if matches!(self.state, UpdateCheckUiState::Error { .. })
-                        && ui.button("Повторить проверку").clicked()
+                        && ui.button(t!("startup.update_check.retry_button")).clicked()
                     {
                         self.start_check();
                     }
 
                     if matches!(self.state, UpdateCheckUiState::UpdateAvailable { .. })
-                        && ui.button("Обновить").clicked()
+                        && ui.button(t!("startup.update_check.update_button")).clicked()
                     {
                         self.set_decision_and_close(UpdateCheckDecision::RunUpdaterAndExit, ctx);
                     }
 
-                    if ui.button("Пропустить проверку").clicked() {
+                    if ui.button(t!("startup.update_check.skip_button")).clicked() {
                         self.set_decision_and_close(UpdateCheckDecision::LaunchLauncher, ctx);
                     }
                 });
@@ -1164,7 +1171,7 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
     };
 
     eframe::run_native(
-        "ManhwaStudio - Проверка обновлений",
+        t!("startup.update_check.window_title"),
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -1233,16 +1240,16 @@ fn fetch_latest_release_tag() -> Result<String, String> {
 
     let resp = req
         .call()
-        .map_err(|e| format!("ошибка запроса релизов: {e}"))?;
+        .map_err(|e| tf!("startup.update_check.request_error", e = e))?;
     let body = resp
         .into_string()
-        .map_err(|e| format!("ошибка чтения ответа релизов: {e}"))?;
+        .map_err(|e| tf!("startup.update_check.response_read_error", e = e))?;
 
     let releases: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("ошибка JSON релизов: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| tf!("startup.update_check.json_error", e = e))?;
     let releases = releases
         .as_array()
-        .ok_or_else(|| "неожиданный формат списка релизов".to_string())?;
+        .ok_or_else(|| t!("startup.update_check.unexpected_format").to_string())?;
 
     for rel in releases {
         let tag = rel
@@ -1270,7 +1277,7 @@ fn fetch_latest_release_tag() -> Result<String, String> {
         }
     }
 
-    Err(format!("не найден релиз с asset '{}'", UPDATE_ASSET_NAME))
+    Err(tf!("startup.update_check.asset_not_found", UPDATE_ASSET_NAME = UPDATE_ASSET_NAME))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1461,10 +1468,7 @@ impl BasicLauncherApp {
             self.chapters.clear();
             self.selected_chapter = None;
             self.state = ChooserUiState::Invalid {
-                message: format!(
-                    "Не найдено тайтлов в папке '{}'.",
-                    self.projects_root.display()
-                ),
+                message: tf!("startup.basic_launcher.no_titles", arg = self.projects_root.display()),
             };
             return;
         };
@@ -1475,7 +1479,7 @@ impl BasicLauncherApp {
             self.start_validation(project_dir);
         } else {
             self.state = ChooserUiState::Invalid {
-                message: "Для выбранного тайтла не найдено глав.".to_string(),
+                message: t!("startup.basic_launcher.no_chapters").to_string(),
             };
         }
     }
@@ -1511,7 +1515,7 @@ impl BasicLauncherApp {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     should_clear_receiver = true;
                     self.state = ChooserUiState::Invalid {
-                        message: "Проверка папки завершилась ошибкой.".to_string(),
+                        message: t!("startup.basic_launcher.validation_failed").to_string(),
                     };
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -1539,13 +1543,13 @@ impl eframe::App for BasicLauncherApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.heading("Базовый лаунчер");
+                ui.heading(t!("startup.basic_launcher.heading"));
                 ui.add_space(8.0);
-                ui.label("Выберите тайтл и главу для открытия.");
+                ui.label(t!("startup.basic_launcher.hint"));
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Тайтл:");
+                    ui.label(t!("startup.basic_launcher.title_label"));
                     let mut changed_title = false;
                     WheelComboBox::from_id_salt("basic_launcher_title")
                         .width(320.0)
@@ -1564,7 +1568,7 @@ impl eframe::App for BasicLauncherApp {
                                 }
                             }
                         });
-                    if ui.button("Обновить").clicked() {
+                    if ui.button(t!("startup.basic_launcher.refresh_button")).clicked() {
                         self.reload_lists();
                     }
                     if changed_title {
@@ -1574,7 +1578,7 @@ impl eframe::App for BasicLauncherApp {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("Глава:");
+                    ui.label(t!("startup.basic_launcher.chapter_label"));
                     let mut changed_chapter = false;
                     WheelComboBox::from_id_salt("basic_launcher_chapter")
                         .width(320.0)
@@ -1602,21 +1606,21 @@ impl eframe::App for BasicLauncherApp {
                 if let Some(path) = self.selected_project_dir() {
                     ui.monospace(path.display().to_string());
                 } else {
-                    ui.label("Глава не выбрана.");
+                    ui.label(t!("startup.basic_launcher.no_chapter_selected"));
                 }
 
                 ui.add_space(8.0);
                 match &self.state {
                     ChooserUiState::Empty => {
-                        ui.label("Выберите тайтл и главу.");
+                        ui.label(t!("startup.basic_launcher.select_title_chapter"));
                     }
                     ChooserUiState::Validating => {
-                        ui.label("Проверка структуры папки...");
+                        ui.label(t!("startup.basic_launcher.validating"));
                     }
                     ChooserUiState::Ready { image_count } => {
                         ui.colored_label(
                             egui::Color32::from_rgb(120, 210, 120),
-                            format!("Готово: найдено {} изображений в src.", image_count),
+                            tf!("startup.basic_launcher.validation_ok", image_count = image_count),
                         );
                     }
                     ChooserUiState::Invalid { message } => {
@@ -1627,7 +1631,7 @@ impl eframe::App for BasicLauncherApp {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     let launch_btn =
-                        ui.add_enabled(self.can_start(), egui::Button::new("Запустить"));
+                        ui.add_enabled(self.can_start(), egui::Button::new(t!("startup.basic_launcher.open_button")));
                     if launch_btn.clicked() {
                         if let Some(path) = self.selected_project_dir()
                             && let Ok(mut out) = self.output_project_dir.lock()
@@ -1665,7 +1669,7 @@ fn pick_project_dir_from_basic_launcher_gui(
     };
 
     eframe::run_native(
-        "ManhwaStudio - Базовый лаунчер",
+        t!("startup.basic_launcher.window_title"),
         chooser_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -1691,33 +1695,23 @@ pub(crate) fn validate_project_dir_for_startup(project_dir: &Path) -> ProjectVal
         if scr_dir.is_dir() {
             if let Err(err) = std::fs::rename(&scr_dir, &src_dir) {
                 return ProjectValidationState::Invalid {
-                    message: format!(
-                        "Папка '{}' не подходит: найдена директория scr, но не удалось переименовать её в src: {}",
-                        project_dir.display(),
-                        err
-                    ),
+                    message: tf!("startup.validate.scr_rename_failed", project_dir = project_dir.display(), err = err),
                 };
             }
         } else {
             return ProjectValidationState::Invalid {
-                message: format!(
-                    "Папка '{}' не подходит: внутри нет директории src.",
-                    project_dir.display()
-                ),
+                message: tf!("startup.validate.no_src_dir", project_dir = project_dir.display()),
             };
         }
     }
 
     match count_images_in_dir(&src_dir) {
         Ok(0) => ProjectValidationState::Invalid {
-            message: format!(
-                "Папка '{}' не подходит: в src нет изображений.",
-                project_dir.display()
-            ),
+            message: tf!("startup.validate.no_images_in_src", project_dir = project_dir.display()),
         },
         Ok(image_count) => ProjectValidationState::Valid { image_count },
         Err(err) => ProjectValidationState::Invalid {
-            message: format!("Не удалось проверить '{}': {}", src_dir.display(), err),
+            message: tf!("startup.validate.check_failed", src_dir = src_dir.display(), err = err),
         },
     }
 }

@@ -1626,7 +1626,7 @@ fn draw_aside_slots(
                         let orig_resp = with_bubble_text_font(ui, |ui| {
                             SpellcheckedTextEdit::multiline(&mut new_original)
                                 .id_salt(("aside_original", bid))
-                                .hint_text("Оригинал")
+                                .hint_text(t!("canvas.bubble.original_label"))
                                 .desired_width(text_width)
                                 .desired_rows(1)
                                 .spellcheck_enabled(
@@ -1689,7 +1689,7 @@ fn draw_aside_slots(
                         let tr_resp = with_bubble_text_font(ui, |ui| {
                             SpellcheckedTextEdit::multiline(&mut new_text)
                                 .id_salt(("aside_translation", bid))
-                                .hint_text("Перевод")
+                                .hint_text(t!("canvas.bubble.translation_label"))
                                 .desired_width(text_width)
                                 .desired_rows(1)
                                 .spellcheck_enabled(
@@ -1754,10 +1754,10 @@ fn draw_aside_slots(
             if visible_groups.show_actions {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button("Перевести").clicked() {
+                    if ui.small_button(t!("canvas.bubble.translate_button")).clicked() {
                         want_translate = true;
                     }
-                    if ui.small_button("Удалить").clicked() {
+                    if ui.small_button(t!("canvas.bubble.delete_button")).clicked() {
                         want_delete = true;
                     }
                 });
@@ -2520,7 +2520,7 @@ fn draw_editable_image_areas(
                 if idx > 0 {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("Область {}", idx + 1))
+                            egui::RichText::new(tf!("canvas.image_area.area_index", idx = idx + 1))
                                 .color(color)
                                 .small(),
                         );
@@ -2535,7 +2535,7 @@ fn draw_editable_image_areas(
                 let orig = with_bubble_text_font(ui, |ui| {
                     SpellcheckedTextEdit::multiline(&mut draft.0)
                         .id_salt(("aside_img_original", bid, idx))
-                        .hint_text("Оригинал")
+                        .hint_text(t!("canvas.bubble.original_label"))
                         .desired_width(field_width)
                         .desired_rows(1)
                         .spellcheck_enabled(canvas.state.spellcheck_original)
@@ -2544,7 +2544,7 @@ fn draw_editable_image_areas(
                 let desc = with_bubble_text_font(ui, |ui| {
                     egui::TextEdit::multiline(&mut draft.1)
                         .id_salt(("aside_img_description", bid, idx))
-                        .hint_text("Описание")
+                        .hint_text(t!("canvas.image_area.description_label"))
                         .desired_width(field_width)
                         .desired_rows(1)
                         .show(ui)
@@ -2552,7 +2552,7 @@ fn draw_editable_image_areas(
                 let tr = with_bubble_text_font(ui, |ui| {
                     SpellcheckedTextEdit::multiline(&mut draft.2)
                         .id_salt(("aside_img_translation", bid, idx))
-                        .hint_text("Перевод")
+                        .hint_text(t!("canvas.bubble.translation_label"))
                         .desired_width(field_width)
                         .desired_rows(1)
                         .spellcheck_enabled(canvas.state.spellcheck_translation)
@@ -2577,7 +2577,7 @@ fn draw_editable_image_areas(
         block_rects.push(block.response.rect);
         ui.add_space(4.0);
     }
-    if ui.button("+ Добавить область текста").clicked() {
+    if ui.button(t!("canvas.image_area.add_text_area_button")).clicked() {
         *want_add = true;
         *interacted = true;
     }

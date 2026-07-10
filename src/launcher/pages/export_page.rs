@@ -34,13 +34,21 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use ms_thread as thread;
 
+// Each entry pairs an i18n catalog KEY (not the text) with its zstd level. The key is
+// resolved to the active-locale label at display time via `compression_preset_label`,
+// because `t!` is not `const`.
 const COMPRESSION_PRESETS: [(&str, i32); 5] = [
-    ("Очень быстро", 1),
-    ("Быстро", 3),
-    ("Баланс", 6),
-    ("Сильное сжатие", 10),
-    ("Максимальное", 15),
+    ("launcher.export_page.compression_very_fast", 1),
+    ("launcher.export_page.compression_fast", 3),
+    ("launcher.export_page.compression_balanced", 6),
+    ("launcher.export_page.compression_strong", 10),
+    ("launcher.export_page.compression_max", 15),
 ];
+
+/// Resolves a compression-preset catalog key to its localized label.
+fn compression_preset_label(key: &'static str) -> &'static str {
+    ms_i18n::lookup(key).unwrap_or(key)
+}
 
 #[derive(Debug)]
 pub struct ExportPageState {
@@ -108,10 +116,10 @@ impl ExportPageState {
                 theme::card_frame().show(ui, |ui| {
                     ui.set_width(500.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Экспорт главы").size(24.0).strong());
+                        ui.label(RichText::new(t!("launcher.export_page.heading")).size(24.0).strong());
                         ui.add_space(14.0);
 
-                        ui.label(theme::status("Тайтл:", theme::TEXT_MUTED));
+                        ui.label(theme::status(t!("launcher.export_page.title_label"), theme::TEXT_MUTED));
                         let mut title_changed = false;
                         ui.scope(|ui| {
                             ui.set_style(theme::combo_box_style(ui.style().as_ref()));
@@ -140,7 +148,7 @@ impl ExportPageState {
                         }
 
                         ui.add_space(10.0);
-                        ui.label(theme::status("Глава:", theme::TEXT_MUTED));
+                        ui.label(theme::status(t!("launcher.export_page.chapter_label"), theme::TEXT_MUTED));
                         ui.scope(|ui| {
                             ui.set_style(theme::combo_box_style(ui.style().as_ref()));
                             WheelComboBox::from_id_salt("launcher_export_chapter")
@@ -164,16 +172,17 @@ impl ExportPageState {
                         });
 
                         ui.add_space(10.0);
-                        ui.label(theme::status("Уровень сжатия:", theme::TEXT_MUTED));
+                        ui.label(theme::status(t!("launcher.export_page.compression_level_label"), theme::TEXT_MUTED));
                         ui.scope(|ui| {
                             ui.set_style(theme::combo_box_style(ui.style().as_ref()));
                             egui::ComboBox::from_id_salt("launcher_export_compression")
                                 .selected_text(compression_label(self.selected_compression))
                                 .width(432.0)
                                 .show_ui(ui, |ui| {
-                                    for (index, (label, level)) in
+                                    for (index, (label_key, level)) in
                                         COMPRESSION_PRESETS.iter().enumerate()
                                     {
+                                        let label = compression_preset_label(label_key);
                                         ui.selectable_value(
                                             &mut self.selected_compression,
                                             index,
@@ -195,7 +204,7 @@ impl ExportPageState {
                         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                             if theme::launcher_button(
                                 ui,
-                                "Экспортировать",
+                                t!("launcher.export_page.export_button"),
                                 egui::vec2(148.0, 36.0),
                                 self.can_export(),
                             )
@@ -205,7 +214,7 @@ impl ExportPageState {
                             }
                             if theme::launcher_button(
                                 ui,
-                                "Обновить",
+                                t!("launcher.common.refresh_button"),
                                 egui::vec2(118.0, 36.0),
                                 !self.is_busy(),
                             )
@@ -269,7 +278,7 @@ impl ExportPageState {
         if let Err(err) = spawn_result {
             self.pending_refresh = None;
             self.status = ExportPageStatus::Error(
-                "Не удалось запустить обновление списка проектов.".to_string(),
+                t!("launcher.export_page.start_refresh_error").to_string(),
             );
             runtime_log::log_error(format!(
                 "[launcher-export] failed to spawn refresh worker: {err}"
@@ -286,7 +295,7 @@ impl ExportPageState {
     #[cfg(not(target_arch = "wasm32"))]
     fn start_export(&mut self) {
         let Some(selection) = self.current_selection() else {
-            self.status = ExportPageStatus::Error("Выберите тайтл и главу.".to_string());
+            self.status = ExportPageStatus::Error(t!("launcher.common.select_title_chapter_error").to_string());
             return;
         };
 
@@ -300,7 +309,7 @@ impl ExportPageState {
                     .and_then(|name| name.to_str())
                     .unwrap_or("chapter.mschapter"),
             )
-            .add_filter("Файлы глав", &["mschapter"])
+            .add_filter(t!("launcher.common.chapter_files_filter"), &["mschapter"])
             .save_file()
         else {
             return;
@@ -322,10 +331,7 @@ impl ExportPageState {
                 let result =
                     match export_chapter_archive(&project_dir, &chapter_name, &save_path, level) {
                         Ok(()) => ExportWorkerResult {
-                            user_message: format!(
-                                "Глава успешно экспортирована в файл:\n{}",
-                                save_path.display()
-                            ),
+                            user_message: tf!("launcher.export_page.export_success_status", save_path = save_path.display()),
                             log_message: Some(format!(
                                 "[launcher-export] exported '{}' to '{}'",
                                 project_dir.display(),
@@ -334,7 +340,7 @@ impl ExportPageState {
                             success: true,
                         },
                         Err(err) => ExportWorkerResult {
-                            user_message: format!("Не удалось экспортировать главу: {err}"),
+                            user_message: tf!("launcher.export_page.export_error", err = err),
                             log_message: Some(format!(
                                 "[launcher-export] failed to export '{}' to '{}': {err}",
                                 project_dir.display(),
@@ -352,7 +358,7 @@ impl ExportPageState {
         if let Err(err) = spawn_result {
             self.pending_export = None;
             self.status =
-                ExportPageStatus::Error("Не удалось запустить экспорт главы.".to_string());
+                ExportPageStatus::Error(t!("launcher.export_page.start_export_error").to_string());
             runtime_log::log_error(format!(
                 "[launcher-export] failed to spawn export worker: {err}"
             ));
@@ -364,7 +370,7 @@ impl ExportPageState {
     #[cfg(target_arch = "wasm32")]
     fn start_export(&mut self) {
         self.status =
-            ExportPageStatus::Error("Экспорт главы недоступен в веб-версии.".to_string());
+            ExportPageStatus::Error(t!("launcher.export_page.export_web_unsupported").to_string());
     }
 
     fn poll_refresh(&mut self) {
@@ -386,7 +392,7 @@ impl ExportPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear = true;
                     self.status = ExportPageStatus::Error(
-                        "Обновление списка проектов завершилось ошибкой.".to_string(),
+                        t!("launcher.export_page.refresh_failed").to_string(),
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -419,7 +425,7 @@ impl ExportPageState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     clear = true;
                     self.status =
-                        ExportPageStatus::Error("Экспорт главы завершился ошибкой.".to_string());
+                        ExportPageStatus::Error(t!("launcher.export_page.export_failed").to_string());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -467,11 +473,7 @@ fn build_refresh_result(
                 selected_title: None,
                 chapters: Vec::new(),
                 selected_chapter: None,
-                error_message: Some(format!(
-                    "Не удалось прочитать папку проектов '{}': {}",
-                    projects_root.display(),
-                    err
-                )),
+                error_message: Some(tf!("launcher.common.read_projects_folder_error", projects_root = projects_root.display(), err = err)),
             };
         }
     };
@@ -516,24 +518,24 @@ fn export_chapter_archive(
     compression_level: i32,
 ) -> Result<(), String> {
     if !chapter_dir.is_dir() {
-        return Err(format!("папка главы не найдена: {}", chapter_dir.display()));
+        return Err(tf!("launcher.export_page.chapter_dir_not_found", chapter_dir = chapter_dir.display()));
     }
 
     let file = File::create(save_path)
-        .map_err(|err| format!("не удалось создать '{}': {err}", save_path.display()))?;
+        .map_err(|err| tf!("launcher.export_page.create_file_error", save_path = save_path.display(), err = err))?;
     let mut encoder = zstd::stream::write::Encoder::new(file, compression_level)
-        .map_err(|err| format!("не удалось открыть zstd-кодер: {err}"))?;
+        .map_err(|err| tf!("launcher.export_page.open_zstd_encoder_error", err = err))?;
     let mut builder = tar::Builder::new(&mut encoder);
     builder
         .append_dir_all(chapter_name, chapter_dir)
-        .map_err(|err| format!("не удалось упаковать папку главы: {err}"))?;
+        .map_err(|err| tf!("launcher.export_page.pack_chapter_error", err = err))?;
     builder
         .finish()
-        .map_err(|err| format!("не удалось завершить tar-архив: {err}"))?;
+        .map_err(|err| tf!("launcher.export_page.finish_tar_error", err = err))?;
     drop(builder);
     encoder
         .finish()
-        .map_err(|err| format!("не удалось завершить zstd-архив: {err}"))?;
+        .map_err(|err| tf!("launcher.export_page.finish_zstd_error", err = err))?;
     Ok(())
 }
 
@@ -554,23 +556,23 @@ fn ensure_mschapter_extension(path: PathBuf) -> PathBuf {
 fn compression_label(index: usize) -> String {
     COMPRESSION_PRESETS
         .get(index)
-        .map(|(label, level)| format!("{label} ({level})"))
-        .unwrap_or_else(|| "Баланс (6)".to_string())
+        .map(|(label_key, level)| format!("{} ({level})", compression_preset_label(label_key)))
+        .unwrap_or_else(|| t!("launcher.export_page.compression_balanced_default").to_string())
 }
 
 fn show_status(ui: &mut Ui, status: &ExportPageStatus) {
     match status {
         ExportPageStatus::Loading => {
             ui.label(theme::status(
-                "Считываем список проектов...",
+                t!("launcher.export_page.reading_projects_status"),
                 theme::TEXT_MUTED,
             ));
         }
         ExportPageStatus::Ready => {
-            ui.label(theme::status("Готово к экспорту.", theme::TEXT_MUTED));
+            ui.label(theme::status(t!("launcher.export_page.ready_to_export"), theme::TEXT_MUTED));
         }
         ExportPageStatus::Exporting => {
-            ui.label(theme::status("Экспортируем главу...", theme::TEXT_MUTED));
+            ui.label(theme::status(t!("launcher.export_page.exporting_status"), theme::TEXT_MUTED));
         }
         ExportPageStatus::Success(message) => {
             ui.label(theme::status(message, theme::STATUS_SUCCESS));

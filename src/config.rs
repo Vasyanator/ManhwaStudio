@@ -789,6 +789,24 @@ fn merge_missing(dst: &mut Value, defaults: &Value) {
 
 pub fn user_config_defaults() -> Value {
     let default_projects_root = default_projects_root();
+    // `enabled_tabs` object keys are the stable English `AppTab::key()` ids (the
+    // persistence contract). Building the default from `key()` keeps the config and
+    // the enum in lockstep: adding or renaming a tab id updates both at once, and the
+    // keys can never drift back to a localized `title()`. The Settings and PS-editor
+    // tabs are intentionally omitted (they are always shown).
+    let enabled_tabs: Value = [
+        crate::tabs::AppTab::Translation,
+        crate::tabs::AppTab::Cleaning,
+        crate::tabs::AppTab::Typing,
+        crate::tabs::AppTab::Characters,
+        crate::tabs::AppTab::Terms,
+        crate::tabs::AppTab::Notes,
+        crate::tabs::AppTab::Wiki,
+    ]
+    .into_iter()
+    .map(|tab| (tab.key().to_owned(), Value::Bool(true)))
+    .collect::<Map<String, Value>>()
+    .into();
     json!({
         "General": {
             "theme": "dark",
@@ -807,15 +825,10 @@ pub fn user_config_defaults() -> Value {
             "ort_load_state": {},
             "memory_profile": MemoryProfile::default().as_config_str(),
             "typing_panel_layout": "vertical",
-            "enabled_tabs": {
-                "Перевод": true,
-                "Клининг": true,
-                "Текст": true,
-                "Персонажи": true,
-                "Термины": true,
-                "Заметки перевода": true,
-                "Вики": true
-            }
+            // Built above from `AppTab::key()`. Older configs may still carry the
+            // legacy Russian keys next to these; see the `enabled_tabs` note in
+            // `src/MODULE_README.md` for why those stale keys are left inert.
+            "enabled_tabs": enabled_tabs
         },
         "Canvas": {
             "scale_bubbles": true,

@@ -178,7 +178,7 @@ impl ProjectCatalogController {
                 self.pending = Some(PendingProjectCatalog { rx: fallback_rx });
                 if fallback_tx
                     .send(Err(ProjectCatalogError {
-                        user_message: "Не удалось запустить чтение списка проектов.".to_string(),
+                        user_message: t!("launcher.new_project.io.start_read_projects_error").to_string(),
                         log_message: format!("failed to spawn project catalog worker: {err}"),
                     }))
                     .is_err()
@@ -246,7 +246,7 @@ impl ProjectSaveController {
                 self.pending = Some(PendingProjectSave { rx: fallback_rx });
                 if fallback_tx
                     .send(ProjectSaveWorkerEvent::Finished(Err(ProjectSaveError {
-                        user_message: "Не удалось запустить сохранение.".to_string(),
+                        user_message: t!("launcher.new_project.io.start_save_error").to_string(),
                         log_message: format!("failed to spawn save worker: {err}"),
                     })))
                     .is_err()
@@ -318,7 +318,7 @@ fn clear_dir_contents(path: &Path) -> Result<(), ProjectSaveError> {
         return Ok(());
     }
     let entries = fs::read_dir(path).map_err(|err| ProjectSaveError {
-        user_message: "Не удалось подготовить папку для сохранения.".to_string(),
+        user_message: t!("launcher.new_project.io.prepare_save_folder_error").to_string(),
         log_message: format!(
             "failed to read dir '{}' before cleaning: {err}",
             path.display()
@@ -326,7 +326,7 @@ fn clear_dir_contents(path: &Path) -> Result<(), ProjectSaveError> {
     })?;
     for entry in entries {
         let entry = entry.map_err(|err| ProjectSaveError {
-            user_message: "Не удалось подготовить папку для сохранения.".to_string(),
+            user_message: t!("launcher.new_project.io.prepare_save_folder_error").to_string(),
             log_message: format!(
                 "failed to enumerate dir '{}' before cleaning: {err}",
                 path.display()
@@ -339,7 +339,7 @@ fn clear_dir_contents(path: &Path) -> Result<(), ProjectSaveError> {
             fs::remove_file(&entry_path)
         };
         result.map_err(|err| ProjectSaveError {
-            user_message: "Не удалось очистить папку перед сохранением.".to_string(),
+            user_message: t!("launcher.new_project.io.clear_folder_error").to_string(),
             log_message: format!(
                 "failed to remove '{}' while cleaning: {err}",
                 entry_path.display()
@@ -353,7 +353,7 @@ fn load_project_catalog(
     projects_root: &Path,
 ) -> Result<ProjectCatalogSnapshot, ProjectCatalogError> {
     let titles = crate::list_titles(projects_root).map_err(|err| ProjectCatalogError {
-        user_message: "Не удалось прочитать список тайтлов.".to_string(),
+        user_message: t!("launcher.new_project.io.read_titles_error").to_string(),
         log_message: format!(
             "failed to list titles in '{}': {err}",
             projects_root.display()
@@ -363,7 +363,7 @@ fn load_project_catalog(
     for title in &titles {
         let chapters =
             crate::list_chapters(projects_root, title).map_err(|err| ProjectCatalogError {
-                user_message: format!("Не удалось прочитать главы тайтла '{title}'."),
+                user_message: tf!("launcher.new_project.io.read_title_chapters_error", title = title),
                 log_message: format!(
                     "failed to list chapters for title '{}' in '{}': {err}",
                     title,
@@ -385,7 +385,7 @@ fn run_save_request(
 ) -> Result<ProjectSaveSuccess, ProjectSaveError> {
     if request.images.is_empty() {
         return Err(ProjectSaveError {
-            user_message: "На холсте нет изображений для сохранения.".to_string(),
+            user_message: t!("launcher.new_project.no_images_to_save_error").to_string(),
             log_message: "save request received without images".to_string(),
         });
     }
@@ -393,7 +393,7 @@ fn run_save_request(
     send_progress(&tx, "prepare", 0, 0);
     let resolved = resolve_target(projects_root, &request.target)?;
     fs::create_dir_all(&resolved.output_dir).map_err(|err| ProjectSaveError {
-        user_message: "Не удалось создать папку для сохранения.".to_string(),
+        user_message: t!("launcher.new_project.io.create_save_folder_error").to_string(),
         log_message: format!(
             "failed to create save dir '{}': {err}",
             resolved.output_dir.display()
@@ -406,7 +406,7 @@ fn run_save_request(
     let saved_images = save_png_images_parallel(&request.images, &resolved.output_dir, &tx)?;
     if saved_images == 0 {
         return Err(ProjectSaveError {
-            user_message: "Не удалось сохранить ни одного изображения.".to_string(),
+            user_message: t!("launcher.new_project.io.save_no_images_error").to_string(),
             log_message: format!(
                 "save target '{}' produced zero files",
                 resolved.output_dir.display()
@@ -431,7 +431,7 @@ fn resolve_target(
             let chapter = chapter.trim();
             if title.is_empty() || chapter.is_empty() {
                 return Err(ProjectSaveError {
-                    user_message: "Укажите тайтл и название главы.".to_string(),
+                    user_message: t!("launcher.new_project.specify_title_chapter_error").to_string(),
                     log_message: format!(
                         "project save target missing title/chapter: title='{}', chapter='{}'",
                         title, chapter
@@ -440,7 +440,7 @@ fn resolve_target(
             }
             let title_dir = projects_root.join(title);
             fs::create_dir_all(&title_dir).map_err(|err| ProjectSaveError {
-                user_message: "Не удалось подготовить папку тайтла.".to_string(),
+                user_message: t!("launcher.new_project.io.prepare_title_folder_error").to_string(),
                 log_message: format!(
                     "failed to create title dir '{}': {err}",
                     title_dir.display()
@@ -449,7 +449,7 @@ fn resolve_target(
             let notes_path = title_dir.join(config::NOTES_FILE);
             if !notes_path.exists() {
                 fs::write(&notes_path, b"").map_err(|err| ProjectSaveError {
-                    user_message: "Не удалось подготовить файл заметок тайтла.".to_string(),
+                    user_message: t!("launcher.new_project.io.prepare_title_notes_error").to_string(),
                     log_message: format!(
                         "failed to create notes file '{}': {err}",
                         notes_path.display()
@@ -478,7 +478,7 @@ fn resolve_target(
             let alt_name = alt_name.trim();
             if title.is_empty() || chapter.is_empty() || alt_name.is_empty() {
                 return Err(ProjectSaveError {
-                    user_message: "Укажите тайтл, главу и название альтер-версии.".to_string(),
+                    user_message: t!("launcher.new_project.io.specify_alt_version_error").to_string(),
                     log_message: format!(
                         "alt save target missing fields: title='{}', chapter='{}', alt='{}'",
                         title, chapter, alt_name
@@ -519,7 +519,7 @@ fn save_png_images_parallel(
             DynamicImage::ImageRgba8(image.image.clone())
                 .save_with_format(&path, ImageFormat::Png)
                 .map_err(|err| ProjectSaveError {
-                    user_message: "Не удалось сохранить изображения в PNG.".to_string(),
+                    user_message: t!("launcher.new_project.io.save_png_error").to_string(),
                     log_message: format!("failed to save png '{}': {err}", path.display()),
                 })?;
             let current = progress.fetch_add(1, Ordering::Relaxed) + 1;
