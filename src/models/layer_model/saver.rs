@@ -28,10 +28,10 @@ The whole point is that `PageSaveJob` carries OWNED `ColorImage`s, not borrows, 
 the real `persist::*` write path while the doc is free for the GUI thread.
 */
 
+use ms_thread::{self as thread, JoinHandle};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use ms_thread::{self as thread, JoinHandle};
 
 use eframe::egui::ColorImage;
 use serde_json::Value;
@@ -109,6 +109,8 @@ pub struct OwnedTextNode {
     pub group_uid: Option<String>,
     pub payload_uid: String,
     pub render_data: Value,
+    /// Whether this text node represents a placed PNG image overlay.
+    pub is_image: bool,
     pub transform: TransformRec,
     pub deform: Option<DeformRec>,
     pub mask_clip: Option<bool>,
@@ -224,7 +226,8 @@ impl PageSaveJob {
                 let present = crate::storage::storage()
                     .exists(primary_path.to_string_lossy().as_ref())
                     || fallback_dir.is_some_and(|d| {
-                        crate::storage::storage().exists(d.join(&file_name).to_string_lossy().as_ref())
+                        crate::storage::storage()
+                            .exists(d.join(&file_name).to_string_lossy().as_ref())
                     });
                 let rendered_file = if node.pixels_dirty || !present {
                     Some(persist::write_text_image(
@@ -248,6 +251,7 @@ impl PageSaveJob {
                     pinned_by_group: false,
                     payload_uid: node.payload_uid.clone(),
                     render_data: node.render_data.clone(),
+                    is_image: node.is_image,
                     transform: node.transform,
                     deform: node.deform.clone(),
                     rendered_file,
@@ -521,10 +525,8 @@ mod tests {
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "ms_layer_saver_{tag}_{}_{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ms_layer_saver_{tag}_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -578,6 +580,7 @@ mod tests {
             group_uid: None,
             payload_uid: uid.to_string(),
             render_data: Value::Null,
+            is_image: false,
             transform: tf(5.0, 5.0),
             deform: None,
             mask_clip: None,
@@ -616,7 +619,11 @@ mod tests {
         let page = persist::load_page_rasters(&dir, None, 5).unwrap();
         let mut uids: Vec<&str> = page.layers.iter().map(|l| l.uid.as_str()).collect();
         uids.sort_unstable();
-        assert_eq!(uids, vec!["c", "d"], "only the latest job's rasters persisted");
+        assert_eq!(
+            uids,
+            vec!["c", "d"],
+            "only the latest job's rasters persisted"
+        );
 
         saver.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -632,7 +639,10 @@ mod tests {
         saver.barrier_blocking();
 
         // Immediately readable — the barrier guarantees the write completed.
-        assert!(dir.join("layers.json").is_file(), "manifest written before barrier returned");
+        assert!(
+            dir.join("layers.json").is_file(),
+            "manifest written before barrier returned"
+        );
         let page = persist::load_page_rasters(&dir, None, 0).unwrap();
         assert_eq!(page.layers.len(), 1);
         assert_eq!(page.layers[0].uid, "r");
@@ -681,7 +691,11 @@ mod tests {
 
         // Raster survives (text-only half did not erase it).
         let rasters = persist::load_page_rasters(&dir, None, 2).unwrap();
-        assert_eq!(rasters.layers.len(), 1, "raster preserved through text merge");
+        assert_eq!(
+            rasters.layers.len(),
+            1,
+            "raster preserved through text merge"
+        );
         assert_eq!(rasters.layers[0].uid, "rast");
 
         // Text survives (full half did not erase it). The rendered text PNG exists too.
@@ -756,11 +770,18 @@ mod tests {
         saver.barrier_blocking();
 
         let page = persist::load_page_rasters(&dir, None, 4).unwrap();
-        assert_eq!(page.layers.len(), 2, "both rasters preserved (no rewrite drop)");
+        assert_eq!(
+            page.layers.len(),
+            2,
+            "both rasters preserved (no rewrite drop)"
+        );
         let a = page.layers.iter().find(|l| l.uid == "a").unwrap();
         assert_eq!(a.effects, chain, "effects-only job set the chain");
         let b = page.layers.iter().find(|l| l.uid == "b").unwrap();
-        assert!(b.effects.is_empty(), "other raster untouched by targeted effects update");
+        assert!(
+            b.effects.is_empty(),
+            "other raster untouched by targeted effects update"
+        );
 
         // Effects-only CLEAR for "a": empty chain + no rendered. The raster reconcile loop would skip
         // this (it gates on a non-empty chain), so only the effects-only path can express it.
@@ -829,7 +850,10 @@ mod tests {
         let x = page.layers.iter().find(|l| l.uid == "x").unwrap();
         let y = page.layers.iter().find(|l| l.uid == "y").unwrap();
         assert_eq!(x.effects, cx, "x effects survived the coalesce");
-        assert_eq!(y.effects, cy, "y effects survived the coalesce (different uid not dropped)");
+        assert_eq!(
+            y.effects, cy,
+            "y effects survived the coalesce (different uid not dropped)"
+        );
 
         saver.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

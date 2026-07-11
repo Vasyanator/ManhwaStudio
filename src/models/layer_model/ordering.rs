@@ -105,7 +105,12 @@ mod tests {
             group_uid: None,
             visible: true,
             opacity: 1.0,
-            transform: Some(TransformRec { cx: 0.0, cy: 0.0, rotation: 0.0, scale: 1.0 }),
+            transform: Some(TransformRec {
+                cx: 0.0,
+                cy: 0.0,
+                rotation: 0.0,
+                scale: 1.0,
+            }),
             deform: None,
             base_file: Some(format!("{uid}.png")),
             rendered_file: None,
@@ -113,6 +118,7 @@ mod tests {
             effects: Vec::new(),
             payload_ref: None,
             render_data: None,
+            overlay_is_image: None,
             mask_clip: None,
         }
     }
@@ -137,6 +143,7 @@ mod tests {
             effects: Vec::new(),
             payload_ref: None,
             render_data: None,
+            overlay_is_image: None,
             mask_clip: None,
         }
     }
@@ -149,15 +156,23 @@ mod tests {
             // Raster r0 at z=0, text group 0 band at z=1, raster r1 at z=2, group 1 at z=3,
             // a pinned text at z=4 (top).
             text_groups: vec![
-                TextGroupRec { layer_idx: 0, z: 1, name: "g0".into() },
-                TextGroupRec { layer_idx: 1, z: 3, name: "g1".into() },
+                TextGroupRec {
+                    layer_idx: 0,
+                    z: 1,
+                    name: "g0".into(),
+                },
+                TextGroupRec {
+                    layer_idx: 1,
+                    z: 3,
+                    name: "g1".into(),
+                },
             ],
             tree: vec![
                 raster("r0", 0),
                 raster("r1", 2),
                 text("t_a", 0, false, 0),
-                text("t_b", 0, false, 0), // both in group 0
-                text("t_c", 1, false, 0), // group 1
+                text("t_b", 0, false, 0),  // both in group 0
+                text("t_c", 1, false, 0),  // group 1
                 text("t_pin", 0, true, 4), // pinned, its own band at top
             ],
         };
@@ -168,7 +183,11 @@ mod tests {
 
         // Band at z=1 is text group 0 with both unpinned members.
         match &bands[1] {
-            Band::TextGroup { layer_idx, member_uids, .. } => {
+            Band::TextGroup {
+                layer_idx,
+                member_uids,
+                ..
+            } => {
                 assert_eq!(*layer_idx, 0);
                 assert_eq!(member_uids.len(), 2);
                 assert!(member_uids.contains(&"t_a".to_string()));

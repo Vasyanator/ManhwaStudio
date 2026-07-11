@@ -28,7 +28,8 @@ On disk under `{chapter}/layers/` (staged in `{chapter}_unsaved/layers/`, merged
 project"):
 - `layers.json` — `LayersManifest`: explicit `schema_version` (now **3**). v2 added
   `LayerRec.pinned_by_group` + `GroupRec.collapsed`; **v3 inlines the TEXT payload** onto a text
-  `LayerRec` (`render_data`, the rendered-PNG name in `rendered_file`, `mask_clip`, and the reused
+  `LayerRec` (`render_data`, the rendered-PNG name in `rendered_file`, `mask_clip`,
+  `overlay_is_image`, and the reused
   `transform`/`deform` geometry), so `layers.json` is self-sufficient for text and `text_info.json`
   is read-only legacy. All v3 fields are serde-default `Option`s, so a v2 file still reads cleanly.
   Per-page trees of `LayerRec` nodes ordered bottom-to-top by `z`; carries `groups`, `deform`,
@@ -159,7 +160,8 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     effects); a dirty one (PS paint/cut/merge/bake) rewrites the base and drops the chain (bakes it in).
   - Text nodes (single writer, schema v3): `write_page_text_payload(layers_dir, fallback_dir, page_idx,
     &[TextPayloadOut])` writes each text node's FULL payload (`render_data` + canonical
-    `transform`/`deform` + the rendered PNG name in `rendered_file` + `mask_clip`) inline into
+    `transform`/`deform` + the rendered PNG name in `rendered_file` + `mask_clip` + the optional
+    `overlay_is_image` marker) inline into
     `layers.json`, so the file is self-sufficient for text. Kind-filtered preservation (rasters + PS
     groups + rebuilt text-group bands survive), and it carries each existing node's `layer_idx` +
     PS-owned pin/z/group fields. WRITE-keep-present invariant: a page that already EXISTED (in this
@@ -217,8 +219,9 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
 
 ### Text migration gate (lazy, on read)
 `ensure_page_loaded` treats a page as MIGRATED once it carries any inline text node (`write_page_text_payload`
-always writes the page's FULL text set inline at once, so "any inline node" ⇒ "all text inline"). A
-migrated page IGNORES `text_info.json` entirely, so an overlay deleted/rasterized from the inline set
+always writes the page's FULL text set inline at once, so "any inline node" ⇒ "all text inline"). Inline
+image overlays use `is_image: true` with `render_data: Null` and participate in the same gate. A migrated
+page IGNORES `text_info.json` entirely, so an overlay deleted/rasterized from the inline set
 does not resurrect from the stale legacy file. A page with no inline nodes is pure-legacy and reads
 `text_info.json` (migration-on-read), migrating to inline on its first flush. This lazy path stays as
 the per-frame safety net.
@@ -238,9 +241,10 @@ v3 persistently:
   migration permanent. (Trade-off: a crash mid-migration that left SOME pages inline blocks eager
   completion of the rest; those pages still load via the lazy on-read path — no data loss.)
 - For every page: cross-entry-migrate + decode geometry through the SHARED codec with the FULL chapter
-  `page_sizes` map (ribbon correctness); for each text overlay **RENAME (move)** its original PNG into
-  the v3 `text_image_file_name`, PRESERVING the bytes (never re-rendered); build the inline node
-  (render_data + radians transform/deform + mask_clip + renamed PNG) and write it via
+  `page_sizes` map (ribbon correctness); for each text or image overlay **RENAME (move)** its original PNG
+  into the v3 `text_image_file_name`, PRESERVING the bytes (never re-rendered); build the inline node
+  (text render data, or `is_image: true` with `render_data: Null`, plus radians transform/deform,
+  mask_clip, and renamed PNG) and write it via
   `write_page_text_payload` (preserving rasters / PS groups / pin-z-group). If the original PNG is
   genuinely missing the overlay is kept WITHOUT an image (logged) — never DROPPED.
 - ORDER for rollback safety: the destructive `text_info.json → text_info.json.bak` rename happens LAST,

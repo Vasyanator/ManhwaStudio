@@ -86,7 +86,12 @@ impl TypingTextOverlayLayer {
     /// `persist::save_page_band_order` (the disk authority for pin + Z — which a later `flush_page_text`
     /// then PRESERVES via `merge_preserved_text_fields`, so the reorder is never clobbered), and the
     /// SAME order is mirrored into the shared doc via `set_z_order` so both tabs re-project in step.
-    pub(super) fn move_overlay_in_unified_z(&mut self, page_idx: usize, overlay_idx: usize, up: bool) {
+    pub(super) fn move_overlay_in_unified_z(
+        &mut self,
+        page_idx: usize,
+        overlay_idx: usize,
+        up: bool,
+    ) {
         let Some(uid) = self.overlays.get(overlay_idx).map(|o| o.uid.clone()) else {
             return;
         };
@@ -95,7 +100,12 @@ impl TypingTextOverlayLayer {
 
     /// Moves a RASTER one step in the page's unified band-Z order (text + raster interleaved). Resolves
     /// the raster's uid from `raster_layers_by_page[page][raster_idx]` and reuses the shared band-Z core.
-    pub(super) fn move_raster_in_unified_z(&mut self, page_idx: usize, raster_idx: usize, up: bool) {
+    pub(super) fn move_raster_in_unified_z(
+        &mut self,
+        page_idx: usize,
+        raster_idx: usize,
+        up: bool,
+    ) {
         let resolved = self
             .raster_layers_by_page
             .get(&page_idx)
@@ -140,10 +150,12 @@ impl TypingTextOverlayLayer {
             .iter()
             .filter(|b| matches!(b, persist::BandRef::Raster(_)))
             .count();
-        let target_pos = order.iter().position(|b| matches!(
-            b,
-            persist::BandRef::PinnedText(u) | persist::BandRef::Raster(u) if u == uid
-        ));
+        let target_pos = order.iter().position(|b| {
+            matches!(
+                b,
+                persist::BandRef::PinnedText(u) | persist::BandRef::Raster(u) if u == uid
+            )
+        });
         crate::trace_log!(
             cat::TYPING,
             "move_node_in_unified_z uid={} up={} order_len={} raster_bands={} target_pos={:?}",
@@ -284,7 +296,11 @@ impl TypingTextOverlayLayer {
         out
     }
 
-    /// (Re)loads the read-only PS raster layers for `page_idx` if not already cached for it.
+    /// (Re)loads the PS raster layers for `page_idx` if not already cached for it.
+    ///
+    /// With a shared `LayerDoc`, decodes the full page payload before acquiring the doc lock, then
+    /// inserts it with a brief lock and projects the doc-authoritative state. If that decode cannot
+    /// produce a resident doc page, falls back to the disk-backed cache for doc-less callers.
     pub(super) fn ensure_raster_layers_for_page(&mut self, page_idx: usize) {
         if self.raster_layers_by_page.contains_key(&page_idx) {
             return;
@@ -295,65 +311,100 @@ impl TypingTextOverlayLayer {
             return;
         };
         let fallback = self.layers_fallback_dir.clone();
-        // Unified per-page Z bands, used to interleave rasters with overlays in one ordered pass.
-        let bands = crate::models::layer_model::persist::load_page_bands(
-            &primary,
-            fallback.as_deref(),
-            page_idx,
-        );
-        self.bands_by_page.insert(page_idx, bands);
-        let loaded = crate::models::layer_model::persist::load_page_rasters(
-            &primary,
-            fallback.as_deref(),
-            page_idx,
-        );
-        let layers = match loaded {
-            Ok(page) => page
-                .layers
-                .into_iter()
-                .map(|l| TypingRasterLayer {
-                    uid: l.uid,
-                    name: l.name,
-                    visible: l.visible,
-                    opacity: l.opacity,
-                    transform: l.transform,
-                    image: l.image,
-                    base_file: l.base_file,
-                    effects: l.effects,
-                    deform: l.deform,
-                    mask_clip_enabled: l.mask_clip.unwrap_or(false),
-                    clipped_image: None,
-                    texture: None,
-                })
-                .collect(),
-            Err(err) => {
-                crate::runtime_log::log_warn(format!(
-                    "[typing] load PS raster layers for page {page_idx} failed: {err}"
-                ));
-                Vec::new()
+        // The shared doc is the source of truth. Decode its owned payload before locking it: this
+        // performs all disk I/O and PNG decoding, while insertion below is only a cheap move.
+        let populated_from_doc = if let Some(doc) = self.layer_doc.clone() {
+            // The legacy ribbon migration requires every page's aspect ratio, not just this page.
+            let page_sizes = self.page_sizes_map();
+            match crate::models::layer_model::layer_doc::LayerDoc::decode_page_payload(
+                page_idx,
+                &primary,
+                fallback.as_deref(),
+                &page_sizes,
+            ) {
+                Ok(payload) => {
+                    if let Ok(mut doc_guard) = doc.lock() {
+                        doc_guard.insert_decoded_page(page_idx, payload);
+                        self.sync_from_doc(page_idx, &doc_guard);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(err) => {
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] layer payload decode for page {page_idx} failed: {err}"
+                    ));
+                    // A resident page remains valid after a disk decode failure, so preserve its live
+                    // edits by projecting it instead of replacing it with disk-loaded state.
+                    if let Ok(doc_guard) = doc.lock()
+                        && doc_guard.page(page_idx).is_some()
+                    {
+                        self.sync_from_doc(page_idx, &doc_guard);
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
+        } else {
+            false
         };
-        // A just-created raster asked to be selected once its page reloaded — resolve by uid now.
+
+        if !populated_from_doc {
+            // Without a resident shared-doc page, the disk cache remains the source of truth.
+            let bands = crate::models::layer_model::persist::load_page_bands(
+                &primary,
+                fallback.as_deref(),
+                page_idx,
+            );
+            self.bands_by_page.insert(page_idx, bands);
+            let layers = match crate::models::layer_model::persist::load_page_rasters(
+                &primary,
+                fallback.as_deref(),
+                page_idx,
+            ) {
+                Ok(page) => page
+                    .layers
+                    .into_iter()
+                    .map(|l| TypingRasterLayer {
+                        uid: l.uid,
+                        name: l.name,
+                        visible: l.visible,
+                        opacity: l.opacity,
+                        transform: l.transform,
+                        image: l.image,
+                        base_file: l.base_file,
+                        effects: l.effects,
+                        deform: l.deform,
+                        mask_clip_enabled: l.mask_clip.unwrap_or(false),
+                        clipped_image: None,
+                        texture: None,
+                    })
+                    .collect(),
+                Err(err) => {
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] load PS raster layers for page {page_idx} failed: {err}"
+                    ));
+                    Vec::new()
+                }
+            };
+            self.raster_layers_by_page.insert(page_idx, layers);
+        }
+
+        // A just-created raster is selected from the final source-of-truth projection, whether that
+        // was the shared doc or the disk fallback.
         if let Some((pending_page, uid)) = self.pending_select_raster_uid.clone()
             && pending_page == page_idx
-            && let Some(idx) = layers.iter().position(|l| l.uid == uid)
+            && let Some(idx) = self
+                .raster_layers_by_page
+                .get(&page_idx)
+                .and_then(|layers| layers.iter().position(|layer| layer.uid == uid))
         {
             self.selected_raster_idx = Some(idx);
             self.selected_raster_page = Some(page_idx);
             self.selected_overlay_idx = None;
             self.pending_select_raster_uid = None;
-        }
-        self.raster_layers_by_page.insert(page_idx, layers);
-        // The shared unified layer document is the source of truth for layer MODEL state. Ensure the
-        // page is resident, then rebuild the per-page projections (rasters / overlays / bands) from
-        // it, overriding the disk-loaded caches above so both tabs read one model.
-        // Full chapter page sizes: the legacy ribbon migration in the doc needs every page's aspect.
-        let page_sizes = self.page_sizes_map();
-        if let Some(doc) = self.layer_doc.clone()
-            && let Ok(mut doc_guard) = doc.lock()
-        {
-            let _ = doc_guard.ensure_page_loaded(page_idx, &primary, fallback.as_deref(), &page_sizes);
-            self.sync_from_doc(page_idx, &doc_guard);
         }
     }
 
@@ -442,8 +493,8 @@ impl TypingTextOverlayLayer {
             // mask-clip toggle bumps the node generation, so this invalidates the texture (and the
             // cached clipped image below) → re-clip + re-upload.
             let cache_key = (page_idx, node.uid.clone());
-            let gen_unchanged = self.raster_texture_generations.get(&cache_key).copied()
-                == Some(node.generation);
+            let gen_unchanged =
+                self.raster_texture_generations.get(&cache_key).copied() == Some(node.generation);
             let texture = if gen_unchanged {
                 prev_rasters.remove(&node.uid)
             } else {
@@ -522,7 +573,14 @@ impl TypingTextOverlayLayer {
         let page_size_px = self.page_size_px(page_idx);
         let mut to_requeue: Vec<usize> = Vec::new();
         for node in &page.nodes {
-            let NodeBody::Text { render_data, image, mask_clip, .. } = &node.body else {
+            let NodeBody::Text {
+                render_data,
+                image,
+                is_image,
+                mask_clip,
+                ..
+            } = &node.body
+            else {
                 continue;
             };
             let center = [node.transform.cx, node.transform.cy];
@@ -555,6 +613,11 @@ impl TypingTextOverlayLayer {
                     rt.user_scale = user_scale;
                     rt.deform_mesh = deform_mesh;
                     rt.render_data_json = render_data_json;
+                    rt.kind = if *is_image {
+                        TypingOverlayKind::Image
+                    } else {
+                        TypingOverlayKind::Text
+                    };
                     if pixels_changed {
                         rt.size_px = size_px;
                         rt.source_rgba = color_image_to_rgba(image);
@@ -574,6 +637,7 @@ impl TypingTextOverlayLayer {
                         angle_deg,
                         deform_mesh,
                         mask_clip.unwrap_or(false),
+                        *is_image,
                         node.text_layer_idx.unwrap_or(0) as usize,
                         render_data_json,
                         size_px,
@@ -696,7 +760,11 @@ impl TypingTextOverlayLayer {
             .unwrap_or(&layer.image)
             .clone();
         let texture = layer.texture.get_or_insert_with(|| {
-            ctx.load_texture("typing_ps_raster_layer", upload_image, TextureOptions::LINEAR)
+            ctx.load_texture(
+                "typing_ps_raster_layer",
+                upload_image,
+                TextureOptions::LINEAR,
+            )
         });
         let texture_id = texture.id();
         // Deformed raster: positioned by its cols×rows mesh (absolute page px), exactly like a
@@ -853,7 +921,10 @@ impl TypingTextOverlayLayer {
         self.primary_pointer_targets_overlay_this_frame
     }
 
-    pub(super) fn gpu_memory_snapshot(&self, pinned_pages: &BTreeSet<usize>) -> Vec<CacheResourceInfo> {
+    pub(super) fn gpu_memory_snapshot(
+        &self,
+        pinned_pages: &BTreeSet<usize>,
+    ) -> Vec<CacheResourceInfo> {
         self.overlays
             .iter()
             .enumerate()
@@ -877,7 +948,10 @@ impl TypingTextOverlayLayer {
             .collect()
     }
 
-    pub(super) fn evict_gpu_cache(&mut self, request: &CacheEvictionRequest) -> CacheEvictionReport {
+    pub(super) fn evict_gpu_cache(
+        &mut self,
+        request: &CacheEvictionRequest,
+    ) -> CacheEvictionReport {
         let snapshot = self.gpu_memory_snapshot(&request.pinned_pages);
         let candidates = select_eviction_candidates(&snapshot, request);
         let mut evicted = Vec::new();
@@ -950,9 +1024,9 @@ impl TypingTextOverlayLayer {
         let Ok(guard) = doc.lock() else {
             return false;
         };
-        page_indices.iter().all(|idx| {
-            self.raster_layers_by_page.contains_key(idx) && guard.page(*idx).is_some()
-        })
+        page_indices
+            .iter()
+            .all(|idx| self.raster_layers_by_page.contains_key(idx) && guard.page(*idx).is_some())
     }
 
     /// Starts (or no-ops) an async preload of every not-yet-resident page. Idempotent: a no-op if a
@@ -1194,8 +1268,10 @@ impl TypingTextOverlayLayer {
         // Refresh progress and detect completion.
         let complete = match self.preload_all_state.as_ref() {
             Some(state) => {
-                self.preload_all_progress =
-                    (state.total.saturating_sub(state.remaining.len()), state.total);
+                self.preload_all_progress = (
+                    state.total.saturating_sub(state.remaining.len()),
+                    state.total,
+                );
                 // Done when every target has been applied. `disconnected` is a safety net: if the
                 // worker died early (never sent every target), the closed channel still completes the
                 // pass instead of leaving it stuck forever.

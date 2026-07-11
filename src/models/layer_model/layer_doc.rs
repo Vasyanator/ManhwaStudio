@@ -76,12 +76,14 @@ pub enum NodeBody {
         mask_clip: Option<bool>,
     },
     /// A text node: its render params (`render_data`, opaque here), the rendered `image`, the uid of
-    /// the payload it references in the text store, and the persisted mask-clip flag. The text flush
+    /// the payload it references in the text store, and the persisted mask-clip flag. `is_image == true`
+    /// marks a placed PNG image overlay: `render_data` is `Value::Null` and it is not re-renderable. The text flush
     /// (`LayerDoc::flush_page`) writes these inline into `layers.json` (schema v3); the load builds
     /// them from the inline node when present, else from the legacy `text_info.json` overlay entry.
     Text {
         render_data: Value,
         image: ColorImage,
+        is_image: bool,
         /// The uid of the overlay payload this text node renders from (its `payload_ref` uid, or the
         /// node uid for a v3 inline node). Written back as the node's `payload_uid` on flush.
         payload_uid: String,
@@ -238,15 +240,21 @@ impl LayerDoc {
     /// Loads `page_idx` into memory if not already resident.
     ///
     /// Convenience composition of [`Self::decode_page_payload`] (disk I/O + PNG decode + legacy
-    /// migration, lock-free) and [`Self::insert_decoded_page`] (the cheap memoized move). Kept for the
-    /// synchronous callers and the unit tests; the off-thread page load splits the two steps so the
-    /// decode runs on a worker and only the insert runs under the shared doc lock.
+    /// migration, lock-free) and [`Self::insert_decoded_page`] (the cheap memoized move).
+    ///
+    /// TEST-ONLY reference implementation: every production caller now runs the two steps explicitly so
+    /// the multi-MB PNG decode happens off the shared doc lock (a worker in the PS page loader, the GUI
+    /// thread before locking in the typing tab). This monolith is retained only as the differential
+    /// oracle the split path is unit-tested against (see
+    /// `decode_then_insert_matches_ensure_page_loaded_incl_legacy_ribbon`); keeping it out of production
+    /// prevents a future caller from reintroducing a decode under the lock.
     ///
     /// See [`Self::decode_page_payload`] for the full decode contract (raster + text node build,
     /// unified-Z re-rank, the FULL-`page_sizes`-map ribbon-migration requirement).
     ///
     /// # Errors
     /// Propagates [`Self::decode_page_payload`]'s error string.
+    #[cfg(test)]
     pub fn ensure_page_loaded(
         &mut self,
         page_idx: usize,
@@ -345,10 +353,7 @@ impl LayerDoc {
 
         let mut nodes: Vec<LayerNode> = Vec::with_capacity(rasters.layers.len());
         for (idx, layer) in rasters.layers.into_iter().enumerate() {
-            let z = z_by_uid
-                .get(&layer.uid)
-                .copied()
-                .unwrap_or(idx as u32);
+            let z = z_by_uid.get(&layer.uid).copied().unwrap_or(idx as u32);
             nodes.push(LayerNode {
                 uid: layer.uid,
                 name: layer.name,
@@ -386,20 +391,21 @@ impl LayerDoc {
         // every page's resulting `img_u`/`img_v`, is wrong. The PNG footprint (top-left case) is
         // resolved from the text dirs.
         let raw_entries = text_payload::read_overlay_entries(&text_dirs);
-        let overlay_entries = text_payload::migrate_overlay_entries(&raw_entries, page_sizes, |obj| {
-            obj.get("file")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .and_then(|file| {
-                    text_dirs.iter().find_map(|dir| {
-                        image::image_dimensions(dir.join(file))
-                            .ok()
-                            .map(|(w, h)| (w as f32, h as f32))
+        let overlay_entries =
+            text_payload::migrate_overlay_entries(&raw_entries, page_sizes, |obj| {
+                obj.get("file")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|file| {
+                        text_dirs.iter().find_map(|dir| {
+                            image::image_dimensions(dir.join(file))
+                                .ok()
+                                .map(|(w, h)| (w as f32, h as f32))
+                        })
                     })
-                })
-                .unwrap_or((0.0, 0.0))
-        });
+                    .unwrap_or((0.0, 0.0))
+            });
 
         // Pinned-text band Z by uid; text-group band Z by layer_idx — for the unified text node Z.
         let mut pinned_z_by_uid: HashMap<String, u32> = HashMap::new();
@@ -490,6 +496,7 @@ impl LayerDoc {
                 body: NodeBody::Text {
                     render_data: inline.render_data.clone(),
                     image,
+                    is_image: inline.is_image,
                     payload_uid: meta.payload_uid.clone(),
                     mask_clip: inline.mask_clip,
                 },
@@ -503,7 +510,11 @@ impl LayerDoc {
         // that was DELETED (or rasterized) from the inline set would resurrect from the stale legacy
         // file. A page with no inline nodes is still pure-legacy and reads `text_info.json` below.
         let page_is_migrated = !built_inline.is_empty();
-        let legacy_entries: &[Value] = if page_is_migrated { &[] } else { &overlay_entries };
+        let legacy_entries: &[Value] = if page_is_migrated {
+            &[]
+        } else {
+            &overlay_entries
+        };
 
         // 2) Legacy overlays from `text_info.json` (migration-on-read), skipping uids already inline.
         for entry in legacy_entries {
@@ -582,6 +593,7 @@ impl LayerDoc {
                 body: NodeBody::Text {
                     render_data,
                     image,
+                    is_image,
                     payload_uid: uid,
                     mask_clip,
                 },
@@ -1222,7 +1234,12 @@ impl LayerDoc {
         fallback_dir: Option<&Path>,
         removed_uid: &str,
     ) -> Result<(), String> {
-        self.flush_page_inner(page_idx, layers_dir, fallback_dir, &[removed_uid.to_string()])
+        self.flush_page_inner(
+            page_idx,
+            layers_dir,
+            fallback_dir,
+            &[removed_uid.to_string()],
+        )
     }
 
     fn flush_page_inner(
@@ -1261,7 +1278,12 @@ impl LayerDoc {
         let mut outs: Vec<RasterLayerOut> = Vec::with_capacity(raster_indices.len());
         for &i in &raster_indices {
             let node = &page.nodes[i];
-            let NodeBody::Raster { base_image, mask_clip, .. } = &node.body else {
+            let NodeBody::Raster {
+                base_image,
+                mask_clip,
+                ..
+            } = &node.body
+            else {
                 continue;
             };
             outs.push(RasterLayerOut {
@@ -1285,7 +1307,13 @@ impl LayerDoc {
             outs.len(),
             page.groups.len()
         );
-        persist::save_page_rasters(layers_dir, page_idx, &outs, &page.groups, removed_raster_uids)?;
+        persist::save_page_rasters(
+            layers_dir,
+            page_idx,
+            &outs,
+            &page.groups,
+            removed_raster_uids,
+        )?;
 
         // Text flush (schema v3): write every TEXT node's inline payload (see `write_page_text`).
         Self::write_page_text(page, page_idx, layers_dir, fallback_dir)?;
@@ -1376,6 +1404,7 @@ impl LayerDoc {
             let NodeBody::Text {
                 render_data,
                 image,
+                is_image,
                 payload_uid,
                 mask_clip,
             } = &node.body
@@ -1397,7 +1426,9 @@ impl LayerDoc {
                     node.pixels_dirty,
                     present
                 );
-                Some(persist::write_text_image(layers_dir, page_idx, &node.uid, image)?)
+                Some(persist::write_text_image(
+                    layers_dir, page_idx, &node.uid, image,
+                )?)
             } else {
                 Some(file_name)
             };
@@ -1416,6 +1447,7 @@ impl LayerDoc {
                 pinned_by_group: false,
                 payload_uid: payload_uid.clone(),
                 render_data: render_data.clone(),
+                is_image: *is_image,
                 transform: node.transform,
                 deform: node.deform.clone(),
                 rendered_file,
@@ -1563,7 +1595,14 @@ impl LayerDoc {
             });
             Ok(())
         } else {
-            persist::update_raster_effects(layers_dir, page_idx, uid, effects, display, fallback_dir)
+            persist::update_raster_effects(
+                layers_dir,
+                page_idx,
+                uid,
+                effects,
+                display,
+                fallback_dir,
+            )
         }
     }
 
@@ -1679,6 +1718,7 @@ impl LayerDoc {
             let NodeBody::Text {
                 render_data,
                 image,
+                is_image,
                 payload_uid,
                 mask_clip,
             } = &node.body
@@ -1695,6 +1735,7 @@ impl LayerDoc {
                 group_uid: node.group_uid.clone(),
                 payload_uid: payload_uid.clone(),
                 render_data: render_data.clone(),
+                is_image: *is_image,
                 transform: node.transform,
                 deform: node.deform.clone(),
                 mask_clip: *mask_clip,
@@ -1774,13 +1815,34 @@ mod tests {
         let dir = temp_dir("load");
 
         // Seed two rasters on disk; add order is bottom-to-top, so r0 is below r1.
-        persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf(10.0, 20.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
-        persist::add_page_raster(&dir, None, 0, "r1", "Top", false, 0.5, tf(30.0, 40.0, 2.0), &img([3, 3], Color32::BLUE))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "Bottom",
+            true,
+            1.0,
+            tf(10.0, 20.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r1",
+            "Top",
+            false,
+            0.5,
+            tf(30.0, 40.0, 2.0),
+            &img([3, 3], Color32::BLUE),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
 
         let page = doc.page(0).expect("page resident");
         assert_eq!(page.nodes.len(), 2, "two raster nodes loaded");
@@ -1807,19 +1869,35 @@ mod tests {
     fn set_transform_round_trips_through_flush() {
         let dir = temp_dir("tf");
 
-        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r",
+            "Pic",
+            true,
+            1.0,
+            tf(1.0, 1.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         doc.set_transform(0, "r", tf(123.0, 456.0, 3.5));
         // Geometry-only change must not bump the generation.
-        assert_eq!(doc.node(0, "r").unwrap().generation, 0, "set_transform does not bump generation");
+        assert_eq!(
+            doc.node(0, "r").unwrap().generation,
+            0,
+            "set_transform does not bump generation"
+        );
         doc.flush_page(0, &dir, None).unwrap();
 
         // A fresh doc reload sees the new transform, including scale.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let r = doc2.node(0, "r").unwrap();
         assert!((r.transform.cx - 123.0).abs() < 1e-6, "cx round-trips");
         assert!((r.transform.cy - 456.0).abs() < 1e-6, "cy round-trips");
@@ -1833,13 +1911,34 @@ mod tests {
         // The typing tab's raster delete: remove the doc node, then flush DROPPING its uid so it does
         // not resurrect (save_page_rasters otherwise preserves a manifest raster as another tab's).
         let dir = temp_dir("drop_raster");
-        persist::add_page_raster(&dir, None, 0, "r0", "A", true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
-        persist::add_page_raster(&dir, None, 0, "r1", "B", true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::BLUE))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "A",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r1",
+            "B",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::BLUE),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         assert_eq!(doc.page(0).unwrap().nodes.len(), 2);
 
         // Remove r0 from the doc, then flush dropping it.
@@ -1848,8 +1947,12 @@ mod tests {
 
         // A fresh reload sees only r1 (r0 gone, not resurrected); r1 intact.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        assert!(doc2.node(0, "r0").is_none(), "deleted raster did not resurrect on disk");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        assert!(
+            doc2.node(0, "r0").is_none(),
+            "deleted raster did not resurrect on disk"
+        );
         assert!(doc2.node(0, "r1").is_some(), "the other raster survives");
         assert_eq!(doc2.page(0).unwrap().nodes.len(), 1);
 
@@ -1861,12 +1964,26 @@ mod tests {
         use super::super::manifest::DeformRec;
         let dir = temp_dir("dfm");
 
-        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r",
+            "Pic",
+            true,
+            1.0,
+            tf(1.0, 1.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        assert!(doc.node(0, "r").unwrap().deform.is_none(), "raster loads affine (no deform)");
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        assert!(
+            doc.node(0, "r").unwrap().deform.is_none(),
+            "raster loads affine (no deform)"
+        );
 
         let ver_before = doc.version();
         let gen_before = doc.node(0, "r").unwrap().generation;
@@ -1876,7 +1993,11 @@ mod tests {
             points_px: vec![[0.0, 0.0], [10.0, 1.0], [1.0, 12.0], [11.0, 13.0]],
         };
         doc.set_deform(0, "r", Some(mesh.clone()));
-        assert_eq!(doc.version(), ver_before + 1, "set_deform bumps the version");
+        assert_eq!(
+            doc.version(),
+            ver_before + 1,
+            "set_deform bumps the version"
+        );
         assert_eq!(
             doc.node(0, "r").unwrap().generation,
             gen_before,
@@ -1887,8 +2008,14 @@ mod tests {
 
         // A fresh doc reload sees the persisted mesh.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        let got = doc2.node(0, "r").unwrap().deform.as_ref().expect("deform round-trips");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        let got = doc2
+            .node(0, "r")
+            .unwrap()
+            .deform
+            .as_ref()
+            .expect("deform round-trips");
         assert_eq!(got.cols, 2);
         assert_eq!(got.rows, 2);
         assert_eq!(got.points_px, mesh.points_px);
@@ -1897,8 +2024,12 @@ mod tests {
         doc2.set_deform(0, "r", None);
         doc2.flush_page(0, &dir, None).unwrap();
         let mut doc3 = LayerDoc::new();
-        doc3.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        assert!(doc3.node(0, "r").unwrap().deform.is_none(), "cleared deform stays None");
+        doc3.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        assert!(
+            doc3.node(0, "r").unwrap().deform.is_none(),
+            "cleared deform stays None"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1906,11 +2037,22 @@ mod tests {
     #[test]
     fn set_raster_mask_clip_bumps_generation_and_round_trips_through_flush() {
         let dir = temp_dir("rclip");
-        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r",
+            "Pic",
+            true,
+            1.0,
+            tf(1.0, 1.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         // A freshly-loaded raster defaults OFF (no clip).
         if let NodeBody::Raster { mask_clip, .. } = &doc.node(0, "r").unwrap().body {
             assert_eq!(*mask_clip, None, "raster defaults to no mask-clip");
@@ -1932,9 +2074,14 @@ mod tests {
 
         doc.flush_page(0, &dir, None).unwrap();
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         if let NodeBody::Raster { mask_clip, .. } = &doc2.node(0, "r").unwrap().body {
-            assert_eq!(*mask_clip, Some(true), "mask_clip round-trips through the doc + flush");
+            assert_eq!(
+                *mask_clip,
+                Some(true),
+                "mask_clip round-trips through the doc + flush"
+            );
         } else {
             panic!("expected raster body");
         }
@@ -1943,7 +2090,11 @@ mod tests {
         doc2.add_node(0, text_node("t", [2, 2], Color32::WHITE));
         let t_gen = doc2.node(0, "t").unwrap().generation;
         doc2.set_raster_mask_clip(0, "t", Some(true));
-        assert_eq!(doc2.node(0, "t").unwrap().generation, t_gen, "no-op on a text node");
+        assert_eq!(
+            doc2.node(0, "t").unwrap().generation,
+            t_gen,
+            "no-op on a text node"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1952,11 +2103,22 @@ mod tests {
     fn set_effects_bumps_generation_and_persists() {
         let dir = temp_dir("fx");
 
-        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r",
+            "Pic",
+            true,
+            1.0,
+            tf(1.0, 1.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let gen_before = doc.node(0, "r").unwrap().generation;
 
         let effects = vec![serde_json::json!({"type": "shadow"})];
@@ -1966,10 +2128,18 @@ mod tests {
         let node = doc.node(0, "r").unwrap();
         assert!(node.generation > gen_before, "set_effects bumps generation");
         // display_image now differs from the base.
-        if let NodeBody::Raster { base_image, display_image, .. } = &node.body {
+        if let NodeBody::Raster {
+            base_image,
+            display_image,
+            ..
+        } = &node.body
+        {
             assert_eq!(base_image.size, [2, 2]);
             assert_eq!(display_image.size, [4, 4], "display image replaced");
-            assert_ne!(base_image.size, display_image.size, "display distinct from base");
+            assert_ne!(
+                base_image.size, display_image.size,
+                "display distinct from base"
+            );
         } else {
             panic!("expected raster body");
         }
@@ -1978,13 +2148,23 @@ mod tests {
 
         // Reload: effects present, display distinct from base.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let r = doc2.node(0, "r").unwrap();
-        if let NodeBody::Raster { base_image, display_image, effects, .. } = &r.body {
+        if let NodeBody::Raster {
+            base_image,
+            display_image,
+            effects,
+            ..
+        } = &r.body
+        {
             assert_eq!(effects.len(), 1, "effects chain persisted");
             assert_eq!(display_image.size, [4, 4], "rendered display persisted");
             assert_eq!(base_image.size, [2, 2], "base preserved (non-destructive)");
-            assert_ne!(base_image.size, display_image.size, "display still distinct from base");
+            assert_ne!(
+                base_image.size, display_image.size,
+                "display still distinct from base"
+            );
         } else {
             panic!("expected raster body");
         }
@@ -1996,26 +2176,66 @@ mod tests {
     fn reorder_node_one_swaps_z() {
         let dir = temp_dir("reorder");
 
-        persist::add_page_raster(&dir, None, 0, "r0", "A", true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
-        persist::add_page_raster(&dir, None, 0, "r1", "B", true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::BLUE))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "A",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r1",
+            "B",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::BLUE),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
 
-        let order_before: Vec<String> = doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect();
+        let order_before: Vec<String> = doc
+            .page(0)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.uid.clone())
+            .collect();
         assert_eq!(order_before, vec!["r0".to_string(), "r1".to_string()]);
 
         // Move bottom node (r0) up one: it swaps z with r1, so order flips.
         let changed = doc.reorder_node_one(0, "r0", true);
         assert!(changed, "reorder reports a change");
 
-        let order_after: Vec<String> = doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect();
-        assert_eq!(order_after, vec!["r1".to_string(), "r0".to_string()], "order flipped");
+        let order_after: Vec<String> = doc
+            .page(0)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.uid.clone())
+            .collect();
+        assert_eq!(
+            order_after,
+            vec!["r1".to_string(), "r0".to_string()],
+            "order flipped"
+        );
 
         // Already at the top: moving up again is a no-op.
-        assert!(!doc.reorder_node_one(0, "r0", true), "top node can't move up");
+        assert!(
+            !doc.reorder_node_one(0, "r0", true),
+            "top node can't move up"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2034,28 +2254,53 @@ mod tests {
         doc.add_node(0, c);
         doc.add_group(
             0,
-            GroupMeta { uid: "g0".into(), name: "G".into(), visible: true, opacity: 1.0, collapsed: false },
+            GroupMeta {
+                uid: "g0".into(),
+                name: "G".into(),
+                visible: true,
+                opacity: 1.0,
+                collapsed: false,
+            },
         );
 
         let order = |d: &LayerDoc| -> Vec<String> {
-            d.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect()
+            d.page(0)
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|n| n.uid.clone())
+                .collect()
         };
         assert_eq!(order(&doc), vec!["a", "b", "c"]);
 
         // Move the g0 block up: it hops past the ungrouped c, preserving intra-group order a<b.
         assert!(doc.reorder_group_block(0, "g0", true), "group block moved");
-        assert_eq!(order(&doc), vec!["c", "a", "b"], "group hopped past c, intra-order kept");
+        assert_eq!(
+            order(&doc),
+            vec!["c", "a", "b"],
+            "group hopped past c, intra-order kept"
+        );
         // z stays contiguous and sorted.
         let zs: Vec<u32> = doc.page(0).unwrap().nodes.iter().map(|n| n.z).collect();
         assert_eq!(zs, vec![0, 1, 2], "z reassigned contiguously");
 
         // Move it back down: g0 hops past c again, restoring the original order.
-        assert!(doc.reorder_group_block(0, "g0", false), "group block moved back");
-        assert_eq!(order(&doc), vec!["a", "b", "c"], "moved back to original order");
+        assert!(
+            doc.reorder_group_block(0, "g0", false),
+            "group block moved back"
+        );
+        assert_eq!(
+            order(&doc),
+            vec!["a", "b", "c"],
+            "moved back to original order"
+        );
 
         // g0 is now the bottom block; moving it down further is a no-op.
         let before = doc.version();
-        assert!(!doc.reorder_group_block(0, "g0", false), "g0 already at the bottom");
+        assert!(
+            !doc.reorder_group_block(0, "g0", false),
+            "g0 already at the bottom"
+        );
         assert_eq!(doc.version(), before, "no-op did not bump version");
 
         // Unknown group → false.
@@ -2070,13 +2315,22 @@ mod tests {
         doc.add_node(0, raster_node("c", [2, 2], Color32::BLUE));
 
         let order = |d: &LayerDoc| -> Vec<String> {
-            d.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect()
+            d.page(0)
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|n| n.uid.clone())
+                .collect()
         };
         assert_eq!(order(&doc), vec!["a", "b", "c"]);
 
         // Reverse the order via an explicit uid list.
         doc.set_z_order(0, &["c".into(), "b".into(), "a".into()]);
-        assert_eq!(order(&doc), vec!["c", "b", "a"], "reordered to the listed order");
+        assert_eq!(
+            order(&doc),
+            vec!["c", "b", "a"],
+            "reordered to the listed order"
+        );
         let zs: Vec<u32> = doc.page(0).unwrap().nodes.iter().map(|n| n.z).collect();
         assert_eq!(zs, vec![0, 1, 2], "z = position in the list");
 
@@ -2112,12 +2366,15 @@ mod tests {
             .iter_mut()
             .find(|p| p["img_idx"] == 0)
             .expect("page 0 exists");
-        page["tree"].as_array_mut().unwrap().push(serde_json::json!({
-            "uid": uid, "name": uid, "kind": "text", "z": z,
-            "layer_idx": layer_idx, "pinned": pinned,
-            "visible": visible, "opacity": opacity,
-            "payload_ref": { "store": "text_info", "uid": uid }
-        }));
+        page["tree"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "uid": uid, "name": uid, "kind": "text", "z": z,
+                "layer_idx": layer_idx, "pinned": pinned,
+                "visible": visible, "opacity": opacity,
+                "payload_ref": { "store": "text_info", "uid": uid }
+            }));
         fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
     }
 
@@ -2149,14 +2406,32 @@ mod tests {
         // sub-order exactly: group 0's members (by Y) then group 1's members (by Y).
         let dir = temp_dir("degenerate_two_groups");
         // A raster first, to create the page manifest (and sit at the bottom, z=0).
-        persist::add_page_raster(&dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "R",
+            true,
+            1.0,
+            tf(50.0, 50.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         // Both groups at the SAME band Z = 5 (degenerate; normally distinct).
         add_text_group_band(&dir, 0, 5);
         add_text_group_band(&dir, 1, 5);
         // group 0: a (Y=30), b (Y=10); group 1: c (Y=20), d (Y=5). All unpinned at node z=0.
         for uid in ["a", "b", "c", "d"] {
-            add_legacy_text_ref_node(&dir, uid, 0, if matches!(uid, "a" | "b") { 0 } else { 1 }, false, true, 1.0);
+            add_legacy_text_ref_node(
+                &dir,
+                uid,
+                0,
+                if matches!(uid, "a" | "b") { 0 } else { 1 },
+                false,
+                true,
+                1.0,
+            );
         }
         let mk = |uid: &str, layer_idx: u32, y: f32| {
             save_png(&dir.join(format!("{uid}.png")), 4, 3, [0, 255, 0, 255]);
@@ -2166,15 +2441,35 @@ mod tests {
                 "render_data": { "text": uid }
             })
         };
-        let overlays = serde_json::json!([mk("a", 0, 30.0), mk("b", 0, 10.0), mk("c", 1, 20.0), mk("d", 1, 5.0)]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        let overlays = serde_json::json!([
+            mk("a", 0, 30.0),
+            mk("b", 0, 10.0),
+            mk("c", 1, 20.0),
+            mk("d", 1, 5.0)
+        ]);
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
-        let order: Vec<&str> = doc.page(0).unwrap().nodes.iter().map(|n| n.uid.as_str()).collect();
+        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
+        let order: Vec<&str> = doc
+            .page(0)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.uid.as_str())
+            .collect();
         // Raster at the bottom (z=0 < group z=5), then (layer_idx asc, then page-Y asc):
         // group0 = b(10), a(30); group1 = d(5), c(20).
-        assert_eq!(order, vec!["r0", "b", "a", "d", "c"], "old (layer_idx, page-Y) sub-order reproduced");
+        assert_eq!(
+            order,
+            vec!["r0", "b", "a", "d", "c"],
+            "old (layer_idx, page-Y) sub-order reproduced"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2187,8 +2482,18 @@ mod tests {
         let dir = temp_dir("legacy_group_flatten");
 
         // Raster r0 at the BOTTOM (add_page_raster assigns z above existing bands → 0 here).
-        persist::add_page_raster(&dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "R",
+            true,
+            1.0,
+            tf(50.0, 50.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         // Text group 0 band ABOVE the raster (z = 5). Three unpinned members.
         add_text_group_band(&dir, 0, 5);
         for uid in ["tc", "ta", "tb"] {
@@ -2205,15 +2510,24 @@ mod tests {
             })
         };
         let overlays = serde_json::json!([mk("ta", 10.0), mk("tb", 20.0), mk("tc", 30.0)]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
         let page = doc.page(0).expect("resident");
 
         // Bottom-to-top: raster (group band was z=5 > raster z=0), then the group members by page-Y.
         let order: Vec<&str> = page.nodes.iter().map(|n| n.uid.as_str()).collect();
-        assert_eq!(order, vec!["r0", "ta", "tb", "tc"], "visual order preserved, group flattened by page-Y");
+        assert_eq!(
+            order,
+            vec!["r0", "ta", "tb", "tc"],
+            "visual order preserved, group flattened by page-Y"
+        );
         // Every node now has a UNIQUE, contiguous Z (each text individually movable).
         let zs: Vec<u32> = page.nodes.iter().map(|n| n.z).collect();
         assert_eq!(zs, vec![0, 1, 2, 3], "each band has a unique sequential Z");
@@ -2221,13 +2535,27 @@ mod tests {
         // IDEMPOTENCY: flush to disk → reload → order unchanged (no drift across save/reload).
         doc.flush_page(0, &dir, None).unwrap();
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
-        let order2: Vec<String> = doc2.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect();
-        assert_eq!(order2, vec!["r0", "ta", "tb", "tc"], "order stable across a save/reload cycle");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
+        let order2: Vec<String> = doc2
+            .page(0)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.uid.clone())
+            .collect();
+        assert_eq!(
+            order2,
+            vec!["r0", "ta", "tb", "tc"],
+            "order stable across a save/reload cycle"
+        );
         // On disk every text is now pinned-with-explicit-Z; no TextGroup band remains.
         let bands = persist::load_page_bands(&dir, None, 0);
         assert!(
-            !bands.iter().any(|b| matches!(b, crate::models::layer_model::ordering::Band::TextGroup { .. })),
+            !bands.iter().any(|b| matches!(
+                b,
+                crate::models::layer_model::ordering::Band::TextGroup { .. }
+            )),
             "groups dissolved into per-text pinned bands after the flush"
         );
 
@@ -2238,8 +2566,18 @@ mod tests {
     fn new_text_node_is_added_on_top() {
         // PART 1(d): a NEW text overlay goes to the TOP of the unified Z (max Z + 1), not auto-by-Y.
         let dir = temp_dir("new_text_top");
-        persist::add_page_raster(&dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "R",
+            true,
+            1.0,
+            tf(50.0, 50.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         add_legacy_text_ref_node(&dir, "t0", 5, 0, true, true, 1.0);
         save_png(&dir.join("t0.png"), 4, 3, [0, 255, 0, 255]);
         let overlays = serde_json::json!([{
@@ -2247,10 +2585,15 @@ mod tests {
             "img_x_px": 5.0, "img_y_px": 5.0, "rotation_deg": 0.0, "scale": 1.0,
             "render_data": { "text": "t0" }
         }]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
 
         // Add a NEW text node (a freshly-created overlay routes through `add_node`).
         let new_node = LayerNode {
@@ -2262,13 +2605,19 @@ mod tests {
             opacity: 1.0,
             group_uid: None,
             text_layer_idx: Some(0),
-            transform: TransformRec { cx: 5.0, cy: 1.0, rotation: 0.0, scale: 1.0 }, // very high on page (low Y)
+            transform: TransformRec {
+                cx: 5.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            }, // very high on page (low Y)
             deform: None,
             generation: 0,
             pixels_dirty: false,
             body: NodeBody::Text {
                 render_data: serde_json::json!({ "text": "new" }),
                 image: img([2, 2], Color32::GREEN),
+                is_image: false,
                 payload_uid: "tnew".into(),
                 mask_clip: None,
             },
@@ -2276,8 +2625,18 @@ mod tests {
         assert!(doc.add_node(0, new_node));
 
         // Despite a low page-Y (which auto-Y would have sunk), the new text is on TOP.
-        let order: Vec<String> = doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect();
-        assert_eq!(order.last().map(String::as_str), Some("tnew"), "new text is on top (max Z + 1)");
+        let order: Vec<String> = doc
+            .page(0)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.uid.clone())
+            .collect();
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("tnew"),
+            "new text is on top (max Z + 1)"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2286,8 +2645,18 @@ mod tests {
         // A flattened text owns its own band, so it can move BELOW a raster (Part 1 unifies text+raster Z)
         // and back, via the doc Z order (the same set_z_order the ⬆/⬇ band move uses).
         let dir = temp_dir("text_below_raster");
-        persist::add_page_raster(&dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "R",
+            true,
+            1.0,
+            tf(50.0, 50.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         add_legacy_text_ref_node(&dir, "t0", 5, 0, true, true, 1.0);
         save_png(&dir.join("t0.png"), 4, 3, [0, 255, 0, 255]);
         let overlays = serde_json::json!([{
@@ -2295,26 +2664,46 @@ mod tests {
             "img_x_px": 5.0, "img_y_px": 5.0, "rotation_deg": 0.0, "scale": 1.0,
             "render_data": { "text": "t0" }
         }]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
         // Initially text above raster.
         assert_eq!(
-            doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect::<Vec<_>>(),
+            doc.page(0)
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|n| n.uid.clone())
+                .collect::<Vec<_>>(),
             vec!["r0".to_string(), "t0".to_string()]
         );
         // Move text BELOW the raster.
         doc.set_z_order(0, &["t0".to_string(), "r0".to_string()]);
         assert_eq!(
-            doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect::<Vec<_>>(),
+            doc.page(0)
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|n| n.uid.clone())
+                .collect::<Vec<_>>(),
             vec!["t0".to_string(), "r0".to_string()],
             "text now below the raster"
         );
         // And back above.
         doc.set_z_order(0, &["r0".to_string(), "t0".to_string()]);
         assert_eq!(
-            doc.page(0).unwrap().nodes.iter().map(|n| n.uid.clone()).collect::<Vec<_>>(),
+            doc.page(0)
+                .unwrap()
+                .nodes
+                .iter()
+                .map(|n| n.uid.clone())
+                .collect::<Vec<_>>(),
             vec!["r0".to_string(), "t0".to_string()]
         );
         let _ = fs::remove_dir_all(&dir);
@@ -2325,8 +2714,18 @@ mod tests {
         let dir = temp_dir("text_load");
 
         // A raster at the bottom (z = 0). add_page_raster assigns Z above existing bands → 0 here.
-        persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf(10.0, 20.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "Bottom",
+            true,
+            1.0,
+            tf(10.0, 20.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
 
         // A pinned text node at z = 5 (above the raster), referencing an overlay payload by uid.
         add_legacy_text_ref_node(&dir, "t0", 5, 0, true, false, 0.75);
@@ -2347,10 +2746,15 @@ mod tests {
                 "render_data": { "text": "Hello", "size": 24 }
             }
         ]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+            .unwrap();
 
         let page = doc.page(0).expect("page resident");
         assert_eq!(page.nodes.len(), 2, "raster + text loaded");
@@ -2359,19 +2763,34 @@ mod tests {
         assert!(page.nodes[0].is_raster());
         assert_eq!(page.nodes[1].uid, "t0");
         assert!(page.nodes[1].is_text());
-        assert!(page.nodes[0].z < page.nodes[1].z, "text sorts above the raster");
+        assert!(
+            page.nodes[0].z < page.nodes[1].z,
+            "text sorts above the raster"
+        );
 
         let t = doc.node(0, "t0").unwrap();
         assert!(t.is_text());
         assert!(!t.visible, "visible carried from the text node");
-        assert!((t.opacity - 0.75).abs() < 1e-6, "opacity carried from the text node");
+        assert!(
+            (t.opacity - 0.75).abs() < 1e-6,
+            "opacity carried from the text node"
+        );
         // Transform decoded from the overlay payload (img_x/y → center, deg→rad).
         assert!((t.transform.cx - 111.0).abs() < 1e-6);
         assert!((t.transform.cy - 222.0).abs() < 1e-6);
         assert!((t.transform.rotation - 0.0).abs() < 1e-6);
         assert!((t.transform.scale - 1.0).abs() < 1e-6);
-        assert_eq!(t.display_image().size, [4, 3], "rendered overlay PNG loaded");
-        if let NodeBody::Text { render_data, payload_uid, .. } = &t.body {
+        assert_eq!(
+            t.display_image().size,
+            [4, 3],
+            "rendered overlay PNG loaded"
+        );
+        if let NodeBody::Text {
+            render_data,
+            payload_uid,
+            ..
+        } = &t.body
+        {
             assert_eq!(payload_uid, "t0");
             assert_eq!(render_data["text"], "Hello");
         } else {
@@ -2402,15 +2821,34 @@ mod tests {
               "render_data": {} },
             { "uid": "other", "img_idx": 1, "overlay_type": "text", "file": "a.png" }
         ]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let page = doc.page(0).expect("page resident");
-        assert_eq!(page.nodes.len(), 2, "both page-0 overlays loaded despite having no layers.json nodes");
-        assert!(doc.node(0, "a").is_some_and(|n| n.is_text() && n.visible), "default visible=true");
-        assert!(doc.node(0, "b").is_some_and(LayerNode::is_text));
-        assert!(doc.node(0, "other").is_none(), "page-1 overlay not loaded onto page 0");
+        assert_eq!(
+            page.nodes.len(),
+            2,
+            "both page-0 overlays loaded despite having no layers.json nodes"
+        );
+        assert!(
+            doc.node(0, "a").is_some_and(|n| n.is_text() && n.visible),
+            "default visible=true"
+        );
+        assert!(
+            doc.node(0, "b")
+                .is_some_and(|node| { matches!(node.body, NodeBody::Text { is_image: true, .. }) }),
+            "legacy image overlay retains its image marker"
+        );
+        assert!(
+            doc.node(0, "other").is_none(),
+            "page-1 overlay not loaded onto page 0"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2419,15 +2857,30 @@ mod tests {
     fn ensure_page_loaded_skips_text_node_without_overlay() {
         let dir = temp_dir("text_no_overlay");
 
-        persist::add_page_raster(&dir, None, 0, "r0", "Bottom", true, 1.0, tf(0.0, 0.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "Bottom",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         // A text node whose payload has no matching text_info.json entry → skipped (warned).
         add_legacy_text_ref_node(&dir, "ghost", 3, 0, true, true, 1.0);
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let page = doc.page(0).unwrap();
-        assert_eq!(page.nodes.len(), 1, "text node without an overlay is skipped");
+        assert_eq!(
+            page.nodes.len(),
+            1,
+            "text node without an overlay is skipped"
+        );
         assert!(page.nodes[0].is_raster());
 
         let _ = fs::remove_dir_all(&dir);
@@ -2444,7 +2897,12 @@ mod tests {
             opacity: 0.5,
             group_uid: None,
             text_layer_idx: Some(0),
-            transform: TransformRec { cx: 111.0, cy: 222.0, rotation: 0.7, scale: 1.5 },
+            transform: TransformRec {
+                cx: 111.0,
+                cy: 222.0,
+                rotation: 0.7,
+                scale: 1.5,
+            },
             deform: Some(DeformRec {
                 cols: 2,
                 rows: 2,
@@ -2455,6 +2913,7 @@ mod tests {
             body: NodeBody::Text {
                 render_data: serde_json::json!({"text": "Hello", "size": 24}),
                 image: img([4, 3], Color32::GREEN),
+                is_image: false,
                 payload_uid: uid.into(),
                 mask_clip: Some(true),
             },
@@ -2471,22 +2930,40 @@ mod tests {
         doc.add_node(0, text_node_with_payload("t0"));
         doc.flush_page(0, &dir, None).unwrap();
         // No text_info.json was written: the inline payload is self-sufficient.
-        assert!(!dir.join("text_info.json").exists(), "flush writes no text_info.json");
+        assert!(
+            !dir.join("text_info.json").exists(),
+            "flush writes no text_info.json"
+        );
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        let t = doc2.node(0, "t0").expect("inline text node reloads from layers.json alone");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        let t = doc2
+            .node(0, "t0")
+            .expect("inline text node reloads from layers.json alone");
         assert!(t.is_text());
         assert!(!t.visible, "visible round-trips");
         assert!((t.opacity - 0.5).abs() < 1e-6, "opacity round-trips");
         assert!((t.transform.cx - 111.0).abs() < 1e-4, "cx round-trips");
         assert!((t.transform.cy - 222.0).abs() < 1e-4, "cy round-trips");
-        assert!((t.transform.rotation - 0.7).abs() < 1e-5, "rotation (radians) round-trips");
+        assert!(
+            (t.transform.rotation - 0.7).abs() < 1e-5,
+            "rotation (radians) round-trips"
+        );
         assert!((t.transform.scale - 1.5).abs() < 1e-6, "scale round-trips");
         let d = t.deform.as_ref().expect("deform round-trips");
-        assert_eq!(d.points_px, vec![[0.0, 0.0], [10.0, 1.0], [1.0, 12.0], [11.0, 13.0]]);
+        assert_eq!(
+            d.points_px,
+            vec![[0.0, 0.0], [10.0, 1.0], [1.0, 12.0], [11.0, 13.0]]
+        );
         assert_eq!(t.display_image().size, [4, 3], "rendered PNG round-trips");
-        if let NodeBody::Text { render_data, mask_clip, payload_uid, .. } = &t.body {
+        if let NodeBody::Text {
+            render_data,
+            mask_clip,
+            payload_uid,
+            ..
+        } = &t.body
+        {
             assert_eq!(render_data["text"], "Hello");
             assert_eq!(render_data["size"], 24);
             assert_eq!(*mask_clip, Some(true), "mask_clip persisted");
@@ -2505,18 +2982,36 @@ mod tests {
         let dir = temp_dir("text_flush_preserve");
 
         // Seed a raster on disk, load it, add a text node, flush.
-        persist::add_page_raster(&dir, None, 0, "r0", "Pic", true, 1.0, tf(5.0, 5.0, 1.0), &img([2, 2], Color32::RED))
-            .unwrap();
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r0",
+            "Pic",
+            true,
+            1.0,
+            tf(5.0, 5.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         doc.add_node(0, text_node_with_payload("t0"));
         doc.flush_page(0, &dir, None).unwrap();
 
         // Both kinds present on a fresh reload.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        assert!(doc2.node(0, "r0").is_some_and(LayerNode::is_raster), "raster preserved across text flush");
-        assert!(doc2.node(0, "t0").is_some_and(LayerNode::is_text), "text node persisted");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        assert!(
+            doc2.node(0, "r0").is_some_and(LayerNode::is_raster),
+            "raster preserved across text flush"
+        );
+        assert!(
+            doc2.node(0, "t0").is_some_and(LayerNode::is_text),
+            "text node persisted"
+        );
 
         // The raster is still loadable from persist (kind-filter preserved it).
         let rasters = persist::load_page_rasters(&dir, None, 0).unwrap();
@@ -2545,7 +3040,11 @@ mod tests {
                 }]
             }]
         });
-        fs::write(dir.join("layers.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        fs::write(
+            dir.join("layers.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
 
         // The legacy payload + PNG live in text_info.json.
         save_png(&dir.join("t0.png"), 6, 5, [0, 255, 0, 255]);
@@ -2554,16 +3053,27 @@ mod tests {
               "img_x_px": 50.0, "img_y_px": 60.0, "rotation_deg": 90.0, "scale": 2.0,
               "render_data": { "text": "Legacy" } }
         ]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let t = doc.node(0, "t0").expect("legacy text node loaded");
         assert!(t.is_text());
-        assert!((t.opacity - 0.8).abs() < 1e-6, "opacity from the layers.json override");
+        assert!(
+            (t.opacity - 0.8).abs() < 1e-6,
+            "opacity from the layers.json override"
+        );
         // Geometry decoded from the legacy entry (deg→rad).
         assert!((t.transform.cx - 50.0).abs() < 1e-4);
-        assert!((t.transform.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4, "90° → π/2");
+        assert!(
+            (t.transform.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "90° → π/2"
+        );
         assert!((t.transform.scale - 2.0).abs() < 1e-6);
         assert_eq!(t.display_image().size, [6, 5], "legacy PNG loaded");
         if let NodeBody::Text { render_data, .. } = &t.body {
@@ -2578,12 +3088,24 @@ mod tests {
         // Remove the legacy file: the migrated page must load without it.
         let _ = fs::remove_file(dir.join("text_info.json"));
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        let t = doc2.node(0, "t0").expect("migrated text node reloads from inline alone");
-        assert_eq!(t.name, "T", "persisted node name round-trips (not regenerated)");
-        assert!((t.transform.scale - 2.0).abs() < 1e-6, "geometry migrated to inline");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        let t = doc2
+            .node(0, "t0")
+            .expect("migrated text node reloads from inline alone");
+        assert_eq!(
+            t.name, "T",
+            "persisted node name round-trips (not regenerated)"
+        );
+        assert!(
+            (t.transform.scale - 2.0).abs() < 1e-6,
+            "geometry migrated to inline"
+        );
         if let NodeBody::Text { render_data, .. } = &t.body {
-            assert_eq!(render_data["text"], "Legacy", "render_data migrated to inline");
+            assert_eq!(
+                render_data["text"], "Legacy",
+                "render_data migrated to inline"
+            );
         } else {
             panic!("expected text body");
         }
@@ -2603,18 +3125,46 @@ mod tests {
         doc.add_node(0, node);
 
         // Geometry edit (drag) + a re-render (text change) routed through the doc mutators.
-        doc.set_transform(0, "ov1", TransformRec { cx: 77.0, cy: 88.0, rotation: 0.3, scale: 2.5 });
-        doc.set_text_render(0, "ov1", serde_json::json!({"text": "Edited", "size": 40}), img([6, 5], Color32::BLUE));
+        doc.set_transform(
+            0,
+            "ov1",
+            TransformRec {
+                cx: 77.0,
+                cy: 88.0,
+                rotation: 0.3,
+                scale: 2.5,
+            },
+        );
+        doc.set_text_render(
+            0,
+            "ov1",
+            serde_json::json!({"text": "Edited", "size": 40}),
+            img([6, 5], Color32::BLUE),
+        );
         doc.flush_page_text(0, &dir, None).unwrap();
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         let t = doc2.node(0, "ov1").expect("text node reloads");
-        assert!((t.transform.cx - 77.0).abs() < 1e-4, "edited cx round-trips");
-        assert!((t.transform.scale - 2.5).abs() < 1e-6, "edited scale round-trips");
-        assert!((t.transform.rotation - 0.3).abs() < 1e-5, "edited rotation round-trips");
+        assert!(
+            (t.transform.cx - 77.0).abs() < 1e-4,
+            "edited cx round-trips"
+        );
+        assert!(
+            (t.transform.scale - 2.5).abs() < 1e-6,
+            "edited scale round-trips"
+        );
+        assert!(
+            (t.transform.rotation - 0.3).abs() < 1e-5,
+            "edited rotation round-trips"
+        );
         assert_eq!(t.text_layer_idx, Some(3), "text-group axis round-trips");
-        assert_eq!(t.display_image().size, [6, 5], "re-rendered image round-trips");
+        assert_eq!(
+            t.display_image().size,
+            [6, 5],
+            "re-rendered image round-trips"
+        );
         if let NodeBody::Text { render_data, .. } = &t.body {
             assert_eq!(render_data["text"], "Edited");
             assert_eq!(render_data["size"], 40);
@@ -2639,16 +3189,29 @@ mod tests {
         let before = std::fs::read(&png_path).expect("initial png written");
 
         // Re-render with a DIFFERENT-sized, different-colored image; set_text_render sets pixels_dirty.
-        doc.set_text_render(0, "t0", serde_json::json!({"text": "New"}), img([9, 7], Color32::from_rgb(1, 2, 3)));
-        assert!(doc.node(0, "t0").unwrap().pixels_dirty, "set_text_render marks pixels_dirty");
+        doc.set_text_render(
+            0,
+            "t0",
+            serde_json::json!({"text": "New"}),
+            img([9, 7], Color32::from_rgb(1, 2, 3)),
+        );
+        assert!(
+            doc.node(0, "t0").unwrap().pixels_dirty,
+            "set_text_render marks pixels_dirty"
+        );
         doc.flush_page_text(0, &dir, None).unwrap();
         let after = std::fs::read(&png_path).expect("png still present");
         assert_ne!(before, after, "flush re-encoded the changed text PNG");
 
         // Reload sees the new pixels.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
-        assert_eq!(doc2.node(0, "t0").unwrap().display_image().size, [9, 7], "new render size persisted");
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        assert_eq!(
+            doc2.node(0, "t0").unwrap().display_image().size,
+            [9, 7],
+            "new render size persisted"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2669,12 +3232,20 @@ mod tests {
             { "uid": "ghost", "img_idx": 0, "overlay_type": "text", "file": "ghost.png",
               "img_x_px": 1.0, "img_y_px": 1.0, "rotation_deg": 0.0, "scale": 1.0, "render_data": {} }
         ]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100])).unwrap();
+        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
         assert!(doc2.node(0, "keep").is_some(), "inline node loads");
-        assert!(doc2.node(0, "ghost").is_none(), "stale legacy overlay does NOT resurrect on a migrated page");
+        assert!(
+            doc2.node(0, "ghost").is_none(),
+            "stale legacy overlay does NOT resurrect on a migrated page"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2697,7 +3268,11 @@ mod tests {
             {"uid":"b","page":"1_2","x":10.0,"y":150.0,"region_w":20.0,"region_h":4.0,
              "file":"b.png","render_data":{"text":"B"}},
         ]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         let full: HashMap<usize, [usize; 2]> =
             [(0, [100, 250]), (1, [100, 300])].into_iter().collect();
@@ -2707,7 +3282,10 @@ mod tests {
         let migrated = text_payload::migrate_overlay_entries(&raw, &full, |_| (0.0, 0.0));
         let ref_obj = migrated
             .iter()
-            .find_map(|e| e.as_object().filter(|o| o.get("uid").and_then(Value::as_str) == Some("b")))
+            .find_map(|e| {
+                e.as_object()
+                    .filter(|o| o.get("uid").and_then(Value::as_str) == Some("b"))
+            })
             .expect("page-1 entry migrated")
             .clone();
         let ref_placement = text_payload::decode_overlay_placement(&ref_obj, [100, 300]);
@@ -2719,22 +3297,29 @@ mod tests {
         assert!(
             (t.transform.cx - ref_placement.transform.cx).abs() < 1e-3,
             "cx matches full-map reference: doc={} ref={}",
-            t.transform.cx, ref_placement.transform.cx
+            t.transform.cx,
+            ref_placement.transform.cx
         );
         assert!(
             (t.transform.cy - ref_placement.transform.cy).abs() < 1e-3,
             "cy matches full-map reference: doc={} ref={}",
-            t.transform.cy, ref_placement.transform.cy
+            t.transform.cy,
+            ref_placement.transform.cy
         );
         // Sanity: a single-page map would have produced a different cy (the corruption case).
         let single: HashMap<usize, [usize; 2]> = [(1, [100, 300])].into_iter().collect();
         let migrated_bad = text_payload::migrate_overlay_entries(&raw, &single, |_| (0.0, 0.0));
         let bad_obj = migrated_bad
             .iter()
-            .find_map(|e| e.as_object().filter(|o| o.get("uid").and_then(Value::as_str) == Some("b")))
+            .find_map(|e| {
+                e.as_object()
+                    .filter(|o| o.get("uid").and_then(Value::as_str) == Some("b"))
+            })
             .unwrap()
             .clone();
-        let bad_cy = text_payload::decode_overlay_placement(&bad_obj, [100, 300]).transform.cy;
+        let bad_cy = text_payload::decode_overlay_placement(&bad_obj, [100, 300])
+            .transform
+            .cy;
         assert!(
             (t.transform.cy - bad_cy).abs() > 1e-2,
             "the full-map doc result differs from the buggy single-page result (corruption avoided)"
@@ -2762,6 +3347,7 @@ mod tests {
             body: NodeBody::Text {
                 render_data: serde_json::json!({"text": "Hello", "size": 24}),
                 image: img([5, 6], Color32::WHITE),
+                is_image: false,
                 payload_uid: "payload-123".into(),
                 mask_clip: None,
             },
@@ -2769,8 +3355,17 @@ mod tests {
 
         assert!(node.is_text());
         assert!(!node.is_raster());
-        assert_eq!(node.display_image().size, [5, 6], "display_image returns the text image");
-        if let NodeBody::Text { payload_uid, render_data, .. } = &node.body {
+        assert_eq!(
+            node.display_image().size,
+            [5, 6],
+            "display_image returns the text image"
+        );
+        if let NodeBody::Text {
+            payload_uid,
+            render_data,
+            ..
+        } = &node.body
+        {
             assert_eq!(payload_uid, "payload-123");
             assert_eq!(render_data["text"], "Hello");
         } else {
@@ -2821,6 +3416,7 @@ mod tests {
             body: NodeBody::Text {
                 render_data: serde_json::json!({"text": "x"}),
                 image: img(size, c),
+                is_image: false,
                 payload_uid: uid.into(),
                 mask_clip: None,
             },
@@ -2830,7 +3426,13 @@ mod tests {
     /// A resident, empty page for in-memory mutator tests (no disk involved).
     fn doc_with_empty_page() -> LayerDoc {
         let mut doc = LayerDoc::new();
-        doc.pages.insert(0, DocPage { nodes: Vec::new(), groups: Vec::new() });
+        doc.pages.insert(
+            0,
+            DocPage {
+                nodes: Vec::new(),
+                groups: Vec::new(),
+            },
+        );
         doc
     }
 
@@ -2860,9 +3462,21 @@ mod tests {
         assert_bumped(&doc, "set_visibility");
         doc.set_opacity(0, "a", 0.5);
         assert_bumped(&doc, "set_opacity");
-        doc.set_effects(0, "a", vec![serde_json::json!({"x": 1})], img([3, 3], Color32::GREEN));
+        doc.set_effects(
+            0,
+            "a",
+            vec![serde_json::json!({"x": 1})],
+            img([3, 3], Color32::GREEN),
+        );
         assert_bumped(&doc, "set_effects");
-        doc.set_raster_pixels(0, "a", img([4, 4], Color32::RED), img([4, 4], Color32::RED), Vec::new(), true);
+        doc.set_raster_pixels(
+            0,
+            "a",
+            img([4, 4], Color32::RED),
+            img([4, 4], Color32::RED),
+            Vec::new(),
+            true,
+        );
         assert_bumped(&doc, "set_raster_pixels");
         assert!(doc.reorder_node_one(0, "a", true));
         assert_bumped(&doc, "reorder_node_one");
@@ -2883,7 +3497,12 @@ mod tests {
 
         doc.add_node(0, text_node("t", [2, 2], Color32::WHITE));
         assert_bumped(&doc, "add_node t");
-        doc.set_text_render(0, "t", serde_json::json!({"text": "y"}), img([2, 2], Color32::WHITE));
+        doc.set_text_render(
+            0,
+            "t",
+            serde_json::json!({"text": "y"}),
+            img([2, 2], Color32::WHITE),
+        );
         assert_bumped(&doc, "set_text_render");
 
         assert!(doc.remove_node(0, "a"));
@@ -2892,14 +3511,22 @@ mod tests {
         // A no-op (missing node) must NOT bump the version.
         let before_noop = doc.version();
         doc.set_visibility(0, "missing", true);
-        assert_eq!(doc.version(), before_noop, "no-op must not bump the version");
+        assert_eq!(
+            doc.version(),
+            before_noop,
+            "no-op must not bump the version"
+        );
 
         // Evicting a resident page bumps; evicting an absent page does not.
         doc.evict_page(0);
         assert!(doc.version() > before_noop, "evict_page bumps the version");
         let after_evict = doc.version();
         doc.evict_page(0);
-        assert_eq!(doc.version(), after_evict, "evicting an absent page is a no-op");
+        assert_eq!(
+            doc.version(),
+            after_evict,
+            "evicting an absent page is a no-op"
+        );
     }
 
     #[test]
@@ -2952,9 +3579,15 @@ mod tests {
         doc.set_opacity(0, "a", 0.25);
         assert!((doc.node(0, "a").unwrap().opacity - 0.25).abs() < 1e-6);
         doc.set_opacity(0, "a", 5.0);
-        assert!((doc.node(0, "a").unwrap().opacity - 1.0).abs() < 1e-6, "opacity clamped high");
+        assert!(
+            (doc.node(0, "a").unwrap().opacity - 1.0).abs() < 1e-6,
+            "opacity clamped high"
+        );
         doc.set_opacity(0, "a", -3.0);
-        assert!((doc.node(0, "a").unwrap().opacity - 0.0).abs() < 1e-6, "opacity clamped low");
+        assert!(
+            (doc.node(0, "a").unwrap().opacity - 0.0).abs() < 1e-6,
+            "opacity clamped low"
+        );
     }
 
     #[test]
@@ -2974,7 +3607,11 @@ mod tests {
         assert_eq!(doc.page(0).unwrap().groups.len(), 1);
         // Duplicate uid ignored.
         doc.add_group(0, group);
-        assert_eq!(doc.page(0).unwrap().groups.len(), 1, "duplicate group uid ignored");
+        assert_eq!(
+            doc.page(0).unwrap().groups.len(),
+            1,
+            "duplicate group uid ignored"
+        );
 
         doc.set_group(0, "a", Some("g0".into()));
         doc.set_group(0, "b", Some("g0".into()));
@@ -2983,8 +3620,16 @@ mod tests {
 
         doc.remove_group(0, "g0");
         assert!(doc.page(0).unwrap().groups.is_empty(), "GroupMeta dropped");
-        assert_eq!(doc.node(0, "a").unwrap().group_uid, None, "member a ungrouped");
-        assert_eq!(doc.node(0, "b").unwrap().group_uid, None, "member b ungrouped");
+        assert_eq!(
+            doc.node(0, "a").unwrap().group_uid,
+            None,
+            "member a ungrouped"
+        );
+        assert_eq!(
+            doc.node(0, "b").unwrap().group_uid,
+            None,
+            "member b ungrouped"
+        );
     }
 
     #[test]
@@ -2994,12 +3639,28 @@ mod tests {
         let gen_before = doc.node(0, "a").unwrap().generation;
 
         let effects = vec![serde_json::json!({"type": "blur"})];
-        doc.set_raster_pixels(0, "a", img([4, 4], Color32::GREEN), img([5, 5], Color32::BLUE), effects, true);
+        doc.set_raster_pixels(
+            0,
+            "a",
+            img([4, 4], Color32::GREEN),
+            img([5, 5], Color32::BLUE),
+            effects,
+            true,
+        );
 
         let node = doc.node(0, "a").unwrap();
-        assert!(node.generation > gen_before, "set_raster_pixels bumps generation");
+        assert!(
+            node.generation > gen_before,
+            "set_raster_pixels bumps generation"
+        );
         assert!(node.pixels_dirty, "pixels_dirty set");
-        if let NodeBody::Raster { base_image, display_image, effects, .. } = &node.body {
+        if let NodeBody::Raster {
+            base_image,
+            display_image,
+            effects,
+            ..
+        } = &node.body
+        {
             assert_eq!(base_image.size, [4, 4], "base swapped");
             assert_eq!(display_image.size, [5, 5], "display swapped");
             assert_eq!(effects.len(), 1, "effects swapped");
@@ -3010,8 +3671,19 @@ mod tests {
         // No-op on a text node.
         doc.add_node(0, text_node("t", [2, 2], Color32::WHITE));
         let t_gen = doc.node(0, "t").unwrap().generation;
-        doc.set_raster_pixels(0, "t", img([9, 9], Color32::RED), img([9, 9], Color32::RED), Vec::new(), true);
-        assert_eq!(doc.node(0, "t").unwrap().generation, t_gen, "no-op on a text node");
+        doc.set_raster_pixels(
+            0,
+            "t",
+            img([9, 9], Color32::RED),
+            img([9, 9], Color32::RED),
+            Vec::new(),
+            true,
+        );
+        assert_eq!(
+            doc.node(0, "t").unwrap().generation,
+            t_gen,
+            "no-op on a text node"
+        );
     }
 
     #[test]
@@ -3020,11 +3692,22 @@ mod tests {
         doc.add_node(0, text_node("t", [2, 2], Color32::WHITE));
         let gen_before = doc.node(0, "t").unwrap().generation;
 
-        doc.set_text_render(0, "t", serde_json::json!({"text": "Hi", "size": 32}), img([7, 8], Color32::BLUE));
+        doc.set_text_render(
+            0,
+            "t",
+            serde_json::json!({"text": "Hi", "size": 32}),
+            img([7, 8], Color32::BLUE),
+        );
 
         let node = doc.node(0, "t").unwrap();
-        assert!(node.generation > gen_before, "set_text_render bumps generation");
-        if let NodeBody::Text { render_data, image, .. } = &node.body {
+        assert!(
+            node.generation > gen_before,
+            "set_text_render bumps generation"
+        );
+        if let NodeBody::Text {
+            render_data, image, ..
+        } = &node.body
+        {
             assert_eq!(render_data["text"], "Hi", "render_data swapped");
             assert_eq!(render_data["size"], 32);
             assert_eq!(image.size, [7, 8], "image swapped");
@@ -3035,8 +3718,17 @@ mod tests {
         // No-op on a raster node.
         doc.add_node(0, raster_node("r", [2, 2], Color32::RED));
         let r_gen = doc.node(0, "r").unwrap().generation;
-        doc.set_text_render(0, "r", serde_json::json!({"x": 1}), img([9, 9], Color32::RED));
-        assert_eq!(doc.node(0, "r").unwrap().generation, r_gen, "no-op on a raster node");
+        doc.set_text_render(
+            0,
+            "r",
+            serde_json::json!({"x": 1}),
+            img([9, 9], Color32::RED),
+        );
+        assert_eq!(
+            doc.node(0, "r").unwrap().generation,
+            r_gen,
+            "no-op on a raster node"
+        );
     }
 
     /// A compact, comparable fingerprint of a loaded page's nodes + groups, so the split path and the
@@ -3081,7 +3773,11 @@ mod tests {
                 )
             })
             .collect();
-        format!("nodes=[{}] groups=[{}]", nodes.join(", "), groups.join(", "))
+        format!(
+            "nodes=[{}] groups=[{}]",
+            nodes.join(", "),
+            groups.join(", ")
+        )
     }
 
     /// The off-thread split (`decode_page_payload` + `insert_decoded_page`) must produce a loaded page
@@ -3096,7 +3792,15 @@ mod tests {
         // geometry is decoded through the shared codec with the FULL chapter page-size map — exercising
         // the same legacy migration path the worker must reproduce.
         persist::add_page_raster(
-            &dir, None, 0, "r0", "R", true, 1.0, tf(50.0, 50.0, 1.0), &img([3, 3], Color32::RED),
+            &dir,
+            None,
+            0,
+            "r0",
+            "R",
+            true,
+            1.0,
+            tf(50.0, 50.0, 1.0),
+            &img([3, 3], Color32::RED),
         )
         .unwrap();
         add_text_group_band(&dir, 0, 5);
@@ -3112,7 +3816,11 @@ mod tests {
             })
         };
         let overlays = serde_json::json!([mk("ta", 10.0), mk("tb", 20.0), mk("tc", 30.0)]);
-        fs::write(dir.join("text_info.json"), serde_json::to_string(&overlays).unwrap()).unwrap();
+        fs::write(
+            dir.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
 
         // FULL chapter page-size map (a second page is present so the ribbon solve is non-degenerate).
         let mut page_sizes = HashMap::new();
@@ -3121,7 +3829,9 @@ mod tests {
 
         // Reference: the synchronous monolith.
         let mut doc_ref = LayerDoc::new();
-        doc_ref.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+        doc_ref
+            .ensure_page_loaded(0, &dir, None, &page_sizes)
+            .unwrap();
         let ref_fp = page_fingerprint(doc_ref.page(0).expect("ref page resident"));
 
         // Split: decode lock-free, then insert.
@@ -3132,7 +3842,10 @@ mod tests {
         doc_split.insert_decoded_page(0, payload);
         let split_fp = page_fingerprint(doc_split.page(0).expect("split page resident"));
 
-        assert_eq!(ref_fp, split_fp, "split path matches ensure_page_loaded (incl. legacy migration)");
+        assert_eq!(
+            ref_fp, split_fp,
+            "split path matches ensure_page_loaded (incl. legacy migration)"
+        );
         assert!(
             doc_split.version() > version_before,
             "a real insert bumps the doc version (cross-tab re-projection)"

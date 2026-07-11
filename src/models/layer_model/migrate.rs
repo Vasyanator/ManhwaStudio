@@ -2,8 +2,8 @@
 File: models/layer_model/migrate.rs
 
 Purpose:
-One-shot EAGER migration of a legacy text chapter (`text_info.json`) into the canonical schema-v3
-inline `layers.json` form, run once in the background on chapter open. The lazy on-read migration
+One-shot EAGER migration of a legacy text/image-overlay chapter (`text_info.json`) into the canonical
+schema-v3 inline `layers.json` form, run once in the background on chapter open. The lazy on-read migration
 (`layer_doc::ensure_page_loaded`) still handles display correctness frame-to-frame; this module makes
 the rewrite happen up-front and PERSISTENTLY, so a chapter is converted once and never re-read from
 `text_info.json` afterwards.
@@ -33,7 +33,7 @@ const TEXT_INFO_FILE: &str = "text_info.json";
 /// Outcome of an eager chapter migration, for logging / tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MigrationReport {
-    /// Number of text overlays migrated into inline v3 nodes.
+    /// Number of text and image overlays migrated into inline v3 nodes.
     pub migrated_overlays: usize,
     /// Overlays whose original PNG was renamed into the v3 name (pixels preserved).
     pub renamed_pngs: usize,
@@ -58,7 +58,10 @@ pub struct MigrationReport {
 /// overwrote the good v3 data with the partial stale set. A genuinely un-migrated chapter (a
 /// `text_info.json` exists and the manifest has no inline text) still migrates.
 #[must_use]
-pub fn chapter_needs_migration(layers_dir: &Path, legacy_text_images_dir: &Path) -> Option<PathBuf> {
+pub fn chapter_needs_migration(
+    layers_dir: &Path,
+    legacy_text_images_dir: &Path,
+) -> Option<PathBuf> {
     // Already migrated? If the committed manifest carries any inline (v3) TEXT node, the chapter has
     // been migrated — never re-run (a lingering stale `text_info.json` must NOT re-trigger).
     if manifest_has_inline_text(layers_dir) {
@@ -71,13 +74,14 @@ pub fn chapter_needs_migration(layers_dir: &Path, legacy_text_images_dir: &Path)
     // `text_info.json` is a deterministic FILE name so a directory there would be a corrupt project.
     let layers_text_info = layers_dir.join(TEXT_INFO_FILE);
     let legacy_text_info = legacy_text_images_dir.join(TEXT_INFO_FILE);
-    let source_dir = if crate::storage::storage().exists(layers_text_info.to_string_lossy().as_ref()) {
-        layers_dir.to_path_buf()
-    } else if crate::storage::storage().exists(legacy_text_info.to_string_lossy().as_ref()) {
-        legacy_text_images_dir.to_path_buf()
-    } else {
-        return None;
-    };
+    let source_dir =
+        if crate::storage::storage().exists(layers_text_info.to_string_lossy().as_ref()) {
+            layers_dir.to_path_buf()
+        } else if crate::storage::storage().exists(legacy_text_info.to_string_lossy().as_ref()) {
+            legacy_text_images_dir.to_path_buf()
+        } else {
+            return None;
+        };
 
     // Require at least one TEXT overlay. (A `text_info.json` carrying only image overlays — which the
     // app treats as rasters elsewhere — is not migrated, so we don't spuriously `.bak` it.)
@@ -102,14 +106,16 @@ fn manifest_has_inline_text(layers_dir: &Path) -> bool {
         .is_some_and(|m| {
             m.pages.iter().any(|p| {
                 p.tree.iter().any(|r| {
-                    matches!(r.kind, crate::models::layer_model::manifest::LayerKindRec::Text)
-                        && r.render_data.is_some()
+                    matches!(
+                        r.kind,
+                        crate::models::layer_model::manifest::LayerKindRec::Text
+                    ) && r.render_data.is_some()
                 })
             })
         })
 }
 
-/// Eagerly migrates the chapter's legacy text overlays to inline schema-v3 nodes in `layers_dir`'s
+/// Eagerly migrates the chapter's legacy text and image overlays to inline schema-v3 nodes in `layers_dir`'s
 /// `layers.json`, preserving pixels by RENAMING each overlay PNG into the v3 name, then moves the
 /// legacy `text_info.json` to `text_info.json.bak` (rollback anchor) LAST. Idempotent: if there is
 /// nothing to migrate (see [`chapter_needs_migration`]) it is a clean no-op that touches no files.
@@ -140,7 +146,11 @@ pub fn migrate_chapter_to_v3(
 
     // Directories an overlay PNG may live in, in search order: the legacy source dir, the canonical
     // committed `layers/` dir, the legacy `text_images/` dir, and the unsaved staging dir.
-    let mut png_dirs: Vec<PathBuf> = vec![source_dir.clone(), layers_dir.to_path_buf(), legacy_text_images_dir.to_path_buf()];
+    let mut png_dirs: Vec<PathBuf> = vec![
+        source_dir.clone(),
+        layers_dir.to_path_buf(),
+        legacy_text_images_dir.to_path_buf(),
+    ];
     if let Some(u) = unsaved_layers_dir {
         png_dirs.push(u.to_path_buf());
     }
@@ -156,15 +166,16 @@ pub fn migrate_chapter_to_v3(
             .map_or((0.0, 0.0), |(w, h)| (w as f32, h as f32))
     });
 
-    // Group TEXT overlays by page. (Image overlays are left in `text_info.json`; they are display-only
-    // legacy and not part of the inline text model.)
+    // Group text and image overlays by page. Image overlays become inline image nodes so their PNGs
+    // survive the final `text_info.json` retirement.
     let mut by_page: HashMap<usize, Vec<Map<String, Value>>> = HashMap::new();
     for entry in &migrated_entries {
-        let Some(obj) = entry.as_object() else { continue };
-        if obj.get("overlay_type").and_then(Value::as_str) == Some("image") {
+        let Some(obj) = entry.as_object() else {
             continue;
-        }
-        let Some(uid) = obj.get("uid").and_then(Value::as_str) else { continue };
+        };
+        let Some(uid) = obj.get("uid").and_then(Value::as_str) else {
+            continue;
+        };
         if uid.is_empty() {
             continue;
         }
@@ -179,9 +190,10 @@ pub fn migrate_chapter_to_v3(
     for (&page_idx, overlays) in &by_page {
         let page_size = page_sizes.get(&page_idx).copied().unwrap_or([1, 1]);
         let mut outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(overlays.len());
-        // Only TEXT overlays reach here (image overlays were filtered out), so names follow the same
-        // "Текст {n}" scheme the lazy load path produces, in text_info.json order.
+        // Text and image names mirror the lazy load path, with independent counters in text_info.json
+        // order so both default-name families remain stable.
         let mut text_n = 0usize;
+        let mut image_n = 0usize;
         for obj in overlays {
             let uid = obj
                 .get("uid")
@@ -190,21 +202,29 @@ pub fn migrate_chapter_to_v3(
                 .to_string();
             let placement = text_payload::decode_overlay_placement(obj, page_size);
             let render_data = obj.get("render_data").cloned().unwrap_or(Value::Null);
+            let is_image = obj.get("overlay_type").and_then(Value::as_str) == Some("image");
             let mask_clip = obj.get("mask_clip_enabled").and_then(Value::as_bool);
             let layer_idx = obj.get("layer_idx").and_then(Value::as_u64).unwrap_or(0) as u32;
-            text_n += 1;
-            let name = format!("Текст {text_n}");
+            let name = if is_image {
+                image_n += 1;
+                format!("Картинка {image_n}")
+            } else {
+                text_n += 1;
+                format!("Текст {text_n}")
+            };
 
             // RENAME (move) the original PNG into the v3 name, preserving its exact bytes. Missing PNG
             // → keep the overlay WITHOUT an image (never drop), logged.
             //
             // KNOWN LIMITATION (by design): an overlay whose original PNG was ALREADY missing pre-
             // migration becomes an inline node with `rendered_file: None`. The doc build skips imageless
-            // text nodes, so after `text_info.json → .bak` such an overlay is invisible/uneditable in
-            // the tabs. This is NOT new data loss — its text + geometry survive in `layers.json`, and
-            // the legacy entry survives in `text_info.json.bak`. Re-rendering its image from
-            // `render_data` would require the typing tab's text-render engine, which the model layer
-            // does not have (out of scope). Re-rendering happens naturally on the next text edit.
+            // nodes, so after `text_info.json → .bak` such an overlay is invisible/uneditable in
+            // the tabs. This is NOT new data loss — its params + geometry survive in `layers.json`, and
+            // the legacy entry survives in `text_info.json.bak`. A TEXT node self-heals: its image
+            // re-renders from `render_data` on the next text edit (re-rendering during migration would
+            // need the typing tab's text-render engine, which the model layer lacks — out of scope). An
+            // IMAGE node (`render_data` is null) cannot self-heal — it has no params to re-render from —
+            // so a missing-PNG image overlay stays imageless until re-imported; its geometry is preserved.
             let rendered_file =
                 rename_overlay_png(obj, &uid, page_idx, layers_dir, &png_dirs, &mut report);
 
@@ -220,6 +240,7 @@ pub fn migrate_chapter_to_v3(
                 pinned_by_group: false,
                 payload_uid: uid,
                 render_data,
+                is_image,
                 // The codec already produced canonical geometry (center-anchored, rotation in radians).
                 transform: placement.transform,
                 deform: placement.deform,
@@ -233,7 +254,7 @@ pub fn migrate_chapter_to_v3(
         // touch the renamed PNGs.
         crate::trace_log!(
             cat::PERSIST,
-            "migrate_chapter_to_v3 page={} migrating {} legacy text overlays -> inline v3",
+            "migrate_chapter_to_v3 page={} migrating {} legacy text/image overlays -> inline v3",
             page_idx,
             outs.len()
         );
@@ -278,7 +299,10 @@ pub fn migrate_chapter_to_v3(
         }
         let bak = next_backup_path(dir);
         crate::storage::storage()
-            .rename(src.to_string_lossy().as_ref(), bak.to_string_lossy().as_ref())
+            .rename(
+                src.to_string_lossy().as_ref(),
+                bak.to_string_lossy().as_ref(),
+            )
             .map_err(|e| format!("rename {} -> {}: {e}", src.display(), bak.display()))?;
         crate::trace_log!(
             cat::PERSIST,
@@ -348,6 +372,7 @@ fn additive_merge_for_unsaved(
             pinned_by_group: n.pinned_by_group,
             payload_uid: n.payload_uid,
             render_data: inline.render_data,
+            is_image: inline.is_image,
             transform: inline.transform.unwrap_or(super::manifest::TransformRec {
                 cx: 0.0,
                 cy: 0.0,
@@ -430,8 +455,7 @@ fn rename_overlay_png(
     };
     let src_str = src.to_string_lossy();
 
-    if let Err(e) =
-        crate::storage::storage().create_dir_all(layers_dir.to_string_lossy().as_ref())
+    if let Err(e) = crate::storage::storage().create_dir_all(layers_dir.to_string_lossy().as_ref())
     {
         crate::runtime_log::log_warn(format!("[migrate] create {}: {e}", layers_dir.display()));
         return None;
@@ -544,7 +568,12 @@ mod tests {
             .pages
             .iter()
             .flat_map(|p| p.tree.iter())
-            .filter(|r| matches!(r.kind, crate::models::layer_model::manifest::LayerKindRec::Text))
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    crate::models::layer_model::manifest::LayerKindRec::Text
+                )
+            })
             .count();
         (pages, texts)
     }
@@ -563,7 +592,15 @@ mod tests {
 
         // COMPLETE set in layers/: pages 0..5, one text overlay per page, NEWER geometry (x=100*page).
         let complete: Vec<Value> = (0..5)
-            .map(|p| overlay(&format!("u{p}"), p, &format!("u{p}.png"), 100.0 * (p as f64 + 1.0), 50.0))
+            .map(|p| {
+                overlay(
+                    &format!("u{p}"),
+                    p,
+                    &format!("u{p}.png"),
+                    100.0 * (p as f64 + 1.0),
+                    50.0,
+                )
+            })
             .collect();
         write_text_info(&layers, Value::Array(complete));
         // STALE set in text_images/: pages 0..2, SAME uids u0/u1 but OLDER geometry (x=1.0).
@@ -573,10 +610,14 @@ mod tests {
         write_text_info(&text_images, Value::Array(stale));
         // PNGs for all overlays (in layers/, where the renamer puts them).
         for p in 0..5 {
-            write_png(&layers.join(format!("u{p}.png")), 2, 2, [p as u8, 0, 0, 255]);
+            write_png(
+                &layers.join(format!("u{p}.png")),
+                2,
+                2,
+                [p as u8, 0, 0, 255],
+            );
         }
-        let page_sizes: HashMap<usize, [usize; 2]> =
-            (0..5).map(|p| (p, [1000, 1000])).collect();
+        let page_sizes: HashMap<usize, [usize; 2]> = (0..5).map(|p| (p, [1000, 1000])).collect();
 
         // RUN 1 (first open): migrates the COMPLETE layers/ set.
         let r1 = migrate_chapter_to_v3(&layers, &text_images, None, &page_sizes).unwrap();
@@ -587,17 +628,27 @@ mod tests {
         // Geometry is the COMPLETE (newer) one: u1 has cx = 200.
         let nodes1 = persist::load_page_text_nodes(&layers, None, 1).unwrap();
         let cx1 = nodes1[0].inline.as_ref().unwrap().transform.unwrap().cx;
-        assert!((cx1 - 200.0).abs() < 1e-3, "run 1 used the COMPLETE geometry (cx=200)");
+        assert!(
+            (cx1 - 200.0).abs() < 1e-3,
+            "run 1 used the COMPLETE geometry (cx=200)"
+        );
 
         // RUN 2 (second open): the STALE text_images/text_info.json still exists. Must be a NO-OP.
         let r2 = migrate_chapter_to_v3(&layers, &text_images, None, &page_sizes).unwrap();
         let (pages2, texts2) = manifest_pages_and_texts(&layers);
-        assert_eq!(pages2, vec![0, 1, 2, 3, 4], "run 2 must NOT drop pages 2-4 (no truncation)");
+        assert_eq!(
+            pages2,
+            vec![0, 1, 2, 3, 4],
+            "run 2 must NOT drop pages 2-4 (no truncation)"
+        );
         assert_eq!(texts2, 5, "run 2 must NOT regress the overlay set");
         assert_eq!(r2.migrated_overlays, 0, "run 2 is a clean no-op");
         let nodes2 = persist::load_page_text_nodes(&layers, None, 1).unwrap();
         let cx2 = nodes2[0].inline.as_ref().unwrap().transform.unwrap().cx;
-        assert!((cx2 - 200.0).abs() < 1e-3, "run 2 kept the COMPLETE geometry (no stale regression)");
+        assert!(
+            (cx2 - 200.0).abs() < 1e-3,
+            "run 2 kept the COMPLETE geometry (no stale regression)"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -615,10 +666,21 @@ mod tests {
         fs::create_dir_all(&layers).unwrap();
         fs::create_dir_all(&text_images).unwrap();
         // Recreate the PRE-migration dual-location state from the .bak files.
-        fs::copy(snap.join("layers/text_info.json.bak"), layers.join(TEXT_INFO_FILE)).unwrap();
-        fs::copy(snap.join("text_images/text_info.json.bak"), text_images.join(TEXT_INFO_FILE)).unwrap();
+        fs::copy(
+            snap.join("layers/text_info.json.bak"),
+            layers.join(TEXT_INFO_FILE),
+        )
+        .unwrap();
+        fs::copy(
+            snap.join("text_images/text_info.json.bak"),
+            text_images.join(TEXT_INFO_FILE),
+        )
+        .unwrap();
         // Synthesize a PNG for every overlay file referenced (in BOTH sources), in layers/.
-        for src in [layers.join(TEXT_INFO_FILE), text_images.join(TEXT_INFO_FILE)] {
+        for src in [
+            layers.join(TEXT_INFO_FILE),
+            text_images.join(TEXT_INFO_FILE),
+        ] {
             let arr: Value = serde_json::from_str(&fs::read_to_string(&src).unwrap()).unwrap();
             for o in arr.as_array().unwrap() {
                 if let Some(f) = o.get("file").and_then(Value::as_str) {
@@ -631,7 +693,12 @@ mod tests {
         // RUN 1: migrates the COMPLETE layers/ set (184 overlays across 23 pages).
         let r1 = migrate_chapter_to_v3(&layers, &text_images, None, &page_sizes).unwrap();
         let (pages1, texts1) = manifest_pages_and_texts(&layers);
-        eprintln!("RUN1: pages={} texts={} migrated={}", pages1.len(), texts1, r1.migrated_overlays);
+        eprintln!(
+            "RUN1: pages={} texts={} migrated={}",
+            pages1.len(),
+            texts1,
+            r1.migrated_overlays
+        );
         assert_eq!(pages1.len(), 23, "run 1 migrated all 23 pages");
         assert_eq!(texts1, 184, "run 1 migrated all 184 text overlays");
         // BOTH text_info.json locations are retired so the stale secondary can't re-trigger.
@@ -641,10 +708,21 @@ mod tests {
         // RUN 2 (the disaster trigger): the gate blocks re-migration; NO truncation, NO regression.
         let r2 = migrate_chapter_to_v3(&layers, &text_images, None, &page_sizes).unwrap();
         let (pages2, texts2) = manifest_pages_and_texts(&layers);
-        eprintln!("RUN2: pages={} texts={} migrated={}", pages2.len(), texts2, r2.migrated_overlays);
-        assert_eq!(r2.migrated_overlays, 0, "run 2 is a clean no-op (no stale re-migration)");
+        eprintln!(
+            "RUN2: pages={} texts={} migrated={}",
+            pages2.len(),
+            texts2,
+            r2.migrated_overlays
+        );
+        assert_eq!(
+            r2.migrated_overlays, 0,
+            "run 2 is a clean no-op (no stale re-migration)"
+        );
         assert_eq!(pages2.len(), 23, "no pages dropped (no truncation)");
-        assert_eq!(texts2, 184, "all 184 overlays preserved (no regression to the stale 68)");
+        assert_eq!(
+            texts2, 184,
+            "all 184 overlays preserved (no regression to the stale 68)"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -669,52 +747,99 @@ mod tests {
         // Reproduce the CORRUPTED committed state: the 8-page live layers.json.
         fs::copy(snap.join("layers/layers.json"), layers.join("layers.json")).unwrap();
         // The renamed _text.png exist for ALL pages 0-22 (per the incident) — synthesize them.
-        let source_184: Value =
-            serde_json::from_str(&fs::read_to_string(snap.join("layers/text_info.json.bak")).unwrap())
-                .unwrap();
+        let source_184: Value = serde_json::from_str(
+            &fs::read_to_string(snap.join("layers/text_info.json.bak")).unwrap(),
+        )
+        .unwrap();
         for o in source_184.as_array().unwrap() {
             let uid = o["uid"].as_str().unwrap();
             let page = o.get("img_idx").and_then(Value::as_u64).unwrap_or(0) as usize;
-            write_png(&layers.join(persist::text_image_file_name(page, uid)), 2, 2, [1, 2, 3, 255]);
+            write_png(
+                &layers.join(persist::text_image_file_name(page, uid)),
+                2,
+                2,
+                [1, 2, 3, 255],
+            );
         }
 
         // --- RECOVERY STEP 1: restore layers/text_info.json from the 184 .bak.
-        fs::copy(snap.join("layers/text_info.json.bak"), layers.join(TEXT_INFO_FILE)).unwrap();
+        fs::copy(
+            snap.join("layers/text_info.json.bak"),
+            layers.join(TEXT_INFO_FILE),
+        )
+        .unwrap();
 
         // --- RECOVERY STEP 2: strip inline TEXT nodes from layers.json (keep rasters + groups), so the
         // manifest is no longer v3-inline and the migration gate allows the re-run.
         strip_inline_text_nodes(&layers.join("layers.json"));
         // Sanity: the 2 page-0 rasters survived the strip.
-        let stripped =
-            super::super::compat::read_manifest(&layers.join("layers.json")).unwrap().unwrap();
+        let stripped = super::super::compat::read_manifest(&layers.join("layers.json"))
+            .unwrap()
+            .unwrap();
         let p0_rasters: Vec<&str> = stripped
             .page(0)
             .unwrap()
             .tree
             .iter()
-            .filter(|r| matches!(r.kind, crate::models::layer_model::manifest::LayerKindRec::Raster))
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    crate::models::layer_model::manifest::LayerKindRec::Raster
+                )
+            })
             .map(|r| r.uid.as_str())
             .collect();
-        assert_eq!(p0_rasters.len(), 2, "both page-0 rasters preserved through the strip");
-        assert!(chapter_needs_migration(&layers, &text_images).is_some(), "strip re-enables migration");
+        assert_eq!(
+            p0_rasters.len(),
+            2,
+            "both page-0 rasters preserved through the strip"
+        );
+        assert!(
+            chapter_needs_migration(&layers, &text_images).is_some(),
+            "strip re-enables migration"
+        );
 
         // --- RECOVERY STEP 3: run the fixed migration.
         let page_sizes: HashMap<usize, [usize; 2]> = (0..23).map(|p| (p, [1000, 1600])).collect();
         let report = migrate_chapter_to_v3(&layers, &text_images, None, &page_sizes).unwrap();
-        eprintln!("RECOVERY: migrated={} renamed={} missing={}", report.migrated_overlays, report.renamed_pngs, report.missing_pngs);
+        eprintln!(
+            "RECOVERY: migrated={} renamed={} missing={}",
+            report.migrated_overlays, report.renamed_pngs, report.missing_pngs
+        );
 
         let (pages, texts) = manifest_pages_and_texts(&layers);
         assert_eq!(pages.len(), 23, "recovered all 23 pages");
         assert_eq!(texts, 184, "recovered all 184 text overlays");
         // The 2 page-0 rasters are still present.
-        let m = super::super::compat::read_manifest(&layers.join("layers.json")).unwrap().unwrap();
-        let p0r: Vec<&str> = m.page(0).unwrap().tree.iter()
-            .filter(|r| matches!(r.kind, crate::models::layer_model::manifest::LayerKindRec::Raster))
-            .map(|r| r.uid.as_str()).collect();
-        assert!(p0r.contains(&"f12d9a16-3448-40a7-adb8-9a4ee0714b50"), "raster f12d9a16 intact");
-        assert!(p0r.contains(&"ad5994dc-b132-4f3e-ae72-23d5cf99d349"), "raster ad5994dc intact");
+        let m = super::super::compat::read_manifest(&layers.join("layers.json"))
+            .unwrap()
+            .unwrap();
+        let p0r: Vec<&str> = m
+            .page(0)
+            .unwrap()
+            .tree
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    crate::models::layer_model::manifest::LayerKindRec::Raster
+                )
+            })
+            .map(|r| r.uid.as_str())
+            .collect();
+        assert!(
+            p0r.contains(&"f12d9a16-3448-40a7-adb8-9a4ee0714b50"),
+            "raster f12d9a16 intact"
+        );
+        assert!(
+            p0r.contains(&"ad5994dc-b132-4f3e-ae72-23d5cf99d349"),
+            "raster ad5994dc intact"
+        );
         // Geometry is the COMPLETE source (no stale): the migration reused the existing _text.png (no missing).
-        assert_eq!(report.missing_pngs, 0, "all _text.png reused (none missing)");
+        assert_eq!(
+            report.missing_pngs, 0,
+            "all _text.png reused (none missing)"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -772,7 +897,10 @@ mod tests {
         for page in [0usize, 1] {
             let nodes = persist::load_page_text_nodes(&dir, None, page).unwrap();
             assert!(!nodes.is_empty(), "page {page} has text nodes");
-            assert!(nodes.iter().all(|n| n.inline.is_some()), "page {page} fully inline");
+            assert!(
+                nodes.iter().all(|n| n.inline.is_some()),
+                "page {page} fully inline"
+            );
         }
 
         // (b) old PNGs renamed to the v3 name with IDENTICAL bytes (pixels preserved, not re-encoded).
@@ -788,6 +916,46 @@ mod tests {
         let bak = dir.join(format!("{TEXT_INFO_FILE}.bak"));
         assert!(bak.is_file(), ".bak created");
         assert_eq!(report.backup_path.as_deref(), Some(bak.as_path()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_text_and_image_chapter_migrates_both_inline() {
+        let dir = tmp("mixed_text_image");
+        write_png(&dir.join("text.png"), 4, 3, [10, 20, 30, 255]);
+        write_png(&dir.join("image.png"), 5, 2, [40, 50, 60, 255]);
+        let text_bytes = fs::read(dir.join("text.png")).unwrap();
+        let image_bytes = fs::read(dir.join("image.png")).unwrap();
+        write_text_info(
+            &dir,
+            serde_json::json!([
+                overlay("text", 0, "text.png", 100.0, 50.0),
+                {"uid":"image","img_idx":0,"overlay_type":"image","file":"image.png",
+                 "img_x_px":200.0,"img_y_px":60.0,"rotation_deg":0.0,"scale":1.0}
+            ]),
+        );
+        let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
+
+        let report = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
+        assert_eq!(report.migrated_overlays, 2, "both overlay kinds migrated");
+
+        let nodes = persist::load_page_text_nodes(&dir, None, 0).unwrap();
+        assert_eq!(nodes.len(), 2, "image overlay was not dropped");
+        let text = nodes.iter().find(|node| node.uid == "text").unwrap();
+        let text_inline = text.inline.as_ref().unwrap();
+        assert!(!text_inline.is_image, "text stays a text node");
+        assert_eq!(text_inline.render_data["text"], "text");
+        let text_file = text_inline.rendered_file.as_ref().unwrap();
+        assert_eq!(fs::read(dir.join(text_file)).unwrap(), text_bytes, "text PNG bytes preserved");
+
+        let image = nodes.iter().find(|node| node.uid == "image").unwrap();
+        let image_inline = image.inline.as_ref().unwrap();
+        assert!(image_inline.is_image, "image retains its inline marker");
+        assert!(image_inline.render_data.is_null(), "image render data is null");
+        let image_file = image_inline.rendered_file.as_ref().unwrap();
+        assert_eq!(fs::read(dir.join(image_file)).unwrap(), image_bytes, "image PNG bytes preserved");
+        assert!(dir.join(format!("{TEXT_INFO_FILE}.bak")).is_file(), "legacy file retired after both nodes persisted");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -809,7 +977,8 @@ mod tests {
             ]),
         );
         // Non-uniform aspects: page0 100x250, page1 100x300.
-        let full: HashMap<usize, [usize; 2]> = [(0, [100, 250]), (1, [100, 300])].into_iter().collect();
+        let full: HashMap<usize, [usize; 2]> =
+            [(0, [100, 250]), (1, [100, 300])].into_iter().collect();
 
         // Reference geometry via the SAME shared codec + full map (what the doc would compute).
         let raw = text_payload::read_overlay_entries(&[dir.as_path()]);
@@ -821,10 +990,15 @@ mod tests {
         });
         let ref_obj = migrated
             .iter()
-            .find_map(|e| e.as_object().filter(|o| o.get("uid").and_then(Value::as_str) == Some("r1")))
+            .find_map(|e| {
+                e.as_object()
+                    .filter(|o| o.get("uid").and_then(Value::as_str) == Some("r1"))
+            })
             .unwrap()
             .clone();
-        let ref_cy = text_payload::decode_overlay_placement(&ref_obj, [100, 300]).transform.cy;
+        let ref_cy = text_payload::decode_overlay_placement(&ref_obj, [100, 300])
+            .transform
+            .cy;
 
         migrate_chapter_to_v3(&dir, &dir, None, &full).unwrap();
 
@@ -832,7 +1006,10 @@ mod tests {
         let nodes = persist::load_page_text_nodes(&dir, None, 1).unwrap();
         let n = nodes.iter().find(|n| n.uid == "r1").expect("r1 migrated");
         let cy = n.inline.as_ref().unwrap().transform.unwrap().cy;
-        assert!((cy - ref_cy).abs() < 1e-3, "ribbon geometry uses full page sizes: {cy} vs {ref_cy}");
+        assert!(
+            (cy - ref_cy).abs() < 1e-3,
+            "ribbon geometry uses full page sizes: {cy} vs {ref_cy}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -841,7 +1018,10 @@ mod tests {
     fn re_running_migration_is_a_noop() {
         let dir = tmp("idempotent");
         write_png(&dir.join("a.png"), 4, 3, [10, 20, 30, 255]);
-        write_text_info(&dir, serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]));
+        write_text_info(
+            &dir,
+            serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]),
+        );
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
 
         let first = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
@@ -849,12 +1029,22 @@ mod tests {
         assert!(first.backup_path.is_some());
 
         // Detection now returns None (text_info.json is gone, layers.json is v3-inline).
-        assert!(chapter_needs_migration(&dir, &dir).is_none(), "no longer needs migration");
+        assert!(
+            chapter_needs_migration(&dir, &dir).is_none(),
+            "no longer needs migration"
+        );
 
         // A second run touches nothing: no second .bak, an empty report.
         let second = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
-        assert_eq!(second, MigrationReport::default(), "second run is a clean no-op");
-        assert!(!dir.join(format!("{TEXT_INFO_FILE}.bak.1")).exists(), "no second .bak");
+        assert_eq!(
+            second,
+            MigrationReport::default(),
+            "second run is a clean no-op"
+        );
+        assert!(
+            !dir.join(format!("{TEXT_INFO_FILE}.bak.1")).exists(),
+            "no second .bak"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -866,7 +1056,12 @@ mod tests {
         // either dir (a crash before the `.bak` rename, OR a STALE secondary in `text_images/`). This is
         // what stops a stale partial `text_info.json` from overwriting the good v3 data.
         let dir = tmp("v3_gate");
-        write_png(&dir.join(persist::text_image_file_name(0, "a")), 4, 3, [10, 20, 30, 255]);
+        write_png(
+            &dir.join(persist::text_image_file_name(0, "a")),
+            4,
+            3,
+            [10, 20, 30, 255],
+        );
         // layers.json already has the inline node (the good migrated data, cx=100).
         persist::write_page_text_payload(
             &dir,
@@ -884,7 +1079,13 @@ mod tests {
                 pinned_by_group: false,
                 payload_uid: "a".into(),
                 render_data: serde_json::json!({"text": "a"}),
-                transform: TransformRec { cx: 100.0, cy: 50.0, rotation: 0.0, scale: 1.0 },
+                is_image: false,
+                transform: TransformRec {
+                    cx: 100.0,
+                    cy: 50.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "a")),
                 mask_clip: Some(true),
@@ -892,7 +1093,10 @@ mod tests {
         )
         .unwrap();
         // A STALE/lingering text_info.json with DIFFERENT geometry (cx=1) is present.
-        write_text_info(&dir, serde_json::json!([overlay("a", 0, "a.png", 1.0, 1.0)]));
+        write_text_info(
+            &dir,
+            serde_json::json!([overlay("a", 0, "a.png", 1.0, 1.0)]),
+        );
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
 
         assert!(
@@ -900,13 +1104,20 @@ mod tests {
             "a v3-inline manifest is already migrated — never re-run"
         );
         let report = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
-        assert_eq!(report, MigrationReport::default(), "clean no-op (no regression)");
+        assert_eq!(
+            report,
+            MigrationReport::default(),
+            "clean no-op (no regression)"
+        );
 
         // The good inline geometry (cx=100) survived — NOT regressed to the stale text_info.json (cx=1).
         let nodes = persist::load_page_text_nodes(&dir, None, 0).unwrap();
         assert_eq!(nodes.len(), 1, "no duplicate");
         let cx = nodes[0].inline.as_ref().unwrap().transform.unwrap().cx;
-        assert!((cx - 100.0).abs() < 1e-3, "kept the good v3 geometry, did NOT regress to stale");
+        assert!(
+            (cx - 100.0).abs() < 1e-3,
+            "kept the good v3 geometry, did NOT regress to stale"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -934,7 +1145,13 @@ mod tests {
                 pinned_by_group: false,
                 payload_uid: "t".into(),
                 render_data: serde_json::json!({"text": "t"}),
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                is_image: false,
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "t")),
                 mask_clip: None,
@@ -942,10 +1159,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(chapter_needs_migration(&dir, &dir).is_none(), "modern chapter: no migration");
+        assert!(
+            chapter_needs_migration(&dir, &dir).is_none(),
+            "modern chapter: no migration"
+        );
         let report = migrate_chapter_to_v3(&dir, &dir, None, &HashMap::new()).unwrap();
         assert_eq!(report, MigrationReport::default());
-        assert!(!dir.join(format!("{TEXT_INFO_FILE}.bak")).exists(), "no spurious .bak");
+        assert!(
+            !dir.join(format!("{TEXT_INFO_FILE}.bak")).exists(),
+            "no spurious .bak"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -965,7 +1188,10 @@ mod tests {
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
 
         let report = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
-        assert_eq!(report.migrated_overlays, 2, "both overlays migrated (none dropped)");
+        assert_eq!(
+            report.migrated_overlays, 2,
+            "both overlays migrated (none dropped)"
+        );
         assert_eq!(report.renamed_pngs, 1);
         assert_eq!(report.missing_pngs, 1);
 
@@ -984,15 +1210,24 @@ mod tests {
     fn does_not_clobber_an_existing_backup() {
         let dir = tmp("existing_bak");
         write_png(&dir.join("a.png"), 4, 3, [10, 20, 30, 255]);
-        write_text_info(&dir, serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]));
+        write_text_info(
+            &dir,
+            serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]),
+        );
         // A pre-existing .bak from an older rollback.
         fs::write(dir.join(format!("{TEXT_INFO_FILE}.bak")), "OLD BACKUP").unwrap();
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
 
         let report = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
         // The old .bak is untouched; the new one is .bak.1.
-        assert_eq!(fs::read_to_string(dir.join(format!("{TEXT_INFO_FILE}.bak"))).unwrap(), "OLD BACKUP");
-        assert_eq!(report.backup_path.as_deref(), Some(dir.join(format!("{TEXT_INFO_FILE}.bak.1")).as_path()));
+        assert_eq!(
+            fs::read_to_string(dir.join(format!("{TEXT_INFO_FILE}.bak"))).unwrap(),
+            "OLD BACKUP"
+        );
+        assert_eq!(
+            report.backup_path.as_deref(),
+            Some(dir.join(format!("{TEXT_INFO_FILE}.bak.1")).as_path())
+        );
         assert!(dir.join(format!("{TEXT_INFO_FILE}.bak.1")).is_file());
 
         let _ = fs::remove_dir_all(&dir);
@@ -1008,17 +1243,29 @@ mod tests {
         fs::create_dir_all(&layers_dir).unwrap();
         fs::create_dir_all(&text_images_dir).unwrap();
         write_png(&text_images_dir.join("a.png"), 4, 3, [10, 20, 30, 255]);
-        write_text_info(&text_images_dir, serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]));
+        write_text_info(
+            &text_images_dir,
+            serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]),
+        );
         let page_sizes: HashMap<usize, [usize; 2]> = [(0, [1000, 1000])].into_iter().collect();
 
-        let report = migrate_chapter_to_v3(&layers_dir, &text_images_dir, None, &page_sizes).unwrap();
+        let report =
+            migrate_chapter_to_v3(&layers_dir, &text_images_dir, None, &page_sizes).unwrap();
         assert_eq!(report.migrated_overlays, 1);
         // Inline node + renamed PNG land in the canonical layers/ dir.
         let nodes = persist::load_page_text_nodes(&layers_dir, None, 0).unwrap();
         assert!(nodes[0].inline.is_some());
-        assert!(layers_dir.join(persist::text_image_file_name(0, "a")).is_file());
+        assert!(
+            layers_dir
+                .join(persist::text_image_file_name(0, "a"))
+                .is_file()
+        );
         // The legacy text_info.json (in text_images/) is the one backed up.
-        assert!(text_images_dir.join(format!("{TEXT_INFO_FILE}.bak")).is_file());
+        assert!(
+            text_images_dir
+                .join(format!("{TEXT_INFO_FILE}.bak"))
+                .is_file()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1050,7 +1297,13 @@ mod tests {
             pinned_by_group: false,
             payload_uid: uid.into(),
             render_data: serde_json::json!({ "text": uid, "staged": true }),
-            transform: TransformRec { cx, cy, rotation: 0.0, scale: 1.0 },
+            is_image: false,
+            transform: TransformRec {
+                cx,
+                cy,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             rendered_file: Some(persist::text_image_file_name(page, uid)),
             mask_clip: None,
@@ -1088,7 +1341,13 @@ mod tests {
                 pinned_by_group: false,
                 payload_uid: "a".into(),
                 render_data: serde_json::json!({ "text": "a" }),
-                transform: TransformRec { cx: 100.0, cy: 50.0, rotation: 0.0, scale: 1.0 },
+                is_image: false,
+                transform: TransformRec {
+                    cx: 100.0,
+                    cy: 50.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 rendered_file: Some(persist::text_image_file_name(0, "a")),
                 mask_clip: Some(true),
@@ -1109,7 +1368,11 @@ mod tests {
         // The gate blocks re-migration (manifest is v3-inline).
         assert!(chapter_needs_migration(&dir, &dir).is_none());
         let report = migrate_chapter_to_v3(&dir, &dir, None, &page_sizes).unwrap();
-        assert_eq!(report, MigrationReport::default(), "no-op: inline data not touched");
+        assert_eq!(
+            report,
+            MigrationReport::default(),
+            "no-op: inline data not touched"
+        );
 
         // Page 0's good inline data (cx=100) and renamed PNG are intact (NOT regressed to the stale 999).
         let p0 = persist::load_page_text_nodes(&dir, None, 0).unwrap();
@@ -1118,7 +1381,10 @@ mod tests {
         assert!((cx - 100.0).abs() < 1e-3, "page 0 kept its good geometry");
         assert_eq!(fs::read(&a_v3).unwrap(), a_bytes, "page-0 pixels untouched");
         // text_info.json is PRESERVED (not `.bak`'d) so page 1 still loads via the lazy path.
-        assert!(dir.join(TEXT_INFO_FILE).is_file(), "legacy file kept for the not-yet-inlined page");
+        assert!(
+            dir.join(TEXT_INFO_FILE).is_file(),
+            "legacy file kept for the not-yet-inlined page"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1136,7 +1402,10 @@ mod tests {
 
         // Committed legacy chapter: text_info.json + PNG for overlay "a".
         write_png(&committed.join("a.png"), 4, 3, [10, 20, 30, 255]);
-        write_text_info(&committed, serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]));
+        write_text_info(
+            &committed,
+            serde_json::json!([overlay("a", 0, "a.png", 100.0, 50.0)]),
+        );
         // Unsaved staging page 0 already exists with a staged-only inline overlay "s".
         seed_inline_text(&unsaved, 0, "s", 11.0, 22.0, &[]);
 
@@ -1147,13 +1416,19 @@ mod tests {
         let unsaved_nodes = persist::load_page_text_nodes(&unsaved, None, 0).unwrap();
         let uids: std::collections::HashSet<&str> =
             unsaved_nodes.iter().map(|n| n.uid.as_str()).collect();
-        assert!(uids.contains("s"), "staged-only overlay survived the additive mirror");
+        assert!(
+            uids.contains("s"),
+            "staged-only overlay survived the additive mirror"
+        );
         assert!(uids.contains("a"), "migrated overlay was added to unsaved");
         // "s" kept its staged geometry/payload.
         let s = unsaved_nodes.iter().find(|n| n.uid == "s").unwrap();
         let s_inline = s.inline.as_ref().unwrap();
         assert!((s_inline.transform.unwrap().cx - 11.0).abs() < 1e-4);
-        assert_eq!(s_inline.render_data["staged"], true, "staged payload preserved");
+        assert_eq!(
+            s_inline.render_data["staged"], true,
+            "staged payload preserved"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1169,7 +1444,10 @@ mod tests {
         fs::create_dir_all(&unsaved).unwrap();
 
         write_png(&committed.join("x.png"), 4, 3, [10, 20, 30, 255]);
-        write_text_info(&committed, serde_json::json!([overlay("x", 0, "x.png", 100.0, 50.0)]));
+        write_text_info(
+            &committed,
+            serde_json::json!([overlay("x", 0, "x.png", 100.0, 50.0)]),
+        );
         // Unsaved already has a fresher inline edit for "x".
         seed_inline_text(&unsaved, 0, "x", 999.0, 888.0, &[]);
 
@@ -1196,7 +1474,10 @@ mod tests {
             .transform
             .unwrap()
             .cx;
-        assert!((cx_committed - 100.0).abs() < 1e-4, "committed reflects the migrated legacy geometry");
+        assert!(
+            (cx_committed - 100.0).abs() < 1e-4,
+            "committed reflects the migrated legacy geometry"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

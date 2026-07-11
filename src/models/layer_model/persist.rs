@@ -203,7 +203,12 @@ pub fn save_page_rasters(
         .unwrap_or_default();
     // Non-destructive effects: when a raster's base pixels were NOT edited, preserve its on-disk
     // base PNG + rendered PNG + effects chain + base `image_size` (another tab may own the effects).
-    type ExistingRaster = (Option<String>, Option<String>, Vec<serde_json::Value>, Option<[usize; 2]>);
+    type ExistingRaster = (
+        Option<String>,
+        Option<String>,
+        Vec<serde_json::Value>,
+        Option<[usize; 2]>,
+    );
     let existing_rasters: HashMap<String, ExistingRaster> = manifest
         .page(page_idx)
         .map(|p| {
@@ -277,11 +282,14 @@ pub fn save_page_rasters(
     }
     recs.extend(preserved_rasters);
     for layer in layers.iter() {
-        let z = existing_raster_z.get(&layer.uid).copied().unwrap_or_else(|| {
-            let z = next_top_z;
-            next_top_z += 1;
-            z
-        });
+        let z = existing_raster_z
+            .get(&layer.uid)
+            .copied()
+            .unwrap_or_else(|| {
+                let z = next_top_z;
+                next_top_z += 1;
+                z
+            });
         let existing = existing_rasters.get(&layer.uid);
         // Preserve the original base PNG + effects when the base pixels were not edited, so a
         // non-destructive effects chain (set by the typing tab) survives a PS whole-page save.
@@ -325,6 +333,7 @@ pub fn save_page_rasters(
             effects,
             payload_ref: None,
             render_data: None,
+            overlay_is_image: None,
             // The owning writer's value wins; a non-owning writer (PS, `None`) preserves the on-disk one.
             mask_clip: layer
                 .mask_clip
@@ -580,6 +589,7 @@ pub fn add_page_raster(
         effects: Vec::new(),
         payload_ref: None,
         render_data: None,
+        overlay_is_image: None,
         mask_clip: None,
     });
     write_manifest(&manifest_path, &manifest)?;
@@ -749,7 +759,8 @@ pub fn update_raster_effects(
     if let Some(old) = old_rendered
         && node.rendered_file.as_deref() != Some(old.as_str())
     {
-        let _ = crate::storage::storage().remove_file(layers_dir.join(&old).to_string_lossy().as_ref());
+        let _ =
+            crate::storage::storage().remove_file(layers_dir.join(&old).to_string_lossy().as_ref());
     }
     write_manifest(&manifest_path, &manifest)
 }
@@ -776,7 +787,7 @@ struct TextIdent {
 /// (`write_page_text_payload`). Unlike [`TextNodeOut`] (identity/order only, payload referenced into
 /// `text_info.json`), this carries the render params, geometry, the rendered PNG name, and mask-clip
 /// inline so `layers.json` is self-sufficient for text.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TextPayloadOut {
     pub uid: String,
     pub name: String,
@@ -792,6 +803,8 @@ pub struct TextPayloadOut {
     pub payload_uid: String,
     /// Opaque text render payload (was `text_info.json`'s `render_data`).
     pub render_data: serde_json::Value,
+    /// Whether this TEXT node is a placed PNG image overlay rather than re-renderable text.
+    pub is_image: bool,
     /// Canonical geometry (center-anchored, rotation in radians); encoded to disk degrees on write.
     pub transform: TransformRec,
     pub deform: Option<DeformRec>,
@@ -820,9 +833,11 @@ pub struct TextNodeIn {
 
 /// The inline TEXT payload decoded from a schema-v3 `layers.json` node: render params, geometry, the
 /// rendered PNG name, and the mask-clip flag. Present only when the node is self-sufficient.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TextInlineIn {
     pub render_data: serde_json::Value,
+    /// Whether this inline TEXT node is a placed PNG image overlay.
+    pub is_image: bool,
     pub transform: Option<TransformRec>,
     pub deform: Option<DeformRec>,
     /// Rendered text PNG filename in the layers dir (the node's displayed image).
@@ -1005,6 +1020,7 @@ fn text_payload_rec(payload: &TextPayloadOut, ident: &TextIdent) -> LayerRec {
             uid: payload.payload_uid.clone(),
         }),
         render_data: Some(payload.render_data.clone()),
+        overlay_is_image: payload.is_image.then_some(true),
         mask_clip: payload.mask_clip,
     }
 }
@@ -1094,7 +1110,11 @@ fn apply_band_order(page: &mut PageLayers, order: &[BandRef]) {
                 }
             }
             BandRef::TextGroup(layer_idx) => {
-                if let Some(group) = page.text_groups.iter_mut().find(|g| g.layer_idx == *layer_idx) {
+                if let Some(group) = page
+                    .text_groups
+                    .iter_mut()
+                    .find(|g| g.layer_idx == *layer_idx)
+                {
                     group.z = z;
                 }
             }
@@ -1256,14 +1276,9 @@ pub fn save_page_grouping(
 /// knows overlay properties and always sends `group_uid: None`) does not clobber a pin / Z / PS
 /// group membership set in the PS editor. Without preserving `group_uid` here, every typing autosave
 /// would silently ungroup texts that the PS tree put into a group.
-fn merge_preserved_text_fields(
-    existing_text: &[LayerRec],
-    nodes: &[TextIdent],
-) -> Vec<TextIdent> {
-    let existing: HashMap<&str, &LayerRec> = existing_text
-        .iter()
-        .map(|r| (r.uid.as_str(), r))
-        .collect();
+fn merge_preserved_text_fields(existing_text: &[LayerRec], nodes: &[TextIdent]) -> Vec<TextIdent> {
+    let existing: HashMap<&str, &LayerRec> =
+        existing_text.iter().map(|r| (r.uid.as_str(), r)).collect();
     nodes
         .iter()
         .map(|n| {
@@ -1321,8 +1336,13 @@ pub fn load_page_text_nodes(
                 .as_ref()
                 .filter(|p| p.store == TEXT_PAYLOAD_STORE)
                 .map(|p| p.uid.clone());
-            let inline = r.render_data.as_ref().map(|rd| TextInlineIn {
-                render_data: rd.clone(),
+            let is_image = r.overlay_is_image.unwrap_or(false);
+            // JSON `null` deserializes as `Option::None`, which is the expected image-overlay
+            // representation. The marker therefore also establishes that this is a self-sufficient
+            // inline payload; reconstruct its non-re-renderable params as `Value::Null`.
+            let inline = (r.render_data.is_some() || is_image).then(|| TextInlineIn {
+                render_data: r.render_data.clone().unwrap_or(serde_json::Value::Null),
+                is_image,
                 transform: r.transform,
                 deform: r.deform.clone(),
                 rendered_file: r.rendered_file.clone(),
@@ -1406,7 +1426,8 @@ fn read_page_with_fallback(
 ///   whose text was never loaded), the committed page's TEXT nodes + text-group bands are PRESERVED —
 ///   otherwise the unsaved page's missing text would silently DROP the committed text (HIGH data loss),
 ///   while a naive "preserve absent text" would RESURRECT a legitimately-deleted text. Honoring
-///   ownership avoids both.
+///   ownership avoids both. The committed text set is authoritative even when it is empty, so stale
+///   unowned staging text cannot resurrect a committed deletion.
 ///
 /// `schema_version` is taken as the max of the two (never downgrade). No-op when there is no unsaved
 /// manifest. Returns whether anything was written.
@@ -1434,8 +1455,9 @@ pub fn merge_unsaved_layers_into_committed(
 
     for mut page in unsaved.pages {
         let page_idx = page.img_idx;
-        // For a page the session did NOT own text on, carry the COMMITTED text nodes + text-group bands
-        // onto the unsaved (raster) page, so committed text is not dropped by the whole-page replace.
+        // For a page the session did NOT own text on, make the COMMITTED text nodes + text-group bands
+        // authoritative on the unsaved (raster) page. An empty committed text set must also replace
+        // stale unsaved text, so a committed deletion cannot be resurrected by the whole-page replace.
         if !owned_text_pages.contains(&page_idx)
             && let Some(committed_page) = merged.page(page_idx)
         {
@@ -1445,15 +1467,9 @@ pub fn merge_unsaved_layers_into_committed(
                 .filter(|r| r.kind == LayerKindRec::Text)
                 .cloned()
                 .collect();
-            if !committed_text.is_empty() {
-                // Replace any (unowned, hence stale) text the unsaved page might carry with the
-                // committed text, and restore the committed text-group bands.
-                page.tree.retain(|r| r.kind != LayerKindRec::Text);
-                page.tree.extend(committed_text);
-                if page.text_groups.is_empty() {
-                    page.text_groups = committed_page.text_groups.clone();
-                }
-            }
+            page.tree.retain(|r| r.kind != LayerKindRec::Text);
+            page.tree.extend(committed_text);
+            page.text_groups = committed_page.text_groups.clone();
         }
         merged.upsert_page(page);
     }
@@ -1472,8 +1488,8 @@ pub fn merge_unsaved_layers_into_committed(
 }
 
 fn write_manifest(path: &Path, manifest: &LayersManifest) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(manifest)
-        .map_err(|e| format!("serialize manifest: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(manifest).map_err(|e| format!("serialize manifest: {e}"))?;
     crate::storage::storage()
         .write(path.to_string_lossy().as_ref(), text.as_bytes())
         .map_err(|e| format!("write {}: {e}", path.display()))
@@ -1589,7 +1605,13 @@ mod tests {
             pinned_by_group: false,
             payload_uid: uid.into(),
             render_data: serde_json::Value::Null,
-            transform: TransformRec { cx: 0.0, cy: 0.0, rotation: 0.0, scale: 1.0 },
+            is_image: false,
+            transform: TransformRec {
+                cx: 0.0,
+                cy: 0.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             rendered_file: None,
             mask_clip: None,
@@ -1609,7 +1631,12 @@ mod tests {
                 name: "Слой 1".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 2.0, cy: 1.5, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 2.0,
+                    cy: 1.5,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: Some("grp-1".into()),
                 image: &red,
@@ -1621,7 +1648,12 @@ mod tests {
                 name: "Слой 2".into(),
                 visible: false,
                 opacity: 0.5,
-                transform: TransformRec { cx: 10.0, cy: 20.0, rotation: 0.25, scale: 2.0 },
+                transform: TransformRec {
+                    cx: 10.0,
+                    cy: 20.0,
+                    rotation: 0.25,
+                    scale: 2.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &blue,
@@ -1655,7 +1687,14 @@ mod tests {
 
         // Explicitly removing all layers and groups prunes the page and its PNGs. (An empty `layers`
         // with no `removed_uids` would PRESERVE the rasters as unowned — deletions must be explicit.)
-        save_page_rasters(&dir, 0, &[], &[], &["uid-a".to_string(), "uid-b".to_string()]).unwrap();
+        save_page_rasters(
+            &dir,
+            0,
+            &[],
+            &[],
+            &["uid-a".to_string(), "uid-b".to_string()],
+        )
+        .unwrap();
         assert!(load_page_rasters(&dir, None, 0).unwrap().layers.is_empty());
         let pngs = fs::read_dir(&dir)
             .unwrap()
@@ -1684,7 +1723,12 @@ mod tests {
             name: "Деформ".into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 2.0, cy: 1.5, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 2.0,
+                cy: 1.5,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: Some(mesh.clone()),
             group_uid: None,
             image: &red,
@@ -1695,7 +1739,10 @@ mod tests {
 
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
         assert_eq!(loaded.layers.len(), 1);
-        let got = loaded.layers[0].deform.as_ref().expect("deform round-trips");
+        let got = loaded.layers[0]
+            .deform
+            .as_ref()
+            .expect("deform round-trips");
         assert_eq!(got.cols, 2);
         assert_eq!(got.rows, 2);
         assert_eq!(got.points_px, mesh.points_px);
@@ -1710,7 +1757,12 @@ mod tests {
                 name: "Деформ".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &blue,
@@ -1722,7 +1774,10 @@ mod tests {
         )
         .unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert!(loaded.layers[0].deform.is_none(), "cleared deform stays None");
+        assert!(
+            loaded.layers[0].deform.is_none(),
+            "cleared deform stays None"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1742,7 +1797,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &pic,
@@ -1754,7 +1814,11 @@ mod tests {
         )
         .unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert_eq!(loaded.layers[0].mask_clip, Some(true), "mask_clip round-trips");
+        assert_eq!(
+            loaded.layers[0].mask_clip,
+            Some(true),
+            "mask_clip round-trips"
+        );
 
         // A NON-owning writer (mask_clip: None, e.g. PS) must PRESERVE the on-disk Some(true).
         save_page_rasters(
@@ -1765,7 +1829,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 9.0, cy: 9.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 9.0,
+                    cy: 9.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &pic,
@@ -1777,7 +1846,11 @@ mod tests {
         )
         .unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert_eq!(loaded.layers[0].mask_clip, Some(true), "None-writer preserved the on-disk clip");
+        assert_eq!(
+            loaded.layers[0].mask_clip,
+            Some(true),
+            "None-writer preserved the on-disk clip"
+        );
 
         // An OWNING writer can clear it to Some(false).
         save_page_rasters(
@@ -1788,7 +1861,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 9.0, cy: 9.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 9.0,
+                    cy: 9.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &pic,
@@ -1800,7 +1878,11 @@ mod tests {
         )
         .unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert_eq!(loaded.layers[0].mask_clip, Some(false), "owning writer set it off");
+        assert_eq!(
+            loaded.layers[0].mask_clip,
+            Some(false),
+            "owning writer set it off"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1816,7 +1898,12 @@ mod tests {
             name: "R".into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.5, cy: 1.5, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.5,
+                cy: 1.5,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &img,
@@ -1861,7 +1948,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.5, cy: 1.5, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.5,
+                    cy: 1.5,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &pic,
@@ -1894,7 +1986,13 @@ mod tests {
                 pinned_by_group: false,
                 payload_uid: "t1".into(),
                 render_data: serde_json::json!({ "text": "Hi" }),
-                transform: TransformRec { cx: 12.0, cy: 34.0, rotation: 0.4, scale: 2.0 },
+                is_image: false,
+                transform: TransformRec {
+                    cx: 12.0,
+                    cy: 34.0,
+                    rotation: 0.4,
+                    scale: 2.0,
+                },
                 deform: Some(mesh.clone()),
                 rendered_file: Some("ps_p0000_t1_text.png".into()),
                 mask_clip: Some(true),
@@ -1903,7 +2001,11 @@ mod tests {
         .unwrap();
 
         // Raster survives.
-        assert_eq!(load_page_rasters(&dir, None, 0).unwrap().layers.len(), 1, "raster preserved");
+        assert_eq!(
+            load_page_rasters(&dir, None, 0).unwrap().layers.len(),
+            1,
+            "raster preserved"
+        );
 
         // Text node reloads with full inline payload.
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
@@ -1915,17 +2017,79 @@ mod tests {
         assert!((t.opacity - 0.6).abs() < 1e-6);
         let inline = t.inline.as_ref().expect("inline payload present");
         assert_eq!(inline.render_data["text"], "Hi");
-        assert_eq!(inline.rendered_file.as_deref(), Some("ps_p0000_t1_text.png"));
+        assert_eq!(
+            inline.rendered_file.as_deref(),
+            Some("ps_p0000_t1_text.png")
+        );
         assert_eq!(inline.mask_clip, Some(true));
         let tr = inline.transform.expect("inline transform");
         assert!((tr.cx - 12.0).abs() < 1e-4);
-        assert!((tr.rotation - 0.4).abs() < 1e-5, "rotation stored as radians, no deg conversion");
+        assert!(
+            (tr.rotation - 0.4).abs() < 1e-5,
+            "rotation stored as radians, no deg conversion"
+        );
         assert_eq!(inline.deform.as_ref().unwrap().points_px, mesh.points_px);
 
         // A second write that drops the text node preserves the raster (kind-filter both ways).
         write_page_text_payload(&dir, None, 0, &[]).unwrap();
-        assert_eq!(load_page_text_nodes(&dir, None, 0).unwrap().len(), 0, "text node cleared");
-        assert_eq!(load_page_rasters(&dir, None, 0).unwrap().layers.len(), 1, "raster still preserved");
+        assert_eq!(
+            load_page_text_nodes(&dir, None, 0).unwrap().len(),
+            0,
+            "text node cleared"
+        );
+        assert_eq!(
+            load_page_rasters(&dir, None, 0).unwrap().layers.len(),
+            1,
+            "raster still preserved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_payload_image_marker_round_trips_and_text_omits_json_key() {
+        let dir = std::env::temp_dir().join(format!("ml_text_image_marker_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut image_payload = text_payload_out("image", 0, 0, false);
+        image_payload.is_image = true;
+        write_page_text_payload(&dir, None, 0, &[image_payload]).unwrap();
+        let image_manifest = read_manifest(&dir.join(MANIFEST_FILE))
+            .unwrap()
+            .expect("image manifest was written");
+        assert_eq!(
+            image_manifest.pages[0].tree[0].overlay_is_image,
+            Some(true),
+            "image marker survives manifest decode"
+        );
+        let image_nodes = load_page_text_nodes(&dir, None, 0).unwrap();
+        assert_eq!(
+            image_nodes[0].inline.as_ref().map(|inline| inline.is_image),
+            Some(true),
+            "decoded image payload: {:?}",
+            image_nodes[0].inline
+        );
+
+        let text_payload = text_payload_out("text", 0, 0, false);
+        write_page_text_payload(&dir, None, 0, &[text_payload]).unwrap();
+        let manifest = read_manifest(&dir.join(MANIFEST_FILE))
+            .unwrap()
+            .expect("manifest was written");
+        let text_record = manifest
+            .page(0)
+            .and_then(|page| page.tree.iter().find(|record| record.uid == "text"))
+            .expect("text record was written");
+        assert_eq!(
+            text_record.overlay_is_image, None,
+            "text omits the additive JSON key"
+        );
+        let text_nodes = load_page_text_nodes(&dir, None, 0).unwrap();
+        assert!(
+            !text_nodes[0]
+                .inline
+                .as_ref()
+                .is_some_and(|inline| inline.is_image)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1945,7 +2109,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &img,
@@ -1960,9 +2129,16 @@ mod tests {
         // so `page_bands` emits a `PinnedText` band — interleaved with the raster like any other band.
         write_page_text_payload(&dir, None, 0, &[text_payload_out("t1", 0, 0, false)]).unwrap();
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
-        assert!(texts[0].pinned, "text is pinned-with-explicit-Z (no text group)");
+        assert!(
+            texts[0].pinned,
+            "text is pinned-with-explicit-Z (no text group)"
+        );
         let bands = load_page_bands(&dir, None, 0);
-        assert_eq!(bands.len(), 2, "raster + pinned-text bands, no TextGroup band");
+        assert_eq!(
+            bands.len(),
+            2,
+            "raster + pinned-text bands, no TextGroup band"
+        );
         assert!(
             !bands.iter().any(|b| matches!(b, Band::TextGroup { .. })),
             "no TextGroup band is ever produced"
@@ -1972,18 +2148,27 @@ mod tests {
         save_page_band_order(
             &dir,
             0,
-            &[BandRef::PinnedText("t1".into()), BandRef::Raster("r1".into())],
+            &[
+                BandRef::PinnedText("t1".into()),
+                BandRef::Raster("r1".into()),
+            ],
         )
         .unwrap();
         let bands = load_page_bands(&dir, None, 0);
-        assert!(matches!(&bands[0], Band::PinnedText { uid, .. } if uid == "t1"), "text below raster");
+        assert!(
+            matches!(&bands[0], Band::PinnedText { uid, .. } if uid == "t1"),
+            "text below raster"
+        );
         assert!(matches!(&bands[1], Band::Raster { uid, .. } if uid == "r1"));
 
         // Move the text back ABOVE the raster.
         save_page_band_order(
             &dir,
             0,
-            &[BandRef::Raster("r1".into()), BandRef::PinnedText("t1".into())],
+            &[
+                BandRef::Raster("r1".into()),
+                BandRef::PinnedText("t1".into()),
+            ],
         )
         .unwrap();
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
@@ -2013,7 +2198,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &pic,
@@ -2025,11 +2215,24 @@ mod tests {
         )
         .unwrap();
         // Two texts written (both pinned now); seed the order r0, t0, t1 (bottom-to-top).
-        write_page_text_payload(&dir, None, 0, &[text_payload_out("t0", 0, 0, false), text_payload_out("t1", 0, 0, false)]).unwrap();
+        write_page_text_payload(
+            &dir,
+            None,
+            0,
+            &[
+                text_payload_out("t0", 0, 0, false),
+                text_payload_out("t1", 0, 0, false),
+            ],
+        )
+        .unwrap();
         save_page_band_order(
             &dir,
             0,
-            &[BandRef::Raster("r0".into()), BandRef::PinnedText("t0".into()), BandRef::PinnedText("t1".into())],
+            &[
+                BandRef::Raster("r0".into()),
+                BandRef::PinnedText("t0".into()),
+                BandRef::PinnedText("t1".into()),
+            ],
         )
         .unwrap();
         let band_uids = |bands: &[Band]| -> Vec<String> {
@@ -2041,20 +2244,44 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(band_uids(&load_page_bands(&dir, None, 0)), vec!["r0", "t0", "t1"]);
+        assert_eq!(
+            band_uids(&load_page_bands(&dir, None, 0)),
+            vec!["r0", "t0", "t1"]
+        );
 
         // Move t0 UP one step (swap with t1): order becomes r0, t1, t0.
         save_page_band_order(
             &dir,
             0,
-            &[BandRef::Raster("r0".into()), BandRef::PinnedText("t1".into()), BandRef::PinnedText("t0".into())],
+            &[
+                BandRef::Raster("r0".into()),
+                BandRef::PinnedText("t1".into()),
+                BandRef::PinnedText("t0".into()),
+            ],
         )
         .unwrap();
-        assert_eq!(band_uids(&load_page_bands(&dir, None, 0)), vec!["r0", "t1", "t0"], "single text moved up");
+        assert_eq!(
+            band_uids(&load_page_bands(&dir, None, 0)),
+            vec!["r0", "t1", "t0"],
+            "single text moved up"
+        );
 
         // A subsequent text flush PRESERVES the reordered Z (merge_preserved_text_fields keeps pinned Z).
-        write_page_text_payload(&dir, None, 0, &[text_payload_out("t0", 0, 0, false), text_payload_out("t1", 0, 0, false)]).unwrap();
-        assert_eq!(band_uids(&load_page_bands(&dir, None, 0)), vec!["r0", "t1", "t0"], "reorder survives a text flush");
+        write_page_text_payload(
+            &dir,
+            None,
+            0,
+            &[
+                text_payload_out("t0", 0, 0, false),
+                text_payload_out("t1", 0, 0, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            band_uids(&load_page_bands(&dir, None, 0)),
+            vec!["r0", "t1", "t0"],
+            "reorder survives a text flush"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2075,7 +2302,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2093,18 +2325,34 @@ mod tests {
         let wrote = merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).unwrap();
         assert!(wrote);
 
-        let m = read_manifest(&committed.join("layers.json")).unwrap().unwrap();
+        let m = read_manifest(&committed.join("layers.json"))
+            .unwrap()
+            .unwrap();
         let mut pages: Vec<usize> = m.pages.iter().map(|p| p.img_idx).collect();
         pages.sort_unstable();
-        assert_eq!(pages, vec![0, 1, 2, 3, 4], "all committed pages survive (no truncation)");
+        assert_eq!(
+            pages,
+            vec![0, 1, 2, 3, 4],
+            "all committed pages survive (no truncation)"
+        );
         // Page 0 reflects the unsaved edit (its raster set replaced the committed page).
         let p0 = m.page(0).unwrap();
-        assert!(p0.tree.iter().any(|r| r.uid == "edited0"), "page 0 got the unsaved edit");
-        assert!(!p0.tree.iter().any(|r| r.uid == "c0"), "page 0 = the unsaved version (committed replaced)");
+        assert!(
+            p0.tree.iter().any(|r| r.uid == "edited0"),
+            "page 0 got the unsaved edit"
+        );
+        assert!(
+            !p0.tree.iter().any(|r| r.uid == "c0"),
+            "page 0 = the unsaved version (committed replaced)"
+        );
         // Pages 1..5 keep their committed-only rasters.
         for p in 1..5 {
             assert!(
-                m.page(p).unwrap().tree.iter().any(|r| r.uid == format!("c{p}")),
+                m.page(p)
+                    .unwrap()
+                    .tree
+                    .iter()
+                    .any(|r| r.uid == format!("c{p}")),
                 "committed-only page {p} preserved"
             );
         }
@@ -2132,7 +2380,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2141,7 +2394,8 @@ mod tests {
         };
         // COMMITTED page 0: a raster + a text overlay.
         save_page_rasters(&committed, 0, &[raster("r0")], &[], &[]).unwrap();
-        write_page_text_payload(&committed, None, 0, &[text_payload_out("t0", 0, 0, false)]).unwrap();
+        write_page_text_payload(&committed, None, 0, &[text_payload_out("t0", 0, 0, false)])
+            .unwrap();
         assert_eq!(load_page_text_nodes(&committed, None, 0).unwrap().len(), 1);
 
         // UNSAVED page 0: only a raster edit (no text — the page's text was never loaded into the doc).
@@ -2153,12 +2407,85 @@ mod tests {
 
         // The committed text SURVIVES; the raster edit applied.
         let texts = load_page_text_nodes(&committed, None, 0).unwrap();
-        assert_eq!(texts.len(), 1, "committed text preserved on an unowned raster-only edit");
+        assert_eq!(
+            texts.len(),
+            1,
+            "committed text preserved on an unowned raster-only edit"
+        );
         assert_eq!(texts[0].uid, "t0");
-        let m = read_manifest(&committed.join("layers.json")).unwrap().unwrap();
-        assert!(m.page(0).unwrap().tree.iter().any(|r| r.uid == "r0_moved"), "raster edit applied");
+        let m = read_manifest(&committed.join("layers.json"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            m.page(0).unwrap().tree.iter().any(|r| r.uid == "r0_moved"),
+            "raster edit applied"
+        );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unowned_page_with_empty_committed_text_drops_stale_unsaved_text() -> Result<(), String> {
+        // The committed page legitimately has no text, while an interrupted earlier staging save left
+        // stale text behind. Because this session does not own text, the authoritative empty committed
+        // set must remove the stale node without affecting the unsaved raster edit.
+        let root = std::env::temp_dir().join(format!("ml_merge_empty_text_{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).map_err(|e| format!("remove {}: {e}", root.display()))?;
+        }
+        let committed = root.join("layers");
+        let unsaved = root.join("layers_unsaved");
+        let pic = img([2, 2], Color32::WHITE);
+        let raster = |uid: &str| RasterLayerOut {
+            uid: uid.into(),
+            name: uid.into(),
+            visible: true,
+            opacity: 1.0,
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            deform: None,
+            group_uid: None,
+            image: &pic,
+            pixels_dirty: true,
+            mask_clip: None,
+        };
+
+        save_page_rasters(&committed, 0, &[raster("committed_raster")], &[], &[])?;
+        save_page_rasters(&unsaved, 0, &[raster("unsaved_raster")], &[], &[])?;
+        write_page_text_payload(
+            &unsaved,
+            None,
+            0,
+            &[text_payload_out("stale_text", 0, 0, false)],
+        )?;
+
+        let owned: HashSet<usize> = HashSet::new();
+        merge_unsaved_layers_into_committed(&committed, &unsaved, &owned)?;
+
+        let merged = read_manifest(&committed.join("layers.json"))?
+            .ok_or_else(|| "merged manifest is missing".to_owned())?;
+        let page = merged
+            .page(0)
+            .ok_or_else(|| "merged page 0 is missing".to_owned())?;
+        assert!(
+            page.tree
+                .iter()
+                .all(|record| record.kind != LayerKindRec::Text),
+            "stale unowned text must not resurrect a committed deletion"
+        );
+        assert!(
+            page.tree
+                .iter()
+                .any(|record| record.uid == "unsaved_raster"),
+            "the unsaved raster edit remains intact"
+        );
+
+        fs::remove_dir_all(&root).map_err(|e| format!("remove {}: {e}", root.display()))?;
+        Ok(())
     }
 
     #[test]
@@ -2176,7 +2503,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2189,14 +2521,18 @@ mod tests {
             &committed,
             None,
             0,
-            &[text_payload_out("keep", 0, 0, false), text_payload_out("deleted", 1, 0, false)],
+            &[
+                text_payload_out("keep", 0, 0, false),
+                text_payload_out("deleted", 1, 0, false),
+            ],
         )
         .unwrap();
         assert_eq!(load_page_text_nodes(&committed, None, 0).unwrap().len(), 2);
 
         // UNSAVED page 0: the session kept "keep" but DELETED "deleted" (only "keep" flushed).
         save_page_rasters(&unsaved, 0, &[raster("r0")], &[], &[]).unwrap();
-        write_page_text_payload(&unsaved, None, 0, &[text_payload_out("keep", 0, 0, false)]).unwrap();
+        write_page_text_payload(&unsaved, None, 0, &[text_payload_out("keep", 0, 0, false)])
+            .unwrap();
 
         // Page 0 IS owned (its text was loaded this session).
         let owned: HashSet<usize> = [0].into_iter().collect();
@@ -2206,7 +2542,10 @@ mod tests {
         let texts = load_page_text_nodes(&committed, None, 0).unwrap();
         let uids: std::collections::HashSet<&str> = texts.iter().map(|n| n.uid.as_str()).collect();
         assert!(uids.contains("keep"), "kept text survives");
-        assert!(!uids.contains("deleted"), "deleted text NOT resurrected on an owned page");
+        assert!(
+            !uids.contains("deleted"),
+            "deleted text NOT resurrected on an owned page"
+        );
         assert_eq!(texts.len(), 1);
 
         let _ = fs::remove_dir_all(&root);
@@ -2236,7 +2575,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2268,7 +2612,11 @@ mod tests {
             let seed = load_page_text_nodes(&committed, None, 8).unwrap();
             assert_eq!(seed.len(), 1, "seed: committed page 8 has one text node");
             assert!(
-                seed[0].inline.as_ref().and_then(|i| i.rendered_file.as_ref()).is_some(),
+                seed[0]
+                    .inline
+                    .as_ref()
+                    .and_then(|i| i.rendered_file.as_ref())
+                    .is_some(),
                 "seed: inline rendered_file present"
             );
         }
@@ -2276,7 +2624,11 @@ mod tests {
         // STAGE page 0 this session → the unsaved manifest now EXISTS but contains only page 0.
         save_page_rasters(&unsaved, 0, &[raster("c0")], &[], &[]).unwrap();
         assert!(
-            read_manifest(&unsaved.join("layers.json")).unwrap().unwrap().page(8).is_none(),
+            read_manifest(&unsaved.join("layers.json"))
+                .unwrap()
+                .unwrap()
+                .page(8)
+                .is_none(),
             "precondition: staging manifest has no page 8"
         );
 
@@ -2288,38 +2640,70 @@ mod tests {
 
         // OPEN committed-only page 8 through the real loader: primary=unsaved, fallback=committed.
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(8, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(8, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         let loaded_text = doc
             .page(8)
             .expect("page 8 resident")
             .nodes
             .iter()
-            .filter(|n| matches!(n.kind, crate::models::layer_model::layer_doc::NodeKind::Text))
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    crate::models::layer_model::layer_doc::NodeKind::Text
+                )
+            })
             .count();
-        assert_eq!(loaded_text, 1, "per-page fallback loaded page 8's COMMITTED text into the doc");
+        assert_eq!(
+            loaded_text, 1,
+            "per-page fallback loaded page 8's COMMITTED text into the doc"
+        );
 
         // PS raster edit on page 8, then stage it through the real flush path (rasters + text).
-        doc.set_raster_pixels(8, "c8", img([2, 2], Color32::BLACK), img([2, 2], Color32::BLACK), Vec::new(), true);
-        doc.flush_page(8, &unsaved, Some(committed.as_path())).unwrap();
-        doc.flush_page_text(8, &unsaved, Some(committed.as_path())).unwrap();
+        doc.set_raster_pixels(
+            8,
+            "c8",
+            img([2, 2], Color32::BLACK),
+            img([2, 2], Color32::BLACK),
+            Vec::new(),
+            true,
+        );
+        doc.flush_page(8, &unsaved, Some(committed.as_path()))
+            .unwrap();
+        doc.flush_page_text(8, &unsaved, Some(committed.as_path()))
+            .unwrap();
 
         // The REAL owned set: every resident page that flushed text Ok (page 8 was loaded + flushed).
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
-            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+            if doc
+                .flush_page_text(p, &unsaved, Some(committed.as_path()))
+                .is_ok()
+            {
                 owned.insert(p);
             }
         }
-        assert!(owned.contains(&8), "page 8 is owned (its text was loaded + flushed this session)");
+        assert!(
+            owned.contains(&8),
+            "page 8 is owned (its text was loaded + flushed this session)"
+        );
 
         // Save-to-project merge with the REAL owned set.
         merge_unsaved_layers_into_committed(&committed, &unsaved, &owned).unwrap();
 
         // Committed page 8's text SURVIVES (no data loss); page 0's text is intact too.
         let final_t8 = load_page_text_nodes(&committed, None, 8).unwrap();
-        assert_eq!(final_t8.len(), 1, "committed page 8 text survives the save (FIX 1)");
+        assert_eq!(
+            final_t8.len(),
+            1,
+            "committed page 8 text survives the save (FIX 1)"
+        );
         assert_eq!(final_t8[0].uid, "t8");
-        assert_eq!(load_page_text_nodes(&committed, None, 0).unwrap().len(), 1, "page 0 text intact");
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 0).unwrap().len(),
+            1,
+            "page 0 text intact"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2352,7 +2736,11 @@ mod tests {
         // COMMITTED page 3: a TYPESET page (one text), NO staging yet.
         let t3 = text_with_png(&committed, "t3", 3);
         write_page_text_payload(&committed, None, 3, &[t3]).unwrap();
-        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "seed: committed text");
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 3).unwrap().len(),
+            1,
+            "seed: committed text"
+        );
 
         // CREATE an image on page 3 → stage a raster into the (absent) unsaved page, seeding from
         // committed (the production create path: `add_page_raster(unsaved, Some(committed), ...)`).
@@ -2364,13 +2752,22 @@ mod tests {
             "Картинка",
             true,
             1.0,
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             &img([2, 2], Color32::BLUE),
         )
         .unwrap();
         // The staged page now carries BOTH the new raster AND the committed text.
         assert!(
-            read_manifest(&unsaved.join("layers.json")).unwrap().unwrap().page(3).is_some(),
+            read_manifest(&unsaved.join("layers.json"))
+                .unwrap()
+                .unwrap()
+                .page(3)
+                .is_some(),
             "page 3 staged"
         );
         assert_eq!(
@@ -2386,15 +2783,24 @@ mod tests {
             page_sizes.insert(p, [2, 2]);
         }
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         assert_eq!(
-            doc.page(3).unwrap().nodes.iter().filter(|n| n.is_text()).count(),
+            doc.page(3)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|n| n.is_text())
+                .count(),
             1,
             "doc reload sees the committed text (NOT zero)"
         );
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
-            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+            if doc
+                .flush_page_text(p, &unsaved, Some(committed.as_path()))
+                .is_ok()
+            {
                 owned.insert(p);
             }
         }
@@ -2421,7 +2827,8 @@ mod tests {
         // raster → merge → text stays deleted.
         use crate::models::layer_model::layer_doc::LayerDoc;
 
-        let root = std::env::temp_dir().join(format!("ml_addraster_resurrect_{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("ml_addraster_resurrect_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let committed = root.join("layers");
         let unsaved = root.join("layers_unsaved");
@@ -2439,7 +2846,11 @@ mod tests {
         // COMMITTED page 3: a TEXT-ONLY page (one text), NO staging yet.
         let t3 = text_with_png(&committed, "t3", 3);
         write_page_text_payload(&committed, None, 3, &[t3]).unwrap();
-        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "seed: committed text");
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 3).unwrap().len(),
+            1,
+            "seed: committed text"
+        );
 
         let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
         for p in 0..=3 {
@@ -2449,22 +2860,44 @@ mod tests {
         // Session: load page 3 into the doc, then DELETE its last text (doc only — the empty page is not
         // staged by the placement-save, mirroring `spawn_overlay_placement_save`'s `pages_with_text`).
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         assert!(doc.remove_node(3, "t3"));
-        assert_eq!(doc.page(3).unwrap().nodes.iter().filter(|n| n.is_text()).count(), 0, "text deleted in doc");
+        assert_eq!(
+            doc.page(3)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|n| n.is_text())
+                .count(),
+            0,
+            "text deleted in doc"
+        );
         assert!(
-            read_manifest(&unsaved.join("layers.json")).ok().flatten().is_none(),
+            read_manifest(&unsaved.join("layers.json"))
+                .ok()
+                .flatten()
+                .is_none(),
             "precondition: nothing staged yet (the empty page was skipped by the placement-save)"
         );
 
         // THE FIX: flush the target page's CURRENT doc text to staging before creating the raster. For a
         // deleted-last-text page this writes it PRESENT-but-EMPTY (`flush_target_page_text_to_staging`).
-        doc.flush_page_text(3, &unsaved, Some(committed.as_path())).unwrap();
+        doc.flush_page_text(3, &unsaved, Some(committed.as_path()))
+            .unwrap();
         assert!(
-            read_manifest(&unsaved.join("layers.json")).unwrap().unwrap().page(3).is_some(),
+            read_manifest(&unsaved.join("layers.json"))
+                .unwrap()
+                .unwrap()
+                .page(3)
+                .is_some(),
             "page 3 now staged present-but-empty (deletion durable)"
         );
-        assert_eq!(load_page_text_nodes(&unsaved, None, 3).unwrap().len(), 0, "staged page has no text");
+        assert_eq!(
+            load_page_text_nodes(&unsaved, None, 3).unwrap().len(),
+            0,
+            "staged page has no text"
+        );
 
         // CREATE an image on page 3 → `add_page_raster` seeds from committed only if the page is ABSENT;
         // it is now PRESENT (empty) → no stale seed → no resurrection.
@@ -2476,7 +2909,12 @@ mod tests {
             "Картинка",
             true,
             1.0,
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             &img([2, 2], Color32::BLUE),
         )
         .unwrap();
@@ -2488,10 +2926,14 @@ mod tests {
 
         // Reload + flush + save-to-project merge with the real owned set.
         doc.evict_page(3);
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
-            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+            if doc
+                .flush_page_text(p, &unsaved, Some(committed.as_path()))
+                .is_ok()
+            {
                 owned.insert(p);
             }
         }
@@ -2532,7 +2974,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2551,7 +2998,14 @@ mod tests {
 
         // COMMITTED page 3 (the state after the FIRST successful save + reopen): two rasters, one with a
         // non-destructive effect, plus a text overlay. NO staging dir yet (it was removed on last save).
-        save_page_rasters(&committed, 3, &[raster("piece1"), raster("piece2")], &[], &[]).unwrap();
+        save_page_rasters(
+            &committed,
+            3,
+            &[raster("piece1"), raster("piece2")],
+            &[],
+            &[],
+        )
+        .unwrap();
         // Give piece1 a reversible effect (rendered PNG + chain), as the user did.
         update_raster_effects(
             &committed,
@@ -2566,11 +3020,28 @@ mod tests {
         write_page_text_payload(&committed, None, 3, &[t3]).unwrap();
 
         // Sanity: committed page 3 has two rasters (one effected) + one text.
-        assert_eq!(load_page_rasters(&committed, None, 3).unwrap().layers.len(), 2, "seed: 2 rasters");
-        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "seed: 1 text");
+        assert_eq!(
+            load_page_rasters(&committed, None, 3).unwrap().layers.len(),
+            2,
+            "seed: 2 rasters"
+        );
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 3).unwrap().len(),
+            1,
+            "seed: 1 text"
+        );
         assert!(
-            !read_manifest(&committed.join("layers.json")).unwrap().unwrap().page(3).unwrap()
-                .tree.iter().find(|r| r.uid == "piece1").unwrap().effects.is_empty(),
+            !read_manifest(&committed.join("layers.json"))
+                .unwrap()
+                .unwrap()
+                .page(3)
+                .unwrap()
+                .tree
+                .iter()
+                .find(|r| r.uid == "piece1")
+                .unwrap()
+                .effects
+                .is_empty(),
             "seed: piece1 carries its effect chain"
         );
 
@@ -2580,9 +3051,15 @@ mod tests {
             page_sizes.insert(p, [2, 2]);
         }
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         assert_eq!(
-            doc.page(3).unwrap().nodes.iter().filter(|n| n.is_raster()).count(),
+            doc.page(3)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|n| n.is_raster())
+                .count(),
             2,
             "doc reload sees both committed rasters"
         );
@@ -2591,13 +3068,19 @@ mod tests {
         // `flush_page` re-stages the rasters here.
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
-            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+            if doc
+                .flush_page_text(p, &unsaved, Some(committed.as_path()))
+                .is_ok()
+            {
                 owned.insert(p);
             }
         }
         // The staged page must carry the rasters seeded from committed (the fix); pre-fix it had none.
         assert_eq!(
-            load_page_rasters(&unsaved, Some(committed.as_path()), 3).unwrap().layers.len(),
+            load_page_rasters(&unsaved, Some(committed.as_path()), 3)
+                .unwrap()
+                .layers
+                .len(),
             2,
             "staged page keeps the committed rasters (fallback seed)"
         );
@@ -2607,11 +3090,28 @@ mod tests {
 
         // CLOSE + OPEN again: committed page 3 still has BOTH rasters AND the text, effect intact.
         let final_rasters = load_page_rasters(&committed, None, 3).unwrap();
-        assert_eq!(final_rasters.layers.len(), 2, "both rasters survive the second save (the bug)");
-        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "text intact");
+        assert_eq!(
+            final_rasters.layers.len(),
+            2,
+            "both rasters survive the second save (the bug)"
+        );
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 3).unwrap().len(),
+            1,
+            "text intact"
+        );
         assert!(
-            !read_manifest(&committed.join("layers.json")).unwrap().unwrap().page(3).unwrap()
-                .tree.iter().find(|r| r.uid == "piece1").unwrap().effects.is_empty(),
+            !read_manifest(&committed.join("layers.json"))
+                .unwrap()
+                .unwrap()
+                .page(3)
+                .unwrap()
+                .tree
+                .iter()
+                .find(|r| r.uid == "piece1")
+                .unwrap()
+                .effects
+                .is_empty(),
             "piece1's effect chain survives too"
         );
 
@@ -2652,7 +3152,11 @@ mod tests {
         // COMMITTED page 3: TEXT-ONLY (one text, NO raster, NO groups).
         let t3 = text_with_png(&committed, "t3", 3);
         write_page_text_payload(&committed, None, 3, &[t3]).unwrap();
-        assert_eq!(load_page_text_nodes(&committed, None, 3).unwrap().len(), 1, "seed: committed text");
+        assert_eq!(
+            load_page_text_nodes(&committed, None, 3).unwrap().len(),
+            1,
+            "seed: committed text"
+        );
 
         // Full chapter page-size map (ensure_page_loaded's ribbon migration needs it).
         let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
@@ -2662,9 +3166,15 @@ mod tests {
 
         // OPEN page 3 (primary=unsaved which has NOTHING yet, fallback=committed): loads the text.
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes).unwrap();
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+            .unwrap();
         assert_eq!(
-            doc.page(3).unwrap().nodes.iter().filter(|n| n.is_text()).count(),
+            doc.page(3)
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|n| n.is_text())
+                .count(),
             1,
             "doc loaded the committed text"
         );
@@ -2674,18 +3184,31 @@ mod tests {
         // Build the owned set the way `flush_text_layers` does: every resident page flushed Ok is owned.
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
-            if doc.flush_page_text(p, &unsaved, Some(committed.as_path())).is_ok() {
+            if doc
+                .flush_page_text(p, &unsaved, Some(committed.as_path()))
+                .is_ok()
+            {
                 owned.insert(p);
             }
         }
-        assert!(owned.contains(&3), "page 3 owned (text loaded + flushed this session)");
+        assert!(
+            owned.contains(&3),
+            "page 3 owned (text loaded + flushed this session)"
+        );
 
         // The emptied page must remain PRESENT in the unsaved manifest (write-keep-present), so the merge
         // can honor the deletion — NOT absent (which would resurrect committed text).
-        let staged = read_manifest(&unsaved.join("layers.json")).unwrap().unwrap();
-        let staged_page = staged.page(3).expect("emptied page stays present in unsaved (not removed)");
+        let staged = read_manifest(&unsaved.join("layers.json"))
+            .unwrap()
+            .unwrap();
+        let staged_page = staged
+            .page(3)
+            .expect("emptied page stays present in unsaved (not removed)");
         assert!(
-            staged_page.tree.iter().all(|r| r.kind != LayerKindRec::Text),
+            staged_page
+                .tree
+                .iter()
+                .all(|r| r.kind != LayerKindRec::Text),
             "staged page 3 carries no text (deletion honored)"
         );
 
@@ -2714,7 +3237,12 @@ mod tests {
             name: uid.into(),
             visible: true,
             opacity: 1.0,
-            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            transform: TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             deform: None,
             group_uid: None,
             image: &pic,
@@ -2732,7 +3260,11 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(band_uids(&dir), vec!["r0", "r1"], "initial bottom-to-top order");
+        assert_eq!(
+            band_uids(&dir),
+            vec!["r0", "r1"],
+            "initial bottom-to-top order"
+        );
 
         // Move r0 UP one step (swap with r1): [r1, r0]. This is the order `move_node_in_unified_z`
         // computes and passes to `save_page_band_order`.
@@ -2781,7 +3313,10 @@ mod tests {
         save_page_band_order(
             &dir,
             0,
-            &[BandRef::PinnedText("t_hi".into()), BandRef::PinnedText("t_lo".into())],
+            &[
+                BandRef::PinnedText("t_hi".into()),
+                BandRef::PinnedText("t_lo".into()),
+            ],
         )
         .unwrap();
 
@@ -2799,7 +3334,8 @@ mod tests {
             n.render_data = serde_json::json!({ "text": uid });
             n
         };
-        write_page_text_payload(&dir, None, 0, &[with_render("t_lo"), with_render("t_hi")]).unwrap();
+        write_page_text_payload(&dir, None, 0, &[with_render("t_lo"), with_render("t_hi")])
+            .unwrap();
 
         // Reorder preserved: still pinned, same band order, AND now self-sufficient inline.
         let bands = load_page_bands(&dir, None, 0);
@@ -2809,14 +3345,20 @@ mod tests {
         );
         assert!(matches!(bands.last(), Some(Band::PinnedText { uid, .. }) if uid == "t_lo"));
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
-        assert!(texts.iter().all(|t| t.pinned), "pin survived the inline flush");
+        assert!(
+            texts.iter().all(|t| t.pinned),
+            "pin survived the inline flush"
+        );
         // No text-group band lingers (all texts pinned out of the group).
         assert!(
             !bands.iter().any(|b| matches!(b, Band::TextGroup { .. })),
             "the flattened group leaves no TextGroup band"
         );
         // The flush made the nodes self-sufficient (inline payload present).
-        assert!(texts.iter().all(|t| t.inline.is_some()), "inline payload written by the flush");
+        assert!(
+            texts.iter().all(|t| t.inline.is_some()),
+            "inline payload written by the flush"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2836,7 +3378,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &img,
@@ -2865,7 +3412,10 @@ mod tests {
                     ("r1".into(), Some("g1".into())),
                     ("t1".into(), Some("g1".into())),
                 ],
-                order: vec![BandRef::Raster("r1".into()), BandRef::PinnedText("t1".into())],
+                order: vec![
+                    BandRef::Raster("r1".into()),
+                    BandRef::PinnedText("t1".into()),
+                ],
                 pin_for_group: vec!["t1".into()],
                 ..Default::default()
             },
@@ -2876,8 +3426,15 @@ mod tests {
         assert_eq!(rasters.groups.len(), 1, "group created");
         assert_eq!(rasters.layers[0].group_uid.as_deref(), Some("g1"));
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
-        assert_eq!(texts[0].group_uid.as_deref(), Some("g1"), "text in same group");
-        assert!(texts[0].pinned && texts[0].pinned_by_group, "grouped text auto-pinned");
+        assert_eq!(
+            texts[0].group_uid.as_deref(),
+            Some("g1"),
+            "text in same group"
+        );
+        assert!(
+            texts[0].pinned && texts[0].pinned_by_group,
+            "grouped text auto-pinned"
+        );
         let bands = load_page_bands(&dir, None, 0);
         assert!(matches!(bands.first(), Some(Band::Raster { uid, .. }) if uid == "r1"));
         assert!(matches!(bands.last(), Some(Band::PinnedText { uid, .. }) if uid == "t1"));
@@ -2885,8 +3442,15 @@ mod tests {
         // A typing-side rewrite (the inline text flush, group_uid: None) must NOT drop PS membership/pin.
         write_page_text_payload(&dir, None, 0, &[text_payload_out("t1", 0, 0, false)]).unwrap();
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
-        assert_eq!(texts[0].group_uid.as_deref(), Some("g1"), "membership survived typing save");
-        assert!(texts[0].pinned && texts[0].pinned_by_group, "pin survived typing save");
+        assert_eq!(
+            texts[0].group_uid.as_deref(),
+            Some("g1"),
+            "membership survived typing save"
+        );
+        assert!(
+            texts[0].pinned && texts[0].pinned_by_group,
+            "pin survived typing save"
+        );
 
         // Ungroup the text: clears membership + group-owned pin.
         save_page_grouping(
@@ -2902,7 +3466,10 @@ mod tests {
         .unwrap();
         let texts = load_page_text_nodes(&dir, None, 0).unwrap();
         assert!(texts[0].group_uid.is_none(), "ungrouped");
-        assert!(!texts[0].pinned && !texts[0].pinned_by_group, "unpinned back to page-Y order");
+        assert!(
+            !texts[0].pinned && !texts[0].pinned_by_group,
+            "unpinned back to page-Y order"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2921,7 +3488,12 @@ mod tests {
                 name: "PS".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 0.0, cy: 0.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 0.0,
+                    cy: 0.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &img([2, 2], Color32::RED),
@@ -2934,8 +3506,24 @@ mod tests {
         .unwrap();
 
         // Add a new raster (as the typing tab would for an external image).
-        let t0 = TransformRec { cx: 5.0, cy: 6.0, rotation: 0.0, scale: 1.0 };
-        let file = add_page_raster(&dir, None, 0, "img", "Картинка", true, 1.0, t0, &img([3, 4], Color32::BLUE)).unwrap();
+        let t0 = TransformRec {
+            cx: 5.0,
+            cy: 6.0,
+            rotation: 0.0,
+            scale: 1.0,
+        };
+        let file = add_page_raster(
+            &dir,
+            None,
+            0,
+            "img",
+            "Картинка",
+            true,
+            1.0,
+            t0,
+            &img([3, 4], Color32::BLUE),
+        )
+        .unwrap();
         assert!(file.contains("img"));
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
         assert_eq!(loaded.layers.len(), 2, "both rasters present");
@@ -2946,12 +3534,23 @@ mod tests {
         assert_eq!(loaded.layers.last().unwrap().uid, "img");
 
         // Move it (transform only, no PNG change).
-        let t1 = TransformRec { cx: 50.0, cy: 60.0, rotation: 0.5, scale: 2.0 };
+        let t1 = TransformRec {
+            cx: 50.0,
+            cy: 60.0,
+            rotation: 0.5,
+            scale: 2.0,
+        };
         update_raster_transform(&dir, 0, "img", t1, None).unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
         let added = loaded.layers.iter().find(|l| l.uid == "img").unwrap();
-        assert!((added.transform.cx - 50.0).abs() < 1e-6 && (added.transform.scale - 2.0).abs() < 1e-6);
-        assert_eq!(added.image.size, [3, 4], "transform update must not touch pixels");
+        assert!(
+            (added.transform.cx - 50.0).abs() < 1e-6 && (added.transform.scale - 2.0).abs() < 1e-6
+        );
+        assert_eq!(
+            added.image.size,
+            [3, 4],
+            "transform update must not touch pixels"
+        );
 
         // The PS raster is still intact through all of it.
         assert!(loaded.layers.iter().any(|l| l.uid == "ps"));
@@ -2973,14 +3572,27 @@ mod tests {
             "Pic",
             true,
             1.0,
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             &img([2, 2], Color32::RED),
         )
         .unwrap();
 
         // Apply effects: write a rendered (larger) image; base is untouched.
         let effects = vec![serde_json::json!({"type":"shadow"})];
-        update_raster_effects(&dir, 0, "r", &effects, Some(&img([4, 4], Color32::BLUE)), None).unwrap();
+        update_raster_effects(
+            &dir,
+            0,
+            "r",
+            &effects,
+            Some(&img([4, 4], Color32::BLUE)),
+            None,
+        )
+        .unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
         let r = &loaded.layers[0];
         assert_eq!(r.image.size, [4, 4], "display is the rendered image");
@@ -2988,7 +3600,11 @@ mod tests {
         assert_eq!(r.effects.len(), 1, "effects chain stored");
         // The decoded base pixels are the pre-effects original, distinct from the rendered display,
         // so the effects stay reversible after a reload.
-        assert_eq!(r.base_image.size, [2, 2], "base_image is the pre-effects original");
+        assert_eq!(
+            r.base_image.size,
+            [2, 2],
+            "base_image is the pre-effects original"
+        );
         assert_ne!(
             r.base_image.size, r.image.size,
             "base_image is distinct from the rendered display when effects are present"
@@ -3003,7 +3619,12 @@ mod tests {
                 name: "Pic".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 9.0, cy: 9.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 9.0,
+                    cy: 9.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &img([4, 4], Color32::BLUE), // PS holds the display image
@@ -3018,7 +3639,10 @@ mod tests {
         let r = &loaded.layers[0];
         assert_eq!(r.effects.len(), 1, "effects survived a non-dirty PS save");
         assert_eq!(r.image.size, [4, 4], "still showing rendered");
-        assert!((r.transform.cx - 9.0).abs() < 1e-6, "transform update applied");
+        assert!(
+            (r.transform.cx - 9.0).abs() < 1e-6,
+            "transform update applied"
+        );
 
         // Remove effects: rendered file dropped, display falls back to the base.
         update_raster_effects(&dir, 0, "r", &[], None, None).unwrap();
@@ -3032,7 +3656,15 @@ mod tests {
         );
 
         // A pixels-dirty PS save bakes: writes a new base from the display, drops effects.
-        update_raster_effects(&dir, 0, "r", &effects, Some(&img([4, 4], Color32::BLUE)), None).unwrap();
+        update_raster_effects(
+            &dir,
+            0,
+            "r",
+            &effects,
+            Some(&img([4, 4], Color32::BLUE)),
+            None,
+        )
+        .unwrap();
         save_page_rasters(
             &dir,
             0,
@@ -3041,7 +3673,12 @@ mod tests {
                 name: "Pic".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 9.0, cy: 9.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 9.0,
+                    cy: 9.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &img([4, 4], Color32::GREEN),
@@ -3071,7 +3708,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ml_split_fx_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
-        let tf = |cx: f32| TransformRec { cx, cy: 1.0, rotation: 0.0, scale: 1.0 };
+        let tf = |cx: f32| TransformRec {
+            cx,
+            cy: 1.0,
+            rotation: 0.0,
+            scale: 1.0,
+        };
         let base_a = img([2, 2], Color32::RED);
         let base_b = img([2, 2], Color32::BLUE);
 
@@ -3111,7 +3753,8 @@ mod tests {
         let fx_a = vec![serde_json::json!({"type":"shadow"})];
         let fx_b = vec![serde_json::json!({"type":"glow"})];
         update_raster_effects(&dir, 0, "a", &fx_a, Some(&img([4, 4], Color32::RED)), None).unwrap();
-        update_raster_effects(&dir, 0, "b", &fx_b, Some(&img([4, 4], Color32::BLUE)), None).unwrap();
+        update_raster_effects(&dir, 0, "b", &fx_b, Some(&img([4, 4], Color32::BLUE)), None)
+            .unwrap();
 
         // SAVE-time PS flush. The dirty flag was cleared after the first flush, so both halves are
         // CLEAN here (PS still holds their original cut pixels, not the `_fx` image).
@@ -3122,8 +3765,16 @@ mod tests {
         assert_eq!(loaded.layers.len(), 2, "both split halves persisted");
         for uid in ["a", "b"] {
             let r = loaded.layers.iter().find(|l| l.uid == uid).unwrap();
-            assert_eq!(r.effects.len(), 1, "{uid}: effects survived the save-time flush");
-            assert_eq!(r.image.size, [4, 4], "{uid}: display is the rendered (effected) image");
+            assert_eq!(
+                r.effects.len(),
+                1,
+                "{uid}: effects survived the save-time flush"
+            );
+            assert_eq!(
+                r.image.size,
+                [4, 4],
+                "{uid}: display is the rendered (effected) image"
+            );
             assert!(
                 dir.join(rendered_file_name(0, uid)).is_file(),
                 "{uid}: rendered _fx PNG kept through prune"
@@ -3151,21 +3802,42 @@ mod tests {
             "Картинка",
             true,
             1.0,
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             &img([2, 2], Color32::RED),
         )
         .unwrap();
         let effects = vec![serde_json::json!({"type":"shadow"})];
-        update_raster_effects(&dir, 0, "typing", &effects, Some(&img([4, 4], Color32::BLUE)), None).unwrap();
+        update_raster_effects(
+            &dir,
+            0,
+            "typing",
+            &effects,
+            Some(&img([4, 4], Color32::BLUE)),
+            None,
+        )
+        .unwrap();
 
         // PS flush on "save to project" with a stale stack that knows nothing about the raster.
         save_page_rasters(&dir, 0, &[], &[], &[]).unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert_eq!(loaded.layers.len(), 1, "unowned raster survived the whole-page save");
+        assert_eq!(
+            loaded.layers.len(),
+            1,
+            "unowned raster survived the whole-page save"
+        );
         let r = &loaded.layers[0];
         assert_eq!(r.uid, "typing");
         assert_eq!(r.effects.len(), 1, "effects preserved");
-        assert_eq!(r.image.size, [4, 4], "still showing the rendered (effected) image");
+        assert_eq!(
+            r.image.size,
+            [4, 4],
+            "still showing the rendered (effected) image"
+        );
 
         // The rendered PNG must also survive pruning so the display loads after a restart.
         assert!(
@@ -3176,7 +3848,10 @@ mod tests {
         // Now an explicit removal (PS deleted it) drops the node on the next save.
         save_page_rasters(&dir, 0, &[], &[], &["typing".to_string()]).unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
-        assert!(loaded.layers.is_empty(), "explicitly removed raster dropped");
+        assert!(
+            loaded.layers.is_empty(),
+            "explicitly removed raster dropped"
+        );
         assert!(
             !dir.join(rendered_file_name(0, "typing")).is_file(),
             "rendered PNG pruned after removal"
@@ -3203,7 +3878,12 @@ mod tests {
                 name: "R".into(),
                 visible: true,
                 opacity: 1.0,
-                transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+                transform: TransformRec {
+                    cx: 1.0,
+                    cy: 1.0,
+                    rotation: 0.0,
+                    scale: 1.0,
+                },
                 deform: None,
                 group_uid: None,
                 image: &red,
@@ -3220,7 +3900,10 @@ mod tests {
         // Written at the current version.
         let raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw["schema_version"].as_u64().unwrap() as u32, LAYERS_SCHEMA_VERSION);
+        assert_eq!(
+            raw["schema_version"].as_u64().unwrap() as u32,
+            LAYERS_SCHEMA_VERSION
+        );
 
         // `read_manifest` returns it unchanged at the current version (identity pass).
         let m = read_manifest(&path).unwrap().unwrap();
@@ -3235,7 +3918,10 @@ mod tests {
         write_manifest(&path, &bumped).unwrap();
         let reread = read_manifest(&path).unwrap().unwrap();
         assert_eq!(reread.schema_version, LAYERS_SCHEMA_VERSION + 1);
-        assert_eq!(reread.pages[0].tree[0].uid, "r", "newer file read best-effort");
+        assert_eq!(
+            reread.pages[0].tree[0].uid, "r",
+            "newer file read best-effort"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3264,7 +3950,12 @@ mod tests {
             "R",
             true,
             1.0,
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
             &img([2, 2], Color32::RED),
         )
         .unwrap();
@@ -3274,7 +3965,12 @@ mod tests {
             &unsaved,
             0,
             "r",
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.5 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.5,
+            },
             Some(committed.as_path()),
         )
         .unwrap();
@@ -3291,7 +3987,12 @@ mod tests {
             &unsaved_nofb,
             0,
             "r",
-            TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.5 },
+            TransformRec {
+                cx: 1.0,
+                cy: 1.0,
+                rotation: 0.0,
+                scale: 1.5,
+            },
             None,
         )
         .unwrap();

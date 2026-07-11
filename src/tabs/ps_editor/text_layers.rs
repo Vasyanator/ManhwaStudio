@@ -344,6 +344,6 @@ pub fn load_page_text_layer_meta(
 // `LayerDoc` (`sync_view_from_doc`), with PS-owned pin/group metadata seeded from `layers.json` text
 // nodes via `load_page_text_layer_meta`. The former `text_info.json` readers/writers
 // (`read_text_info_array` / `load_png` / `persist_overlay_transform` / `delete_overlay`) were removed
-// across Phases A4–A5 and D. The doc's `ensure_page_loaded` is the only reader of the legacy file, and
+// across Phases A4–A5 and D. The doc's `decode_page_payload` is the only reader of the legacy file, and
 // only for un-migrated chapters.
 

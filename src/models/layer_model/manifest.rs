@@ -198,6 +198,10 @@ pub struct LayerRec {
     /// needs `text_info.json` (a v2 node leaves this `None` and is folded from the legacy file on read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_data: Option<serde_json::Value>,
+    /// TEXT node only: `Some(true)` marks an image overlay (a placed PNG with no re-renderable text
+    /// params, so `render_data` is `None`). Absent for text and raster nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_is_image: Option<bool>,
     /// TEXT and RASTER nodes (schema v3): persists the typing tab's mask-clip flag (whether the layer
     /// is clipped to the page mask). Previously in-memory only and lost across save/restart. `None` ⇒
     /// default (no clip; rasters default OFF, text defaults per the typing tab).

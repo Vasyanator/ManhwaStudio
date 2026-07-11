@@ -206,7 +206,8 @@ pub(super) fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
     out
 }
 
-/// Materializes a typing TEXT overlay runtime from a doc Text node's projected fields. Used by
+/// Materializes a typing overlay runtime from a doc Text node's projected fields. `is_image` selects
+/// the runtime image kind for placed-PNG overlays. Used by
 /// `sync_from_doc` when a doc Text node has no local runtime (the migrated-chapter case, where the
 /// legacy `text_info.json` loader populated nothing). The rendered-PNG `file_name` is reconstructed
 /// deterministically from `page_idx`+`uid` via [`persist::text_image_file_name`] — the SAME name the
@@ -222,6 +223,7 @@ pub(super) fn text_runtime_from_doc_node(
     angle_deg: f32,
     deform_mesh: Option<TypingOverlayDeformMesh>,
     mask_clip_enabled: bool,
+    is_image: bool,
     layer_idx: usize,
     render_data_json: Option<Value>,
     size_px: [usize; 2],
@@ -229,7 +231,11 @@ pub(super) fn text_runtime_from_doc_node(
 ) -> TypingOverlayRuntime {
     TypingOverlayRuntime {
         uid: uid.to_string(),
-        kind: TypingOverlayKind::Text,
+        kind: if is_image {
+            TypingOverlayKind::Image
+        } else {
+            TypingOverlayKind::Text
+        },
         page_idx,
         center_page_px,
         mask_clip_enabled,
@@ -386,13 +392,25 @@ pub(super) fn save_drawn_lines_layout_image_if_needed(
         height.max(1),
         image::ColorType::Rgba8,
     )
-    .map_err(|err| tf!("typing.errors.save_layout_error", layout_path = layout_path.display(), err = err))?;
+    .map_err(|err| {
+        tf!(
+            "typing.errors.save_layout_error",
+            layout_path = layout_path.display(),
+            err = err
+        )
+    })?;
     Ok(Some(layout_path))
 }
 
 pub(super) fn read_image_rgba_from_file(path: &Path) -> Result<(Vec<u8>, usize, usize), String> {
     let img = image::open(path)
-        .map_err(|err| tf!("typing.errors.open_file_error", path = path.display(), err = err))?
+        .map_err(|err| {
+            tf!(
+                "typing.errors.open_file_error",
+                path = path.display(),
+                err = err
+            )
+        })?
         .to_rgba8();
     let width = img.width() as usize;
     let height = img.height() as usize;
@@ -411,7 +429,9 @@ pub(super) fn parse_effects_json_array(raw: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-pub(super) fn load_typing_page_sizes(page_paths: &[(usize, PathBuf)]) -> HashMap<usize, [usize; 2]> {
+pub(super) fn load_typing_page_sizes(
+    page_paths: &[(usize, PathBuf)],
+) -> HashMap<usize, [usize; 2]> {
     let mut out = HashMap::with_capacity(page_paths.len());
     for (page_idx, path) in page_paths {
         let size = image::image_dimensions(path)
@@ -439,12 +459,25 @@ pub(super) fn load_typing_overlays_from_dir(
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(&text_info_path)
-        .map_err(|err| tf!("typing.errors.read_text_info_error", text_info_path = text_info_path.display(), err = err))?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|err| tf!("typing.errors.parse_file_error", text_info_path = text_info_path.display(), err = err))?;
+    let raw = fs::read_to_string(&text_info_path).map_err(|err| {
+        tf!(
+            "typing.errors.read_text_info_error",
+            text_info_path = text_info_path.display(),
+            err = err
+        )
+    })?;
+    let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
+        tf!(
+            "typing.errors.parse_file_error",
+            text_info_path = text_info_path.display(),
+            err = err
+        )
+    })?;
     let Some(items) = parsed.as_array() else {
-        return Err(tf!("typing.errors.text_info_not_array_error", text_info_path = text_info_path.display()));
+        return Err(tf!(
+            "typing.errors.text_info_not_array_error",
+            text_info_path = text_info_path.display()
+        ));
     };
 
     // Migrate the cross-entry legacy placement families (absolute ribbon x/y, top-left u/v) up front

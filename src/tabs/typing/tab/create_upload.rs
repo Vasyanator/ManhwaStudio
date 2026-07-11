@@ -174,10 +174,7 @@ impl TypingTextOverlayLayer {
         let Some((page_idx, page_rect, scene_rect)) =
             resolve_selection_to_page(canvas, project, scene_selection_rect)
         else {
-            self.set_create_error(
-                ctx,
-                t!("typing.create.selection_must_cross_page_error"),
-            );
+            self.set_create_error(ctx, t!("typing.create.selection_must_cross_page_error"));
             return;
         };
 
@@ -555,6 +552,7 @@ impl TypingTextOverlayLayer {
                 body: NodeBody::Text {
                     render_data,
                     image,
+                    is_image: matches!(decoded.kind, TypingOverlayKind::Image),
                     payload_uid: uid,
                     // Carry the overlay's mask-clip flag so the v3 inline payload persists it.
                     mask_clip: Some(decoded.mask_clip_enabled),
