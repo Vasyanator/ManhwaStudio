@@ -150,10 +150,8 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     text; a naive "preserve absent text" would RESURRECT a legitimately-deleted text. The owned set
     comes from `TypingTabState::flush_text_layers`, which now flushes text for EVERY doc-resident page
     (`LayerDoc::resident_pages`) — making staging text-complete for owned pages — then subtracts pages
-    whose latest saver write FAILED at the merge barrier, so committed text is preserved fail-safe.
-    Failure tracking is currently PER-PAGE (not per-kind): a raster/effects write failure marks the
-    whole page failed, so a successfully-written text edit on that page conservatively falls back to
-    committed text (over-preserve, never the pre-fix whole-text drop). Per-kind precision is a follow-up.
+    whose latest TEXT saver write FAILED at the merge barrier, so committed text is preserved fail-safe
+    without coupling text ownership to raster/effects outcomes.
   - **Non-destructive raster effects model**: a raster keeps `base_file` (original), an `effects`
     chain, and a cached `rendered_file` (the post-effects PNG). `load_page_rasters` returns the
     DISPLAY image (`rendered_file` when effects present, else base) plus the `base_file` name + chain.
@@ -211,13 +209,17 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     skips empty chains. The PS/typing effects polls route through it via
     `LayerDoc::enqueue_raster_effects`.
   - `Barrier` (via `barrier_blocking`) waits until all prior jobs complete and returns a snapshot of
-    pages whose latest write FAILED; `Shutdown` drains then stops. `LayerSaverHandle` is a cheap-clone
+    pages whose latest TEXT write FAILED; `Shutdown` drains then stops. `LayerSaverHandle` is a cheap-clone
     `Sender` wrapper for a merge worker / app-close drain.
   WIRING: the doc enables the saver via `enable_background_saver` (called ONCE in `app.rs` on the
   shared doc at startup) and feeds it through `enqueue_page_save` / `enqueue_page_text_save` /
   `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). PS per-edit/raster flushes
-  and typing text flushes ENQUEUE; the save-to-project merge worker and the eframe `on_exit` /
-  exit-cleanup paths `barrier_blocking` (and shut down) the saver so no enqueued write is lost. NO
+  and typing text flushes ENQUEUE. Dirty flags clear only after the frame-loop poll consumes a
+  successful acknowledgement whose per-kind epoch still matches the latest edit/enqueue; failed or
+  stale completions leave that kind dirty for retry. The save-to-project merge worker and the eframe `on_exit` /
+  exit-cleanup paths `barrier_blocking` (and shut down) the saver so no enqueued write is lost. The
+  barrier reports only latest text-write failures, so raster/effects failures do not revoke text
+  ownership. NO
   barrier ever runs on the GUI thread — only in the merge worker and at teardown.
 
 ### Text migration gate (lazy, on read)

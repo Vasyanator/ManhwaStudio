@@ -1438,11 +1438,16 @@ impl PsEditorTabState {
         let removed_count = removed_uids.len();
 
         // Try the off-thread path: capture the saver handle (clone, no doc lock held during the write).
-        let handle = self
+        let saver = self
             .layer_doc
             .as_ref()
-            .and_then(|doc| doc.lock().ok().and_then(|guard| guard.saver_handle()));
-        let persist_result: Result<(), String> = if let Some(handle) = handle {
+            .and_then(|doc| doc.lock().ok().and_then(|mut guard| {
+                guard.saver_handle().map(|handle| {
+                    let epoch = guard.next_save_epoch(page_idx, saver::SaveKind::Raster);
+                    (handle, epoch)
+                })
+            }));
+        let persist_result: Result<(), String> = if let Some((handle, raster_epoch)) = saver {
             handle.enqueue(saver::PageSaveJob {
                 page_idx,
                 layers_dir: project.paths.unsaved_layers_dir.clone(),
@@ -1452,7 +1457,9 @@ impl PsEditorTabState {
                     groups,
                     removed_uids,
                 }),
+                raster_epoch: Some(raster_epoch),
                 text: None,
+                text_epoch: None,
                 effects: Vec::new(),
             });
             Ok(())
@@ -3296,7 +3303,7 @@ impl PsEditorTabState {
             .layer_doc
             .as_ref()
             .and_then(|doc| {
-                doc.lock().ok().map(|guard| {
+                doc.lock().ok().map(|mut guard| {
                     guard.enqueue_raster_effects(
                         page_idx,
                         &project.paths.unsaved_layers_dir,

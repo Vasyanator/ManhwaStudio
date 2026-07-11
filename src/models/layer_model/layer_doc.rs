@@ -28,6 +28,7 @@ flush. `Drop` shuts the saver down (flush queue + join).
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::ColorImage;
 use serde_json::Value;
@@ -37,7 +38,7 @@ use super::ordering::Band;
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use super::saver::{
     EffectsSaveItem, LayerSaver, LayerSaverHandle, OwnedRasterLayer, OwnedTextNode, PageSaveJob,
-    RasterSavePart, TextSavePart,
+    RasterSavePart, SaveAckMap, SaveKind, TextSavePart,
 };
 use super::text_payload;
 use crate::trace::cat;
@@ -199,6 +200,9 @@ pub struct LayerDoc {
     /// synchronous `flush_page` / `flush_page_text`. Created lazily via `enable_background_saver` so a
     /// constructed-and-dropped doc spawns no thread.
     saver: Option<LayerSaver>,
+    save_epoch: u64,
+    latest_epoch: HashMap<(usize, SaveKind), u64>,
+    save_acks: Option<Arc<Mutex<SaveAckMap>>>,
 }
 
 impl Default for LayerDoc {
@@ -214,6 +218,9 @@ impl LayerDoc {
             pages: HashMap::new(),
             version: 0,
             saver: None,
+            save_epoch: 0,
+            latest_epoch: HashMap::new(),
+            save_acks: None,
         }
     }
 
@@ -670,6 +677,13 @@ impl LayerDoc {
     /// Drops a page from memory (e.g. when the shared page index moves away).
     pub fn evict_page(&mut self, page_idx: usize) {
         let evicted = self.pages.remove(&page_idx).is_some();
+        // Drop the page's pending save epochs together with its memory: an evicted page has no in-memory
+        // dirty left to settle, and a page later re-inserted must NOT be settled by a pre-eviction ack (an
+        // in-flight ack whose epoch still equaled a lingering `latest_epoch` would otherwise clear the
+        // reloaded page's dirty). Removing the entries also stops the map growing unbounded across a long
+        // session of page visits.
+        self.latest_epoch.remove(&(page_idx, SaveKind::Raster));
+        self.latest_epoch.remove(&(page_idx, SaveKind::Text));
         crate::trace_log!(
             cat::LAYER_MODEL,
             "evict_page page={} evicted={}",
@@ -793,6 +807,7 @@ impl LayerDoc {
             display_image.size[0],
             display_image.size[1]
         );
+        let mut changed = false;
         if let Some(node) = self.node_mut(page_idx, uid)
             && let NodeBody::Raster {
                 effects: e,
@@ -804,6 +819,10 @@ impl LayerDoc {
             *d = display_image;
             node.bump_generation();
             self.bump_version();
+            changed = true;
+        }
+        if changed {
+            self.bump_dirty_epoch(page_idx, SaveKind::Raster);
         }
     }
 
@@ -831,9 +850,21 @@ impl LayerDoc {
             node.z,
             page.nodes.len() + 1
         );
+        // Capture the node's dirty kind BEFORE moving it into the page: a pushed node that carries
+        // `pixels_dirty` (a fresh text overlay with no on-disk PNG, or a PS undo re-add of a raster whose
+        // base PNG was pruned) must advance its `(page, kind)` dirty epoch, upholding the invariant that
+        // every site making a doc node dirty bumps the epoch — so no stale-but-current-epoch ack settles it.
+        let dirty_kind = node.pixels_dirty.then_some(node.kind);
         page.nodes.push(node);
         page.nodes.sort_by_key(|n| n.z);
         self.bump_version();
+        if let Some(kind) = dirty_kind {
+            let save_kind = match kind {
+                NodeKind::Raster => SaveKind::Raster,
+                NodeKind::Text => SaveKind::Text,
+            };
+            self.bump_dirty_epoch(page_idx, save_kind);
+        }
         true
     }
 
@@ -863,9 +894,19 @@ impl LayerDoc {
             node.z,
             page.nodes.len() + 1
         );
+        // Capture the node's dirty kind BEFORE moving it in (see `add_node`): a re-inserted dirty node
+        // must advance its `(page, kind)` dirty epoch so a stale-but-current-epoch ack cannot settle it.
+        let dirty_kind = node.pixels_dirty.then_some(node.kind);
         page.nodes.push(node);
         page.nodes.sort_by_key(|n| n.z);
         self.bump_version();
+        if let Some(kind) = dirty_kind {
+            let save_kind = match kind {
+                NodeKind::Raster => SaveKind::Raster,
+                NodeKind::Text => SaveKind::Text,
+            };
+            self.bump_dirty_epoch(page_idx, save_kind);
+        }
         true
     }
 
@@ -1005,6 +1046,7 @@ impl LayerDoc {
             effects.len(),
             pixels_dirty
         );
+        let mut changed = false;
         if let Some(node) = self.node_mut(page_idx, uid)
             && let NodeBody::Raster {
                 base_image: b,
@@ -1019,6 +1061,10 @@ impl LayerDoc {
             node.pixels_dirty = pixels_dirty;
             node.bump_generation();
             self.bump_version();
+            changed = pixels_dirty;
+        }
+        if changed {
+            self.bump_dirty_epoch(page_idx, SaveKind::Raster);
         }
     }
 
@@ -1040,6 +1086,7 @@ impl LayerDoc {
             image.size[0],
             image.size[1]
         );
+        let mut changed = false;
         if let Some(node) = self.node_mut(page_idx, uid)
             && let NodeBody::Text {
                 render_data: r,
@@ -1052,6 +1099,10 @@ impl LayerDoc {
             node.pixels_dirty = true;
             node.bump_generation();
             self.bump_version();
+            changed = true;
+        }
+        if changed {
+            self.bump_dirty_epoch(page_idx, SaveKind::Text);
         }
     }
 
@@ -1475,7 +1526,9 @@ impl LayerDoc {
     /// a second call is a no-op (the existing saver + its worker thread are kept).
     pub fn enable_background_saver(&mut self) {
         if self.saver.is_none() {
-            self.saver = Some(LayerSaver::new());
+            let saver = LayerSaver::new();
+            self.save_acks = Some(saver.ack_map());
+            self.saver = Some(saver);
             crate::trace_log!(cat::PERSIST, "enable_background_saver: saver enabled");
         }
     }
@@ -1492,6 +1545,41 @@ impl LayerDoc {
     pub fn shutdown_saver(&mut self) {
         if let Some(saver) = self.saver.take() {
             saver.shutdown();
+        }
+        self.save_acks = None;
+    }
+
+    /// Reserves the current page-kind generation for a background job and returns its epoch.
+    #[must_use]
+    pub fn next_save_epoch(&mut self, page_idx: usize, kind: SaveKind) -> u64 {
+        self.save_epoch = self.save_epoch.wrapping_add(1);
+        self.latest_epoch.insert((page_idx, kind), self.save_epoch);
+        self.save_epoch
+    }
+
+    /// Advances a dirty page-kind generation so older in-flight acknowledgements cannot settle it.
+    fn bump_dirty_epoch(&mut self, page_idx: usize, kind: SaveKind) {
+        let _epoch = self.next_save_epoch(page_idx, kind);
+    }
+
+    /// Applies completed worker acknowledgements without doing persistence or holding the ack lock
+    /// while mutating resident document pages.
+    pub fn poll_save_acks(&mut self) {
+        let completions = self.save_acks.as_ref().and_then(|acks| match acks.lock() {
+            Ok(mut ack) => Some(ack.take()),
+            Err(_) => {
+                crate::runtime_log::log_error("[layer_model] save acknowledgement map lock poisoned");
+                None
+            }
+        }).unwrap_or_default();
+        for (page_idx, kind, ack_epoch, ok) in completions {
+            if ok && self.latest_epoch.get(&(page_idx, kind)) == Some(&ack_epoch) && self.pages.contains_key(&page_idx) {
+                match kind {
+                    SaveKind::Raster => self.clear_page_dirty(page_idx),
+                    SaveKind::Text => self.clear_page_text_dirty(page_idx),
+                }
+                self.latest_epoch.remove(&(page_idx, kind));
+            }
         }
     }
 
@@ -1512,13 +1600,12 @@ impl LayerDoc {
         fallback_dir: Option<&Path>,
     ) -> Result<(), String> {
         if self.saver.is_some() {
-            if let Some(job) = self.build_page_save_job(page_idx, layers_dir, fallback_dir, &[]) {
-                // Clearing `pixels_dirty` mirrors the sync flush: the owned job already captured the
-                // dirty pixels, so a later re-flush of an unchanged page need not re-encode.
+            if let Some(mut job) = self.build_page_save_job(page_idx, layers_dir, fallback_dir, &[]) {
+                job.raster_epoch = Some(self.next_save_epoch(page_idx, SaveKind::Raster));
+                job.text_epoch = Some(self.next_save_epoch(page_idx, SaveKind::Text));
                 if let Some(saver) = &self.saver {
                     saver.enqueue(job);
                 }
-                self.clear_page_dirty(page_idx);
             }
             Ok(())
         } else {
@@ -1540,18 +1627,20 @@ impl LayerDoc {
     ) -> Result<(), String> {
         if self.saver.is_some() {
             if let Some(text) = self.build_text_save_part(page_idx) {
+                let text_epoch = self.next_save_epoch(page_idx, SaveKind::Text);
                 let job = PageSaveJob {
                     page_idx,
                     layers_dir: layers_dir.to_path_buf(),
                     fallback_dir: fallback_dir.map(Path::to_path_buf),
                     raster: None,
+                    raster_epoch: None,
                     text: Some(text),
+                    text_epoch: Some(text_epoch),
                     effects: Vec::new(),
                 };
                 if let Some(saver) = &self.saver {
                     saver.enqueue(job);
                 }
-                self.clear_page_text_dirty(page_idx);
             }
             Ok(())
         } else {
@@ -1572,7 +1661,7 @@ impl LayerDoc {
     /// # Errors
     /// Only the synchronous fallback can error; the async path enqueues and returns `Ok`.
     pub fn enqueue_raster_effects(
-        &self,
+        &mut self,
         page_idx: usize,
         layers_dir: &Path,
         fallback_dir: Option<&Path>,
@@ -1580,13 +1669,19 @@ impl LayerDoc {
         effects: &[serde_json::Value],
         display: Option<&ColorImage>,
     ) -> Result<(), String> {
-        if let Some(saver) = &self.saver {
+        if self.saver.is_some() {
+            let raster_epoch = self.next_save_epoch(page_idx, SaveKind::Raster);
+            let Some(saver) = &self.saver else {
+                return Ok(());
+            };
             saver.enqueue(PageSaveJob {
                 page_idx,
                 layers_dir: layers_dir.to_path_buf(),
                 fallback_dir: fallback_dir.map(Path::to_path_buf),
                 raster: None,
+                raster_epoch: Some(raster_epoch),
                 text: None,
+                text_epoch: None,
                 effects: vec![EffectsSaveItem {
                     uid: uid.to_string(),
                     effects: effects.to_vec(),
@@ -1628,7 +1723,9 @@ impl LayerDoc {
             layers_dir: layers_dir.to_path_buf(),
             fallback_dir: fallback_dir.map(Path::to_path_buf),
             raster: Some(raster),
+            raster_epoch: None,
             text: Some(text),
+            text_epoch: None,
             effects: Vec::new(),
         })
     }
@@ -1746,19 +1843,20 @@ impl LayerDoc {
         TextSavePart { nodes }
     }
 
-    /// Clears `pixels_dirty` on every node of a resident page (after its owned job captured the dirty
-    /// pixels), so an unchanged page need not re-encode on a later async flush — mirroring the sync
-    /// flush's post-write dirty clear.
+    /// Clears `pixels_dirty` on every RASTER node of a resident page after its current raster epoch
+    /// is durably acknowledged, leaving text dirty flags untouched.
     fn clear_page_dirty(&mut self, page_idx: usize) {
         if let Some(page) = self.pages.get_mut(&page_idx) {
             for node in &mut page.nodes {
-                node.pixels_dirty = false;
+                if matches!(node.kind, NodeKind::Raster) {
+                    node.pixels_dirty = false;
+                }
             }
         }
     }
 
-    /// Clears `pixels_dirty` on every TEXT node of a resident page (after a text-only async flush
-    /// captured them), leaving raster dirty flags untouched.
+    /// Clears `pixels_dirty` on every TEXT node of a resident page after its current text epoch is
+    /// durably acknowledged, leaving raster dirty flags untouched.
     fn clear_page_text_dirty(&mut self, page_idx: usize) {
         if let Some(page) = self.pages.get_mut(&page_idx) {
             for node in &mut page.nodes {
@@ -3867,6 +3965,116 @@ mod tests {
             "resident page unchanged by the discarded second payload"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_text_ack_cannot_clear_newer_dirty_generation() {
+        let dir = temp_dir("text_ack_generation");
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage {
+            nodes: vec![text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.enable_background_saver();
+        doc.set_text_render(0, "t", serde_json::json!({"text": "first"}), img([2, 2], Color32::RED));
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        doc.set_text_render(0, "t", serde_json::json!({"text": "second"}), img([2, 2], Color32::BLUE));
+        let handle = doc.saver_handle().expect("background saver enabled");
+        assert!(handle.barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(doc.node(0, "t").unwrap().pixels_dirty, "stale success cannot clear a newer edit");
+
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        assert!(handle.barrier_blocking().is_empty());
+        doc.poll_save_acks();
+        assert!(!doc.node(0, "t").unwrap().pixels_dirty, "current successful acknowledgement settles text dirty");
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_text_ack_leaves_text_dirty() {
+        let invalid_parent = temp_dir("failed_text_ack_parent");
+        fs::write(&invalid_parent, b"not a directory").unwrap();
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage {
+            nodes: vec![text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.enable_background_saver();
+        doc.set_text_render(0, "t", serde_json::json!({"text": "dirty"}), img([2, 2], Color32::RED));
+        doc.enqueue_page_text_save(0, &invalid_parent.join("layers"), None).unwrap();
+        let handle = doc.saver_handle().expect("background saver enabled");
+        assert!(handle.barrier_blocking().contains(&0));
+        doc.poll_save_acks();
+        assert!(doc.node(0, "t").unwrap().pixels_dirty, "failed acknowledgement leaves text dirty");
+        doc.shutdown_saver();
+        let _ = fs::remove_file(&invalid_parent);
+    }
+
+    /// Evicting a page drops its pending save epoch, so a still-unconsumed pre-eviction ack cannot
+    /// settle the page after it is re-inserted (and the epoch map does not leak the evicted key).
+    #[test]
+    fn evict_page_drops_pending_save_epochs() {
+        let dir = temp_dir("evict_drops_epoch");
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage {
+            nodes: vec![text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.enable_background_saver();
+        // Reserve a text epoch and run the real save so an OK ack for it lands in the shared map.
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        let handle = doc.saver_handle().expect("background saver enabled");
+        assert!(handle.barrier_blocking().is_empty());
+        // Evict before polling: the pending epoch entry must be dropped with the page.
+        doc.evict_page(0);
+        assert!(
+            !doc.latest_epoch.contains_key(&(0, SaveKind::Text)),
+            "evict drops the page's latest_epoch entry"
+        );
+        // Re-insert a fresh, dirty page 0; the still-unconsumed pre-eviction ack must NOT settle it.
+        doc.pages.insert(0, DocPage {
+            nodes: vec![text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.poll_save_acks();
+        assert!(
+            doc.node(0, "t").unwrap().pixels_dirty,
+            "a pre-eviction ack cannot clear the reloaded page's dirty"
+        );
+        doc.shutdown_saver();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Adding a dirty node advances its page-kind dirty epoch, so a stale ack for the prior epoch cannot
+    /// clear the freshly added node's dirty.
+    #[test]
+    fn add_node_bumps_dirty_epoch_so_stale_ack_cannot_settle() {
+        let dir = temp_dir("add_node_bumps_epoch");
+        let mut doc = LayerDoc::new();
+        doc.pages.insert(0, DocPage {
+            nodes: vec![text_node_with_payload("t")],
+            groups: Vec::new(),
+        });
+        doc.enable_background_saver();
+        // Reserve e1 and run the real save for the existing text; its OK ack lands in the map.
+        doc.enqueue_page_text_save(0, &dir, None).unwrap();
+        let handle = doc.saver_handle().expect("background saver enabled");
+        assert!(handle.barrier_blocking().is_empty());
+        let e1 = doc.latest_epoch.get(&(0, SaveKind::Text)).copied().expect("text epoch reserved");
+        // Add a fresh DIRTY text node: this must advance the (0, Text) dirty epoch past e1.
+        assert!(doc.add_node(0, text_node_with_payload("t2")));
+        let e2 = doc.latest_epoch.get(&(0, SaveKind::Text)).copied().expect("text epoch present after add");
+        assert!(e2 > e1, "add_node of a dirty text node advances the dirty epoch");
+        // The pre-add OK ack (epoch e1) must NOT settle the page now that latest_epoch = e2.
+        doc.poll_save_acks();
+        assert!(
+            doc.node(0, "t2").unwrap().pixels_dirty,
+            "a stale (e1) ack cannot clear the node added at e2"
+        );
+        doc.shutdown_saver();
         let _ = fs::remove_dir_all(&dir);
     }
 }

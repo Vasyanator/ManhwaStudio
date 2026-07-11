@@ -2354,6 +2354,9 @@ impl eframe::App for MangaApp {
         ctx.options_mut(|opt| {
             opt.zoom_with_keyboard = false;
         });
+        if let Ok(mut doc) = self.layer_doc.lock() {
+            doc.poll_save_acks();
+        }
         #[cfg(target_os = "windows")]
         if self.maximize_root_window_on_first_frame {
             self.maximize_root_window_on_first_frame = false;

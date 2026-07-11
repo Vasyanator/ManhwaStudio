@@ -579,7 +579,7 @@ impl TypingTextOverlayLayer {
                 .layer_doc
                 .as_ref()
                 .and_then(|doc| {
-                    doc.lock().ok().map(|guard| {
+                    doc.lock().ok().map(|mut guard| {
                         guard.enqueue_raster_effects(
                             result.page_idx,
                             &dir,

@@ -713,7 +713,10 @@ reserved ids for later phases (`docs/tutorial-plan.md`).
 - **Слои (layer_model)** — запись на диск асинхронна и коалесцируется через `layer_model/saver.rs`
   (`LayerDoc::enable_background_saver`, включается один раз в `app.rs`). PS per-edit/raster и typing
   text/effects flush'и ENQUEUE'ят задания (`enqueue_page_save` / `enqueue_page_text_save` /
-  `enqueue_raster_effects`; sync-fallback при выключенном saver). Гарантия «байты на диске» даётся
+  `enqueue_raster_effects`; sync-fallback при выключенном saver).
+  Dirty flags clear only on a successful per-kind acknowledgement whose epoch matches the latest
+  edit/enqueue; stale and failed acknowledgements keep dirty set, and barrier ownership considers
+  only TEXT failures. Гарантия «байты на диске» даётся
   ТОЛЬКО барьером: `barrier_blocking` в merge-воркере save-to-project (ДО `merge_unsaved_into_project`)
   и drain (`barrier_blocking` + `shutdown_saver`) в eframe `on_exit` и на exit-cleanup. БАРЬЕР НИКОГДА
   не выполняется в GUI-потоке. Контракт удаления растров (`removed_uids` в `persist_current_page`) и

@@ -32,6 +32,7 @@ use ms_thread::{self as thread, JoinHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::ColorImage;
 use serde_json::Value;
@@ -39,6 +40,38 @@ use serde_json::Value;
 use super::manifest::{DeformRec, TransformRec};
 use super::persist::{self, GroupMeta, RasterLayerOut};
 use crate::runtime_log;
+
+/// The independently acknowledged persistence kinds. Effects are part of the raster contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SaveKind {
+    Raster,
+    Text,
+}
+
+/// Latest completed worker epoch per page and save kind, shared with the document for acknowledgement.
+#[derive(Debug, Default)]
+pub struct SaveAckMap {
+    done: HashMap<(usize, SaveKind), (u64, bool)>,
+}
+
+impl SaveAckMap {
+    /// Records a completed epoch unless a newer completion is already present. Equal-epoch retries
+    /// replace the prior outcome.
+    pub fn record(&mut self, page: usize, kind: SaveKind, epoch: u64, ok: bool) {
+        if self.done.get(&(page, kind)).is_none_or(|(stored_epoch, _)| epoch >= *stored_epoch) {
+            self.done.insert((page, kind), (epoch, ok));
+        }
+    }
+
+    /// Takes all unconsumed completions, leaving the shared map empty.
+    #[must_use]
+    pub fn take(&mut self) -> Vec<(usize, SaveKind, u64, bool)> {
+        std::mem::take(&mut self.done)
+            .into_iter()
+            .map(|((page, kind), (epoch, ok))| (page, kind, epoch, ok))
+            .collect()
+    }
+}
 
 /// One owned raster layer for an off-thread save. Mirrors `persist::RasterLayerOut` but OWNS its base
 /// image (`RasterLayerOut.image` borrows a `&ColorImage`), so the worker holds no borrow into the doc.
@@ -150,7 +183,9 @@ pub struct PageSaveJob {
     pub layers_dir: PathBuf,
     pub fallback_dir: Option<PathBuf>,
     pub raster: Option<RasterSavePart>,
+    pub raster_epoch: Option<u64>,
     pub text: Option<TextSavePart>,
+    pub text_epoch: Option<u64>,
     /// Targeted per-raster effects updates (effects-only path; never rewrites the raster set). Kept as
     /// a per-uid list so two effects updates to DIFFERENT rasters in one coalescing pass both survive
     /// (latest-per-uid wins). Empty for jobs that carry no effects-only update.
@@ -171,9 +206,19 @@ impl PageSaveJob {
         self.fallback_dir = next.fallback_dir;
         if next.raster.is_some() {
             self.raster = next.raster;
+            self.raster_epoch = next.raster_epoch;
         }
         if next.text.is_some() {
             self.text = next.text;
+            self.text_epoch = next.text_epoch;
+        }
+        if !next.effects.is_empty() {
+            // An effects-only job contributes to the raster acknowledgement, so adopt its epoch — but
+            // only when it actually carries one. Never null a still-valid `raster_epoch` (e.g. from a
+            // prior raster half of this coalesced job) with a `None` from an effects-only merge.
+            if let Some(re) = next.raster_epoch {
+                self.raster_epoch = Some(re);
+            }
         }
         // Effects coalesce per-uid: a newer update for a uid REPLACES the older one (latest wins),
         // while updates to other uids are preserved. This keeps two effects edits to different rasters
@@ -195,14 +240,12 @@ impl PageSaveJob {
     /// 3. effects reconcile via `persist::update_raster_effects` for every raster with a non-empty
     ///    chain (after rasters, before/after text is irrelevant — they touch different fields).
     ///
-    /// # Errors
-    /// Returns the first persist error string, identical to the synchronous flush's propagation.
-    fn run(&self) -> Result<(), String> {
+    fn run(&self) -> RunOutcome {
         let layers_dir = self.layers_dir.as_path();
         let fallback_dir = self.fallback_dir.as_deref();
 
         // 1) Rasters: build the borrowed `RasterLayerOut`s and call the same writer the sync flush uses.
-        if let Some(raster) = &self.raster {
+        let raster = self.raster.as_ref().map(|raster| {
             let outs: Vec<RasterLayerOut<'_>> =
                 raster.layers.iter().map(OwnedRasterLayer::as_out).collect();
             persist::save_page_rasters(
@@ -211,12 +254,13 @@ impl PageSaveJob {
                 &outs,
                 &raster.groups,
                 &raster.removed_uids,
-            )?;
-        }
+            )
+        });
 
         // 2) Text: reproduce `write_page_text`'s "rewrite PNG iff dirty or missing" rule, then the
         // single text writer.
-        if let Some(text) = &self.text {
+        let text = self.text.as_ref().map(|text| {
+            (|| {
             let mut text_outs: Vec<persist::TextPayloadOut> = Vec::with_capacity(text.nodes.len());
             for node in &text.nodes {
                 let file_name = persist::text_image_file_name(self.page_idx, &node.uid);
@@ -258,11 +302,13 @@ impl PageSaveJob {
                     mask_clip: node.mask_clip,
                 });
             }
-            persist::write_page_text_payload(layers_dir, fallback_dir, self.page_idx, &text_outs)?;
-        }
+            persist::write_page_text_payload(layers_dir, fallback_dir, self.page_idx, &text_outs)
+            })()
+        });
 
         // 3) Effects reconcile: rewrite the chain + rendered PNG for every raster with a non-empty
         // chain, exactly as `flush_page_inner` does after `save_page_rasters`.
+        let effects = (|| {
         if let Some(raster) = &self.raster {
             for layer in &raster.layers {
                 if !layer.effects.is_empty() {
@@ -293,7 +339,17 @@ impl PageSaveJob {
             )?;
         }
         Ok(())
+        })();
+        RunOutcome { raster, text, effects }
     }
+}
+
+/// Independent persist results for one job. Effects contribute to the raster acknowledgement.
+#[derive(Debug)]
+struct RunOutcome {
+    raster: Option<Result<(), String>>,
+    text: Option<Result<(), String>>,
+    effects: Result<(), String>,
 }
 
 /// The background saver's mailbox protocol.
@@ -303,7 +359,7 @@ pub enum SaverMsg {
     /// Process every currently-queued job, then signal completion on the sender. Used by
     /// `barrier_blocking` so a caller can be sure all prior enqueued jobs are on disk (e.g. before a
     /// save-to-project merge reads the staging files). The reply reports pages whose latest write
-    /// failed, so a merge can preserve their committed text.
+    /// TEXT write failed, so a merge can preserve their committed text without raster coupling.
     Barrier(Sender<HashSet<usize>>),
     /// Drain any remaining queued jobs, then stop the worker.
     Shutdown,
@@ -330,7 +386,7 @@ impl LayerSaverHandle {
     }
 
     /// Blocks until every job enqueued BEFORE this call has completed, returning pages whose latest
-    /// write failed. Returns an empty set if the worker is gone; the loss is logged.
+    /// TEXT write failed. Returns an empty set if the worker is gone; the loss is logged.
     #[must_use]
     pub fn barrier_blocking(&self) -> HashSet<usize> {
         let (done_tx, done_rx) = mpsc::channel::<HashSet<usize>>();
@@ -360,6 +416,7 @@ impl LayerSaverHandle {
 pub struct LayerSaver {
     tx: Sender<SaverMsg>,
     handle: Option<JoinHandle<()>>,
+    ack_map: Arc<Mutex<SaveAckMap>>,
 }
 
 impl LayerSaver {
@@ -371,10 +428,13 @@ impl LayerSaver {
     #[must_use]
     pub fn new() -> LayerSaver {
         let (tx, rx) = mpsc::channel::<SaverMsg>();
-        let handle = thread::spawn(move || worker_loop(&rx));
+        let ack_map = Arc::new(Mutex::new(SaveAckMap::default()));
+        let worker_ack_map = Arc::clone(&ack_map);
+        let handle = thread::spawn(move || worker_loop(&rx, &worker_ack_map));
         LayerSaver {
             tx,
             handle: Some(handle),
+            ack_map,
         }
     }
 
@@ -386,12 +446,18 @@ impl LayerSaver {
         }
     }
 
+    /// Returns the acknowledgement map shared by the worker and its owning document.
+    #[must_use]
+    pub fn ack_map(&self) -> Arc<Mutex<SaveAckMap>> {
+        Arc::clone(&self.ack_map)
+    }
+
     /// Enqueues a page-save job (see [`LayerSaverHandle::enqueue`]).
     pub fn enqueue(&self, job: PageSaveJob) {
         self.handle().enqueue(job);
     }
 
-    /// Blocks until every previously enqueued job completes, returning pages whose latest write failed
+    /// Blocks until every previously enqueued job completes, returning pages whose latest TEXT write failed
     /// (see [`LayerSaverHandle::barrier_blocking`]).
     ///
     /// Production code barriers via a cloned [`LayerSaverHandle`] (the merge worker and app-close
@@ -445,8 +511,9 @@ impl Drop for LayerSaver {
 /// The background worker body: `recv` then `try_recv`-drain, bucketing `Job`s per page (latest data
 /// per kind), running each bucket, honoring `Barrier`/`Shutdown`. A persist error is logged and tracked
 /// (the next page still runs) — a single bad page must not stall the saver.
-fn worker_loop(rx: &Receiver<SaverMsg>) {
-    let mut failed_pages = HashSet::new();
+fn worker_loop(rx: &Receiver<SaverMsg>, ack_map: &Arc<Mutex<SaveAckMap>>) {
+    let mut failed_raster_pages = HashSet::new();
+    let mut failed_text_pages = HashSet::new();
     while let Ok(first) = rx.recv() {
         // Per-page coalescing bucket for this drain pass. Insertion order is preserved by tracking the
         // page sequence so writes happen in a deterministic order.
@@ -483,10 +550,10 @@ fn worker_loop(rx: &Receiver<SaverMsg>) {
         }
 
         // Run every coalesced page in insertion order, then release any barriers waiting on this pass.
-        run_bucket(&bucket, &order, &mut failed_pages);
+        run_bucket(&bucket, &order, &mut failed_raster_pages, &mut failed_text_pages, ack_map);
         for done in pending_barriers {
             // The waiter may have given up (timed out / dropped); ignore a closed receiver.
-            done.send(failed_pages.clone()).ok();
+            done.send(failed_text_pages.clone()).ok();
         }
         if shutdown {
             break;
@@ -504,7 +571,9 @@ fn worker_loop(rx: &Receiver<SaverMsg>) {
 fn run_bucket(
     bucket: &HashMap<usize, PageSaveJob>,
     order: &[usize],
-    failed_pages: &mut HashSet<usize>,
+    failed_raster_pages: &mut HashSet<usize>,
+    failed_text_pages: &mut HashSet<usize>,
+    ack_map: &Arc<Mutex<SaveAckMap>>,
 ) {
     for page in order {
         let Some(job) = bucket.get(page) else {
@@ -514,22 +583,52 @@ fn run_bucket(
         // leaves no observer of a half-mutated value (the on-disk write is the only effect, guarded
         // by persist's own error handling), so asserting unwind-safety is sound here.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
-            Ok(Ok(())) => {
-                failed_pages.remove(page);
-            }
-            Ok(Err(err)) => {
-                failed_pages.insert(*page);
-                runtime_log::log_error(format!(
-                    "[layer_model::saver] failed to persist page {page}: {err}"
-                ));
+            Ok(outcome) => {
+                let raster_ok = outcome.raster.as_ref().is_none_or(Result::is_ok) && outcome.effects.is_ok();
+                let text_ok = outcome.text.as_ref().is_none_or(Result::is_ok);
+                if let Some(Err(err)) = outcome.raster.as_ref() {
+                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} raster: {err}"));
+                }
+                if let Some(Err(err)) = outcome.text.as_ref() {
+                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} text: {err}"));
+                }
+                if let Err(err) = &outcome.effects {
+                    runtime_log::log_error(format!("[layer_model::saver] failed to persist page {page} effects: {err}"));
+                }
+                update_failed_set(failed_raster_pages, *page, job.raster_epoch.is_some(), raster_ok);
+                update_failed_set(failed_text_pages, *page, job.text_epoch.is_some(), text_ok);
+                record_job_acks(ack_map, job, raster_ok, text_ok);
             }
             Err(_) => {
-                failed_pages.insert(*page);
+                update_failed_set(failed_raster_pages, *page, job.raster_epoch.is_some(), false);
+                update_failed_set(failed_text_pages, *page, job.text_epoch.is_some(), false);
+                record_job_acks(ack_map, job, false, false);
                 runtime_log::log_error(format!(
                     "[layer_model::saver] PANIC while persisting page {page}; saver thread continues"
                 ));
             }
         }
+    }
+}
+
+fn update_failed_set(failed: &mut HashSet<usize>, page: usize, present: bool, ok: bool) {
+    if present && ok {
+        failed.remove(&page);
+    } else if present {
+        failed.insert(page);
+    }
+}
+
+fn record_job_acks(ack_map: &Arc<Mutex<SaveAckMap>>, job: &PageSaveJob, raster_ok: bool, text_ok: bool) {
+    let Ok(mut ack) = ack_map.lock() else {
+        runtime_log::log_error("[layer_model::saver] acknowledgement map lock poisoned");
+        return;
+    };
+    if let Some(epoch) = job.raster_epoch {
+        ack.record(job.page_idx, SaveKind::Raster, epoch, raster_ok);
+    }
+    if let Some(epoch) = job.text_epoch {
+        ack.record(job.page_idx, SaveKind::Text, epoch, text_ok);
     }
 }
 
@@ -614,9 +713,22 @@ mod tests {
             layers_dir: dir.to_path_buf(),
             fallback_dir: None,
             raster: Some(raster_part(rasters)),
+            raster_epoch: Some(1),
             text: None,
+            text_epoch: None,
             effects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ack_map_keeps_newest_completion_and_take_clears() {
+        let mut acks = SaveAckMap::default();
+        acks.record(4, SaveKind::Text, 8, true);
+        acks.record(4, SaveKind::Text, 7, false);
+        acks.record(4, SaveKind::Text, 8, false);
+        let taken = acks.take();
+        assert_eq!(taken, vec![(4, SaveKind::Text, 8, false)]);
+        assert!(acks.take().is_empty(), "take clears consumed acknowledgements");
     }
 
     /// Three Full jobs for the same page coalesce to the LATEST on-disk state (last writer wins per
@@ -701,9 +813,11 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: None,
             text: Some(TextSavePart {
                 nodes: vec![text_node("txt", Color32::BLUE)],
             }),
+            text_epoch: Some(1),
             effects: Vec::new(),
         });
         assert!(saver.barrier_blocking().is_empty());
@@ -739,9 +853,11 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: None,
             text: Some(TextSavePart {
                 nodes: vec![text_node("t", Color32::BLUE)],
             }),
+            text_epoch: Some(1),
             effects: Vec::new(),
         });
         saver.enqueue(full_job(7, &dir, vec![raster("r", Color32::RED)]));
@@ -779,7 +895,9 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: Some(2),
             text: None,
+            text_epoch: None,
             effects: vec![EffectsSaveItem {
                 uid: "a".to_string(),
                 effects: chain.clone(),
@@ -809,7 +927,9 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: Some(3),
             text: None,
+            text_epoch: None,
             effects: vec![EffectsSaveItem {
                 uid: "a".to_string(),
                 effects: Vec::new(),
@@ -844,7 +964,9 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: Some(2),
             text: None,
+            text_epoch: None,
             effects: vec![EffectsSaveItem {
                 uid: "x".to_string(),
                 effects: cx.clone(),
@@ -856,7 +978,9 @@ mod tests {
             layers_dir: dir.clone(),
             fallback_dir: None,
             raster: None,
+            raster_epoch: Some(3),
             text: None,
+            text_epoch: None,
             effects: vec![EffectsSaveItem {
                 uid: "y".to_string(),
                 effects: cy.clone(),
@@ -886,14 +1010,32 @@ mod tests {
         std::fs::write(&invalid_parent, b"not a directory").unwrap();
         let valid_dir = temp_dir("barrier_failed_recovery");
         let saver = LayerSaver::new();
-        saver.enqueue(full_job(9, &invalid_parent.join("layers"), vec![raster("r", Color32::RED)]));
+        saver.enqueue(PageSaveJob {
+            page_idx: 9,
+            layers_dir: invalid_parent.join("layers"),
+            fallback_dir: None,
+            raster: None,
+            raster_epoch: None,
+            text: Some(TextSavePart { nodes: vec![text_node("t", Color32::RED)] }),
+            text_epoch: Some(1),
+            effects: Vec::new(),
+        });
 
         assert!(
             saver.barrier_blocking().contains(&9),
             "barrier reports the page whose latest persist failed"
         );
 
-        saver.enqueue(full_job(9, &valid_dir, vec![raster("r", Color32::GREEN)]));
+        saver.enqueue(PageSaveJob {
+            page_idx: 9,
+            layers_dir: valid_dir.clone(),
+            fallback_dir: None,
+            raster: None,
+            raster_epoch: None,
+            text: Some(TextSavePart { nodes: vec![text_node("t", Color32::GREEN)] }),
+            text_epoch: Some(2),
+            effects: Vec::new(),
+        });
         assert!(
             !saver.barrier_blocking().contains(&9),
             "a later successful persist clears the page failure"
@@ -902,5 +1044,36 @@ mod tests {
         saver.shutdown();
         let _ = std::fs::remove_file(&invalid_parent);
         let _ = std::fs::remove_dir_all(&valid_dir);
+    }
+
+    #[test]
+    fn raster_failure_does_not_report_successful_text_as_failed() {
+        let dir = temp_dir("per_kind_failure");
+        let saver = LayerSaver::new();
+        let mut broken_raster = raster("r", Color32::RED);
+        broken_raster.base_image.pixels.truncate(1);
+        saver.enqueue(PageSaveJob {
+            page_idx: 6,
+            layers_dir: dir.clone(),
+            fallback_dir: None,
+            raster: Some(raster_part(vec![broken_raster])),
+            raster_epoch: Some(10),
+            text: Some(TextSavePart { nodes: vec![text_node("t", Color32::WHITE)] }),
+            text_epoch: Some(11),
+            effects: Vec::new(),
+        });
+        assert!(saver.barrier_blocking().is_empty(), "raster failure does not contaminate text barrier");
+        let ack_map = saver.ack_map();
+        let mut completions = ack_map.lock().unwrap().take();
+        completions.sort_by_key(|(_, kind, _, _)| match kind {
+            SaveKind::Raster => 0,
+            SaveKind::Text => 1,
+        });
+        assert_eq!(completions, vec![
+            (6, SaveKind::Raster, 10, false),
+            (6, SaveKind::Text, 11, true),
+        ]);
+        saver.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
