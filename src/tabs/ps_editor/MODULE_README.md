@@ -25,7 +25,12 @@ tool input  -> active PsTool::interact -> ToolOutcome (dirty rect / selection ch
 PAGE-SWITCH DECODE IS OFF-THREAD. On a page switch the worker now decodes BOTH base layers AND the
 persisted user-layer payload (raster PNGs + text + groups + legacy `text_info.json` migration) via the
 PURE `LayerDoc::decode_page_payload` (it holds no doc `Arc`, only the dirs + the FULL chapter page-size
-map). `poll_loader` takes the shared doc lock ONLY to `insert_decoded_page` (a cheap move, never a
+map). `request_page` also threads a GATED legacy `text_images/` dir into the request so a never-migrated
+legacy chapter's text (the doc is the PS editor's ONLY text source) is visible: it is `Some(text_images_dir)`
+only when `migrate::manifest_has_inline_text(layers_dir)` is false, computed once per chapter and cached in
+`doc_legacy_text_dir_cache` (keyed by the committed layers dir) so the GUI thread never re-parses
+`layers.json` on a page switch; a migrated chapter passes `None` so a stale `text_images/text_info.json`
+cannot resurrect a deleted overlay. `poll_loader` takes the shared doc lock ONLY to `insert_decoded_page` (a cheap move, never a
 decode) — so the doc lock is never held across a multi-MB PNG decode and the GUI stays responsive. The
 raster PNGs are decoded exactly ONCE (the former double decode — `load_persisted_into_stack` plus the
 doc's own decode — is gone; `load_persisted_into_stack` was removed and the stack is built from the

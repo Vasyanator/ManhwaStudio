@@ -1846,6 +1846,10 @@ pub(super) struct TypingTextOverlayLayer {
     /// captured when a project loads. Used to (re)load `raster_layers` for the current page.
     layers_primary_dir: Option<PathBuf>,
     layers_fallback_dir: Option<PathBuf>,
+    /// The legacy `text_images/` dir fed to the shared-doc decode for an un-migrated chapter; `None`
+    /// once migrated (inline manifest present). Gated once per chapter in `ensure_loader_started` so
+    /// the GUI hot path never re-parses `layers.json`.
+    doc_legacy_text_dir: Option<PathBuf>,
     /// Read-only PS raster layers per page (bottom-to-top), cached lazily so multi-page scenes do
     /// not thrash the loader. Cleared on project (re)load and cross-tab reload.
     raster_layers_by_page: HashMap<usize, Vec<TypingRasterLayer>>,
@@ -1977,6 +1981,7 @@ impl Default for TypingTextOverlayLayer {
             auto_typing_debug_visual: None,
             layers_primary_dir: None,
             layers_fallback_dir: None,
+            doc_legacy_text_dir: None,
             raster_layers_by_page: HashMap::new(),
             bands_by_page: HashMap::new(),
             last_doc_version: 0,

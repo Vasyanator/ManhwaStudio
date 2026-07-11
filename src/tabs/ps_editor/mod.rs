@@ -84,6 +84,10 @@ const PS_TEXT_PREVIEW_CHARS: usize = 16;
 pub struct PsEditorTabState {
     overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,
     loader: Option<PageLoaderHandles>,
+    /// Gated legacy `text_images/` dir for the shared-doc decode, cached per chapter to keep the
+    /// GUI thread off a per-page-switch `layers.json` parse: `(committed layers dir, gated legacy dir)`.
+    /// The gated value is `Some(text_images_dir)` for an un-migrated chapter, else `None`.
+    doc_legacy_text_dir_cache: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     viewport: viewport::PsViewport,
     stack: Option<LayerStack>,
     selection: Option<Selection>,
@@ -360,6 +364,7 @@ impl Default for PsEditorTabState {
         Self {
             overlays_model: None,
             loader: None,
+            doc_legacy_text_dir_cache: None,
             viewport: viewport::PsViewport::default(),
             stack: None,
             selection: None,
@@ -1352,6 +1357,25 @@ impl PsEditorTabState {
         let page_path = page.path.clone();
         let unsaved_layers_dir = project.paths.unsaved_layers_dir.clone();
         let layers_dir = project.paths.layers_dir.clone();
+        // Gate the legacy `text_images/` fallback ONCE per chapter, cached by the committed layers dir:
+        // a migrated chapter (inline text present) decodes with `None`; an un-migrated one feeds the
+        // legacy dir so its text reaches the doc. Recomputing on every page switch would re-parse
+        // `layers.json` on the GUI thread — the cache keeps that off the hot path.
+        let legacy_text_dir = if let Some((cached_layers_dir, cached_legacy_text_dir)) =
+            &self.doc_legacy_text_dir_cache
+            && cached_layers_dir == &project.paths.layers_dir
+        {
+            cached_legacy_text_dir.clone()
+        } else {
+            let gated = if crate::models::layer_model::migrate::manifest_has_inline_text(&project.paths.layers_dir) {
+                None
+            } else {
+                Some(project.paths.text_images_dir.clone())
+            };
+            self.doc_legacy_text_dir_cache =
+                Some((project.paths.layers_dir.clone(), gated.clone()));
+            gated
+        };
         let page_sizes = self.page_sizes_map(project);
         crate::trace_log!(
             cat::PERSIST,
@@ -1368,6 +1392,7 @@ impl PsEditorTabState {
             page_path,
             unsaved_layers_dir,
             layers_dir,
+            legacy_text_dir,
             page_sizes,
         }));
     }

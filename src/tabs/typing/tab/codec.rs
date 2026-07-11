@@ -1799,7 +1799,7 @@ pub(super) fn normalize_overlay_storage_entry(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| crate::models::layer_model::text_payload::stable_overlay_uid(&file_name));
     Some(build_storage_overlay_entry(
         &uid,
         kind,
@@ -1880,7 +1880,7 @@ pub(super) fn decode_overlay_from_storage_entry(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| crate::models::layer_model::text_payload::stable_overlay_uid(&file_name));
     Some(TypingOverlayDecoded {
         uid,
         kind,

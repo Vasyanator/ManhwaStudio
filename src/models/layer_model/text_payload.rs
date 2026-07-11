@@ -18,6 +18,25 @@ use std::path::Path;
 /// The on-disk overlay store: an ordered JSON array of overlay objects keyed by `uid`.
 const TEXT_INFO_FILE: &str = "text_info.json";
 
+/// Fixed namespace for deterministic legacy-overlay uids. Do NOT change once shipped: it defines the
+/// stable identity of pre-uid legacy overlays across the typing loader and the shared-doc decoder.
+/// The 128-bit value is the ASCII `"ManhwaStudioOver"` (the first 16 bytes of `ManhwaStudioOverlay`,
+/// truncated to fit `u128` — the full 19-byte string does not fit); it is an arbitrary fixed seed.
+const OVERLAY_UID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x4d616e68_77615374_7564696f_4f766572);
+
+/// Deterministic uid for a legacy overlay that has no persisted `uid`, derived (UUIDv5) from its rendered
+/// PNG file NAME. The typing tab's loader and the shared-doc `decode_page_payload` both call this, so the
+/// same overlay resolves to the SAME uid in both — preventing a duplicate text node. `file` may be a path;
+/// only its final component seeds the uid (so a bare name and a `dir/name` agree).
+#[must_use]
+pub fn stable_overlay_uid(file: &str) -> String {
+    let name = std::path::Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(file);
+    uuid::Uuid::new_v5(&OVERLAY_UID_NAMESPACE, name.as_bytes()).to_string()
+}
+
 /// Reads the ordered `text_info.json` overlay array from the first of `dirs` that has a readable,
 /// parseable array. Returns an empty vec if none exists or parsing fails — mirrors the private
 /// `read_text_info_array` in `tabs/ps_editor/text_layers.rs`, but exposed for the shared `LayerDoc`.
@@ -737,5 +756,33 @@ mod tests {
         let d = decode_deform_mesh(Some(&mesh), page).expect("valid uv grid");
         assert_eq!(d.points_px[0], [0.0, 0.0]);
         assert_eq!(d.points_px[3], [200.0, 100.0], "uv (1,1) → page bottom-right px");
+    }
+
+    #[test]
+    fn stable_overlay_uid_is_deterministic_and_basename_stable() {
+        // Same input → identical uid (no randomness): the typing loader and the shared-doc decoder
+        // MUST agree on the uid of a uid-less legacy overlay or the typing tab double-renders it.
+        let a = stable_overlay_uid("typing_overlay_p0001_1700000000.png");
+        let b = stable_overlay_uid("typing_overlay_p0001_1700000000.png");
+        assert_eq!(a, b, "deterministic: same name → same uid");
+
+        // Only the final path component seeds the uid, so a bare name and a `dir/name` agree (the
+        // decoder passes the bare `file`, callers may pass a joined path).
+        let bare = stable_overlay_uid("x.png");
+        let nested = stable_overlay_uid("a/b/x.png");
+        assert_eq!(bare, nested, "basename-stable: dir prefix is ignored");
+
+        // Distinct names must not collide.
+        assert_ne!(
+            stable_overlay_uid("x.png"),
+            stable_overlay_uid("y.png"),
+            "different names → different uids"
+        );
+
+        // The output is a canonical UUID string.
+        assert!(
+            uuid::Uuid::parse_str(&a).is_ok(),
+            "stable_overlay_uid returns a parseable UUID"
+        );
     }
 }

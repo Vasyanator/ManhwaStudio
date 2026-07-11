@@ -267,6 +267,7 @@ impl LayerDoc {
         page_idx: usize,
         primary_dir: &Path,
         fallback_dir: Option<&Path>,
+        legacy_text_dir: Option<&Path>,
         page_sizes: &HashMap<usize, [usize; 2]>,
     ) -> Result<(), String> {
         if self.pages.contains_key(&page_idx) {
@@ -275,7 +276,8 @@ impl LayerDoc {
         // Decode off the (here non-existent) lock, then move the payload in. Identical behavior to the
         // pre-split monolith; the split lets a worker run `decode_page_payload` lock-free and the GUI
         // thread run only the cheap `insert_decoded_page`.
-        let payload = Self::decode_page_payload(page_idx, primary_dir, fallback_dir, page_sizes)?;
+        let payload =
+            Self::decode_page_payload(page_idx, primary_dir, fallback_dir, legacy_text_dir, page_sizes)?;
         self.insert_decoded_page(page_idx, payload);
         Ok(())
     }
@@ -321,6 +323,13 @@ impl LayerDoc {
     /// PNG decode + legacy migration that `ensure_page_loaded` used to do inline, and returns the OWNED
     /// [`DecodedPagePayload`] to hand to [`Self::insert_decoded_page`].
     ///
+    /// `legacy_text_dir` is the un-migrated legacy `text_images/` directory, appended as the LAST text
+    /// source (after `primary_dir` and `fallback_dir`), or `None` once the chapter's inline manifest text
+    /// has migrated. It feeds BOTH the `text_info.json` read and the overlay-PNG lookups, so a
+    /// never-migrated legacy chapter's text becomes visible in the shared doc (hence the PS editor).
+    /// A uid-less legacy entry receives a deterministic uid via [`text_payload::stable_overlay_uid`],
+    /// matching the typing loader so the same overlay never double-renders.
+    ///
     /// `page_sizes` MUST be the FULL chapter page-size map (`page_idx -> [w, h]`): the absolute-ribbon
     /// legacy migration recovers a chapter-wide ribbon scale from EVERY page's aspect ratio, so a
     /// partial map corrupts the geometry of legacy chapters. The loaded page's own size is
@@ -332,6 +341,7 @@ impl LayerDoc {
         page_idx: usize,
         primary_dir: &Path,
         fallback_dir: Option<&Path>,
+        legacy_text_dir: Option<&Path>,
         page_sizes: &HashMap<usize, [usize; 2]>,
     ) -> Result<DecodedPagePayload, String> {
         let _span = crate::trace_scope!(cat::PERSIST, "decode_page_payload page={}", page_idx);
@@ -388,6 +398,12 @@ impl LayerDoc {
         let mut text_dirs: Vec<&Path> = vec![primary_dir];
         if let Some(fb) = fallback_dir {
             text_dirs.push(fb);
+        }
+        // The un-migrated legacy `text_images/` dir is the LAST text source: a migrated chapter whose
+        // `text_info.json` lives in `layers/` still wins over any stale `text_images/text_info.json`,
+        // while a never-migrated chapter (which only has `text_images/`) still resolves its overlays.
+        if let Some(legacy) = legacy_text_dir {
+            text_dirs.push(legacy);
         }
         // Normalize the cross-entry legacy families (ribbon x/y, top-left u/v) to modern
         // `img_u`/`img_v` BEFORE per-entry decode, identically to the typing tab's loader — so an old
@@ -533,16 +549,30 @@ impl LayerDoc {
             if entry_page != page_idx {
                 continue;
             }
-            let Some(uid) = obj.get("uid").and_then(Value::as_str).map(str::to_string) else {
+            // `file` is read FIRST: it seeds the deterministic uid for uid-less legacy entries and is
+            // reused below for the PNG read. Trimmed to match the typing codec's `str::trim`
+            // (`normalize_overlay_storage_entry` / `decode_overlay_from_storage_entry`), so a name with
+            // surrounding whitespace still resolves its PNG AND seeds the SAME uid on both paths.
+            let Some(file) = obj
+                .get("file")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
                 continue;
             };
+            // Legacy `text_info.json` has no `uid` for pre-uid overlays; mint one deterministically from
+            // the PNG file name (matching the typing loader) instead of dropping the entry.
+            let uid = obj
+                .get("uid")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| text_payload::stable_overlay_uid(file));
             // A v3 inline node of the same uid already won; skip the legacy entry.
             if built_inline.contains_key(&uid) {
                 continue;
             }
-            let Some(file) = obj.get("file").and_then(Value::as_str) else {
-                continue;
-            };
             let Some(image) = text_dirs.iter().find_map(|dir| read_png(&dir.join(file))) else {
                 crate::runtime_log::log_warn(format!(
                     "[layer_doc] text overlay image '{file}' not found for page {page_idx}; skipping"
@@ -1964,7 +1994,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
 
         let page = doc.page(0).expect("page resident");
@@ -2005,7 +2035,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         // A clean freshly-decoded page and a non-resident page have no pending save.
         assert!(
@@ -2079,7 +2109,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         doc.set_transform(0, "r", tf(123.0, 456.0, 3.5));
         // Geometry-only change must not bump the generation.
@@ -2092,7 +2122,7 @@ mod tests {
 
         // A fresh doc reload sees the new transform, including scale.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let r = doc2.node(0, "r").unwrap();
         assert!((r.transform.cx - 123.0).abs() < 1e-6, "cx round-trips");
@@ -2133,7 +2163,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert_eq!(doc.page(0).unwrap().nodes.len(), 2);
 
@@ -2143,7 +2173,7 @@ mod tests {
 
         // A fresh reload sees only r1 (r0 gone, not resurrected); r1 intact.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert!(
             doc2.node(0, "r0").is_none(),
@@ -2174,7 +2204,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert!(
             doc.node(0, "r").unwrap().deform.is_none(),
@@ -2204,7 +2234,7 @@ mod tests {
 
         // A fresh doc reload sees the persisted mesh.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let got = doc2
             .node(0, "r")
@@ -2220,7 +2250,7 @@ mod tests {
         doc2.set_deform(0, "r", None);
         doc2.flush_page(0, &dir, None).unwrap();
         let mut doc3 = LayerDoc::new();
-        doc3.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc3.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert!(
             doc3.node(0, "r").unwrap().deform.is_none(),
@@ -2247,7 +2277,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         // A freshly-loaded raster defaults OFF (no clip).
         if let NodeBody::Raster { mask_clip, .. } = &doc.node(0, "r").unwrap().body {
@@ -2270,7 +2300,7 @@ mod tests {
 
         doc.flush_page(0, &dir, None).unwrap();
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         if let NodeBody::Raster { mask_clip, .. } = &doc2.node(0, "r").unwrap().body {
             assert_eq!(
@@ -2313,7 +2343,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let gen_before = doc.node(0, "r").unwrap().generation;
 
@@ -2344,7 +2374,7 @@ mod tests {
 
         // Reload: effects present, display distinct from base.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let r = doc2.node(0, "r").unwrap();
         if let NodeBody::Raster {
@@ -2398,7 +2428,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
 
         let order_before: Vec<String> = doc
@@ -2650,7 +2680,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
         let order: Vec<&str> = doc
             .page(0)
@@ -2713,7 +2743,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
         let page = doc.page(0).expect("resident");
 
@@ -2731,7 +2761,7 @@ mod tests {
         // IDEMPOTENCY: flush to disk → reload → order unchanged (no drift across save/reload).
         doc.flush_page(0, &dir, None).unwrap();
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
         let order2: Vec<String> = doc2
             .page(0)
@@ -2788,7 +2818,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
 
         // Add a NEW text node (a freshly-created overlay routes through `add_node`).
@@ -2867,7 +2897,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
         // Initially text above raster.
         assert_eq!(
@@ -2949,7 +2979,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([1000, 1000]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([1000, 1000]))
             .unwrap();
 
         let page = doc.page(0).expect("page resident");
@@ -3024,7 +3054,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let page = doc.page(0).expect("page resident");
         assert_eq!(
@@ -3050,6 +3080,58 @@ mod tests {
     }
 
     #[test]
+    fn decode_reads_legacy_text_images_dir_and_mints_stable_uid() {
+        // A never-migrated legacy chapter keeps its overlays ONLY under `text_images/` (a MIDDLE-format
+        // `text_info.json` with img_idx/img_x_px/render_data but NO uid) and has no `layers/layers.json`.
+        // `decode_page_payload` must read that dir (when threaded as `legacy_text_dir`) and mint a
+        // deterministic uid for the uid-less entry, so the PS editor's doc-fed text is non-empty.
+        let root = temp_dir("legacy_text_images");
+        let primary = root.join("layers");
+        let legacy = root.join("text_images");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+
+        // MIDDLE-format overlay + its PNG live ONLY in `text_images/` — nothing in the layers dirs.
+        let file_name = "typing_overlay_p0000_1700000000.png";
+        save_png(&legacy.join(file_name), 7, 4, [255, 0, 0, 255]);
+        let overlays = serde_json::json!([
+            { "img_idx": 0, "overlay_type": "text", "file": file_name,
+              "img_x_px": 12.0, "img_y_px": 34.0, "rotation_deg": 0.0, "scale": 1.0,
+              "render_data": { "text": "Legacy" } }
+        ]);
+        fs::write(
+            legacy.join("text_info.json"),
+            serde_json::to_string(&overlays).unwrap(),
+        )
+        .unwrap();
+
+        let expected_uid = text_payload::stable_overlay_uid(file_name);
+
+        // WITH the legacy dir: the overlay resolves to a Text node keyed by the deterministic uid.
+        let payload = LayerDoc::decode_page_payload(0, &primary, None, Some(&legacy), &psz([100, 100]))
+            .expect("decode succeeds with legacy dir");
+        assert_eq!(
+            payload.nodes.len(),
+            1,
+            "the legacy text_images overlay loads when the legacy dir is threaded through"
+        );
+        let node = &payload.nodes[0];
+        assert_eq!(node.uid, expected_uid, "uid-less legacy entry gets the stable uid");
+        assert!(node.is_text(), "loaded as a text node");
+        assert_eq!(node.display_image().size, [7, 4], "legacy PNG resolved from text_images/");
+
+        // WITHOUT the legacy dir (gate closed / migrated chapter): NO text node is produced.
+        let payload_none = LayerDoc::decode_page_payload(0, &primary, None, None, &psz([100, 100]))
+            .expect("decode succeeds without legacy dir");
+        assert!(
+            payload_none.nodes.is_empty(),
+            "no legacy text source ⇒ no text node (proves the gate/threading matters)"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn ensure_page_loaded_skips_text_node_without_overlay() {
         let dir = temp_dir("text_no_overlay");
 
@@ -3069,7 +3151,7 @@ mod tests {
         add_legacy_text_ref_node(&dir, "ghost", 3, 0, true, true, 1.0);
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let page = doc.page(0).unwrap();
         assert_eq!(
@@ -3132,7 +3214,7 @@ mod tests {
         );
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let t = doc2
             .node(0, "t0")
@@ -3191,14 +3273,14 @@ mod tests {
         )
         .unwrap();
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         doc.add_node(0, text_node_with_payload("t0"));
         doc.flush_page(0, &dir, None).unwrap();
 
         // Both kinds present on a fresh reload.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert!(
             doc2.node(0, "r0").is_some_and(LayerNode::is_raster),
@@ -3256,7 +3338,7 @@ mod tests {
         .unwrap();
 
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let t = doc.node(0, "t0").expect("legacy text node loaded");
         assert!(t.is_text());
@@ -3284,7 +3366,7 @@ mod tests {
         // Remove the legacy file: the migrated page must load without it.
         let _ = fs::remove_file(dir.join("text_info.json"));
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let t = doc2
             .node(0, "t0")
@@ -3340,7 +3422,7 @@ mod tests {
         doc.flush_page_text(0, &dir, None).unwrap();
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         let t = doc2.node(0, "ov1").expect("text node reloads");
         assert!(
@@ -3401,7 +3483,7 @@ mod tests {
 
         // Reload sees the new pixels.
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert_eq!(
             doc2.node(0, "t0").unwrap().display_image().size,
@@ -3435,7 +3517,7 @@ mod tests {
         .unwrap();
 
         let mut doc2 = LayerDoc::new();
-        doc2.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+        doc2.ensure_page_loaded(0, &dir, None, None, &psz([100, 100]))
             .unwrap();
         assert!(doc2.node(0, "keep").is_some(), "inline node loads");
         assert!(
@@ -3488,7 +3570,7 @@ mod tests {
 
         // The doc loads page 1 with the FULL map and must produce the same transform.
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(1, &dir, None, &full).unwrap();
+        doc.ensure_page_loaded(1, &dir, None, None, &full).unwrap();
         let t = doc.node(1, "b").expect("page-1 ribbon overlay loaded");
         assert!(
             (t.transform.cx - ref_placement.transform.cx).abs() < 1e-3,
@@ -4026,13 +4108,13 @@ mod tests {
         // Reference: the synchronous monolith.
         let mut doc_ref = LayerDoc::new();
         doc_ref
-            .ensure_page_loaded(0, &dir, None, &page_sizes)
+            .ensure_page_loaded(0, &dir, None, None, &page_sizes)
             .unwrap();
         let ref_fp = page_fingerprint(doc_ref.page(0).expect("ref page resident"));
 
         // Split: decode lock-free, then insert.
         let payload =
-            LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).expect("decode succeeds");
+            LayerDoc::decode_page_payload(0, &dir, None, None, &page_sizes).expect("decode succeeds");
         let mut doc_split = LayerDoc::new();
         let version_before = doc_split.version();
         doc_split.insert_decoded_page(0, payload);
@@ -4049,7 +4131,7 @@ mod tests {
 
         // MEMOIZATION: a second insert of a freshly-decoded payload must NOT clobber the resident page.
         let payload2 =
-            LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).expect("decode succeeds");
+            LayerDoc::decode_page_payload(0, &dir, None, None, &page_sizes).expect("decode succeeds");
         let version_after_first = doc_split.version();
         doc_split.insert_decoded_page(0, payload2);
         assert_eq!(

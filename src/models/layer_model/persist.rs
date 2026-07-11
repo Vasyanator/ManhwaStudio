@@ -2640,7 +2640,7 @@ mod tests {
 
         // OPEN committed-only page 8 through the real loader: primary=unsaved, fallback=committed.
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(8, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(8, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         let loaded_text = doc
             .page(8)
@@ -2783,7 +2783,7 @@ mod tests {
             page_sizes.insert(p, [2, 2]);
         }
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         assert_eq!(
             doc.page(3)
@@ -2860,7 +2860,7 @@ mod tests {
         // Session: load page 3 into the doc, then DELETE its last text (doc only — the empty page is not
         // staged by the placement-save, mirroring `spawn_overlay_placement_save`'s `pages_with_text`).
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         assert!(doc.remove_node(3, "t3"));
         assert_eq!(
@@ -2926,7 +2926,7 @@ mod tests {
 
         // Reload + flush + save-to-project merge with the real owned set.
         doc.evict_page(3);
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         let mut owned: HashSet<usize> = HashSet::new();
         for p in doc.resident_pages() {
@@ -3051,7 +3051,7 @@ mod tests {
             page_sizes.insert(p, [2, 2]);
         }
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         assert_eq!(
             doc.page(3)
@@ -3166,7 +3166,7 @@ mod tests {
 
         // OPEN page 3 (primary=unsaved which has NOTHING yet, fallback=committed): loads the text.
         let mut doc = LayerDoc::new();
-        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), &page_sizes)
+        doc.ensure_page_loaded(3, &unsaved, Some(committed.as_path()), None, &page_sizes)
             .unwrap();
         assert_eq!(
             doc.page(3)

@@ -99,7 +99,11 @@ pub fn chapter_needs_migration(
 /// True when `layers_dir`'s `layers.json` already carries an inline (schema-v3) TEXT node (a text node
 /// with `render_data`). Used as the idempotency anchor: such a manifest is the product of a completed
 /// migration / typing flush, so the chapter must never be re-migrated from a legacy `text_info.json`.
-fn manifest_has_inline_text(layers_dir: &Path) -> bool {
+///
+/// Exposed `pub(crate)` so both tabs can gate the legacy `text_images/` fallback fed to
+/// `LayerDoc::decode_page_payload` on it: a migrated chapter (inline text present) must NOT re-read a
+/// stale `text_images/text_info.json`, or a deleted overlay would resurrect.
+pub(crate) fn manifest_has_inline_text(layers_dir: &Path) -> bool {
     super::compat::read_manifest(&layers_dir.join("layers.json"))
         .ok()
         .flatten()

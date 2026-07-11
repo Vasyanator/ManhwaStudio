@@ -35,9 +35,11 @@ use ms_thread as thread;
 /// Request to load the base layers + persisted user-layer payload for one page.
 ///
 /// `unsaved_layers_dir` / `layers_dir` are the staging (primary) and committed (fallback) layer dirs,
-/// and `page_sizes` is the FULL chapter page-size map (`page_idx -> [w, h]`) required by the doc's
-/// lock-free `decode_page_payload` for the legacy absolute-ribbon migration (a partial map corrupts
-/// legacy geometry — see `LayerDoc::decode_page_payload`).
+/// `legacy_text_dir` is the un-migrated `text_images/` fallback (gated by the committed manifest — `None`
+/// once migrated) so a never-migrated legacy chapter's text still reaches the doc, and `page_sizes` is
+/// the FULL chapter page-size map (`page_idx -> [w, h]`) required by the doc's lock-free
+/// `decode_page_payload` for the legacy absolute-ribbon migration (a partial map corrupts legacy
+/// geometry — see `LayerDoc::decode_page_payload`).
 #[derive(Debug, Clone)]
 pub struct PageLoadRequest {
     pub job_id: u64,
@@ -45,6 +47,7 @@ pub struct PageLoadRequest {
     pub page_path: PathBuf,
     pub unsaved_layers_dir: PathBuf,
     pub layers_dir: PathBuf,
+    pub legacy_text_dir: Option<PathBuf>,
     pub page_sizes: HashMap<usize, [usize; 2]>,
 }
 
@@ -161,6 +164,7 @@ fn load_page(
         request.page_idx,
         &request.unsaved_layers_dir,
         Some(&request.layers_dir),
+        request.legacy_text_dir.as_deref(),
         &request.page_sizes,
     ) {
         Ok(payload) => Some(payload),

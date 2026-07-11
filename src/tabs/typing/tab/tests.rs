@@ -677,7 +677,7 @@ fn raster_selection_tracks_by_uid_across_a_reorder() {
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
     page_sizes.insert(0, [100, 100]);
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
 
     let mut layer = TypingTextOverlayLayer::default();
     layer.sync_from_doc(0, &doc);
@@ -805,7 +805,7 @@ fn remove_raster_clears_page_when_it_empties_the_selected_index() {
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
     page_sizes.insert(0, [100, 100]);
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
 
     let mut layer = TypingTextOverlayLayer::default();
     layer.sync_from_doc(0, &doc);
@@ -881,7 +881,7 @@ fn sync_from_doc_materializes_text_runtimes_for_a_migrated_chapter() {
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
     page_sizes.insert(0, [100, 100]);
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
     assert_eq!(
         doc.page(0)
             .unwrap()
@@ -991,7 +991,7 @@ fn real_interleave_doc_text_survives_empty_loader_completion() {
     let mut doc = LayerDoc::new();
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
     page_sizes.insert(0, [100, 100]);
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
 
     let mut layer = TypingTextOverlayLayer::default();
     // 1) Early frame: doc materializes the text runtime (loader still in flight).
@@ -2021,7 +2021,7 @@ fn preload_apply_preserves_edits_and_deletions() {
     page_sizes.insert(0, [100, 100]);
 
     let mut doc = LayerDoc::new();
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
     assert!(doc.node(0, "ta").is_some());
     assert!(doc.node(0, "tb").is_some());
 
@@ -2041,7 +2041,7 @@ fn preload_apply_preserves_edits_and_deletions() {
     // A STALE decode from disk (still carries "ta"@10 and the deleted "tb"), like a preload payload
     // that finished decoding before the edits. `decode_page_payload` is the exact off-thread fn the
     // preload worker runs; `insert_decoded_page` is the exact memoized apply the driver runs.
-    let stale = LayerDoc::decode_page_payload(0, &dir, None, &page_sizes).unwrap();
+    let stale = LayerDoc::decode_page_payload(0, &dir, None, None, &page_sizes).unwrap();
     doc.insert_decoded_page(0, stale);
 
     let ta = doc.node(0, "ta").expect("ta still resident");
@@ -2105,7 +2105,7 @@ fn export_overlay_snapshot_is_empty_before_residency_and_populated_after() {
     let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
     page_sizes.insert(0, [100, 100]);
     let mut doc = LayerDoc::new();
-    doc.ensure_page_loaded(0, &dir, None, &page_sizes).unwrap();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
 
     // Migrated-chapter state: the page is loaded in the doc but NOT yet projected into this tab, so
     // `self.overlays` is empty — exactly the pre-preload state of a never-visited page.

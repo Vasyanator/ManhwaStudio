@@ -65,21 +65,33 @@ geometry permanently).
 - WRITE — `encode_transform_fields` (center→img_x/y, rad→`rotation_deg`) and `encode_deform_mesh`
   (`DeformRec`→`deform_mesh`) are the single serialization point for the disk vocabulary; the typing
   tab's `build_storage_overlay_entry` calls them (no hand-rolled deg/mesh serialization remains).
-`ensure_page_loaded(page_idx, primary, fallback, page_sizes)` takes the FULL chapter page-size map
-`&HashMap<usize,[usize;2]>` (the loaded page's size is `page_sizes[page_idx]`; the whole map feeds the
-ribbon solve). Callers build it: typing from its memoized page-image-dimension cache (`page_sizes_map`),
-PS from `project.pages` image dimensions (memoized, the loaded page seeded from the stack size).
+`ensure_page_loaded(page_idx, primary, fallback, legacy_text_dir, page_sizes)` takes the FULL chapter
+page-size map `&HashMap<usize,[usize;2]>` (the loaded page's size is `page_sizes[page_idx]`; the whole
+map feeds the ribbon solve). Callers build it: typing from its memoized page-image-dimension cache
+(`page_sizes_map`), PS from `project.pages` image dimensions (memoized, the loaded page seeded from the
+stack size).
 
 ### Lock-free decode split (off-thread page load)
 `ensure_page_loaded` is a thin composition of two parts so the page-switch PNG decode can run off the
 GUI thread WITHOUT holding the shared doc lock across a multi-MB decode:
-- `decode_page_payload(page_idx, primary, fallback, page_sizes) -> Result<DecodedPagePayload, String>`
+- `decode_page_payload(page_idx, primary, fallback, legacy_text_dir, page_sizes) -> Result<DecodedPagePayload, String>`
   — a PURE associated fn (no `&mut self`). It does ALL the disk I/O + PNG decode + legacy migration and
   returns the OWNED `DecodedPagePayload` (the page's raster + text `LayerNode`s, already z-sorted and
   re-ranked, plus the raster groups). It still REQUIRES the FULL chapter `page_sizes` map (the
   absolute-ribbon legacy migration recovers a chapter-wide scale from every page's aspect — a partial
   map corrupts geometry). `DecodedPagePayload`/`LayerNode`/`ColorImage`/`Value` are `Send`, so the
   payload can be built on a worker thread.
+  - `legacy_text_dir: Option<&Path>` is the un-migrated legacy `text_images/` dir, appended as the LAST
+    text source after `primary`/`fallback` (so a migrated `layers/text_info.json` still wins), or `None`
+    once the chapter is migrated. It feeds BOTH the `text_info.json` read and the overlay-PNG lookups, so
+    a never-migrated legacy chapter's text becomes visible in the shared doc (hence the PS editor, whose
+    only text source is the doc). A uid-less legacy entry gets a DETERMINISTIC uid via
+    `text_payload::stable_overlay_uid` (UUIDv5 of the PNG file name), matching the typing loader so the
+    same overlay never double-renders. GATE (both tabs): the legacy dir is threaded ONLY when
+    `migrate::manifest_has_inline_text(committed_layers_dir)` is false, computed once per chapter and
+    cached (typing: `doc_legacy_text_dir` set in `render_jobs::ensure_loader_started`; PS:
+    `doc_legacy_text_dir_cache` in `request_page`) — a migrated chapter passes `None` so a stale
+    `text_images/text_info.json` can never resurrect a deleted overlay.
 - `insert_decoded_page(&mut self, page_idx, payload)` — takes the doc lock only to MOVE the payload into
   `self.pages` (no I/O). Memoized: an already-resident page discards the incoming payload (live in-memory
   edits are never clobbered) and does NOT bump the version; a real insert bumps it.

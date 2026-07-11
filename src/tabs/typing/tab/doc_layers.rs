@@ -320,6 +320,7 @@ impl TypingTextOverlayLayer {
                 page_idx,
                 &primary,
                 fallback.as_deref(),
+                self.doc_legacy_text_dir.as_deref(),
                 &page_sizes,
             ) {
                 Ok(payload) => {
@@ -1054,6 +1055,9 @@ impl TypingTextOverlayLayer {
             return;
         };
         let fallback = self.layers_fallback_dir.clone();
+        // The gated legacy `text_images/` dir (None once migrated) is captured before the spawn so the
+        // worker decodes un-migrated legacy chapters identically to the GUI-thread page load.
+        let legacy = self.doc_legacy_text_dir.clone();
 
         // Target = every page NOT yet fully resident (projected here AND loaded in the doc). Computed
         // under a single doc lock. Already-resident pages are excluded, so the pass never re-decodes
@@ -1107,6 +1111,7 @@ impl TypingTextOverlayLayer {
                     page,
                     &primary,
                     fallback.as_deref(),
+                    legacy.as_deref(),
                     &page_sizes,
                 );
                 if tx.send((page, result)).is_err() {

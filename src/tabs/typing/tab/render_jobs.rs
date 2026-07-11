@@ -82,6 +82,15 @@ impl TypingTextOverlayLayer {
         let unsaved_layers_dir = project.paths.unsaved_layers_dir.clone();
         let main_layers_dir = project.paths.layers_dir.clone();
         let legacy_text_images_dir = project.paths.text_images_dir.clone();
+        // Gate the legacy `text_images/` fallback ONCE per chapter (avoids a per-page `layers.json`
+        // parse on the GUI hot path): a migrated chapter (inline text present) must NOT re-read a stale
+        // `text_images/text_info.json`, so it decodes with `None`; an un-migrated one feeds the legacy
+        // dir so the shared doc (hence the PS editor) sees its text.
+        self.doc_legacy_text_dir = if crate::models::layer_model::migrate::manifest_has_inline_text(&main_layers_dir) {
+            None
+        } else {
+            Some(legacy_text_images_dir.clone())
+        };
 
         // Capture the dirs used to read read-only PS raster layers (Task B) and force a reload of
         // the raster cache for the current page on this project (re)load.

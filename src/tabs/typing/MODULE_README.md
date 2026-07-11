@@ -449,7 +449,14 @@ saving, and export.
   visited pages), so whole-project operations (export, save) that need EVERY page resident use the
   async preloader instead of a synchronous residency loop (which would block the GUI thread).
   `begin_preload_all_pages` spawns ONE worker that decodes each not-yet-resident page off the GUI
-  thread via `LayerDoc::decode_page_payload` (a `Send` pure fn) and streams the payloads;
+  thread via `LayerDoc::decode_page_payload` (a `Send` pure fn) and streams the payloads. Both the
+  per-page decode (`ensure_raster_layers_for_page`) and this worker pass `self.doc_legacy_text_dir`
+  (the GATED legacy `text_images/` dir: `Some` only for an un-migrated chapter, `None` once migrated)
+  set ONCE per chapter in `render_jobs::ensure_loader_started` via
+  `migrate::manifest_has_inline_text` — so an un-migrated legacy chapter's uid-less overlays reach the
+  shared doc with a DETERMINISTIC uid (`text_payload::stable_overlay_uid`, matching this tab's own
+  loader so the same overlay never double-renders), while a migrated chapter never re-reads a stale
+  `text_info.json`.
   `drive_page_preload` (called every frame from `TypingTabState::draw`) applies up to
   `TYPING_PRELOAD_APPLY_BATCH` (4) payloads per frame on the GUI thread. Apply goes through the
   MEMOIZED `LayerDoc::insert_decoded_page` (an already-resident page discards the stale payload) then
