@@ -235,9 +235,9 @@ impl TypingTextOverlayLayer {
             // thread). The save-to-project merge worker barriers the saver BEFORE reading the staging
             // `layers.json`, so every enqueued page is on disk before the merge — the FIFO channel +
             // barrier give the same ordering the old synchronous flush did. A page is marked OWNED on a
-            // successful ENQUEUE (the barrier guarantees the write); an enqueue failure leaves it
-            // unowned (fail-safe), so the merge preserves committed text rather than dropping it. With
-            // no saver, `enqueue_page_text_save` falls back to a synchronous flush, also correct.
+            // successful ENQUEUE; save-to-project removes barrier-reported write failures before the
+            // merge, so they preserve committed text. An enqueue failure leaves it unowned. With no
+            // saver, `enqueue_page_text_save` falls back to a synchronous flush, also correct.
             match guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref()) {
                 Ok(()) => {
                     owned.insert(page_idx);

@@ -29,7 +29,7 @@ the real `persist::*` write path while the doc is free for the GUI thread.
 */
 
 use ms_thread::{self as thread, JoinHandle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -302,8 +302,9 @@ pub enum SaverMsg {
     Job(PageSaveJob),
     /// Process every currently-queued job, then signal completion on the sender. Used by
     /// `barrier_blocking` so a caller can be sure all prior enqueued jobs are on disk (e.g. before a
-    /// save-to-project merge reads the staging files).
-    Barrier(Sender<()>),
+    /// save-to-project merge reads the staging files). The reply reports pages whose latest write
+    /// failed, so a merge can preserve their committed text.
+    Barrier(Sender<HashSet<usize>>),
     /// Drain any remaining queued jobs, then stop the worker.
     Shutdown,
 }
@@ -328,23 +329,27 @@ impl LayerSaverHandle {
         }
     }
 
-    /// Blocks until every job enqueued BEFORE this call has been written to disk. Returns immediately
-    /// if the worker is gone (the barrier cannot be honored, but the caller must not deadlock); the
-    /// loss is logged.
-    pub fn barrier_blocking(&self) {
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+    /// Blocks until every job enqueued BEFORE this call has completed, returning pages whose latest
+    /// write failed. Returns an empty set if the worker is gone; the loss is logged.
+    #[must_use]
+    pub fn barrier_blocking(&self) -> HashSet<usize> {
+        let (done_tx, done_rx) = mpsc::channel::<HashSet<usize>>();
         if self.tx.send(SaverMsg::Barrier(done_tx)).is_err() {
             runtime_log::log_error(
                 "[layer_model::saver] barrier failed: background saver thread is gone",
             );
-            return;
+            return HashSet::new();
         }
         // `recv` returns `Err` only if the worker dropped the sender without replying (it panicked
         // mid-drain); treat that as "barrier could not complete" and proceed rather than hang.
-        if done_rx.recv().is_err() {
-            runtime_log::log_error(
-                "[layer_model::saver] barrier sender dropped without reply (worker stopped)",
-            );
+        match done_rx.recv() {
+            Ok(failed_pages) => failed_pages,
+            Err(_) => {
+                runtime_log::log_error(
+                    "[layer_model::saver] barrier sender dropped without reply (worker stopped)",
+                );
+                HashSet::new()
+            }
         }
     }
 }
@@ -386,8 +391,8 @@ impl LayerSaver {
         self.handle().enqueue(job);
     }
 
-    /// Blocks until every previously enqueued job is on disk (see
-    /// [`LayerSaverHandle::barrier_blocking`]).
+    /// Blocks until every previously enqueued job completes, returning pages whose latest write failed
+    /// (see [`LayerSaverHandle::barrier_blocking`]).
     ///
     /// Production code barriers via a cloned [`LayerSaverHandle`] (the merge worker and app-close
     /// drain hold a handle, not the owner), so this owner-side convenience wrapper has no non-test
@@ -395,8 +400,9 @@ impl LayerSaver {
     /// module's unit tests; the `dead_code` lint is a false-positive for "API completeness used only
     /// in tests" (CLAUDE.md §17 permits an allow when the lint is inapplicable for a stated reason).
     #[allow(dead_code)]
-    pub fn barrier_blocking(&self) {
-        self.handle().barrier_blocking();
+    #[must_use]
+    pub fn barrier_blocking(&self) -> HashSet<usize> {
+        self.handle().barrier_blocking()
     }
 
     /// Shuts the worker down: sends `Shutdown` (so the worker drains its queue first) and joins the
@@ -437,15 +443,16 @@ impl Drop for LayerSaver {
 }
 
 /// The background worker body: `recv` then `try_recv`-drain, bucketing `Job`s per page (latest data
-/// per kind), running each bucket, honoring `Barrier`/`Shutdown`. A persist error is logged (the
-/// next page still runs) — a single bad page must not stall the saver.
+/// per kind), running each bucket, honoring `Barrier`/`Shutdown`. A persist error is logged and tracked
+/// (the next page still runs) — a single bad page must not stall the saver.
 fn worker_loop(rx: &Receiver<SaverMsg>) {
+    let mut failed_pages = HashSet::new();
     while let Ok(first) = rx.recv() {
         // Per-page coalescing bucket for this drain pass. Insertion order is preserved by tracking the
         // page sequence so writes happen in a deterministic order.
         let mut bucket: HashMap<usize, PageSaveJob> = HashMap::new();
         let mut order: Vec<usize> = Vec::new();
-        let mut pending_barriers: Vec<Sender<()>> = Vec::new();
+        let mut pending_barriers: Vec<Sender<HashSet<usize>>> = Vec::new();
         let mut shutdown = false;
 
         // Fold the first message, then drain everything immediately available.
@@ -476,10 +483,10 @@ fn worker_loop(rx: &Receiver<SaverMsg>) {
         }
 
         // Run every coalesced page in insertion order, then release any barriers waiting on this pass.
-        run_bucket(&bucket, &order);
+        run_bucket(&bucket, &order, &mut failed_pages);
         for done in pending_barriers {
             // The waiter may have given up (timed out / dropped); ignore a closed receiver.
-            done.send(()).ok();
+            done.send(failed_pages.clone()).ok();
         }
         if shutdown {
             break;
@@ -494,7 +501,11 @@ fn worker_loop(rx: &Receiver<SaverMsg>) {
 /// encoding, or a logic bug) must NOT unwind out of the worker loop and kill the saver thread —
 /// that would silently drop all later enqueues and leave every future `barrier_blocking` unable to
 /// complete. Catching keeps the worker alive so other pages still save and barriers still reply.
-fn run_bucket(bucket: &HashMap<usize, PageSaveJob>, order: &[usize]) {
+fn run_bucket(
+    bucket: &HashMap<usize, PageSaveJob>,
+    order: &[usize],
+    failed_pages: &mut HashSet<usize>,
+) {
     for page in order {
         let Some(job) = bucket.get(page) else {
             continue;
@@ -503,13 +514,21 @@ fn run_bucket(bucket: &HashMap<usize, PageSaveJob>, order: &[usize]) {
         // leaves no observer of a half-mutated value (the on-disk write is the only effect, guarded
         // by persist's own error handling), so asserting unwind-safety is sound here.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => runtime_log::log_error(format!(
-                "[layer_model::saver] failed to persist page {page}: {err}"
-            )),
-            Err(_) => runtime_log::log_error(format!(
-                "[layer_model::saver] PANIC while persisting page {page}; saver thread continues"
-            )),
+            Ok(Ok(())) => {
+                failed_pages.remove(page);
+            }
+            Ok(Err(err)) => {
+                failed_pages.insert(*page);
+                runtime_log::log_error(format!(
+                    "[layer_model::saver] failed to persist page {page}: {err}"
+                ));
+            }
+            Err(_) => {
+                failed_pages.insert(*page);
+                runtime_log::log_error(format!(
+                    "[layer_model::saver] PANIC while persisting page {page}; saver thread continues"
+                ));
+            }
         }
     }
 }
@@ -614,7 +633,7 @@ mod tests {
             &dir,
             vec![raster("c", Color32::BLUE), raster("d", Color32::WHITE)],
         ));
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         let page = persist::load_page_rasters(&dir, None, 5).unwrap();
         let mut uids: Vec<&str> = page.layers.iter().map(|l| l.uid.as_str()).collect();
@@ -636,7 +655,7 @@ mod tests {
         let dir = temp_dir("barrier");
         let saver = LayerSaver::new();
         saver.enqueue(full_job(0, &dir, vec![raster("r", Color32::RED)]));
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         // Immediately readable — the barrier guarantees the write completed.
         assert!(
@@ -687,7 +706,7 @@ mod tests {
             }),
             effects: Vec::new(),
         });
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         // Raster survives (text-only half did not erase it).
         let rasters = persist::load_page_rasters(&dir, None, 2).unwrap();
@@ -726,7 +745,7 @@ mod tests {
             effects: Vec::new(),
         });
         saver.enqueue(full_job(7, &dir, vec![raster("r", Color32::RED)]));
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         let rasters = persist::load_page_rasters(&dir, None, 7).unwrap();
         assert_eq!(rasters.layers.len(), 1);
@@ -767,7 +786,7 @@ mod tests {
                 display_image: Some(img([2, 2], Color32::BLUE)),
             }],
         });
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         let page = persist::load_page_rasters(&dir, None, 4).unwrap();
         assert_eq!(
@@ -797,7 +816,7 @@ mod tests {
                 display_image: None,
             }],
         });
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         let page = persist::load_page_rasters(&dir, None, 4).unwrap();
         let a = page.layers.iter().find(|l| l.uid == "a").unwrap();
@@ -844,7 +863,7 @@ mod tests {
                 display_image: Some(img([2, 2], Color32::WHITE)),
             }],
         });
-        saver.barrier_blocking();
+        assert!(saver.barrier_blocking().is_empty());
 
         let page = persist::load_page_rasters(&dir, None, 1).unwrap();
         let x = page.layers.iter().find(|l| l.uid == "x").unwrap();
@@ -857,5 +876,31 @@ mod tests {
 
         saver.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed persist is reported by the barrier until a later successful retry for that page
+    /// replaces the failure outcome.
+    #[test]
+    fn barrier_reports_failed_page_until_later_success() {
+        let invalid_parent = temp_dir("barrier_failed_parent");
+        std::fs::write(&invalid_parent, b"not a directory").unwrap();
+        let valid_dir = temp_dir("barrier_failed_recovery");
+        let saver = LayerSaver::new();
+        saver.enqueue(full_job(9, &invalid_parent.join("layers"), vec![raster("r", Color32::RED)]));
+
+        assert!(
+            saver.barrier_blocking().contains(&9),
+            "barrier reports the page whose latest persist failed"
+        );
+
+        saver.enqueue(full_job(9, &valid_dir, vec![raster("r", Color32::GREEN)]));
+        assert!(
+            !saver.barrier_blocking().contains(&9),
+            "a later successful persist clears the page failure"
+        );
+
+        saver.shutdown();
+        let _ = std::fs::remove_file(&invalid_parent);
+        let _ = std::fs::remove_dir_all(&valid_dir);
     }
 }

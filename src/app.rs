@@ -846,9 +846,13 @@ impl MangaApp {
             // Drain the layer saver FIRST: block until every enqueued layer page write (rasters + text
             // + effects from the flushes above) is on disk, so the merge reads a complete staging
             // `layers.json`. This barrier runs in the worker, never on the GUI thread.
-            if let Some(handle) = saver_handle {
-                handle.barrier_blocking();
-            }
+            let failed_pages = saver_handle.map_or_else(HashSet::new, |handle| handle.barrier_blocking());
+            // A failed staging write is not authoritative: preserve its committed text instead of
+            // overwriting it with incomplete or stale staging data.
+            let effective_owned_text_pages: HashSet<usize> = owned_text_pages
+                .difference(&failed_pages)
+                .copied()
+                .collect();
             if let Err(err) =
                 save_overlay_snapshots_to(&unsaved_clean_layers_dir, &dirty_overlay_snapshots)
             {
@@ -863,7 +867,7 @@ impl MangaApp {
                 )));
                 return;
             }
-            let result = merge_unsaved_into_project(&unsaved_dir, &project_dir, &owned_text_pages);
+            let result = merge_unsaved_into_project(&unsaved_dir, &project_dir, &effective_owned_text_pages);
             let _ = tx.send(result);
         });
         self.save_to_project_rx = Some(rx);
@@ -2631,7 +2635,8 @@ impl eframe::App for MangaApp {
             .ok()
             .and_then(|guard| guard.saver_handle());
         if let Some(handle) = handle {
-            handle.barrier_blocking();
+            // Teardown only drains writes; no project merge remains to reconcile failed pages.
+            let _ = handle.barrier_blocking();
         }
         // 2) Drain remaining queue + join the worker thread (idempotent; safe if already shut down).
         if let Ok(mut guard) = self.layer_doc.lock() {
