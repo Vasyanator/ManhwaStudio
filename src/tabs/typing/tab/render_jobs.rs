@@ -202,8 +202,8 @@ impl TypingTextOverlayLayer {
         self.migration_rx = Some(rx);
     }
 
-    /// Polls the eager migration worker. On success, evicts the migrated doc pages so both tabs
-    /// re-project the v3 data; drops the page caches so they reload. Returns true when it completed.
+    /// Polls the eager migration worker. On success, evicts clean migrated doc pages so both tabs
+    /// re-project the v3 data; drops their page caches so they reload. Returns true when it completed.
     pub(super) fn poll_migration(&mut self) -> bool {
         let Some(rx) = self.migration_rx.as_ref() else {
             return false;
@@ -222,17 +222,48 @@ impl TypingTextOverlayLayer {
                                 report.migrated_pages.len(),
                                 report.backup_path
                             ));
-                            // Evict the migrated pages from the shared doc so both tabs re-project the
-                            // v3 inline data (the doc version bump drives their per-frame reproject).
-                            if let Some(doc) = self.layer_doc.clone()
-                                && let Ok(mut guard) = doc.lock()
-                            {
-                                for &page in &report.migrated_pages {
-                                    guard.evict_page(page);
+                            // Evict CLEAN migrated pages from the shared doc so both tabs re-project the
+                            // v3 inline data (the doc version bump drives their per-frame reproject),
+                            // then drop ONLY those pages' local caches so doc and cache stay in lockstep.
+                            // A page with ANY pending save (an edit made DURING migration whose enqueued
+                            // or still-dirty save has not been acknowledged-durable) is left resident so
+                            // it is not clobbered by a reload of the pre-edit v3 geometry; the GUI thread
+                            // cannot safely wait on a saver barrier here.
+                            let refreshed_pages: Vec<usize> = if let Some(doc) = self.layer_doc.clone() {
+                                match doc.lock() {
+                                    Ok(mut guard) => {
+                                        // Compute the evicted set INSIDE the successful-lock block so the
+                                        // cache drop below matches exactly what left the doc.
+                                        let evicted: Vec<usize> = report
+                                            .migrated_pages
+                                            .iter()
+                                            .copied()
+                                            .filter(|&page| !guard.page_has_pending_save(page))
+                                            .collect();
+                                        for &page in &evicted {
+                                            guard.evict_page(page);
+                                        }
+                                        evicted
+                                    }
+                                    Err(_) => {
+                                        // Lock poisoned/unavailable: evict nothing AND drop no caches, so
+                                        // doc and cache stay in lockstep — the pages stay resident and
+                                        // re-project later once the doc is reachable.
+                                        crate::runtime_log::log_warn(
+                                            "[migrate] layer doc lock unavailable; leaving migrated pages resident and their caches intact (they re-project later)",
+                                        );
+                                        Vec::new()
+                                    }
                                 }
-                            }
-                            // Drop the local per-page caches so they reload the migrated bands/text.
-                            for &page in &report.migrated_pages {
+                            } else {
+                                // No shared doc wired to this tab: there is no doc/cache lockstep to
+                                // preserve, so refresh every migrated page's cache from the freshly
+                                // written v3 data on disk.
+                                report.migrated_pages.clone()
+                            };
+                            // Drop the local per-page caches for the refreshed pages so they reload the
+                            // migrated bands/text; pages left resident in the doc keep their caches.
+                            for &page in &refreshed_pages {
                                 self.bands_by_page.remove(&page);
                                 self.raster_layers_by_page.remove(&page);
                             }

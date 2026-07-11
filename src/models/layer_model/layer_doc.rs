@@ -663,6 +663,31 @@ impl LayerDoc {
         self.pages.get(&page_idx)
     }
 
+    /// Returns whether `page_idx` has ANY persistence that is enqueued/edited but not yet
+    /// acknowledged-durable — the correct "do not evict, an edit could be lost" signal.
+    ///
+    /// True iff `latest_epoch` holds an entry for `(page_idx, Raster)` or `(page_idx, Text)`, OR the
+    /// resident page still has a `pixels_dirty` node. A `latest_epoch` entry is created the moment a
+    /// page is touched — by a pixel edit (`bump_dirty_epoch`) OR by ANY persisting enqueue
+    /// (`next_save_epoch`, which every whole-page/text/effects save reserves, so GEOMETRY-only edits
+    /// like `set_transform`/`set_deform`/visibility/opacity/group that persist via a whole-page
+    /// enqueue are covered too) — and is removed only by a matching successful ack in `poll_save_acks`
+    /// or by `evict_page`. The `pixels_dirty` fallback is belt-and-suspenders for the brief window
+    /// between a pixel edit and its enqueue. Lock-free and cheap: only `HashMap`/slice lookups.
+    #[must_use]
+    pub fn page_has_pending_save(&self, page_idx: usize) -> bool {
+        if self
+            .latest_epoch
+            .contains_key(&(page_idx, SaveKind::Raster))
+            || self.latest_epoch.contains_key(&(page_idx, SaveKind::Text))
+        {
+            return true;
+        }
+        self.pages
+            .get(&page_idx)
+            .is_some_and(|page| page.nodes.iter().any(|node| node.pixels_dirty))
+    }
+
     /// Page indices currently resident (loaded) in the doc. A resident page had its text loaded by
     /// `ensure_page_loaded` (both tabs load text on page load), so the doc's view of that page's text
     /// is authoritative — including deletions. The save-to-project flush iterates these to make staging
@@ -1960,6 +1985,79 @@ mod tests {
         assert!((r1.opacity - 0.5).abs() < 1e-6);
         assert!((r1.transform.scale - 2.0).abs() < 1e-6);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_has_pending_save_tracks_all_pending_persistence() {
+        let dir = temp_dir("pending_save");
+        persist::add_page_raster(
+            &dir,
+            None,
+            0,
+            "r",
+            "Raster",
+            true,
+            1.0,
+            tf(0.0, 0.0, 1.0),
+            &img([2, 2], Color32::RED),
+        )
+        .unwrap();
+
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, &psz([100, 100]))
+            .unwrap();
+        // A clean freshly-decoded page and a non-resident page have no pending save.
+        assert!(
+            !doc.page_has_pending_save(0),
+            "freshly decoded page has no pending save"
+        );
+        assert!(
+            !doc.page_has_pending_save(1),
+            "non-resident page has no pending save"
+        );
+
+        // GEOMETRY-only edit: `set_transform` does NOT flag any node `pixels_dirty`; it is persisted
+        // via a whole-page enqueue that reserves a `latest_epoch`. Driving that enqueue is the smallest
+        // public API that exercises the `latest_epoch` gate (Gap-1 regression: the old pixel-only helper
+        // classified this page "clean" and evicted it, losing the rotation).
+        doc.enable_background_saver();
+        doc.set_transform(0, "r", tf(5.0, 7.0, 1.0));
+        doc.enqueue_page_save(0, &dir, None).unwrap();
+        if let Some(handle) = doc.saver_handle() {
+            // Let the job run so `shutdown_saver` joins cleanly; the ack is not polled, so
+            // `latest_epoch` still holds the reserved epoch.
+            let _ = handle.barrier_blocking();
+        }
+        assert!(
+            doc.latest_epoch.contains_key(&(0, SaveKind::Raster))
+                || doc.latest_epoch.contains_key(&(0, SaveKind::Text)),
+            "the geometry enqueue reserved a latest_epoch"
+        );
+        assert!(
+            !doc.pages.get(&0).unwrap().nodes.iter().any(|n| n.pixels_dirty),
+            "a geometry edit does not flag any node pixels_dirty"
+        );
+        assert!(
+            doc.page_has_pending_save(0),
+            "a geometry edit awaiting its enqueued save is pending even with no pixels_dirty node"
+        );
+
+        // A PIXEL edit is likewise pending (via both `pixels_dirty` and the reserved epoch).
+        doc.set_raster_pixels(
+            0,
+            "r",
+            img([2, 2], Color32::BLUE),
+            img([2, 2], Color32::BLUE),
+            Vec::new(),
+            true,
+        );
+        assert!(
+            doc.page_has_pending_save(0),
+            "pixel-edited resident page has a pending save"
+        );
+
+        doc.shutdown_saver();
         let _ = fs::remove_dir_all(&dir);
     }
 

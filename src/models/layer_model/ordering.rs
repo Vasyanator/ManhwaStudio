@@ -64,7 +64,12 @@ pub fn page_bands(page: &PageLayers) -> Vec<Band> {
                 uid: node.uid.clone(),
                 z: node.z,
             }),
-            _ => {}
+            // Unpinned text emits no per-node band here — it is collected into a `TextGroup` band by
+            // the `page.text_groups` pass below. A `Group` is a container, not a Z band. Both are
+            // exhaustive no-ops (a new `LayerKindRec` variant must be reconsidered here, not silently
+            // dropped — CLAUDE.md §17).
+            LayerKindRec::Text => {}
+            LayerKindRec::Group => {}
         }
     }
 
