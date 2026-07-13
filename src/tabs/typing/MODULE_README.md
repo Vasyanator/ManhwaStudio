@@ -245,6 +245,10 @@ saving, and export.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
   - `selection_rasters.rs`: overlay/raster selection, remove, raster interact/menu/drag/transform/deform.
+    Also `resize_selected_overlay_width` (the on-canvas width-guide drag handle): it edits the selected
+    text overlay's `text_params.width_px` and re-renders via the SAME `dispatch_vector_rerender` tail as
+    Ctrl+wheel rotation (latest-wins re-render + render_data write-back + placement save), so canvas and
+    edit-panel width stay in sync.
   - `panels.rs`: deformation panel, layers-tab body, layout-editor floating panels.
   - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
   - `draw_page.rs`: `draw_page_overlays` (master per-page draw) + repaint/visibility/pixel-snap helpers.

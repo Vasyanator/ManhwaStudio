@@ -198,6 +198,13 @@ const TEXT_OVERLAY_DEFORM_SURFACE_ROWS: usize = 13;
 const TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX: f32 = 10.0;
 const TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX: f32 = 5.0;
 const TEXT_OVERLAY_WIDTH_GUIDE_LABEL_GAP_PX: f32 = 4.0;
+/// Screen-px grab radius around each width-guide end tick that starts a width-resize drag (kept
+/// larger than the visual tick half so the handle is comfortably hittable).
+const TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX: f32 = 8.0;
+/// Min/max configured text-layer width (source px) settable from the canvas width handle. Mirrors the
+/// edit-panel width slider range (`panel/create_edit.rs`) so canvas and panel agree on the bounds.
+const TEXT_OVERLAY_WIDTH_MIN_PX: u32 = 16;
+const TEXT_OVERLAY_WIDTH_MAX_PX: u32 = 4096;
 const TEXT_OVERLAY_BEND_HANDLE_COLS: usize = 5;
 const TEXT_OVERLAY_BEND_HANDLE_ROWS: usize = 5;
 const TEXT_OVERLAY_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
@@ -1706,6 +1713,25 @@ struct TypingOverlayDragState {
     start_mesh: TypingOverlayDeformMesh,
 }
 
+/// Active drag of a width-guide end tick, resizing the selected TEXT overlay's configured `width_px`.
+/// Separate from `TypingOverlayDragState` because a width change is a render-param edit + re-render
+/// (via `resize_selected_overlay_width`), not a placement/geometry mutation, so it never shares the
+/// placement drag state or its mode match arms.
+///
+/// The guide is CENTERED on the overlay, so dragging one tick by `Δx` (source px) changes the total
+/// width by `2 * Δx`. `right` selects the tick (RIGHT tick: pointer-right widens; LEFT tick: mirrored).
+#[derive(Debug, Clone, Copy)]
+struct WidthResizeDragState {
+    overlay_idx: usize,
+    page_idx: usize,
+    /// Screen-x of the pointer when the drag began (the guide is horizontal, so only x matters).
+    pointer_start_x: f32,
+    /// The overlay's configured `width_px` (source px) at drag start; the drag offsets from this.
+    start_width_px: u32,
+    /// `true` for the right tick, `false` for the left.
+    right: bool,
+}
+
 /// Active drag while editing the VECTOR transform working mesh (Phase 3a). Separate from
 /// `TypingOverlayDragState` (which drives the overlay's placement / raster deform mesh) so the two
 /// transform kinds never share drag state. `start_mesh` is the working mesh snapshot at drag start
@@ -1831,6 +1857,7 @@ pub(super) struct TypingTextOverlayLayer {
     deform_tool_settings: TypingDeformToolSettings,
     drag_state: Option<TypingOverlayDragState>,
     drag_has_changes: bool,
+    width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
     page_count: usize,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
@@ -1971,6 +1998,7 @@ impl Default for TypingTextOverlayLayer {
             deform_tool_settings: TypingDeformToolSettings::default(),
             drag_state: None,
             drag_has_changes: false,
+            width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
             page_count: 0,
             page_image_paths: HashMap::new(),
