@@ -6,6 +6,8 @@ Compact canvas facade for page rendering, bubble editing, and clean-overlay pain
 
 Main types:
 - `CanvasUiStatus`: per-frame loading status for canvas overlays/hooks.
+- `CanvasHintRow` / `CanvasBottomHint`: per-tab content of the collapsible bottom-center
+  keyboard-shortcut hint overlay (label + key rows); `bottom_hint == None` hides it.
 - `CanvasFrameParams`: per-frame viewport/interaction flags shared by scene + viewport passes.
 - `CanvasScenePageFrame`: geometry snapshot for one page row within the scene pass.
 - `OverlayUploadBudget`: per-frame clean-overlay upload budget used to keep GUI responsive.
@@ -260,8 +262,9 @@ pub(crate) use self::types::ImageTextArea;
 
 pub use self::types::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleAction, BubbleClass, BubbleCopyPasteTarget,
-    BubbleMode, BubbleTextField, BubbleType, CanvasState, CanvasUiStatus, OnTopFocusMode,
-    OverlayRectPx, RectCoords, SourceTextureUploadBudget, TranslationStatusDisplay,
+    BubbleMode, BubbleTextField, BubbleType, CanvasBottomHint, CanvasHintRow, CanvasState,
+    CanvasUiStatus, OnTopFocusMode, OverlayRectPx, RectCoords, SourceTextureUploadBudget,
+    TranslationStatusDisplay,
 };
 
 const TEXT_UPSERT_DEBOUNCE_SECS: f64 = 1.0;
@@ -551,6 +554,12 @@ pub struct CanvasView {
     bubble_unicode_fonts_initialized: bool,
     pixel_sampling_nearest: bool,
     pixel_grid_visible: bool,
+    /// Per-frame content of the collapsible bottom-center keyboard-shortcut hint. Set by the
+    /// owning tab each frame via `set_bottom_hint`; `None` hides the hint entirely.
+    bottom_hint: Option<CanvasBottomHint>,
+    /// Live collapsed state of the bottom hint. Seeded once from `user_config` at tab construction
+    /// via `set_bottom_hint_collapsed`, then toggled only by the arrow button. `false` = expanded.
+    bottom_hint_collapsed: bool,
 }
 
 impl Default for CanvasView {
@@ -569,6 +578,8 @@ impl Default for CanvasView {
             bubble_unicode_fonts_initialized: false,
             pixel_sampling_nearest: false,
             pixel_grid_visible: false,
+            bottom_hint: None,
+            bottom_hint_collapsed: false,
         }
     }
 }
@@ -1213,6 +1224,9 @@ impl CanvasView {
         self.scene.page_world_rects.clear();
         self.scene.page_aside_widths.clear();
         self.scene.visible_scene_rect = None;
+        // Cleared here (after `handle_shortcuts` has consumed last frame's value for occlusion) and
+        // re-set by `draw_canvas_bottom_hint`; stays `None` when the tab supplies no hint.
+        self.scene.canvas_bottom_hint_rect = None;
         self.overlay_runtime
             .overlay_textures
             .retain(|idx, _| self.overlay_runtime.overlay_images.contains_key(idx));
@@ -1514,9 +1528,18 @@ impl CanvasView {
         let ctrl_or_command = mods.ctrl || mods.command;
         let zoom_modifier_down = ctrl_or_command || z_down;
         let pointer_pos = interact_pos.or(hover_pos);
+        // Occlude the bottom-hint overlay: a pointer over the collapsible hint (its rect from last
+        // frame, since the hint draws after this pass) must not count as "inside the canvas", so
+        // canvas zoom/drag input does not leak through the floating hint.
+        let over_bottom_hint = pointer_pos.is_some_and(|p| {
+            self.scene
+                .canvas_bottom_hint_rect
+                .is_some_and(|rect| rect.contains(p))
+        });
         let inside_canvas = pointer_pos
             .map(|p| canvas_rect.contains(p))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && !over_bottom_hint;
         if self.editable && !ctx.egui_wants_keyboard_input() {
             let command_shift_mods = egui::Modifiers {
                 command: true,
@@ -2351,6 +2374,29 @@ impl CanvasView {
 
     pub fn canvas_left_top_controls_rect(&self) -> Option<Rect> {
         self.scene.canvas_left_top_controls_rect
+    }
+
+    // The three bottom-hint API methods below are the public surface used by the per-tab wiring:
+    // the tab feeds content each frame, seeds the collapsed state from `user_config` at
+    // construction, and reads it back on exit for persistence (see `app.rs` on_exit).
+
+    /// Sets the bottom-hint content for the current frame. `None` hides the hint. Content only --
+    /// does not change collapsed state.
+    pub fn set_bottom_hint(&mut self, hint: Option<CanvasBottomHint>) {
+        self.bottom_hint = hint;
+    }
+
+    /// Seeds the collapsed state. Call ONCE at tab construction with the value loaded from
+    /// `user_config` (default `false` = expanded). Calling every frame would override the user's
+    /// toggle.
+    pub fn set_bottom_hint_collapsed(&mut self, collapsed: bool) {
+        self.bottom_hint_collapsed = collapsed;
+    }
+
+    /// Current collapsed state, for persisting to `user_config` on exit. `true` = collapsed.
+    #[must_use]
+    pub fn bottom_hint_collapsed(&self) -> bool {
+        self.bottom_hint_collapsed
     }
 
     fn rect_from_coords(image_rect: Rect, coords: RectCoords) -> Rect {

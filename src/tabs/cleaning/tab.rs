@@ -2,7 +2,8 @@
 FILE HEADER (tabs/cleaning/tab.rs)
 - Назначение: состояние вкладки Cleaning и координация `CanvasView` + активного cleaning-инструмента.
 - Ключевые поля `CleaningTabState`:
-  - `canvas`: холст с overlay-слоями клина.
+  - `canvas`: холст с overlay-слоями клина. The Cleaning tab has NO bottom-hint (the canvas
+    `bottom_hint` stays `None`, so the overlay is not drawn) and does not persist a collapsed flag.
   - `tools` / `active_tool_idx`: набор инструментов и выбранный инструмент.
   - `stroke_active` / `last_stroke_point`: состояние текущего штриха.
   - `panel_rects`: прямоугольники плавающих панелей (`остров` + `панель инструмента`) для фильтрации ввода.

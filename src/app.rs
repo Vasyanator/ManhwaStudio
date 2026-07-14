@@ -46,10 +46,12 @@ Profiling (optional, behind the `profiling` cargo feature):
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleTextField, BubbleType,
-    CanvasDrawParams, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, OnTopFocusMode,
-    SourceTextureUploadBudget, TranslationStatusDisplay, spawn_overlay_autosave_thread,
+    CanvasBottomHint, CanvasDrawParams, CanvasHintRow, CanvasUiStatus, CanvasView,
+    CanvasViewportSnapshot, OnTopFocusMode, SourceTextureUploadBudget, TranslationStatusDisplay,
+    spawn_overlay_autosave_thread,
 };
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, InputManagerV2};
+use serde_json::{Map, Value};
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, MemoryManager, MemoryPressure, classify_memory_pressure,
@@ -116,6 +118,14 @@ const HOTKEY_TRANSLATION_CREATE_BUBBLE: &str = "translation.bubble.create_at_cur
 const HOTKEY_CLEANING_ZOOM_IN: &str = "cleaning.canvas.zoom_in";
 const HOTKEY_CLEANING_ZOOM_OUT: &str = "cleaning.canvas.zoom_out";
 const HOTKEY_CLEANING_ZOOM_RESET: &str = "cleaning.canvas.zoom_reset";
+/// `user_config.json` section holding the per-tab canvas bottom-hint collapsed flags.
+const CANVAS_CONFIG_SECTION: &str = "Canvas";
+/// Config keys (under [`CANVAS_CONFIG_SECTION`]) for each canvas tab's bottom-hint collapsed state.
+/// Default (absent) is `false` = expanded. Written only on exit; seeded once at construction. Only
+/// Translation and Typing have a bottom-hint; Cleaning's hint is disabled and has no key. A stale
+/// `cleaning_hint_collapsed` may linger in an old config; it is never read or written.
+const CANVAS_TRANSLATION_HINT_COLLAPSED_KEY: &str = "translation_hint_collapsed";
+const CANVAS_TYPING_HINT_COLLAPSED_KEY: &str = "typing_hint_collapsed";
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const SOFT_PRESSURE_TARGET_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_PRESSURE_TARGET_FREE_BYTES: u64 = 768 * 1024 * 1024;
@@ -418,6 +428,12 @@ impl MangaApp {
         let memory_manager = Arc::new(MemoryManager::new(
             crate::config::memory_profile_from_user_settings(&user_settings),
         ));
+        // Per-tab canvas bottom-hint collapsed state, seeded once from `user_config` (absent =>
+        // expanded). Read back on exit and persisted via `on_exit`; not saved on every toggle.
+        let translation_hint_collapsed =
+            hint_collapsed_from_user_settings(&user_settings, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY);
+        let typing_hint_collapsed =
+            hint_collapsed_from_user_settings(&user_settings, CANVAS_TYPING_HINT_COLLAPSED_KEY);
         let cache_pages = project.canvas_settings.cache_pages;
         let cache_pages_on_initial_load =
             should_seed_page_cache_on_initial_load(cache_pages, memory_manager.budget());
@@ -500,6 +516,7 @@ impl MangaApp {
         canvas.state.cache_pages = cache_pages;
         canvas.state.translation_status_display =
             TranslationStatusDisplay::from_str(&project.canvas_settings.translation_status_display);
+        canvas.set_bottom_hint_collapsed(translation_hint_collapsed);
         let shared_canvas_settings = SharedCanvasSettings {
             bubble_type: BubbleMode::Hybrid.as_str().to_string(),
             editable_bubble_type: canvas
@@ -576,6 +593,7 @@ impl MangaApp {
         cleaning_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut typing_tab = TypingTabState::default();
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
+        typing_tab.set_hint_collapsed(typing_hint_collapsed);
         typing_tab.set_bubbles_model(Arc::clone(&bubbles_model));
         typing_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut ps_editor_tab = PsEditorTabState::default();
@@ -2463,6 +2481,9 @@ impl eframe::App for MangaApp {
         let _active_tab_draw_scope = puffin::profile_scope_custom!("active_tab_draw");
         match self.active_tab {
             AppTab::Translation => {
+                self.canvas.set_bottom_hint(Some(CanvasBottomHint {
+                    rows: build_translation_hint_rows(),
+                }));
                 self.translation_tab
                     .sync_with_project_settings(&self.project);
                 self.translation_tab
@@ -2500,6 +2521,8 @@ impl eframe::App for MangaApp {
                 });
             }
             AppTab::Cleaning => {
+                // The Cleaning tab has no bottom-hint: its canvas `bottom_hint` stays `None`, so
+                // `draw_canvas_bottom_hint` early-returns and nothing is drawn.
                 let status = CanvasUiStatus {
                     loaded_pages: self.loaded_pages_count(),
                     total_pages: self.project.pages.len(),
@@ -2514,6 +2537,9 @@ impl eframe::App for MangaApp {
                 });
             }
             AppTab::Typing => {
+                self.typing_tab.set_bottom_hint(Some(CanvasBottomHint {
+                    rows: build_typing_hint_rows(),
+                }));
                 let status = CanvasUiStatus {
                     loaded_pages: self.loaded_pages_count(),
                     total_pages: self.project.pages.len(),
@@ -2648,6 +2674,13 @@ impl eframe::App for MangaApp {
             runtime_log::log_error("[app] on_exit: shared doc lock poisoned, saver not joined");
         }
         runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
+
+        // 3) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
+        // `on_exit` fires on both program close and return-to-launcher, so this is the one save point.
+        persist_canvas_hint_collapsed_state(
+            self.canvas.bottom_hint_collapsed(),
+            self.typing_tab.hint_collapsed(),
+        );
     }
 }
 
@@ -2718,6 +2751,187 @@ const fn pressure_target_free_bytes(pressure: MemoryPressure) -> u64 {
         MemoryPressure::Soft => SOFT_PRESSURE_TARGET_FREE_BYTES,
         MemoryPressure::Hard => HARD_PRESSURE_TARGET_FREE_BYTES,
         MemoryPressure::Critical => u64::MAX,
+    }
+}
+
+/// Reads a per-tab canvas bottom-hint collapsed flag from the merged startup `user_settings`.
+///
+/// Looks up `Canvas.<key>` and returns its boolean value; a missing section, key, or non-boolean
+/// value yields `false` (expanded), matching the persistence default.
+#[must_use]
+fn hint_collapsed_from_user_settings(user_settings: &Value, key: &str) -> bool {
+    user_settings
+        .get(CANVAS_CONFIG_SECTION)
+        .and_then(Value::as_object)
+        .and_then(|canvas| canvas.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Builds the fixed, hand-authored Translation-tab bottom-hint rows.
+///
+/// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
+/// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
+/// canonical and must match the documented Translation shortcut set.
+#[must_use]
+fn build_translation_hint_rows() -> Vec<CanvasHintRow> {
+    vec![
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.create_bubble_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.create_bubble_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.create_bubble_recent_char_label")
+                .to_string(),
+            keys: t!("canvas.bottom_hint.translation.create_bubble_recent_char_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.ocr_bubble_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.ocr_bubble_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.advanced_ocr_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.advanced_ocr_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.create_image_bubble_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.create_image_bubble_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.create_image_bubble_crop_label")
+                .to_string(),
+            keys: t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.translation.delete_bubble_label").to_string(),
+            keys: t!("canvas.bottom_hint.translation.delete_bubble_keys").to_string(),
+        },
+    ]
+}
+
+/// Builds the fixed, hand-authored Typing-tab bottom-hint rows.
+///
+/// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
+/// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
+/// canonical and must match the documented Typing shortcut set.
+#[must_use]
+fn build_typing_hint_rows() -> Vec<CanvasHintRow> {
+    vec![
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.typing.select_text_area_label").to_string(),
+            keys: t!("canvas.bottom_hint.typing.select_text_area_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.typing.quick_font_size_label").to_string(),
+            keys: t!("canvas.bottom_hint.typing.quick_font_size_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.typing.rotate_label").to_string(),
+            keys: t!("canvas.bottom_hint.typing.rotate_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.typing.scale_label").to_string(),
+            keys: t!("canvas.bottom_hint.typing.scale_keys").to_string(),
+        },
+        CanvasHintRow {
+            label: t!("canvas.bottom_hint.typing.nudge_label").to_string(),
+            keys: t!("canvas.bottom_hint.typing.nudge_keys").to_string(),
+        },
+    ]
+}
+
+/// Inserts the per-tab canvas bottom-hint collapsed flags (Translation, Typing) into a
+/// `user_config.json` root value, creating the `Canvas` object if absent and preserving all other
+/// keys. Cleaning has no bottom-hint, so no cleaning flag is written; any stale
+/// `cleaning_hint_collapsed` key is left untouched.
+///
+/// Pure and side-effect-free (the disk write is done by the caller under the config write lock), so
+/// the read-modify-merge contract is unit-testable without touching the filesystem. A non-object
+/// `root` is replaced with a fresh object so the flags are never silently dropped.
+fn apply_hint_collapsed_to_config_root(root: &mut Value, translation: bool, typing: bool) {
+    if !root.is_object() {
+        *root = Value::Object(Map::new());
+    }
+    let Some(root_obj) = root.as_object_mut() else {
+        return;
+    };
+    let mut canvas_obj = root_obj
+        .get(CANVAS_CONFIG_SECTION)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    canvas_obj.insert(
+        CANVAS_TRANSLATION_HINT_COLLAPSED_KEY.to_string(),
+        Value::Bool(translation),
+    );
+    canvas_obj.insert(
+        CANVAS_TYPING_HINT_COLLAPSED_KEY.to_string(),
+        Value::Bool(typing),
+    );
+    root_obj.insert(
+        CANVAS_CONFIG_SECTION.to_string(),
+        Value::Object(canvas_obj),
+    );
+}
+
+/// Persists the per-tab canvas bottom-hint collapsed flags (Translation, Typing) to
+/// `user_config.json`.
+///
+/// Called once from [`MangaApp::on_exit`]. Serialized with all other `user_config.json` writers via
+/// [`crate::config::lock_user_config_write`] and done as a single read-modify-write so unrelated keys
+/// survive. Teardown-only: on any read/parse/write failure it logs and returns without panicking, so
+/// a failed write never blocks shutdown.
+fn persist_canvas_hint_collapsed_state(translation: bool, typing: bool) {
+    let _guard = crate::config::lock_user_config_write();
+    let path = crate::config::user_config_path();
+    let mut root = if path.exists() {
+        match fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|err| {
+                runtime_log::log_warn(format!(
+                    "[app::canvas_hint] user_config.json is not valid JSON, rewriting from empty; path={}; cause={err}",
+                    path.display()
+                ));
+                Value::Object(Map::new())
+            }),
+            Err(err) => {
+                runtime_log::log_warn(format!(
+                    "[app::canvas_hint] failed to read user_config.json, rewriting from empty; path={}; cause={err}",
+                    path.display()
+                ));
+                Value::Object(Map::new())
+            }
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+    apply_hint_collapsed_to_config_root(&mut root, translation, typing);
+    let payload = match serde_json::to_string_pretty(&root) {
+        Ok(payload) => payload,
+        Err(err) => {
+            runtime_log::log_error(format!(
+                "[app::canvas_hint] failed to serialize user_config.json canvas hint state; cause={err}"
+            ));
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        runtime_log::log_error(format!(
+            "[app::canvas_hint] failed to create user_config.json parent dir; path={}; cause={err}",
+            parent.display()
+        ));
+        return;
+    }
+    if let Err(err) = fs::write(&path, payload) {
+        runtime_log::log_error(format!(
+            "[app::canvas_hint] failed to write user_config.json canvas hint state; path={}; cause={err}",
+            path.display()
+        ));
     }
 }
 
@@ -3391,11 +3605,93 @@ fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODE_AHEAD_WINDOW, SaveGateDecision, ai_backend_version_warning_message,
-        decode_idx_within_window, deferred_save_ready, save_trigger_decision,
-        should_seed_page_cache_on_initial_load,
+        CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
+        CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, SaveGateDecision,
+        ai_backend_version_warning_message, apply_hint_collapsed_to_config_root,
+        decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
+        save_trigger_decision, should_seed_page_cache_on_initial_load,
     };
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn apply_hint_collapsed_writes_two_flags_and_preserves_other_keys() {
+        // A pre-existing config with an unrelated Canvas key, a stale cleaning-hint key, and an
+        // unrelated section must all survive; only Translation + Typing flags are (re)written.
+        let mut root = json!({
+            "Canvas": { "cache_pages": true, "cleaning_hint_collapsed": true },
+            "General": { "memory_profile": "Medium" }
+        });
+        apply_hint_collapsed_to_config_root(&mut root, true, true);
+
+        let canvas = root
+            .get(CANVAS_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .expect("Canvas section present");
+        assert_eq!(
+            canvas.get(CANVAS_TRANSLATION_HINT_COLLAPSED_KEY),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            canvas.get(CANVAS_TYPING_HINT_COLLAPSED_KEY),
+            Some(&Value::Bool(true))
+        );
+        // Cleaning has no bottom-hint: no cleaning flag is written by us, but a stale one is left
+        // untouched (no migration).
+        assert_eq!(
+            canvas.get("cleaning_hint_collapsed"),
+            Some(&Value::Bool(true))
+        );
+        // Unrelated Canvas key and unrelated section untouched.
+        assert_eq!(canvas.get("cache_pages"), Some(&Value::Bool(true)));
+        assert_eq!(
+            root.get("General")
+                .and_then(Value::as_object)
+                .and_then(|g| g.get("memory_profile")),
+            Some(&Value::String("Medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn apply_hint_collapsed_replaces_non_object_root_and_creates_canvas() {
+        // A corrupt (non-object) root is replaced with a fresh object; flags are never dropped.
+        let mut root = Value::String("not an object".to_string());
+        apply_hint_collapsed_to_config_root(&mut root, false, true);
+        let canvas = root
+            .get(CANVAS_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .expect("Canvas section created");
+        assert_eq!(
+            canvas.get(CANVAS_TRANSLATION_HINT_COLLAPSED_KEY),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            canvas.get(CANVAS_TYPING_HINT_COLLAPSED_KEY),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn hint_collapsed_defaults_to_false_when_absent_or_malformed() {
+        // Missing section, missing key, and non-boolean value all yield the expanded default.
+        assert!(!hint_collapsed_from_user_settings(
+            &json!({}),
+            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
+        ));
+        assert!(!hint_collapsed_from_user_settings(
+            &json!({ "Canvas": {} }),
+            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
+        ));
+        assert!(!hint_collapsed_from_user_settings(
+            &json!({ "Canvas": { "translation_hint_collapsed": "yes" } }),
+            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
+        ));
+        // A present true value round-trips.
+        assert!(hint_collapsed_from_user_settings(
+            &json!({ "Canvas": { "typing_hint_collapsed": true } }),
+            CANVAS_TYPING_HINT_COLLAPSED_KEY
+        ));
+    }
 
     #[test]
     fn save_trigger_defers_until_all_pages_loaded_then_saves() {

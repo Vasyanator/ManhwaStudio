@@ -12,7 +12,10 @@ FILE HEADER (tabs/typing/tab.rs)
   `pub(super)` (или `pub(in crate::tabs::typing)`, если их зовёт typing-сосед вроде `panel.rs`).
   Ниже описан общий контракт вкладки; конкретные реализации ищите в подмодулях каталога `tab/`.
 - Ключевые поля `TypingTabState`:
-  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`).
+  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). Bottom-hint
+    forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `app.rs` seed the
+    collapsed flag from `user_config` at construction, read it back on exit, and push per-frame hint
+    content.
   - `text_overlays`: слой PNG-оверлеев (`text` + `image`) с загрузкой из `text_images/text_info.json`,
     декодирование в фоне, дозированная загрузка текстур в GUI-потоке, выбор, drag,
     загрузка/редактирование сохраняемой `deform_mesh` как общей high-res surface
@@ -93,8 +96,8 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
 use crate::canvas::{
-    CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords,
-    SourceTextureUploadBudget, parse_image_text_areas,
+    CanvasBottomHint, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
+    CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget, parse_image_text_areas,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -418,6 +421,23 @@ impl TypingTabState {
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
         self.canvas.set_scroll_area_id_salt(id_salt);
+    }
+
+    /// Seeds the canvas bottom-hint collapsed state ONCE at construction from `user_config`.
+    /// `false` = expanded (default). Must not be called every frame (would override the user toggle).
+    pub fn set_hint_collapsed(&mut self, collapsed: bool) {
+        self.canvas.set_bottom_hint_collapsed(collapsed);
+    }
+
+    /// Current canvas bottom-hint collapsed state, read on exit to persist to `user_config`.
+    #[must_use]
+    pub fn hint_collapsed(&self) -> bool {
+        self.canvas.bottom_hint_collapsed()
+    }
+
+    /// Sets this tab's canvas bottom-hint content for the current frame; `None` hides it.
+    pub fn set_bottom_hint(&mut self, hint: Option<CanvasBottomHint>) {
+        self.canvas.set_bottom_hint(hint);
     }
 
     pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {

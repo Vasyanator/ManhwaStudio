@@ -38,6 +38,36 @@ its own anchor side. Drag routing (`AsideDragTarget`): a row block moves only it
 outside blocks, or empty space inside the red rect, moves the red rect (areas + anchors follow); an
 area rect on the page moves that area; an anchor point moves only inside its own area.
 
+The canvas owns a collapsible bottom-center keyboard-shortcut hint overlay, drawn centrally in
+`scene.rs::draw_canvas_bottom_hint` right after the floating controls. Content is opt-in per tab:
+the owning tab pushes `Option<CanvasBottomHint>` (label + key rows) every frame via
+`set_bottom_hint`, and `None` hides it. Rows are FIXED, hand-authored, localized pairs (built in
+`app.rs::build_translation_hint_rows` / `build_typing_hint_rows` from `canvas.bottom_hint.*` `t!`
+keys), NOT derived from the hotkey registry; rebuilding them per frame re-localizes on a runtime
+language switch. Only Translation and Typing set a hint; the Cleaning tab leaves `bottom_hint` at
+`None`, so the overlay is not drawn there. The overlay is bottom-pinned just above the horizontal
+scrollbar (or the inner viewport bottom when no bar is drawn) and never overlaps the bar. Collapsed
+shows only an up-arrow toggle; expanded slides a popup panel up with the arrow riding above it.
+`bottom_hint_collapsed` is the live user toggle: seeded once from `user_config` via
+`set_bottom_hint_collapsed` at tab construction (default expanded) and read back with
+`bottom_hint_collapsed()` for persistence — persisted only for Translation and Typing (Cleaning has
+no hint). Per-tab content and config persistence live in the tabs, not here.
+`scene.canvas_bottom_hint_rect` (last-frame rect) occludes canvas zoom/drag input under the hint.
+
+The top-left canvas controls panel (`scene.rs::draw_canvas_controls`) is a movable, collapsible
+auto-sized `Area`. Its zoom row also carries the canvas-shortcuts hover chip
+(`canvas.shortcuts_hint.*`), right-aligned via `egui::containers::Sides` in
+`draw_zoom_and_shortcuts_row`; the chip lists the canvas-intrinsic navigation keys (zoom/pan/scroll)
+and is hover-only, so it has no click and no persisted state. Layout invariant: `Sides` (like a bare
+`right_to_left` layout) expands to the parent's full available width, which inside an auto-sized
+`Area` is the whole screen and would stretch the panel. So the chip row is allocated to exactly
+`scene.controls_content_width` — the panel's natural width, measured each frame from the rows that do
+NOT contain the chip (header, checkbox, opacity slider). That exclusion is required: measuring the
+stretched chip row would feed its width back in and grow the panel by one item-spacing per frame,
+and re-measuring the chip-free rows every frame is what lets the panel shrink again under a shorter
+locale. When adding a row to this panel, fold its width into `natural_width` unless it is
+chip-stretched.
+
 Clean overlays enter through `CleanOverlaysModel`. Normal canvas visibility uses the
 model's shared visibility flag. A canvas may also set a local clean-overlay visibility
 override for UI-only cases such as the typing tab; local overrides must not mutate the
