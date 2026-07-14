@@ -732,6 +732,27 @@ reserved ids for later phases (`docs/tutorial-plan.md`).
 
 ---
 
+## Verifying UI changes (egui MCP)
+
+The `/egui-mcp` skill can drive the live app (click, type, screenshot). Do **not** reach for it
+on your own initiative: launching the app hijacks a real window on the user's desktop, a session
+of blind clicking is slow and easily lands in the wrong project/page, and an agent cannot tell
+"looks right" from "is right" for this product's UI.
+
+Default contract for a UI change:
+
+1. Finish the change, build it, and describe **what** should now be visible/clickable and **where**.
+2. **Ask the user to test it in the running app** — state the exact steps and the expected result,
+   so the answer is a yes/no, not an investigation.
+3. Drive the app over egui MCP only when the user explicitly asks for it ("проверь сам",
+   "погоняй через MCP", "сделай скриншот"), or when they hand back a reproduction that
+   needs an interactive bisect and they agreed to the app being taken over.
+
+The user's report is the source of truth for UI behavior. Do not claim a UI fix is verified
+because a screenshot looked plausible.
+
+---
+
 ## Что важно не ломать
 
 - **GUI-поток** — никакого I/O, декодирования изображений, сети, длительных вычислений.
