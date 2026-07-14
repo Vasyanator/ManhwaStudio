@@ -75,7 +75,42 @@ Do NOT enter this mode when:
 
 In those cases, do the work directly.
 
-### 2.2 Research vs. Implementation
+### 2.2 Sub-Agent Model Selection
+
+Two agent pools are available. Built-in sub-agents (the Agent tool) run on Anthropic
+models: **Fable** (the session model, most capable and most expensive) and **Opus**
+(pass `model: "opus"`, cheaper). External sub-agents run through the codex CLI:
+**Sol** (`gpt-5.6-sol`) and **Terra** (`gpt-5.6-terra`). Codex may be UNAVAILABLE
+(CLI missing, no auth, session limits) — always smoke-test it before relying on it
+(`codex -m gpt-5.6-sol exec --sandbox read-only "Reply OK"`); when it is unavailable,
+run everything on the built-in pool and note that in the report.
+
+Who is good at what (observed on real rotated task classes in this repo):
+
+| Model | Best at | Use for | Watch out for |
+|---|---|---|---|
+| **Fable** (built-in) | Hardest design work: fixes requiring new invariants (undo invalidation, generation tombstones), systematic reviews that RUN tests and verify claims, clean first-pass implementations | The most complex task of a round: subtle concurrency fixes, integration reviews, anything where a wrong design is expensive. It is the most expensive model — do not spend it on routine work | Can stall on long reads (watchdog); resume it with a message. Delegate large files in chunks |
+| **Opus** (built-in) | Standard implementation, exploration, routine reviews at lower cost | Default workhorse when Fable is overkill and codex is unavailable or busy: scoped features, explorer/worker roles, mechanical refactors | Less depth on cross-subsystem invariants than Fable — pair with a strong reviewer |
+| **Sol** (codex) | Adversarial review of low-level protocols (crash-safety, journals, filesystem atomicity, concurrency races); disciplined verify-then-fix passes; accurate GUI-free layers | Reviewing anything transactional or lock-heavy; applying confirmed review findings without scope creep; small precise engine modules | Sandbox blocks socket binds and read-only blocks cargo — its "environmental" test-failure claims must be re-verified outside the sandbox |
+| **Terra** (codex) | High-volume implementation against a detailed written spec (integrations, UI panels) — fast and complete | Big scoped implementation tasks where the spec already pins the design | Repeatedly misses cross-subsystem races (gate holes on frame boundaries, writer lifecycles). ALWAYS have Sol or Fable review its work before merge |
+
+Rules for codex sub-agents:
+
+* Invoke non-interactively: `codex -m <model> exec --sandbox <read-only|workspace-write>
+  --skip-git-repo-check -o <result-file> - < <prompt-file>`. Reviews get `read-only`,
+  implementation gets `workspace-write`.
+* Every codex prompt MUST state: it is a sub-agent, must not spawn agents or assume it
+  is the main agent; must never run `cargo fmt`/`rustfmt`; must not `git commit`.
+* Codex sandboxes cannot bind sockets (backend IPC tests fail there) and read-only
+  cannot run cargo at all. Re-run the full test suite yourself before trusting a
+  codex "all green except environmental failures" claim, and check its diff for mass
+  reformatting before accepting it.
+* Rotation habit that pays off: cross-review between pools (codex reviews built-in
+  work and vice versa) — each pool reliably finds real bug classes the other missed.
+* Parallel agents in one worktree: give each a disjoint file scope in the prompt and
+  name the files the OTHER agent owns; sequence tasks that share `src/app.rs` hotspots.
+
+### 2.3 Research vs. Implementation
 
 For bug/issue requests, the user's verb selects the mode:
 
