@@ -11,6 +11,7 @@ Main responsibilities:
 
 Key structures:
 - CanvasUiStatus
+- CanvasHintRow / CanvasBottomHint
 - SourceTextureUploadBudget
 - BubbleAction / BubbleClass / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
 - RectCoords
@@ -39,6 +40,21 @@ pub struct CanvasUiStatus {
     pub loaded_pages: usize,
     pub total_pages: usize,
     pub load_errors_count: usize,
+}
+
+/// One row of the canvas bottom hint: a localized action label and its key combination.
+/// `keys` may be empty for a plain full-width informational line.
+#[derive(Debug, Clone)]
+pub struct CanvasHintRow {
+    pub label: String,
+    pub keys: String,
+}
+
+/// Per-tab content of the collapsible bottom hint overlay.
+/// `CanvasView.bottom_hint == None` hides the hint entirely for that tab.
+#[derive(Debug, Clone, Default)]
+pub struct CanvasBottomHint {
+    pub rows: Vec<CanvasHintRow>,
 }
 
 #[derive(Debug, Clone, Copy)]

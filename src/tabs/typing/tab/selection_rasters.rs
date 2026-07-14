@@ -35,6 +35,7 @@ impl TypingTextOverlayLayer {
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
         self.drag_has_changes = false;
+        self.width_resize_drag = None;
         self.shape_variant_preview = None;
         self.selected_raster_idx = None;
         self.selected_raster_page = None;
@@ -66,6 +67,7 @@ impl TypingTextOverlayLayer {
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
         self.drag_has_changes = false;
+        self.width_resize_drag = None;
         self.shape_variant_preview = None;
     }
 
@@ -471,6 +473,47 @@ impl TypingTextOverlayLayer {
         // itself, so we return `true` even if it reports a failure (no double raster rotation).
         self.dispatch_vector_rerender(overlay_idx, render_data, ctx);
         true
+    }
+
+    /// Sets the selected TEXT overlay's configured `width_px` (source px) to `new_width_px`, clamped to
+    /// [`TEXT_OVERLAY_WIDTH_MIN_PX`, `TEXT_OVERLAY_WIDTH_MAX_PX`] (mirrors the edit-panel width slider),
+    /// and dispatches the latest-wins background re-render via `dispatch_vector_rerender` (which re-wraps
+    /// the text, writes the render_data back onto the overlay so the edit panel re-syncs, and requests a
+    /// placement save). Used by the on-canvas width-guide drag handle.
+    ///
+    /// Returns `true` when the width changed and a re-render was dispatched, `false` when the overlay has
+    /// no usable `render_data`/`text_params` or the width was already at the requested value.
+    pub(super) fn resize_selected_overlay_width(
+        &mut self,
+        overlay_idx: usize,
+        new_width_px: u32,
+        ctx: &egui::Context,
+    ) -> bool {
+        let clamped = new_width_px.clamp(TEXT_OVERLAY_WIDTH_MIN_PX, TEXT_OVERLAY_WIDTH_MAX_PX);
+        let Some(mut render_data) = self
+            .overlays
+            .get(overlay_idx)
+            .and_then(|overlay| overlay.render_data_json.clone())
+        else {
+            return false;
+        };
+        let Some(text_params) = render_data
+            .get_mut("text_params")
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        // Read the current width the same way `codec.rs` does (absent -> None) to skip a redundant
+        // re-render once the drag pins the value at a clamp bound.
+        let current = text_params
+            .get("width_px")
+            .and_then(value_as_f32)
+            .map(|width| width.round().max(1.0) as u32);
+        if current == Some(clamped) {
+            return false;
+        }
+        text_params.insert("width_px".to_string(), json!(clamped));
+        self.dispatch_vector_rerender(overlay_idx, render_data, ctx)
     }
 
     pub(super) fn try_scale_selected_overlay_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {

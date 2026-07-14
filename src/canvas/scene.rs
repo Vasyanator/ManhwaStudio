@@ -25,6 +25,7 @@ Key functions:
 - CanvasView::handle_canvas_page_interactions()
 - CanvasView::draw_canvas_viewport_ui()
 - CanvasView::draw_canvas_controls()
+- CanvasView::draw_canvas_bottom_hint()
 - Canvas viewport controls here stay lightweight; advanced ribbon settings live in the
   Settings tab and are synchronized through shared canvas snapshots.
 
@@ -42,7 +43,8 @@ use super::types::{
 };
 use super::view_transform::DVec2;
 use super::{
-    BubbleCopyPasteTarget, CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode, ViewTransform,
+    BubbleCopyPasteTarget, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode,
+    ViewTransform,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::project::ProjectData;
@@ -86,6 +88,21 @@ pub(super) struct CanvasSceneState {
     pub(super) pending_scroll_offset: Option<Vec2>,
     pub(super) on_top_hit_rects: HashMap<i64, Rect>,
     pub(super) canvas_left_top_controls_rect: Option<Rect>,
+    /// Natural content width (points) of the controls panel, measured last frame from the rows that
+    /// do NOT contain the shortcuts chip (header, checkbox, opacity slider). The chip row is
+    /// stretched to this width to right-align the chip, so it must be excluded from the measurement:
+    /// including it would feed the stretched width back in and inflate the panel by one item-spacing
+    /// every frame. Re-measured each frame, so the panel also shrinks again when a shorter locale
+    /// narrows those rows. `None` until the panel has been laid out expanded at least once.
+    pub(super) controls_content_width: Option<f32>,
+    /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn last frame, or
+    /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
+    /// the hint. Reset each frame with the other per-frame scene rects.
+    pub(super) canvas_bottom_hint_rect: Option<Rect>,
+    /// Fully-expanded size of the bottom-hint body measured on the last frame it was drawn at full
+    /// reveal. Drives the height-clip reveal animation so the panel grows/shrinks from the bottom
+    /// with the arrow riding upward. `None` until the body has been measured at least once.
+    pub(super) bottom_hint_body_size: Option<Vec2>,
     /// World<->screen transform established once per frame from the first laid-out
     /// page's `ScrollArea` geometry and then used to derive every page's authoritative
     /// screen `image_rect`. The `ScrollArea` still allocates/scrolls; this only maps
@@ -154,6 +171,9 @@ impl Default for CanvasSceneState {
             pending_scroll_offset: None,
             on_top_hit_rects: HashMap::new(),
             canvas_left_top_controls_rect: None,
+            controls_content_width: None,
+            canvas_bottom_hint_rect: None,
+            bottom_hint_body_size: None,
             view: ViewTransform::default(),
             view_established_this_frame: false,
             view_drift_warned: false,
@@ -1288,7 +1308,12 @@ impl CanvasView {
         frame: CanvasFrameParams,
         hooks: &mut dyn CanvasHooks,
     ) {
+        // Draws the controls panel; the canvas-shortcuts hover chip is rendered inline on its zoom
+        // row (see `draw_canvas_shortcuts_chip`), not as a separate floating box.
         self.draw_canvas_controls(ctx, frame.canvas_rect, project.pages.len());
+        // Drawn right after the controls: the horizontal scrollbar rect is already cached (see
+        // `cache_scrollbar_rects`), so the hint can anchor its bottom just above the bar.
+        self.draw_canvas_bottom_hint(ctx, &frame);
         hooks.draw_canvas_overlay_top_left(ctx, frame.canvas_rect, self, project, status);
     }
 
@@ -1306,6 +1331,11 @@ impl CanvasView {
         let page_text = format!("{} / {}", cur_page, total_pages.max(1));
         let zoom_text = format!("{:.1}×", self.state.zoom);
 
+        // Width the shortcuts chip is right-aligned against: the panel's natural content width as
+        // measured last frame from the rows WITHOUT the chip. See `controls_content_width`.
+        let target_width = self.scene.controls_content_width;
+        // Max width of this frame's chip-free rows, accumulated below.
+        let mut natural_width: f32 = 0.0;
         let controls_area = egui::Area::new("canvas_left_top_controls".into())
             .movable(true)
             .default_pos(canvas_rect.left_top() + egui::vec2(12.0, 12.0))
@@ -1321,7 +1351,7 @@ impl CanvasView {
                     } else {
                         "▼"
                     };
-                    ui.horizontal(|ui| {
+                    let header = ui.horizontal(|ui| {
                         if ui
                             .small_button(toggle_icon)
                             .on_hover_text(toggle_hint)
@@ -1332,20 +1362,224 @@ impl CanvasView {
                         }
                         ui.label(&page_text);
                     });
+                    natural_width = natural_width.max(header.response.rect.width());
                     if self.state.controls_panel_collapsed {
                         return;
                     }
                     ui.add_space(2.0);
-                    ui.label(zoom_text);
+                    Self::draw_zoom_and_shortcuts_row(ui, &zoom_text, target_width);
                     ui.add_space(4.0);
-                    ui.checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
-                    ui.add(
+                    let show_bubbles = ui
+                        .checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
+                    natural_width = natural_width.max(show_bubbles.rect.width());
+                    let opacity = ui.add(
                         WheelSlider::new(&mut self.state.bubble_opacity, 0.0..=1.0)
                             .text(t!("canvas.controls.bubble_opacity")),
                     );
+                    natural_width = natural_width.max(opacity.rect.width());
                 });
             });
         self.scene.canvas_left_top_controls_rect = Some(controls_area.response.rect);
+        // Collapsed, the width-defining rows are not laid out, so keep the last expanded value for
+        // when the panel opens again rather than collapsing the target to the header's width.
+        if !self.state.controls_panel_collapsed {
+            self.scene.controls_content_width = Some(natural_width);
+        }
+    }
+
+    /// Draws the zoom label with the canvas-shortcuts hover chip right-aligned on the same row.
+    ///
+    /// `target_width` is the panel's natural content width (measured from the chip-free rows). The
+    /// row is allocated exactly that wide so `Sides` right-aligns the chip to the panel's right
+    /// edge: `Sides` (like a bare `right_to_left` layout) otherwise expands to the parent's full
+    /// available width, which in the auto-sized `Area` is the whole screen and would stretch the
+    /// panel. `None` — the first expanded frame, before any measurement — falls back to the
+    /// natural, unstretched layout; the width captured that frame fixes the alignment on the next.
+    fn draw_zoom_and_shortcuts_row(ui: &mut egui::Ui, zoom_text: &str, target_width: Option<f32>) {
+        let sides = egui::containers::Sides::new();
+        let add_zoom = |ui: &mut egui::Ui| {
+            ui.label(zoom_text);
+        };
+        match target_width {
+            Some(width) => {
+                let height = ui.spacing().interact_size.y;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, height),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| sides.show(ui, add_zoom, Self::draw_canvas_shortcuts_chip),
+                );
+            }
+            None => {
+                sides.show(ui, add_zoom, Self::draw_canvas_shortcuts_chip);
+            }
+        }
+    }
+
+    /// Draws the collapsible bottom-center keyboard-shortcut hint for the current frame.
+    ///
+    /// Does nothing when the owning tab supplied no hint (`bottom_hint == None`). The hint is
+    /// bottom-pinned just above the horizontal scrollbar (or the inner viewport bottom when no bar
+    /// is drawn) and never overlaps the bar. Collapsed shows only an up-arrow toggle; expanded
+    /// slides a popup panel up from the anchor line with the arrow riding above it. Clicking the
+    /// arrow toggles `bottom_hint_collapsed`; the reveal is animated via `animate_bool_responsive`.
+    /// Stores the drawn rect in `scene.canvas_bottom_hint_rect` for input occlusion.
+    pub(super) fn draw_canvas_bottom_hint(&mut self, ctx: &egui::Context, frame: &CanvasFrameParams) {
+        // Gap in logical points between the hint's bottom edge and the scrollbar / viewport bottom.
+        const GAP: f32 = 6.0;
+
+        let Some(hint) = self.bottom_hint.as_ref() else {
+            return;
+        };
+        let rows = hint.rows.clone();
+
+        // Bottom edge sits just above the horizontal scrollbar when present, else just above the
+        // inner viewport bottom; both are last-frame geometry cached before this pass runs.
+        let bottom_ref = self
+            .scene
+            .scroll_horizontal_bar_rect
+            .map(|r| r.top())
+            .or_else(|| self.scene.scroll_inner_rect.map(|r| r.bottom()))
+            .unwrap_or(frame.canvas_rect.bottom());
+        let anchor_y = bottom_ref - GAP;
+        let center_x = frame.canvas_rect.center().x;
+
+        let mut collapsed = self.bottom_hint_collapsed;
+        let expanded = !collapsed;
+        let reveal =
+            ctx.animate_bool_responsive(egui::Id::new("canvas_bottom_hint_reveal"), expanded);
+        let cached_size = self.scene.bottom_hint_body_size;
+        // Body size measured this frame at (near-)full reveal, written back after the Area closes.
+        let mut measured_body_size: Option<Vec2> = None;
+
+        let area = egui::Area::new(egui::Id::new("canvas_bottom_hint"))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .fixed_pos(egui::pos2(center_x, anchor_y))
+            .order(egui::Order::Middle)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    // Arrow toggle sits above the body (top-down layout), so with the CENTER_BOTTOM
+                    // pivot the body's bottom stays at `anchor_y` and the arrow rides upward.
+                    let (icon, tooltip) = if collapsed {
+                        ("\u{25B2}", t!("canvas.bottom_hint.expand_tooltip"))
+                    } else {
+                        ("\u{25BC}", t!("canvas.bottom_hint.collapse_tooltip"))
+                    };
+                    if ui.small_button(icon).on_hover_text(tooltip).clicked() {
+                        collapsed = !collapsed;
+                    }
+
+                    if reveal <= 0.001 {
+                        return;
+                    }
+                    ui.add_space(2.0);
+                    // Only clip to a partial bottom slice while mid-animation AND a full size has
+                    // already been measured; otherwise draw the body at its natural size and record
+                    // the size for the next animation.
+                    let partial = if reveal < 0.999 { cached_size } else { None };
+                    if let Some(full) = partial {
+                        // Reserve a growing bottom slice and draw the full body clipped to it,
+                        // bottom-aligned, so the panel slides up from behind the anchor line.
+                        let revealed_h = (full.y * reveal).max(0.0);
+                        let (slot, _resp) =
+                            ui.allocate_exact_size(egui::vec2(full.x, revealed_h), Sense::hover());
+                        let body_rect =
+                            Rect::from_min_size(egui::pos2(slot.left(), slot.bottom() - full.y), full);
+                        let mut body_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(body_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Center)),
+                        );
+                        body_ui.set_clip_rect(slot);
+                        Self::draw_bottom_hint_body(&mut body_ui, &rows);
+                    } else {
+                        let size = Self::draw_bottom_hint_body(ui, &rows).rect.size();
+                        measured_body_size = Some(size);
+                    }
+                });
+            });
+
+        if let Some(size) = measured_body_size {
+            self.scene.bottom_hint_body_size = Some(size);
+        }
+        self.bottom_hint_collapsed = collapsed;
+        self.scene.canvas_bottom_hint_rect = Some(area.response.rect);
+    }
+
+    /// Renders the bottom-hint popup body (title + shortcut rows) into `ui` and returns its frame
+    /// response. Each row shows its label left and monospaced `keys` right; a row with empty `keys`
+    /// renders as a full-width informational line. Stateless: no `self` access.
+    fn draw_bottom_hint_body(ui: &mut egui::Ui, rows: &[CanvasHintRow]) -> egui::Response {
+        egui::Frame::popup(ui.style())
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(t!("canvas.bottom_hint.title")).strong());
+                ui.add_space(2.0);
+                Self::draw_hint_rows_grid(ui, "canvas_bottom_hint_grid", rows);
+            })
+            .response
+    }
+
+    /// Renders shortcut rows as a two-column grid: `label` left, monospaced `keys` right. A row with
+    /// empty `keys` renders as a full-width label. `grid_id` must be unique per live call site.
+    fn draw_hint_rows_grid(ui: &mut egui::Ui, grid_id: &str, rows: &[CanvasHintRow]) {
+        egui::Grid::new(grid_id)
+            .num_columns(2)
+            .spacing(egui::vec2(16.0, 2.0))
+            .show(ui, |ui| {
+                for row in rows {
+                    ui.label(&row.label);
+                    if !row.keys.is_empty() {
+                        ui.monospace(&row.keys);
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Fixed, localized list of the canvas's own navigation shortcuts (zoom, pan, scroll) shown by
+    /// the canvas-shortcuts hover chip. These are canvas-intrinsic behaviours, identical across all
+    /// tabs; rebuilt each call so a runtime language switch is reflected.
+    fn canvas_shortcut_rows() -> Vec<CanvasHintRow> {
+        vec![
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.zoom_cursor_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.zoom_cursor_keys").to_string(),
+            },
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.zoom_in_out_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.zoom_in_out_keys").to_string(),
+            },
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.zoom_reset_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.zoom_reset_keys").to_string(),
+            },
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.pan_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.pan_keys").to_string(),
+            },
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.scroll_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.scroll_keys").to_string(),
+            },
+            CanvasHintRow {
+                label: t!("canvas.shortcuts_hint.scroll_horizontal_label").to_string(),
+                keys: t!("canvas.shortcuts_hint.scroll_horizontal_keys").to_string(),
+            },
+        ]
+    }
+
+    /// Renders the canvas-shortcuts hover chip inline into `ui`: a subtle, non-interactive weak
+    /// label (`canvas.shortcuts_hint.title`) that reveals the canvas's own navigation shortcuts
+    /// (zoom, pan, scroll) as a tooltip on hover. Drawn on the zoom row of the controls panel
+    /// (see `draw_canvas_controls`); hover-only, so it takes no click and has no persisted state.
+    fn draw_canvas_shortcuts_chip(ui: &mut egui::Ui) {
+        let rows = Self::canvas_shortcut_rows();
+        let label = egui::Label::new(egui::RichText::new(t!("canvas.shortcuts_hint.title")).weak())
+            // Keep the chip on a single line; the panel is sized by the wider rows below, so it fits.
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .sense(egui::Sense::hover());
+        ui.add(label).on_hover_ui(|ui| {
+            Self::draw_hint_rows_grid(ui, "canvas_shortcuts_hint_grid", &rows);
+        });
     }
 
     fn create_bubble_context_menu_label(&self) -> String {
@@ -1620,5 +1854,40 @@ mod tests {
                 "image width {image_screen_width} should stay centered in the viewport"
             );
         }
+    }
+
+    #[test]
+    fn bottom_hint_state_defaults_and_seeding_contract() {
+        // Contract: the bottom hint starts absent and expanded; `set_bottom_hint` toggles content
+        // presence without touching collapsed state, and `set_bottom_hint_collapsed` seeds the
+        // persisted collapsed value read back by `bottom_hint_collapsed`.
+        use super::super::CanvasBottomHint;
+        let viewport = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut view = view_with_layout(1.0, 1000.0, viewport);
+
+        assert!(view.bottom_hint.is_none(), "hint content defaults to None");
+        assert!(!view.bottom_hint_collapsed(), "default state is expanded");
+
+        view.set_bottom_hint(Some(CanvasBottomHint {
+            rows: vec![CanvasHintRow {
+                label: "Save".to_string(),
+                keys: "Ctrl+S".to_string(),
+            }],
+        }));
+        assert!(view.bottom_hint.is_some(), "content is stored");
+        assert!(
+            !view.bottom_hint_collapsed(),
+            "set_bottom_hint must not change collapsed state"
+        );
+
+        view.set_bottom_hint_collapsed(true);
+        assert!(view.bottom_hint_collapsed(), "collapsed state is seeded");
+
+        view.set_bottom_hint(None);
+        assert!(view.bottom_hint.is_none(), "None hides the hint content");
+        assert!(
+            view.bottom_hint_collapsed(),
+            "hiding content leaves collapsed state untouched"
+        );
     }
 }

@@ -55,16 +55,21 @@ pub(super) fn draw_dashed_selection_path(painter: &egui::Painter, path: &[Pos2])
     painter.extend(shapes);
 }
 
+/// Draws the dashed "specified width" guide line + "N px" label above a selected text overlay.
+///
+/// `render_width_px` is the layer's CONFIGURED width (source px, from `text_params.width_px`) and is
+/// what the label prints. The line length is that width scaled to screen by
+/// `display_scale_px_per_source_px` (= `zoom * user_scale`). The scale is deliberately taken from the
+/// overlay's placement transform, NOT from its on-screen bounding box: a raster-rotated overlay's AABB
+/// inflates with the rotation, which would stretch the guide and make it disagree with its own label.
+/// The guide therefore always reflects the specified width regardless of raster rotation.
 pub(super) fn draw_text_overlay_width_guide(
     painter: &egui::Painter,
     selection_bounds_rect: Rect,
     render_width_px: u32,
-    overlay_screen_width_px: f32,
-    overlay_source_width_px: usize,
+    display_scale_px_per_source_px: f32,
 ) {
-    let source_width = overlay_source_width_px.max(1) as f32;
-    let guide_width =
-        (render_width_px.max(1) as f32 / source_width) * overlay_screen_width_px.max(1.0);
+    let guide_width = render_width_px.max(1) as f32 * display_scale_px_per_source_px.max(0.0);
     let half_width = guide_width.max(1.0) * 0.5;
     let center_x = selection_bounds_rect.center().x;
     let line_y = selection_bounds_rect.top() - TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX;
@@ -106,6 +111,30 @@ pub(super) fn draw_text_overlay_width_guide(
         font_id,
         Color32::WHITE,
     );
+}
+
+/// Computes the new configured text width (source px) for a width-guide tick drag.
+///
+/// The guide is CENTERED on the overlay, so a single tick's screen-x offset (`pointer_dx_screen`,
+/// current pointer x minus the drag-start x) changes the TOTAL width by twice its source-px
+/// equivalent. `display_scale_px_per_source_px` (= `zoom * user_scale`) converts screen px to source
+/// px. `right` is the dragged tick: the right tick widens on a positive (rightward) offset, the left
+/// tick is mirrored. The result is clamped to
+/// [`TEXT_OVERLAY_WIDTH_MIN_PX`, `TEXT_OVERLAY_WIDTH_MAX_PX`].
+pub(super) fn width_from_guide_drag(
+    start_width_px: u32,
+    right: bool,
+    pointer_dx_screen: f32,
+    display_scale_px_per_source_px: f32,
+) -> u32 {
+    let sign = if right { 1.0 } else { -1.0 };
+    let delta_source_px = pointer_dx_screen / display_scale_px_per_source_px.max(f32::EPSILON);
+    (start_width_px as f32 + 2.0 * sign * delta_source_px)
+        .round()
+        .clamp(
+            TEXT_OVERLAY_WIDTH_MIN_PX as f32,
+            TEXT_OVERLAY_WIDTH_MAX_PX as f32,
+        ) as u32
 }
 
 pub(super) fn mesh_boundary_path(mesh_scene: &[Pos2], cols: usize, rows: usize) -> Vec<Pos2> {

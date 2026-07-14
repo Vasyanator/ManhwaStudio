@@ -67,6 +67,12 @@ impl TypingTextOverlayLayer {
             self.drag_state = None;
             self.drag_has_changes = false;
         }
+        if self
+            .width_resize_drag
+            .is_some_and(|state| state.overlay_idx >= self.overlays.len())
+        {
+            self.width_resize_drag = None;
+        }
         // One selection at a time across the two layer kinds: an overlay selection wins (overlay
         // interaction runs before the raster pass below; `select_raster` clears overlays directly).
         if self.selected_overlay_idx.is_some() {
@@ -104,6 +110,10 @@ impl TypingTextOverlayLayer {
             }
             self.drag_state = None;
             self.drag_has_changes = false;
+            // A width-resize drag persists per-frame (each `resize_selected_overlay_width` dispatches a
+            // re-render + placement save), so on button-up there is nothing to commit — just clear it so
+            // it can't get stuck if the widget's `drag_stopped` was never observed.
+            self.width_resize_drag = None;
             // Settle a vector-transform drag whose pointer was released off-widget (the in-method
             // `drag_stopped` path handles the normal on-widget release; whichever fires first wins via
             // the `take`).
@@ -357,6 +367,28 @@ impl TypingTextOverlayLayer {
                 } else {
                     None
                 };
+                // Width-guide end ticks are draggable to resize the layer's configured width. Shown only
+                // when `show_rotate_handle` (selected overlay, outside raster-transform mode), and
+                // `entry.render_width_px` is `Some` only for a TEXT overlay, so together this is
+                // text-only. The tick positions mirror `draw_text_overlay_width_guide` exactly.
+                let width_guide_ticks = if show_rotate_handle {
+                    entry.render_width_px.and_then(|render_width_px| {
+                        let overlay = self.overlays.get(entry.idx)?;
+                        // Rotation-invariant source->screen scale (see `draw_text_overlay_width_guide`).
+                        let display_scale = zoom * overlay.user_scale.max(0.01);
+                        let half_width =
+                            (render_width_px.max(1) as f32 * display_scale).max(1.0) * 0.5;
+                        let center_x = entry.selection_bounds_rect.center().x;
+                        let line_y =
+                            entry.selection_bounds_rect.top() - TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX;
+                        Some((
+                            Pos2::new(center_x - half_width, line_y),
+                            Pos2::new(center_x + half_width, line_y),
+                        ))
+                    })
+                } else {
+                    None
+                };
                 let mut interact_rect = if is_transform_mode {
                     entry
                         .bounds_rect
@@ -372,6 +404,12 @@ impl TypingTextOverlayLayer {
                         Vec2::splat(TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 4.0),
                     );
                     interact_rect = interact_rect.union(handle_rect);
+                }
+                if let Some((left_tick, right_tick)) = width_guide_ticks {
+                    let tick_size = Vec2::splat(TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX * 2.0);
+                    interact_rect = interact_rect
+                        .union(Rect::from_center_size(left_tick, tick_size))
+                        .union(Rect::from_center_size(right_tick, tick_size));
                 }
                 // Если курсор внутри рамки уже выделенного оверлея, перекрывающий НЕвыделенный
                 // оверлей не должен перехватывать DRAG: регистрируем его click-only, чтобы egui
@@ -454,9 +492,40 @@ impl TypingTextOverlayLayer {
                         .is_some_and(|(pointer, handle)| {
                             pointer.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0
                         });
+                // `Some(true)` -> right tick hit, `Some(false)` -> left tick, `None` -> neither.
+                let pointer_on_width_handle = pointer_pos.zip(width_guide_ticks).and_then(
+                    |(pointer, (left_tick, right_tick))| {
+                        let radius = TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX;
+                        if pointer.distance(right_tick) <= radius {
+                            Some(true)
+                        } else if pointer.distance(left_tick) <= radius {
+                            Some(false)
+                        } else {
+                            None
+                        }
+                    },
+                );
                 let pointer_targets_overlay = pointer_inside_grab_area
                     || pointer_on_handle.is_some()
-                    || pointer_on_rotate_handle;
+                    || pointer_on_rotate_handle
+                    || pointer_on_width_handle.is_some();
+                // Show the horizontal-resize cursor while HOVERING a width tick, or while actively
+                // dragging one. Hover uses `response.hover_pos()` (set on plain mouse-over), NOT
+                // `interact_pointer_pos()` above (which is `Some` only during an active click/drag, so it
+                // would flip the cursor only after pressing).
+                let width_resize_active = self
+                    .width_resize_drag
+                    .is_some_and(|state| state.overlay_idx == entry.idx);
+                let hover_on_width_handle = response.hover_pos().zip(width_guide_ticks).is_some_and(
+                    |(pointer, (left_tick, right_tick))| {
+                        let radius = TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX;
+                        pointer.distance(left_tick) <= radius
+                            || pointer.distance(right_tick) <= radius
+                    },
+                );
+                if hover_on_width_handle || width_resize_active {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
 
                 if response.clicked() && pointer_targets_overlay {
                     // Не перехватываем фокус перекрывающим оверлеем, если клик попал
@@ -658,6 +727,19 @@ impl TypingTextOverlayLayer {
                 if response.drag_started() && pointer_targets_overlay {
                     self.primary_pointer_targets_overlay_this_frame = true;
                     if let Some(pointer_pos) = pointer_pos {
+                        // A width-guide tick starts a width-resize drag (param edit + re-render), NOT a
+                        // placement drag, so set that state and skip the placement drag setup.
+                        if let Some(right) = pointer_on_width_handle {
+                            self.selected_overlay_idx = Some(entry.idx);
+                            self.width_resize_drag = Some(WidthResizeDragState {
+                                overlay_idx: entry.idx,
+                                page_idx,
+                                pointer_start_x: pointer_pos.x,
+                                start_width_px: entry.render_width_px.unwrap_or(0),
+                                right,
+                            });
+                            continue;
+                        }
                         let Some((
                             mut start_center_page_px,
                             start_angle_deg,
@@ -811,6 +893,35 @@ impl TypingTextOverlayLayer {
                         });
                         self.drag_has_changes = snapped_on_drag_start;
                     }
+                }
+
+                // Width-resize drag: change the layer's configured width_px and re-render (latest-wins).
+                // Runs BEFORE the placement `dragged()` handler below, whose `drag_state.take()` would
+                // otherwise `continue` past this block (width resize uses a separate state field).
+                if let Some(state) = self.width_resize_drag
+                    && state.overlay_idx == entry.idx
+                    && state.page_idx == page_idx
+                {
+                    self.primary_pointer_targets_overlay_this_frame = true;
+                    if response.dragged()
+                        && let Some(pointer_pos) = pointer_pos
+                    {
+                        let display_scale = self
+                            .overlays
+                            .get(entry.idx)
+                            .map_or(zoom, |overlay| zoom * overlay.user_scale.max(0.01));
+                        let new_width = width_from_guide_drag(
+                            state.start_width_px,
+                            state.right,
+                            pointer_pos.x - state.pointer_start_x,
+                            display_scale,
+                        );
+                        self.resize_selected_overlay_width(entry.idx, new_width, ctx);
+                    }
+                    if response.drag_stopped() {
+                        self.width_resize_drag = None;
+                    }
+                    continue;
                 }
 
                 if response.dragged() {
@@ -1264,15 +1375,17 @@ impl TypingTextOverlayLayer {
                 );
                 draw_dashed_selection_path(&painter, &selection_path);
                 if let Some(render_width_px) = entry.render_width_px {
+                    // Rotation-invariant source->screen scale (matches `default_overlay_quad_scene`):
+                    // the specified width must not stretch with the overlay's raster rotation.
+                    let display_scale = self
+                        .overlays
+                        .get(entry.idx)
+                        .map_or(zoom, |overlay| zoom * overlay.user_scale.max(0.01));
                     draw_text_overlay_width_guide(
                         &painter,
                         entry.selection_bounds_rect,
                         render_width_px,
-                        entry.bounds_rect.width(),
-                        self.overlays
-                            .get(entry.idx)
-                            .map(|overlay| overlay.size_px[0])
-                            .unwrap_or_default(),
+                        display_scale,
                     );
                 }
                 // RASTER transform mode draws its handles on the overlay's runtime deform mesh here.

@@ -2169,3 +2169,44 @@ fn export_dispatch_gate_pass_completion_masks_and_mutual_exclusion() {
     // Every gate unmet at once stays blocked.
     assert!(!export_dispatch_ready(true, false, true));
 }
+
+#[test]
+fn width_guide_drag_zero_offset_keeps_width() {
+    // No pointer movement -> width unchanged.
+    assert_eq!(width_from_guide_drag(300, true, 0.0, 1.0), 300);
+    assert_eq!(width_from_guide_drag(300, false, 0.0, 2.0), 300);
+}
+
+#[test]
+fn width_guide_drag_is_symmetric_about_center() {
+    // The guide is centered, so a tick's source-px offset changes the TOTAL width by 2x. At scale 1.0,
+    // a 20px rightward drag of the RIGHT tick widens by 40; the LEFT tick mirrors (a rightward drag
+    // narrows by 40, a leftward drag widens by 40).
+    assert_eq!(width_from_guide_drag(300, true, 20.0, 1.0), 340);
+    assert_eq!(width_from_guide_drag(300, false, 20.0, 1.0), 260);
+    assert_eq!(width_from_guide_drag(300, false, -20.0, 1.0), 340);
+    assert_eq!(width_from_guide_drag(300, true, -20.0, 1.0), 260);
+}
+
+#[test]
+fn width_guide_drag_divides_out_display_scale() {
+    // A screen offset is converted to source px by dividing by the display scale (zoom * user_scale),
+    // so the same on-screen drag yields a smaller source-px width change when zoomed/scaled up.
+    // 40 screen px at scale 2.0 == 20 source px per side == 40 total. 300 + 40 = 340.
+    assert_eq!(width_from_guide_drag(300, true, 40.0, 2.0), 340);
+    // A non-positive scale must not divide by zero; it falls back to a tiny epsilon and stays finite.
+    assert!(width_from_guide_drag(300, true, 0.0, 0.0) >= TEXT_OVERLAY_WIDTH_MIN_PX);
+}
+
+#[test]
+fn width_guide_drag_clamps_to_settable_range() {
+    // Dragging far past the bounds clamps to the min/max settable width.
+    assert_eq!(
+        width_from_guide_drag(300, false, 100_000.0, 1.0),
+        TEXT_OVERLAY_WIDTH_MIN_PX
+    );
+    assert_eq!(
+        width_from_guide_drag(300, true, 100_000.0, 1.0),
+        TEXT_OVERLAY_WIDTH_MAX_PX
+    );
+}

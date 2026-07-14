@@ -12,7 +12,10 @@ FILE HEADER (tabs/typing/tab.rs)
   `pub(super)` (или `pub(in crate::tabs::typing)`, если их зовёт typing-сосед вроде `panel.rs`).
   Ниже описан общий контракт вкладки; конкретные реализации ищите в подмодулях каталога `tab/`.
 - Ключевые поля `TypingTabState`:
-  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`).
+  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). Bottom-hint
+    forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `app.rs` seed the
+    collapsed flag from `user_config` at construction, read it back on exit, and push per-frame hint
+    content.
   - `text_overlays`: слой PNG-оверлеев (`text` + `image`) с загрузкой из `text_images/text_info.json`,
     декодирование в фоне, дозированная загрузка текстур в GUI-потоке, выбор, drag,
     загрузка/редактирование сохраняемой `deform_mesh` как общей high-res surface
@@ -93,8 +96,8 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
 use crate::canvas::{
-    CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords,
-    SourceTextureUploadBudget, parse_image_text_areas,
+    CanvasBottomHint, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
+    CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget, parse_image_text_areas,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -198,6 +201,13 @@ const TEXT_OVERLAY_DEFORM_SURFACE_ROWS: usize = 13;
 const TEXT_OVERLAY_WIDTH_GUIDE_GAP_PX: f32 = 10.0;
 const TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX: f32 = 5.0;
 const TEXT_OVERLAY_WIDTH_GUIDE_LABEL_GAP_PX: f32 = 4.0;
+/// Screen-px grab radius around each width-guide end tick that starts a width-resize drag (kept
+/// larger than the visual tick half so the handle is comfortably hittable).
+const TEXT_OVERLAY_WIDTH_GUIDE_HANDLE_RADIUS_PX: f32 = 8.0;
+/// Min/max configured text-layer width (source px) settable from the canvas width handle. Mirrors the
+/// edit-panel width slider range (`panel/create_edit.rs`) so canvas and panel agree on the bounds.
+const TEXT_OVERLAY_WIDTH_MIN_PX: u32 = 16;
+const TEXT_OVERLAY_WIDTH_MAX_PX: u32 = 4096;
 const TEXT_OVERLAY_BEND_HANDLE_COLS: usize = 5;
 const TEXT_OVERLAY_BEND_HANDLE_ROWS: usize = 5;
 const TEXT_OVERLAY_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
@@ -411,6 +421,23 @@ impl TypingTabState {
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
         self.canvas.set_scroll_area_id_salt(id_salt);
+    }
+
+    /// Seeds the canvas bottom-hint collapsed state ONCE at construction from `user_config`.
+    /// `false` = expanded (default). Must not be called every frame (would override the user toggle).
+    pub fn set_hint_collapsed(&mut self, collapsed: bool) {
+        self.canvas.set_bottom_hint_collapsed(collapsed);
+    }
+
+    /// Current canvas bottom-hint collapsed state, read on exit to persist to `user_config`.
+    #[must_use]
+    pub fn hint_collapsed(&self) -> bool {
+        self.canvas.bottom_hint_collapsed()
+    }
+
+    /// Sets this tab's canvas bottom-hint content for the current frame; `None` hides it.
+    pub fn set_bottom_hint(&mut self, hint: Option<CanvasBottomHint>) {
+        self.canvas.set_bottom_hint(hint);
     }
 
     pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {
@@ -1712,6 +1739,25 @@ struct TypingOverlayDragState {
     start_mesh: TypingOverlayDeformMesh,
 }
 
+/// Active drag of a width-guide end tick, resizing the selected TEXT overlay's configured `width_px`.
+/// Separate from `TypingOverlayDragState` because a width change is a render-param edit + re-render
+/// (via `resize_selected_overlay_width`), not a placement/geometry mutation, so it never shares the
+/// placement drag state or its mode match arms.
+///
+/// The guide is CENTERED on the overlay, so dragging one tick by `Δx` (source px) changes the total
+/// width by `2 * Δx`. `right` selects the tick (RIGHT tick: pointer-right widens; LEFT tick: mirrored).
+#[derive(Debug, Clone, Copy)]
+struct WidthResizeDragState {
+    overlay_idx: usize,
+    page_idx: usize,
+    /// Screen-x of the pointer when the drag began (the guide is horizontal, so only x matters).
+    pointer_start_x: f32,
+    /// The overlay's configured `width_px` (source px) at drag start; the drag offsets from this.
+    start_width_px: u32,
+    /// `true` for the right tick, `false` for the left.
+    right: bool,
+}
+
 /// Active drag while editing the VECTOR transform working mesh (Phase 3a). Separate from
 /// `TypingOverlayDragState` (which drives the overlay's placement / raster deform mesh) so the two
 /// transform kinds never share drag state. `start_mesh` is the working mesh snapshot at drag start
@@ -1837,6 +1883,7 @@ pub(super) struct TypingTextOverlayLayer {
     deform_tool_settings: TypingDeformToolSettings,
     drag_state: Option<TypingOverlayDragState>,
     drag_has_changes: bool,
+    width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
     page_count: usize,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
@@ -1977,6 +2024,7 @@ impl Default for TypingTextOverlayLayer {
             deform_tool_settings: TypingDeformToolSettings::default(),
             drag_state: None,
             drag_has_changes: false,
+            width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
             page_count: 0,
             page_image_paths: HashMap::new(),
