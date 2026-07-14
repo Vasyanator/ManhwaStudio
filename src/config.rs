@@ -795,6 +795,7 @@ pub fn user_config_defaults() -> Value {
     // keys can never drift back to a localized `title()`. The Settings and PS-editor
     // tabs are intentionally omitted (they are always shown).
     let enabled_tabs: Value = [
+        crate::tabs::AppTab::PageManager,
         crate::tabs::AppTab::Translation,
         crate::tabs::AppTab::Cleaning,
         crate::tabs::AppTab::Typing,

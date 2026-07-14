@@ -3352,6 +3352,7 @@ dependencies = [
  "sha2",
  "swash",
  "tar",
+ "tempfile",
  "texture-synthesis",
  "thiserror 2.0.18",
  "tokio",

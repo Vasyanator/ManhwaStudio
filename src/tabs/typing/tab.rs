@@ -556,6 +556,12 @@ impl TypingTabState {
         self.save_busy = save_busy;
     }
 
+    /// Returns whether a to-folder/PSD export worker is currently rendering.
+    #[must_use]
+    pub fn export_in_progress(&self) -> bool {
+        self.text_overlays.export_rx.is_some()
+    }
+
     pub fn draw(
         &mut self,
         ctx: &egui::Context,

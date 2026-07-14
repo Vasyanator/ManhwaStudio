@@ -364,6 +364,9 @@ saving, and export.
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask
   flood fill, export, or auto-typing detection. Use worker threads and poll receivers
   from the frame loop.
+- Known structural-operation limitation: the detached `spawn_overlay_placement_save` writer has
+  no explicit quiescence handle. The layer-saver barrier covers shared-document writes, but a
+  placement worker already detached before a page operation cannot currently be joined directly.
 - Overlay texture upload happens only on the GUI thread and must respect the existing
   per-frame count and byte budgets.
 - Memory-pressure eviction may clear only tiled mask textures and text/image overlay display

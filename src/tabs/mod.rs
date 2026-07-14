@@ -17,6 +17,7 @@ change with the UI language, while `title()` is a localized label for display on
 pub mod characters;
 pub mod cleaning;
 pub mod notes;
+pub mod page_manager;
 pub mod ps_editor;
 pub mod settings;
 pub mod terms;
@@ -29,6 +30,7 @@ pub mod wiki;
 /// on `key()`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AppTab {
+    PageManager,
     Translation,
     Cleaning,
     Typing,
@@ -41,7 +43,8 @@ pub enum AppTab {
 }
 
 impl AppTab {
-    pub const ALL: [AppTab; 9] = [
+    pub const ALL: [AppTab; 10] = [
+        AppTab::PageManager,
         AppTab::Translation,
         AppTab::Cleaning,
         AppTab::Typing,
@@ -64,6 +67,7 @@ impl AppTab {
     #[must_use]
     pub fn key(self) -> &'static str {
         match self {
+            AppTab::PageManager => "page_manager",
             AppTab::Translation => "translation",
             AppTab::Cleaning => "cleaning",
             AppTab::Typing => "typing",
@@ -83,6 +87,7 @@ impl AppTab {
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
+            AppTab::PageManager => t!("app.tab.page_manager"),
             AppTab::Translation => t!("app.tab.translation"),
             AppTab::Cleaning => t!("app.tab.cleaning"),
             AppTab::Typing => t!("app.tab.typing"),

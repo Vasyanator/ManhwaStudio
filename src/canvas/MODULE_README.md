@@ -113,6 +113,8 @@ X range before the old overflow point.
   `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content.
 - Bubble persistence is routed through `BubblesModel` saver tasks; canvas runtime should keep
   unsaved runtime edits explicit until they are flushed to the model.
+- The periodic overlay autosave has an explicit shutdown flag and is joined before structural page
+  operations or app teardown; no autosave writer may survive a page-index transaction.
 - Bubble undo/redo is delegated to the generic `ms-actions` engine
   (`bubble_runtime.rs::bubble_history: ActionHistory<BubbleSnapshotOp>`; the op lives in
   `bubble_action.rs`). It is a behavior-preserving FULL snapshot op, not a field-level patch:

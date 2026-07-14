@@ -260,6 +260,35 @@ Source page dimensions come from `PageImageInfo`; source page `PageTexture` hand
 
 ## Вкладки
 
+### Page Manager (`src/tabs/page_manager/`) + `src/page_ops/`
+
+- **Page Manager tab** — first tab in `AppTab::ALL` (default active tab stays Translation).
+  NOT a CanvasView and not a view tab (excluded from viewport sync): virtualized card grid
+  (background thumbnails, clean/bubble/layer badges), multi-select, dialogs for inserting
+  image files, creating a blank page (size defaults from the neighbor page, solid fill color)
+  and deletion. `draw` returns `PageManagerAction` (`RequestOp(PageOpKind)` / `OpenPageIn`),
+  executed by `app.rs`.
+- **`src/page_ops/`** — GUI-free engine for STRUCTURAL page operations (Move / InsertFiles /
+  CreateBlank / Delete). Pages are position-keyed everywhere, so an operation is a journaled
+  crash-safe transaction that consistently remaps ALL page-keyed artifacts in BOTH trees
+  (committed chapter dir and `_unsaved` staging): `src/{idx:03}`, `clean_layers/`,
+  `layers/layers.json` + `ps_p{idx:04}_*` PNGs, `translation_bubbles.json` (`img_idx`,
+  `crop_page_idx`), legacy `text_info.json` + `mask_page_{idx}.png`, `text_detection/`.
+  Two-slot A/B journal (`page_ops_journal*.json`, durable via fsync), phase A = reversible
+  renames to temp names, phase B = roll-forward only; deleted artifacts go to
+  `{chapter}/.pageop_trash/{id}/`, never destroyed. `recover_pending_page_op` runs at the very
+  start of `ProjectData::load_internal`. `alt_vers/` is intentionally NOT remapped
+  (position-matched by sorted filename, no reliable per-file key — see its MODULE_README).
+- **Runtime contract (`app.rs::start_page_op`)**: structural ops are NOT staged — they apply
+  immediately to both trees and are not undone by discarding unsaved changes. Before the
+  transaction the app quiesces every chapter writer (flush PS/typing layers + pending bubble
+  upserts, layer-saver barrier, bubble-saver write-gate + synchronous staging snapshot,
+  overlay-autosave shutdown+join — all inside the worker thread); save/export/page-op gate
+  each other, including the completion frame (`pending_project_reload`). After success the
+  whole app is rebuilt through `StudioBootstrapApp` (project reload behind the loading screen,
+  user settings re-read from disk, active tab restored to Page Manager); on failure a modal
+  error dialog offers reload (journal recovery finishes or rolls back the transaction).
+
 ### Translation (`src/tabs/translation/`)
 
 **Submodules:**

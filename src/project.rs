@@ -7,7 +7,10 @@ Main items:
   `Bubble` stores per-bubble placement plus optional `bubble_class`
   (`text`/`image`) and optional `bubble_type` (`default`/`aside`/`on_top`) for text display.
 - `CanvasSettings` stores editable/readonly default bubble display types.
-- `ProjectData::load`: discovers project/title paths, loads pages, bubbles and settings.
+- `ProjectData::load`: discovers project/title paths, loads pages, bubbles and settings. Before
+  any reconcile/normalize pass it calls `page_ops::recover_pending_page_op` so an interrupted
+  structural page operation (journaled transaction, see `src/page_ops/`) is rolled forward or
+  back first; a failed recovery aborts the load.
 - `load_bubbles` + `LegacyRibbonGeometry`: detect and migrate the very old bubble format
   (absolute Tkinter ribbon `x`/`y`, no `img_u`/`img_v`) into page-normalized coordinates,
   recovering the shared continuous-ribbon scale/offset from all bubbles and the page sizes;
@@ -280,6 +283,23 @@ impl ProjectData {
             .with_context(|| format!("project dir not found: {}", project_dir.display()))?;
         #[cfg(target_arch = "wasm32")]
         let project_dir = project_dir.to_path_buf();
+
+        // A structural page operation (src/page_ops) may have been interrupted
+        // by a crash. Its journal must be resolved (rolled forward or back)
+        // BEFORE any reconcile/normalize pass below reads or renames chapter
+        // files: until then the transaction owns the page keying of every
+        // artifact. A failed recovery aborts the load — proceeding would let
+        // the loaders mis-pair half-renamed pages with their overlays/bubbles.
+        crate::page_ops::recover_pending_page_op(&project_dir).map_err(|err| {
+            runtime_log::log_error(format!(
+                "page-op recovery failed for {}: {err}",
+                project_dir.display()
+            ));
+            anyhow::anyhow!(
+                "an interrupted page operation could not be recovered for {}: {err}",
+                project_dir.display()
+            )
+        })?;
 
         let title_dir = project_dir
             .parent()

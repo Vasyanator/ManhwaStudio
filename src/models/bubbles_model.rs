@@ -102,12 +102,15 @@ pub struct BubblesModel {
     canvas_settings: SharedCanvasSettings,
     canvas_revision: u64,
     saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
+    /// Serializes saver writes with a structural page operation's final synchronous snapshot.
+    saver_gate: Arc<Mutex<BubblesSaverGate>>,
 }
 
 #[derive(Clone)]
 pub struct BubblesSaveTask {
     snapshot: Arc<Vec<Bubble>>,
     saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
+    saver_gate: Arc<Mutex<BubblesSaverGate>>,
     unsaved_bubbles_path: PathBuf,
     bubbles_path: PathBuf,
 }
@@ -119,8 +122,15 @@ impl BubblesSaveTask {
             &self.unsaved_bubbles_path,
             &self.bubbles_path,
             &self.snapshot,
+            &self.saver_gate,
         );
     }
+}
+
+/// State shared by the coalescing saver and a structural-operation quiescence barrier.
+#[derive(Debug, Default)]
+struct BubblesSaverGate {
+    paused: bool,
 }
 
 #[allow(dead_code)]
@@ -131,8 +141,10 @@ impl BubblesModel {
         unsaved_bubbles_path: PathBuf,
         canvas_settings: SharedCanvasSettings,
     ) -> Self {
+        let saver_gate = Arc::new(Mutex::new(BubblesSaverGate::default()));
         let saver_tx = Arc::new(Mutex::new(spawn_bubbles_saver_thread(
             unsaved_bubbles_path.clone(),
+            Arc::clone(&saver_gate),
         )));
         let bubble_index_by_id = build_bubble_index(&bubbles);
         // Query the storage seam for the staging file so the web build checks its
@@ -151,6 +163,7 @@ impl BubblesModel {
             canvas_settings,
             canvas_revision: 1,
             saver_tx,
+            saver_gate,
         }
     }
 
@@ -170,6 +183,19 @@ impl BubblesModel {
 
     pub fn snapshot_shared(&self) -> Arc<Vec<Bubble>> {
         Arc::clone(&self.bubbles)
+    }
+
+    /// Stops future asynchronous writes after any in-progress write has left the critical section.
+    ///
+    /// Callers use this immediately before a structural page transaction and must reload the
+    /// model afterwards. The returned snapshot is therefore safe to write synchronously without
+    /// a stale coalesced saver overwriting remapped page indices.
+    pub fn pause_saver_for_page_op(&mut self) -> Arc<Vec<Bubble>> {
+        match self.saver_gate.lock() {
+            Ok(mut gate) => gate.paused = true,
+            Err(poisoned) => poisoned.into_inner().paused = true,
+        }
+        self.snapshot_shared()
     }
 
     /// Runs `f` against the bubble with id `bid` without cloning the whole list.
@@ -373,13 +399,17 @@ impl BubblesModel {
         BubblesSaveTask {
             snapshot: Arc::clone(&self.bubbles),
             saver_tx: Arc::clone(&self.saver_tx),
+            saver_gate: Arc::clone(&self.saver_gate),
             unsaved_bubbles_path: self.unsaved_bubbles_path.clone(),
             bubbles_path: self.bubbles_path.clone(),
         }
     }
 }
 
-fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Arc<Vec<Bubble>>> {
+fn spawn_bubbles_saver_thread(
+    bubbles_path: PathBuf,
+    saver_gate: Arc<Mutex<BubblesSaverGate>>,
+) -> Sender<Arc<Vec<Bubble>>> {
     let (tx, rx) = mpsc::channel::<Arc<Vec<Bubble>>>();
     thread::spawn(move || {
         // Coalesce queued snapshots and persist only the latest one. The channel now carries
@@ -390,7 +420,16 @@ fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Arc<Vec<Bubble>>>
             while let Ok(next) = rx.try_recv() {
                 latest = next;
             }
-            if let Err(err) = write_bubbles_file(&bubbles_path, latest.as_slice()) {
+            let gate = match saver_gate.lock() {
+                Ok(gate) => gate,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if gate.paused {
+                continue;
+            }
+            // Keep the gate locked through the filesystem write. `pause_saver_for_page_op`
+            // therefore returns only after any already-selected coalesced snapshot is done.
+            if let Err(err) = write_bubbles_snapshot_to(&bubbles_path, latest.as_slice()) {
                 eprintln!(
                     "failed to persist bubbles {}: {err:#}",
                     bubbles_path.display()
@@ -401,7 +440,11 @@ fn spawn_bubbles_saver_thread(bubbles_path: PathBuf) -> Sender<Arc<Vec<Bubble>>>
     tx
 }
 
-fn write_bubbles_file(path: &Path, bubbles: &[Bubble]) -> Result<()> {
+/// Synchronously persists a bubbles snapshot to the supplied unsaved staging path.
+///
+/// Structural page operations call this only after [`BubblesModel::pause_saver_for_page_op`],
+/// which prevents the normal coalescing saver from racing the transaction.
+pub fn write_bubbles_snapshot_to(path: &Path, bubbles: &[Bubble]) -> Result<()> {
     // Routed through the storage seam so the web build persists bubbles to its
     // in-memory/IndexedDB store instead of the desktop filesystem.
     let store = crate::storage::storage();
@@ -467,7 +510,15 @@ fn send_snapshot_to_bubbles_saver(
     unsaved_bubbles_path: &Path,
     bubbles_path: &Path,
     snapshot: &Arc<Vec<Bubble>>,
+    saver_gate: &Arc<Mutex<BubblesSaverGate>>,
 ) {
+    let paused = match saver_gate.lock() {
+        Ok(gate) => gate.paused,
+        Err(poisoned) => poisoned.into_inner().paused,
+    };
+    if paused {
+        return;
+    }
     let sender = match saver_tx.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -480,7 +531,10 @@ fn send_snapshot_to_bubbles_saver(
         "WARN bubbles saver thread gone, respawning: {}",
         unsaved_bubbles_path.display()
     );
-    let new_sender = spawn_bubbles_saver_thread(unsaved_bubbles_path.to_path_buf());
+    let new_sender = spawn_bubbles_saver_thread(
+        unsaved_bubbles_path.to_path_buf(),
+        Arc::clone(saver_gate),
+    );
     match saver_tx.lock() {
         Ok(mut guard) => *guard = new_sender.clone(),
         Err(poisoned) => *poisoned.into_inner() = new_sender.clone(),

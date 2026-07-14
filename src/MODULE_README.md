@@ -169,6 +169,12 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `screen_capture.rs`: viewport/screen capture helpers for color picking and related tools.
 - `tools/`: small shared tool modules that are not tied to a specific tab, currently including mask
   brush behavior.
+- `page_ops/`: GUI-free engine for structural page operations (move / insert /
+  create-blank / delete) executed as a journaled crash-safe transaction over both the
+  committed chapter tree and the `_unsaved` mirror; `recover_pending_page_op` is called at
+  the start of `ProjectData::load_internal`. `MangaApp` quiesces all page-indexed writers before
+  dispatching the engine on a worker; `StudioBootstrapApp` then rebuilds a fresh app from disk,
+  never remapping runtime state in place. See `page_ops/MODULE_README.md`.
 - `models/`: shared mutable chapter models used across tabs and workers. See
   `models/MODULE_README.md`.
 - `canvas/`: shared canvas engine for page layout, viewport navigation, bubble editing, overlays,

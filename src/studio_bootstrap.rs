@@ -38,6 +38,7 @@ use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::app::MangaApp;
 use crate::project::ProjectData;
 use crate::runtime_log;
+use crate::tabs::AppTab;
 use anyhow::Context;
 use ms_thread as thread;
 use std::path::PathBuf;
@@ -58,12 +59,24 @@ const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// observed by `StudioBootstrapApp` through the returned receiver.
 pub fn spawn_project_load_thread(
     project_dir: PathBuf,
-    user_settings: serde_json::Value,
+    fallback_user_settings: serde_json::Value,
 ) -> Receiver<anyhow::Result<ProjectData>> {
     let (tx, rx) = mpsc::channel();
     let spawn_result = thread::Builder::new()
         .name("studio-project-load".to_string())
         .spawn(move || {
+            // Reloads must observe settings changed during the current studio session. If the
+            // config became unreadable, retain the last known-good startup snapshot and log the
+            // degradation instead of making an otherwise recoverable project reload fail.
+            let user_settings = match crate::config::load_user_settings_for_startup() {
+                Ok(settings) => settings,
+                Err(err) => {
+                    runtime_log::log_error(format!(
+                        "[studio-bootstrap] failed to refresh user_config.json before project load; using last known settings; error={err}"
+                    ));
+                    fallback_user_settings
+                }
+            };
             let resume_unsaved = crate::detect_unsaved_for_project(&project_dir);
             let result = if resume_unsaved {
                 ProjectData::load_resume_unsaved(&project_dir, &user_settings)
@@ -105,10 +118,14 @@ enum BootstrapState {
 pub struct StudioBootstrapApp {
     state: BootstrapState,
     ai_backend: AiBackendHandle,
+    /// Retained for a safe project reload after a structural page operation.
+    user_settings: serde_json::Value,
     return_to_launcher_flag: Arc<AtomicBool>,
     /// Set when the user tried to close the window during `Loading`; the close is deferred
     /// until the load worker delivers its result (see the file-header corruption note).
     close_after_load: bool,
+    /// Tab restored after a structural-operation reload; selection intentionally does not persist.
+    reload_tab: Option<AppTab>,
     /// Windows-only workaround mirrored from `MangaApp`: `with_maximized` is skipped in the
     /// viewport builder there, so the shell maximizes the root window on its first frame
     /// (otherwise the loading screen shows in the unmaximized 1400x900 window).
@@ -119,14 +136,17 @@ pub struct StudioBootstrapApp {
 impl StudioBootstrapApp {
     pub fn new(
         rx: Receiver<anyhow::Result<ProjectData>>,
+        user_settings: serde_json::Value,
         ai_backend: AiBackendHandle,
         return_to_launcher_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state: BootstrapState::Loading { rx },
             ai_backend,
+            user_settings,
             return_to_launcher_flag,
             close_after_load: false,
+            reload_tab: None,
             #[cfg(target_os = "windows")]
             maximize_root_window_on_first_frame: true,
         }
@@ -149,11 +169,15 @@ impl StudioBootstrapApp {
                     );
                     BootstrapState::ClosingDiscarded
                 } else {
-                    BootstrapState::Running(Box::new(MangaApp::new(
+                    let mut app = MangaApp::new(
                         project,
                         self.ai_backend.clone(),
                         Arc::clone(&self.return_to_launcher_flag),
-                    )))
+                    );
+                    if let Some(tab) = self.reload_tab.take() {
+                        app.set_active_tab(tab);
+                    }
+                    BootstrapState::Running(Box::new(app))
                 }
             }
             Ok(Err(err)) => {
@@ -260,8 +284,17 @@ impl eframe::App for StudioBootstrapApp {
             ctx.request_repaint();
         }
         self.poll_load_result();
-        match &mut self.state {
-            BootstrapState::Running(app) => app.ui(ui, frame),
+        let reload = match &mut self.state {
+            BootstrapState::Running(app) => {
+                app.ui(ui, frame);
+                if app.take_project_reload_request() {
+                    let project_dir = app.project_dir();
+                    app.on_exit(None);
+                    Some(project_dir)
+                } else {
+                    None
+                }
+            }
             BootstrapState::Loading { .. } => {
                 // Never let the OS close kill the load worker mid-write (chapter corruption
                 // risk — see the file header): cancel the close and defer it until the
@@ -273,16 +306,26 @@ impl eframe::App for StudioBootstrapApp {
                 Self::draw_loading_screen(ui, self.close_after_load);
                 // Poll the worker at ~10 Hz; nothing else triggers repaints while loading.
                 ctx.request_repaint_after(LOAD_POLL_INTERVAL);
+                None
             }
             BootstrapState::Failed { error_text } => {
                 Self::draw_error_screen(ui, &ctx, error_text, &self.return_to_launcher_flag);
+                None
             }
             BootstrapState::ClosingDiscarded => {
                 // The deferred close can proceed now; re-sending `Close` every frame until
                 // the window actually closes is harmless.
                 Self::draw_loading_screen(ui, true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                None
             }
+        };
+        if let Some(project_dir) = reload {
+            self.reload_tab = Some(AppTab::PageManager);
+            self.state = BootstrapState::Loading {
+                rx: spawn_project_load_thread(project_dir, self.user_settings.clone()),
+            };
+            ctx.request_repaint();
         }
     }
 
