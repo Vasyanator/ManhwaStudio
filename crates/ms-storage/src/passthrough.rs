@@ -18,6 +18,7 @@ path originates inside the app from trusted `config::*` roots, never from
 untrusted input. Use `NativeStorage` (rooted, escape-guarded) for sandboxes.
 */
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::{DirEntry, Metadata, Storage, StorageError};
@@ -52,6 +53,23 @@ impl PassthroughStorage {
 impl Storage for PassthroughStorage {
     fn read(&self, path: &str) -> Result<Vec<u8>, StorageError> {
         std::fs::read(PathBuf::from(path)).map_err(|e| Self::io_err(path, e))
+    }
+
+    fn read_prefix(&self, path: &str, max_len: usize) -> Result<Vec<u8>, StorageError> {
+        // Explicit directory guard: with `max_len == 0` the bounded read below never issues a
+        // `read(2)`, so `File::open` on a directory would otherwise return `Ok(vec![])` on Linux
+        // instead of the `IsADirectory` the trait contract promises.
+        if PathBuf::from(path).is_dir() {
+            return Err(StorageError::IsADirectory(path.to_string()));
+        }
+        let file = std::fs::File::open(PathBuf::from(path)).map_err(|e| Self::io_err(path, e))?;
+        // `take` bounds the read so a huge file costs only `max_len` bytes of I/O.
+        // The length saturates instead of overflowing, keeping the method total.
+        let mut buf = Vec::new();
+        file.take(u64::try_from(max_len).unwrap_or(u64::MAX))
+            .read_to_end(&mut buf)
+            .map_err(|e| Self::io_err(path, e))?;
+        Ok(buf)
     }
 
     fn write(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {

@@ -47,6 +47,33 @@ fn absolute_path_roundtrip() {
 }
 
 #[test]
+fn read_prefix_is_bounded() {
+    let g = temp_dir();
+    let s = PassthroughStorage::new();
+    let file = g.0.join("f.bin");
+    let file_s = file.to_string_lossy();
+
+    s.write(file_s.as_ref(), b"abcdef").unwrap();
+    // Longer than max_len, exactly max_len, shorter than max_len.
+    assert_eq!(s.read_prefix(file_s.as_ref(), 3).unwrap(), b"abc");
+    assert_eq!(s.read_prefix(file_s.as_ref(), 6).unwrap(), b"abcdef");
+    assert_eq!(s.read_prefix(file_s.as_ref(), 100).unwrap(), b"abcdef");
+
+    let missing = g.0.join("does-not-exist");
+    let err = s.read_prefix(missing.to_string_lossy().as_ref(), 3).unwrap_err();
+    assert!(matches!(err, StorageError::NotFound(_)), "got {err:?}");
+
+    // A directory must be typed `IsADirectory` even with `max_len == 0`, where the bounded
+    // read never touches the file contents and `File::open` alone would succeed on Linux.
+    let dir = g.0.join("subdir");
+    s.create_dir_all(dir.to_string_lossy().as_ref()).unwrap();
+    for max_len in [0, 3] {
+        let err = s.read_prefix(dir.to_string_lossy().as_ref(), max_len).unwrap_err();
+        assert!(matches!(err, StorageError::IsADirectory(_)), "max_len={max_len}: got {err:?}");
+    }
+}
+
+#[test]
 fn missing_maps_to_not_found() {
     let g = temp_dir();
     let s = PassthroughStorage::new();

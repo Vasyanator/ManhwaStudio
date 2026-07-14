@@ -11,11 +11,17 @@ Main structs:
 - `UploadTask`: incremental texture upload state with per-frame budget.
 
 Async/background pipeline:
-- `spawn_loader_thread`: decodes pages in worker pool and sends `LoaderEvent`; workers throttle
-  their look-ahead to `DECODE_AHEAD_WINDOW` pages past the promotion frontier so a slow early page
-  cannot let decoded-but-unpromotable pages pile up unbounded in `decoded_pending_by_idx`.
-- `spawn_overlay_loader_thread`: loads clean overlays in background and prebuilds the
-  `RgbaImage` + `ColorImage` payload before it reaches the GUI thread.
+- `spawn_loader_thread`: one unified worker pool decodes BOTH source pages and clean overlays
+  from a single queue sorted by (page index, source-before-overlay), so each page's overlay
+  becomes available roughly alongside its source page instead of strictly after the whole
+  source stage. Source results are sent as `LoaderEvent`; overlay results are prebuilt
+  worker-side (`RgbaImage` + `ColorImage`, see `decode_overlay`) and sent as
+  `OverlayLoaderEvent` on a separate channel — overlays bypass in-order promotion. Workers
+  throttle their look-ahead to `DECODE_AHEAD_WINDOW` pages past the SOURCE promotion frontier
+  (both job kinds park on it) so a slow early page cannot let decoded-but-unpromotable pages
+  pile up unbounded in `decoded_pending_by_idx`; both `Finished` events are sent only after
+  the whole pool drains, so `loader_finished`/`overlay_loader_finished` each imply both job
+  kinds are done decoding.
 - `decode_worker_count`: picks decode worker parallelism (logical cores by default, env override).
 - `poll_loader_events` + `promote_decoded_pages_in_order`: preserve strict page order.
 - `upload_textures_incremental`: frame-budgeted GPU upload to avoid GUI freezes.
@@ -95,10 +101,12 @@ use web_time::{Duration, Instant};
 
 const DECODE_TILE_SIDE: u32 = 2048;
 const LOADER_QUEUE_CAPACITY: usize = 2;
-/// Maximum number of source pages workers may decode ahead of the next page still waiting
-/// for in-order promotion. Bounds `decoded_pending_by_idx` so a slow early page cannot let
-/// later pages pile up unbounded in RAM. Must be >= 1 so the page that unblocks promotion is
-/// always inside the window (otherwise the loader would deadlock).
+/// Maximum number of pages workers may decode ahead of the next SOURCE page still waiting
+/// for in-order promotion. Both job kinds of the unified loader pool park on this bound:
+/// for source jobs it bounds `decoded_pending_by_idx` so a slow early page cannot let later
+/// pages pile up unbounded in RAM; overlay jobs park on the same source frontier so decoded
+/// overlays stay roughly in step with their source pages. Must be >= 1 so the source page
+/// that unblocks promotion is always inside the window (otherwise the loader would deadlock).
 const DECODE_AHEAD_WINDOW: usize = 8;
 const EVENT_POLL_BUDGET: usize = 8;
 const UPLOAD_TILE_BUDGET_PER_FRAME: usize = 4;
@@ -154,10 +162,17 @@ pub struct MangaApp {
     /// pool so it can throttle how far ahead it decodes (see `DECODE_AHEAD_WINDOW`). Mirrors
     /// `next_decode_idx_to_enqueue`; updated whenever promotion advances it.
     decode_promotion_progress: Arc<AtomicUsize>,
+    /// Raised in `on_exit` to release decode workers parked on the look-ahead window. Without
+    /// it, returning to the launcher mid-load freezes the promotion frontier and any parked
+    /// worker (plus the pool-joining spawner thread) would spin/block forever, leaking threads
+    /// on every launcher<->studio round-trip during a load.
+    loader_shutdown: Arc<AtomicBool>,
     upload_task: Option<UploadTask>,
     loader_finished: bool,
-    overlay_loader_rx: Option<Receiver<OverlayLoaderEvent>>,
-    overlay_loader_started: bool,
+    /// Receives overlay results from the unified loader pool (`spawn_loader_thread`); overlay
+    /// jobs are interleaved with source-page jobs in page order, so overlays arrive alongside
+    /// their source pages rather than after the whole source stage.
+    overlay_loader_rx: Receiver<OverlayLoaderEvent>,
     overlay_loader_finished: bool,
     page_cache_loader_rx: Option<Receiver<PageCacheLoaderEvent>>,
     page_cache_loader_started: bool,
@@ -378,6 +393,32 @@ enum OverlayLoaderEvent {
     Finished,
 }
 
+/// One unit of work for the unified loader pool (`spawn_loader_thread`): either a source-page
+/// decode or that page's clean-overlay decode. Overlay results bypass in-order promotion and
+/// are applied to `CleanOverlaysModel` as soon as they reach the GUI thread.
+enum LoaderJob {
+    SourcePage { idx: usize, path: PathBuf },
+    CleanOverlay { idx: usize, path: PathBuf },
+}
+
+impl LoaderJob {
+    fn page_idx(&self) -> usize {
+        match self {
+            LoaderJob::SourcePage { idx, .. } | LoaderJob::CleanOverlay { idx, .. } => *idx,
+        }
+    }
+
+    /// Sort rank within one page index: the source decode must precede the same page's overlay
+    /// decode so the job that advances the promotion frontier is always popped first (see the
+    /// deadlock-freedom argument in `spawn_loader_thread`).
+    fn kind_rank(&self) -> u8 {
+        match self {
+            LoaderJob::SourcePage { .. } => 0,
+            LoaderJob::CleanOverlay { .. } => 1,
+        }
+    }
+}
+
 enum PageCacheLoaderEvent {
     Decoded {
         idx: usize,
@@ -441,12 +482,17 @@ impl MangaApp {
             })
             .collect();
         let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
+        let (overlay_tx, overlay_rx) = sync_channel(LOADER_QUEUE_CAPACITY);
         let decode_promotion_progress = Arc::new(AtomicUsize::new(0));
+        let loader_shutdown = Arc::new(AtomicBool::new(false));
         spawn_loader_thread(
             pages,
+            collect_overlay_job_candidates(&project),
             tx,
+            overlay_tx,
             cache_pages_on_initial_load,
             Arc::clone(&decode_promotion_progress),
+            Arc::clone(&loader_shutdown),
         );
         // Warm the process-global text-render FontSystem pool off the GUI thread. The first lease
         // pays a full system-font scan (~2.2s in a fresh process); doing it here on a detached
@@ -647,10 +693,10 @@ impl MangaApp {
             decoded_pending_by_idx: HashMap::new(),
             next_decode_idx_to_enqueue: 0,
             decode_promotion_progress,
+            loader_shutdown,
             upload_task: None,
             loader_finished: false,
-            overlay_loader_rx: None,
-            overlay_loader_started: false,
+            overlay_loader_rx: overlay_rx,
             overlay_loader_finished: false,
             page_cache_loader_rx: None,
             page_cache_loader_started: false,
@@ -2039,17 +2085,6 @@ impl MangaApp {
         }
     }
 
-    fn ensure_overlay_loader_started(&mut self) {
-        if self.overlay_loader_started || !self.main_pages_fully_loaded() {
-            return;
-        }
-        self.overlay_loader_started = true;
-        let jobs = collect_overlay_jobs(&self.project);
-        let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
-        spawn_overlay_loader_thread(jobs, tx);
-        self.overlay_loader_rx = Some(rx);
-    }
-
     fn ensure_page_cache_loader_started(&mut self) {
         if self.page_cache_loader_started
             || !self.canvas.state.cache_pages
@@ -2071,11 +2106,8 @@ impl MangaApp {
     }
 
     fn poll_overlay_loader_events(&mut self) {
-        let Some(rx) = self.overlay_loader_rx.as_ref() else {
-            return;
-        };
         for _ in 0..OVERLAY_EVENT_POLL_BUDGET {
-            match rx.try_recv() {
+            match self.overlay_loader_rx.try_recv() {
                 Ok(OverlayLoaderEvent::Decoded { idx, overlay }) => {
                     if let Ok(mut overlays) = self.clean_overlays_model.lock() {
                         overlays.load_prepared_overlay(idx, overlay.rgba, overlay.color);
@@ -2419,7 +2451,6 @@ impl eframe::App for MangaApp {
             puffin::profile_scope!("poll_loaders_and_upload");
             self.poll_loader_events();
             self.upload_textures_incremental(ctx);
-            self.ensure_overlay_loader_started();
             self.poll_overlay_loader_events();
             self.ensure_page_cache_loader_started();
             self.poll_page_cache_loader_events();
@@ -2440,7 +2471,7 @@ impl eframe::App for MangaApp {
         if let Some(layout) = self.settings_tab.take_typing_panel_layout_request() {
             self.typing_tab.set_panel_layout(layout);
         }
-        if (self.overlay_loader_started && !self.overlay_loader_finished)
+        if !self.overlay_loader_finished
             || (self.page_cache_loader_started && !self.page_cache_loader_finished)
         {
             ctx.request_repaint();
@@ -2631,6 +2662,11 @@ impl eframe::App for MangaApp {
     /// lock, then barriers; finally `shutdown_saver` drains the queue + joins the worker. Relying on
     /// Arc-drop ordering alone is unsafe (a lingering Arc clone in a worker could skip the join).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Release decode workers parked on the look-ahead window: after this frame nothing
+        // drains the loader channels, so the promotion frontier would never advance again and
+        // parked workers (and the pool joiner) would leak. Workers blocked on `send` exit on
+        // their own once the receivers drop with `self`.
+        self.loader_shutdown.store(true, AtomicOrdering::Release);
         // 1) Barrier without holding the lock (clone the handle, drop the guard, then block).
         let handle = self
             .layer_doc
@@ -2869,34 +2905,56 @@ fn spawn_text_render_font_pool_prewarm() {
 }
 
 fn spawn_loader_thread(
-    mut pages: Vec<(usize, PathBuf)>,
+    pages: Vec<(usize, PathBuf)>,
+    overlay_candidates: Vec<(usize, PathBuf)>,
     tx: SyncSender<LoaderEvent>,
+    overlay_tx: SyncSender<OverlayLoaderEvent>,
     cache_pages_immediately: bool,
     promotion_progress: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        if pages.is_empty() {
+        // Overlay candidates are filtered for existence here, off the GUI thread, so opening a
+        // project does not pay a per-page `stat` on slow filesystems. Pages without an overlay
+        // file simply contribute no overlay job.
+        let mut merged: Vec<LoaderJob> = pages
+            .into_iter()
+            .map(|(idx, path)| LoaderJob::SourcePage { idx, path })
+            .chain(
+                overlay_candidates
+                    .into_iter()
+                    .filter(|(_, path)| path.is_file())
+                    .map(|(idx, path)| LoaderJob::CleanOverlay { idx, path }),
+            )
+            .collect();
+        if merged.is_empty() {
             let _ = tx.send(LoaderEvent::Finished);
+            let _ = overlay_tx.send(OverlayLoaderEvent::Finished);
             return;
         }
 
-        // Enforce ascending page-index order so the look-ahead back-pressure below stays
-        // deadlock-free regardless of how `project.pages` was constructed: the page that
-        // unblocks promotion is always popped before any later page can park a worker.
-        pages.sort_by_key(|(idx, _)| *idx);
+        // Enforce ascending page-index order (with each page's source decode ahead of its
+        // overlay decode) so the look-ahead back-pressure below stays deadlock-free
+        // regardless of how `project.pages` was constructed: the source job that unblocks
+        // promotion is always popped before any job that can park a worker.
+        merged.sort_by_key(|job| (job.page_idx(), job.kind_rank()));
         debug_assert!(
-            pages.windows(2).all(|w| w[0].0 <= w[1].0),
-            "decode jobs must be in ascending page-index order"
+            merged
+                .windows(2)
+                .all(|w| (w[0].page_idx(), w[0].kind_rank()) <= (w[1].page_idx(), w[1].kind_rank())),
+            "loader jobs must be in ascending (page index, source-before-overlay) order"
         );
 
-        let worker_count = decode_worker_count(pages.len());
-        let jobs = Arc::new(Mutex::new(VecDeque::from(pages)));
+        let worker_count = decode_worker_count(merged.len());
+        let jobs = Arc::new(Mutex::new(VecDeque::from(merged)));
         let mut workers = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
             let tx = tx.clone();
+            let overlay_tx = overlay_tx.clone();
             let jobs = Arc::clone(&jobs);
             let promotion_progress = Arc::clone(&promotion_progress);
+            let shutdown = Arc::clone(&shutdown);
             workers.push(thread::spawn(move || {
                 loop {
                     let job = {
@@ -2905,34 +2963,67 @@ fn spawn_loader_thread(
                         queue.pop_front()
                     };
 
-                    let Some((idx, path)) = job else {
+                    let Some(job) = job else {
                         return;
                     };
 
-                    // Look-ahead throttle: do not decode pages more than DECODE_AHEAD_WINDOW
-                    // beyond the next page awaiting promotion, so decoded-but-unpromotable
-                    // pages cannot pile up unbounded in the GUI-side pending map. The job
-                    // queue is sorted ascending before this loop, so jobs are popped in
-                    // ascending index order; the page that unblocks promotion is never stuck
-                    // behind a parked worker and this cannot deadlock.
+                    // Look-ahead throttle: do not decode jobs for pages more than
+                    // DECODE_AHEAD_WINDOW beyond the next SOURCE page awaiting promotion.
+                    // Source jobs park so decoded-but-unpromotable pages cannot pile up
+                    // unbounded in the GUI-side pending map; overlay jobs park on the same
+                    // SOURCE frontier so decoded overlays stay roughly in step with their
+                    // source pages. Deadlock-freedom: the queue is sorted by (page index,
+                    // source-before-overlay) before this loop, so jobs are popped in that
+                    // order and the frontier's source job — always inside the window —
+                    // precedes every job that can park. It was therefore popped before any
+                    // worker parked, and it either completes or fails, letting the GUI
+                    // advance the frontier (the GUI drains both event channels every frame,
+                    // so a worker blocked on `send` also makes progress). The frontier thus
+                    // keeps advancing and every parked worker eventually re-enters the
+                    // window; overlay jobs never gate promotion themselves. The `shutdown`
+                    // check is the app-exit escape hatch: once the GUI stops draining the
+                    // channels (window closed, e.g. return-to-launcher mid-load) the
+                    // frontier freezes forever, and without it a parked worker — which
+                    // never touches a channel — would spin here for the rest of the
+                    // process, keeping the pool joiner blocked with it.
                     loop {
+                        if shutdown.load(AtomicOrdering::Acquire) {
+                            return;
+                        }
                         let progress = promotion_progress.load(AtomicOrdering::Acquire);
-                        if decode_idx_within_window(idx, progress) {
+                        if decode_idx_within_window(job.page_idx(), progress) {
                             break;
                         }
                         thread::sleep(Duration::from_millis(2));
                     }
 
-                    let event = match decode_page(idx, &path, cache_pages_immediately) {
-                        Ok(page) => LoaderEvent::Decoded(page),
-                        Err(error) => LoaderEvent::Failed {
-                            idx,
-                            path: path.display().to_string(),
-                            error,
-                        },
-                    };
-                    if tx.send(event).is_err() {
-                        return;
+                    match job {
+                        LoaderJob::SourcePage { idx, path } => {
+                            let event = match decode_page(idx, &path, cache_pages_immediately) {
+                                Ok(page) => LoaderEvent::Decoded(page),
+                                Err(error) => LoaderEvent::Failed {
+                                    idx,
+                                    path: path.display().to_string(),
+                                    error,
+                                },
+                            };
+                            if tx.send(event).is_err() {
+                                return;
+                            }
+                        }
+                        LoaderJob::CleanOverlay { idx, path } => {
+                            let event = match decode_overlay(idx, &path) {
+                                Ok(overlay) => OverlayLoaderEvent::Decoded { idx, overlay },
+                                Err(error) => OverlayLoaderEvent::Failed {
+                                    idx,
+                                    path: path.display().to_string(),
+                                    error,
+                                },
+                            };
+                            if overlay_tx.send(event).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }));
@@ -2942,7 +3033,10 @@ fn spawn_loader_thread(
             let _ = worker.join();
         }
 
+        // Both `Finished` events are deliberately sent only after the whole pool drains, so
+        // `loader_finished` and `overlay_loader_finished` each imply both job kinds are done.
         let _ = tx.send(LoaderEvent::Finished);
+        let _ = overlay_tx.send(OverlayLoaderEvent::Finished);
     });
 }
 
@@ -3019,7 +3113,9 @@ fn decode_page(idx: usize, path: &Path, cache_page_rgba: bool) -> Result<Decoded
     })
 }
 
-fn collect_overlay_jobs(project: &ProjectData) -> Vec<(usize, PathBuf)> {
+/// Candidate clean-overlay files for every page, in page order. Existence is NOT checked here:
+/// the unified loader thread (`spawn_loader_thread`) stats the candidates off the GUI thread.
+fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PathBuf)> {
     project
         .pages
         .iter()
@@ -3032,7 +3128,6 @@ fn collect_overlay_jobs(project: &ProjectData) -> Vec<(usize, PathBuf)> {
             let candidate = project.paths.clean_layers_dir.join(format!("{stem}.png"));
             (page.idx, candidate)
         })
-        .filter(|(_, p)| p.is_file())
         .collect()
 }
 
@@ -3057,51 +3152,6 @@ fn collect_missing_page_cache_jobs(
         .filter(|page| !cached_indexes.contains(&page.idx))
         .map(|page| (page.idx, page.path.clone()))
         .collect()
-}
-
-fn spawn_overlay_loader_thread(jobs: Vec<(usize, PathBuf)>, tx: SyncSender<OverlayLoaderEvent>) {
-    thread::spawn(move || {
-        if jobs.is_empty() {
-            let _ = tx.send(OverlayLoaderEvent::Finished);
-            return;
-        }
-
-        let worker_count = decode_worker_count(jobs.len());
-        let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
-        let mut workers = Vec::with_capacity(worker_count);
-
-        for _ in 0..worker_count {
-            let tx = tx.clone();
-            let queue = Arc::clone(&queue);
-            workers.push(thread::spawn(move || {
-                loop {
-                    let job = {
-                        let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
-                        q.pop_front()
-                    };
-                    let Some((idx, path)) = job else {
-                        return;
-                    };
-                    let event = match decode_overlay(idx, &path) {
-                        Ok(overlay) => OverlayLoaderEvent::Decoded { idx, overlay },
-                        Err(error) => OverlayLoaderEvent::Failed {
-                            idx,
-                            path: path.display().to_string(),
-                            error,
-                        },
-                    };
-                    if tx.send(event).is_err() {
-                        return;
-                    }
-                }
-            }));
-        }
-
-        for w in workers {
-            let _ = w.join();
-        }
-        let _ = tx.send(OverlayLoaderEvent::Finished);
-    });
 }
 
 fn spawn_page_cache_loader_thread(

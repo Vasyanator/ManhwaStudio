@@ -14,6 +14,7 @@ Because `path::normalize` strips every `..`, the joined real path can never
 escape `root`; there is no TOCTOU traversal risk from the path string itself.
 */
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::{DirEntry, Metadata, Storage, StorageError, path};
@@ -66,6 +67,21 @@ impl Storage for NativeStorage {
             return Err(StorageError::IsADirectory(path.to_string()));
         }
         std::fs::read(&real).map_err(|e| Self::io_err(path, e))
+    }
+
+    fn read_prefix(&self, path: &str, max_len: usize) -> Result<Vec<u8>, StorageError> {
+        let real = self.resolve(path)?;
+        if real.is_dir() {
+            return Err(StorageError::IsADirectory(path.to_string()));
+        }
+        let file = std::fs::File::open(&real).map_err(|e| Self::io_err(path, e))?;
+        // `take` bounds the read so a huge file costs only `max_len` bytes of I/O.
+        // The length saturates instead of overflowing, keeping the method total.
+        let mut buf = Vec::new();
+        file.take(u64::try_from(max_len).unwrap_or(u64::MAX))
+            .read_to_end(&mut buf)
+            .map_err(|e| Self::io_err(path, e))?;
+        Ok(buf)
     }
 
     fn write(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
