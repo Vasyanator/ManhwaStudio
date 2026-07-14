@@ -47,10 +47,10 @@ Why it matters: under the zoom modifier (Ctrl/Cmd) egui diverts the wheel into `
 **Project replacement — call this, do not reinvent it:**
 
 ```rust
-// src/input_util.rs:34
+// src/input_util.rs:31
 pub fn raw_wheel_delta(input: &egui::InputState) -> egui::Vec2
 ```
-It sums the frame's `Event::MouseWheel { delta, .. }` values (`src/input_util.rs:35-43`). Sign matches
+It sums the frame's `Event::MouseWheel { delta, .. }` values (`src/input_util.rs:32-39`). Sign matches
 `smooth_scroll_delta` (positive Y = content moved down). The magnitude is **unit-dependent** —
 `MouseWheelUnit::{Point, Line, Page}` (`egui-0.35.0/src/data/input/mouse_wheel_unit.rs`) — so only use
 it for sign/threshold decisions, never as a pixel distance. Unit tests: `src/input_util.rs:66-98`.
@@ -71,12 +71,12 @@ of the same helper, `raw_wheel_events_delta` — `src/widgets/wheel_slider.rs:43
 (`egui-0.35.0/src/context.rs:2841`) is **not** a drop-in: with a space-filling `CentralPanel` the root
 ui's available rect is empty, so it reports `true` for every point over the central content. That
 permanently suppressed deselect-on-empty-click in the typing tab (see the doc comment at
-`src/input_util.rs:45-56`).
+`src/input_util.rs:42-53`).
 
 **Project replacement:**
 
 ```rust
-// src/input_util.rs:58
+// src/input_util.rs:55
 pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool
 // = ctx.layer_id_at(interact_pos).is_some_and(|l| l.order != egui::Order::Background)
 ```
@@ -224,8 +224,8 @@ a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::User
 
 ## Editing map
 
-- Wheel/zoom on any canvas → `crate::input_util::raw_wheel_delta` (`src/input_util.rs:34`).
-- "Did the click hit bare canvas?" → `crate::input_util::pointer_over_floating_area` (`src/input_util.rs:58`).
+- Wheel/zoom on any canvas → `crate::input_util::raw_wheel_delta` (`src/input_util.rs:31`).
+- "Did the click hit bare canvas?" → `crate::input_util::pointer_over_floating_area` (`src/input_util.rs:55`).
 - New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in
   `MangaApp::execute_hotkey_command` (`src/app.rs:1571`).
 - Widget-local interaction → allocate with the right `Sense` and read the `Response`; do not read

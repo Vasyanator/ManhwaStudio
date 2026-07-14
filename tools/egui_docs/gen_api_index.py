@@ -54,6 +54,13 @@ TOPLEVEL_KINDS = {
     "macro",
 }
 
+# Additionally listed in symbols.txt, though they get no full entry. Modules must be
+# here: `egui` re-exports the `epaint` and `atomics` modules, so `egui::epaint::Vertex`
+# is a path callers legitimately write. Omitting modules would make a grep for it come
+# up empty and — under this tree's "absent means it does not exist" rule — produce a
+# confident false negative.
+SYMBOL_ONLY_KINDS = {"module"}
+
 
 class RustdocCrate:
     """One crate's rustdoc JSON, with helpers to resolve ids and render types.
@@ -82,6 +89,8 @@ class RustdocCrate:
         # not exist — the exact failure this whole tree exists to prevent. So
         # walk the public module tree and record the shortest reachable path.
         self.public_paths: dict[int, list[str]] = {}
+        # Every public path an item is reachable by, not just the shortest. See `_record`.
+        self.alias_paths: dict[int, list[list[str]]] = {}
         # Re-exports of items owned by another crate, collected during the walk and
         # resolved later by the Registry (which has every crate's JSON loaded).
         # (public path in this crate, definition path in the owning crate)
@@ -168,13 +177,23 @@ class RustdocCrate:
                     queue.append((child_id, child_path))
 
     def _record(self, item_id: int, path: list[str]) -> None:
-        """Keep the shortest (then lexicographically smallest) public path for an item."""
+        """Record a public path for an item.
+
+        `public_paths` keeps the shortest (then lexicographically smallest) one — that
+        is the canonical path the per-crate pages group by. `alias_paths` keeps *every*
+        public path, because a caller may legitimately write a longer one
+        (`egui::epaint::Vertex` as well as `egui::Vertex`), and `symbols.txt` is read
+        as "absent means it does not exist". A missing alias would be a false negative.
+        """
+        self.alias_paths.setdefault(item_id, []).append(path)
         prev = self.public_paths.get(item_id)
         if prev is None or (len(path), path) < (len(prev), prev):
             self.public_paths[item_id] = path
 
-    def own_items(self) -> list[tuple[str, int, dict[str, Any], list[str]]]:
-        """Public, documentable items this crate itself defines: (kind, id, item, public_path)."""
+    def own_items(
+        self, kinds: set[str] = TOPLEVEL_KINDS
+    ) -> list[tuple[str, int, dict[str, Any], list[str]]]:
+        """Public items this crate defines, of the requested kinds: (kind, id, item, path)."""
         out: list[tuple[str, int, dict[str, Any], list[str]]] = []
         for item_id, path in self.public_paths.items():
             item = self.index.get(item_id)
@@ -182,7 +201,7 @@ class RustdocCrate:
                 continue
             entry = self.paths.get(item_id)
             kind = entry.get("kind") if entry else kind_of(item)
-            if kind not in TOPLEVEL_KINDS:
+            if kind not in kinds:
                 continue
             out.append((kind, item_id, item, path))
         return out
@@ -424,10 +443,17 @@ class Registry:
             return None
         return owner, item_id
 
-    def entries_for(self, crate: RustdocCrate) -> list[IndexEntry]:
-        """Every public item reachable under `crate`'s public paths, own or re-exported."""
+    def entries_for(
+        self, crate: RustdocCrate, kinds: set[str] = TOPLEVEL_KINDS
+    ) -> list[IndexEntry]:
+        """Every public item reachable under `crate`'s public paths, own or re-exported.
+
+        `kinds` selects what to include: the per-crate pages want documentable items
+        only, while `symbols.txt` additionally wants modules (see `SYMBOL_ONLY_KINDS`).
+        """
         out: list[IndexEntry] = [
-            (kind, crate, item_id, item, path) for kind, item_id, item, path in crate.own_items()
+            (kind, crate, item_id, item, path)
+            for kind, item_id, item, path in crate.own_items(kinds)
         ]
         seen_paths = {tuple(e[4]) for e in out}
         unresolved = 0
@@ -443,13 +469,36 @@ class Registry:
                 unresolved += 1
                 continue
             kind = owner.paths[item_id].get("kind") or kind_of(item)
-            if kind not in TOPLEVEL_KINDS:
+            if kind not in kinds:
                 continue
             key = tuple(public_path)
             if key in seen_paths:
                 continue
             seen_paths.add(key)
             out.append((kind, owner, item_id, item, public_path))
+
+            # A re-exported module is a namespace callers can path through: `egui`
+            # does `pub use epaint;`, so `egui::epaint::Vertex` is a real path. Walking
+            # the module's rustdoc children does not work — a crate root's children are
+            # `use` items, not the types themselves. Remap the owner's own public paths
+            # instead: every `epaint::X` it exposes is reachable here as `egui::epaint::X`.
+            if kind == "module":
+                for owned_id, aliases in owner.alias_paths.items():
+                    owned = owner.index.get(owned_id)
+                    if not owned:
+                        continue
+                    oentry = owner.paths.get(owned_id)
+                    okind = (oentry.get("kind") if oentry else kind_of(owned)) or "?"
+                    if okind not in kinds:
+                        continue
+                    for alias in aliases:
+                        if tuple(alias[: len(def_path)]) != def_path:
+                            continue
+                        ckey = tuple(public_path + alias[len(def_path) :])
+                        if ckey in seen_paths:
+                            continue
+                        seen_paths.add(ckey)
+                        out.append((okind, owner, owned_id, owned, list(ckey)))
 
         # `pub use other::module::*;` — lift the target module's public children
         # into the re-exporting module's namespace.
@@ -691,12 +740,20 @@ def render_symbols(per_crate: dict[str, list[IndexEntry]]) -> str:
         "",
     ]
     rows: list[str] = []
-    for entries in per_crate.values():
+    for crate_name, entries in per_crate.items():
         for kind, owner, item_id, item, path_parts in entries:
             path = "::".join(path_parts)
             loc = owner.span(item) or "-"
             dep_flag = "deprecated-" if item.get("deprecation") else ""
             rows.append(f"{path}\t{dep_flag}{kind}\t{loc}")
+
+            # Alternative public paths to the same item, e.g. `egui::text::LayoutJob`
+            # beside `egui::LayoutJob`. Callers write either; a grep must find both.
+            if owner.name == crate_name:
+                for alias in owner.alias_paths.get(item_id, []):
+                    if alias == path_parts:
+                        continue
+                    rows.append(f"{'::'.join(alias)}\t{dep_flag}{kind}-alias\t{loc}")
 
             inner = item.get("inner") or {}
 
@@ -785,8 +842,14 @@ def main() -> int:
         log.info("loaded %s %s (%d items)", name, crate.version, len(crate.index))
 
     registry = Registry(loaded)
+    # Pages document items; symbols.txt additionally lists modules, so that a path a
+    # caller can legitimately write (`egui::epaint::Vertex`) is never reported absent.
     per_crate: dict[str, list[IndexEntry]] = {
         crate.name: registry.entries_for(crate) for crate in loaded
+    }
+    symbol_kinds = TOPLEVEL_KINDS | SYMBOL_ONLY_KINDS
+    per_crate_symbols: dict[str, list[IndexEntry]] = {
+        crate.name: registry.entries_for(crate, symbol_kinds) for crate in loaded
     }
 
     for crate in loaded:
@@ -796,7 +859,7 @@ def main() -> int:
         log.info("wrote %s (%d public items)", target, len(entries))
 
     symbols = args.out / "symbols.txt"
-    symbols.write_text(render_symbols(per_crate), encoding="utf-8")
+    symbols.write_text(render_symbols(per_crate_symbols), encoding="utf-8")
     log.info("wrote %s", symbols)
 
     readme = args.out / "README.md"

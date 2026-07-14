@@ -7,14 +7,10 @@ memory of 0.27-0.31 — several APIs on this page did not exist then.
 
 ## 0. The hard project rule (read first)
 
-`README_AGENT.md:616`:
-
-> **Правило**: не использовать `egui::Slider`, `egui::ComboBox` напрямую в продуктовом
-> UI — использовать Wheel-версии.
-
-Translated and extended to `DragValue` (which `WheelSpinBox` wraps, `README_AGENT.md:611`):
-**do NOT use `egui::Slider`, `egui::ComboBox`, or `egui::DragValue` directly in product
-UI.** Use the `Wheel*` replacements from `src/widgets/`.
+**Do NOT use `egui::Slider` or `egui::ComboBox` directly in product UI** — use the `Wheel*`
+replacements from `src/widgets/`. That is the rule as written in `README_AGENT.md:616`. It
+extends to `egui::DragValue`, which `WheelSpinBox` wraps for the same reason
+(`README_AGENT.md:611`).
 
 Why — two reasons, both invisible in the type system:
 
@@ -172,7 +168,7 @@ egui 0.35 has an **atomics** layer (`egui-0.35.0/src/atomics/`): `atom.rs`, `ato
 - `Atoms<'a>` (`atomics/atoms.rs:16`) — an ordered list of them.
 - `IntoAtoms<'a>` (`atomics/atoms.rs:209`) — implemented for tuples, so
   `ui.button((image, "Click me!"))` works (`atoms.rs:202-207`).
-- `AtomLayout` (`atomics/atom_layout.rs:83`) lays them out and returns
+- `AtomLayout` (`atomics/atom_layout.rs:60`) lays them out and returns
   **`AtomLayoutResponse`** (`atom_layout.rs:701`), which *wraps* a `Response`:
 
 ```rust

@@ -87,8 +87,10 @@ On desktop the two are usually identical; do not assume it.
   the zero-init is at `input_state/mod.rs:450`.)
 * `Event::MouseWheel { unit: MouseWheelUnit, delta: Vec2, phase, modifiers }` — the raw per-event delta,
   unit-dependent (`Point`/`Line`/`Page`). (`egui-0.35.0/src/data/input/event.rs:147`.)
-* `InputState::wheel: WheelState` with `unprocessed_wheel_delta` / `smooth_wheel_delta`
-  (`input_state/wheel_state.rs:39,53,67`) — internal accumulator, not the old raw delta.
+* `InputState` also keeps a `wheel: WheelState` accumulator, but the field is **private**
+  (`input_state/mod.rs:229` — no `pub`), so app code cannot reach it. Its
+  `unprocessed_wheel_delta` / `smooth_wheel_delta` (`input_state/wheel_state.rs:53,67`) are an
+  implementation detail of smoothing, not a replacement for the old raw delta. Do not plan around them.
 
 **In this repo:** `src/input_util.rs:31` `raw_wheel_delta(&egui::InputState) -> Vec2` reconstructs the old
 semantics by summing this frame's `Event::MouseWheel` deltas. Use it for Ctrl+wheel zoom/rotate; do not
@@ -206,6 +208,11 @@ Practical rule: a bare `&str`, `RichText` or `Image` still works as before becau
 | `Image` widget | `Image::new(impl Into<ImageSource>)`, `Image::from_texture(impl Into<SizedTexture>)`, `.max_size`, `.fit_to_exact_size`, `.paint_at(ui, rect)`. `egui::include_image!` still exists. | `widgets/image.rs:63,101,146,176,368`, `lib.rs:535` |
 | Loaders | `egui_extras::install_image_loaders(ctx)`. | `egui_extras-0.35.0/src/loaders.rs:58` |
 | Tables/strips | `egui_extras::TableBuilder`, `StripBuilder` still exist. | `egui_extras-0.35.0/src/table.rs:247`, `strip.rs:44` |
+
+> **`egui_extras` is not a dependency of this binary.** It is pulled in only by
+> `crates/puffin_egui`, behind the `profiling` feature, so nothing in this table is reachable
+> from `src/` as things stand. Adding the dependency is a deliberate decision, not a detail.
+> See `04-widgets.md` §8.
 
 ---
 

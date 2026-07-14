@@ -81,7 +81,7 @@ Rule of thumb: clone once at the top of `ui()`, pass `&Context` down for context
   `pub fn show<R>(self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R>`
   (panel.rs:363). `show_inside` is deprecated → renamed to `show` (panel.rs:369).
 * Animated variants: `show_collapsible(ui, &mut is_expanded, add_contents)` (panel.rs:389) and
-  `show_switched(...)` (panel.rs:483) — the latter animates between a collapsed and an expanded panel;
+  `show_switched(...)` (panel.rs:500) — the latter animates between a collapsed and an expanded panel;
   give them **distinct ids** (panel.rs:451).
 * `CentralPanel::default()` / `::no_frame()` (panel.rs:1045) / `::default_margins()` (panel.rs:1052);
   `show(ui, …)` at panel.rs:1064.

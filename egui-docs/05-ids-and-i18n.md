@@ -58,21 +58,17 @@ pub fn id_source(self, id_salt: impl AsIdSalt) -> Self {
 }
 ```
 
-That is the **only** public `id_source` builder left (`grep -rn "id_source" egui-0.35.0/src`
-otherwise hits only the private `UiBuilder.id_source` field at `ui_builder.rs:20`, the private
-`id_source` debug module at `id.rs:172`, and `panel.rs:207`'s private `resize_id_source`).
+That is the **only** `id_source` *builder method* left (`grep -rn "id_source" egui-0.35.0/src`
+otherwise hits the public `UiBuilder.id_source` **field** at `ui_builder.rs:20` — set through
+`.id_salt()` / `.id()`, not by name — plus the debug-only `id_source` module at `id.rs:172` and
+`panel.rs:207`'s private `resize_id_source`).
 `ComboBox::from_id_source`, `ScrollArea::id_source`, `CollapsingHeader::id_source`,
 `Grid::new(id_source)`-as-a-name — all gone. **Write `id_salt` everywhere.**
 
 ## 2. THE RULE: localized label ⇒ mandatory `id_salt`
 
-`README_AGENT.md:532-534`:
-
-> Локализуя `ComboBox::from_label` / `WheelComboBox::from_label` / `Window::new` /
-> `CollapsingHeader::new` / `ui.collapsing`, обязательно добавь стабильный `id_salt`:
-> egui выводит `Id` из текста подписи, иначе смена языка сбрасывает состояние виджета.
-
-In English: **when the label of a `from_label` / `Window::new` / `CollapsingHeader::new` /
+The rule (`README_AGENT.md:532-534`): **when the label of a `ComboBox::from_label` /
+`WheelComboBox::from_label` / `Window::new` / `CollapsingHeader::new` /
 `ui.collapsing` widget is a translated string, you MUST pin a stable `id_salt`.** egui hashes
 the label *text* into the `Id`, so the id changes with the UI language — and everything egui
 stores under that id (combo open/closed, collapsing open/closed, scroll offset, `TextEdit`
@@ -108,11 +104,9 @@ parameter — its id is the text. Wrap it: `ui.push_id("stable_key", |ui| ui.col
 
 ## 3. The other mandatory i18n rule: no literal user-visible strings
 
-`README_AGENT.md:508-513`:
-
-> ⛔ ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ДЛЯ АГЕНТА: НИКАКОГО ТЕКСТА В КОДЕ
-> **Запрещено писать пользовательский текст литералом в `.rs`.** […] добавляется КЛЮЧОМ в
-> каталог и вызывается через `t!` / `tf!` / `tp!`.
+`README_AGENT.md:508-513` states it as an absolute: **no user-visible text may be written as a
+literal in `.rs`.** Every such string is added to the catalog as a KEY and read back through
+`t!` / `tf!` / `tp!`.
 
 - Macros: `t!` (`crates/ms-i18n/src/lib.rs:106`), `tf!` (formatted, `:119`), `tp!` (plural,
   `:136`).
