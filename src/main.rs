@@ -80,6 +80,7 @@ mod native_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod onnx_runtime;
+mod page_ops;
 mod paste_image;
 mod project;
 mod python_manager;
@@ -1393,6 +1394,7 @@ fn run_main_window(
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
                 load_rx,
+                user_settings.clone(),
                 ai_backend.clone(),
                 flag_for_app,
             )))

@@ -49,6 +49,9 @@ to refresh local mask caches.
   list changes.
 - Bubble autosave writes the latest snapshot to the unsaved staging path and must preserve
   explicit project-save semantics.
+- A structural page operation pauses the bubble saver under its write gate, takes its shared
+  snapshot, and writes that snapshot synchronously before remapping page indices. Do not add a
+  bypass writer that can race this quiescence boundary.
 - RGBA image buffers must match `width * height * 4`; mask buffers must match
   `width * height`.
 - PNG/export-facing clean overlay buffers must be straight-alpha RGBA. Convert from

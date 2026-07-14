@@ -38,6 +38,7 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
 
@@ -120,16 +121,27 @@ fn build_overlay_prepared_tiles_parallel(image: &egui::ColorImage) -> Vec<Overla
 /// Spawns a background thread that saves dirty clean-overlay pages to the unsaved staging
 /// directory every 30 seconds if there are any pending changes.
 ///
-/// The thread keeps running until the `Arc` holding `model` is dropped (all strong counts go to
-/// zero), at which point `model.lock()` will fail and the loop exits cleanly.
+/// `shutdown` lets the owner stop and join the worker before a structural page transaction. The
+/// worker checks it at most once a second, so shutdown never leaves a stale autosave writer racing
+/// a page-index remap.
 pub fn spawn_overlay_autosave_thread(
     model: Arc<Mutex<CleanOverlaysModel>>,
     unsaved_clean_layers_dir: PathBuf,
+    shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
         loop {
-            thread::sleep(AUTOSAVE_INTERVAL);
+            // Sleep in bounded slices so teardown can join promptly instead of waiting 30 seconds.
+            for _ in 0..AUTOSAVE_INTERVAL.as_secs() {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
             let snapshots = {
                 let Ok(mut locked) = model.lock() else {
                     // Model mutex poisoned or dropped — exit.
@@ -143,7 +155,11 @@ pub fn spawn_overlay_autosave_thread(
             if snapshots.is_empty() {
                 continue;
             }
-            if let Err(err) = save_overlay_snapshots_parallel(&unsaved_clean_layers_dir, &snapshots)
+            if let Err(err) = save_overlay_snapshots_parallel(
+                &unsaved_clean_layers_dir,
+                &snapshots,
+                Some(shutdown.as_ref()),
+            )
             {
                 runtime_log::log_error(format!(
                     "[canvas::autosave] failed to autosave dirty overlays; path={}; error={err}",
@@ -162,14 +178,11 @@ pub fn spawn_overlay_autosave_thread(
     })
 }
 
-/// Encodes dirty overlay snapshots to `dir/<stem>.png`, one PNG per page, in parallel via the
-/// global rayon pool.
+/// Encodes dirty overlay snapshots to `dir/<stem>.png`, checking cancellation between pages.
 ///
-/// Each entry is `(page_idx, file_stem, rgba_image)`. Pages encode independently to distinct files
-/// (distinct stems), so there is no shared mutable state across the parallel work. Behavior matches
-/// the sequential `clean_overlays_model::save_overlay_snapshots_to`: the directory is created once
-/// up front, every snapshot is written to `dir/<stem>.png` via `image::RgbaImage::save`, and the
-/// set of files written is identical.
+/// Each entry is `(page_idx, file_stem, rgba_image)`. The directory is created once up front and
+/// every snapshot is written to `dir/<stem>.png` via `image::RgbaImage::save`. A shutdown abort is
+/// reported as an error so the caller restores all dirty indexes, including pages not yet visited.
 ///
 /// # Errors
 /// Returns the first per-page encode/write failure (deterministically the lowest `page_idx` among
@@ -178,6 +191,7 @@ pub fn spawn_overlay_autosave_thread(
 fn save_overlay_snapshots_parallel(
     dir: &Path,
     snapshots: &[(usize, String, Arc<RgbaImage>)],
+    shutdown: Option<&AtomicBool>,
 ) -> anyhow::Result<()> {
     if snapshots.is_empty() {
         return Ok(());
@@ -188,26 +202,26 @@ fn save_overlay_snapshots_parallel(
             dir.display()
         )
     })?;
-    // Encode each page independently. The parallel `filter_map().collect()` is unindexed: rayon
-    // gathers the surviving failures in arbitrary, scheduling-dependent order, NOT in page order.
-    // Determinism is established afterwards by `sort_by_key` on `page_idx`, which selects the
-    // lowest failing page regardless of how the failures landed in this Vec. No failure is dropped.
-    let mut failures: Vec<(usize, anyhow::Error)> = snapshots
-        .par_iter()
-        .filter_map(|(page_idx, stem, image)| {
-            let dst = dir.join(format!("{stem}.png"));
-            match image.save(&dst) {
-                Ok(()) => None,
-                Err(err) => Some((
-                    *page_idx,
-                    anyhow::anyhow!(
-                        "failed to encode overlay page {page_idx} to {}: {err}",
-                        dst.display()
-                    ),
-                )),
-            }
-        })
-        .collect();
+    // Encode pages in stable order so cancellation can be observed between individual files.
+    let mut failures = Vec::new();
+    for (page_idx, stem, image) in snapshots {
+        // Cancellation is checked between pages. Encoding one page may still use the image
+        // crate's internal parallel work, but shutdown never waits for the rest of the pass.
+        if shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(anyhow::anyhow!("overlay autosave cancelled during shutdown"));
+        }
+        let dst = dir.join(format!("{stem}.png"));
+        match image.save(&dst) {
+            Ok(()) => {}
+            Err(err) => failures.push((
+                *page_idx,
+                anyhow::anyhow!(
+                    "failed to encode overlay page {page_idx} to {}: {err}",
+                    dst.display()
+                ),
+            )),
+        }
+    }
     if failures.is_empty() {
         return Ok(());
     }
@@ -387,7 +401,7 @@ mod tests {
         let seq_dir = unique_temp_dir("encode_seq");
         let par_dir = unique_temp_dir("encode_par");
         save_overlay_snapshots_to(&seq_dir, &snapshots).expect("sequential encode must succeed");
-        save_overlay_snapshots_parallel(&par_dir, &snapshots)
+        save_overlay_snapshots_parallel(&par_dir, &snapshots, None)
             .expect("parallel encode must succeed");
 
         for (_, stem, _) in &snapshots {
@@ -421,7 +435,7 @@ mod tests {
     #[test]
     fn parallel_png_encode_empty_is_ok_and_writes_nothing() {
         let dir = unique_temp_dir("encode_empty");
-        save_overlay_snapshots_parallel(&dir, &[]).expect("empty encode must succeed");
+        save_overlay_snapshots_parallel(&dir, &[], None).expect("empty encode must succeed");
         // Matches sequential: no directory created, no files written for an empty snapshot set.
         assert!(
             !dir.exists(),
@@ -449,7 +463,7 @@ mod tests {
         let snapshots: Vec<(usize, String, Arc<RgbaImage>)> =
             vec![(7, "001".to_string(), Arc::new(img))];
 
-        let err = save_overlay_snapshots_parallel(&file_as_dir, &snapshots)
+        let err = save_overlay_snapshots_parallel(&file_as_dir, &snapshots, None)
             .expect_err("create_dir_all over an existing file must fail, not return Ok");
         // The error must carry the offending path as diagnostic context, not be an opaque failure.
         let msg = err.to_string();
@@ -481,7 +495,7 @@ mod tests {
         let snapshots: Vec<(usize, String, Arc<RgbaImage>)> =
             vec![(5, "002".to_string(), Arc::new(img))];
 
-        let err = save_overlay_snapshots_parallel(&dir, &snapshots)
+        let err = save_overlay_snapshots_parallel(&dir, &snapshots, None)
             .expect_err("saving over an existing directory path must fail, not return Ok");
         let msg = err.to_string();
         assert!(

@@ -63,15 +63,17 @@ use crate::memory_manager::{
     CacheResourceKind, MemoryManager, MemoryPressure, classify_memory_pressure,
     current_memory_availability, select_eviction_candidates,
 };
-use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
+use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings, write_bubbles_snapshot_to};
 use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snapshots_to};
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::{ComicType, ProjectData, save_comic_type_to_project_file};
+use crate::page_ops::{PageOpKind, PageOpOutcome, execute_page_op};
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
 use crate::tabs::cleaning::CleaningTabState;
 use crate::tabs::notes::NotesTabState;
+use crate::tabs::page_manager::{PageManagerAction, PageManagerTabState};
 use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::settings::SettingsTabState;
 use crate::tabs::terms::TermsTabState;
@@ -210,6 +212,7 @@ pub struct MangaApp {
     cleaning_tab: CleaningTabState,
     typing_tab: TypingTabState,
     ps_editor_tab: PsEditorTabState,
+    page_manager_tab: PageManagerTabState,
     /// Shared unified layer document: the source of truth for per-page layer MODEL state, held by
     /// both view tabs (`Arc<Mutex<…>>`). Each tab re-projects its current page whenever the doc's
     /// `version` changes (the in-memory cross-tab sync). This field keeps the `Arc` alive.
@@ -232,8 +235,9 @@ pub struct MangaApp {
     ai_backend_version_warning_open: bool,
     ai_backend_version_warning_dismissed: bool,
     /// Background thread that autosaves dirty overlays every 30 s.
-    #[allow(dead_code)]
     overlay_autosave_thread: Option<JoinHandle<()>>,
+    /// Signals the overlay autosave worker before it is joined for a page operation or teardown.
+    overlay_autosave_shutdown: Arc<AtomicBool>,
     /// Active "save to project" merge job.
     save_to_project_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Status text shown next to the "save to project" button.
@@ -258,6 +262,12 @@ pub struct MangaApp {
     exit_dialog: Option<ExitDialogKind>,
     /// In-flight unsaved cleanup that must complete before the app is allowed to close.
     pending_exit_cleanup: Option<PendingExitCleanup>,
+    /// Result channel of the quiesced structural page operation worker.
+    page_op_rx: Option<Receiver<Result<PageOpOutcome, String>>>,
+    /// Error dialog shown after a failed operation; disk state must be reloaded before editing.
+    page_op_error: Option<String>,
+    /// Consumed by `StudioBootstrapApp` to reconstruct this app from disk.
+    pending_project_reload: bool,
     has_unsaved_changes_cached: bool,
     next_unsaved_dir_check_s: f64,
     /// Windows can misplace a maximized root window when maximize is requested at native creation.
@@ -684,10 +694,16 @@ impl MangaApp {
         let has_unsaved_changes_cached = project.paths.unsaved_dir.exists();
 
         // Start the 30-second overlay autosave background thread.
+        let overlay_autosave_shutdown = Arc::new(AtomicBool::new(false));
         let overlay_autosave_thread = Some(spawn_overlay_autosave_thread(
             Arc::clone(&clean_overlays_model),
             project.paths.unsaved_clean_layers_dir.clone(),
+            Arc::clone(&overlay_autosave_shutdown),
         ));
+        let mut page_manager_tab = PageManagerTabState::default();
+        page_manager_tab.set_bubbles_model(Arc::clone(&bubbles_model));
+        page_manager_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
+        page_manager_tab.set_layer_doc(Arc::clone(&layer_doc));
 
         Self {
             project,
@@ -733,6 +749,7 @@ impl MangaApp {
             cleaning_tab,
             typing_tab,
             ps_editor_tab,
+            page_manager_tab,
             layer_doc,
             characters_tab: CharactersTabState::default(),
             terms_tab: TermsTabState::default(),
@@ -751,12 +768,16 @@ impl MangaApp {
             ai_backend_version_warning_open: false,
             ai_backend_version_warning_dismissed: false,
             overlay_autosave_thread,
+            overlay_autosave_shutdown,
             save_to_project_rx: None,
             save_to_project_status: None,
             pending_save_completion_action: None,
             pending_save_after_preload: false,
             exit_dialog: None,
             pending_exit_cleanup: None,
+            page_op_rx: None,
+            page_op_error: None,
+            pending_project_reload: false,
             has_unsaved_changes_cached,
             next_unsaved_dir_check_s: 0.0,
             #[cfg(target_os = "windows")]
@@ -771,6 +792,179 @@ impl MangaApp {
     /// Returns true if there are in-session changes not yet merged into the project folder.
     fn has_unsaved_changes(&self) -> bool {
         self.has_unsaved_changes_cached
+    }
+
+    /// Returns the loaded project's root directory for bootstrap-driven reconstruction.
+    #[must_use]
+    pub fn project_dir(&self) -> PathBuf {
+        self.project.paths.project_dir.clone()
+    }
+
+    /// Selects a tab after a full project reload.
+    pub fn set_active_tab(&mut self, tab: AppTab) {
+        self.active_tab = tab;
+    }
+
+    /// Returns and clears the request to rebuild this application from the project on disk.
+    pub fn take_project_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_project_reload)
+    }
+
+    /// Stops and joins the periodic overlay writer during final application teardown.
+    ///
+    /// This may block for the current per-page PNG encode. That is acceptable only from
+    /// `on_exit`; structural operations transfer the handle to their worker instead.
+    fn stop_overlay_autosave(&mut self) {
+        self.overlay_autosave_shutdown.store(true, AtomicOrdering::Release);
+        if let Some(handle) = self.overlay_autosave_thread.take()
+            && handle.join().is_err()
+        {
+            runtime_log::log_error("[app] overlay autosave worker panicked during shutdown");
+        }
+    }
+
+    /// Starts a structural page operation after quiescing every writer that owns page-indexed data.
+    fn start_page_op(&mut self, op: PageOpKind) {
+        if self.page_op_rx.is_some()
+            || self.page_op_error.is_some()
+            || self.pending_project_reload
+            || self.save_to_project_rx.is_some()
+            || self.pending_save_after_preload
+            || self.pending_exit_cleanup.is_some()
+            || self.typing_tab.export_in_progress()
+        {
+            runtime_log::log_info("[page_op] request ignored while another persistence operation is active");
+            return;
+        }
+        self.canvas.flush_pending_bubble_upserts_now(&self.project);
+        self.ps_editor_tab.flush_layers(&self.project);
+        drop(self.typing_tab.flush_text_layers());
+
+        self.overlay_autosave_shutdown
+            .store(true, AtomicOrdering::Release);
+        let overlay_autosave_thread = self.overlay_autosave_thread.take();
+        let overlay_autosave_shutdown = Arc::clone(&self.overlay_autosave_shutdown);
+
+        let saver_handle = self.layer_doc.lock().ok().and_then(|guard| guard.saver_handle());
+        let overlays_model = Arc::clone(&self.clean_overlays_model);
+        let bubbles_model = Arc::clone(&self.bubbles_model);
+        let paths = self.project.paths.clone();
+        let pages = self.project.pages.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            overlay_autosave_shutdown.store(true, AtomicOrdering::Release);
+            if let Some(handle) = overlay_autosave_thread
+                && handle.join().is_err()
+            {
+                runtime_log::log_error("[page_op] overlay autosave worker panicked during shutdown");
+            }
+            // Snapshot only after autosave has stopped: otherwise it can take or restore the same
+            // dirty indexes concurrently with this transaction's final staging flush.
+            let dirty_overlay_snapshots = match overlays_model.lock() {
+                Ok(mut overlays) => overlays.take_dirty_save_snapshots(),
+                Err(_) => {
+                    let _ = tx.send(Err(t!("page_manager.op_lock_error").to_string()));
+                    return;
+                }
+            };
+            let bubbles_snapshot = match bubbles_model.lock() {
+                Ok(mut bubbles) => bubbles.pause_saver_for_page_op(),
+                Err(_) => {
+                    if let Ok(mut overlays) = overlays_model.lock() {
+                        overlays.restore_dirty_save_indexes(
+                            dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx),
+                        );
+                    }
+                    let _ = tx.send(Err(t!("page_manager.op_lock_error").to_string()));
+                    return;
+                }
+            };
+            // The saver FIFO barrier follows the UI-side flushes, making the staging manifest
+            // authoritative before the transaction reads and remaps it.
+            if let Some(handle) = saver_handle {
+                let failed_pages = handle.barrier_blocking();
+                if !failed_pages.is_empty() {
+                    runtime_log::log_warn(format!(
+                        "[page_op] layer saver reported failed staging pages; pages={failed_pages:?}"
+                    ));
+                }
+            }
+            if let Err(err) = save_overlay_snapshots_to(&paths.unsaved_clean_layers_dir, &dirty_overlay_snapshots) {
+                if let Ok(mut overlays) = overlays_model.lock() {
+                    overlays.restore_dirty_save_indexes(dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx));
+                }
+                if tx.send(Err(format!("failed to flush dirty overlays: {err}"))).is_err() {
+                    runtime_log::log_error("[page_op] result receiver dropped after overlay flush failure");
+                }
+                return;
+            }
+            if let Err(err) = write_bubbles_snapshot_to(&paths.unsaved_bubbles_file, bubbles_snapshot.as_slice()) {
+                if let Ok(mut overlays) = overlays_model.lock() {
+                    overlays.restore_dirty_save_indexes(dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx));
+                }
+                if tx.send(Err(format!("failed to flush translation bubbles: {err}"))).is_err() {
+                    runtime_log::log_error("[page_op] result receiver dropped after bubbles flush failure");
+                }
+                return;
+            }
+            let result = execute_page_op(&paths, &pages, &op).map_err(|err| err.to_string());
+            if tx.send(result).is_err() {
+                runtime_log::log_error("[page_op] result receiver dropped before transaction completed");
+            }
+        });
+        self.page_op_rx = Some(rx);
+    }
+
+    /// Polls the structural-operation worker and requests a safe bootstrap reload on success.
+    fn poll_page_op(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.page_op_rx.as_ref() else { return; };
+        match rx.try_recv() {
+            Ok(Ok(outcome)) => {
+                runtime_log::log_info(format!(
+                    "[page_op] completed; old_pages={}; pages={}",
+                    outcome.old_to_new.len(), outcome.new_page_count
+                ));
+                self.page_op_rx = None;
+                self.pending_project_reload = true;
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                runtime_log::log_error(format!("[page_op] failed: {err}"));
+                self.page_op_rx = None;
+                self.page_op_error = Some(err);
+            }
+            Err(TryRecvError::Empty) => ctx.request_repaint(),
+            Err(TryRecvError::Disconnected) => {
+                self.page_op_rx = None;
+                self.page_op_error = Some(t!("page_manager.op_thread_crashed").to_string());
+            }
+        }
+    }
+
+    /// Draws the blocking progress veil and the failure dialog for a structural page operation.
+    fn draw_page_op_overlays(&mut self, ctx: &egui::Context) {
+        if self.page_op_rx.is_some() || self.pending_project_reload || self.page_op_error.is_some() {
+            let screen = ctx.viewport_rect();
+            egui::Area::new(egui::Id::new("page_op_progress_blocker"))
+                .order(egui::Order::Foreground).fixed_pos(screen.min).constrain(false)
+                .movable(false).interactable(true).show(ctx, |ui| {
+                    ui.set_clip_rect(screen);
+                    ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+                    ui.allocate_rect(screen, egui::Sense::click_and_drag());
+                    ui.vertical_centered(|ui| { ui.add_space(screen.height() * 0.45); ui.spinner(); ui.label(t!("page_manager.op_in_progress")); });
+                });
+        }
+        if let Some(error) = self.page_op_error.as_ref() {
+            let mut reload = false;
+            egui::Window::new(t!("page_manager.op_failed_title")).id(egui::Id::new("page_op_failed_dialog"))
+                .order(egui::Order::Foreground)
+                .collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label(t!("page_manager.op_failed_message"));
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 120), error);
+                    if ui.button(t!("page_manager.op_reload_button")).clicked() { reload = true; }
+                });
+            if reload { self.page_op_error = None; self.pending_project_reload = true; }
+        }
     }
 
     /// Refreshes the cached unsaved-changes flag.
@@ -819,6 +1013,14 @@ impl MangaApp {
     /// `take_dirty_save_snapshots`, so gating on the mask loader or the клин loader would have no
     /// save-time correctness effect (CLAUDE.md §14).
     fn request_save_to_project(&mut self) {
+        if self.page_op_rx.is_some() || self.page_op_error.is_some() || self.pending_project_reload {
+            runtime_log::log_info("[save_to_project] trigger ignored while structural page operation is active");
+            self.save_to_project_status = Some((
+                t!("app.save.blocked_by_page_operation").to_string(),
+                0.0,
+            ));
+            return;
+        }
         match save_trigger_decision(
             self.save_to_project_rx.is_some(),
             self.pending_save_after_preload,
@@ -880,6 +1082,8 @@ impl MangaApp {
         // Flush the PS editor's active-page raster layers into the staging dir so the merge below
         // picks them up. Other visited pages were already written on their page switch.
         self.ps_editor_tab.flush_layers(&self.project);
+        // Bubble upserts intentionally are not forced here: the live model remains active during
+        // a normal save, so its existing debounce/flush path catches up before later persistence.
         // Flush the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
         // legacy chapter that was only viewed (no edits → no placement save) still migrates its text
         // before the unsaved→committed merge. The typing tab owns text persistence now. The returned set
@@ -1529,6 +1733,28 @@ impl MangaApp {
             });
     }
 
+    /// Switches to a page-capable tab and applies the selected page without letting viewport
+    /// snapshot synchronization overwrite the explicit focus.
+    fn open_page_in_tab(&mut self, tab: AppTab, page_idx: usize) {
+        self.active_tab = tab;
+        self.shared_page_idx = page_idx;
+        self.shared_page_center = None;
+        let zoom = self.shared_canvas_viewport.zoom;
+        match tab {
+            AppTab::Translation => self.canvas.focus_page(page_idx, None, zoom),
+            AppTab::Cleaning => self.cleaning_tab.focus_page(page_idx, None, zoom),
+            AppTab::Typing => self.typing_tab.focus_page(page_idx, None, zoom),
+            AppTab::PageManager
+            | AppTab::PsEditor
+            | AppTab::Characters
+            | AppTab::Terms
+            | AppTab::Notes
+            | AppTab::Settings
+            | AppTab::Wiki => {}
+        }
+        self.active_viewport_owner_tab = Some(tab);
+    }
+
     fn apply_shared_viewport_to_active_canvas(&mut self) {
         let entering_from_ps = self.prev_view_tab == Some(AppTab::PsEditor);
         // Leaving the PS editor: flush its in-memory raster/group edits to disk and bump the shared
@@ -1879,7 +2105,8 @@ impl MangaApp {
             AppTab::Typing => self.typing_tab.active_source_page_window(neighbor_radius),
             // The PS-like editor owns its own page residency through `CleanOverlaysModel`'s page
             // cache, so it does not participate in the shared source-texture window.
-            AppTab::PsEditor
+            AppTab::PageManager
+            | AppTab::PsEditor
             | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
@@ -1893,7 +2120,8 @@ impl MangaApp {
             AppTab::Translation => self.canvas.source_pixel_inspection_active(),
             AppTab::Cleaning => self.cleaning_tab.source_pixel_inspection_active(),
             AppTab::Typing => self.typing_tab.source_pixel_inspection_active(),
-            AppTab::PsEditor
+            AppTab::PageManager
+            | AppTab::PsEditor
             | AppTab::Characters
             | AppTab::Terms
             | AppTab::Notes
@@ -2328,11 +2556,22 @@ impl MangaApp {
                         self.finalize_close(ui.ctx(), PendingCloseAction::ReturnToLauncher);
                     }
                 }
-                let save_busy = self.save_to_project_rx.is_some() || self.pending_save_after_preload;
-                if ui
-                    .add_enabled(!save_busy, egui::Button::new(t!("app.menu.save_project_button")))
-                    .clicked()
+                let save_busy = self.save_to_project_rx.is_some()
+                    || self.pending_save_after_preload
+                    || self.page_op_rx.is_some()
+                    || self.page_op_error.is_some()
+                    || self.pending_project_reload;
+                let save_response = ui
+                    .add_enabled(!save_busy, egui::Button::new(t!("app.menu.save_project_button")));
+                let save_response = if self.page_op_rx.is_some()
+                    || self.page_op_error.is_some()
+                    || self.pending_project_reload
                 {
+                    save_response.on_disabled_hover_text(t!("app.save.blocked_by_page_operation"))
+                } else {
+                    save_response
+                };
+                if save_response.clicked() {
                     self.request_save_to_project();
                 }
                 if let Some((status, _)) = &self.save_to_project_status {
@@ -2421,6 +2660,7 @@ impl eframe::App for MangaApp {
         // the active tab and dispatches the real save once every page is resident.
         self.drive_pending_save_preload(ctx);
         let save_completed_this_frame = self.poll_save_to_project(now);
+        self.poll_page_op(ctx);
         self.poll_pending_exit_cleanup(ctx, now);
         self.refresh_unsaved_changes_cache(now);
         if let Some((_, ts)) = &self.save_to_project_status {
@@ -2502,6 +2742,8 @@ impl eframe::App for MangaApp {
         // Show exit/leave dialog on top of all other content.
         self.draw_exit_dialog(ctx);
 
+        self.draw_page_op_overlays(ctx);
+
         self.apply_shared_viewport_to_active_canvas();
 
         // Coarse marker for the active-tab draw, the single most expensive phase per frame
@@ -2511,6 +2753,28 @@ impl eframe::App for MangaApp {
         #[cfg(feature = "profiling")]
         let _active_tab_draw_scope = puffin::profile_scope_custom!("active_tab_draw");
         match self.active_tab {
+            AppTab::PageManager => {
+                let op_in_progress = self.page_op_rx.is_some()
+                    || self.page_op_error.is_some()
+                    || self.pending_project_reload
+                    || self.save_to_project_rx.is_some()
+                    || self.pending_save_after_preload
+                    || self.pending_exit_cleanup.is_some()
+                    || self.typing_tab.export_in_progress();
+                let project = &self.project;
+                let page_infos = &self.page_infos;
+                let tab = &mut self.page_manager_tab;
+                let mut actions = Vec::new();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    actions = tab.draw(ctx, ui, project, page_infos, op_in_progress);
+                });
+                for action in actions {
+                    match action {
+                        PageManagerAction::RequestOp(op) => self.start_page_op(op),
+                        PageManagerAction::OpenPageIn { tab, page_idx } => self.open_page_in_tab(tab, page_idx),
+                    }
+                }
+            }
             AppTab::Translation => {
                 self.canvas.set_bottom_hint(Some(CanvasBottomHint {
                     rows: build_translation_hint_rows(),
@@ -2579,7 +2843,11 @@ impl eframe::App for MangaApp {
                 // Export is mutually exclusive with a project save (Finding 2): the save may be pending
                 // on the whole-project preload or already running. Push it into the typing tab before
                 // draw so both the export trigger and the deferred-export gate can suppress dispatch.
-                let save_busy = self.save_to_project_rx.is_some() || self.pending_save_after_preload;
+                let save_busy = self.save_to_project_rx.is_some()
+                    || self.pending_save_after_preload
+                    || self.page_op_rx.is_some()
+                    || self.page_op_error.is_some()
+                    || self.pending_project_reload;
                 let project = &self.project;
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
@@ -2688,6 +2956,7 @@ impl eframe::App for MangaApp {
     /// lock, then barriers; finally `shutdown_saver` drains the queue + joins the worker. Relying on
     /// Arc-drop ordering alone is unsafe (a lingering Arc clone in a worker could skip the join).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_overlay_autosave();
         // Release decode workers parked on the look-ahead window: after this frame nothing
         // drains the loader channels, so the promotion frontier would never advance again and
         // parked workers (and the pool joiner) would leak. Workers blocked on `send` exit on
