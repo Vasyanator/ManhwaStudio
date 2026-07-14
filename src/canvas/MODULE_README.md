@@ -78,6 +78,13 @@ shared `CanvasViewportSnapshot`, publishes it only from the active canvas after 
 canvas is drawn, and applies it only to the canvas being entered. Inactive canvases must
 not be scrolled or re-anchored every frame.
 
+`CanvasView::focus_page` is deferred navigation: it applies the zoom immediately and records
+a `pending_focus` request that the draw pass resolves into a scroll offset once the target
+page's world rect (and its center, when not passed explicitly) is known — so focusing a canvas
+that has never been laid out (e.g. opening a page in a not-yet-visited tab from the page
+manager) scrolls on its first frames instead of being silently dropped. Exactly one request is
+pending at a time; a newer `focus_page` or `apply_viewport_snapshot` call replaces or drops it.
+
 Source page geometry is separate from source page GPU residency. Scene layout and hit testing use
 `PageImageInfo` dimensions supplied by `MangaApp`; `PageTexture` only represents optional tiled GPU
 handles for source imagery. NEAREST source textures are materialized lazily while pixel inspection

@@ -31,8 +31,9 @@ use super::settings::{save_canvas_settings_to_project_file, save_canvas_settings
 use super::types::{
     CanvasSettingsSaveRequest, OverlayPrepareRequest, OverlayPrepareResult, OverlayPreparedTile,
 };
-use crate::models::clean_overlays_model::CleanOverlaysModel;
+use crate::models::clean_overlays_model::{CleanOverlaysModel, OverlaySaveSnapshot};
 use crate::runtime_log;
+#[cfg(test)]
 use image::RgbaImage;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -159,6 +160,7 @@ pub fn spawn_overlay_autosave_thread(
                 &unsaved_clean_layers_dir,
                 &snapshots,
                 Some(shutdown.as_ref()),
+                Some(&model),
             )
             {
                 runtime_log::log_error(format!(
@@ -166,7 +168,7 @@ pub fn spawn_overlay_autosave_thread(
                     unsaved_clean_layers_dir.display()
                 ));
                 if let Ok(mut locked) = model.lock() {
-                    locked.restore_dirty_save_indexes(snapshots.iter().map(|(idx, _, _)| *idx));
+                    locked.restore_dirty_save_snapshots(&snapshots);
                 }
             } else {
                 runtime_log::log_info(format!(
@@ -180,18 +182,25 @@ pub fn spawn_overlay_autosave_thread(
 
 /// Encodes dirty overlay snapshots to `dir/<stem>.png`, checking cancellation between pages.
 ///
-/// Each entry is `(page_idx, file_stem, rgba_image)`. The directory is created once up front and
-/// every snapshot is written to `dir/<stem>.png` via `image::RgbaImage::save`. A shutdown abort is
-/// reported as an error so the caller restores all dirty indexes, including pages not yet visited.
+/// The directory is created once up front and every snapshot is written to `dir/<stem>.png`
+/// via `image::RgbaImage::save`. A shutdown abort is reported as an error so the caller
+/// restores all dirty snapshots, including pages not yet visited.
+///
+/// When `model` is provided, each page is guarded against a concurrent
+/// `CleanOverlaysModel::detach_page_overlay` via the snapshot's detach generation: a page
+/// detached before its write is skipped, and a page detached DURING its (lock-free) write has
+/// the just-written file removed again, so an in-flight autosave can never resurrect a
+/// detached clean layer.
 ///
 /// # Errors
-/// Returns the first per-page encode/write failure (deterministically the lowest `page_idx` among
-/// failures), with the page index and target path attached as context. A failure is propagated as a
-/// real error, never silently dropped.
+/// Returns the first per-page encode/write failure (deterministically the lowest `page_idx`
+/// among failures), with the page index and target path attached as context. A failure is
+/// propagated as a real error, never silently dropped.
 fn save_overlay_snapshots_parallel(
     dir: &Path,
-    snapshots: &[(usize, String, Arc<RgbaImage>)],
+    snapshots: &[OverlaySaveSnapshot],
     shutdown: Option<&AtomicBool>,
+    model: Option<&Mutex<CleanOverlaysModel>>,
 ) -> anyhow::Result<()> {
     if snapshots.is_empty() {
         return Ok(());
@@ -202,21 +211,49 @@ fn save_overlay_snapshots_parallel(
             dir.display()
         )
     })?;
+    // Returns whether the snapshot is still current; a poisoned model lock counts as
+    // stale so a broken model never gates a write open.
+    let snapshot_is_current = |snapshot: &OverlaySaveSnapshot| -> bool {
+        model.is_none_or(|model| {
+            model
+                .lock()
+                .map(|guard| guard.overlay_snapshot_is_current(snapshot))
+                .unwrap_or(false)
+        })
+    };
     // Encode pages in stable order so cancellation can be observed between individual files.
     let mut failures = Vec::new();
-    for (page_idx, stem, image) in snapshots {
+    for snapshot in snapshots {
         // Cancellation is checked between pages. Encoding one page may still use the image
         // crate's internal parallel work, but shutdown never waits for the rest of the pass.
         if shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Err(anyhow::anyhow!("overlay autosave cancelled during shutdown"));
         }
-        let dst = dir.join(format!("{stem}.png"));
-        match image.save(&dst) {
-            Ok(()) => {}
+        // Cheap pre-write skip: the page was detached after the snapshot was taken.
+        if !snapshot_is_current(snapshot) {
+            continue;
+        }
+        let dst = dir.join(format!("{}.png", snapshot.stem));
+        match snapshot.image.save(&dst) {
+            Ok(()) => {
+                // Post-write reconcile: a detach racing the encode above already bumped the
+                // generation; remove the stale file (already-trashed/missing is fine).
+                if !snapshot_is_current(snapshot) {
+                    match std::fs::remove_file(&dst) {
+                        Ok(())  => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => runtime_log::log_warn(format!(
+                            "[canvas::autosave] could not remove stale overlay written during detach: {}: {err}",
+                            dst.display()
+                        )),
+                    }
+                }
+            }
             Err(err) => failures.push((
-                *page_idx,
+                snapshot.page_idx,
                 anyhow::anyhow!(
-                    "failed to encode overlay page {page_idx} to {}: {err}",
+                    "failed to encode overlay page {} to {}: {err}",
+                    snapshot.page_idx,
                     dst.display()
                 ),
             )),
@@ -379,7 +416,7 @@ mod tests {
 
     #[test]
     fn parallel_png_encode_matches_sequential_files() {
-        let snapshots: Vec<(usize, String, Arc<RgbaImage>)> = (0..4)
+        let snapshots: Vec<OverlaySaveSnapshot> = (0..4)
             .map(|i| {
                 let w = 8 + u32::try_from(i).unwrap_or(0);
                 let h = 6 + u32::try_from(i).unwrap_or(0);
@@ -394,17 +431,22 @@ mod tests {
                         255,
                     ]);
                 }
-                (i, format!("{:03}", i + 1), Arc::new(img))
+                OverlaySaveSnapshot {
+                    page_idx: i,
+                    stem: format!("{:03}", i + 1),
+                    image: Arc::new(img),
+                    generation: 0,
+                }
             })
             .collect();
 
         let seq_dir = unique_temp_dir("encode_seq");
         let par_dir = unique_temp_dir("encode_par");
         save_overlay_snapshots_to(&seq_dir, &snapshots).expect("sequential encode must succeed");
-        save_overlay_snapshots_parallel(&par_dir, &snapshots, None)
+        save_overlay_snapshots_parallel(&par_dir, &snapshots, None, None)
             .expect("parallel encode must succeed");
 
-        for (_, stem, _) in &snapshots {
+        for OverlaySaveSnapshot { stem, .. } in &snapshots {
             let seq_path = seq_dir.join(format!("{stem}.png"));
             let par_path = par_dir.join(format!("{stem}.png"));
             assert!(seq_path.exists(), "sequential file missing: {stem}");
@@ -421,8 +463,8 @@ mod tests {
                 .to_rgba8();
             let original = snapshots
                 .iter()
-                .find(|(_, s, _)| s == stem)
-                .map(|(_, _, img)| img.clone())
+                .find(|snapshot| &snapshot.stem == stem)
+                .map(|snapshot| snapshot.image.clone())
                 .expect("snapshot present");
             assert_eq!(decoded.dimensions(), original.dimensions());
             assert_eq!(decoded.as_raw(), original.as_raw());
@@ -435,7 +477,7 @@ mod tests {
     #[test]
     fn parallel_png_encode_empty_is_ok_and_writes_nothing() {
         let dir = unique_temp_dir("encode_empty");
-        save_overlay_snapshots_parallel(&dir, &[], None).expect("empty encode must succeed");
+        save_overlay_snapshots_parallel(&dir, &[], None, None).expect("empty encode must succeed");
         // Matches sequential: no directory created, no files written for an empty snapshot set.
         assert!(
             !dir.exists(),
@@ -460,10 +502,14 @@ mod tests {
         for px in img.pixels_mut() {
             *px = image::Rgba([1, 2, 3, 255]);
         }
-        let snapshots: Vec<(usize, String, Arc<RgbaImage>)> =
-            vec![(7, "001".to_string(), Arc::new(img))];
+        let snapshots = vec![OverlaySaveSnapshot {
+            page_idx: 7,
+            stem: "001".to_string(),
+            image: Arc::new(img),
+            generation: 0,
+        }];
 
-        let err = save_overlay_snapshots_parallel(&file_as_dir, &snapshots, None)
+        let err = save_overlay_snapshots_parallel(&file_as_dir, &snapshots, None, None)
             .expect_err("create_dir_all over an existing file must fail, not return Ok");
         // The error must carry the offending path as diagnostic context, not be an opaque failure.
         let msg = err.to_string();
@@ -492,10 +538,14 @@ mod tests {
             *px = image::Rgba([9, 8, 7, 255]);
         }
         // page_idx 5 maps to stem "002"; only this page targets the blocked path.
-        let snapshots: Vec<(usize, String, Arc<RgbaImage>)> =
-            vec![(5, "002".to_string(), Arc::new(img))];
+        let snapshots = vec![OverlaySaveSnapshot {
+            page_idx: 5,
+            stem: "002".to_string(),
+            image: Arc::new(img),
+            generation: 0,
+        }];
 
-        let err = save_overlay_snapshots_parallel(&dir, &snapshots, None)
+        let err = save_overlay_snapshots_parallel(&dir, &snapshots, None, None)
             .expect_err("saving over an existing directory path must fail, not return Ok");
         let msg = err.to_string();
         assert!(
@@ -505,6 +555,36 @@ mod tests {
         assert!(
             msg.contains("002.png"),
             "error must include the failing target path; got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The autosave writer must not persist a snapshot whose page was detached after the
+    /// snapshot was taken (deterministic replay of the take -> detach -> write race).
+    #[test]
+    fn parallel_encode_skips_snapshots_of_detached_pages() {
+        let dir = unique_temp_dir("encode_detached");
+        let model = Mutex::new(CleanOverlaysModel::new_from_pages(&[PathBuf::from(
+            "001.png",
+        )]));
+        let snapshots = {
+            let mut guard = model.lock().expect("model lock");
+            let mut img = RgbaImage::new(4, 4);
+            for px in img.pixels_mut() {
+                *px = image::Rgba([255, 255, 255, 255]);
+            }
+            guard.replace_from_rgba(0, img);
+            guard.take_dirty_save_snapshots()
+        };
+        assert_eq!(snapshots.len(), 1);
+        assert!(model.lock().expect("model lock").detach_page_overlay(0));
+
+        save_overlay_snapshots_parallel(&dir, &snapshots, None, Some(&model))
+            .expect("guarded encode must succeed");
+        assert!(
+            !dir.join("001.png").exists(),
+            "a detached page's snapshot must not be written"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

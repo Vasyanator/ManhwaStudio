@@ -23,11 +23,13 @@ Notes:
 This tab is NOT a `CanvasView`. It never executes structural operations itself:
 it only emits `PageManagerAction::RequestOp`, and the app quiesces writers,
 executes the op, reloads the project, and calls `notify_pages_changed`.
-All disk work (thumbnail decode, `layers.json` scans) runs on the worker in
-`thumbs.rs`; shared-model locks are short and revision-gated per frame.
+All disk work (thumbnail decode, `layers.json` scans, and clean assignment
+operations) runs on workers; shared-model locks are short and revision-gated
+per frame.
 */
 
 mod dialogs;
+mod clean;
 mod grid;
 mod thumbs;
 
@@ -46,6 +48,7 @@ use crate::project::ProjectData;
 use crate::widgets::WheelSpinBox;
 
 use dialogs::PageManagerDialog;
+use clean::CleanRuntime;
 use thumbs::ThumbRuntime;
 
 /// File name of the layer manifest inside a layers directory. Persistence
@@ -88,6 +91,21 @@ pub struct PageManagerTabState {
 
     /// Thumbnail decode + manifest scan worker and the LRU thumbnail cache.
     thumbs: ThumbRuntime,
+    /// Dedicated worker for orphan scans and clean attachment/destruction I/O.
+    clean_runtime: CleanRuntime,
+    /// Most recent worker scan, also used to flag size-mismatched card overlays.
+    orphan_cleans: Vec<crate::models::clean_assign::OrphanClean>,
+    selected_orphan: Option<usize>,
+    /// Current orphan-scan epoch; results from older epochs are dropped
+    /// (mirrors the `scan_epoch` pattern of the layers scan).
+    clean_scan_epoch: u64,
+    /// Epoch a scan job has already been submitted for.
+    clean_scan_requested_epoch: Option<u64>,
+    /// Epoch whose scan result has been applied.
+    clean_scan_done_epoch: Option<u64>,
+    clean_op_in_flight: bool,
+    clean_dialog: Option<clean::CleanDialog>,
+    clean_picker_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 
     // --- badge caches, recomputed only when the source revision changes ---
     /// `BubblesModel::revision` the counts were computed at.
@@ -130,6 +148,15 @@ impl Default for PageManagerTabState {
             selection_anchor: None,
             move_to_position: 1,
             thumbs: ThumbRuntime::default(),
+            clean_runtime: CleanRuntime::default(),
+            orphan_cleans: Vec::new(),
+            selected_orphan: None,
+            clean_scan_epoch: 0,
+            clean_scan_requested_epoch: None,
+            clean_scan_done_epoch: None,
+            clean_op_in_flight: false,
+            clean_dialog: None,
+            clean_picker_rx: None,
             bubbles_revision_seen: None,
             bubble_counts: HashMap::new(),
             bubble_total: 0,
@@ -181,6 +208,24 @@ impl PageManagerTabState {
         self.layer_doc_version_seen = None;
         self.resident_layer_counts.clear();
         self.manifest_layer_counts.clear();
+        self.orphan_cleans.clear();
+        self.selected_orphan = None;
+        // New epoch: any in-flight scan result is stale (page indices may have
+        // shifted) and a fresh scan is requested on the next frame. A pending
+        // clean confirmation or picker also refers to pre-reload indices.
+        self.clean_scan_epoch = self.clean_scan_epoch.wrapping_add(1);
+        self.clean_scan_requested_epoch = None;
+        self.clean_scan_done_epoch = None;
+        self.clean_dialog = None;
+        self.clean_picker_rx = None;
+    }
+
+    /// True while a clean attach/detach/delete/probe worker job is running. The
+    /// app root gates structural page operations and project saves on this: those
+    /// flows reload or merge page-indexed state that the clean worker is mutating.
+    #[must_use]
+    pub fn clean_op_in_flight(&self) -> bool {
+        self.clean_op_in_flight
     }
 
     /// Per-frame entry point. Renders the toolbar, the card grid, the status
@@ -200,8 +245,10 @@ impl PageManagerTabState {
 
         self.ensure_project(project);
         self.absorb_worker_events(ctx);
+        self.absorb_clean_events(project);
         self.refresh_badges(page_count);
         self.request_layers_scan_if_needed(project);
+        self.request_clean_scan_if_needed(project);
         self.clamp_selection(page_count);
 
         egui::Panel::top("page_manager_toolbar").show(ui, |ui| {
@@ -212,6 +259,8 @@ impl PageManagerTabState {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             self.draw_grid(ui, project, page_infos, op_in_progress, &mut actions);
+            ui.separator();
+            self.draw_orphan_cleans(ui, project, page_infos, op_in_progress);
         });
 
         // The create dialog seeds its default size from a neighbouring page:
@@ -239,6 +288,8 @@ impl PageManagerTabState {
         }
         let size_of = move |idx: usize| known_sizes.get(&idx).copied();
         self.draw_dialogs(ctx, page_count, &size_of, op_in_progress, &mut actions);
+        self.poll_clean_picker(project, page_infos);
+        self.draw_clean_dialog(ctx, project, page_infos, op_in_progress);
 
         // Keep frames coming while background work is pending so its results land.
         if self.thumbs.has_in_flight()
@@ -246,6 +297,9 @@ impl PageManagerTabState {
                 .dialog
                 .as_ref()
                 .is_some_and(PageManagerDialog::picker_active)
+            || self.clean_scan_in_flight()
+            || self.clean_op_in_flight
+            || self.clean_picker_rx.is_some()
         {
             ctx.request_repaint();
         }
@@ -492,7 +546,8 @@ impl PageManagerTabState {
             "page_manager.status.summary",
             pages = page_count,
             cleaned = cleaned,
-            bubbles = self.bubble_total
+            bubbles = self.bubble_total,
+            orphans = self.orphan_cleans.len()
         ));
     }
 }

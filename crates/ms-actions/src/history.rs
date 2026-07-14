@@ -239,6 +239,25 @@ impl<A: ReversibleAction> ActionHistory<A> {
         self.undo_weight = 0;
     }
 
+    /// Remove every undo AND redo entry for which `keep` returns `false`,
+    /// preserving the order of the retained entries, and recompute the undo
+    /// weight (the one place the running sum is rebuilt by iteration, because
+    /// arbitrary mid-stack entries may leave).
+    ///
+    /// Contract: the caller must only remove entries whose absence keeps the
+    /// remaining stacks valid — the removed actions must be independent of every
+    /// retained action (for example, per-page raster diffs when ALL of one
+    /// page's entries are removed at once). The engine cannot verify this.
+    pub fn retain(&mut self, mut keep: impl FnMut(&A) -> bool) {
+        self.undo.retain(|action| keep(action));
+        self.redo.retain(|action| keep(action));
+        self.undo_weight = self
+            .undo
+            .iter()
+            .map(ReversibleAction::weight)
+            .fold(0usize, usize::saturating_add);
+    }
+
     /// Push an applied action onto the undo stack, add its weight to the running
     /// sum, and evict the oldest entries (front) beyond the count/weight caps.
     fn push_undo(&mut self, action: A) {

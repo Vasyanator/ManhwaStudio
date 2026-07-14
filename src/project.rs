@@ -942,6 +942,10 @@ fn reconcile_legacy_cleaned_names(pages: &[Page], overlay_dir: &Path) -> Result<
         }
         let source_path = &sources[0];
         // `page_number` is 1-based; pages are stored in reading order.
+        let target_page = &pages[page_number - 1];
+        if !clean_dimensions_match_page(source_path, target_page, "cleaned-reconcile") {
+            continue;
+        }
         let desired_stem = page_stems[page_number - 1];
         let desired_path = overlay_dir.join(format!("{desired_stem}.png"));
         if storage().exists(desired_path.to_string_lossy().as_ref()) {
@@ -992,6 +996,39 @@ fn legacy_cleaned_page_number(stem: &str) -> Option<usize> {
         return None;
     }
     parts.last().and_then(|last| last.parse::<usize>().ok())
+}
+
+/// Returns whether an overlay can safely be assigned to `page` by a reconcile pass.
+///
+/// Header probe failures and size mismatches are logged and treated as non-matches so the file is
+/// preserved in place for orphan management instead of being silently assigned.
+fn clean_dimensions_match_page(clean_path: &Path, page: &Page, log_scope: &str) -> bool {
+    let clean_size = image::image_dimensions(clean_path);
+    let page_size = image::image_dimensions(&page.path);
+    match (clean_size, page_size) {
+        (Ok(clean_size), Ok(page_size)) if clean_size == page_size => true,
+        (Ok(clean_size), Ok(page_size)) => {
+            runtime_log::log_info(format!(
+                "[{log_scope}] leaving '{}' in place: clean size {}x{} differs from page '{}' size {}x{}",
+                clean_path.display(), clean_size.0, clean_size.1, page.path.display(), page_size.0, page_size.1
+            ));
+            false
+        }
+        (Err(err), _) => {
+            runtime_log::log_info(format!(
+                "[{log_scope}] leaving unreadable clean '{}' in place: {err}",
+                clean_path.display()
+            ));
+            false
+        }
+        (_, Err(err)) => {
+            runtime_log::log_info(format!(
+                "[{log_scope}] cannot validate clean '{}' because page '{}' is unreadable: {err}",
+                clean_path.display(), page.path.display()
+            ));
+            false
+        }
+    }
 }
 
 /// Returns `true` when `overlay_dir`'s files are exactly the canonical page sequence
@@ -1133,6 +1170,12 @@ fn reconcile_clean_overlay_names(pages: &[Page], overlay_dir: &Path) -> Result<(
         let (page_idx, desired_stem, desired_path) = &page_candidates[0];
         let source_path = &overlay_candidates[0];
         if storage().exists(desired_path.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let Some(page) = pages.iter().find(|page| page.idx == *page_idx) else {
+            continue;
+        };
+        if !clean_dimensions_match_page(source_path, page, "overlay-reconcile") {
             continue;
         }
 
@@ -2242,25 +2285,73 @@ mod tests {
     #[test]
     fn reconcile_legacy_cleaned_names_maps_to_page_stems() -> Result<(), Box<dyn std::error::Error>>
     {
-        let dir = unique_temp_dir("cleaned_names");
+        let root = unique_temp_dir("cleaned_names");
+        let dir = root.join("clean");
+        let src = root.join("src");
         std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&src)?;
         // Modern three-digit zero-padded page stems.
         let pages: Vec<super::Page> = (1..=3)
             .map(|n| super::Page {
                 idx: n - 1,
-                path: std::path::PathBuf::from(format!("/src/{n:03}.png")),
+                path: src.join(format!("{n:03}.png")),
             })
             .collect();
-        // Legacy cleaned files use the `<group>_<page>` numbering; content is irrelevant here.
-        for legacy in ["1_1.png", "1_2.png", "1_3.png"] {
-            std::fs::write(dir.join(legacy), b"x")?;
+        // Reconcile validates both source and clean headers before assigning by position.
+        for (page, legacy) in pages.iter().zip(["1_1.png", "1_2.png", "1_3.png"]) {
+            std::fs::write(&page.path, png_bytes()?)?;
+            std::fs::write(dir.join(legacy), png_bytes()?)?;
         }
         super::reconcile_legacy_cleaned_names(&pages, &dir)?;
         assert!(dir.join("001.png").exists());
         assert!(dir.join("002.png").exists());
         assert!(dir.join("003.png").exists());
         assert!(!dir.join("1_1.png").exists());
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn fuzzy_clean_reconcile_requires_matching_dimensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("clean_size_reconcile");
+        let src = root.join("src");
+        let clean = root.join("clean");
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&clean)?;
+        let page_path = src.join("001.png");
+        image::RgbaImage::new(8, 8).save(&page_path)?;
+        let pages = [super::Page { idx: 0, path: page_path }];
+
+        image::RgbaImage::new(8, 8).save(clean.join("1.png"))?;
+        super::reconcile_clean_overlay_names(&pages, &clean)?;
+        assert!(clean.join("001.png").exists());
+
+        std::fs::remove_file(clean.join("001.png"))?;
+        image::RgbaImage::new(9, 8).save(clean.join("1.png"))?;
+        super::reconcile_clean_overlay_names(&pages, &clean)?;
+        assert!(clean.join("1.png").exists());
+        assert!(!clean.join("001.png").exists());
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_clean_reconcile_leaves_size_mismatch_in_place()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("legacy_clean_size_reconcile");
+        let src = root.join("src");
+        let clean = root.join("clean");
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&clean)?;
+        let page_path = src.join("001.png");
+        image::RgbaImage::new(8, 8).save(&page_path)?;
+        image::RgbaImage::new(9, 8).save(clean.join("1_1.png"))?;
+        let pages = [super::Page { idx: 0, path: page_path }];
+        super::reconcile_legacy_cleaned_names(&pages, &clean)?;
+        assert!(clean.join("1_1.png").exists());
+        assert!(!clean.join("001.png").exists());
+        std::fs::remove_dir_all(&root).ok();
         Ok(())
     }
 

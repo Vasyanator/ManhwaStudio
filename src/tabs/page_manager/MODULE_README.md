@@ -13,6 +13,7 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
    |-- toolbar (top Panel)      structural buttons, disabled while an op runs
    |-- card grid (CentralPanel) virtualized rows, selection, context menu
    |-- status line (bottom)     totals: pages / with clean / bubbles
+   |-- orphan-clean section     worker-scanned invalid clean files and attachment candidates
    `-- dialogs (Windows)        insert / create-blank / delete-confirm
 ```
 
@@ -35,6 +36,11 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   abandons queued jobs before joining the worker.
 - The native `rfd` file picker for "insert pages" is blocking and therefore
   runs on its own worker thread; the wasm build resolves it as a cancelled pick.
+- `clean.rs` owns a second, serial worker for `clean_assign` scans, image decoding/resizing,
+  and destructive clean-file operations. It receives immutable project snapshots, locks
+  `CleanOverlaysModel` only after decode, reports completion through `mpsc`, and triggers a
+  fresh orphan scan after each operation. The GUI only does candidate arithmetic from known
+  page dimensions; it never reads clean files or decodes images.
 
 ## Files and submodules
 - `mod.rs`: public contract (`PageManagerTabState`, `PageManagerAction`),
@@ -47,6 +53,8 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   (`default_blank_size`, unit-tested), and the background file picker.
 - `thumbs.rs`: worker thread + generic LRU `ThumbCache` (unit-tested) + the
   `layers.json` layer-count scan.
+- `clean.rs`: clean worker protocol, attachment-candidate ordering and persistence-path helpers
+  (unit-tested), orphan section, and clean-operation confirmations.
 
 ## Contracts and invariants
 - The tab is NOT a `CanvasView` and must not become one; it holds no page
@@ -63,11 +71,28 @@ draw(ctx, ui, project, page_infos, op_in_progress) -> Vec<PageManagerAction>
   `crates/ms-i18n/locales/en.json` and `ru.json`; `.pageop_trash` and
   `layers.json` are persistence identifiers (i18n-exempt), surfaced only via
   placeholders.
+- A clean attach/detach/delete/probe sets a local in-flight flag until its worker reply. The
+  gate is MUTUAL: clean buttons and dialog confirmation are disabled while `op_in_progress`
+  (structural op / save), and the app root refuses `start_page_op` / `request_save_to_project`
+  while `clean_op_in_flight()` is true — a clean worker holds page indices and an Arc of the
+  current overlays model, which a reload/merge would invalidate.
+- Orphan scans are epoch-tagged (same pattern as the layers scan): `notify_pages_changed`, the
+  refresh button, and every finished clean operation bump the epoch; a scan result from a
+  superseded epoch is dropped. A completed clean operation always rescans (in every outcome,
+  including partial failure), so a retained size-mismatched committed clean is visible both as
+  an orphan and as a card warning badge.
+- "Replace clean from file" probes the picked file on the worker (header dimensions -> real
+  `AttachFit`) before showing the confirmation dialog, so the dialog warns about scaling and an
+  incompatible image is rejected with a localized error instead of being silently resized.
+- Worker failures distinguish partial success (`CleanOpError`): an attach whose source cleanup
+  failed and a detach whose file trashing partially failed report exactly what was applied.
 
 ## Editing map
 - To add a toolbar operation: `mod.rs` (`draw_toolbar`) and, if it needs
   confirmation/input, a dialog in `dialogs.rs`.
 - To change card visuals/badges or selection behavior: `grid.rs`.
 - To change thumbnail decoding, caching, or the layer-count scan: `thumbs.rs`.
+- To change orphan clean discovery or content operations: `clean.rs` and the GUI-free
+  `models/clean_assign.rs` contract.
 - To change what the app must execute: extend `PageManagerAction` (coordinate
   with the app-root integration and `src/page_ops/`).

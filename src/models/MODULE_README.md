@@ -32,12 +32,16 @@ to refresh local mask caches.
 ## Files and submodules
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
   coalesced background saving.
+- `clean_assign.rs`: worker-thread filesystem API for discovering orphan clean images,
+  checking attachment fit, decoding/resizing attachments, and moving committed files to trash.
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, dirty
   tracking, autosave snapshots, and cached decoded page images.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.
 - `mod.rs`: module declarations for the shared model layer.
 
 ## Contracts and invariants
+- Every `clean_assign` public function that accesses images or files is synchronous and must run
+  on a worker thread. Unreadable clean images remain visible to callers as diagnostic orphans.
 - Do not hold model locks during long operations or disk I/O. Clone snapshots first.
 - To read a single bubble (or its `extra` map) by id, use `BubblesModel::with_bubble` /
   `extra_of` instead of `snapshot()`; they look up via `bubble_index_by_id` and avoid cloning
@@ -67,6 +71,16 @@ to refresh local mask caches.
   is a planned Phase 2c follow-up). Because `RasterDiff` works in straight-alpha space, a synced
   `ColorImage` pixel can differ from a directly-blitted one by at most premultiplication rounding for
   partial alpha; the save/export RGBA cache is bit-exact.
+- `detach_page_overlay` (page-manager clean management) selectively removes the page's undo/redo
+  entries (per-page raster diffs are independent across pages, so other pages keep their history)
+  and bumps the page's detach generation. `OverlaySaveSnapshot` carries that generation: writers
+  that persist snapshots WITHOUT holding the model lock must use `save_overlay_snapshots_guarded`
+  (or the autosave's guarded path), which skips stale pages before writing and removes a file
+  written for a page detached mid-write, so an in-flight save can never resurrect a detached
+  clean layer. `restore_dirty_save_snapshots` likewise skips stale snapshots on failure restore.
+- `clean_assign::trash_clean_file` accepts only paths that stay strictly inside one of the two
+  managed clean folders after lexical component validation (no `..`/root re-anchoring); anything
+  else is rejected with a typed `TrashCleanError` before any filesystem access.
 - Page cache eviction and population must not make canvas/export results depend on whether caching
   is enabled; it is a performance cache only.
 - Decoded source-page cache entries are always clean and reconstructable from page files; memory

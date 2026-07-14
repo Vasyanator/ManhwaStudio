@@ -64,7 +64,7 @@ use crate::memory_manager::{
     current_memory_availability, select_eviction_candidates,
 };
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings, write_bubbles_snapshot_to};
-use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snapshots_to};
+use crate::models::clean_overlays_model::{CleanOverlaysModel, save_overlay_snapshots_guarded};
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::{ComicType, ProjectData, save_comic_type_to_project_file};
 use crate::page_ops::{PageOpKind, PageOpOutcome, execute_page_op};
@@ -836,6 +836,12 @@ impl MangaApp {
             runtime_log::log_info("[page_op] request ignored while another persistence operation is active");
             return;
         }
+        // A clean attach/detach worker holds page indices and an Arc of the CURRENT model;
+        // reloading the project under it would misapply or lose the clean operation.
+        if self.page_manager_tab.clean_op_in_flight() {
+            runtime_log::log_info("[page_op] request ignored while a clean-layer operation is in flight");
+            return;
+        }
         self.canvas.flush_pending_bubble_upserts_now(&self.project);
         self.ps_editor_tab.flush_layers(&self.project);
         drop(self.typing_tab.flush_text_layers());
@@ -871,9 +877,7 @@ impl MangaApp {
                 Ok(mut bubbles) => bubbles.pause_saver_for_page_op(),
                 Err(_) => {
                     if let Ok(mut overlays) = overlays_model.lock() {
-                        overlays.restore_dirty_save_indexes(
-                            dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx),
-                        );
+                        overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
                     }
                     let _ = tx.send(Err(t!("page_manager.op_lock_error").to_string()));
                     return;
@@ -889,9 +893,13 @@ impl MangaApp {
                     ));
                 }
             }
-            if let Err(err) = save_overlay_snapshots_to(&paths.unsaved_clean_layers_dir, &dirty_overlay_snapshots) {
+            if let Err(err) = save_overlay_snapshots_guarded(
+                &paths.unsaved_clean_layers_dir,
+                &dirty_overlay_snapshots,
+                &overlays_model,
+            ) {
                 if let Ok(mut overlays) = overlays_model.lock() {
-                    overlays.restore_dirty_save_indexes(dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx));
+                    overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
                 }
                 if tx.send(Err(format!("failed to flush dirty overlays: {err}"))).is_err() {
                     runtime_log::log_error("[page_op] result receiver dropped after overlay flush failure");
@@ -900,7 +908,7 @@ impl MangaApp {
             }
             if let Err(err) = write_bubbles_snapshot_to(&paths.unsaved_bubbles_file, bubbles_snapshot.as_slice()) {
                 if let Ok(mut overlays) = overlays_model.lock() {
-                    overlays.restore_dirty_save_indexes(dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx));
+                    overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
                 }
                 if tx.send(Err(format!("failed to flush translation bubbles: {err}"))).is_err() {
                     runtime_log::log_error("[page_op] result receiver dropped after bubbles flush failure");
@@ -1021,6 +1029,17 @@ impl MangaApp {
             ));
             return;
         }
+        // A clean attach/detach worker mutates the overlays model and moves clean files while it
+        // runs; merging staging into the committed chapter mid-operation could persist a half
+        // applied state. The clean worker finishes within moments, so the user simply retries.
+        if self.page_manager_tab.clean_op_in_flight() {
+            runtime_log::log_info("[save_to_project] trigger ignored while a clean-layer operation is in flight");
+            self.save_to_project_status = Some((
+                t!("app.save.blocked_by_clean_operation").to_string(),
+                0.0,
+            ));
+            return;
+        }
         match save_trigger_decision(
             self.save_to_project_rx.is_some(),
             self.pending_save_after_preload,
@@ -1121,13 +1140,13 @@ impl MangaApp {
                 .difference(&failed_pages)
                 .copied()
                 .collect();
-            if let Err(err) =
-                save_overlay_snapshots_to(&unsaved_clean_layers_dir, &dirty_overlay_snapshots)
-            {
+            if let Err(err) = save_overlay_snapshots_guarded(
+                &unsaved_clean_layers_dir,
+                &dirty_overlay_snapshots,
+                &clean_overlays_model,
+            ) {
                 if let Ok(mut overlays) = clean_overlays_model.lock() {
-                    overlays.restore_dirty_save_indexes(
-                        dirty_overlay_snapshots.iter().map(|(idx, _, _)| *idx),
-                    );
+                    overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
                 }
                 let _ = tx.send(Err(format!(
                     "failed to flush dirty overlays into '{}': {err}",
@@ -1734,16 +1753,30 @@ impl MangaApp {
     }
 
     /// Switches to a page-capable tab and applies the selected page without letting viewport
-    /// snapshot synchronization overwrite the explicit focus.
+    /// snapshot synchronization overwrite the explicit focus: setting
+    /// `active_viewport_owner_tab` to the destination makes the next
+    /// `apply_shared_viewport_to_active_canvas` skip its snapshot re-apply.
     fn open_page_in_tab(&mut self, tab: AppTab, page_idx: usize) {
         self.active_tab = tab;
         self.shared_page_idx = page_idx;
         self.shared_page_center = None;
         let zoom = self.shared_canvas_viewport.zoom;
+        // Center of the page in page-local source pixels when its metadata is already loaded.
+        // `None` defers the center to the canvas: `CanvasView::focus_page` keeps the request
+        // pending and resolves the center from `PageImageInfo` once the page is known.
+        let center = self.page_infos.get(&page_idx).and_then(|info| {
+            if info.width_px == 0 || info.height_px == 0 {
+                return None;
+            }
+            Some(egui::vec2(
+                info.width_px as f32 * 0.5,
+                info.height_px as f32 * 0.5,
+            ))
+        });
         match tab {
-            AppTab::Translation => self.canvas.focus_page(page_idx, None, zoom),
-            AppTab::Cleaning => self.cleaning_tab.focus_page(page_idx, None, zoom),
-            AppTab::Typing => self.typing_tab.focus_page(page_idx, None, zoom),
+            AppTab::Translation => self.canvas.focus_page(page_idx, center, zoom),
+            AppTab::Cleaning => self.cleaning_tab.focus_page(page_idx, center, zoom),
+            AppTab::Typing => self.typing_tab.focus_page(page_idx, center, zoom),
             AppTab::PageManager
             | AppTab::PsEditor
             | AppTab::Characters
@@ -3389,7 +3422,7 @@ fn spawn_text_render_font_pool_prewarm() {
 
 fn spawn_loader_thread(
     pages: Vec<(usize, PathBuf)>,
-    overlay_candidates: Vec<(usize, PathBuf)>,
+    overlay_candidates: Vec<(usize, PathBuf, PathBuf)>,
     tx: SyncSender<LoaderEvent>,
     overlay_tx: SyncSender<OverlayLoaderEvent>,
     cache_pages_immediately: bool,
@@ -3406,8 +3439,10 @@ fn spawn_loader_thread(
             .chain(
                 overlay_candidates
                     .into_iter()
-                    .filter(|(_, path)| path.is_file())
-                    .map(|(idx, path)| LoaderJob::CleanOverlay { idx, path }),
+                    .filter_map(|(idx, path, page_path)| {
+                        clean_overlay_candidate_is_compatible(&path, &page_path)
+                            .then_some(LoaderJob::CleanOverlay { idx, path })
+                    }),
             )
             .collect();
         if merged.is_empty() {
@@ -3523,6 +3558,34 @@ fn spawn_loader_thread(
     });
 }
 
+/// Checks an overlay candidate on the loader thread and warns about mismatched files.
+///
+/// Warning dedup needs no retained state: each candidate is examined exactly once per
+/// loader spawn (the single filtering pass in `spawn_loader_thread`), so the warning is
+/// naturally scoped to one project load instead of accumulating paths for the whole
+/// process lifetime.
+fn clean_overlay_candidate_is_compatible(clean_path: &Path, page_path: &Path) -> bool {
+    if !clean_path.is_file() {
+        return false;
+    }
+    let Ok(clean_size) = image::image_dimensions(clean_path) else {
+        // Decode will provide the existing detailed failure event for unreadable overlays.
+        return true;
+    };
+    let Ok(page_size) = image::image_dimensions(page_path) else {
+        // Source decode will report its own error; do not hide an otherwise decodable overlay.
+        return true;
+    };
+    if clean_size == page_size {
+        return true;
+    }
+    runtime_log::log_warn(format!(
+        "[overlay-loader] skipping '{}' size {}x{}: source page '{}' size is {}x{}",
+        clean_path.display(), clean_size.0, clean_size.1, page_path.display(), page_size.0, page_size.1
+    ));
+    false
+}
+
 fn should_seed_page_cache_on_initial_load(
     cache_pages_enabled: bool,
     memory_budget: crate::memory_manager::MemoryBudget,
@@ -3596,9 +3659,9 @@ fn decode_page(idx: usize, path: &Path, cache_page_rgba: bool) -> Result<Decoded
     })
 }
 
-/// Candidate clean-overlay files for every page, in page order. Existence is NOT checked here:
-/// the unified loader thread (`spawn_loader_thread`) stats the candidates off the GUI thread.
-fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PathBuf)> {
+/// Candidate clean-overlay files and their source pages, in page order. Existence and header
+/// dimensions are checked by `spawn_loader_thread`, off the GUI thread.
+fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PathBuf, PathBuf)> {
     project
         .pages
         .iter()
@@ -3609,7 +3672,7 @@ fn collect_overlay_job_candidates(project: &ProjectData) -> Vec<(usize, PathBuf)
                 .and_then(|s| s.to_str())
                 .unwrap_or("overlay");
             let candidate = project.paths.clean_layers_dir.join(format!("{stem}.png"));
-            (page.idx, candidate)
+            (page.idx, candidate, page.path.clone())
         })
         .collect()
 }

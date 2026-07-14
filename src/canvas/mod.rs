@@ -175,7 +175,7 @@ Key CanvasView state groups (important fields):
   `active_rect_handle`, `aside_drag_state`, `bubble_history`, `pending_history_before`,
   `pending_*`, `focused_bubbles`, `deferred_remote_*`, `canvas_context_menu_target`.
 - Page/view state: `page_rects`, `scroll_center_idx`, `scroll_offset`, `visible_scene_rect`,
-  `scroll_inner_rect`, `pending_zoom_anchor`, `pending_scroll_offset`.
+  `scroll_inner_rect`, `pending_zoom_anchor`, `pending_scroll_offset`, `pending_focus`.
 - Overlay runtime: `overlays_visible`, `overlay_images`, `overlay_textures`,
   `overlay_dirty_tiles`, `overlay_prepare_*`, `overlay_prepared_pages`,
   `overlay_upload_min_interval_s`, `overlay_last_upload_s`.
@@ -196,7 +196,7 @@ use self::helpers::*;
 use self::overlay_runtime::OverlayRuntimeState;
 use self::scene::CanvasSceneState;
 use self::settings::CanvasSettingsRuntime;
-use self::types::{OverlayUploadBudget, RuntimeBubble};
+use self::types::{OverlayUploadBudget, PendingPageFocus, RuntimeBubble};
 use crate::app::{PageImageInfo, PageTexture};
 use crate::bubble_status::BubbleBorderStyle;
 use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest};
@@ -1006,6 +1006,9 @@ impl CanvasView {
         self.scene.scroll_offset = scroll_offset;
         self.scene.pending_scroll_offset = Some(scroll_offset);
         self.scene.pending_zoom_anchor = None;
+        // A snapshot restore is a full explicit viewport and the newest navigation intent: it
+        // supersedes any not-yet-applied deferred page focus.
+        self.scene.pending_focus = None;
         self.scene.initial_horizontal_scroll_centered = true;
     }
 
@@ -1030,15 +1033,47 @@ impl CanvasView {
     /// Scrolls/zooms so that `center_px` (page-local source pixels) of `page_idx` is centered in
     /// the viewport at `zoom`. Inverse of [`Self::current_page_local_view_center`].
     ///
-    /// Requires the target page to have been laid out (its world rect is known from a prior
-    /// frame); when it has not, only the zoom is applied. The page layout is zoom-independent, so
-    /// a stale-but-present world rect from the last draw still positions the page correctly.
+    /// The zoom applies immediately; the scroll target is recorded as a deferred focus request
+    /// (`center_px == None` means "the center of the page", resolved from `PageImageInfo` at
+    /// apply time). `try_apply_pending_focus` applies the request from `draw` as soon as the
+    /// page's world rect is known, so focusing a canvas that has never been laid out (e.g. a tab
+    /// that was never opened) scrolls right after its first frame instead of being lost. A newer
+    /// `focus_page` or [`Self::apply_viewport_snapshot`] call replaces the pending request.
     pub fn focus_page(&mut self, page_idx: usize, center_px: Option<Vec2>, zoom: f32) {
         self.state.zoom = zoom.clamp(0.2, 5.0);
-        let zoom = self.state.zoom;
-        let (Some(center), Some(world_rect)) = (center_px, self.page_world_rect(page_idx)) else {
-            return;
+        // The focus is the newest navigation intent: stale zoom-anchor / raw-offset requests
+        // must not override it when the next draw resolves its scroll offset.
+        self.scene.pending_zoom_anchor = None;
+        self.scene.pending_scroll_offset = None;
+        self.scene.pending_focus = Some(PendingPageFocus {
+            page_idx,
+            center_px,
+        });
+    }
+
+    /// Applies a pending [`Self::focus_page`] request if it is resolvable: the page's world rect
+    /// must be known from a scene layout (the layout is zoom-independent, so a stale-but-present
+    /// rect from the last draw is fine) and the focus center must be explicit or derivable from
+    /// `page_infos`. Returns `true` when the request was applied (and cleared); an unresolvable
+    /// request stays pending for a later call. Invoked from `draw` twice: before the frame clears
+    /// the previous layout (same-frame apply for an already-laid-out canvas) and after the scene
+    /// pass (freshly opened canvas whose first layout just happened).
+    fn try_apply_pending_focus(&mut self, page_infos: &HashMap<usize, PageImageInfo>) -> bool {
+        let Some(request) = self.scene.pending_focus else {
+            return false;
         };
+        let center = request.center_px.or_else(|| {
+            page_infos
+                .get(&request.page_idx)
+                .and_then(page_info_content_size)
+                .map(|size| size * 0.5)
+        });
+        let (Some(center), Some(world_rect)) = (center, self.page_world_rect(request.page_idx))
+        else {
+            return false;
+        };
+        self.scene.pending_focus = None;
+        let zoom = self.state.zoom;
         let viewport = self
             .scene
             .scroll_inner_rect
@@ -1050,6 +1085,7 @@ impl CanvasView {
         self.scene.pending_scroll_offset = Some(offset);
         self.scene.pending_zoom_anchor = None;
         self.scene.initial_horizontal_scroll_centered = true;
+        true
     }
 
     pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
@@ -1220,6 +1256,10 @@ impl CanvasView {
         let canvas_rect = ui.max_rect();
         let (suppress_wheel_scroll, zoom_drag_active) =
             self.handle_shortcuts(ctx, project, canvas_rect);
+        // Deferred focus, pass 1: an already-laid-out canvas still holds last frame's world rects
+        // here, so a between-frames `focus_page` (tab switch, PS-editor return) resolves into
+        // `pending_scroll_offset` before the scene pass below consumes it — a same-frame apply.
+        self.try_apply_pending_focus(page_infos);
         self.scene.page_rects.clear();
         self.scene.page_world_rects.clear();
         self.scene.page_aside_widths.clear();
@@ -1278,6 +1318,15 @@ impl CanvasView {
         self.scene.scroll_content_size = scroll_output.content_size;
         self.cache_scrollbar_rects(ctx, scroll_output.inner_rect, scroll_output.content_size);
         self.scene.pending_zoom_anchor = None;
+        // Deferred focus, pass 2: a canvas drawn for the first time (or whose page metadata only
+        // just loaded) gained its world rects in the scene pass above. The resolved offset lands
+        // in `pending_scroll_offset` for the next frame, so request that frame explicitly. This
+        // also overrides the `scroll_offset` read-back so `viewport_snapshot()` already reports
+        // the focus target. An unresolvable request (page metadata still loading) stays pending
+        // without repaint-spinning: the metadata arrival triggers the next repaint.
+        if self.try_apply_pending_focus(page_infos) {
+            ctx.request_repaint();
+        }
         // Pointer-up fallback for positional drags whose widget never delivered `drag_stopped()`
         // (e.g. the dragged page scrolled fully off-screen mid-drag, so its widget stopped being
         // rendered). This runs AFTER the scene draw pass, so a normally-finishing gesture has
@@ -2825,6 +2874,95 @@ mod tests {
             Some(snapshot.scroll_offset)
         );
         assert!(canvas.scene.pending_zoom_anchor.is_none());
+    }
+
+    /// Builds a loaded `PageImageInfo` for the deferred-focus tests.
+    fn page_info(width_px: u32, height_px: u32) -> PageImageInfo {
+        PageImageInfo {
+            width_px,
+            height_px,
+            load_state: crate::app::SourcePageLoadState::Available,
+        }
+    }
+
+    #[test]
+    fn focus_page_defers_until_layout_and_center_are_known() {
+        let mut canvas = CanvasView::default();
+        let mut page_infos: HashMap<usize, PageImageInfo> = HashMap::new();
+
+        canvas.focus_page(3, None, 1.5);
+
+        // Zoom applies immediately; the scroll target stays pending: no layout, no page info.
+        assert!((canvas.zoom() - 1.5).abs() <= f32::EPSILON);
+        assert!(canvas.scene.pending_scroll_offset.is_none());
+        assert!(!canvas.try_apply_pending_focus(&page_infos));
+        assert!(canvas.scene.pending_focus.is_some());
+
+        // A known world rect alone is not enough while the implicit center is unresolvable.
+        canvas.scene.page_world_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::ZERO); 3];
+        canvas
+            .scene
+            .page_world_rects
+            .push(Rect::from_min_size(egui::pos2(50.0, 100.0), egui::vec2(200.0, 400.0)));
+        canvas.scene.scroll_inner_rect =
+            Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)));
+        assert!(!canvas.try_apply_pending_focus(&page_infos));
+        assert!(canvas.scene.pending_focus.is_some());
+
+        // Page metadata arrives: the request applies once and clears itself.
+        page_infos.insert(3, page_info(200, 400));
+        assert!(canvas.try_apply_pending_focus(&page_infos));
+        assert!(canvas.scene.pending_focus.is_none());
+        // content center = (world_min + page_size/2) * zoom = (225, 450);
+        // offset = center - viewport/2 = (-175, 150) -> x clamps to 0.
+        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(0.0, 150.0)));
+        assert_eq!(canvas.scene.scroll_offset, egui::vec2(0.0, 150.0));
+        assert!(canvas.scene.initial_horizontal_scroll_centered);
+        // Applied request is gone: the next call is a no-op.
+        assert!(!canvas.try_apply_pending_focus(&page_infos));
+    }
+
+    #[test]
+    fn focus_page_with_explicit_center_applies_from_last_layout() {
+        let mut canvas = CanvasView::default();
+        canvas.scene.page_world_rects =
+            vec![Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 300.0))];
+        canvas.scene.scroll_inner_rect =
+            Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 200.0)));
+
+        canvas.focus_page(0, Some(egui::vec2(50.0, 150.0)), 2.0);
+
+        // An explicit center needs no page info: an empty map still resolves.
+        assert!(canvas.try_apply_pending_focus(&HashMap::new()));
+        // content center = (50, 150) * 2.0 = (100, 300); offset = (100, 300) - (200, 100).
+        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(0.0, 200.0)));
+        assert!(canvas.scene.pending_focus.is_none());
+    }
+
+    #[test]
+    fn newer_navigation_request_supersedes_pending_focus() {
+        let mut canvas = CanvasView::default();
+
+        // The newest focus_page replaces the pending request and drops a stale raw offset.
+        canvas.scene.pending_scroll_offset = Some(egui::vec2(11.0, 22.0));
+        canvas.focus_page(1, Some(egui::vec2(10.0, 10.0)), 1.0);
+        canvas.focus_page(2, None, 1.0);
+        assert!(canvas.scene.pending_scroll_offset.is_none());
+        assert_eq!(
+            canvas.scene.pending_focus,
+            Some(crate::canvas::types::PendingPageFocus {
+                page_idx: 2,
+                center_px: None,
+            })
+        );
+
+        // A snapshot restore is newer still: it drops the pending focus entirely.
+        canvas.apply_viewport_snapshot(CanvasViewportSnapshot {
+            zoom: 1.0,
+            scroll_offset: egui::vec2(5.0, 6.0),
+        });
+        assert!(canvas.scene.pending_focus.is_none());
+        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(5.0, 6.0)));
     }
 
     #[test]

@@ -4,7 +4,8 @@ File: tabs/page_manager/dialogs.rs
 Purpose:
 Modal dialogs of the page-manager tab: "Insert pages" (native file picker on a
 worker thread), "Create blank page" (size/color/position), and the delete
-confirmation with attachment counts.
+confirmation with attachment counts. It also supplies the background native
+picker used by the clean replacement flow.
 
 Key structures:
 - PageManagerDialog: which dialog is open, with its state.
@@ -203,6 +204,28 @@ fn spawn_files_picker() -> Receiver<Option<Vec<PathBuf>>> {
             .pick_files();
         let _ = tx.send(files);
     });
+    rx
+}
+
+/// Starts the single-image picker used for replacement clean layers.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn spawn_clean_picker() -> Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+    thread::spawn(move || {
+        let file = rfd::FileDialog::new()
+            .add_filter(t!("page_manager.clean_picker_filter"), &["png", "jpg", "jpeg"])
+            .pick_file();
+        let _ = tx.send(file);
+    });
+    rx
+}
+
+/// Web fallback for the replacement-clean picker.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn spawn_clean_picker() -> Receiver<Option<PathBuf>> {
+    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+    crate::runtime_log::log_warn("[page_manager] native clean picker unavailable on web build");
+    let _ = tx.send(None);
     rx
 }
 

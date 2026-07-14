@@ -3,8 +3,8 @@ File: tabs/page_manager/grid.rs
 
 Purpose:
 Card grid of the page-manager tab: virtualized rows of page cards (thumbnail,
-page number, file name, pixel size, badges), plus selection handling and the
-per-card context menu.
+page number, file name, pixel size, badges), plus selection handling, clean
+content actions, and the per-card context menu.
 
 Key structures:
 - CardThumb: per-frame snapshot of a card's thumbnail visual state.
@@ -293,6 +293,9 @@ impl PageManagerTabState {
         }
 
         let clean = self.clean_present.get(idx).copied().unwrap_or(false);
+        let clean_size_mismatch = self.orphan_cleans.iter().any(|orphan| {
+            matches!(orphan.reason, crate::models::clean_assign::OrphanReason::SizeMismatch { page_idx, .. } if page_idx == idx)
+        });
         let bubbles = self.bubble_counts.get(&idx).copied().unwrap_or(0);
         let layers = self.effective_layer_count(idx);
         ui.horizontal_wrapped(|ui| {
@@ -308,6 +311,9 @@ impl PageManagerTabState {
                     )
                     .selectable(false),
                 );
+            }
+            if clean_size_mismatch {
+                ui.colored_label(ui.visuals().warn_fg_color, t!("page_manager.card.clean_size_mismatch_badge"));
             }
             ui.add(
                 egui::Label::new(tf!("page_manager.card.bubbles_badge", count = bubbles))
@@ -337,6 +343,19 @@ impl PageManagerTabState {
             {
                 actions.push(PageManagerAction::OpenPageIn { tab, page_idx: idx });
             }
+        }
+        ui.separator();
+        // Clean mutations are blocked both by their own worker flag and by any
+        // structural op / save in flight (`op_in_progress`), mirroring the reverse
+        // gate in the app root (`start_page_op` / `request_save_to_project`).
+        let clean_blocked = self.clean_op_in_flight || op_in_progress;
+        let clean_present = self.clean_present.get(idx).copied().unwrap_or(false);
+        if ui.add_enabled(!clean_blocked, egui::Button::new(t!("page_manager.clean_replace_button"))).clicked() {
+            self.selection = [idx].into_iter().collect();
+            self.start_replace_clean_picker(op_in_progress);
+        }
+        if ui.add_enabled(!clean_blocked && clean_present, egui::Button::new(t!("page_manager.clean_detach_button"))).clicked() {
+            self.start_detach_clean(idx, op_in_progress);
         }
         ui.separator();
         if ui

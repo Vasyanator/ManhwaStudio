@@ -114,6 +114,16 @@ pub(crate) struct PendingZoomAnchor {
     pub(crate) world_focus: Vec2,
 }
 
+/// Deferred `CanvasView::focus_page` request. Recorded when the target page's world rect (or its
+/// page-info-derived center) is not resolvable yet and applied by the draw pass once it is.
+/// `center_px == None` means "the center of the page in source pixels", resolved from
+/// `PageImageInfo` at apply time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PendingPageFocus {
+    pub(crate) page_idx: usize,
+    pub(crate) center_px: Option<Vec2>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OverlayUploadBudget {
     pub(crate) tile_budget: usize,
