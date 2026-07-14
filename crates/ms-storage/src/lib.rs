@@ -127,6 +127,17 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// if it is a directory, or [`StorageError::Io`] on backend failure.
     fn read(&self, path: &str) -> Result<Vec<u8>>;
 
+    /// Reads at most the first `max_len` bytes of the file at `path`.
+    ///
+    /// Returns fewer bytes when the file is shorter than `max_len` (an empty
+    /// vector for an empty file). Intended for header sniffing (magic bytes)
+    /// without paying for a whole-file read.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if it does not exist, [`StorageError::IsADirectory`]
+    /// if it is a directory, or [`StorageError::Io`] on backend failure.
+    fn read_prefix(&self, path: &str, max_len: usize) -> Result<Vec<u8>>;
+
     /// Writes `data` to `path`, truncating any existing file.
     ///
     /// The parent directory must already exist.

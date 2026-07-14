@@ -815,13 +815,13 @@ fn remove_placeholder_on_error(dst_path: &Path, original: anyhow::Error) -> anyh
 /// Returns an error if the file cannot be opened or read; a file shorter than three bytes
 /// returns `Ok(false)`.
 fn file_is_jpeg(path: &Path) -> Result<bool> {
-    // The storage seam exposes only whole-file reads, so the full file is loaded to inspect its
-    // three magic bytes. A file shorter than three bytes cannot be a JPEG and yields `Ok(false)`,
-    // matching the previous `UnexpectedEof` handling of the header read.
-    let bytes = storage()
-        .read(path.to_string_lossy().as_ref())
+    // Only the three magic bytes are inspected, so read a bounded prefix instead of the whole
+    // file: this runs for every image in up to three directories on each chapter open. A file
+    // shorter than three bytes cannot be a JPEG and yields `Ok(false)`.
+    let header = storage()
+        .read_prefix(path.to_string_lossy().as_ref(), 3)
         .with_context(|| format!("failed to read header of {}", path.display()))?;
-    Ok(bytes.starts_with(&[0xFF, 0xD8, 0xFF]))
+    Ok(header.starts_with(&[0xFF, 0xD8, 0xFF]))
 }
 
 fn collect_images(dir: &Path) -> Result<Vec<Page>> {

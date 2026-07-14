@@ -100,6 +100,17 @@ impl Storage for MemStorage {
         }
     }
 
+    fn read_prefix(&self, path: &str, max_len: usize) -> Result<Vec<u8>, StorageError> {
+        let comps = path::normalize(path)?;
+        let root = self.read_root();
+        match lookup(&root, &comps) {
+            // Clamp to the stored length so a short file yields its full contents.
+            Some(Node::File(data)) => Ok(data[..data.len().min(max_len)].to_vec()),
+            Some(Node::Dir(_)) => Err(StorageError::IsADirectory(path.to_string())),
+            None => Err(StorageError::NotFound(path.to_string())),
+        }
+    }
+
     fn write(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
         let comps = path::normalize(path)?;
         let (name, parents) = comps

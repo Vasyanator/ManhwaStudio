@@ -90,6 +90,11 @@ mod screen_capture;
 // double-interface panels (General/AiBackend/Tutorials).
 mod settings_shared;
 mod storage;
+// Studio window startup shell: opens the window immediately and runs the project load on
+// a background thread behind a loading screen, then swaps in `MangaApp`. Native-only: it
+// wraps the native windowed startup flow (`run_main_window`), which does not exist on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+mod studio_bootstrap;
 mod tabs;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
@@ -292,16 +297,11 @@ fn run_main() -> anyhow::Result<()> {
             return Ok(());
         };
 
-        // Detect resume_unsaved: look for a {chapter}_unsaved folder next to the chapter.
-        let resume_unsaved = detect_unsaved_for_project(&project_dir);
-        let project = if resume_unsaved {
-            project::ProjectData::load_resume_unsaved(&project_dir, &user_settings)
-        } else {
-            project::ProjectData::load(&project_dir, &user_settings)
-        }
-        .with_context(|| format!("failed to load project at {}", project_dir.display()))?;
-
-        match run_main_window(project, ai_backend.clone())? {
+        // The project load (unsaved detection + `ProjectData::load*`) runs on a background
+        // thread inside `run_main_window`, so the studio window opens immediately with a
+        // loading screen instead of blocking here with no window on screen. A load failure
+        // is shown in-window and resolves through the same `RunResult` mechanism.
+        match run_main_window(project_dir, &user_settings, ai_backend.clone())? {
             RunResult::Exit => return Ok(()),
             RunResult::ReturnToLauncher => {
                 // Clear the --project CLI flag so the launcher is shown next iteration.
@@ -1351,13 +1351,14 @@ enum VersionPart {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main_window(
-    project: project::ProjectData,
+    project_dir: PathBuf,
+    user_settings: &serde_json::Value,
     ai_backend: ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<RunResult> {
     let title = format!(
         "ManhwaStudio v{} - {}",
         env!("CARGO_PKG_VERSION"),
-        project.project_dir.display()
+        project_dir.display()
     );
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -1380,13 +1381,18 @@ fn run_main_window(
     let return_to_launcher_flag = Arc::new(AtomicBool::new(false));
     let flag_for_app = Arc::clone(&return_to_launcher_flag);
 
+    // Start the project load before the window opens; the bootstrap shell shows a loading
+    // screen until the receiver yields, then constructs `MangaApp` in place.
+    let load_rx =
+        studio_bootstrap::spawn_project_load_thread(project_dir, user_settings.clone());
+
     eframe::run_native(
         &title,
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
-            Ok(Box::new(app::MangaApp::new(
-                project,
+            Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
+                load_rx,
                 ai_backend.clone(),
                 flag_for_app,
             )))

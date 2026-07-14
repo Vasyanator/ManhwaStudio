@@ -14,7 +14,7 @@ The top-level flow is:
 ```text
 main.rs / args.rs
     -> config.rs + python_manager.rs + ms_log (runtime_log/trace)
-    -> launcher/ or ProjectData::load()
+    -> launcher/ or studio_bootstrap.rs (background ProjectData::load behind a loading screen)
     -> MangaApp
     -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel
     -> tabs/* through shared CanvasView + CanvasHooks
@@ -24,10 +24,13 @@ main.rs / args.rs
 `main.rs` owns process startup and hidden service flags. It prepares runtime logging, validates or
 discovers a project, starts installer/update/launcher flows when needed, handles direct `--update`
 entry, custom/existing install update entry, and hidden `--continue-update` continuation into the
-update window, and constructs `MangaApp` for an opened chapter.
+update window, and opens the studio window for an opened chapter. The studio window starts as
+`StudioBootstrapApp` (`studio_bootstrap.rs`), which runs `ProjectData::load*` on a background
+thread behind a loading screen and swaps in `MangaApp` once the project snapshot is ready.
 
 `MangaApp` in `app.rs` is the editor root. It creates shared models, wires them into tabs and
-canvas instances, starts page/overlay loaders, seeds the source-page CPU cache from the initial
+canvas instances, starts one unified background loader pool that decodes source pages and clean
+overlays from a single page-ordered queue, seeds the source-page CPU cache from the initial
 page decode when both canvas caching and the memory profile allow it, throttles GPU uploads, routes
 the active tab, and dispatches global hotkeys. It should coordinate subsystems, not absorb
 feature-specific domain logic.
@@ -51,9 +54,12 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   validation, launcher handoff, direct project opening, and Linux/Windows integration hooks.
 - `args.rs`: `clap` CLI contract, including visible startup/update flags, the update-check test
   override, and hidden installer/update continuation flags.
-- `app.rs`: root `eframe::App`, shared model construction, tab wiring, page/overlay worker
-  polling, source-page geometry metadata, incremental texture upload and source GPU trimming,
-  shared viewport sync, AI backend health wiring, and global hotkey dispatch.
+- `app.rs`: root `eframe::App`, shared model construction, tab wiring, unified source-page +
+  clean-overlay loader polling, source-page geometry metadata, incremental texture upload and
+  source GPU trimming, shared viewport sync, AI backend health wiring, and global hotkey dispatch.
+- `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
+  the background project load behind a loading screen (or an error screen with exit/return-to-
+  launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it.
 - `project.rs`: chapter data models, project path discovery, project/settings loading,
   legacy `scr`/`src` and `cleaned`/`clean_layers` folder normalization, magic-byte JPEG->PNG
   conversion in `src`/`cleaned`/`clean_layers`, clean-layer filename normalization (including the
@@ -182,10 +188,13 @@ Startup first resolves config and runtime paths, initializes logging, handles hi
 and either opens a validated project or starts the Rust launcher. The launcher returns a typed
 outcome to startup; it does not start the editor on its own.
 
-When a chapter opens, `ProjectData::load` builds the typed project snapshot. `MangaApp::new`
-constructs `BubblesModel`, `CleanOverlaysModel`, and `TextMaskModel`, shares them with tabs, and
-starts page/overlay decode workers. Page image decode and clean overlay preparation happen off the
-GUI thread; the GUI thread uploads texture tiles incrementally with a per-frame budget. Source-page
+When a chapter opens, `ProjectData::load` builds the typed project snapshot on a background thread
+while `StudioBootstrapApp` shows a loading screen. `MangaApp::new` then constructs `BubblesModel`,
+`CleanOverlaysModel`, and `TextMaskModel`, shares them with tabs, and starts one unified decode
+pool that interleaves source pages and clean overlays in page order; overlays are applied to
+`CleanOverlaysModel` as they arrive (no in-order promotion), while source pages keep strict
+in-order promotion. Page image decode and clean overlay preparation happen off the GUI thread; the
+GUI thread uploads texture tiles incrementally with a per-frame budget. Source-page
 dimensions are kept separately from source GPU texture handles so canvas layout can remain stable
 after GPU cache eviction.
 
@@ -297,6 +306,7 @@ prompts instead of blocking the GUI thread.
   legacy bubble format migration: `project.rs`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,
   active tab routing, viewport sync, or global hotkeys: `app.rs`.
+- Studio window startup shell, background project load, loading/error screens: `studio_bootstrap.rs`.
 - Canvas layout, zoom, scrolling, bubble interaction, overlay runtime, or canvas settings:
   `canvas/`.
 - Shared bubble, clean overlay, or text detector mask state: `models/`.

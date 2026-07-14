@@ -54,6 +54,32 @@ fn write_read_roundtrip() {
 }
 
 #[test]
+fn read_prefix_is_bounded_and_typed() {
+    let (stores, _g) = backends();
+    for s in &stores {
+        s.create_dir_all("d").unwrap();
+        s.write("d/f.bin", b"abcdef").unwrap();
+        // File longer than max_len: only the prefix comes back.
+        assert_eq!(s.read_prefix("d/f.bin", 3).unwrap(), b"abc");
+        // File exactly max_len long: the whole contents.
+        assert_eq!(s.read_prefix("d/f.bin", 6).unwrap(), b"abcdef");
+        // File shorter than max_len: everything there is, no padding.
+        assert_eq!(s.read_prefix("d/f.bin", 100).unwrap(), b"abcdef");
+        // Zero-length prefix of a real file is an empty vec, not an error.
+        assert_eq!(s.read_prefix("d/f.bin", 0).unwrap(), b"");
+        // Error surface matches `read`.
+        assert!(matches!(
+            s.read_prefix("nope", 3).unwrap_err(),
+            StorageError::NotFound(_)
+        ));
+        assert!(matches!(
+            s.read_prefix("d", 3).unwrap_err(),
+            StorageError::IsADirectory(_)
+        ));
+    }
+}
+
+#[test]
 fn write_without_parent_fails() {
     let (stores, _g) = backends();
     for s in &stores {
