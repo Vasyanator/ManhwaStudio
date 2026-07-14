@@ -57,14 +57,16 @@ crates/ag-psd/
 !egui-docs/api/symbols.txt
 !egui-docs/VERSION
 
-# Maintained helper tooling (generators, checkers). Source only.
+# The egui-docs generator. Scoped to this one directory on purpose: `tools/` also
+# holds local helper scripts whose publication status is a separate decision, and a
+# broad `!tools/**` allowlist would silently publish them.
 !tools/
-!tools/**/
-!tools/**/*.py
-!tools/**/*.sh
-!tools/**/MODULE_README.md
-tools/**/__pycache__/
-tools/**/*.py[cod]
+!tools/egui_docs/
+!tools/egui_docs/*.py
+!tools/egui_docs/*.sh
+!tools/egui_docs/MODULE_README.md
+tools/egui_docs/__pycache__/
+tools/egui_docs/*.py[cod]
 
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/
