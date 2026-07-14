@@ -26,6 +26,10 @@ Core behavior:
   each edit is stored as a tiled, zstd-compressed, reversible straight-RGBA delta (`RasterDiff`),
   bounded by a 128-step count cap AND a per-memory-profile COMPRESSED byte budget; the redo branch
   is discarded after a new head commit.
+- `detach_page_overlay` (page-manager clean management) selectively drops the detached page's
+  undo/redo entries and bumps the page's detach generation; `OverlaySaveSnapshot` carries the
+  generation so lock-free save writers (`save_overlay_snapshots_guarded`, the overlay autosave)
+  discard in-flight snapshots of a detached page instead of resurrecting its PNG.
 - Supports "cache pages immediately" mode via `cache_pages_enabled`; when disabled, page cache can
   still be populated lazily for specific pages when needed by tools.
 
@@ -210,6 +214,26 @@ impl ReversibleAction for CleanOverlayDiffOp {
     }
 }
 
+/// One dirty overlay page captured for a background save pass.
+///
+/// `generation` is the page's detach generation at capture time
+/// ([`CleanOverlaysModel::detach_page_overlay`] bumps it). A writer that
+/// persists this snapshot without holding the model lock must re-check
+/// [`CleanOverlaysModel::overlay_snapshot_is_current`] after writing and remove
+/// the file when the check fails, so a concurrent detach can never be
+/// resurrected by an in-flight save.
+#[derive(Debug, Clone)]
+pub struct OverlaySaveSnapshot {
+    /// Page index in the model's page order.
+    pub page_idx: usize,
+    /// File stem (source page basename without extension); the file is `<stem>.png`.
+    pub stem: String,
+    /// Straight-alpha RGBA pixels, shared with the model.
+    pub image: Arc<RgbaImage>,
+    /// Detach generation of the page at capture time.
+    pub generation: u64,
+}
+
 #[derive(Debug)]
 pub struct CleanOverlaysModel {
     overlays: Vec<Option<ColorImage>>,
@@ -228,6 +252,10 @@ pub struct CleanOverlaysModel {
     revision: u64,
     dirty_indexes: HashSet<usize>,
     save_dirty_indexes: HashSet<usize>,
+    /// Per-page detach generation. `detach_page_overlay` bumps it; save writers
+    /// compare it against the generation captured in an [`OverlaySaveSnapshot`]
+    /// to discard snapshots (and files written from them) that predate a detach.
+    detach_generations: Vec<u64>,
     has_project_unsaved_changes: bool,
     visibility_dirty: bool,
     /// Unified undo/redo engine. Each entry is a reversible tiled+zstd overlay
@@ -268,6 +296,7 @@ impl CleanOverlaysModel {
             revision: 1,
             dirty_indexes: HashSet::new(),
             save_dirty_indexes: HashSet::new(),
+            detach_generations: vec![0; sorted_pages.len()],
             has_project_unsaved_changes: false,
             visibility_dirty: true,
             // Start with the count cap and a default (Medium-profile) byte budget;
@@ -860,6 +889,48 @@ impl CleanOverlaysModel {
         self.mark_dirty(idx);
     }
 
+    /// Detaches the clean layer from `idx` without creating an autosave deletion snapshot.
+    ///
+    /// Both synchronized representations become virtual-absent. This is intended for a workflow
+    /// that has already moved or deleted (or is about to move) the backing file on a worker
+    /// thread; it updates runtime subscribers but deliberately leaves the page out of the save
+    /// dirty set. Two additional invalidations happen here:
+    /// - the page's undo/redo history entries are removed SELECTIVELY (per-page raster diffs are
+    ///   independent across pages, so other pages keep their history; a full `clear` would
+    ///   needlessly destroy it). Otherwise an undo could re-materialize the page and a later
+    ///   save would resurrect the trashed PNG;
+    /// - the page's detach generation is bumped, invalidating any in-flight
+    ///   [`OverlaySaveSnapshot`] so a concurrent autosave/save pass cannot rewrite the file.
+    pub fn detach_page_overlay(&mut self, idx: usize) -> bool {
+        if idx >= self.overlays.len() {
+            return false;
+        }
+        self.history.retain(|op| op.page_idx != idx);
+        if let Some(generation) = self.detach_generations.get_mut(idx) {
+            *generation = generation.wrapping_add(1);
+        }
+        // Evaluate every removal independently: boolean short-circuiting here would leave the
+        // RGBA half materialized whenever the `ColorImage` half existed.
+        let had_color = self.overlays[idx].take().is_some();
+        let had_rgba = self.overlay_rgba_cache[idx].take().is_some();
+        let was_save_dirty = self.save_dirty_indexes.remove(&idx);
+        let changed = had_color || had_rgba || was_save_dirty;
+        if changed {
+            self.mark_runtime_changed(idx);
+        }
+        changed
+    }
+
+    /// Returns true when `snapshot`'s page has NOT been detached since the snapshot was
+    /// captured, i.e. a file written from it may be kept. A false result means the writer
+    /// must discard the snapshot and remove any file it already wrote from it.
+    #[must_use]
+    pub fn overlay_snapshot_is_current(&self, snapshot: &OverlaySaveSnapshot) -> bool {
+        self.detach_generations
+            .get(snapshot.page_idx)
+            .is_some_and(|generation| *generation == snapshot.generation)
+    }
+
     pub fn can_undo_overlay_history(&self) -> bool {
         self.history.can_undo()
     }
@@ -989,9 +1060,11 @@ impl CleanOverlaysModel {
     /// (tracked via `save_dirty_indexes`). Clears autosave dirty tracking after writing.
     /// The destination directory is created if it does not yet exist.
     pub fn save_dirty_to(&mut self, dir: &Path) -> anyhow::Result<()> {
+        // Runs entirely under `&mut self`, so a detach cannot interleave and the
+        // unguarded writer is race-free here.
         let snapshots = self.take_dirty_save_snapshots();
         if let Err(err) = save_overlay_snapshots_to(dir, &snapshots) {
-            self.restore_dirty_save_indexes(snapshots.iter().map(|(idx, _, _)| *idx));
+            self.restore_dirty_save_snapshots(&snapshots);
             return Err(err);
         }
         Ok(())
@@ -1010,7 +1083,7 @@ impl CleanOverlaysModel {
         self.has_project_unsaved_changes = false;
     }
 
-    pub fn take_dirty_save_snapshots(&mut self) -> Vec<(usize, String, Arc<RgbaImage>)> {
+    pub fn take_dirty_save_snapshots(&mut self) -> Vec<OverlaySaveSnapshot> {
         let dirty: Vec<usize> = self.save_dirty_indexes.drain().collect();
         dirty
             .into_iter()
@@ -1025,16 +1098,29 @@ impl CleanOverlaysModel {
                     .and_then(|n| std::path::Path::new(n).file_stem().and_then(|s| s.to_str()))
                     .unwrap_or("overlay")
                     .to_string();
-                Some((idx, stem, Arc::clone(image)))
+                Some(OverlaySaveSnapshot {
+                    page_idx: idx,
+                    stem,
+                    image: Arc::clone(image),
+                    generation: self.detach_generations.get(idx).copied().unwrap_or(0),
+                })
             })
             .collect()
     }
 
-    pub fn restore_dirty_save_indexes<I>(&mut self, indexes: I)
-    where
-        I: IntoIterator<Item = usize>,
-    {
-        self.save_dirty_indexes.extend(indexes);
+    /// Puts the dirty markers of failed-to-save snapshots back, so the next save pass
+    /// retries them. Snapshots whose page was detached since capture are skipped: their
+    /// pixels no longer exist in the model and re-marking the page would make the next
+    /// save write a stale (pre-detach) file.
+    pub fn restore_dirty_save_snapshots(&mut self, snapshots: &[OverlaySaveSnapshot]) {
+        // Collected first: the filter closure borrows `self` immutably, which cannot
+        // overlap the mutable borrow of `save_dirty_indexes` inside `extend`.
+        let current: Vec<usize> = snapshots
+            .iter()
+            .filter(|snapshot| self.overlay_snapshot_is_current(snapshot))
+            .map(|snapshot| snapshot.page_idx)
+            .collect();
+        self.save_dirty_indexes.extend(current);
     }
 
     fn mark_dirty(&mut self, idx: usize) {
@@ -1346,7 +1432,7 @@ fn transparent_overlay(w: usize, h: usize) -> ColorImage {
 
 pub fn save_overlay_snapshots_to(
     dir: &Path,
-    snapshots: &[(usize, String, Arc<RgbaImage>)],
+    snapshots: &[OverlaySaveSnapshot],
 ) -> anyhow::Result<()> {
     if snapshots.is_empty() {
         return Ok(());
@@ -1355,14 +1441,78 @@ pub fn save_overlay_snapshots_to(
     let store = crate::storage::storage();
     let dir_str = dir.to_string_lossy();
     store.create_dir_all(dir_str.as_ref())?;
-    for (_, stem, image) in snapshots {
-        let dst = dir.join(format!("{stem}.png"));
+    for snapshot in snapshots {
+        let dst = dir.join(format!("{}.png", snapshot.stem));
         let dst_str = dst.to_string_lossy();
         // Encode straight-alpha RGBA to PNG in memory (default encoder params,
         // identical to `RgbaImage::save`) before handing bytes to storage.
         let mut buf = Vec::new();
-        image.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        snapshot
+            .image
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
         store.write(dst_str.as_ref(), &buf)?;
+    }
+    Ok(())
+}
+
+/// Writes `snapshots` to `dir/<stem>.png` like [`save_overlay_snapshots_to`], but guards
+/// every page against a concurrent [`CleanOverlaysModel::detach_page_overlay`]: a page whose
+/// detach generation moved on is skipped before writing, and re-checked under a short model
+/// lock AFTER its write — a file written for a page detached mid-write is removed again, so
+/// an in-flight save can never resurrect a detached clean layer. Use this from every writer
+/// that persists snapshots without holding the model lock.
+///
+/// # Errors
+/// Returns the first encode/write failure. A poisoned model lock aborts with an error before
+/// any further writes (the guard cannot be evaluated).
+pub fn save_overlay_snapshots_guarded(
+    dir: &Path,
+    snapshots: &[OverlaySaveSnapshot],
+    model: &std::sync::Mutex<CleanOverlaysModel>,
+) -> anyhow::Result<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let store = crate::storage::storage();
+    let dir_str = dir.to_string_lossy();
+    store.create_dir_all(dir_str.as_ref())?;
+    for snapshot in snapshots {
+        // Cheap early skip: the page was already detached, do not even encode.
+        {
+            let guard = model
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clean overlay model lock is poisoned"))?;
+            if !guard.overlay_snapshot_is_current(snapshot) {
+                continue;
+            }
+        }
+        let dst = dir.join(format!("{}.png", snapshot.stem));
+        let dst_str = dst.to_string_lossy();
+        let mut buf = Vec::new();
+        snapshot
+            .image
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+        store.write(dst_str.as_ref(), &buf)?;
+        // Post-write reconcile: a detach that raced the (lock-free) encode/write above
+        // has already bumped the generation, so the file just written is stale.
+        let stale = {
+            let guard = model
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clean overlay model lock is poisoned"))?;
+            !guard.overlay_snapshot_is_current(snapshot)
+        };
+        if stale {
+            // The detach worker may have trashed the file already; a missing file is fine.
+            match store.remove_file(dst_str.as_ref()) {
+                Ok(()) | Err(ms_storage::StorageError::NotFound(_)) => {}
+                Err(err) => {
+                    crate::runtime_log::log_warn(format!(
+                        "[clean-overlays] could not remove stale overlay written during detach: {}: {err}",
+                        dst.display()
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1940,6 +2090,101 @@ mod tests {
         assert!(model.get(0).is_some());
         assert!(model.overlay_rgba(0).is_some());
         assert!(model.has_unsaved_overlay_changes());
+    }
+
+    #[test]
+    fn detach_overlay_restores_virtual_absence_without_save_dirty() {
+        let mut model = single_page_model();
+        model.replace_from_rgba(0, RgbaImage::new(4, 4));
+        assert!(model.save_dirty_indexes.contains(&0));
+        assert!(model.detach_page_overlay(0));
+        assert!(model.is_overlay_virtual_absent(0));
+        assert!(!model.save_dirty_indexes.contains(&0));
+    }
+
+    fn opaque_image(side: u32) -> RgbaImage {
+        let mut image = RgbaImage::new(side, side);
+        for px in image.pixels_mut() {
+            *px = image::Rgba([255, 255, 255, 255]);
+        }
+        image
+    }
+
+    #[test]
+    fn undo_after_detach_does_not_rematerialize_page() {
+        let mut model = single_page_model();
+        model.replace_from_rgba(0, opaque_image(4));
+        assert!(model.can_undo_overlay_history());
+
+        assert!(model.detach_page_overlay(0));
+
+        // The page's history entries are gone: undo has nothing to replay, so a
+        // later save cannot recreate the trashed PNG.
+        assert!(!model.can_undo_overlay_history());
+        assert!(!model.undo_overlay_history());
+        assert!(model.is_overlay_virtual_absent(0));
+        assert!(model.take_dirty_save_snapshots().is_empty());
+    }
+
+    #[test]
+    fn detach_invalidates_history_selectively_per_page() {
+        let mut model = multi_page_model(2);
+        model.replace_from_rgba(0, opaque_image(4));
+        model.replace_from_rgba(1, opaque_image(4));
+
+        assert!(model.detach_page_overlay(0));
+
+        // Page 1 keeps its undo step; undoing it must not touch the detached page.
+        assert!(model.can_undo_overlay_history());
+        assert!(model.undo_overlay_history());
+        assert!(model.is_overlay_virtual_absent(0));
+    }
+
+    #[test]
+    fn detach_invalidates_in_flight_save_snapshots() {
+        let mut model = single_page_model();
+        model.replace_from_rgba(0, opaque_image(4));
+        let snapshots = model.take_dirty_save_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert!(model.overlay_snapshot_is_current(&snapshots[0]));
+
+        assert!(model.detach_page_overlay(0));
+
+        assert!(!model.overlay_snapshot_is_current(&snapshots[0]));
+        // The failure-path restore must skip the stale snapshot so the next save
+        // pass does not resurrect the detached page.
+        model.restore_dirty_save_snapshots(&snapshots);
+        assert!(model.take_dirty_save_snapshots().is_empty());
+    }
+
+    #[test]
+    fn guarded_save_does_not_resurrect_detached_page() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("staging");
+        let model = std::sync::Mutex::new(single_page_model());
+        let file = dir.join("001.png");
+
+        // Deterministic model of the race: snapshots taken BEFORE the detach, the
+        // write attempted AFTER it — the guarded writer must leave no file behind.
+        let snapshots = {
+            let mut guard = model.lock().expect("model lock");
+            guard.replace_from_rgba(0, opaque_image(4));
+            guard.take_dirty_save_snapshots()
+        };
+        assert_eq!(snapshots.len(), 1);
+        assert!(model.lock().expect("model lock").detach_page_overlay(0));
+        save_overlay_snapshots_guarded(&dir, &snapshots, &model)?;
+        assert!(!file.exists(), "stale snapshot must not be persisted");
+
+        // A snapshot taken after a re-attach carries the new generation and is written.
+        let snapshots = {
+            let mut guard = model.lock().expect("model lock");
+            guard.replace_from_rgba(0, opaque_image(4));
+            guard.take_dirty_save_snapshots()
+        };
+        save_overlay_snapshots_guarded(&dir, &snapshots, &model)?;
+        assert!(file.exists(), "current snapshot must be persisted");
+        Ok(())
     }
 
     #[test]

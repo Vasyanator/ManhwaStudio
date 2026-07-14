@@ -3,7 +3,7 @@
 //! Usage:
 //! ```
 //! # let mut egui_ctx = egui::Context::default();
-//! # egui_ctx.begin_frame(Default::default());
+//! # egui_ctx.begin_pass(Default::default());
 //! puffin_egui::profiler_window(&egui_ctx);
 //! ```
 

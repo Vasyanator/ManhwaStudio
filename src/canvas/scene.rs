@@ -39,7 +39,7 @@ use super::bubble_on_top_ui;
 use super::helpers::page_info_content_size;
 use super::types::{
     CanvasContextMenuTarget, CanvasFrameParams, CanvasScenePageFrame, OverlayUploadBudget,
-    PendingZoomAnchor, SourceTextureUploadBudget,
+    PendingPageFocus, PendingZoomAnchor, SourceTextureUploadBudget,
 };
 use super::view_transform::DVec2;
 use super::{
@@ -86,6 +86,11 @@ pub(super) struct CanvasSceneState {
     pub(super) initial_horizontal_scroll_centered: bool,
     pub(super) pending_zoom_anchor: Option<PendingZoomAnchor>,
     pub(super) pending_scroll_offset: Option<Vec2>,
+    /// Deferred `CanvasView::focus_page` request waiting for the target page's world rect (and
+    /// its center, when not explicit) to become resolvable. Applied and cleared by
+    /// `CanvasView::try_apply_pending_focus` from the draw pass; a newer `focus_page` or
+    /// `apply_viewport_snapshot` call replaces/drops it.
+    pub(super) pending_focus: Option<PendingPageFocus>,
     pub(super) on_top_hit_rects: HashMap<i64, Rect>,
     pub(super) canvas_left_top_controls_rect: Option<Rect>,
     /// Natural content width (points) of the controls panel, measured last frame from the rows that
@@ -169,6 +174,7 @@ impl Default for CanvasSceneState {
             initial_horizontal_scroll_centered: false,
             pending_zoom_anchor: None,
             pending_scroll_offset: None,
+            pending_focus: None,
             on_top_hit_rects: HashMap::new(),
             canvas_left_top_controls_rect: None,
             controls_content_width: None,

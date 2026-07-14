@@ -457,3 +457,28 @@ fn set_weight_budget_enforces_against_existing_stack() {
     assert_eq!(hist.undo_weight(), 80);
     assert_eq!(hist.undo_len(), 2);
 }
+
+#[test]
+fn retain_drops_matching_entries_from_both_stacks_and_recomputes_weight() {
+    // Two independent cells; retain removes every entry touching cell 0 from
+    // BOTH stacks and rebuilds the undo weight from the survivors.
+    let mut ctx = vec![0, 0];
+    let mut hist: ActionHistory<WeightedOp> = ActionHistory::new(16);
+    hist.apply(WeightedOp::new(0, 1, 10), &mut ctx).expect("a");
+    hist.apply(WeightedOp::new(1, 2, 20), &mut ctx).expect("b");
+    hist.apply(WeightedOp::new(0, 3, 40), &mut ctx).expect("c");
+    // Move the newest cell-0 entry onto the redo stack too.
+    assert!(hist.undo(&mut ctx).expect("undo c"));
+    assert_eq!(hist.undo_weight(), 30);
+    assert!(hist.can_redo());
+
+    hist.retain(|op| op.index != 0);
+
+    // Only the cell-1 entry survives; the redo branch for cell 0 is gone.
+    assert_eq!(hist.undo_len(), 1);
+    assert!(!hist.can_redo());
+    assert_eq!(hist.undo_weight(), 20);
+    assert!(hist.undo(&mut ctx).expect("undo b"));
+    assert_eq!(ctx, vec![1, 0]);
+    assert!(!hist.can_undo());
+}
