@@ -291,20 +291,48 @@ the API that a language model has memorised from earlier versions (`eframe::App:
 merely produce dated code; it produces code that does not compile, or that compiles
 and misbehaves.
 
-Therefore, when touching UI code:
+Therefore `egui-docs/` is **mandatory reading, not a reference of last resort**. The
+rules below are obligations, not suggestions.
 
-* Read `egui-docs/README.md` first; it routes to the page for your task.
-* Decide whether an API exists by grepping the generated index, not by recall:
-  `grep -P '^egui::Panel::top\t' egui-docs/api/symbols.txt`. **A name absent from
-  `egui-docs/api/symbols.txt` does not exist in the version we build against.**
-* `egui-docs/` also records project rules that override egui defaults (the `Wheel*`
-  widgets replace `egui::Slider`/`ComboBox`; localized labels require a stable
-  `id_salt`).
+**Before touching any egui code — always:**
+
+1. Read `egui-docs/README.md`. It routes to the page for your task.
+2. **Read the pages covering every widget and mechanic your change touches**, before
+   you write the change - not after it fails to compile. Touching a panel or window
+   means reading `01-app-shell.md`; painting means `02-painting.md`; clicks, drags,
+   wheel or hotkeys mean `03-input.md`; a widget or settings pane means
+   `04-widgets.md`; a localized label or stored widget state means `05-ids-and-i18n.md`;
+   anything drawn on top of other UI means `06-overlays.md`. Reading only the page you
+   assume is relevant is not enough - a change usually spans several.
+3. Decide whether an API exists by grepping the generated index, never by recall:
+   `grep -P '^egui::Panel::top\t' egui-docs/api/symbols.txt`. **A name absent from
+   `egui-docs/api/symbols.txt` does not exist in the version we build against.** Do not
+   write an egui call you have not confirmed there.
+
+**When introducing new UI — choosing the widget is a decision you must justify from
+the docs, not from habit:**
+
+* Survey what already exists before you reach for a raw egui widget. `04-widgets.md`
+  lists the project's own widget set (`src/widgets/`); `egui-docs/api/egui.md` lists
+  every widget egui 0.35 actually ships. Pick the **most specific existing widget that
+  fits**, and only build a new one when nothing fits - then say why.
+* Some choices are already made for you and are not open to re-litigation: `egui::Slider`,
+  `egui::ComboBox`, and `egui::DragValue` are **forbidden** in product UI - use the
+  `Wheel*` replacements (`04-widgets.md` §0). An AI-gated action uses `AiButton`, not a
+  hand-threaded `add_enabled(..)`. A settings pane shared by studio and launcher uses the
+  double-interface pattern (`04-widgets.md` §7).
+* A new widget inherits the project's contracts: no literal user-visible strings
+  (`t!`/`tf!`/`tp!`), a stable `id_salt` on any localized label, and no blocking work on
+  the GUI thread.
+
+**Maintenance obligations:**
+
 * If you upgrade egui/eframe, the change is not complete until `tools/egui_docs/build.sh`
   has been run and its diff reviewed. `python3 tools/egui_docs/check_sync.py` fails
   when the docs drift from `Cargo.lock`.
 * When you learn a new egui-0.35 fact the hard way, add it to the relevant page - with
   a `file:line` citation into the crate source, which is that folder's standing rule.
+  A claim without a citation does not belong there.
 
 ---
 
