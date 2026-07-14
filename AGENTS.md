@@ -279,6 +279,33 @@ Before changing source code, use this order:
 4. Declaration comments of the functions, structs, and other items you touch.
 5. The code itself, its inline comments, and existing tests.
 
+For UI code, add one step before all of the above: read `egui-docs/README.md`. See
+"egui: never write it from memory" below.
+
+### egui: Never Write It From Memory
+
+The project builds against **egui / eframe 0.35**, which renamed or removed much of
+the API that a language model has memorised from earlier versions (`eframe::App::update`,
+`SidePanel`, `TopBottomPanel`, `Context::screen_rect`, `Rounding`, `id_source`,
+`InputState::raw_scroll_delta` - none of these exist here). Recalled egui does not
+merely produce dated code; it produces code that does not compile, or that compiles
+and misbehaves.
+
+Therefore, when touching UI code:
+
+* Read `egui-docs/README.md` first; it routes to the page for your task.
+* Decide whether an API exists by grepping the generated index, not by recall:
+  `grep -P '^egui::Panel::top\t' egui-docs/api/symbols.txt`. **A name absent from
+  `egui-docs/api/symbols.txt` does not exist in the version we build against.**
+* `egui-docs/` also records project rules that override egui defaults (the `Wheel*`
+  widgets replace `egui::Slider`/`ComboBox`; localized labels require a stable
+  `id_salt`).
+* If you upgrade egui/eframe, the change is not complete until `tools/egui_docs/build.sh`
+  has been run and its diff reviewed. `python3 tools/egui_docs/check_sync.py` fails
+  when the docs drift from `Cargo.lock`.
+* When you learn a new egui-0.35 fact the hard way, add it to the relevant page - with
+  a `file:line` citation into the crate source, which is that folder's standing rule.
+
 ---
 
 ## 4. Version Control
@@ -459,7 +486,9 @@ Always:
 5. Check whether a similar function already exists.
 6. Check the change against architectural layers.
 7. Ensure the change does not break project contracts from `README_AGENT.md`.
-8. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed, and update or add declaration and inline comments for the code you changed.
+8. If the file contains UI code, read `egui-docs/README.md` and verify every egui API you
+   are about to use against `egui-docs/api/symbols.txt`. Do not write egui from memory.
+9. After the edit, update `MODULE_README.md` and/or the file header if architectural responsibility changed, and update or add declaration and inline comments for the code you changed.
 
 ---
 

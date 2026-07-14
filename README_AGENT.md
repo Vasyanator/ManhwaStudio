@@ -20,7 +20,7 @@ New functionality belongs in Rust under `src/`.
 
 ## Стек технологий
 
-- **GUI**: `eframe` / `egui` (Rust, edition 2024)
+- **GUI**: `eframe` / `egui` **0.35** (upstream crates.io, без форка и `[patch]`). 0.35 переименовал/удалил значительную часть API, который модели помнят по 0.27–0.31 (`App::update`, `SidePanel`/`TopBottomPanel`, `screen_rect`, `Rounding`, `id_source`, `raw_scroll_delta` — ничего из этого здесь нет). **Перед любой правкой UI: `egui-docs/README.md`**; существование API проверять грепом по `egui-docs/api/symbols.txt`, а не по памяти
 - **Рендер текста**: `cosmic-text` (typing tab)
 - **Изображения**: `image` crate (RGBA), `egui::ColorImage` (GPU upload)
 - **IPC к Python backend**: framed IPC via `crate::backend_ipc` over a pluggable transport — AF_UNIX by default (Linux/Windows, default path from `backend_ipc::backend_socket_path()`) with a loopback WebSocket fallback on Windows; the transport-agnostic frame codec is `[u32 BE header_len][header_json][u32 BE blob_len][blob]`. Rust-side app-managed model downloads use the official `hf-hub` crate to resolve repository URLs, then stream files directly into `ManhwaStudio_AI_Models` without HF cache blobs or symlinks
