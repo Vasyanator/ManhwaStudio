@@ -21,6 +21,14 @@
 !README.md
 !README_AGENT.md
 
+# Published, human-facing documentation (including localized README translations).
+# Counterpart: dev-docs/ holds development-time plans, reports and changelogs and is
+# deliberately NOT whitelisted here — it stays out of the published repository.
+!docs/
+!docs/**/
+!docs/**/*.md
+!docs/**/*.png
+
 # Root runtime and helper scripts.
 !ai_backend.py
 !config.py
