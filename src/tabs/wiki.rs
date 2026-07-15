@@ -1,7 +1,16 @@
 /*
 FILE OVERVIEW: src/tabs/wiki.rs
-Wiki tab for rendering local Markdown docs from `wiki/` with file tabs and
+Wiki tab for rendering local Markdown docs from `wiki/<lang>/` with file tabs and
 an async image pipeline.
+
+Localized wiki layout:
+- `wiki/` holds one Markdown folder per UI language (`wiki/ru`, `wiki/en`, …) plus
+  a single shared `wiki/images/` tree, so screenshots are not duplicated per
+  language; the localized pages link them as `../images/...`.
+- the folder is picked from the ACTIVE UI locale's language subtag
+  (`resolve_locale_wiki_dir`): `wiki/<lang>` -> `wiki/en` -> `wiki/` itself, using
+  the first one that exists. Resolution happens in the scan worker, never on the
+  GUI thread, and the tab re-scans when the user switches the interface language.
 
 Main structs:
 - `WikiTabState`: tab state, selected file, async receivers, and image cache.
@@ -99,6 +108,13 @@ struct InlineSegment {
     is_bold: bool,
 }
 
+/// Root of the wiki tree, parent of the per-language Markdown folders and of the
+/// shared `images/` tree they link into.
+const WIKI_ROOT_DIR: &str = "wiki";
+
+/// Language folder used when the active UI language has no folder of its own.
+const WIKI_FALLBACK_LANGUAGE_DIR: &str = "en";
+
 /// Default display width of a wiki image as a fraction of the available content
 /// width when no `w=NN%` directive is present. Two default images fill one row.
 const WIKI_DEFAULT_IMAGE_WIDTH_FRACTION: f32 = 0.5;
@@ -119,7 +135,11 @@ enum WikiRowItem {
 }
 
 enum WikiScanResult {
-    Ok(Vec<WikiFileEntry>),
+    /// The language folder the scan settled on plus the Markdown files inside it.
+    Ok {
+        dir: PathBuf,
+        files: Vec<WikiFileEntry>,
+    },
     Err(String),
 }
 
@@ -142,7 +162,12 @@ enum WikiImageLoadResult {
 }
 
 pub struct WikiTabState {
+    /// Root of the wiki tree (`wiki/`), parent of the per-language folders.
+    wiki_root: PathBuf,
+    /// Language folder the last scan settled on; `wiki_root` until it reports.
     wiki_dir: PathBuf,
+    /// UI locale the current file list was scanned for; a change re-scans.
+    locale: ms_i18n::LocaleTag,
     files: Vec<WikiFileEntry>,
     selected_idx: Option<usize>,
     doc: Option<WikiDocument>,
@@ -155,10 +180,14 @@ pub struct WikiTabState {
 }
 
 impl WikiTabState {
+    /// Creates the tab and starts the first scan for the active UI language.
     pub fn new() -> Self {
         let (image_tx, image_rx) = channel();
+        let root = PathBuf::from(WIKI_ROOT_DIR);
         let mut state = Self {
-            wiki_dir: PathBuf::from("wiki"),
+            wiki_dir: root.clone(),
+            wiki_root: root,
+            locale: ms_i18n::active_locale(),
             files: Vec::new(),
             selected_idx: None,
             doc: None,
@@ -173,7 +202,10 @@ impl WikiTabState {
         state
     }
 
+    /// Draws the tab, re-scanning first if the user switched the interface
+    /// language since the last frame (the wiki folder is per-language).
     pub fn draw(&mut self, ui: &mut egui::Ui) {
+        self.sync_locale();
         self.poll_background(ui.ctx());
 
         ui.horizontal(|ui| {
@@ -484,7 +516,8 @@ impl WikiTabState {
         }
         for event in events {
             match event {
-                WikiScanResult::Ok(files) => {
+                WikiScanResult::Ok { dir, files } => {
+                    self.wiki_dir = dir;
                     self.files = files;
                     self.selected_idx = if self.files.is_empty() { None } else { Some(0) };
                     self.status = tf!("wiki.files_found", count = self.files.len());
@@ -562,14 +595,27 @@ impl WikiTabState {
         }
     }
 
+    /// Re-scans when the active UI locale no longer matches the one the current
+    /// file list was built for, so a language switch swaps `wiki/<lang>` live.
+    fn sync_locale(&mut self) {
+        let active = ms_i18n::active_locale();
+        if active == self.locale {
+            return;
+        }
+        self.locale = active;
+        self.refresh_files();
+    }
+
     fn refresh_files(&mut self) {
         self.status = t!("wiki.scanning").to_owned();
         self.doc = None;
         self.image_cache.clear();
-        let wiki_dir = self.wiki_dir.clone();
+        let root = self.wiki_root.clone();
+        // The language subtag alone selects the folder: `pt-BR` reads `wiki/pt`.
+        let language = self.locale.language().to_owned();
         let (tx, rx) = channel();
         self.scan_rx = Some(rx);
-        spawn_scan_thread(wiki_dir, tx);
+        spawn_scan_thread(root, language, tx);
     }
 
     fn load_selected_file(&mut self) {
@@ -619,16 +665,40 @@ impl Default for WikiTabState {
     }
 }
 
-fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
+/// Picks the wiki folder for `language`: `wiki/<language>` when it exists,
+/// otherwise the English folder, otherwise `root` itself.
+///
+/// `exists` reports whether a storage path is present; the caller supplies it so
+/// this stays a pure decision (the storage seam is queried on a worker thread, not
+/// the GUI thread). The last fallback keeps a wiki tree with no per-language
+/// folders — loose `.md` files dropped straight into `wiki/` — working.
+fn resolve_locale_wiki_dir(root: &Path, language: &str, exists: &dyn Fn(&Path) -> bool) -> PathBuf {
+    let localized = root.join(language);
+    if exists(&localized) {
+        return localized;
+    }
+    let english = root.join(WIKI_FALLBACK_LANGUAGE_DIR);
+    if exists(&english) {
+        return english;
+    }
+    root.to_path_buf()
+}
+
+fn spawn_scan_thread(root: PathBuf, language: String, tx: Sender<WikiScanResult>) {
     ms_thread::spawn(move || {
         // Routed through the storage seam so the web build scans its virtual store
         // instead of the desktop filesystem.
         let store = crate::storage::storage();
-        let wiki_dir_str = wiki_dir.to_string_lossy();
-        if let Err(err) = store.create_dir_all(wiki_dir_str.as_ref()) {
-            let _ = tx.send(WikiScanResult::Err(tf!("wiki.create_folder_error", wiki_dir = wiki_dir.display(), err = err)));
+        let root_str = root.to_string_lossy();
+        if let Err(err) = store.create_dir_all(root_str.as_ref()) {
+            let _ = tx.send(WikiScanResult::Err(tf!("wiki.create_folder_error", wiki_dir = root.display(), err = err)));
             return;
         }
+
+        let wiki_dir = resolve_locale_wiki_dir(&root, &language, &|dir: &Path| {
+            store.exists(dir.to_string_lossy().as_ref())
+        });
+        let wiki_dir_str = wiki_dir.to_string_lossy();
 
         let entries = match store.read_dir(wiki_dir_str.as_ref()) {
             Ok(entries) => entries,
@@ -654,7 +724,10 @@ fn spawn_scan_thread(wiki_dir: PathBuf, tx: Sender<WikiScanResult>) {
         }
         files.sort_by(|a, b| a.title.cmp(&b.title));
 
-        let _ = tx.send(WikiScanResult::Ok(files));
+        let _ = tx.send(WikiScanResult::Ok {
+            dir: wiki_dir,
+            files,
+        });
     });
 }
 
@@ -944,6 +1017,13 @@ fn find_next_bold_marker(text: &str, from: usize) -> Option<(usize, usize)> {
     Some((idx, marker_len))
 }
 
+/// Resolves a Markdown image destination against the page's folder.
+///
+/// Remote and absolute sources pass through unchanged. A relative source is
+/// joined onto `base_dir` and then lexically normalized (`.` dropped, `..`
+/// popping the previous component), because localized pages in `wiki/<lang>/`
+/// reach the shared tree as `../images/...` and the storage seam addresses
+/// entries by literal path, not by an OS-resolved one.
 fn resolve_image_source(base_dir: &Path, source: &str) -> String {
     if source.starts_with("http://") || source.starts_with("https://") {
         return source.to_owned();
@@ -952,10 +1032,41 @@ fn resolve_image_source(base_dir: &Path, source: &str) -> String {
     if path.is_absolute() {
         return path.to_string_lossy().to_string();
     }
-    base_dir
-        .join(relative_local_image_source_path(source))
-        .to_string_lossy()
-        .to_string()
+    let joined = base_dir.join(relative_local_image_source_path(source));
+    normalize_relative_path(&joined).to_string_lossy().to_string()
+}
+
+/// Lexically normalizes a relative path: drops `.` components and pops the
+/// previous component for each `..`.
+///
+/// A `..` with nothing left to pop is kept, so a source escaping above the wiki
+/// root stays visibly wrong (and fails to load) instead of silently resolving to
+/// an unrelated file. No filesystem access, so it is symlink-oblivious by design;
+/// wiki image links are plain relative paths inside the repo.
+fn normalize_relative_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only pop a real, popped-back name; keep a leading `..` verbatim.
+                let popped = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)))
+                    && normalized.pop();
+                if !popped {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn relative_local_image_source_path(source: &str) -> PathBuf {
@@ -976,6 +1087,13 @@ fn relative_local_image_source_path(source: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn sanitize_windows_local_path_component(component: &str) -> String {
+    // `.` and `..` are navigation, not file names: the trailing-dot stripping below
+    // would erase them, and localized wiki pages reach the shared image tree
+    // through `../images/...`.
+    if component == "." || component == ".." {
+        return component.to_owned();
+    }
+
     let mut sanitized: String = component
         .chars()
         .map(|ch| match ch {
@@ -1055,8 +1173,10 @@ fn load_remote_image_rgba(_url: &str) -> Result<(usize, usize, Vec<u8>), String>
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_image_alt_width, parse_image_row, resolve_image_source};
-    use std::path::Path;
+    use super::{
+        parse_image_alt_width, parse_image_row, resolve_image_source, resolve_locale_wiki_dir,
+    };
+    use std::path::{Path, PathBuf};
 
     /// Russian selects the correct CLDR plural form of "символ" for the wiki
     /// document character count. Installs the `ru` catalog under the shared locale
@@ -1127,6 +1247,59 @@ mod tests {
         assert_eq!(parse_image_alt_width("w=50"), Some(50.0));
         assert_eq!(parse_image_alt_width("image"), None);
         assert_eq!(parse_image_alt_width("w=0%"), None);
+    }
+
+    /// The active language selects its own folder when it exists.
+    #[test]
+    fn resolve_locale_wiki_dir_prefers_the_active_language_folder() {
+        let present = |dir: &Path| dir == Path::new("wiki/fr") || dir == Path::new("wiki/en");
+
+        assert_eq!(
+            resolve_locale_wiki_dir(Path::new("wiki"), "fr", &present),
+            PathBuf::from("wiki/fr")
+        );
+    }
+
+    /// A language with no folder of its own reads the English one; a wiki with no
+    /// language folders at all keeps reading the root (loose `.md` files).
+    #[test]
+    fn resolve_locale_wiki_dir_falls_back_to_english_then_root() {
+        let only_english = |dir: &Path| dir == Path::new("wiki/en");
+        assert_eq!(
+            resolve_locale_wiki_dir(Path::new("wiki"), "de", &only_english),
+            PathBuf::from("wiki/en")
+        );
+
+        let nothing = |_: &Path| false;
+        assert_eq!(
+            resolve_locale_wiki_dir(Path::new("wiki"), "de", &nothing),
+            PathBuf::from("wiki")
+        );
+    }
+
+    /// A localized page in `wiki/<lang>/` links the shared image tree as
+    /// `../images/...`; the `..` must be resolved away, because the storage seam
+    /// addresses entries by literal path.
+    #[test]
+    fn resolve_image_source_normalizes_parent_dir_into_shared_images() {
+        assert_eq!(
+            resolve_image_source(Path::new("wiki/ru"), "../images/Вкладка-Текст/1.png"),
+            "wiki/images/Вкладка-Текст/1.png"
+        );
+        assert_eq!(
+            resolve_image_source(Path::new("wiki/en"), "./../images/a.png"),
+            "wiki/images/a.png"
+        );
+    }
+
+    /// A `..` that would escape above the wiki root is kept verbatim (the image
+    /// then fails to load) rather than silently resolving to an unrelated file.
+    #[test]
+    fn resolve_image_source_keeps_unpoppable_parent_dir() {
+        assert_eq!(
+            resolve_image_source(Path::new("wiki"), "../../etc/passwd.png"),
+            "../etc/passwd.png"
+        );
     }
 
     #[test]

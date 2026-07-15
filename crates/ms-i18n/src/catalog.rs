@@ -343,6 +343,17 @@ fn load_embedded_catalog(tag: &LocaleTag) -> Result<Catalog, I18nError> {
     Catalog::from_json_str(tag, source)
 }
 
+/// The tag of the currently installed catalog.
+///
+/// Returns the English reference tag before any `install`/`set_locale` call (the
+/// same empty-catalog default `lookup` reads from), so callers never observe an
+/// "unset" state. Wait-free; clones the tag so the result outlives later locale
+/// switches.
+#[must_use]
+pub fn active_locale() -> LocaleTag {
+    active().load().tag().clone()
+}
+
 /// Looks up a simple key in the active catalog, walking its fallback chain.
 ///
 /// Returns a `'static` reference valid regardless of later locale switches, or

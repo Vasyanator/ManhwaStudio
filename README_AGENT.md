@@ -409,8 +409,12 @@ original, and a bbox relative to the sent image) and the model returns
 
 ### Wiki (`src/tabs/wiki.rs`)
 
-- Читает Markdown-файлы из `wiki/` с разбором inline-сегментов (bold/code/plain).
-- `WikiBlock`: headings, paragraphs, lists, images, code.
+- Localized wiki tree: `wiki/<lang>/*.md` (one folder per UI language) plus a single shared
+  `wiki/images/` tree that the pages link as `../images/...` (screenshots are NOT duplicated
+  per language). The folder is selected from the ACTIVE UI locale's language subtag:
+  `wiki/<lang>` -> `wiki/en` -> `wiki/` itself; switching the interface language re-scans.
+  Both the studio Wiki tab and the launcher guide window use the same `WikiTabState`.
+- `WikiBlock`: headings, paragraphs, lists, images, code; inline-сегменты (bold/code/plain).
 - `spawn_scan_thread` / `spawn_document_load_thread` / `spawn_image_load_thread` — все фоновые.
 - Image cache: pending/ready/failed состояния.
 

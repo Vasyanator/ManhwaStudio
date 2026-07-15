@@ -28,7 +28,9 @@ fallback) -> `install` swaps the `ArcSwap` -> `t!/tf!/tp!` -> `lookup`/
   (`Matched` | `FellBackToEnglish`); pure `plural_category(rules, n)` (CLDR selection).
 - `src/catalog.rs`: `Catalog` (stores its `LocaleTag` + resolved `PluralRules`), entry
   model, the leak, the process-global `ArcSwap`,
-  `install`/`set_locale(&LocaleTag)`/`lookup`/`lookup_plural`/`embedded_locales`.
+  `install`/`set_locale(&LocaleTag)`/`lookup`/`lookup_plural`/`embedded_locales`/
+  `active_locale()` (the installed catalog's tag — what UI code reads to load
+  language-dependent assets such as the per-language `wiki/<lang>/` folder).
 - `src/interpolate.rs`: `interpolate(template, args)` — named `{placeholder}` substitution.
 - `src/error.rs`: `I18nError` (typed, `thiserror`) — loading-side errors only.
 - `locales/`: embedded locale JSON (flat dotted keys; `_meta` reserved; values are

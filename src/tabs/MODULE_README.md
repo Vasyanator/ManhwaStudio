@@ -38,6 +38,9 @@ model/backend calls, text rendering, export, or synchronous save-heavy workflows
 - `notes.rs`: notes prompt/template editor that composes prompt text from notes, characters, and
   terms through a background worker.
 - `wiki.rs`: local Markdown wiki viewer with worker-based scan, document load, and image decode.
+  Reads the per-language folder `wiki/<lang>/` chosen from the active UI locale (falling back to
+  `wiki/en`, then `wiki/`), and re-scans when the interface language changes; the pages share one
+  `wiki/images/` tree via `../images/...` links, so image sources are normalized lexically.
 
 ## Contracts and invariants
 - `AppTab::ALL`, `AppTab::key`, `AppTab::title`, and root app tab routing must stay in sync when

@@ -46,7 +46,7 @@ pub mod locale;
 pub mod plural;
 
 pub use catalog::{
-    Catalog, embedded_locales, install, lookup, lookup_plural, set_locale,
+    Catalog, active_locale, embedded_locales, install, lookup, lookup_plural, set_locale,
 };
 pub use error::I18nError;
 pub use interpolate::interpolate;
