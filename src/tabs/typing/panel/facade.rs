@@ -260,12 +260,19 @@ impl TypingTopPanelState {
                                             self.create_panel.draw_create_presets_section(ui);
                                             ui.add_space(6.0);
                                         }
-                                        let params_title = if image_edit_only {
-                                            t!("typing.panel.image_params_heading")
-                                        } else {
-                                            t!("typing.panel.main_text_params_heading")
-                                        };
-                                        ui.label(egui::RichText::new(params_title).strong());
+                                        // The text-params panel is now grouped into
+                                        // labelled collapsible sections, so a floating
+                                        // heading above them would group nothing and is
+                                        // dropped. The image-only panel is NOT sectioned,
+                                        // so it keeps its heading.
+                                        if image_edit_only {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    t!("typing.panel.image_params_heading"),
+                                                )
+                                                .strong(),
+                                            );
+                                        }
                                         ui.scope(|ui| {
                                             ui.style_mut().always_scroll_the_only_direction = true;
                                             egui::ScrollArea::horizontal()

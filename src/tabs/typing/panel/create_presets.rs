@@ -24,9 +24,33 @@ impl TypingCreatePanelState {
         if !self.preview_enabled {
             return;
         }
+        // The section title comes from the collapsing header (below); the summary
+        // is the currently selected preset display name (or the "none" label).
+        let preview_enabled = self.preview_enabled;
+        let preset_summary = self
+            .selected_preset_name
+            .clone()
+            .unwrap_or_else(|| text_preset_none_label().to_string());
+        collapsing_param_section(
+            ui,
+            "typing.section.presets",
+            preview_enabled,
+            t!("typing.presets.section_heading"),
+            false,
+            Some(preset_summary.as_str()),
+            |ui| {
+                self.draw_create_presets_body(ui);
+            },
+        );
+    }
+
+    /// Body of the create-presets section (moved verbatim from the former
+    /// `ui.group(...)`): the preset selector combo plus the save-preset name
+    /// input and button. The strong section title is now shown in the collapsing
+    /// header, so it is no longer drawn inline here.
+    fn draw_create_presets_body(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(t!("typing.presets.section_heading")).strong());
                 let mut names: Vec<String> = self.presets_by_name.keys().cloned().collect();
                 names.sort();
                 let selected_text = self

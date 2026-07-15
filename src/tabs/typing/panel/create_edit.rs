@@ -51,6 +51,23 @@ impl TypingCreatePanelState {
                 ui.add_space(6.0);
 
                 let selection_mode = self.inline_selection_context().is_some();
+                // «Слой» (layer transform): collapsible section (default open) for
+                // the overlay width / scale / rotation. Gating condition unchanged.
+                let preview_enabled = self.preview_enabled;
+                let layer_summary = format!(
+                    "{}px · ×{:.2} · {}°",
+                    self.width_px,
+                    self.overlay_scale,
+                    self.overlay_rotation_deg.round() as i32
+                );
+                collapsing_param_section(
+                    ui,
+                    "typing.section.layer",
+                    preview_enabled,
+                    t!("typing.section.layer"),
+                    true,
+                    Some(layer_summary.as_str()),
+                    |ui| {
                 ui.add_enabled_ui(!selection_mode && !font_missing, |ui| {
                     let width_resp = ui
                         .add(WheelSlider::new(&mut self.width_px, 16..=4096).text(t!("typing.params.width_px_label")));
@@ -91,6 +108,8 @@ impl TypingCreatePanelState {
                         );
                     }
                 });
+                    },
+                );
 
                 ui.separator();
                 changed |= self.draw_main_text_params(

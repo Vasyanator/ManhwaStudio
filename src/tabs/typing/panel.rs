@@ -200,6 +200,7 @@ mod create_render_data;
 mod create_presets;
 mod create_sections;
 mod create_main_text;
+use create_main_text::collapsing_param_section;
 mod create_advanced;
 mod create_edit;
 mod create_apply;

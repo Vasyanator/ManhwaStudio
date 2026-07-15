@@ -289,7 +289,12 @@ saving, and export.
   - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
   - `create_presets.rs`: create/formula preset apply & save UI, font-combo binding, face-index clamp.
   - `create_sections.rs`: top-level section drawing (preview/params/effects/right actions) + effects_json.
-  - `create_main_text.rs`: main text-param UI (left/right columns, inline offset, alignment).
+  - `create_main_text.rs`: main text-param UI. The "Параметры" sub-tab is grouped into six
+    collapsible sections (font / glyph metrics / layout & alignment / shape & smoothing / typeface
+    style / text processing) drawn by the `pub(super)` free fn `collapsing_param_section`, followed by
+    the unchanged advanced-params header. Also inline offset + alignment controls. The former
+    left/right column split is gone; the non-stacked ("wide") path is dead (both call sites pass
+    `stacked_columns = true`).
   - `create_advanced.rs`: advanced params — formula/shape layout, spacing, text accordion, advanced-form window.
   - `create_edit.rs`: edit-mode params section + inline text-selection / inline-tag styling.
   - `create_apply.rs`: apply selected-overlay data, font selection, preview render queue/poll, render-param builders.
@@ -571,6 +576,13 @@ saving, and export.
   `CollapsingHeader::new`, `egui::Window::new`) must seed a stable, language-independent
   id (`.id_salt("typing.…")` / `egui::Id::new`). `egui::ComboBox` has no `id_salt()`
   builder — use `ComboBox::new(id_salt, label)`.
+- The create/edit "Параметры" panel is grouped into collapsible sections by the free fn
+  `create_main_text::collapsing_param_section` (a `CollapsingState` with a strong title + optional
+  weak summary). Each section's open/closed state persists per `egui::Id::new((id_salt,
+  preview_enabled))`: the `id_salt` is a LITERAL persistence key (an i18n exclusion, not a caption —
+  section titles come from `t!` keys), and pairing it with `preview_enabled` keeps the create panel
+  (`preview_enabled = true`) and edit panel (`false`) independent while surviving a UI-language switch.
+  Presets (create-only) and the "Слой" width/scale/angle group (edit-only) use the same helper.
 
 ## Storage and external boundaries
 - Persistent text assets are under `ProjectPaths::text_images_dir`.

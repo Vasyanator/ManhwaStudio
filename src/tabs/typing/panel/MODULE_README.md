@@ -52,6 +52,24 @@ panel state/UI, font loading, and coverage; edit `render_next/` for the renderer
   typing panel draws — no explicit invalidation call from the settings UI is required.
 
 ## Contracts and invariants
+- The "Параметры" sub-tab is grouped into collapsible sections via
+  `create_main_text::collapsing_param_section` (six param sections + presets +
+  the edit-only "Слой" transform group). Each section renders as a "header bar +
+  left guide rule": a faint full-width bar (`Visuals::faint_bg_color`) behind the
+  toggle/title/weak-summary header row, and an indented body with a thin faint
+  vertical guide line (`Visuals::weak_text_color`) down its left. The bar uses
+  the reserve-`Shape::Noop`-then-`painter().set()` trick (a `Frame` can't wrap
+  `show_header` because `HeaderResponse::body` re-borrows the same `ui`); egui's
+  built-in indent vline is suppressed for the body so it doesn't double the
+  guide. A uniform `PARAM_SECTION_GAP_PX` trailing space keeps open/collapsed
+  rhythm even. There is no floating panel heading above the sections anymore
+  (the image-only edit panel, which is NOT sectioned, keeps its heading in
+  `facade.rs`). Section open/closed state persists per
+  `egui::Id::new((id_salt, preview_enabled))` so the create and edit panels are
+  independent and state survives a UI-language switch. The `id_salt`s are literal
+  persistence keys (i18n exclusions); titles/summaries are localized. The
+  non-stacked ("wide") layout path is dead code (both call sites pass
+  `stacked_columns = true`) kept only so the file compiles.
 - Bold/italic controls preserve legacy real-face behavior by default. Faux controls
   serialize their seven `text_params` keys on every render-data rebuild; parameterized
   inline tags use the renderer's `<b=...>` / `<i=...>` grammar.
