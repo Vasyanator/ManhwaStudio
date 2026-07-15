@@ -1250,6 +1250,7 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         anti_aliasing: AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
         line_placement_percent: 0.0,
+        line_placement_reference: LinePlacementReference::GlyphHeight,
         raster_transform: None,
     }
 }

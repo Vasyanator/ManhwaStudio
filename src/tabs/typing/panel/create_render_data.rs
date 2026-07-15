@@ -111,6 +111,7 @@ impl TypingCreatePanelState {
                 "align_bias": self.align.bias,
                 "global_rotation_deg": self.global_rotation_deg,
                 "line_placement_percent": self.line_placement_percent,
+                "line_placement_reference": self.line_placement_reference.as_json_str(),
                 "text_line_mode": match self.text_line_mode {
                     TextLineMode::Horizontal => "horizontal",
                     TextLineMode::Vertical => "vertical",

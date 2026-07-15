@@ -117,7 +117,8 @@ use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_pa
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
-    AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, PxOrPercent, RenderedTextImage,
+    AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, LinePlacementReference,
+    PxOrPercent, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -1125,6 +1126,11 @@ struct TypingCreatePanelState {
     /// (сверху), `-100` below (снизу). Only shown/used for line-based layouts
     /// (`Formula`, `CustomVectorLines`).
     line_placement_percent: f32,
+    /// Reference band `line_placement_percent` snaps to on `CustomVectorLines`:
+    /// `LineBox` = shared font line (all glyphs on one baseline, a clean curved
+    /// string); `GlyphHeight` = each glyph's own bitmap height (legacy). New text
+    /// defaults to `LineBox`; projects saved before the option load as `GlyphHeight`.
+    line_placement_reference: LinePlacementReference,
     /// Raw `raster_transform` object carried verbatim through render_data
     /// rebuilds; authored on the canvas in Phase 3. `None` = no warp; a `Some`
     /// value is re-emitted into `text_params` on every rebuild so it survives

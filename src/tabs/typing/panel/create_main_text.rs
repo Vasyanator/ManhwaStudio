@@ -752,6 +752,55 @@ impl TypingCreatePanelState {
                 });
             }
 
+            // Опора размещения: к чему привязывается «Размещение по линии» —
+            // к общей строке (все символы на единой базовой линии, ровная изогнутая
+            // строка) или к фактической высоте каждого символа (легаси, символы
+            // «прыгают»). Только для векторных линий; формула этот режим не использует.
+            if self.text_layout_mode == TextLayoutMode::CustomVectorLines {
+                let prev_reference = self.line_placement_reference;
+                let reference_combo = WheelComboBox::from_label(
+                    t!("typing.params.line_placement_reference_label"),
+                )
+                .id_salt("typing.params.line_placement_reference")
+                .selected_text(match self.line_placement_reference {
+                    LinePlacementReference::LineBox => {
+                        t!("typing.params.line_placement_reference_line")
+                    }
+                    LinePlacementReference::GlyphHeight => {
+                        t!("typing.params.line_placement_reference_glyph")
+                    }
+                })
+                .show_ui_with_wheel(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.line_placement_reference,
+                        LinePlacementReference::LineBox,
+                        t!("typing.params.line_placement_reference_line"),
+                    );
+                    ui.selectable_value(
+                        &mut self.line_placement_reference,
+                        LinePlacementReference::GlyphHeight,
+                        t!("typing.params.line_placement_reference_glyph"),
+                    );
+                });
+                let reference_resp = reference_combo
+                    .inner
+                    .response
+                    .on_hover_text(t!("typing.params.line_placement_reference_tooltip"));
+                mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &reference_resp);
+                // A wheel notch over the closed combo toggles between the two modes.
+                if let Some(steps) = reference_combo.wheel_steps
+                    && steps != 0
+                {
+                    self.line_placement_reference = match self.line_placement_reference {
+                        LinePlacementReference::LineBox => LinePlacementReference::GlyphHeight,
+                        LinePlacementReference::GlyphHeight => LinePlacementReference::LineBox,
+                    };
+                }
+                if self.line_placement_reference != prev_reference {
+                    *changed = true;
+                }
+            }
+
             let prev_shape = self.text_shape;
             let shape_combo = WheelComboBox::from_label(t!("typing.create.shape_combo_id")).id_salt("typing.create.shape_combo_id")
                 .selected_text(match self.text_shape {

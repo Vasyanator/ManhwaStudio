@@ -86,7 +86,8 @@ use super::panel::{
 use super::render_next::{apply_effects_to_image, render_text_to_image};
 use super::render_next::{FontContentSet, FontProvider};
 use super::render_next::types::{
-    AntiAliasingMode, HorizontalAlign, KerningMode, PxOrPercent, TEXT_FORMULA_USER_VAR_COUNT,
+    AntiAliasingMode, HorizontalAlign, KerningMode, LinePlacementReference, PxOrPercent,
+    TEXT_FORMULA_USER_VAR_COUNT,
     TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
     TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,

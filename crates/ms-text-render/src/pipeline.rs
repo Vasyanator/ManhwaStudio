@@ -3077,6 +3077,7 @@ mod tests {
             anti_aliasing: AntiAliasingMode::Smooth,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            line_placement_reference: crate::types::LinePlacementReference::GlyphHeight,
             raster_transform: None,
         }
     }

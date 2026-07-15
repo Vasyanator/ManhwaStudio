@@ -239,10 +239,21 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `offset = line_frac * scaled_ink_height / 2` toward the top side; the top side
   is the negation of the `normal_offset_px` "down" normal `(-sin, cos)`). Both
   formula spots and the vector-lines `drawn_line_glyph_destination_center_raw`
-  chokepoint use it. COMPAT: the vector-lines path now places the glyph INK
+  chokepoint use it. COMPAT: the vector-lines path places the glyph INK
   CENTER (not the baseline) on the line at 0%, so both line modes share one
   meaning of 0 = center; projects saved before the key default to 0.0 = center.
   Like `global_rotation_deg`, it does not affect layout text.
+  REFERENCE BAND (`TextRenderParams.line_placement_reference`,
+  `LinePlacementReference`, `CustomVectorLines` only): `GlyphHeight` is the legacy
+  per-glyph anchoring above (each glyph centered by its OWN scaled ink height, so
+  glyphs of differing height float to different offsets). `LineBox` instead anchors
+  every glyph to one SHARED baseline: `drawn_line_glyph_destination_center_raw`
+  computes a per-render `ascent_scaled` (primary font ascent at the line size ×
+  base vertical stretch) and offsets each glyph by its own scaled top bearing so
+  the baseline is constant — the line is a clean, just-curved string. `line_frac`
+  then snaps the shared band top(-1)/center(0)/baseline(+1). Gated to
+  `CustomVectorLines`; the panel defaults NEW text to `LineBox`, old projects load
+  as `GlyphHeight`. Unit-tested by `line_box_reference_shares_one_baseline_across_glyph_heights`.
 - Faux bold/italic (`TextRenderParams.faux_bold: Option<FauxBoldParams>`,
   `faux_italic_slant_deg: Option<f32>`): synthetic styles applied to the VECTOR
   outline instead of switching faces. They take effect ONLY together with the

@@ -358,12 +358,58 @@ pub struct TextRenderParams {
     /// ABOVE the line (сверху, ink bottom on the line), `-100` BELOW it (снизу,
     /// ink top on the line). Applied along the path normal at the vector level.
     pub line_placement_percent: f32,
+    /// Reference band that `line_placement_percent` snaps a glyph to on the
+    /// `CustomVectorLines` layout. `GlyphHeight` centers each glyph by its OWN
+    /// scaled bitmap height (legacy — glyphs of different ink height float to
+    /// different offsets). `LineBox` anchors every glyph to the SHARED font line
+    /// box (baseline..ascent) so all glyphs share one baseline, producing a clean
+    /// (just curved) line of text. Only `CustomVectorLines` consults it.
+    pub line_placement_reference: LinePlacementReference,
     /// Optional vector mesh warp applied to glyph outlines after per-glyph
     /// layout and before global rotation/rasterization (see [`VectorMeshWarp`]).
     /// `None` (and an identity mesh) render byte-identically to no warp. Phase 1
     /// honors it on the horizontal path (Normal, and the rotated variant); other
     /// layout modes currently ignore it.
     pub raster_transform: Option<VectorMeshWarp>,
+}
+
+/// What the perpendicular line placement (`TextRenderParams::line_placement_percent`)
+/// snaps a glyph to on the line-based layouts.
+///
+/// `GlyphHeight` is the legacy on-path behavior (each glyph centered by its own
+/// scaled bitmap height); `LineBox` anchors every glyph to the shared font line box
+/// so they share one baseline. See `line_placement_reference`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinePlacementReference {
+    /// Legacy: the glyph's own scaled ink height defines the perpendicular offset,
+    /// so at 0% each glyph's ink center sits on the line. Kept as the default so
+    /// projects saved before this option render unchanged.
+    #[default]
+    GlyphHeight,
+    /// Shared font line box (baseline..ascent): every glyph is anchored to one
+    /// common baseline and only the shared band shifts with the percent.
+    LineBox,
+}
+
+impl LinePlacementReference {
+    /// Stable JSON token used by the typing tab's hand-rolled render-data codec.
+    #[must_use]
+    pub fn as_json_str(self) -> &'static str {
+        match self {
+            LinePlacementReference::GlyphHeight => "glyph_height",
+            LinePlacementReference::LineBox => "line_box",
+        }
+    }
+
+    /// Parse the JSON token produced by [`as_json_str`]; unknown/absent input maps
+    /// to the legacy [`GlyphHeight`](Self::GlyphHeight) so old projects are stable.
+    #[must_use]
+    pub fn from_json_str(value: &str) -> Self {
+        match value {
+            "line_box" => LinePlacementReference::LineBox,
+            _ => LinePlacementReference::GlyphHeight,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

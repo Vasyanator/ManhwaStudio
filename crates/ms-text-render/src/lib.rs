@@ -208,6 +208,7 @@ pub fn touch_runtime_smoke_contract() {
         anti_aliasing: types::AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
         line_placement_percent: 0.0,
+        line_placement_reference: types::LinePlacementReference::GlyphHeight,
         raster_transform: None,
     };
 
@@ -402,6 +403,7 @@ mod tests {
             anti_aliasing: AntiAliasingMode::Strong,
             global_rotation_deg: 0.0,
             line_placement_percent: 0.0,
+            line_placement_reference: crate::types::LinePlacementReference::GlyphHeight,
             raster_transform: None,
         };
 

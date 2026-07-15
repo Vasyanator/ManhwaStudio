@@ -145,6 +145,14 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("line_placement_percent")
             .and_then(value_as_f32)
             .unwrap_or(0.0),
+        // Reference band the line placement snaps to. Absent in projects saved before
+        // the option -> legacy per-glyph anchoring (GlyphHeight).
+        line_placement_reference: text_params
+            .get("line_placement_reference")
+            .and_then(|value| value.as_str())
+            .map_or(LinePlacementReference::GlyphHeight, |token| {
+                LinePlacementReference::from_json_str(token)
+            }),
         // Vector mesh warp authored on the canvas (Phase 3); carried verbatim
         // through render_data. Absent/invalid -> None (identity / no warp).
         raster_transform: text_params

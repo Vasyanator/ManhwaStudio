@@ -80,6 +80,15 @@ the line paths.
   fallback). The effective `line_frac` is threaded in from the pipeline router
   (`FormulaRenderRequest.line_placement_frac` -> `CustomLineLayoutSettings`), gated to
   `0.0` for the HIDE siblings `Shape` and `CustomRasterLines`.
+- Line placement REFERENCE (`TextRenderParams.line_placement_reference`, `CustomVectorLines`
+  only, threaded via `CustomLineLayoutSettings.line_placement_reference` + `ascent_scaled`):
+  `GlyphHeight` keeps the per-glyph ink-center anchoring above; `LineBox` anchors every glyph
+  to one SHARED baseline (offset by the glyph's own scaled top bearing) and shifts the whole
+  band by `line_frac * ascent_scaled / 2`, so glyphs no longer float by their own height. The
+  shared `ascent_scaled` is the primary font ascent (first seed's font at `font_size_px`) ×
+  base vertical stretch, computed once in `render_text_with_drawn_lines_layout_once`. All three
+  `drawn_line_glyph_destination_center_raw` sites (bounds, draw, ink-distance contour) pass the
+  same reference/ascent so the measured contour matches the drawn ink.
 
 ## Editing map
 - To add formula syntax, edit `parser.rs`, then update `eval.rs` if the new syntax

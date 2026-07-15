@@ -77,8 +77,8 @@ use crate::raster::{
     sample_swash_alpha, trim_rendered_image_to_alpha_bounds,
 };
 use crate::types::{
-    HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextRenderParams,
-    TextVectorLineDistanceMode, TextVectorLineTextDirection,
+    HorizontalAlign, KerningMode, LinePlacementReference, RenderedTextImage, TextLayoutMode,
+    TextRenderParams, TextVectorLineDistanceMode, TextVectorLineTextDirection,
 };
 use cosmic_text::{
     Attrs, AttrsOwned, Buffer, CacheKey, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping,
@@ -250,25 +250,57 @@ fn apply_line_placement(
 
 /// World-space center of the glyph bitmap for a given on-path transform.
 ///
-/// This is the single mapping the blit relies on. At `line_frac = 0` the glyph's
-/// INK CENTER sits on the path point (`transform.center`); `line_frac` then
-/// shifts it perpendicular via [`apply_line_placement`]. Deliberate behavior
-/// change from the previous baseline-on-line placement so both line-based modes
-/// share one meaning of 0 = center (see `render_next/MODULE_README.md`). Kept
-/// free of `FormulaGlyphSeed` so the contour-placement path and unit tests can
+/// This is the single mapping the blit relies on. The `reference` selects HOW the
+/// perpendicular placement is anchored:
+/// - [`GlyphHeight`](LinePlacementReference::GlyphHeight): legacy — the glyph's INK
+///   CENTER sits on the path point at `line_frac = 0`, shifted by `line_frac` via
+///   [`apply_line_placement`] using the glyph's own `scaled_height`. Glyphs of
+///   different ink height float to different offsets.
+/// - [`LineBox`](LinePlacementReference::LineBox): the glyph's BASELINE is anchored
+///   to a shared band (`ascent_scaled` above the baseline is the top, the baseline
+///   is the bottom), constant across glyphs, so every glyph shares one baseline and
+///   `line_frac` snaps the band baseline(+1, ink rests above the line)/center(0)/top
+///   (-1, ink hangs below) — a clean, just-curved line. `placement_top_scaled` is the glyph's scaled
+///   top bearing (`placement.top * height_mul`) and `scaled_height` its scaled bitmap
+///   height, both used to convert the shared baseline to the bitmap center that
+///   [`glyph_outline_transform`] positions.
+///
+/// Kept free of `FormulaGlyphSeed` so the contour-placement path and unit tests can
 /// reuse it.
 fn drawn_line_glyph_destination_center_raw(
     transform: &DrawnLineTransform,
     scaled_height: f32,
+    placement_top_scaled: f32,
     line_frac: f32,
+    reference: LinePlacementReference,
+    ascent_scaled: f32,
 ) -> (f32, f32) {
-    apply_line_placement(
-        transform.center_x,
-        transform.center_y,
-        transform.rotation_rad,
-        scaled_height,
-        line_frac,
-    )
+    match reference {
+        LinePlacementReference::GlyphHeight => apply_line_placement(
+            transform.center_x,
+            transform.center_y,
+            transform.rotation_rad,
+            scaled_height,
+            line_frac,
+        ),
+        LinePlacementReference::LineBox => {
+            // Height above the baseline of the band point the line snaps to. `line_frac`
+            // in [-1, 1]: +1 -> baseline (bottom) on line, 0 -> band center, -1 -> band
+            // top on line. Shared `ascent_scaled` => identical for every glyph, so the
+            // baseline is consistent (no per-glyph float).
+            let h_sel = ascent_scaled * 0.5 * (1.0 - line_frac);
+            // `glyph_outline_transform` places the bitmap CENTER at the returned point;
+            // the bitmap center sits `scaled_height/2 - placement_top_scaled` below the
+            // baseline, so offset the shared band selection by that per-glyph term. The
+            // sign follows [`apply_line_placement`]'s TOP normal `(sin, -cos)`.
+            let offset = -(h_sel + scaled_height * 0.5 - placement_top_scaled);
+            let (sin_a, cos_a) = transform.rotation_rad.sin_cos();
+            (
+                transform.center_x + offset * sin_a,
+                transform.center_y - offset * cos_a,
+            )
+        }
+    }
 }
 
 /// Resolve a seed glyph's true font outline through the per-render cache.
@@ -510,6 +542,25 @@ fn render_text_with_drawn_lines_layout_once(
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Shared band for the LineBox line-placement reference: the primary font's ascent
+    // (baseline..ascender top) at the line size, in the SAME scaled px space as each
+    // glyph's `scaled_height` (so it also carries the base vertical stretch). Computed
+    // once per render from the first seed's font; ignored under GlyphHeight. Gate the
+    // reference to CustomVectorLines so raster/drawn lines keep the legacy anchoring.
+    let base_height_mul = (params.glyph_height_percent / 100.0).clamp(0.01, 3.0);
+    let ascent_scaled = seeds
+        .first()
+        .and_then(|seed| font_system.get_font(seed.glyph.font_id))
+        .map(|font| font.as_swash().metrics(&[]).scale(font_size_px).ascent)
+        .unwrap_or(font_size_px)
+        * base_height_mul;
+    let line_placement_reference = match params.text_layout_mode {
+        TextLayoutMode::CustomVectorLines => params.line_placement_reference,
+        TextLayoutMode::Normal
+        | TextLayoutMode::Formula
+        | TextLayoutMode::Shape
+        | TextLayoutMode::CustomRasterLines => LinePlacementReference::GlyphHeight,
+    };
     let mut transforms = build_drawn_line_transforms(
         params,
         seeds.as_slice(),
@@ -519,6 +570,7 @@ fn render_text_with_drawn_lines_layout_once(
         &mut contour_cache,
         &mut outline_cache,
         line_placement_frac,
+        ascent_scaled,
     );
     let skipped = transforms.iter().filter(|item| item.is_none()).count();
     // Global block rotation (vector level): rotate every placed line-glyph rigidly
@@ -573,10 +625,14 @@ fn render_text_with_drawn_lines_layout_once(
                 glyph_h as f32,
                 image.placement.top as f32,
             );
+            let placement_top_scaled = image.placement.top as f32 * seed.glyph_scale.height_mul;
             let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
                 transform,
                 scaled_height,
+                placement_top_scaled,
                 line_placement_frac,
+                line_placement_reference,
+                ascent_scaled,
             );
             include_rotated_rect_bounds(
                 &mut pre_box,
@@ -641,8 +697,15 @@ fn render_text_with_drawn_lines_layout_once(
             glyph_h as f32,
             image.placement.top as f32,
         );
-        let (dst_center_x, dst_center_y) =
-            drawn_line_glyph_destination_center_raw(transform, scaled_height, line_placement_frac);
+        let placement_top_scaled = image.placement.top as f32 * seed.glyph_scale.height_mul;
+        let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
+            transform,
+            scaled_height,
+            placement_top_scaled,
+            line_placement_frac,
+            line_placement_reference,
+            ascent_scaled,
+        );
         include_rotated_rect_bounds(
             &mut bounds,
             padded_left,
@@ -767,8 +830,15 @@ fn render_text_with_drawn_lines_layout_once(
         let (_scaled_left, _scaled_top, _scaled_width, scaled_height) =
             seed.glyph_scale
                 .scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
-        let (dst_center_x, dst_center_y) =
-            drawn_line_glyph_destination_center_raw(&transform, scaled_height, line_placement_frac);
+        let placement_top_scaled = placement_top * seed.glyph_scale.height_mul;
+        let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
+            &transform,
+            scaled_height,
+            placement_top_scaled,
+            line_placement_frac,
+            line_placement_reference,
+            ascent_scaled,
+        );
 
         // Prefer the true font outline: rasterize it directly into the output at
         // the exact world placement the bitmap blit would have used. Color/emoji
@@ -887,9 +957,10 @@ fn build_drawn_line_transforms(
     contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
     outline_cache: &mut OutlineCache,
     line_placement_frac: f32,
+    ascent_scaled: f32,
 ) -> Vec<Option<DrawnLineTransform>> {
     let mut line_offsets = HashMap::<usize, DrawnLinePlacementState>::new();
-    let layout_settings = custom_line_layout_settings(params, line_placement_frac);
+    let layout_settings = custom_line_layout_settings(params, line_placement_frac, ascent_scaled);
     let mut ctx = DrawnLinePlacementCtx {
         params,
         seeds,
@@ -1013,6 +1084,8 @@ fn drawn_line_seed_transform(
                     seed.faux.shear_x,
                     g.scaled_height,
                     layout.line_placement_frac,
+                    layout.line_placement_reference,
+                    layout.ascent_scaled,
                     g.subpixel,
                     &transform,
                 ));
@@ -1259,6 +1332,8 @@ fn place_seed_contour_at(
         seed.faux.shear_x,
         geom.scaled_height,
         layout.line_placement_frac,
+        layout.line_placement_reference,
+        layout.ascent_scaled,
         geom.subpixel,
         &transform,
     ))
@@ -1287,11 +1362,21 @@ fn placed_contour_for_transform(
     shear_x: f32,
     scaled_height: f32,
     line_frac: f32,
+    reference: LinePlacementReference,
+    ascent_scaled: f32,
     subpixel: [f32; 2],
     transform: &DrawnLineTransform,
 ) -> PlacedContour {
-    let (dst_center_x, dst_center_y) =
-        drawn_line_glyph_destination_center_raw(transform, scaled_height, line_frac);
+    // Same per-glyph scaled top bearing the placement uses to convert baseline->center.
+    let placement_top_scaled = placement_top * height_mul;
+    let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
+        transform,
+        scaled_height,
+        placement_top_scaled,
+        line_frac,
+        reference,
+        ascent_scaled,
+    );
     // Same subpixel-corrected pivot (and faux-italic shear) the outline
     // rasterizer uses, so the measured contour matches the drawn ink exactly.
     let glyph_transform = glyph_outline_transform(
@@ -1321,11 +1406,19 @@ struct CustomLineLayoutSettings {
     /// mode-gated by the router). Shared by the ink-distance search so the
     /// measured contour lands on the same shifted pixels the blit draws.
     line_placement_frac: f32,
+    /// Reference band `line_placement_frac` snaps to. `LineBox` only for
+    /// `CustomVectorLines`; every other mode stays `GlyphHeight` (legacy).
+    line_placement_reference: LinePlacementReference,
+    /// Shared scaled font ascent (baseline..ascender top, in the same px units as
+    /// the glyph `scaled_height`) used by the `LineBox` reference; `0` under
+    /// `GlyphHeight` where it is ignored.
+    ascent_scaled: f32,
 }
 
 fn custom_line_layout_settings(
     params: &TextRenderParams,
     line_placement_frac: f32,
+    ascent_scaled: f32,
 ) -> CustomLineLayoutSettings {
     match params.text_layout_mode {
         TextLayoutMode::CustomRasterLines => CustomLineLayoutSettings {
@@ -1335,6 +1428,9 @@ fn custom_line_layout_settings(
             letter_spacing_mul: params.drawn_lines_layout.letter_spacing_mul,
             letter_spacing_px: params.drawn_lines_layout.letter_spacing_px,
             line_placement_frac,
+            // Raster lines keep the legacy per-glyph anchoring.
+            line_placement_reference: LinePlacementReference::GlyphHeight,
+            ascent_scaled,
         },
         TextLayoutMode::CustomVectorLines => CustomLineLayoutSettings {
             use_tangent_rotation: params.vector_lines_layout.use_tangent_rotation,
@@ -1343,6 +1439,8 @@ fn custom_line_layout_settings(
             letter_spacing_mul: params.vector_lines_layout.letter_spacing_mul,
             letter_spacing_px: params.vector_lines_layout.letter_spacing_px,
             line_placement_frac,
+            line_placement_reference: params.line_placement_reference,
+            ascent_scaled,
         },
         TextLayoutMode::Normal | TextLayoutMode::Formula | TextLayoutMode::Shape => {
             CustomLineLayoutSettings {
@@ -1352,6 +1450,8 @@ fn custom_line_layout_settings(
                 letter_spacing_mul: 1.0,
                 letter_spacing_px: 0.0,
                 line_placement_frac,
+                line_placement_reference: LinePlacementReference::GlyphHeight,
+                ascent_scaled,
             }
         }
     }
@@ -3123,9 +3223,9 @@ fn glyph_ink_profile_from_image(
 #[cfg(test)]
 mod tests {
     use super::{
-        DrawnLineTransform, apply_line_placement, drawn_line_glyph_destination_center_raw,
-        find_minimum_ink_distance_center_s, placed_contour_for_transform,
-        sample_drawn_line_path_for_direction,
+        DrawnLineTransform, LinePlacementReference, apply_line_placement,
+        drawn_line_glyph_destination_center_raw, find_minimum_ink_distance_center_s,
+        placed_contour_for_transform, sample_drawn_line_path_for_direction,
     };
     use crate::drawn_lines::{DrawnLinePath, DrawnLinePoint};
     use crate::glyph_contour::{
@@ -3349,8 +3449,14 @@ mod tests {
             center_y: 25.0,
             rotation_rad: 0.7,
         };
-        let (dst_cx, dst_cy) =
-            drawn_line_glyph_destination_center_raw(&transform, scaled_height, line_frac);
+        let (dst_cx, dst_cy) = drawn_line_glyph_destination_center_raw(
+            &transform,
+            scaled_height,
+            placement_top * height_mul,
+            line_frac,
+            LinePlacementReference::GlyphHeight,
+            0.0,
+        );
         let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
             scaled_left,
             scaled_top,
@@ -3372,6 +3478,8 @@ mod tests {
             0.0,
             scaled_height,
             line_frac,
+            LinePlacementReference::GlyphHeight,
+            0.0,
             [0.0, 0.0],
             &transform,
         );
@@ -3381,5 +3489,56 @@ mod tests {
         assert!(placed.aabb_min[1] >= min_y - eps, "min_y");
         assert!(placed.aabb_max[0] <= max_x + eps, "max_x");
         assert!(placed.aabb_max[1] <= max_y + eps, "max_y");
+    }
+
+    #[test]
+    fn line_box_reference_shares_one_baseline_across_glyph_heights() {
+        // LineBox must anchor EVERY glyph to one shared baseline regardless of its
+        // own ink height / top bearing (the fix for glyphs "jumping" on the line),
+        // while GlyphHeight (legacy) centers each glyph by its own height.
+        let transform = DrawnLineTransform {
+            center_x: 40.0,
+            center_y: 25.0,
+            rotation_rad: 0.0, // horizontal line: DOWN normal is +y, so baseline math is trivial.
+        };
+        let ascent_scaled = 30.0f32;
+        let line_frac = 0.0f32;
+        // (scaled_height, placement_top_scaled): a tall cap vs a short x-height glyph.
+        let cap = (20.0f32, 20.0f32);
+        let low = (14.0f32, 9.0f32);
+        // At rotation 0 the bitmap center is (scaled_height/2 - placement_top_scaled)
+        // BELOW the baseline, so baseline = dst_cy - (h/2 - top).
+        let baseline = |reference, (h, top): (f32, f32)| {
+            let (_dx, dy) = drawn_line_glyph_destination_center_raw(
+                &transform,
+                h,
+                top,
+                line_frac,
+                reference,
+                ascent_scaled,
+            );
+            dy - (h * 0.5 - top)
+        };
+
+        let cap_base = baseline(LinePlacementReference::LineBox, cap);
+        let low_base = baseline(LinePlacementReference::LineBox, low);
+        assert!(
+            (cap_base - low_base).abs() < 1e-4,
+            "LineBox baselines must match: {cap_base} vs {low_base}"
+        );
+        // The shared baseline sits `ascent/2 * (1 - line_frac)` below the path point.
+        let expected = transform.center_y + ascent_scaled * 0.5 * (1.0 - line_frac);
+        assert!(
+            (cap_base - expected).abs() < 1e-4,
+            "LineBox baseline={cap_base} expected={expected}"
+        );
+
+        // Legacy per-glyph centering does NOT share a baseline.
+        let cap_gh = baseline(LinePlacementReference::GlyphHeight, cap);
+        let low_gh = baseline(LinePlacementReference::GlyphHeight, low);
+        assert!(
+            (cap_gh - low_gh).abs() > 1.0,
+            "GlyphHeight must not share a baseline: {cap_gh} vs {low_gh}"
+        );
     }
 }

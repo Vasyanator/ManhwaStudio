@@ -178,6 +178,13 @@ impl TypingCreatePanelState {
         {
             self.line_placement_percent = line_placement_percent;
         }
+        // Absent in projects saved before the reference toggle -> legacy GlyphHeight.
+        self.line_placement_reference = text_params_obj
+            .get("line_placement_reference")
+            .and_then(Value::as_str)
+            .map_or(LinePlacementReference::GlyphHeight, |token| {
+                LinePlacementReference::from_json_str(token)
+            });
         if let Some(text_line_mode) = text_params_obj
             .get("text_line_mode")
             .and_then(Value::as_str)
@@ -599,6 +606,7 @@ impl TypingCreatePanelState {
             align: self.align,
             global_rotation_deg: self.global_rotation_deg,
             line_placement_percent: self.line_placement_percent,
+            line_placement_reference: self.line_placement_reference,
             // Decode the carried canvas-authored warp (Phase 3) for the live
             // preview render; absent/invalid -> None (identity / no warp).
             raster_transform: self
