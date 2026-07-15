@@ -61,8 +61,9 @@ use crate::optical::{
     optical_base_advance, optical_delta, optical_pair_gap,
 };
 use crate::pipeline::{
-    GlyphScaleSettings, KerningSettings, inline_glyph_offset_for_glyph,
-    inline_glyph_scale_for_glyph, inline_kerning_for_glyph, inline_text_color_for_glyph,
+    FauxGlyphStyle, GlyphScaleSettings, KerningSettings, faux_bounds_pads, faux_style_for_glyph,
+    inline_glyph_offset_for_glyph, inline_glyph_scale_for_glyph, inline_kerning_for_glyph,
+    inline_text_color_for_glyph,
 };
 use crate::raster::{
     GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
@@ -102,6 +103,9 @@ enum VerticalRenderCell {
         glyph_scale: GlyphScaleSettings,
         kerning: KerningSettings,
         glyph_offset_px: [f32; 2],
+        /// Faux bold/italic style resolved once per cell (`FauxGlyphStyle::NONE`
+        /// keeps every seam byte-identical to the pre-faux path).
+        faux: FauxGlyphStyle,
     },
     Blank(f32),
 }
@@ -232,6 +236,7 @@ pub(crate) fn render_vertical_text(
                 glyph,
                 glyph_scale,
                 glyph_offset_px,
+                faux,
                 ..
             } = cell
             else {
@@ -245,17 +250,30 @@ pub(crate) fn render_vertical_text(
             let Some(image) = cache.get_image(font_system, physical.cache_key) else {
                 continue;
             };
+            // Faux ink pads (exact zeros without faux, keeping the historical
+            // bounds bit-identical): the bitmap box under-reports faux ink.
+            let pads = faux_bounds_pads(
+                *faux,
+                image.placement.top as f32,
+                image.placement.height as f32,
+                glyph_scale.width_mul,
+                glyph_scale.height_mul,
+            );
             let x = physical.x + image.placement.left;
             let y = physical.y - image.placement.top;
+            let padded_x = x as f32 - pads[0];
+            let padded_y = y as f32 - pads[1];
+            let padded_w = image.placement.width as f32 + 2.0 * pads[0];
+            let padded_h = image.placement.height as f32 + 2.0 * pads[1];
             if want_warp {
                 // Un-rotated scaled glyph box (the same math the non-rotated bounds
                 // branch uses) — this is the warp's normalization frame.
                 include_scaled_rect_bounds(
                     &mut pre_box,
-                    x as f32,
-                    y as f32,
-                    image.placement.width as f32,
-                    image.placement.height as f32,
+                    padded_x,
+                    padded_y,
+                    padded_w,
+                    padded_h,
                     *glyph_scale,
                 );
             }
@@ -265,7 +283,7 @@ pub(crate) fn render_vertical_text(
                 let glyph_w = image.placement.width as f32;
                 let glyph_h = image.placement.height as f32;
                 let (scaled_left, scaled_top, scaled_width, scaled_height) =
-                    glyph_scale.scaled_rect(x as f32, y as f32, glyph_w, glyph_h);
+                    glyph_scale.scaled_rect(padded_x, padded_y, padded_w, padded_h);
                 let (dst_center_x, dst_center_y) = rotate_point_about(
                     x as f32 + glyph_w * 0.5,
                     y as f32 + glyph_h * 0.5,
@@ -287,10 +305,10 @@ pub(crate) fn render_vertical_text(
             } else {
                 include_scaled_rect_bounds(
                     &mut bounds,
-                    x as f32,
-                    y as f32,
-                    image.placement.width as f32,
-                    image.placement.height as f32,
+                    padded_x,
+                    padded_y,
+                    padded_w,
+                    padded_h,
                     *glyph_scale,
                 );
             }
@@ -368,6 +386,7 @@ pub(crate) fn render_vertical_text(
                 text_color,
                 glyph_scale,
                 glyph_offset_px,
+                faux,
                 ..
             } = cell
             else {
@@ -410,7 +429,7 @@ pub(crate) fn render_vertical_text(
             // upright; the only rotation is the global block rotation. The canvas
             // offset is folded into the rasterizer origin as the horizontal path does.
             if let Some(outline) =
-                resolve_outline_for_glyph(font_system, &mut outline_cache, glyph)
+                resolve_outline_for_glyph(font_system, &mut outline_cache, glyph, faux.bold)
             {
                 // Re-add the subpixel fraction baked into the bitmap coverage so the
                 // outline lands on the same pixels (physical.x/y are integer-only).
@@ -425,6 +444,7 @@ pub(crate) fn render_vertical_text(
                     glyph_scale.width_mul,
                     glyph_scale.height_mul,
                     glyph_subpixel_offset(physical.cache_key),
+                    faux.shear_x,
                 );
                 rasterize_outline_into(
                     &mut raster_scratch,
@@ -656,40 +676,7 @@ fn collect_vertical_render_columns(
                 run.line_i,
                 glyph,
             );
-            visual_width_px = visual_width_px.max(measure_vertical_glyph_visual_width(
-                font_system,
-                cache,
-                glyph,
-                font_size_px,
-                glyph_scale,
-            ));
-            cells.push(VerticalRenderCell::Glyph {
-                glyph: glyph.clone(),
-                text_color: inline_text_color_for_glyph(
-                    default_text_color,
-                    inline_style_spans,
-                    layout_line_offsets,
-                    run.line_i,
-                    glyph,
-                ),
-                glyph_scale,
-                kerning: inline_kerning_for_glyph(
-                    params,
-                    inline_style_spans,
-                    layout_line_offsets,
-                    run.line_i,
-                    glyph,
-                ),
-                glyph_offset_px: inline_glyph_offset_for_glyph(
-                    inline_style_spans,
-                    layout_line_offsets,
-                    run.line_i,
-                    glyph,
-                ),
-            });
-        }
-        for glyph in glyph_iter {
-            let glyph_scale = inline_glyph_scale_for_glyph(
+            let faux = faux_style_for_glyph(
                 params,
                 inline_style_spans,
                 layout_line_offsets,
@@ -702,6 +689,7 @@ fn collect_vertical_render_columns(
                 glyph,
                 font_size_px,
                 glyph_scale,
+                faux,
             ));
             cells.push(VerticalRenderCell::Glyph {
                 glyph: glyph.clone(),
@@ -726,6 +714,56 @@ fn collect_vertical_render_columns(
                     run.line_i,
                     glyph,
                 ),
+                faux,
+            });
+        }
+        for glyph in glyph_iter {
+            let glyph_scale = inline_glyph_scale_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
+            let faux = faux_style_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
+            visual_width_px = visual_width_px.max(measure_vertical_glyph_visual_width(
+                font_system,
+                cache,
+                glyph,
+                font_size_px,
+                glyph_scale,
+                faux,
+            ));
+            cells.push(VerticalRenderCell::Glyph {
+                glyph: glyph.clone(),
+                text_color: inline_text_color_for_glyph(
+                    default_text_color,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                glyph_scale,
+                kerning: inline_kerning_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                glyph_offset_px: inline_glyph_offset_for_glyph(
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
+                faux,
             });
         }
         if !cells.is_empty() {
@@ -739,19 +777,34 @@ fn collect_vertical_render_columns(
     columns
 }
 
+/// Visual width of a vertical cell's glyph in px (drives column spacing).
+///
+/// Faux styles widen the measured ink by the same pre-scale pads the bounds
+/// passes use (`faux_bounds_pads`): the bold offset overhang on both axes AND
+/// the faux-italic shear overhang on x — so adjacent columns move apart
+/// instead of colliding with thickened or slanted ink. `faux == NONE` adds
+/// exact zeros and stays byte-identical.
 fn measure_vertical_glyph_visual_width(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
     glyph: &LayoutGlyph,
     font_size_px: f32,
     glyph_scale: GlyphScaleSettings,
+    faux: FauxGlyphStyle,
 ) -> f32 {
     let physical = glyph.physical((-glyph.x, font_size_px), 1.0);
     if let Some(image) = cache.get_image(font_system, physical.cache_key) {
         let (scaled_width, scaled_height) =
             glyph_scale.scaled_size(image.placement.width as f32, image.placement.height as f32);
-        scaled_width
-            .max(scaled_height)
+        let pads = faux_bounds_pads(
+            faux,
+            image.placement.top as f32,
+            image.placement.height as f32,
+            glyph_scale.width_mul,
+            glyph_scale.height_mul,
+        );
+        (scaled_width + 2.0 * pads[0] * glyph_scale.width_mul)
+            .max(scaled_height + 2.0 * pads[1] * glyph_scale.height_mul)
             .max(glyph.w.max(1.0) * glyph_scale.width_mul)
     } else {
         glyph.w.max(font_size_px * 0.5) * glyph_scale.width_mul
@@ -847,8 +900,18 @@ fn compute_vertical_cell_baselines(
         .cells
         .iter()
         .map(|cell| match cell {
-            VerticalRenderCell::Glyph { glyph, .. } => {
-                Some(glyph_ink_profile(font_system, cache, glyph, font_size_px))
+            VerticalRenderCell::Glyph { glyph, faux, .. } => {
+                let mut profile = glyph_ink_profile(font_system, cache, glyph, font_size_px);
+                // The ink profile is measured from the PLAIN swash bitmap; faux
+                // bold moves the ink boundary outward by `d`, so grow the
+                // profile symmetrically to keep the ink-height stacking from
+                // overlapping thickened glyphs. `d == 0.0` is a no-op.
+                let faux_d = faux.d_px();
+                if faux_d > 0.0 {
+                    profile.top_px -= faux_d;
+                    profile.bottom_px += faux_d;
+                }
+                Some(profile)
             }
             VerticalRenderCell::Blank(_) => None,
         })
@@ -957,12 +1020,14 @@ fn optical_vertical_gap_deltas(
                 glyph: prev_glyph,
                 glyph_scale: prev_scale,
                 glyph_offset_px: prev_offset,
+                faux: prev_faux,
                 ..
             },
             VerticalRenderCell::Glyph {
                 glyph: cur_glyph,
                 glyph_scale: cur_scale,
                 glyph_offset_px: cur_offset,
+                faux: cur_faux,
                 ..
             },
         ) = (&column.cells[idx], &column.cells[idx + 1])
@@ -986,6 +1051,7 @@ fn optical_vertical_gap_deltas(
             column.visual_width_px,
             prev_offset[0],
             *prev_scale,
+            *prev_faux,
             font_system,
             cache,
             outline_cache,
@@ -997,6 +1063,7 @@ fn optical_vertical_gap_deltas(
             column.visual_width_px,
             cur_offset[0],
             *cur_scale,
+            *cur_faux,
             font_system,
             cache,
             outline_cache,
@@ -1043,6 +1110,7 @@ fn place_optical_vertical_contour(
     visual_width_px: f32,
     glyph_offset_x: f32,
     glyph_scale: GlyphScaleSettings,
+    faux: FauxGlyphStyle,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
     outline_cache: &mut OutlineCache,
@@ -1080,11 +1148,12 @@ fn place_optical_vertical_contour(
         hash_font_id(glyph.font_id),
         glyph.glyph_id,
         glyph.font_size.to_bits(),
+        faux.bold_key_bits(),
     );
     let contour = match contour_cache.entry(contour_key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
-            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph)?;
+            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold)?;
             entry.insert(glyph_contour_from_outline(
                 &outline,
                 OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX,
@@ -1108,6 +1177,7 @@ fn place_optical_vertical_contour(
         glyph_scale.width_mul,
         glyph_scale.height_mul,
         glyph_subpixel_offset(cache_key),
+        faux.shear_x,
     );
     Some(transform.place_contour(contour))
 }
@@ -1241,6 +1311,8 @@ mod tests {
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             uppercase_text: false,
             trim_extra_spaces: true,
             hanging_punctuation: false,

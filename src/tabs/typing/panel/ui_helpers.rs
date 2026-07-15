@@ -25,6 +25,88 @@ helper in tab/geometry.rs.
 
 use super::*;
 
+/// Mutable borrows of the faux bold/italic controls for [`draw_faux_style_controls`].
+///
+/// Bundles the faux sub-state (bold: enable + thicken/expand/sharp/outward,
+/// italic: enable + slant) into one parameter so the draw fn stays under the
+/// argument-count lint. The caller owns the fields, so the same widget set drives
+/// both the whole-overlay state and a per-selection inline style.
+pub(super) struct FauxStyleControlValues<'a> {
+    pub(super) faux_bold: &'a mut bool,
+    pub(super) faux_bold_thicken_percent: &'a mut f32,
+    pub(super) faux_bold_expand_percent: &'a mut f32,
+    pub(super) faux_bold_sharp_corners: &'a mut bool,
+    pub(super) faux_bold_outward_only: &'a mut bool,
+    pub(super) faux_italic: &'a mut bool,
+    pub(super) faux_italic_slant_deg: &'a mut f32,
+}
+
+/// Draw the bold and italic rows: each a `[style checkbox] [«Принудительно» faux
+/// checkbox]` pair, followed by the faux parameter strip (thicken/expand/sharp/
+/// outward for bold, slant for italic) shown only while both that style and its
+/// faux flag are on. `bold`/`italic` and the `values` fields are edited in place;
+/// every widget response is OR-ed into `changed`. `id_salt` disambiguates the two
+/// indented parameter strips across the panels that reuse this helper.
+pub(super) fn draw_faux_style_controls(
+    ui: &mut egui::Ui,
+    bold: &mut bool,
+    italic: &mut bool,
+    values: FauxStyleControlValues<'_>,
+    changed: &mut bool,
+    block_hscroll_by_hovered_param: &mut bool,
+    id_salt: &str,
+) {
+    let FauxStyleControlValues { faux_bold, faux_bold_thicken_percent, faux_bold_expand_percent, faux_bold_sharp_corners, faux_bold_outward_only, faux_italic, faux_italic_slant_deg } = values;
+    ui.horizontal(|ui| {
+        let response = ui.checkbox(bold, t!("typing.params.bold"));
+        mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+        *changed |= response.changed();
+        let response = ui.checkbox(faux_bold, t!("typing.params.force"));
+        mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+        *changed |= response.changed();
+    });
+    if *bold && *faux_bold {
+        ui.indent(Id::new(id_salt).with("faux_bold"), |ui| {
+            let response = ui.add(WheelSlider::new(faux_bold_thicken_percent, 0.0..=25.0).suffix("%").text(t!("typing.params.thicken")));
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+            *changed |= response.changed();
+            if let Some(steps) = wheel_steps_if_hovered(ui, &response) {
+                *changed |= apply_wheel_step_f32(faux_bold_thicken_percent, steps, 1.0, 0.0, 25.0);
+            }
+            let response = ui.add(WheelSlider::new(faux_bold_expand_percent, 0.0..=50.0).suffix("%").text(t!("typing.params.extra_spacing")));
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+            *changed |= response.changed();
+            if let Some(steps) = wheel_steps_if_hovered(ui, &response) {
+                *changed |= apply_wheel_step_f32(faux_bold_expand_percent, steps, 1.0, 0.0, 50.0);
+            }
+            let response = ui.checkbox(faux_bold_sharp_corners, t!("typing.params.sharp_corners"));
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+            *changed |= response.changed();
+            let response = ui.checkbox(faux_bold_outward_only, t!("typing.params.outward_only"));
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+            *changed |= response.changed();
+        });
+    }
+    ui.horizontal(|ui| {
+        let response = ui.checkbox(italic, t!("typing.params.italic"));
+        mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+        *changed |= response.changed();
+        let response = ui.checkbox(faux_italic, t!("typing.params.force"));
+        mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+        *changed |= response.changed();
+    });
+    if *italic && *faux_italic {
+        ui.indent(Id::new(id_salt).with("faux_italic"), |ui| {
+            let response = ui.add(WheelSlider::new(faux_italic_slant_deg, -45.0..=45.0).suffix("°").text(t!("typing.params.slant")));
+            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &response);
+            *changed |= response.changed();
+            if let Some(steps) = wheel_steps_if_hovered(ui, &response) {
+                *changed |= apply_wheel_step_f32(faux_italic_slant_deg, steps, 1.0, -45.0, 45.0);
+            }
+        });
+    }
+}
+
 pub(super) fn is_font_family_bound(ctx: &egui::Context, family: &egui::FontFamily) -> bool {
     ctx.fonts(|fonts| fonts.definitions().families.contains_key(family))
 }

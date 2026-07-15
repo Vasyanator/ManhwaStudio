@@ -17,15 +17,22 @@ paths still use the `raster.rs` bitmap blit and are unaffected.
 Key structures:
 - FillRule: glyph fill winding rule (TrueType/CFF use non-zero).
 - Outline: flattened, y-down glyph-local closed subpaths + cached local bbox.
-- GlyphTransform: local->world affine, same convention as `PlacedContour`.
-- OutlineKey / OutlineCache: resolution-independent outline cache; `OutlineCache`
-  also owns the reusable swash `ScaleContext` used on a cache miss.
+- GlyphTransform: local->world affine (scale, faux-italic baseline shear,
+  rotation, translation), same convention as `PlacedContour`.
+- OutlineKey / OutlineCache: resolution-independent outline cache keyed per
+  faux-bold variant (`faux_bits`, 0 = plain); `OutlineCache` also owns the
+  reusable swash `ScaleContext` used on a cache miss.
+- FauxOutlineParams: quantized (1/64 px) faux-bold offset parameters shared by
+  the outline cache key and the offset geometry itself.
 - RasterScratch: reusable per-render rasterizer buffers (subpaths, zeno commands,
   coverage mask) so `rasterize_outline_into` allocates nothing per glyph.
 
 Key functions:
 - extract_glyph_outline: swash outline -> flattened `Outline` (via a reused
   `ScaleContext` passed by the caller).
+- offset_outline: polyline offset (faux bold embolden) on the flattened
+  outline — outward for outer contours, optional hole shrink, miter/round
+  joins; self-intersections are resolved by the NonZero fill.
 - flatten_quad / flatten_cubic: adaptive bezier flattening.
 - rasterize_outline_into: the single vector rasterizer (zeno + tint + over-blend);
   takes a `&mut RasterScratch` and resets it per glyph for byte-identical reuse.
@@ -154,10 +161,18 @@ impl Outline {
 
 /// Local->world affine placement for a glyph outline.
 ///
-/// `world = Rot(rot) * (Scale(sx, sy) * local) + pos`, where
-/// `Rot([x, y]) = [x*cos - y*sin, x*sin + y*cos]`. This is the SAME convention
-/// as `glyph_contour::PlacedContour`, so a `GlyphTransform` can place both the
-/// rasterized outline and the measured contour identically.
+/// `world = Rot(rot) * (Shear(shear_x) * Scale(sx, sy) * local) + pos`, where
+/// `Rot([x, y]) = [x*cos - y*sin, x*sin + y*cos]` and
+/// `Shear([x, y]) = [x - shear_x * y, y]`. The shear sits BETWEEN scale and
+/// rotation and operates in the scaled glyph-local frame, whose baseline is the
+/// `y = 0` line (outline extraction keeps the pen/baseline at the local
+/// origin, ascenders at negative y in the y-down frame). Because `pos` places
+/// the local origin (the pen), the baseline is invariant under the shear and a
+/// POSITIVE `shear_x` leans glyph tops to the right (faux italic,
+/// `shear_x = tan(slant)`). `shear_x = 0.0` is bit-exact to the pre-shear
+/// transform. This is the SAME convention as `glyph_contour::PlacedContour`,
+/// so a `GlyphTransform` can place both the rasterized outline and the
+/// measured contour identically.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GlyphTransform {
     /// World-space translation applied after scale and rotation.
@@ -166,24 +181,31 @@ pub(crate) struct GlyphTransform {
     pub(crate) rot: f32,
     /// Per-axis scale `[sx, sy]` applied before rotation.
     pub(crate) scale: [f32; 2],
+    /// Baseline shear applied between scale and rotation
+    /// (`x' = x - shear_x * y` in the scaled local frame); `0.0` = none.
+    pub(crate) shear_x: f32,
 }
 
 impl GlyphTransform {
-    /// Identity transform (no translation/rotation, unit scale).
+    /// Identity transform (no translation/rotation/shear, unit scale).
     #[must_use]
     pub(crate) fn identity() -> Self {
         Self {
             pos: [0.0, 0.0],
             rot: 0.0,
             scale: [1.0, 1.0],
+            shear_x: 0.0,
         }
     }
 
-    /// Transform one glyph-local point to world space.
+    /// Transform one glyph-local point to world space (scale, shear, rotate,
+    /// translate — see the struct doc for the exact composition).
     #[must_use]
     fn apply(&self, local: [f32; 2], cos: f32, sin: f32) -> [f32; 2] {
-        let sx = local[0] * self.scale[0];
         let sy = local[1] * self.scale[1];
+        // Baseline shear in the scaled local frame; `shear_x == 0.0` yields
+        // `sx - 0.0`, which is bit-exact to the unsheared value.
+        let sx = local[0] * self.scale[0] - self.shear_x * sy;
         [
             sx * cos - sy * sin + self.pos[0],
             sx * sin + sy * cos + self.pos[1],
@@ -192,19 +214,108 @@ impl GlyphTransform {
 
     /// Place a glyph-local `GlyphContour` into world space with this transform.
     ///
-    /// Reuses `GlyphContour::placed` so on-path measurement and rasterization
-    /// share one placement convention.
+    /// Reuses `GlyphContour::placed` (including the baseline shear) so on-path
+    /// measurement and rasterization share one placement convention.
     #[must_use]
     pub(crate) fn place_contour(&self, contour: &GlyphContour) -> PlacedContour {
         let (cos, sin) = (self.rot.cos(), self.rot.sin());
-        contour.placed(cos, sin, self.scale[0], self.scale[1], self.pos[0], self.pos[1])
+        contour.placed_sheared(
+            cos,
+            sin,
+            self.scale[0],
+            self.scale[1],
+            self.shear_x,
+            self.pos[0],
+            self.pos[1],
+        )
     }
+}
+
+/// Offset distances below this are treated as "no faux bold" (return the plain
+/// outline unchanged). Half of the 1/64 px quantization step.
+const FAUX_MIN_OFFSET_PX: f32 = 1.0 / 128.0;
+
+/// Quantized faux-bold parameters for outline offsetting and cache keying.
+///
+/// The offset distance is stored in 1/64 px fixed point so two near-identical
+/// `f32` distances share one cache entry AND one geometry (the offset itself is
+/// computed from the quantized value — key and geometry can never disagree).
+/// The step is far below visual resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FauxOutlineParams {
+    /// Offset distance in 1/64 px units, `> 0` (zero-distance params are
+    /// rejected by [`FauxOutlineParams::new`]). Capped at `2^30 - 1` so the two
+    /// flag bits of [`FauxOutlineParams::key_bits`] never collide.
+    d_q64: u32,
+    /// Miter (`true`) vs round (`false`) joins at offset vertices.
+    sharp_corners: bool,
+    /// Preserve counters/holes (`true`) vs shrink them by `d` (`false`).
+    outward_only: bool,
+}
+
+impl FauxOutlineParams {
+    /// Quantize `d_px` (outline offset distance in glyph-local px) to 1/64 px.
+    ///
+    /// Returns `None` for a non-finite, non-positive, or sub-quantum distance —
+    /// callers then take the plain (non-faux) outline path, which keeps a
+    /// zero-strength faux bold byte-identical to no faux bold.
+    #[must_use]
+    pub(crate) fn new(d_px: f32, sharp_corners: bool, outward_only: bool) -> Option<Self> {
+        if !d_px.is_finite() || d_px < FAUX_MIN_OFFSET_PX {
+            return None;
+        }
+        // Round to the fixed-point grid; cap so the flag bits stay free.
+        let d_q64 = (d_px * 64.0).round().min(((1u32 << 30) - 1) as f32) as u32;
+        if d_q64 == 0 {
+            return None;
+        }
+        Some(Self {
+            d_q64,
+            sharp_corners,
+            outward_only,
+        })
+    }
+
+    /// The quantized offset distance in px (always `> 0`).
+    #[must_use]
+    pub(crate) fn d_px(self) -> f32 {
+        self.d_q64 as f32 / 64.0
+    }
+
+    /// Worst-case distance the offset boundary can stray from the source ink:
+    /// `d` for round joins (and bevel fallbacks), up to the miter limit `4*d`
+    /// at acute sharp corners. Bounds/canvas padding must use this, not `d`.
+    #[must_use]
+    pub(crate) fn max_overhang_px(self) -> f32 {
+        self.d_px() * if self.sharp_corners { 4.0 } else { 1.0 }
+    }
+
+    /// Pack into the non-zero `u32` used by [`OutlineKey`] and the optical
+    /// contour-cache keys: bits 0..=29 = `d_q64`, bit 30 = sharp, bit 31 = out.
+    #[must_use]
+    pub(crate) fn key_bits(self) -> u32 {
+        self.d_q64
+            | (u32::from(self.sharp_corners) << 30)
+            | (u32::from(self.outward_only) << 31)
+    }
+}
+
+/// Non-zero faux key bits, or `0` for the plain (non-faux) variant.
+///
+/// Shared helper for every cache keyed per faux-bold variant (`OutlineKey`,
+/// `OpticalContourCache`, the formula ink cache).
+#[must_use]
+pub(crate) fn faux_key_bits(faux: Option<FauxOutlineParams>) -> u32 {
+    faux.map_or(0, FauxOutlineParams::key_bits)
 }
 
 /// Cache key for an extracted outline.
 ///
 /// Vectors are resolution independent, so no subpixel bin is needed; the em
 /// size is keyed by its raw `f32` bit pattern to make identical sizes hit.
+/// `faux_bits` distinguishes faux-bold offset variants of the same glyph
+/// (`0` = the plain extracted outline, so plain-variant keys — and therefore
+/// the cached plain geometry — are unaffected by the faux feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OutlineKey {
     /// Stable per-font identifier supplied by the caller.
@@ -213,16 +324,28 @@ pub(crate) struct OutlineKey {
     glyph_id: u16,
     /// `em_px.to_bits()` — exact-match keying for the extraction ppem.
     em_bits: u32,
+    /// Packed faux-bold variant bits (`FauxOutlineParams::key_bits`), `0` = plain.
+    faux_bits: u32,
 }
 
 impl OutlineKey {
-    /// Build a key; `em_px` is keyed by its exact bit pattern.
+    /// Build a PLAIN (non-faux) key; `em_px` is keyed by its exact bit pattern.
     #[must_use]
     pub(crate) fn new(font_id: u64, glyph_id: u16, em_px: f32) -> Self {
         Self {
             font_id,
             glyph_id,
             em_bits: em_px.to_bits(),
+            faux_bits: 0,
+        }
+    }
+
+    /// This key's faux-bold variant: same glyph/em, faux bits from `faux`.
+    #[must_use]
+    fn with_faux(self, faux: FauxOutlineParams) -> Self {
+        Self {
+            faux_bits: faux.key_bits(),
+            ..self
         }
     }
 }
@@ -285,6 +408,44 @@ impl OutlineCache {
         let extracted = extract_glyph_outline(&mut self.context, font, glyph_id, em_px).map(Arc::new);
         self.map.insert(key, extracted.clone());
         extracted
+    }
+
+    /// Faux-bold-aware outline lookup: the plain outline for `faux == None`,
+    /// or the offset (emboldened) variant cached under the faux key otherwise.
+    ///
+    /// `key` must be the PLAIN key for `font`/`glyph_id`/`em_px`. On a faux
+    /// miss the plain outline is resolved first (through this same cache, so it
+    /// is extracted at most once and stays byte-identical to the non-faux
+    /// path), then offset via [`offset_outline`] with the QUANTIZED distance
+    /// and cached under the faux variant key. A glyph with no fillable outline
+    /// is `None` for every variant. Never panics.
+    pub(crate) fn get_or_extract_with_faux(
+        &mut self,
+        key: OutlineKey,
+        font: &swash::FontRef,
+        glyph_id: u16,
+        em_px: f32,
+        faux: Option<FauxOutlineParams>,
+    ) -> Option<Arc<Outline>> {
+        let Some(faux) = faux else {
+            return self.get_or_extract(key, font, glyph_id, em_px);
+        };
+        let faux_key = key.with_faux(faux);
+        if let Some(cached) = self.map.get(&faux_key) {
+            return cached.clone();
+        }
+        let offset = self
+            .get_or_extract(key, font, glyph_id, em_px)
+            .map(|plain| {
+                Arc::new(offset_outline(
+                    &plain,
+                    faux.d_px(),
+                    faux.sharp_corners,
+                    faux.outward_only,
+                ))
+            });
+        self.map.insert(faux_key, offset.clone());
+        offset
     }
 
     /// Number of cached entries (including negative results).
@@ -475,6 +636,403 @@ pub(crate) fn extract_glyph_outline(
 #[must_use]
 fn points_close(a: [f32; 2], b: [f32; 2]) -> bool {
     (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
+}
+
+/// Contours with |signed area| below this (px^2) are dropped by
+/// [`offset_outline`] as degenerate (hairline slivers cannot be offset
+/// meaningfully and contribute no visible fill).
+const FAUX_MIN_CONTOUR_AREA_PX2: f32 = 1e-2;
+
+/// Miter-limit fallback threshold: bevel when `1 + n0·n1 < 0.125`, i.e. when
+/// the miter length `d * sqrt(2 / (1 + dot))` would exceed `4 * d`.
+const FAUX_MITER_LIMIT_DOT: f32 = 0.125;
+
+/// Chord tolerance (px) for round-join circular-arc approximation; matches the
+/// bezier flattening tolerance so joins are as smooth as the flattened curves.
+const FAUX_ARC_TOLERANCE_PX: f32 = 0.2;
+
+/// Hard cap on interior points per round join (safety bound for huge `d`).
+const FAUX_MAX_ARC_STEPS: usize = 64;
+
+/// Shoelace signed area of a closed ring (closing edge implicit).
+///
+/// Orientation convention (this crate's y-DOWN glyph-local frame, see the file
+/// header): a POSITIVE area means the ring runs clockwise on screen. The sign
+/// gives each ring's own orientation (used for its outward normal and for the
+/// inversion check after offsetting); outer-vs-hole classification does NOT
+/// rely on any absolute winding convention — [`offset_outline`] evaluates the
+/// actual NonZero winding of the whole outline at a point inside each ring.
+#[must_use]
+fn ring_signed_area(ring: &[[f32; 2]]) -> f32 {
+    let n = ring.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[(i + 1) % n];
+        sum += a[0] * b[1] - b[0] * a[1];
+    }
+    sum * 0.5
+}
+
+/// Wrap an angle difference into `(-PI, PI]`.
+#[must_use]
+fn wrap_angle(mut angle: f32) -> f32 {
+    while angle > std::f32::consts::PI {
+        angle -= std::f32::consts::TAU;
+    }
+    while angle <= -std::f32::consts::PI {
+        angle += std::f32::consts::TAU;
+    }
+    angle
+}
+
+/// Offset (embolden) a flattened glyph outline by `d_px` on the crate's own
+/// polyline representation, preserving vertex order (and therefore winding).
+///
+/// Semantics (faux bold):
+/// - Outer-vs-hole is decided by the actual NonZero fill semantics, not by a
+///   winding convention: for each ring the total winding of ALL
+///   (non-degenerate) rings is evaluated at a point strictly inside it
+///   (`ring_interior_is_inked`). Ink inside (`winding != 0`) = an OUTER/ink
+///   boundary, moved outward by `d_px`; empty inside (`winding == 0`) = a
+///   counter (HOLE), moved INTO the hole by `d_px` (shrinking it) when
+///   `outward_only == false` and copied unchanged when `outward_only == true`.
+///   This matches what the NonZero rasterizer will fill for both TrueType and
+///   CFF conventions and for same-wound nested rings (which are ink, not
+///   holes). Assumes simple (non-self-intersecting) source contours — the norm
+///   for font outlines.
+/// - Joins at vertices: `sharp_corners == true` uses miter joins with limit ~4
+///   (falling back to bevel beyond the limit); `false` approximates a circular
+///   arc with a segment count proportional to `d_px`.
+/// - Degenerate contours (fewer than 3 distinct points or near-zero area) are
+///   dropped. An offset ring whose orientation FLIPPED or whose area collapsed
+///   below the epsilon (a counter narrower than `2*d`) is dropped entirely —
+///   an inverted ring would contribute filled ink under NonZero instead of a
+///   collapsed counter.
+/// - `d_px <= 0` (or below the quantization epsilon) returns a clone.
+///
+/// Self-intersections in the offset polygons are ACCEPTABLE by contract: the
+/// rasterizer fills with the NonZero rule (`rasterize_outline_into`), which
+/// resolves both local join overlaps and an expanded outer contour crossing
+/// its (preserved) hole. The result recomputes the outline AABB via
+/// `Outline::from_subpaths`. Never panics.
+#[must_use]
+pub(crate) fn offset_outline(
+    outline: &Outline,
+    d_px: f32,
+    sharp_corners: bool,
+    outward_only: bool,
+) -> Outline {
+    if !d_px.is_finite() || d_px < FAUX_MIN_OFFSET_PX {
+        return outline.clone();
+    }
+
+    // Per-ring signed areas; `retained` marks the non-degenerate rings that
+    // both survive into the output and participate in the winding evaluation.
+    let areas: Vec<f32> = outline
+        .subpaths
+        .iter()
+        .map(|ring| ring_signed_area(ring))
+        .collect();
+    let retained: Vec<bool> = outline
+        .subpaths
+        .iter()
+        .zip(areas.iter())
+        .map(|(ring, &area)| ring.len() >= 3 && area.abs() >= FAUX_MIN_CONTOUR_AREA_PX2)
+        .collect();
+    if !retained.iter().any(|&keep| keep) {
+        // No non-degenerate contour: nothing to offset.
+        return outline.clone();
+    }
+
+    let mut out_subpaths: Vec<Vec<[f32; 2]>> = Vec::with_capacity(outline.subpaths.len());
+    for (i, (ring, &area)) in outline.subpaths.iter().zip(areas.iter()).enumerate() {
+        if !retained[i] {
+            continue;
+        }
+        let is_outer = ring_interior_is_inked(&outline.subpaths, &retained, i);
+        if !is_outer && outward_only {
+            // Counters preserved: hole geometry copied verbatim.
+            out_subpaths.push(ring.clone());
+            continue;
+        }
+        // Outer rings expand (offset outward relative to the ring); holes
+        // shrink, i.e. their boundary moves AGAINST the ring's outward normal
+        // (into the hole interior), which is a negative signed offset.
+        let delta = if is_outer { d_px } else { -d_px };
+        let offset_ring = offset_closed_ring(ring, area.signum(), delta, sharp_corners);
+        if offset_ring.len() < 3 {
+            continue;
+        }
+        // Inversion/collapse guard: shrinking a counter narrower than `2*d`
+        // turns the ring inside out (flipped signed area) — under NonZero an
+        // inverted "hole" would ADD ink instead of vanishing. A collapsed
+        // counter is simply removed (solid ink), which is the correct
+        // embolden limit. Outward offsets cannot flip; the check is uniform
+        // for robustness.
+        let offset_area = ring_signed_area(&offset_ring);
+        if offset_area.abs() < FAUX_MIN_CONTOUR_AREA_PX2 || (offset_area > 0.0) != (area > 0.0) {
+            continue;
+        }
+        out_subpaths.push(offset_ring);
+    }
+
+    // `from_subpaths` recomputes the AABB. An outline that lost every contour
+    // (e.g. a lone counter that collapsed) falls back to a clone — safe.
+    Outline::from_subpaths(out_subpaths, outline.winding).unwrap_or_else(|| outline.clone())
+}
+
+/// Whether the region JUST INSIDE ring `index` (immediately right of its
+/// leftmost boundary on a scanline) is INK under the NonZero rule: the total
+/// winding of all `retained` rings there is non-zero.
+///
+/// Ink inside means the ring is an outer/ink boundary (faux bold offsets it
+/// outward); an empty interior means it bounds a counter (hole). Evaluating
+/// the real winding — instead of comparing orientations — is convention-free
+/// (TrueType and CFF wind oppositely) and treats same-wound nested rings as
+/// the ink they render as. The sample interval runs from the ring's leftmost
+/// scanline crossing to the NEAREST boundary of any retained ring, so nested
+/// children (e.g. a counter inside this outer ring) can never capture the
+/// sample point — a naive interior midpoint could land inside the counter and
+/// misclassify the outer ring. Falls back to `true` (outer) if no valid sample
+/// interval is found, which only happens for near-degenerate rings.
+#[must_use]
+fn ring_interior_is_inked(subpaths: &[Vec<[f32; 2]>], retained: &[bool], index: usize) -> bool {
+    let ring = &subpaths[index];
+    if ring.len() < 3 {
+        return true;
+    }
+    let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+    for v in ring {
+        min_y = min_y.min(v[1]);
+        max_y = max_y.max(v[1]);
+    }
+    if !(max_y - min_y).is_finite() || max_y - min_y <= 1e-4 {
+        return true;
+    }
+    // Odd fractions of the height avoid vertex-aligned scanlines on typical
+    // axis-aligned geometry; several candidates make the search robust.
+    let mut crossings: Vec<f32> = Vec::new();
+    for k in [0.5f32, 0.37, 0.61, 0.23, 0.79] {
+        let y = min_y + (max_y - min_y) * k;
+        // Leftmost crossing of THIS ring = entry into its interior.
+        crossings.clear();
+        ring_crossings_at_y(ring, y, &mut crossings);
+        let Some(x_enter) = crossings
+            .iter()
+            .copied()
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        else {
+            continue;
+        };
+        // Nearest boundary of ANY retained ring strictly right of the entry:
+        // the open interval between them lies inside this ring and crosses no
+        // other boundary, so its winding is uniform and describes the region
+        // adjacent to this ring's inner side.
+        let mut x_next = f32::INFINITY;
+        for (other, &keep) in subpaths.iter().zip(retained.iter()) {
+            if !keep {
+                continue;
+            }
+            crossings.clear();
+            ring_crossings_at_y(other, y, &mut crossings);
+            for &x in &crossings {
+                if x > x_enter + 1e-4 {
+                    x_next = x_next.min(x);
+                }
+            }
+        }
+        if !x_next.is_finite() {
+            continue;
+        }
+        let sample = [(x_enter + x_next) * 0.5, y];
+        let mut winding = 0i32;
+        for (other, &keep) in subpaths.iter().zip(retained.iter()) {
+            if keep {
+                winding += ring_winding_at(other, sample);
+            }
+        }
+        return winding != 0;
+    }
+    true
+}
+
+/// Append the x coordinates where the closed ring's edges cross the horizontal
+/// scanline `y` (half-open `<=` rule, so vertex-aligned scanlines count each
+/// crossing once).
+fn ring_crossings_at_y(ring: &[[f32; 2]], y: f32, out: &mut Vec<f32>) {
+    let n = ring.len();
+    if n < 2 {
+        return;
+    }
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[(i + 1) % n];
+        if (a[1] <= y) != (b[1] <= y) {
+            let t = (y - a[1]) / (b[1] - a[1]);
+            out.push(a[0] + t * (b[0] - a[0]));
+        }
+    }
+}
+
+/// NonZero winding number of one closed ring at `point` (`0` when outside; the
+/// sign reflects the ring's orientation in the y-down frame).
+///
+/// Standard signed crossing count over the rightward ray from `point`; the
+/// half-open `<=` test makes shared vertices count exactly once. `point` must
+/// not lie exactly ON the ring (callers sample strictly interior points).
+#[must_use]
+fn ring_winding_at(ring: &[[f32; 2]], point: [f32; 2]) -> i32 {
+    let n = ring.len();
+    if n < 3 {
+        return 0;
+    }
+    let mut winding = 0i32;
+    for i in 0..n {
+        let a = ring[i];
+        let b = ring[(i + 1) % n];
+        if (a[1] <= point[1]) != (b[1] <= point[1]) {
+            // The divisor is non-zero exactly because the endpoints straddle.
+            let t = (point[1] - a[1]) / (b[1] - a[1]);
+            let x = a[0] + t * (b[0] - a[0]);
+            if x > point[0] {
+                winding += if b[1] > a[1] { 1 } else { -1 };
+            }
+        }
+    }
+    winding
+}
+
+/// Offset one closed ring by the signed distance `delta` along its outward
+/// normal, joining edges per `sharp_corners`.
+///
+/// `orientation_sign` is the sign of the ring's shoelace area in the y-down
+/// frame; the outward unit normal of an edge with direction `t = (dx, dy)` is
+/// `sign * (dy, -dx) / |t|` (verified by the axis-aligned-square unit tests).
+/// A join gap opens at a vertex exactly when `sign * cross(t0, t1) * delta > 0`
+/// (loop-convex corners for a positive offset, loop-concave for a negative
+/// one); the opposite side uses the natural line intersection (miter apex),
+/// avoiding backward micro-loops that could flip NonZero winding locally.
+/// Returns an empty vec for rings with fewer than 3 distinct points.
+fn offset_closed_ring(
+    ring: &[[f32; 2]],
+    orientation_sign: f32,
+    delta: f32,
+    sharp_corners: bool,
+) -> Vec<[f32; 2]> {
+    // Deduplicate consecutive coincident points (keeping order/orientation).
+    let mut pts: Vec<[f32; 2]> = Vec::with_capacity(ring.len());
+    for &p in ring {
+        if pts.last().is_none_or(|last| !points_close(*last, p)) {
+            pts.push(p);
+        }
+    }
+    if pts.len() >= 2 && points_close(pts[0], pts[pts.len() - 1]) {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+
+    // Per-edge outward unit normals (edge i runs pts[i] -> pts[(i+1) % n]).
+    let mut normals: Vec<[f32; 2]> = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= f32::EPSILON {
+            // Coincident points were deduped, so this is unreachable in
+            // practice; a zero normal degrades to a plain translation-free
+            // join rather than NaN.
+            normals.push([0.0, 0.0]);
+            continue;
+        }
+        normals.push([
+            orientation_sign * dy / len,
+            -orientation_sign * dx / len,
+        ]);
+    }
+
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        // Vertex pts[i] joins incoming edge (i-1) and outgoing edge i.
+        let p = pts[i];
+        let n0 = normals[(i + n - 1) % n];
+        let n1 = normals[i];
+        let e0 = [p[0] + delta * n0[0], p[1] + delta * n0[1]];
+        let e1 = [p[0] + delta * n1[0], p[1] + delta * n1[1]];
+        let dot = n0[0] * n1[0] + n0[1] * n1[1];
+        let cross = n0[0] * n1[1] - n0[1] * n1[0];
+
+        if dot >= 1.0 - 1e-6 {
+            // Collinear edges: one shared offset point.
+            out.push(e1);
+            continue;
+        }
+        // Gap opens on the offset side at loop-convex corners for delta > 0
+        // (and loop-concave for delta < 0). cross(n0, n1) == cross(t0, t1)
+        // because both normals are the same fixed rotation of the tangents.
+        let opens = orientation_sign * cross * delta > 0.0;
+        if !opens {
+            // Closing side: the natural join is the offset-line intersection
+            // (same formula as the miter apex); it is bounded here because the
+            // edges converge. Near-antiparallel edges fall back to both
+            // endpoints (tiny backward loop, absorbed by the NonZero fill).
+            if 1.0 + dot > FAUX_MITER_LIMIT_DOT {
+                out.push(miter_apex(p, n0, n1, delta, dot));
+            } else {
+                out.push(e0);
+                out.push(e1);
+            }
+            continue;
+        }
+        if sharp_corners {
+            // Miter within limit ~4, bevel beyond it.
+            if 1.0 + dot >= FAUX_MITER_LIMIT_DOT {
+                out.push(miter_apex(p, n0, n1, delta, dot));
+            } else {
+                out.push(e0);
+                out.push(e1);
+            }
+        } else {
+            // Round join: circular arc of radius |delta| about the vertex from
+            // e0 to e1, swept the short way (the offset-normal rotation).
+            out.push(e0);
+            let radius = delta.abs();
+            let a0 = (e0[1] - p[1]).atan2(e0[0] - p[0]);
+            let a1 = (e1[1] - p[1]).atan2(e1[0] - p[0]);
+            let sweep = wrap_angle(a1 - a0);
+            // Segment count proportional to d: chord error <= FAUX_ARC_TOLERANCE_PX.
+            let max_step = if radius > FAUX_ARC_TOLERANCE_PX {
+                2.0 * (1.0 - FAUX_ARC_TOLERANCE_PX / radius).acos()
+            } else {
+                std::f32::consts::FRAC_PI_2
+            };
+            let steps = ((sweep.abs() / max_step.max(1e-3)).ceil() as usize)
+                .clamp(1, FAUX_MAX_ARC_STEPS);
+            for step in 1..steps {
+                let angle = a0 + sweep * (step as f32 / steps as f32);
+                out.push([p[0] + radius * angle.cos(), p[1] + radius * angle.sin()]);
+            }
+            out.push(e1);
+        }
+    }
+    out
+}
+
+/// Intersection of the two offset lines at a vertex (the miter apex):
+/// `p + delta * (n0 + n1) / (1 + n0·n1)`. Caller guarantees `1 + dot` is
+/// bounded away from zero (miter-limit check), so the division is safe.
+#[must_use]
+fn miter_apex(p: [f32; 2], n0: [f32; 2], n1: [f32; 2], delta: f32, dot: f32) -> [f32; 2] {
+    let scale = delta / (1.0 + dot);
+    [p[0] + scale * (n0[0] + n1[0]), p[1] + scale * (n0[1] + n1[1])]
 }
 
 /// Adaptively flatten a quadratic bezier into `out` (excluding the start point).
@@ -1565,6 +2123,7 @@ mod tests {
             pos: [0.0, 0.0],
             rot: std::f32::consts::FRAC_PI_2,
             scale: [1.0, 1.0],
+            shear_x: 0.0,
         };
         // After rot, local x-extent maps to y and vice versa; choose an origin
         // that keeps the rotated ink on-canvas.
@@ -1601,6 +2160,7 @@ mod tests {
             pos: [100_000.0, 100_000.0],
             rot: 0.0,
             scale: [1.0, 1.0],
+            shear_x: 0.0,
         };
         rasterize_outline_into(
             &mut scratch,
@@ -1696,6 +2256,7 @@ mod tests {
                     pos,
                     rot: 0.0,
                     scale: [1.0, 1.0],
+                    shear_x: 0.0,
                 },
                 [255, 255, 255, 255],
                 &identity_lut(),
@@ -2008,6 +2569,321 @@ mod tests {
             (w[1] - (p[1] + expected[1])).abs() < 1e-3,
             "y shift must use src dims: got {w:?}"
         );
+    }
+
+    /// Build an outline directly from rings (test-only; NonZero fill).
+    fn outline_from_rings(rings: Vec<Vec<[f32; 2]>>) -> Outline {
+        Outline::from_subpaths(rings, FillRule::NonZero).expect("non-empty outline")
+    }
+
+    /// Screen-clockwise (positive shoelace area in the y-down frame) square.
+    fn cw_square(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<[f32; 2]> {
+        vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+
+    /// Opposite-orientation (negative-area) square, used as a hole ring.
+    fn ccw_square(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<[f32; 2]> {
+        vec![[x0, y0], [x0, y1], [x1, y1], [x1, y0]]
+    }
+
+    fn assert_has_vertex_near(ring: &[[f32; 2]], expected: [f32; 2], tol: f32) {
+        assert!(
+            ring.iter().any(|v| (v[0] - expected[0]).abs() <= tol
+                && (v[1] - expected[1]).abs() <= tol),
+            "expected a vertex near {expected:?} in {ring:?}"
+        );
+    }
+
+    #[test]
+    fn offset_square_miter_corners_are_exact() {
+        let outline = outline_from_rings(vec![cw_square(0.0, 0.0, 10.0, 10.0)]);
+        let d = 2.0;
+        let offset = offset_outline(&outline, d, true, true);
+        assert_eq!(offset.subpaths().len(), 1);
+        let ring = &offset.subpaths()[0];
+        // Right-angle miter apexes sit exactly d beyond each corner diagonal.
+        for corner in [[-2.0, -2.0], [12.0, -2.0], [12.0, 12.0], [-2.0, 12.0]] {
+            assert_has_vertex_near(ring, corner, 1e-3);
+        }
+        let (min, max) = offset.local_bbox();
+        assert!((min[0] + 2.0).abs() < 1e-3 && (min[1] + 2.0).abs() < 1e-3);
+        assert!((max[0] - 12.0).abs() < 1e-3 && (max[1] - 12.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn offset_square_with_hole_respects_outward_only() {
+        let outer = cw_square(0.0, 0.0, 20.0, 20.0);
+        let hole = ccw_square(5.0, 5.0, 15.0, 15.0);
+        let outline = outline_from_rings(vec![outer, hole.clone()]);
+        let d = 2.0;
+
+        // outward_only = true: the hole ring is copied VERBATIM (counters kept).
+        let kept = offset_outline(&outline, d, true, true);
+        assert_eq!(kept.subpaths().len(), 2);
+        assert_eq!(kept.subpaths()[1], hole, "hole must be untouched");
+        // The outer ring still expanded.
+        assert_has_vertex_near(&kept.subpaths()[0], [-2.0, -2.0], 1e-3);
+
+        // outward_only = false: the hole shrinks by d on each side.
+        let shrunk = offset_outline(&outline, d, true, false);
+        assert_eq!(shrunk.subpaths().len(), 2);
+        let hole_ring = &shrunk.subpaths()[1];
+        for corner in [[7.0, 7.0], [7.0, 13.0], [13.0, 13.0], [13.0, 7.0]] {
+            assert_has_vertex_near(hole_ring, corner, 1e-3);
+        }
+        // Orientation must be preserved (NonZero hole subtraction relies on it).
+        assert!(
+            ring_signed_area(hole_ring) < 0.0,
+            "hole ring must keep its (negative) orientation"
+        );
+    }
+
+    #[test]
+    fn offset_round_joins_add_arc_vertices_at_convex_corners() {
+        let outline = outline_from_rings(vec![cw_square(0.0, 0.0, 10.0, 10.0)]);
+        let sharp = offset_outline(&outline, 2.0, true, true);
+        let round = offset_outline(&outline, 2.0, false, true);
+        assert!(
+            round.subpaths()[0].len() > sharp.subpaths()[0].len(),
+            "round joins must add arc vertices over miter joins ({} vs {})",
+            round.subpaths()[0].len(),
+            sharp.subpaths()[0].len()
+        );
+        // Segment count grows with d (arc step is proportional to the radius).
+        let round_small = offset_outline(&outline, 0.1, false, true);
+        let round_big = offset_outline(&outline, 8.0, false, true);
+        assert!(
+            round_big.subpaths()[0].len() > round_small.subpaths()[0].len(),
+            "arc segment count must grow with d ({} vs {})",
+            round_big.subpaths()[0].len(),
+            round_small.subpaths()[0].len()
+        );
+        // No round-join vertex strays farther than d (+ arc chord tolerance)
+        // from the source square boundary.
+        let square = cw_square(0.0, 0.0, 10.0, 10.0);
+        let mut closed = square.clone();
+        closed.push(square[0]);
+        for v in &round.subpaths()[0] {
+            let dist = dist_to_polyline(*v, &closed);
+            assert!(
+                dist <= 2.0 + 0.25,
+                "round-join vertex {v:?} strays {dist} > d from the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_collapses_counter_narrower_than_two_d() {
+        // A 2px-wide slot counter inside solid ink, shrunk by d = 2 per side:
+        // the offset ring inverts (flipped signed area). It must be DROPPED
+        // (collapsed counter = solid ink), never emitted inverted — an
+        // inverted "hole" would ADD ink under the NonZero fill.
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 20.0, 20.0),
+            ccw_square(9.0, 4.0, 11.0, 16.0),
+        ]);
+        for sharp in [true, false] {
+            let offset = offset_outline(&outline, 2.0, sharp, false);
+            assert_eq!(
+                offset.subpaths().len(),
+                1,
+                "collapsed counter must be dropped entirely (sharp={sharp})"
+            );
+            assert!(
+                ring_signed_area(&offset.subpaths()[0]) > 0.0,
+                "remaining outer ring keeps its orientation (sharp={sharp})"
+            );
+        }
+        // A wide-enough counter survives the same shrink with its orientation
+        // intact (round joins exercised on the shrinking side too).
+        let survivable = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 20.0, 20.0),
+            ccw_square(5.0, 5.0, 15.0, 15.0),
+        ]);
+        let offset = offset_outline(&survivable, 2.0, false, false);
+        assert_eq!(offset.subpaths().len(), 2);
+        assert!(
+            ring_signed_area(&offset.subpaths()[1]) < 0.0,
+            "surviving hole keeps its (negative) orientation under round joins"
+        );
+    }
+
+    #[test]
+    fn offset_round_joins_arc_concave_hole_corners_when_shrinking() {
+        // An L-shaped counter has one loop-concave corner; shrinking it opens
+        // a join gap there, so the round mode must insert arc vertices that
+        // the sharp mode replaces with a single miter apex.
+        let l_hole = vec![
+            [4.0, 4.0],
+            [4.0, 16.0],
+            [16.0, 16.0],
+            [16.0, 12.0],
+            [8.0, 12.0],
+            [8.0, 4.0],
+        ];
+        let outline =
+            outline_from_rings(vec![cw_square(0.0, 0.0, 20.0, 20.0), l_hole]);
+        let sharp = offset_outline(&outline, 1.5, true, false);
+        let round = offset_outline(&outline, 1.5, false, false);
+        assert_eq!(sharp.subpaths().len(), 2);
+        assert_eq!(round.subpaths().len(), 2);
+        assert!(
+            round.subpaths()[1].len() > sharp.subpaths()[1].len(),
+            "round joins must arc the concave hole corner ({} vs {})",
+            round.subpaths()[1].len(),
+            sharp.subpaths()[1].len()
+        );
+        // Both keep the hole orientation (no inversion at this size).
+        assert!(ring_signed_area(&sharp.subpaths()[1]) < 0.0);
+        assert!(ring_signed_area(&round.subpaths()[1]) < 0.0);
+    }
+
+    #[test]
+    fn winding_classification_is_orientation_convention_free() {
+        // Two DISJOINT blobs wound oppositely (larger one "CCW"): with an
+        // orientation-relative heuristic the small blob would be misread as a
+        // hole of the dominant ring. The NonZero-winding classification sees
+        // ink inside BOTH, so both expand outward.
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 5.0, 5.0),
+            ccw_square(10.0, 0.0, 30.0, 20.0),
+        ]);
+        let offset = offset_outline(&outline, 1.0, true, true);
+        assert_eq!(offset.subpaths().len(), 2);
+        assert_has_vertex_near(&offset.subpaths()[0], [-1.0, -1.0], 1e-3);
+        assert_has_vertex_near(&offset.subpaths()[0], [6.0, 6.0], 1e-3);
+        assert_has_vertex_near(&offset.subpaths()[1], [9.0, -1.0], 1e-3);
+        assert_has_vertex_near(&offset.subpaths()[1], [31.0, 21.0], 1e-3);
+    }
+
+    #[test]
+    fn winding_classification_treats_same_wound_nested_ring_as_ink() {
+        // A nested ring with the SAME orientation is NOT a counter under
+        // NonZero (its interior winds to 2, i.e. it renders as ink), so it
+        // must be offset outward even in `outward_only == false` mode.
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 20.0, 20.0),
+            cw_square(5.0, 5.0, 15.0, 15.0),
+        ]);
+        let offset = offset_outline(&outline, 1.0, true, false);
+        assert_eq!(offset.subpaths().len(), 2);
+        assert_has_vertex_near(&offset.subpaths()[1], [4.0, 4.0], 1e-3);
+        assert_has_vertex_near(&offset.subpaths()[1], [16.0, 16.0], 1e-3);
+    }
+
+    #[test]
+    fn offset_handles_duplicate_and_collinear_points() {
+        // A square ring polluted with duplicated vertices and long collinear
+        // runs on every edge must offset to the same miter corners as the
+        // clean square, with no NaN/degenerate output.
+        let noisy = vec![
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [3.0, 0.0],
+            [6.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 0.0],
+            [10.0, 5.0],
+            [10.0, 10.0],
+            [5.0, 10.0],
+            [5.0, 10.0],
+            [0.0, 10.0],
+            [0.0, 5.0],
+        ];
+        let offset = offset_outline(&outline_from_rings(vec![noisy]), 2.0, true, true);
+        assert_eq!(offset.subpaths().len(), 1);
+        for v in &offset.subpaths()[0] {
+            assert!(v[0].is_finite() && v[1].is_finite(), "no NaN vertices");
+        }
+        for corner in [[-2.0, -2.0], [12.0, -2.0], [12.0, 12.0], [-2.0, 12.0]] {
+            assert_has_vertex_near(&offset.subpaths()[0], corner, 1e-3);
+        }
+        let (min, max) = offset.local_bbox();
+        assert!((min[0] + 2.0).abs() < 1e-3 && (max[0] - 12.0).abs() < 1e-3);
+        assert!((min[1] + 2.0).abs() < 1e-3 && (max[1] - 12.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn offset_drops_degenerate_contours() {
+        // A tiny sliver (area far below the epsilon) and a 2-point path ride
+        // along with a real square: both must be dropped from the offset result.
+        let outline = outline_from_rings(vec![
+            cw_square(0.0, 0.0, 10.0, 10.0),
+            vec![[30.0, 30.0], [30.001, 30.0], [30.001, 30.001]],
+            vec![[40.0, 40.0], [41.0, 40.0]],
+        ]);
+        let offset = offset_outline(&outline, 2.0, true, true);
+        assert_eq!(
+            offset.subpaths().len(),
+            1,
+            "degenerate contours must be dropped"
+        );
+    }
+
+    #[test]
+    fn offset_zero_distance_returns_identical_outline() {
+        let rings = vec![cw_square(0.0, 0.0, 10.0, 10.0), ccw_square(2.0, 2.0, 8.0, 8.0)];
+        let outline = outline_from_rings(rings.clone());
+        for d in [0.0, -1.0, 1.0 / 256.0, f32::NAN] {
+            let offset = offset_outline(&outline, d, true, false);
+            assert_eq!(offset.subpaths(), outline.subpaths(), "d={d} must be a clone");
+            assert_eq!(offset.local_bbox(), outline.local_bbox());
+        }
+    }
+
+    #[test]
+    fn outline_cache_keys_faux_variants_separately() {
+        let data = load_test_font_bytes();
+        let font = swash::FontRef::from_index(&data, 0).expect("valid font");
+        let mut cache = OutlineCache::new();
+        let gid = glyph_for_char(&font, 'H');
+        let key = OutlineKey::new(1, gid, 64.0);
+
+        let plain = cache
+            .get_or_extract_with_faux(key, &font, gid, 64.0, None)
+            .expect("plain outline");
+        let faux = FauxOutlineParams::new(2.0, true, true).expect("valid faux params");
+        let bold = cache
+            .get_or_extract_with_faux(key, &font, gid, 64.0, Some(faux))
+            .expect("faux outline");
+        // Distinct entries: the plain variant is untouched, the faux one is
+        // wider by ~d on each side.
+        assert_eq!(cache.len(), 2, "plain + faux variants must both be cached");
+        let (pmin, pmax) = plain.local_bbox();
+        let (bmin, bmax) = bold.local_bbox();
+        assert!((pmin[0] - bmin[0] - 2.0).abs() < 0.75, "left edge moved by ~d");
+        assert!((bmax[0] - pmax[0] - 2.0).abs() < 0.75, "right edge moved by ~d");
+        // Repeat lookups hit the same Arcs (per-variant caching).
+        let plain_again = cache
+            .get_or_extract_with_faux(key, &font, gid, 64.0, None)
+            .expect("plain outline");
+        let bold_again = cache
+            .get_or_extract_with_faux(key, &font, gid, 64.0, Some(faux))
+            .expect("faux outline");
+        assert!(Arc::ptr_eq(&plain, &plain_again));
+        assert!(Arc::ptr_eq(&bold, &bold_again));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn glyph_transform_shear_leans_tops_and_fixes_baseline() {
+        // A square above the baseline (y in [-10, 0], y-down local frame).
+        let contour = GlyphContour {
+            components: vec![vec![[0.0, -10.0], [10.0, -10.0], [10.0, 0.0], [0.0, 0.0]]],
+        };
+        let transform = GlyphTransform {
+            pos: [0.0, 0.0],
+            rot: 0.0,
+            scale: [1.0, 1.0],
+            shear_x: 0.5,
+        };
+        let placed = transform.place_contour(&contour);
+        let ring = &placed.components[0];
+        // Baseline vertices (y = 0) are fixed; top vertices (y = -10) lean
+        // right by shear_x * 10 = 5 (positive shear leans tops right).
+        assert!((ring[3][0] - 0.0).abs() < 1e-5 && (ring[3][1] - 0.0).abs() < 1e-5);
+        assert!((ring[0][0] - 5.0).abs() < 1e-5 && (ring[0][1] + 10.0).abs() < 1e-5);
+        assert!((ring[1][0] - 15.0).abs() < 1e-5);
     }
 
     #[test]

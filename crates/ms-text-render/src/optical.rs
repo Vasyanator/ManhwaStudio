@@ -51,10 +51,13 @@ pub(crate) const OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX: f32 = 1.5;
 pub(crate) const OPTICAL_MIN_INK_GAP_FLOOR_PX: f32 = 0.5;
 
 /// Per-render cache of glyph ink contours keyed by
-/// `(hash_font_id(font_id), glyph_id, font_size.to_bits())`, so the bounds and
-/// draw passes plus repeated glyphs derive each contour at most once. Shared by
-/// the horizontal (`pipeline.rs`) and vertical (`layout/vertical.rs`) paths.
-pub(crate) type OpticalContourCache = HashMap<(u64, u16, u32), GlyphContour>;
+/// `(hash_font_id(font_id), glyph_id, font_size.to_bits(), faux_bold_bits)`,
+/// so the bounds and draw passes plus repeated glyphs derive each contour at
+/// most once. The last component is `vector::faux_key_bits` (`0` = plain), so a
+/// faux-bold (offset-outline) variant never aliases the plain contour — the
+/// same variant keying `OutlineKey` uses. Shared by the horizontal
+/// (`pipeline.rs`) and vertical (`layout/vertical.rs`) paths.
+pub(crate) type OpticalContourCache = HashMap<(u64, u16, u32, u32), GlyphContour>;
 
 /// Median of the finite entries of `gaps`.
 ///

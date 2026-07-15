@@ -874,16 +874,41 @@ impl TypingCreatePanelState {
             style.align = Some(align);
 
             let mut bold = style.bold;
-            let force_bold_resp = ui.checkbox(&mut bold, "Bold");
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_bold_resp);
-            *changed |= force_bold_resp.changed();
-            style.bold = bold;
-
             let mut italic = style.italic;
-            let force_italic_resp = ui.checkbox(&mut italic, "Italic");
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_italic_resp);
-            *changed |= force_italic_resp.changed();
+            let faux = style.faux_bold.unwrap_or_default();
+            let mut thicken = faux.thicken_percent;
+            let mut expand = faux.expand_percent;
+            let mut sharp = faux.sharp_corners;
+            let mut outward = faux.outward_only;
+            let mut faux_bold = style.faux_bold.is_some();
+            let mut slant = style.faux_italic_slant.unwrap_or(14.0);
+            let mut faux_italic = style.faux_italic_slant.is_some();
+            draw_faux_style_controls(
+                ui,
+                &mut bold,
+                &mut italic,
+                FauxStyleControlValues {
+                    faux_bold: &mut faux_bold,
+                    faux_bold_thicken_percent: &mut thicken,
+                    faux_bold_expand_percent: &mut expand,
+                    faux_bold_sharp_corners: &mut sharp,
+                    faux_bold_outward_only: &mut outward,
+                    faux_italic: &mut faux_italic,
+                    faux_italic_slant_deg: &mut slant,
+                },
+                changed,
+                block_hscroll_by_hovered_param,
+                "typing_main_inline_faux",
+            );
+            style.bold = bold;
             style.italic = italic;
+            style.faux_bold = (bold && faux_bold).then_some(FauxBoldParams {
+                thicken_percent: thicken,
+                expand_percent: expand,
+                sharp_corners: sharp,
+                outward_only: outward,
+            });
+            style.faux_italic_slant = (italic && faux_italic).then_some(slant);
 
             let mut no_break = style.no_break;
             let no_break_resp = ui.checkbox(&mut no_break, t!("typing.params.no_break"));
@@ -891,12 +916,23 @@ impl TypingCreatePanelState {
             *changed |= no_break_resp.changed();
             style.no_break = no_break;
         } else {
-            let force_bold_resp = ui.checkbox(&mut self.force_bold, "Bold");
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_bold_resp);
-            *changed |= force_bold_resp.changed();
-            let force_italic_resp = ui.checkbox(&mut self.force_italic, "Italic");
-            mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &force_italic_resp);
-            *changed |= force_italic_resp.changed();
+            draw_faux_style_controls(
+                ui,
+                &mut self.force_bold,
+                &mut self.force_italic,
+                FauxStyleControlValues {
+                    faux_bold: &mut self.faux_bold,
+                    faux_bold_thicken_percent: &mut self.faux_bold_thicken_percent,
+                    faux_bold_expand_percent: &mut self.faux_bold_expand_percent,
+                    faux_bold_sharp_corners: &mut self.faux_bold_sharp_corners,
+                    faux_bold_outward_only: &mut self.faux_bold_outward_only,
+                    faux_italic: &mut self.faux_italic,
+                    faux_italic_slant_deg: &mut self.faux_italic_slant_deg,
+                },
+                changed,
+                block_hscroll_by_hovered_param,
+                "typing_main_faux",
+            );
         }
         ui.add_enabled_ui(!selection_mode, |ui| {
             let hanging_punct_resp =

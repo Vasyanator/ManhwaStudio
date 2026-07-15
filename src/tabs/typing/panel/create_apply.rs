@@ -307,6 +307,13 @@ impl TypingCreatePanelState {
             .get("force_italic")
             .and_then(Value::as_bool)
             .unwrap_or(self.force_italic);
+        self.faux_bold = text_params_obj.get("faux_bold").and_then(Value::as_bool).unwrap_or(false);
+        self.faux_bold_thicken_percent = text_params_obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0);
+        self.faux_bold_expand_percent = text_params_obj.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0);
+        self.faux_bold_sharp_corners = text_params_obj.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true);
+        self.faux_bold_outward_only = text_params_obj.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true);
+        self.faux_italic = text_params_obj.get("faux_italic").and_then(Value::as_bool).unwrap_or(false);
+        self.faux_italic_slant_deg = text_params_obj.get("faux_italic_slant_deg").and_then(value_as_f32).unwrap_or(14.0).clamp(-45.0, 45.0);
         self.hanging_punctuation = text_params_obj
             .get("hanging_punctuation")
             .and_then(Value::as_bool)
@@ -607,6 +614,14 @@ impl TypingCreatePanelState {
             selected_face_index,
             force_bold: self.force_bold,
             force_italic: self.force_italic,
+            faux_bold: (self.force_bold && self.faux_bold).then_some(FauxBoldParams {
+                thicken_percent: self.faux_bold_thicken_percent,
+                expand_percent: self.faux_bold_expand_percent,
+                sharp_corners: self.faux_bold_sharp_corners,
+                outward_only: self.faux_bold_outward_only,
+            }),
+            faux_italic_slant_deg: (self.force_italic && self.faux_italic)
+                .then_some(self.faux_italic_slant_deg),
             uppercase_text: self.uppercase_text,
             trim_extra_spaces: self.trim_extra_spaces,
             hanging_punctuation: self.hanging_punctuation,

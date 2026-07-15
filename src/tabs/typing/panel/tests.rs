@@ -18,6 +18,8 @@ paths change.
     #[test]
     fn machine_tag_round_trips_through_build_and_parse() {
         let style = TypingInlineTagStyle {
+            faux_bold: None,
+            faux_italic_slant: None,
             bold: true,
             italic: false,
             no_break: true,
@@ -49,6 +51,30 @@ paths change.
     #[test]
     fn empty_machine_tag_is_not_emitted() {
         assert!(build_inline_machine_tag(&TypingInlineTagStyle::default()).is_empty());
+    }
+
+    #[test]
+    fn faux_inline_tags_round_trip_through_panel_grammar() {
+        let style = TypingInlineTagStyle {
+            bold: true,
+            italic: true,
+            faux_bold: Some(FauxBoldParams {
+                thicken_percent: 5.0,
+                expand_percent: 2.0,
+                sharp_corners: false,
+                outward_only: false,
+            }),
+            faux_italic_slant: Some(-10.0),
+            ..TypingInlineTagStyle::default()
+        };
+
+        let machine = build_inline_machine_tag(&style);
+        let parsed_machine = parse_machine_tag_style(&machine[1..machine.len() - 1])
+            .unwrap_or_default();
+        assert_eq!(parsed_machine.faux_bold, style.faux_bold);
+        assert_eq!(parsed_machine.faux_italic_slant, style.faux_italic_slant);
+        assert!(matches!(parse_opening_inline_tag("b=5,round,both,2"), Some(TypingInlineTagKind::FauxBold(_))));
+        assert!(matches!(parse_opening_inline_tag("i=-10"), Some(TypingInlineTagKind::FauxItalic(-10.0))));
     }
 
     #[test]
@@ -244,6 +270,201 @@ paths change.
             "missing and unparseable imported paths must be skipped"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build a minimal selection context whose only meaningful field is `style`;
+    /// the ranges are dummies (the tested functions read only `selection.style`).
+    fn selection_with_style(style: TypingInlineTagStyle) -> TypingInlineSelectionContext {
+        TypingInlineSelectionContext {
+            char_range: 0..1,
+            text_byte_range: 0..1,
+            opening_wrapper_range: 0..0,
+            closing_wrapper_range: 1..1,
+            style,
+        }
+    }
+
+    /// A state carrying one selectable font so `effective`/`normalize` filter the
+    /// overlay-default font label, size, color, etc. down to nothing.
+    fn state_with_font() -> TypingCreatePanelState {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = merge_duplicate_fonts(vec![raw_font("/fonts/Test.ttf", None, 1)]);
+        state.selected_font_idx = 0;
+        state
+    }
+
+    // Finding 10 (a): every faux field must be pinned into the built render_data.
+    #[test]
+    fn faux_params_pin_all_seven_text_params_keys() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.force_bold = true;
+        state.faux_bold = true;
+        state.faux_bold_thicken_percent = 7.5;
+        state.faux_bold_expand_percent = 4.0;
+        state.faux_bold_sharp_corners = false;
+        state.faux_bold_outward_only = false;
+        state.force_italic = true;
+        state.faux_italic = true;
+        state.faux_italic_slant_deg = -30.0;
+
+        let render_data = state.build_render_data_json_with_font(
+            "Hi".to_string(),
+            100,
+            Some("/fonts/Test.ttf".to_string()),
+            Some("Test".to_string()),
+            None,
+        );
+        let tp = render_data
+            .get("text_params")
+            .and_then(Value::as_object)
+            .expect("text_params object");
+        assert_eq!(tp.get("faux_bold").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            tp.get("faux_bold_thicken_percent").and_then(value_as_f32),
+            Some(7.5)
+        );
+        assert_eq!(
+            tp.get("faux_bold_expand_percent").and_then(value_as_f32),
+            Some(4.0)
+        );
+        assert_eq!(
+            tp.get("faux_bold_sharp_corners").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            tp.get("faux_bold_outward_only").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(tp.get("faux_italic").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            tp.get("faux_italic_slant_deg").and_then(value_as_f32),
+            Some(-30.0)
+        );
+    }
+
+    // Finding 10 (b): the read path round-trips the seven fields and clamps them.
+    #[test]
+    fn faux_params_round_trip_through_apply_with_clamping() {
+        let render_data = serde_json::json!({
+            "text_params": {
+                "text": "Hi",
+                "force_bold": true,
+                "faux_bold": true,
+                "faux_bold_thicken_percent": 99.0,
+                "faux_bold_expand_percent": 4.0,
+                "faux_bold_sharp_corners": false,
+                "faux_bold_outward_only": false,
+                "force_italic": true,
+                "faux_italic": true,
+                "faux_italic_slant_deg": -90.0,
+            },
+            "effects": [],
+        });
+        let mut state = TypingCreatePanelState::new(false);
+        state.apply_render_data_json_with_options(&render_data, false);
+        assert!(state.faux_bold);
+        assert_eq!(state.faux_bold_thicken_percent, 25.0); // 99 clamps to 25
+        assert_eq!(state.faux_bold_expand_percent, 4.0);
+        assert!(!state.faux_bold_sharp_corners);
+        assert!(!state.faux_bold_outward_only);
+        assert!(state.faux_italic);
+        assert_eq!(state.faux_italic_slant_deg, -45.0); // -90 clamps to -45
+    }
+
+    // Finding 10 (c): the built TextRenderParams gate faux on the force_* flags.
+    #[test]
+    fn faux_render_params_gate_on_force_flags() {
+        let mut state = state_with_font();
+        state.faux_bold = true;
+        state.faux_bold_thicken_percent = 7.5;
+        state.faux_italic = true;
+        state.faux_italic_slant_deg = -30.0;
+
+        // force_* off -> None even though faux_* is on.
+        state.force_bold = false;
+        state.force_italic = false;
+        let params = state.build_render_params().expect("render params");
+        assert!(params.faux_bold.is_none());
+        assert!(params.faux_italic_slant_deg.is_none());
+
+        // force_* on + faux_* on -> Some with the pinned values.
+        state.force_bold = true;
+        state.force_italic = true;
+        let params = state.build_render_params().expect("render params");
+        assert_eq!(params.faux_bold.map(|f| f.thicken_percent), Some(7.5));
+        assert_eq!(params.faux_italic_slant_deg, Some(-30.0));
+    }
+
+    // Finding 2: a bare `<b>` span under a faux overlay reports REAL bold (faux
+    // None), and normalization re-emits the span verbatim (round-trips to `<m b>`).
+    #[test]
+    fn bare_bold_span_under_overlay_faux_reports_real_bold_and_round_trips() {
+        let mut state = state_with_font();
+        state.force_bold = true;
+        state.faux_bold = true;
+        state.faux_bold_thicken_percent = 6.0;
+
+        let selection = selection_with_style(TypingInlineTagStyle {
+            bold: true,
+            faux_bold: None,
+            ..TypingInlineTagStyle::default()
+        });
+
+        let effective = state.effective_inline_tag_style(&selection);
+        assert!(effective.bold);
+        assert_eq!(effective.faux_bold, None, "bare <b> stays real bold");
+
+        let normalized = state.normalize_desired_inline_tag_style(effective);
+        assert!(normalized.bold);
+        assert_eq!(normalized.faux_bold, None);
+        assert_eq!(build_inline_machine_tag(&normalized), "<m b>");
+    }
+
+    // Finding 1: a selection whose faux state differs from the overlay's under
+    // force_bold=true still emits a parameterized tag (not silently dropped).
+    #[test]
+    fn selection_faux_differing_from_overlay_emits_parameterized_tag() {
+        let mut state = state_with_font();
+        // Overlay: forced REAL bold (faux off).
+        state.force_bold = true;
+        state.faux_bold = false;
+
+        let selection = selection_with_style(TypingInlineTagStyle::default());
+        let mut desired = state.effective_inline_tag_style(&selection);
+        // Simulate the panel edit: enable faux bold on this selection (thicken 8).
+        desired.faux_bold = Some(FauxBoldParams {
+            thicken_percent: 8.0,
+            ..FauxBoldParams::default()
+        });
+
+        let normalized = state.normalize_desired_inline_tag_style(desired);
+        assert!(normalized.bold);
+        assert_eq!(
+            normalized.faux_bold.map(|f| f.thicken_percent),
+            Some(8.0),
+            "differing faux must be emitted under overlay force+real bold"
+        );
+        assert_eq!(
+            build_inline_machine_tag(&normalized),
+            "<m b=8.00,sharp,out,0.00>"
+        );
+    }
+
+    // Finding 1/2: selecting a plain span with no edits under a faux overlay is a
+    // no-op — the overlay already provides the faux bold, so no span tag is emitted.
+    #[test]
+    fn plain_span_under_overlay_faux_is_a_noop() {
+        let mut state = state_with_font();
+        state.force_bold = true;
+        state.faux_bold = true;
+        state.faux_bold_thicken_percent = 6.0;
+
+        let selection = selection_with_style(TypingInlineTagStyle::default());
+        let effective = state.effective_inline_tag_style(&selection);
+        let normalized = state.normalize_desired_inline_tag_style(effective);
+        assert!(!normalized.bold);
+        assert_eq!(normalized.faux_bold, None);
+        assert!(build_inline_machine_tag(&normalized).is_empty());
     }
 
     #[test]

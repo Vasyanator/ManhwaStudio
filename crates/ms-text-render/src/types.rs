@@ -26,6 +26,7 @@ Source compatibility:
 - `TextVectorLineTextDirection`
 - `TextVectorLineDistanceMode`
 - `AntiAliasingMode`
+- `FauxBoldParams`
 - `TEXT_FORMULA_USER_VAR_COUNT`
 */
 
@@ -38,7 +39,13 @@ pub const TEXT_FORMULA_USER_VAR_COUNT: usize = 8;
 /// кодируется одним ключом; отсутствующий параметр — отсутствующий ключ.
 ///
 /// Ключи (общий контракт панели и рендера):
-/// - `b` — bold (флаг), `i` — italic (флаг)
+/// - `b` — bold: valueless = the real Bold face; with a value
+///   `b=thicken[,sharp|round][,out|both][,expand]` (or `b=default`) = faux bold
+///   on the Regular face (see [`FauxBoldParams`]); an unreadable value falls
+///   back to plain (real-face) bold
+/// - `i` — italic: valueless = the real Italic face; with a value
+///   `i=slant_deg` (degrees, −45..45) = faux italic (baseline shear); an
+///   unreadable value falls back to plain italic
 /// - `f` — шрифт (строка, при необходимости в кавычках)
 /// - `s` — размер шрифта в px
 /// - `c` — цвет (hex `RRGGBBAA`)
@@ -207,6 +214,43 @@ impl PxOrPercent {
     }
 }
 
+/// Faux (synthetic) bold parameters: geometric thickening of the Regular-face
+/// glyph outlines instead of switching to the family's real Bold face.
+///
+/// Takes effect only when the corresponding bold flag is also set
+/// (`TextRenderParams.force_bold` for the whole overlay, or an inline
+/// `<b=...>` span). The ink boundary of every affected glyph moves outward by
+/// `d = thicken_percent / 100 * font_size_px` (the glyph's own effective font
+/// size), and the horizontal pen advance automatically grows by `2*d` plus the
+/// extra `expand_percent` letter-spacing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FauxBoldParams {
+    /// Outline offset distance as % of font size, `0..=25`. `0` = no thickening.
+    pub thicken_percent: f32,
+    /// EXTRA letter-spacing as % of font size (`0..=50`), added on top of the
+    /// automatic `2*d` advance growth.
+    pub expand_percent: f32,
+    /// `true` = miter joins (limit ~4, sharp corners preserved); `false` =
+    /// round (circular-arc) joins at offset vertices.
+    pub sharp_corners: bool,
+    /// `true` = only outer contours offset outward (counters/holes keep their
+    /// size); `false` = holes also shrink by `d` (denser classic embolden).
+    pub outward_only: bool,
+}
+
+impl Default for FauxBoldParams {
+    /// Defaults match the `<b=default>` inline tag: thicken 3 %, no extra
+    /// expansion, sharp (miter) corners, counters preserved.
+    fn default() -> Self {
+        Self {
+            thicken_percent: 3.0,
+            expand_percent: 0.0,
+            sharp_corners: true,
+            outward_only: true,
+        }
+    }
+}
+
 /// Vector mesh warp ("raster-transformation") applied to glyph OUTLINES while
 /// still vector — a lattice deformation inserted AFTER per-glyph layout but
 /// BEFORE the global rotation and rasterization, so warped text stays crisp.
@@ -270,6 +314,17 @@ pub struct TextRenderParams {
     pub selected_face_index: usize,
     pub force_bold: bool,
     pub force_italic: bool,
+    /// Faux (synthetic) bold. Takes effect ONLY when `force_bold` is also
+    /// `true`: the renderer then keeps the Regular face (no
+    /// `Weight::BOLD` font matching) and thickens glyph outlines geometrically
+    /// (see [`FauxBoldParams`]). `force_bold && faux_bold.is_none()` = current
+    /// real-Bold-face behavior; `None` + `force_bold == false` = no bold.
+    pub faux_bold: Option<FauxBoldParams>,
+    /// Faux (synthetic) italic slant in degrees, `-45..=45`; positive = top
+    /// leans right. Takes effect ONLY when `force_italic` is also `true`: the
+    /// renderer then keeps the upright face (no `Style::Italic` matching) and
+    /// shears glyph outlines about the baseline. Advances are unchanged.
+    pub faux_italic_slant_deg: Option<f32>,
     pub uppercase_text: bool,
     pub trim_extra_spaces: bool,
     pub hanging_punctuation: bool,

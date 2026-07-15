@@ -80,6 +80,7 @@ const _: usize = std::mem::size_of::<types::TextRenderParams>()
     + std::mem::size_of::<types::TextVectorLine>()
     + std::mem::size_of::<types::TextVectorPoint>()
     + std::mem::size_of::<types::AntiAliasingMode>()
+    + std::mem::size_of::<types::FauxBoldParams>()
     + types::TEXT_FORMULA_USER_VAR_COUNT;
 
 const _: fn(&types::TextRenderParams) -> Result<types::RenderedTextImage, String> =
@@ -184,6 +185,8 @@ pub fn touch_runtime_smoke_contract() {
         selected_face_index: 0,
         force_bold: false,
         force_italic: false,
+        faux_bold: None,
+        faux_italic_slant_deg: None,
         uppercase_text: false,
         trim_extra_spaces: true,
         hanging_punctuation: false,
@@ -232,6 +235,8 @@ pub fn touch_runtime_smoke_contract() {
         params.selected_face_index,
         params.force_bold,
         params.force_italic,
+        &params.faux_bold,
+        params.faux_italic_slant_deg,
         params.uppercase_text,
         params.trim_extra_spaces,
         params.hanging_punctuation,
@@ -374,6 +379,8 @@ mod tests {
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             uppercase_text: false,
             trim_extra_spaces: true,
             hanging_punctuation: false,

@@ -865,6 +865,15 @@ impl TypingCreatePanelState {
                 .map_or(0, |face| face.face_index),
             force_bold: self.force_bold,
             force_italic: self.force_italic,
+            faux_bold: self.faux_bold,
+            faux_bold_thicken_percent: self.faux_bold_thicken_percent.to_bits(),
+            faux_bold_expand_percent: self.faux_bold_expand_percent.to_bits(),
+            faux_bold_sharp_corners: self.faux_bold_sharp_corners,
+            faux_bold_outward_only: self.faux_bold_outward_only,
+            // Faux italic flips the face Italic <-> Regular, which changes advances
+            // for families that ship a real Italic face -> the width metric goes
+            // stale. The slant magnitude is a pure shear and stays out.
+            faux_italic: self.faux_italic,
             hanging_punctuation: self.hanging_punctuation,
         }
     }

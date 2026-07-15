@@ -117,7 +117,7 @@ use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_pa
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
-    AntiAliasingMode, HorizontalAlign, KerningMode, PxOrPercent, RenderedTextImage,
+    AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, PxOrPercent, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -1152,6 +1152,13 @@ struct TypingCreatePanelState {
     shape_variant: u8,
     force_bold: bool,
     force_italic: bool,
+    faux_bold: bool,
+    faux_bold_thicken_percent: f32,
+    faux_bold_expand_percent: f32,
+    faux_bold_sharp_corners: bool,
+    faux_bold_outward_only: bool,
+    faux_italic: bool,
+    faux_italic_slant_deg: f32,
     uppercase_text: bool,
     trim_extra_spaces: bool,
     hanging_punctuation: bool,
@@ -1248,6 +1255,18 @@ struct AdvancedFormMetricSignature {
     face_index: usize,
     force_bold: bool,
     force_italic: bool,
+    faux_bold: bool,
+    faux_bold_thicken_percent: u32,
+    faux_bold_expand_percent: u32,
+    faux_bold_sharp_corners: bool,
+    faux_bold_outward_only: bool,
+    /// Faux italic toggles the synthesized-slant path, which keeps the Regular
+    /// (upright) face instead of switching to the family's real Italic face.
+    /// That face switch changes per-glyph advances for families that ship a real
+    /// Italic, so the width metric must be rebuilt when it flips. The signed
+    /// slant magnitude itself is a pure shear and leaves advances unchanged, so
+    /// it stays out of this signature.
+    faux_italic: bool,
     hanging_punctuation: bool,
 }
 
@@ -1255,6 +1274,11 @@ struct AdvancedFormMetricSignature {
 struct TypingInlineTagStyle {
     bold: bool,
     italic: bool,
+    /// `Some` = faux (synthesized) bold on the Regular face with these params;
+    /// `None` while `bold == true` = the family's real Bold face. Mirrors the
+    /// renderer's per-span resolution (see `pipeline.rs::faux_bold_params_at_offset`).
+    faux_bold: Option<FauxBoldParams>,
+    faux_italic_slant: Option<f32>,
     no_break: bool,
     align: Option<HorizontalAlign>,
     font_label: Option<String>,
@@ -1303,6 +1327,8 @@ struct TypingInlineSelectionContext {
 enum TypingInlineTagKind {
     Bold,
     Italic,
+    FauxBold(FauxBoldParams),
+    FauxItalic(f32),
     NoBreak,
     Align(HorizontalAlign),
     Font(String),

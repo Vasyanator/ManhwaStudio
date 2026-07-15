@@ -161,6 +161,17 @@ pub(super) fn parse_opening_inline_tag(raw: &str) -> Option<TypingInlineTagKind>
         _ => {}
     }
 
+    if let Some(value) = inline_tag_value(raw, "b").or_else(|| inline_tag_value(raw, "strong"))
+        && let Some(params) = parse_faux_bold_value(value)
+    {
+        return Some(TypingInlineTagKind::FauxBold(params));
+    }
+    if let Some(value) = inline_tag_value(raw, "i").or_else(|| inline_tag_value(raw, "em"))
+        && let Some(slant) = parse_faux_italic_value(value)
+    {
+        return Some(TypingInlineTagKind::FauxItalic(slant));
+    }
+
     if let Some(style) = parse_machine_tag_style(raw) {
         return Some(TypingInlineTagKind::Machine(style));
     }
@@ -257,7 +268,17 @@ pub(super) fn inline_tag_kinds_match(left: &TypingInlineTagKind, right: &TypingI
     matches!(
         (left, right),
         (TypingInlineTagKind::Bold, TypingInlineTagKind::Bold)
+            | (TypingInlineTagKind::FauxBold(_), TypingInlineTagKind::Bold)
+            | (TypingInlineTagKind::Bold, TypingInlineTagKind::FauxBold(_))
+            // Bold and faux-bold pair by kind, not by payload (a `<b=5>` opens and
+            // a `</b>` closes it). These two same-kind arms are unreachable today —
+            // closing tags always parse to `Bold`/`Italic` — but keep the matcher
+            // total so a future faux-typed closing tag cannot fall through silently.
+            | (TypingInlineTagKind::FauxBold(_), TypingInlineTagKind::FauxBold(_))
             | (TypingInlineTagKind::Italic, TypingInlineTagKind::Italic)
+            | (TypingInlineTagKind::FauxItalic(_), TypingInlineTagKind::Italic)
+            | (TypingInlineTagKind::Italic, TypingInlineTagKind::FauxItalic(_))
+            | (TypingInlineTagKind::FauxItalic(_), TypingInlineTagKind::FauxItalic(_))
             | (TypingInlineTagKind::NoBreak, TypingInlineTagKind::NoBreak)
             | (TypingInlineTagKind::Align(_), TypingInlineTagKind::Align(_))
             | (TypingInlineTagKind::Font(_), TypingInlineTagKind::Font(_))
@@ -316,10 +337,18 @@ pub(super) fn format_inline_align_value(align: HorizontalAlign) -> String {
 pub(super) fn build_inline_machine_tag(style: &TypingInlineTagStyle) -> String {
     let mut out = String::from("<m");
     if style.bold {
-        out.push_str(" b");
+        if let Some(faux) = style.faux_bold {
+            out.push_str(format_faux_bold_payload(faux, " b=").as_str());
+        } else {
+            out.push_str(" b");
+        }
     }
     if style.italic {
-        out.push_str(" i");
+        if let Some(slant) = style.faux_italic_slant {
+            out.push_str(format!(" i={slant:.2}").as_str());
+        } else {
+            out.push_str(" i");
+        }
     }
     if style.no_break {
         out.push_str(" j");
@@ -411,12 +440,38 @@ pub(super) fn build_inline_opening_tags(style: &TypingInlineTagStyle) -> String 
         out.push_str(format!("<align={}>", format_inline_align_value(align)).as_str());
     }
     if style.bold {
-        out.push_str("<b>");
+        if let Some(faux) = style.faux_bold {
+            out.push_str(format!("<b={}>", faux_bold_payload_tokens(faux)).as_str());
+        } else {
+            out.push_str("<b>");
+        }
     }
     if style.italic {
-        out.push_str("<i>");
+        if let Some(slant) = style.faux_italic_slant {
+            out.push_str(format!("<i={slant:.2}>").as_str());
+        } else {
+            out.push_str("<i>");
+        }
     }
     out
+}
+
+/// Grammar-canonical faux-bold payload tokens `thicken,sharp|round,out|both,expand`
+/// (mirrors the renderer's `<b=...>` payload). Shared by the machine and legacy
+/// tag builders so both stay byte-identical.
+fn faux_bold_payload_tokens(faux: FauxBoldParams) -> String {
+    format!(
+        "{:.2},{},{},{:.2}",
+        faux.thicken_percent,
+        if faux.sharp_corners { "sharp" } else { "round" },
+        if faux.outward_only { "out" } else { "both" },
+        faux.expand_percent,
+    )
+}
+
+/// `prefix` + [`faux_bold_payload_tokens`], e.g. `" b="` for the machine tag.
+fn format_faux_bold_payload(faux: FauxBoldParams, prefix: &str) -> String {
+    format!("{prefix}{}", faux_bold_payload_tokens(faux))
 }
 
 pub(super) fn build_inline_closing_tags(style: &TypingInlineTagStyle) -> String {
@@ -584,8 +639,26 @@ pub(super) fn parse_machine_tag_style(raw: &str) -> Option<TypingInlineTagStyle>
 
     for (key, value) in &attrs {
         match key {
-            'b' => style.bold = true,
-            'i' => style.italic = true,
+            'b' => {
+                style.bold = true;
+                // Empty payload = bare `<m b>` = real Bold face. Use the renderer's
+                // pre-trim `is_empty` check (inline_styles.rs) so a whitespace-only
+                // payload like `<m b=" ">` resolves to faux defaults on both sides,
+                // not real bold on one and faux on the other.
+                style.faux_bold = if value.is_empty() {
+                    None
+                } else {
+                    parse_faux_bold_value(value)
+                };
+            }
+            'i' => {
+                style.italic = true;
+                style.faux_italic_slant = if value.is_empty() {
+                    None
+                } else {
+                    parse_faux_italic_value(value)
+                };
+            }
             'j' | 'J' => style.no_break = true,
             'a' | 'A' => {
                 if let Some(align) = parse_inline_align_value(value) {
@@ -676,6 +749,55 @@ pub(super) fn parse_machine_tag_style(raw: &str) -> Option<TypingInlineTagStyle>
     }
 
     Some(style)
+}
+
+/// Mirror the renderer's faux-bold payload grammar (`inline_styles.rs`) for panel
+/// tag editing. `None` = unreadable payload; an empty or `default` payload yields
+/// [`FauxBoldParams::default`].
+pub(super) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
+    let value = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '\"' | '\'' | ' '))
+        .trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("default") {
+        return Some(FauxBoldParams::default());
+    }
+    let thicken = value.split(',').next()?.trim().parse::<f32>().ok()?;
+    if !thicken.is_finite() {
+        return None;
+    }
+    let mut result = FauxBoldParams {
+        thicken_percent: thicken.clamp(0.0, 25.0),
+        expand_percent: 0.0,
+        sharp_corners: true,
+        outward_only: true,
+    };
+    let mut expand_seen = false;
+    for token in value.split(',').skip(1).map(str::trim) {
+        match token.to_ascii_lowercase().as_str() {
+            "sharp" => result.sharp_corners = true,
+            "round" => result.sharp_corners = false,
+            "out" => result.outward_only = true,
+            "both" => result.outward_only = false,
+            other => {
+                // The lone numeric token (after the leading thicken value) is the
+                // extra letter-spacing; a second numeric token is a grammar error.
+                let expand = other.parse::<f32>().ok()?;
+                if !expand.is_finite() || expand_seen {
+                    return None;
+                }
+                result.expand_percent = expand.clamp(0.0, 50.0);
+                expand_seen = true;
+            }
+        }
+    }
+    Some(result)
+}
+
+/// Mirror the renderer's faux-italic payload grammar for panel tag editing.
+pub(super) fn parse_faux_italic_value(value: &str) -> Option<f32> {
+    let value = value.trim().trim_matches(|ch| matches!(ch, '\"' | '\'' | ' ')).trim().parse::<f32>().ok()?;
+    value.is_finite().then(|| value.clamp(-45.0, 45.0))
 }
 
 pub(super) fn parse_inline_offset_value(raw: &str) -> Option<TypingInlineOffsetStyle> {

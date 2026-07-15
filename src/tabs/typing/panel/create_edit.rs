@@ -797,22 +797,41 @@ impl TypingCreatePanelState {
                                         }
                                         if let Some(style) = inline_style.as_mut() {
                                             let mut bold = style.bold;
-                                            let force_bold_resp = ui.checkbox(&mut bold, "Bold");
-                                            mark_hscroll_block_on_hover(
-                                                &mut block_hscroll_by_hovered_param,
-                                                &force_bold_resp,
-                                            );
-                                            changed |= force_bold_resp.changed();
-                                            style.bold = bold;
-
                                             let mut italic = style.italic;
-                                            let force_italic_resp = ui.checkbox(&mut italic, "Italic");
-                                            mark_hscroll_block_on_hover(
+                                            let faux = style.faux_bold.unwrap_or_default();
+                                            let mut thicken = faux.thicken_percent;
+                                            let mut expand = faux.expand_percent;
+                                            let mut sharp = faux.sharp_corners;
+                                            let mut outward = faux.outward_only;
+                                            let mut faux_bold = style.faux_bold.is_some();
+                                            let mut slant = style.faux_italic_slant.unwrap_or(14.0);
+                                            let mut faux_italic = style.faux_italic_slant.is_some();
+                                            draw_faux_style_controls(
+                                                ui,
+                                                &mut bold,
+                                                &mut italic,
+                                                FauxStyleControlValues {
+                                                    faux_bold: &mut faux_bold,
+                                                    faux_bold_thicken_percent: &mut thicken,
+                                                    faux_bold_expand_percent: &mut expand,
+                                                    faux_bold_sharp_corners: &mut sharp,
+                                                    faux_bold_outward_only: &mut outward,
+                                                    faux_italic: &mut faux_italic,
+                                                    faux_italic_slant_deg: &mut slant,
+                                                },
+                                                &mut changed,
                                                 &mut block_hscroll_by_hovered_param,
-                                                &force_italic_resp,
+                                                "typing_edit_inline_faux",
                                             );
-                                            changed |= force_italic_resp.changed();
+                                            style.bold = bold;
                                             style.italic = italic;
+                                            style.faux_bold = (bold && faux_bold).then_some(FauxBoldParams {
+                                                thicken_percent: thicken,
+                                                expand_percent: expand,
+                                                sharp_corners: sharp,
+                                                outward_only: outward,
+                                            });
+                                            style.faux_italic_slant = (italic && faux_italic).then_some(slant);
 
                                             let mut no_break = style.no_break;
                                             let no_break_resp =
@@ -824,20 +843,23 @@ impl TypingCreatePanelState {
                                             changed |= no_break_resp.changed();
                                             style.no_break = no_break;
                                         } else {
-                                            let force_bold_resp =
-                                                ui.checkbox(&mut self.force_bold, "Bold");
-                                            mark_hscroll_block_on_hover(
+                                            draw_faux_style_controls(
+                                                ui,
+                                                &mut self.force_bold,
+                                                &mut self.force_italic,
+                                                FauxStyleControlValues {
+                                                    faux_bold: &mut self.faux_bold,
+                                                    faux_bold_thicken_percent: &mut self.faux_bold_thicken_percent,
+                                                    faux_bold_expand_percent: &mut self.faux_bold_expand_percent,
+                                                    faux_bold_sharp_corners: &mut self.faux_bold_sharp_corners,
+                                                    faux_bold_outward_only: &mut self.faux_bold_outward_only,
+                                                    faux_italic: &mut self.faux_italic,
+                                                    faux_italic_slant_deg: &mut self.faux_italic_slant_deg,
+                                                },
+                                                &mut changed,
                                                 &mut block_hscroll_by_hovered_param,
-                                                &force_bold_resp,
+                                                "typing_edit_faux",
                                             );
-                                            changed |= force_bold_resp.changed();
-                                            let force_italic_resp =
-                                                ui.checkbox(&mut self.force_italic, "Italic");
-                                            mark_hscroll_block_on_hover(
-                                                &mut block_hscroll_by_hovered_param,
-                                                &force_italic_resp,
-                                            );
-                                            changed |= force_italic_resp.changed();
                                         }
                                         let hanging_punct_resp = ui.checkbox(
                                             &mut self.hanging_punctuation,
@@ -1057,6 +1079,8 @@ impl TypingCreatePanelState {
             match &tag.kind {
                 TypingInlineTagKind::Bold => style.bold = true,
                 TypingInlineTagKind::Italic => style.italic = true,
+                TypingInlineTagKind::FauxBold(params) => { style.bold = true; style.faux_bold = Some(*params); }
+                TypingInlineTagKind::FauxItalic(slant) => { style.italic = true; style.faux_italic_slant = Some(*slant); }
                 TypingInlineTagKind::NoBreak => style.no_break = true,
                 TypingInlineTagKind::Align(align) => style.align = Some(*align),
                 TypingInlineTagKind::Font(label) => style.font_label = Some(label.clone()),
@@ -1070,9 +1094,11 @@ impl TypingCreatePanelState {
                     if machine.bold {
                         style.bold = true;
                     }
+                    if machine.faux_bold.is_some() { style.faux_bold = machine.faux_bold; }
                     if machine.italic {
                         style.italic = true;
                     }
+                    if machine.faux_italic_slant.is_some() { style.faux_italic_slant = machine.faux_italic_slant; }
                     if machine.no_break {
                         style.no_break = true;
                     }
@@ -1113,6 +1139,27 @@ impl TypingCreatePanelState {
         })
     }
 
+    /// The whole-overlay effective faux-bold params, as the renderer sees them:
+    /// `Some` only when the overlay bold style is forced AND faux is enabled;
+    /// `None` means the overlay is off or requests the real Bold face. This is the
+    /// global fallback a spanless offset resolves to, and the reference a span is
+    /// compared against when deciding whether it needs its own tag.
+    fn overlay_effective_faux_bold(&self) -> Option<FauxBoldParams> {
+        (self.force_bold && self.faux_bold).then_some(FauxBoldParams {
+            thicken_percent: self.faux_bold_thicken_percent,
+            expand_percent: self.faux_bold_expand_percent,
+            sharp_corners: self.faux_bold_sharp_corners,
+            outward_only: self.faux_bold_outward_only,
+        })
+    }
+
+    /// Whole-overlay effective faux-italic slant, analogous to
+    /// [`Self::overlay_effective_faux_bold`]. `None` = overlay italic off or real
+    /// Italic face requested.
+    fn overlay_effective_faux_italic_slant(&self) -> Option<f32> {
+        (self.force_italic && self.faux_italic).then_some(self.faux_italic_slant_deg)
+    }
+
     pub(super) fn effective_inline_tag_style(
         &self,
         selection: &TypingInlineSelectionContext,
@@ -1123,6 +1170,20 @@ impl TypingCreatePanelState {
         TypingInlineTagStyle {
             bold: selection.style.bold || self.force_bold,
             italic: selection.style.italic || self.force_italic,
+            // Mirror the renderer's `faux_bold_params_at_offset`: a span that sets
+            // bold decides for itself INCLUDING `None` (bare `<b>` = real face,
+            // never the overlay's faux). Only a spanless offset falls back to the
+            // whole-overlay faux, and only while `force_bold` is on.
+            faux_bold: if selection.style.bold {
+                selection.style.faux_bold
+            } else {
+                self.overlay_effective_faux_bold()
+            },
+            faux_italic_slant: if selection.style.italic {
+                selection.style.faux_italic_slant
+            } else {
+                self.overlay_effective_faux_italic_slant()
+            },
             no_break: selection.style.no_break,
             align: Some(selection.style.align.unwrap_or(self.align)),
             font_label: Some(
@@ -1264,9 +1325,37 @@ impl TypingCreatePanelState {
             .map(normalize_inline_offset_style)
             .filter(inline_offset_style_is_non_default);
 
+        // Bold/faux-bold: a span is emitted only when it differs from the overlay's
+        // effective bold state. When `force_bold` is off, the span carries the
+        // desired state verbatim. When it is on, we strip the span ONLY if the
+        // desired faux state equals the overlay's effective faux (both real, or the
+        // same faux params); a differing faux state still emits a `bold: true` span
+        // so it overrides the global per the renderer precedence (a bold span wins
+        // INCLUDING a bare `<b>` = real face under a global faux overlay).
+        let (bold, faux_bold) = if self.force_bold
+            && desired_effective_style.faux_bold == self.overlay_effective_faux_bold()
+        {
+            (false, None)
+        } else {
+            (desired_effective_style.bold, desired_effective_style.faux_bold)
+        };
+        let (italic, faux_italic_slant) = if self.force_italic
+            && desired_effective_style.faux_italic_slant
+                == self.overlay_effective_faux_italic_slant()
+        {
+            (false, None)
+        } else {
+            (
+                desired_effective_style.italic,
+                desired_effective_style.faux_italic_slant,
+            )
+        };
+
         TypingInlineTagStyle {
-            bold: desired_effective_style.bold && !self.force_bold,
-            italic: desired_effective_style.italic && !self.force_italic,
+            bold,
+            italic,
+            faux_bold,
+            faux_italic_slant,
             font_label,
             font_size_px,
             text_color,

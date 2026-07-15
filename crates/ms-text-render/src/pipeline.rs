@@ -75,11 +75,11 @@ use super::raster::{
     rotate_placements_about_centroid, trim_rendered_image_to_alpha_bounds,
 };
 use super::vector::{
-    MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
-    glyph_contour_from_outline, rasterize_outline_into,
+    FauxOutlineParams, MeshWarpContext, Outline, OutlineCache, RasterScratch, build_aa_lut,
+    faux_key_bits, glyph_contour_from_outline, rasterize_outline_into,
 };
 use super::types::{
-    HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
+    FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
     TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
 };
 use super::wrap::{
@@ -424,10 +424,15 @@ pub fn render_text_to_image(
 
     let mut attrs = Attrs::new().metrics(Metrics::new(font_size_px, font_size_px));
     attrs = selected_face.apply_to_attrs(attrs);
-    if params.force_bold {
+    // Faux bold/italic bypass: with faux params present the renderer must KEEP
+    // the Regular/upright face (no Bold/Italic font matching) and synthesize
+    // the style geometrically at the glyph seam. Without faux params the
+    // legacy real-face behavior is unchanged.
+    let (want_real_bold, want_real_italic) = base_attrs_real_bold_italic(params);
+    if want_real_bold {
         attrs = attrs.weight(cosmic_text::Weight::BOLD);
     }
-    if params.force_italic {
+    if want_real_italic {
         attrs = attrs.style(cosmic_text::Style::Italic);
     }
 
@@ -787,6 +792,13 @@ pub fn render_text_to_image(
                 run.line_i,
                 glyph,
             );
+            let glyph_faux = faux_style_for_glyph(
+                params,
+                mapped_inline_style_spans.as_deref(),
+                layout_line_offsets.as_slice(),
+                run.line_i,
+                glyph,
+            );
             if let Some(placement) = build_horizontal_placement(
                 font_system,
                 &mut cache,
@@ -796,6 +808,7 @@ pub fn render_text_to_image(
                 baseline_y + glyph_offset[1],
                 glyph_scale,
                 glyph_text_color,
+                glyph_faux,
             ) {
                 placements.push(placement);
             }
@@ -839,6 +852,16 @@ pub fn render_text_to_image(
                     inline_glyph_offset_at_offset(mapped_inline_style_spans.as_deref(), offset)
                 })
                 .unwrap_or([0.0, 0.0]);
+            let hyphen_faux = style_offset
+                .map(|offset| {
+                    faux_style_at_offset(
+                        params,
+                        mapped_inline_style_spans.as_deref(),
+                        offset,
+                        hyphen_glyph.font_size,
+                    )
+                })
+                .unwrap_or(FauxGlyphStyle::NONE);
             let hyphen_offset_x = line_offset_x
                 + trailing_hyphen_x(&run)
                 + run_layout
@@ -856,6 +879,7 @@ pub fn render_text_to_image(
                 baseline_y + hyphen_offset[1],
                 hyphen_scale,
                 hyphen_text_color,
+                hyphen_faux,
             ) {
                 placements.push(placement);
             }
@@ -870,12 +894,15 @@ pub fn render_text_to_image(
     // already no-ops for `include_scaled_rect_bounds`.
     let mut bounds = PixelBounds::empty();
     for placement in &placements {
+        // Faux ink pads (`bounds_pad`) widen the box for the offset/sheared
+        // outline; they are exact zeros without faux, keeping the historical
+        // canvas byte-identical.
         include_scaled_rect_bounds(
             &mut bounds,
-            placement.src_left_i as f32,
-            placement.src_top_i as f32,
-            placement.glyph_w as f32,
-            placement.glyph_h as f32,
+            placement.src_left_i as f32 - placement.bounds_pad[0],
+            placement.src_top_i as f32 - placement.bounds_pad[1],
+            placement.glyph_w as f32 + 2.0 * placement.bounds_pad[0],
+            placement.glyph_h as f32 + 2.0 * placement.bounds_pad[1],
             placement.scale,
         );
     }
@@ -989,6 +1016,12 @@ struct HorizontalGlyphPlacement {
     /// Subpixel fraction baked into the swash bitmap coverage; re-applied to the
     /// outline placement only (the bitmap fallback already carries it).
     subpixel: [f32; 2],
+    /// Faux bold/italic style; `outline` already IS the faux-bold variant, the
+    /// shear applies at the draw transform. `NONE` = byte-identical plain path.
+    faux: FauxGlyphStyle,
+    /// Pre-scale bounds padding for the faux ink (`faux_bounds_pads`);
+    /// `[0.0, 0.0]` when `faux` is `NONE`.
+    bounds_pad: [f32; 2],
 }
 
 /// Collect one glyph placement for the normal horizontal path.
@@ -1008,6 +1041,7 @@ fn build_horizontal_placement(
     pos_y: f32,
     scale: GlyphScaleSettings,
     text_color: [u8; 4],
+    faux: FauxGlyphStyle,
 ) -> Option<HorizontalGlyphPlacement> {
     let physical = glyph.physical((pos_x, pos_y), 1.0);
     let image = cache.get_image(font_system, physical.cache_key).as_ref()?;
@@ -1022,7 +1056,7 @@ fn build_horizontal_placement(
     let src_left_i = physical.x + image.placement.left;
     let src_top_i = physical.y - image.placement.top;
     let subpixel = glyph_subpixel_offset(physical.cache_key);
-    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph);
+    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold);
     // Capture the swash bitmap only for outline-less glyphs (real color/emoji or a
     // monochrome embedded-bitmap glyph); the outline path never touches it.
     let fallback = if outline.is_none() {
@@ -1030,6 +1064,13 @@ fn build_horizontal_placement(
     } else {
         None
     };
+    let bounds_pad = faux_bounds_pads(
+        faux,
+        placement_top,
+        glyph_h as f32,
+        scale.width_mul,
+        scale.height_mul,
+    );
     Some(HorizontalGlyphPlacement {
         outline,
         fallback,
@@ -1042,6 +1083,8 @@ fn build_horizontal_placement(
         scale,
         text_color,
         subpixel,
+        faux,
+        bounds_pad,
     })
 }
 
@@ -1095,6 +1138,7 @@ fn draw_horizontal_placement(
             placement.scale.width_mul,
             placement.scale.height_mul,
             placement.subpixel,
+            placement.faux.shear_x,
         );
         rasterize_outline_into(
             scratch,
@@ -1179,11 +1223,30 @@ struct RotatedGlyphPlacement {
     /// Subpixel fraction baked into the swash bitmap coverage; re-applied to the
     /// outline placement only (the bitmap fallback already carries it).
     subpixel: [f32; 2],
+    /// Faux bold/italic style; `outline` already IS the faux-bold variant, the
+    /// shear applies at the draw transform. `NONE` = byte-identical plain path.
+    faux: FauxGlyphStyle,
+    /// Pre-scale bounds padding for the faux ink (`faux_bounds_pads`);
+    /// `[0.0, 0.0]` when `faux` is `NONE`.
+    bounds_pad: [f32; 2],
     center_x: f32,
     center_y: f32,
     rotation_rad: f32,
     group_key: Option<(usize, usize)>,
     group_rotation_rad: f32,
+}
+
+impl RotatedGlyphPlacement {
+    /// The scaled glyph rect widened by the faux bounds pads (exactly the
+    /// plain `scaled_rect` when faux is off — the pads are hard zeros).
+    fn padded_scaled_rect(&self) -> (f32, f32, f32, f32) {
+        self.scale.scaled_rect(
+            self.src_left - self.bounds_pad[0],
+            self.src_top - self.bounds_pad[1],
+            self.glyph_w as f32 + 2.0 * self.bounds_pad[0],
+            self.glyph_h as f32 + 2.0 * self.bounds_pad[1],
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1196,6 +1259,7 @@ fn build_rotated_placement(
     pos_y: f32,
     scale: GlyphScaleSettings,
     text_color: [u8; 4],
+    faux: FauxGlyphStyle,
     glyph_rotation_rad: f32,
     group_key: Option<(usize, usize)>,
     group_rotation_rad: f32,
@@ -1214,7 +1278,7 @@ fn build_rotated_placement(
     let src_left = (physical.x + image.placement.left) as f32;
     let src_top = (physical.y - image.placement.top) as f32;
     let subpixel = glyph_subpixel_offset(physical.cache_key);
-    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph);
+    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold);
     // Build the bitmap RGBA for any outline-less glyph fallback: real color glyphs
     // and monochrome embedded-bitmap / sbix / CBDT-mono glyphs alike (the zero-size
     // skip above already filtered spaces).
@@ -1223,6 +1287,13 @@ fn build_rotated_placement(
     } else {
         Vec::new()
     };
+    let bounds_pad = faux_bounds_pads(
+        faux,
+        placement_top,
+        glyph_h as f32,
+        scale.width_mul,
+        scale.height_mul,
+    );
     let (scaled_left, scaled_top, scaled_width, scaled_height) =
         scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
     Some(RotatedGlyphPlacement {
@@ -1237,6 +1308,8 @@ fn build_rotated_placement(
         scale,
         text_color,
         subpixel,
+        faux,
+        bounds_pad,
         center_x: scaled_left + scaled_width * 0.5,
         center_y: scaled_top + scaled_height * 0.5,
         rotation_rad: glyph_rotation_rad,
@@ -1392,6 +1465,13 @@ fn render_horizontal_rotated(
                 run.line_i,
                 glyph,
             );
+            let glyph_faux = faux_style_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            );
             let group_key = if offset.group_rotation_rad.abs() > f32::EPSILON {
                 inline_glyph_offset_span_for_glyph(
                     inline_style_spans,
@@ -1411,6 +1491,7 @@ fn render_horizontal_rotated(
                 baseline_y + offset.global_px[1],
                 glyph_scale,
                 glyph_text_color,
+                glyph_faux,
                 offset.glyph_rotation_rad,
                 group_key,
                 offset.group_rotation_rad,
@@ -1444,6 +1525,16 @@ fn render_horizontal_rotated(
             let hyphen_offset = style_offset
                 .map(|offset| inline_glyph_offset_style_at_offset(inline_style_spans, offset))
                 .unwrap_or_else(|| InlineGlyphOffset::global_only([0.0, 0.0]));
+            let hyphen_faux = style_offset
+                .map(|offset| {
+                    faux_style_at_offset(
+                        params,
+                        inline_style_spans,
+                        offset,
+                        hyphen_glyph.font_size,
+                    )
+                })
+                .unwrap_or(FauxGlyphStyle::NONE);
             let group_key = if hyphen_offset.group_rotation_rad.abs() > f32::EPSILON {
                 style_offset
                     .and_then(|offset| inline_glyph_offset_span_at_offset(inline_style_spans, offset))
@@ -1467,6 +1558,7 @@ fn render_horizontal_rotated(
                 baseline_y + hyphen_offset.global_px[1],
                 hyphen_scale,
                 hyphen_text_color,
+                hyphen_faux,
                 hyphen_offset.glyph_rotation_rad,
                 group_key,
                 hyphen_offset.group_rotation_rad,
@@ -1494,14 +1586,9 @@ fn render_horizontal_rotated(
         let mut sum_x = 0.0f32;
         let mut sum_y = 0.0f32;
         for placement in &placements {
-            let (scaled_left, scaled_top, scaled_width, scaled_height) = placement
-                .scale
-                .scaled_rect(
-                    placement.src_left,
-                    placement.src_top,
-                    placement.glyph_w as f32,
-                    placement.glyph_h as f32,
-                );
+            // Faux-padded rect (plain rect when faux is off).
+            let (scaled_left, scaled_top, scaled_width, scaled_height) =
+                placement.padded_scaled_rect();
             include_rotated_rect_bounds(
                 &mut pre_box,
                 scaled_left,
@@ -1537,12 +1624,10 @@ fn render_horizontal_rotated(
 
     let mut bounds = PixelBounds::empty();
     for placement in &placements {
-        let (scaled_left, scaled_top, scaled_width, scaled_height) = placement.scale.scaled_rect(
-            placement.src_left,
-            placement.src_top,
-            placement.glyph_w as f32,
-            placement.glyph_h as f32,
-        );
+        // Faux-padded rect (plain rect when faux is off), so offset/sheared ink
+        // never clips the auto-grown canvas.
+        let (scaled_left, scaled_top, scaled_width, scaled_height) =
+            placement.padded_scaled_rect();
         include_rotated_rect_bounds(
             &mut bounds,
             scaled_left,
@@ -1596,6 +1681,7 @@ fn render_horizontal_rotated(
                 placement.scale.width_mul,
                 placement.scale.height_mul,
                 placement.subpixel,
+                placement.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
@@ -1678,6 +1764,16 @@ pub fn smoke_render_text_to_image(params: &TextRenderParams) -> Result<RenderedT
 /// (outline extraction + ink measurement) and are untouched for `Auto`/`Fixed`.
 /// Never panics; a glyph without a fillable outline is treated as non-kernable
 /// (delta 0) rather than an error.
+///
+/// Faux bold: on the metric branches (`Auto`/`Fixed`, and the `Optical`
+/// fallback) each pen step additionally grows by the previous glyph's
+/// `2*d + expand_px` (`faux_advance_extra_px_for_glyph`), and `line_width_px`
+/// includes each glyph's own extra so the trailing faux glyph is part of the
+/// logical (alignment) width; a run with any faux glyph never takes the
+/// byte-identical shaped-position fast path. The optical branch instead
+/// measures ink from the offset outlines and adds only the normalization
+/// delta. A `LayoutRun` is one whole laid-out line in cosmic-text 0.14, so
+/// per-run accumulation already spans every inline size/font/style boundary.
 #[allow(clippy::too_many_arguments)]
 fn horizontal_run_layout(
     params: &TextRenderParams,
@@ -1713,9 +1809,33 @@ fn horizontal_run_layout(
         })
         .collect::<Vec<_>>();
 
+    // Faux-bold advance growth per glyph (`2*d + expand_px`; all zeros when
+    // faux bold is off anywhere in the run). The step from glyph `i-1` to `i`
+    // grows by the PREVIOUS glyph's extra: thickening a glyph widens its own
+    // ink, so it pushes the following glyph away. No cross-run carry is
+    // needed: a cosmic-text 0.14 `LayoutRun` is one WHOLE laid-out line
+    // (`LayoutRun.glyphs` spans every attrs/size/font boundary of the line,
+    // see cosmic-text `buffer.rs`), so this accumulation already covers inline
+    // boundaries; the trailing glyph's extra is folded into `line_width_px`
+    // below instead.
+    let faux_extras = run
+        .glyphs
+        .iter()
+        .map(|glyph| {
+            faux_advance_extra_px_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            )
+        })
+        .collect::<Vec<_>>();
+
     if glyph_kernings
         .iter()
         .all(|kerning| kerning.uses_default_metric_layout())
+        && faux_extras.iter().all(|extra| *extra == 0.0)
     {
         let glyph_xs = run.glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>();
         let (visual_width_px, leading_hang_px) =
@@ -1777,15 +1897,22 @@ fn horizontal_run_layout(
             KerningMode::Auto | KerningMode::Optical => metric_advance,
         };
         let spacing_basis = metric_advance.abs().max(prev.w.max(default_advance));
-        current_x += base_advance + pair_kerning.extra_spacing_px(spacing_basis);
+        // Faux-bold growth of the PREVIOUS glyph's advance (0.0 when off).
+        current_x +=
+            base_advance + faux_extras[idx - 1] + pair_kerning.extra_spacing_px(spacing_basis);
         glyph_xs.push(current_x);
     }
 
+    // Logical line width includes each glyph's own faux advance growth (the
+    // trailing glyph's `2*d + expand` would otherwise be dropped, making
+    // right/center alignment overshoot the margin by the faux growth).
+    // `faux_extras` are exact zeros without faux, keeping this byte-identical.
     let line_width_px = run
         .glyphs
         .iter()
         .zip(glyph_xs.iter().copied())
-        .map(|(glyph, glyph_x)| glyph_x + glyph.w)
+        .zip(faux_extras.iter().copied())
+        .map(|((glyph, glyph_x), faux_extra)| glyph_x + glyph.w + faux_extra)
         .fold(0.0, f32::max);
     let (visual_width_px, leading_hang_px) =
         hanging_metrics_for_layout(run, glyph_xs.as_slice(), line_width_px);
@@ -1859,6 +1986,21 @@ fn optical_horizontal_run_layout(
             )
         })
         .collect();
+    // Per-glyph faux style, mirroring the draw pass: optical gaps MUST be
+    // measured from the same (possibly offset/sheared) ink that is drawn.
+    let glyph_fauxes: Vec<FauxGlyphStyle> = run
+        .glyphs
+        .iter()
+        .map(|glyph| {
+            faux_style_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            )
+        })
+        .collect();
 
     // gaps[idx] is the minimum directional projected whitespace of the pair
     // (idx-1, idx) — the closest facing points; index 0 has no pair. The gap is
@@ -1874,6 +2016,7 @@ fn optical_horizontal_run_layout(
             prev,
             0.0,
             glyph_scales[idx - 1],
+            glyph_fauxes[idx - 1],
             font_system,
             cache,
             outline_cache,
@@ -1883,6 +2026,7 @@ fn optical_horizontal_run_layout(
             cur,
             prev.w,
             glyph_scales[idx],
+            glyph_fauxes[idx],
             font_system,
             cache,
             outline_cache,
@@ -1937,13 +2081,19 @@ fn optical_horizontal_run_layout(
 /// matches the drawn ink.
 ///
 /// `pen_x` is the pen x in layout px (the baseline y is irrelevant to the gap and
-/// is fixed at 0). Returns `None` for a space/empty glyph (zero-size placement),
-/// an outline-less color glyph, or an empty contour — all of which are treated as
-/// non-kernable by the caller. Never panics.
+/// is fixed at 0). `faux` selects the faux-bold outline variant the contour is
+/// derived from (the contour cache is keyed per variant, like `OutlineKey`) and
+/// the faux-italic shear the placement applies, so the measured ink matches the
+/// drawn ink exactly. Returns `None` for a space/empty glyph (zero-size
+/// placement), an outline-less color glyph, or an empty contour — all of which
+/// are treated as non-kernable by the caller. Never panics.
+// Mirrors the draw-pass inputs; a wrapper struct would just hide the wiring.
+#[allow(clippy::too_many_arguments)]
 fn place_optical_horizontal_contour(
     glyph: &LayoutGlyph,
     pen_x: f32,
     glyph_scale: GlyphScaleSettings,
+    faux: FauxGlyphStyle,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
     outline_cache: &mut OutlineCache,
@@ -1978,11 +2128,12 @@ fn place_optical_horizontal_contour(
         hash_font_id(glyph.font_id),
         glyph.glyph_id,
         glyph.font_size.to_bits(),
+        faux.bold_key_bits(),
     );
     let contour = match contour_cache.entry(contour_key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(entry) => {
-            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph)?;
+            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph, faux.bold)?;
             entry.insert(glyph_contour_from_outline(
                 &outline,
                 OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX,
@@ -2006,6 +2157,7 @@ fn place_optical_horizontal_contour(
         glyph_scale.width_mul,
         glyph_scale.height_mul,
         glyph_subpixel_offset(cache_key),
+        faux.shear_x,
     );
     Some(transform.place_contour(contour))
 }
@@ -2212,6 +2364,204 @@ fn spans_have_inline_rotation(spans: &[InlineStyleSpan]) -> bool {
                 || offset.glyph_rotation_rad.abs() > f32::EPSILON
         })
     })
+}
+
+/// Per-glyph faux (synthetic) bold/italic style resolved from the inline span
+/// with fallback to the whole-overlay params.
+///
+/// `bold` carries the QUANTIZED outline-offset parameters at the glyph's own
+/// em; `shear_x` is the baseline shear `tan(slant)` for faux italic (`0.0` =
+/// none). The default (`NONE`) keeps every seam byte-identical to the pre-faux
+/// renderer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FauxGlyphStyle {
+    /// Faux-bold outline offset variant; `None` = plain outline.
+    pub(crate) bold: Option<FauxOutlineParams>,
+    /// Faux-italic baseline shear (`tan(slant)`, positive = top leans right).
+    pub(crate) shear_x: f32,
+}
+
+impl FauxGlyphStyle {
+    /// No faux styling (plain outline, no shear).
+    pub(crate) const NONE: Self = Self {
+        bold: None,
+        shear_x: 0.0,
+    };
+
+    /// Faux-bold offset distance in glyph-local px (`0.0` when off).
+    #[must_use]
+    pub(crate) fn d_px(self) -> f32 {
+        self.bold.map_or(0.0, FauxOutlineParams::d_px)
+    }
+
+    /// Whether both faux effects are off.
+    #[must_use]
+    pub(crate) fn is_none(self) -> bool {
+        self.bold.is_none() && self.shear_x == 0.0
+    }
+
+    /// Packed cache-key bits for the faux-bold variant (`0` = plain), shared
+    /// with `OutlineKey` so every per-variant cache keys identically.
+    #[must_use]
+    pub(crate) fn bold_key_bits(self) -> u32 {
+        faux_key_bits(self.bold)
+    }
+}
+
+/// Whether the whole-overlay base attrs request the REAL Bold/Italic faces.
+///
+/// The pair is `(bold, italic)`. Real face matching happens only when the
+/// force flag is set WITHOUT faux params; `force_* && faux present` keeps the
+/// Regular/upright face (the faux geometry is synthesized at the glyph seam),
+/// and faux params without the force flag are ignored entirely.
+#[must_use]
+pub(crate) fn base_attrs_real_bold_italic(params: &TextRenderParams) -> (bool, bool) {
+    (
+        params.force_bold && params.faux_bold.is_none(),
+        params.force_italic && params.faux_italic_slant_deg.is_none(),
+    )
+}
+
+/// Effective faux-bold parameters at a plain-text byte offset.
+///
+/// Resolution contract: a span that sets bold decides for itself — `Some` faux
+/// params mean faux bold, `None` means the real Bold face (no faux, even if
+/// the whole overlay is faux). A glyph outside any bold span falls back to the
+/// whole-overlay pair: `faux_bold` takes effect ONLY when `force_bold` is set.
+fn faux_bold_params_at_offset(
+    params: &TextRenderParams,
+    spans: Option<&[InlineStyleSpan]>,
+    offset: usize,
+) -> Option<FauxBoldParams> {
+    if let Some(style) = spans.and_then(|style_spans| inline_style_at_offset(style_spans, offset))
+        && style.bold
+    {
+        return style.faux_bold;
+    }
+    if params.force_bold {
+        params.faux_bold
+    } else {
+        None
+    }
+}
+
+/// Effective faux-italic slant (degrees) at a plain-text byte offset; the same
+/// span-over-global resolution as [`faux_bold_params_at_offset`].
+fn faux_italic_slant_at_offset(
+    params: &TextRenderParams,
+    spans: Option<&[InlineStyleSpan]>,
+    offset: usize,
+) -> Option<f32> {
+    if let Some(style) = spans.and_then(|style_spans| inline_style_at_offset(style_spans, offset))
+        && style.italic
+    {
+        return style.faux_italic_slant_deg;
+    }
+    if params.force_italic {
+        params.faux_italic_slant_deg
+    } else {
+        None
+    }
+}
+
+/// Resolve the faux style at `offset` for a glyph shaped at `em_px`.
+///
+/// Converts the percent-domain params to the glyph's own em: bold offset
+/// `d = thicken/100 * em` (quantized by `FauxOutlineParams::new`; zero-strength
+/// resolves to `None`), italic shear `tan(slant)` with the documented
+/// `-45..=45` degree clamp.
+pub(crate) fn faux_style_at_offset(
+    params: &TextRenderParams,
+    spans: Option<&[InlineStyleSpan]>,
+    offset: usize,
+    em_px: f32,
+) -> FauxGlyphStyle {
+    let bold = faux_bold_params_at_offset(params, spans, offset).and_then(|faux| {
+        let d_px = faux.thicken_percent.clamp(0.0, 25.0) / 100.0 * em_px.max(0.0);
+        FauxOutlineParams::new(d_px, faux.sharp_corners, faux.outward_only)
+    });
+    let shear_x = faux_italic_slant_at_offset(params, spans, offset)
+        .map_or(0.0, |slant| slant.clamp(-45.0, 45.0).to_radians().tan());
+    FauxGlyphStyle { bold, shear_x }
+}
+
+/// [`faux_style_at_offset`] for a laid-out glyph (em = `glyph.font_size`).
+pub(crate) fn faux_style_for_glyph(
+    params: &TextRenderParams,
+    spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    line_idx: usize,
+    glyph: &LayoutGlyph,
+) -> FauxGlyphStyle {
+    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
+    faux_style_at_offset(
+        params,
+        spans,
+        line_offset + glyph.start.min(glyph.end),
+        glyph.font_size,
+    )
+}
+
+/// Horizontal pen-advance growth for one glyph under faux bold:
+/// `2*d + expand_px` (`d` = quantized outline offset at the glyph's em,
+/// `expand_px = expand_percent/100 * em`). `0.0` when faux bold is off, which
+/// keeps the non-faux layout byte-identical. Optical kerning deliberately does
+/// NOT add this term: it re-normalizes true ink gaps measured from the
+/// already-offset outlines, so the thickening is accounted for by measurement.
+fn faux_advance_extra_px_for_glyph(
+    params: &TextRenderParams,
+    spans: Option<&[InlineStyleSpan]>,
+    layout_line_offsets: &[usize],
+    line_idx: usize,
+    glyph: &LayoutGlyph,
+) -> f32 {
+    let line_offset = layout_line_offsets.get(line_idx).copied().unwrap_or(0);
+    let offset = line_offset + glyph.start.min(glyph.end);
+    let Some(faux) = faux_bold_params_at_offset(params, spans, offset) else {
+        return 0.0;
+    };
+    let em = glyph.font_size.max(0.0);
+    let d = FauxOutlineParams::new(
+        faux.thicken_percent.clamp(0.0, 25.0) / 100.0 * em,
+        faux.sharp_corners,
+        faux.outward_only,
+    )
+    .map_or(0.0, FauxOutlineParams::d_px);
+    2.0 * d + faux.expand_percent.clamp(0.0, 50.0) / 100.0 * em
+}
+
+/// Pre-scale bounds padding `[pad_x, pad_y]` (bitmap-local px) for a glyph's
+/// faux style: the swash bitmap placement box under-reports faux ink.
+///
+/// Bold pads both axes by the worst-case offset overhang (`d`, or the miter
+/// limit `4*d` for sharp corners). Italic pads x by the worst-case
+/// baseline-shear overhang `|shear_x| * max_dy * height_mul / width_mul`,
+/// where `max_dy` is the farthest bitmap-box edge from the baseline (plus the
+/// bold overhang); the `height/width` ratio converts the post-scale overhang
+/// into the pre-scale units `include_scaled_rect_bounds`/`scaled_rect` expect.
+/// Returns exact `[0.0, 0.0]` when faux is off, so subtracting/adding the pads
+/// keeps the non-faux bounds bit-identical.
+pub(crate) fn faux_bounds_pads(
+    faux: FauxGlyphStyle,
+    placement_top: f32,
+    glyph_h: f32,
+    width_mul: f32,
+    height_mul: f32,
+) -> [f32; 2] {
+    if faux.is_none() {
+        return [0.0, 0.0];
+    }
+    let overhang = faux
+        .bold
+        .map_or(0.0, super::vector::FauxOutlineParams::max_overhang_px);
+    let mut pad_x = overhang;
+    if faux.shear_x != 0.0 {
+        // The bitmap box spans y in [-placement_top, glyph_h - placement_top]
+        // around the baseline (y-down), so the extreme |y| is the larger edge.
+        let max_dy = placement_top.abs().max((glyph_h - placement_top).abs()) + overhang;
+        pad_x += faux.shear_x.abs() * max_dy * height_mul / width_mul.max(0.01);
+    }
+    [pad_x, overhang]
 }
 
 fn inline_glyph_scale_at_offset(
@@ -2640,10 +2990,10 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_effects_to_image;
+    use super::{apply_effects_to_image, base_attrs_real_bold_italic};
     use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
-        AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage,
+        AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextImage,
         TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
         TextRenderParams, TextRenderShapeCompareParams, TextShape, TextVectorLine,
         TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
@@ -2702,6 +3052,8 @@ mod tests {
             selected_face_index: 0,
             force_bold: false,
             force_italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             uppercase_text: false,
             trim_extra_spaces: true,
             hanging_punctuation: false,
@@ -2823,6 +3175,420 @@ mod tests {
             }
         }
         (alpha_sum > 0.0).then_some(weighted_y / alpha_sum)
+    }
+
+    /// Faux params for the render tests: strong enough that the geometric
+    /// growth is unambiguous against AA noise.
+    fn test_faux_bold(thicken_percent: f32, expand_percent: f32) -> FauxBoldParams {
+        FauxBoldParams {
+            thicken_percent,
+            expand_percent,
+            sharp_corners: true,
+            outward_only: true,
+        }
+    }
+
+    #[test]
+    fn faux_zero_strength_and_ungated_params_are_byte_identical_to_plain() {
+        let base = base_params();
+        let plain = render_text_to_image(&base, None).expect("plain render");
+
+        // Faux params WITHOUT the force flag are ignored entirely.
+        let mut ungated = base.clone();
+        ungated.faux_bold = Some(test_faux_bold(10.0, 5.0));
+        ungated.faux_italic_slant_deg = Some(20.0);
+        let ungated_render = render_text_to_image(&ungated, None).expect("ungated render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (ungated_render.width, ungated_render.height, &ungated_render.rgba),
+            "faux params without force flags must be byte-identical to plain"
+        );
+
+        // Zero-strength faux bold keeps the Regular face and offsets nothing.
+        let mut zero_bold = base.clone();
+        zero_bold.force_bold = true;
+        zero_bold.faux_bold = Some(test_faux_bold(0.0, 0.0));
+        let zero_bold_render = render_text_to_image(&zero_bold, None).expect("zero-bold render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (zero_bold_render.width, zero_bold_render.height, &zero_bold_render.rgba),
+            "zero-strength faux bold must be byte-identical to plain"
+        );
+
+        // Zero slant shears nothing.
+        let mut zero_italic = base.clone();
+        zero_italic.force_italic = true;
+        zero_italic.faux_italic_slant_deg = Some(0.0);
+        let zero_italic_render =
+            render_text_to_image(&zero_italic, None).expect("zero-italic render");
+        assert_eq!(
+            (plain.width, plain.height, &plain.rgba),
+            (zero_italic_render.width, zero_italic_render.height, &zero_italic_render.rgba),
+            "zero faux slant must be byte-identical to plain"
+        );
+    }
+
+    #[test]
+    fn faux_bold_attrs_keep_regular_face() {
+        // Faux path must NOT request the real Bold/Italic faces from font
+        // matching; the legacy force flags without faux still do.
+        let mut params = base_params();
+        params.force_bold = true;
+        params.force_italic = true;
+        assert_eq!(base_attrs_real_bold_italic(&params), (true, true));
+        params.faux_bold = Some(test_faux_bold(3.0, 0.0));
+        assert_eq!(base_attrs_real_bold_italic(&params), (false, true));
+        params.faux_italic_slant_deg = Some(14.0);
+        assert_eq!(base_attrs_real_bold_italic(&params), (false, false));
+        params.force_bold = false;
+        params.force_italic = false;
+        assert_eq!(base_attrs_real_bold_italic(&params), (false, false));
+    }
+
+    #[test]
+    fn faux_bold_grows_ink_extent_by_offset_and_advance() {
+        // Two glyphs: the total ink width grows by the pen-step growth
+        // (2*d + expand) plus one `d` of outline growth on each outer edge,
+        // i.e. 4*d + expand; the ink height grows by 2*d.
+        let mut plain = base_params();
+        plain.text = "HH".to_string();
+        plain.font_size_px = 48.0;
+        let plain_render = render_text_to_image(&plain, None).expect("plain render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain_render.width, plain_render.height, &plain_render.rgba)
+                .expect("plain ink");
+
+        let thicken = 5.0f32;
+        let expand = 10.0f32;
+        let d = thicken / 100.0 * plain.font_size_px;
+        let expand_px = expand / 100.0 * plain.font_size_px;
+        let mut faux = plain.clone();
+        faux.force_bold = true;
+        faux.faux_bold = Some(test_faux_bold(thicken, expand));
+        let faux_render = render_text_to_image(&faux, None).expect("faux render");
+        let (faux_w, faux_h) =
+            alpha_bounds_from_rgba(faux_render.width, faux_render.height, &faux_render.rgba)
+                .expect("faux ink");
+
+        let expected_w_growth = 4.0 * d + expand_px;
+        let w_growth = faux_w as f32 - plain_w as f32;
+        assert!(
+            (w_growth - expected_w_growth).abs() <= 2.0,
+            "ink width growth {w_growth} should be ~{expected_w_growth} (d={d}, expand={expand_px})"
+        );
+        let h_growth = faux_h as f32 - plain_h as f32;
+        assert!(
+            (h_growth - 2.0 * d).abs() <= 2.0,
+            "ink height growth {h_growth} should be ~{}",
+            2.0 * d
+        );
+    }
+
+    /// Alpha-weighted x centroid over the row band `[y0, y1)`.
+    fn alpha_centroid_x_in_rows(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        y0: usize,
+        y1: usize,
+    ) -> Option<f32> {
+        let width = width as usize;
+        let mut weighted_x = 0.0f32;
+        let mut alpha_sum = 0.0f32;
+        for y in y0..y1.min(height as usize) {
+            for x in 0..width {
+                let alpha = f32::from(rgba[(y * width + x) * 4 + 3]);
+                weighted_x += x as f32 * alpha;
+                alpha_sum += alpha;
+            }
+        }
+        (alpha_sum > 0.0).then_some(weighted_x / alpha_sum)
+    }
+
+    #[test]
+    fn faux_italic_leans_tops_in_slant_direction() {
+        // Compare the x centroid of the ink's top half against its bottom
+        // half: a positive slant leans tops right, a negative one left.
+        let mut base = base_params();
+        base.text = "H".to_string();
+        base.font_size_px = 64.0;
+        base.force_italic = true;
+
+        let lean_of = |slant: f32| -> f32 {
+            let mut params = base.clone();
+            params.faux_italic_slant_deg = Some(slant);
+            let render = render_text_to_image(&params, None).expect("italic render");
+            let h = render.height as usize;
+            let top = alpha_centroid_x_in_rows(render.width, render.height, &render.rgba, 0, h / 2)
+                .expect("top ink");
+            let bottom =
+                alpha_centroid_x_in_rows(render.width, render.height, &render.rgba, h / 2, h)
+                    .expect("bottom ink");
+            top - bottom
+        };
+
+        let right = lean_of(30.0);
+        let left = lean_of(-30.0);
+        assert!(right > 3.0, "positive slant must lean tops right, got {right}");
+        assert!(left < -3.0, "negative slant must lean tops left, got {left}");
+    }
+
+    #[test]
+    fn optical_kerning_measures_faux_offset_ink() {
+        // Under Optical the pen positions come from ink-gap normalization of
+        // the OFFSET outlines (no `2*d` pen growth); under Auto the faux pen
+        // growth applies. So the optical faux render must be measurably
+        // narrower than the Auto faux render of the same text, proving the
+        // optical path measures the emboldened contours instead of inheriting
+        // the metric growth.
+        let mut auto_faux = base_params();
+        auto_faux.text = "HHH".to_string();
+        auto_faux.font_size_px = 48.0;
+        auto_faux.force_bold = true;
+        auto_faux.faux_bold = Some(test_faux_bold(6.0, 0.0));
+        auto_faux.kerning_mode = KerningMode::Auto;
+        let auto_render = render_text_to_image(&auto_faux, None).expect("auto faux render");
+        let (auto_w, _) =
+            alpha_bounds_from_rgba(auto_render.width, auto_render.height, &auto_render.rgba)
+                .expect("auto ink");
+
+        let mut optical_faux = auto_faux.clone();
+        optical_faux.kerning_mode = KerningMode::Optical;
+        let optical_render =
+            render_text_to_image(&optical_faux, None).expect("optical faux render");
+        let (optical_w, _) = alpha_bounds_from_rgba(
+            optical_render.width,
+            optical_render.height,
+            &optical_render.rgba,
+        )
+        .expect("optical ink");
+
+        let d = 6.0 / 100.0 * 48.0;
+        assert!(
+            (auto_w as f32) - (optical_w as f32) >= d,
+            "optical faux ({optical_w}) must be narrower than auto faux ({auto_w}) \
+             because optical normalizes the measured (offset) ink gaps"
+        );
+    }
+
+    #[test]
+    fn faux_bold_grows_vertical_stacking() {
+        let mut plain = base_params();
+        plain.text = "HH".to_string();
+        plain.font_size_px = 48.0;
+        plain.text_line_mode = TextLineMode::Vertical;
+        let plain_render = render_text_to_image(&plain, None).expect("plain vertical render");
+        let (_, plain_h) =
+            alpha_bounds_from_rgba(plain_render.width, plain_render.height, &plain_render.rgba)
+                .expect("plain ink");
+
+        let mut faux = plain.clone();
+        faux.force_bold = true;
+        faux.faux_bold = Some(test_faux_bold(6.0, 0.0));
+        let faux_render = render_text_to_image(&faux, None).expect("faux vertical render");
+        let (_, faux_h) =
+            alpha_bounds_from_rgba(faux_render.width, faux_render.height, &faux_render.rgba)
+                .expect("faux ink");
+
+        // Two glyphs, each thickened by d top+bottom, and the ink-height
+        // stacking pads the step accordingly: expect ~4*d total growth.
+        let d = 6.0 / 100.0 * 48.0;
+        let growth = faux_h as f32 - plain_h as f32;
+        assert!(
+            (growth - 4.0 * d).abs() <= 3.0,
+            "vertical ink height growth {growth} should be ~{}",
+            4.0 * d
+        );
+    }
+
+    #[test]
+    fn inline_faux_bold_tag_differs_from_real_bold_tag() {
+        // `<b=...>` must produce different pixels than the legacy `<b>` (which
+        // resolves the family's Bold face — here the same Regular fixture, so
+        // it renders like plain) on the same text.
+        let mut real = base_params();
+        real.text = "a<b>bb</b>a".to_string();
+        real.enable_inline_style_tags = true;
+        let real_render = render_text_to_image(&real, None).expect("real-bold render");
+
+        let mut faux = real.clone();
+        faux.text = "a<b=8>bb</b>a".to_string();
+        let faux_render = render_text_to_image(&faux, None).expect("faux-bold render");
+        assert_ne!(
+            (real_render.width, real_render.height, &real_render.rgba),
+            (faux_render.width, faux_render.height, &faux_render.rgba),
+            "a parameterized faux bold span must change the rendered pixels"
+        );
+    }
+
+    /// Maximum inked x over the row band `[y0, y1)`, or `None` if the band is
+    /// fully transparent.
+    fn max_ink_x_in_rows(
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        y0: usize,
+        y1: usize,
+    ) -> Option<usize> {
+        let width = width as usize;
+        let mut max_x = None;
+        for y in y0..y1.min(height as usize) {
+            for x in 0..width {
+                if rgba[(y * width + x) * 4 + 3] > 0 {
+                    max_x = Some(max_x.map_or(x, |current: usize| current.max(x)));
+                }
+            }
+        }
+        max_x
+    }
+
+    #[test]
+    fn faux_advance_carries_across_inline_size_boundary() {
+        // A faux span ending immediately before an inline size change: the
+        // following (differently-sized, non-faux) glyph must be pushed by the
+        // full 2*d instead of staying at its shaped position over the
+        // thickened ink. Expected total ink width growth vs the same text
+        // without faux: d (left edge of the thickened glyph) + 2*d (pen shift
+        // of everything after the span) = 3*d. A dropped boundary extra would
+        // leave only ~d of growth (and a d-deep overlap).
+        let mut plain = base_params();
+        plain.text = "H<size=24>H".to_string();
+        plain.font_size_px = 48.0;
+        plain.enable_inline_style_tags = true;
+        let plain_render = render_text_to_image(&plain, None).expect("plain render");
+        let (plain_w, _) =
+            alpha_bounds_from_rgba(plain_render.width, plain_render.height, &plain_render.rgba)
+                .expect("plain ink");
+
+        let mut faux = plain.clone();
+        faux.text = "<b=10>H</b><size=24>H".to_string();
+        let faux_render = render_text_to_image(&faux, None).expect("faux render");
+        let (faux_w, _) =
+            alpha_bounds_from_rgba(faux_render.width, faux_render.height, &faux_render.rgba)
+                .expect("faux ink");
+
+        let d = 10.0 / 100.0 * 48.0;
+        let growth = faux_w as f32 - plain_w as f32;
+        assert!(
+            (growth - 3.0 * d).abs() <= 2.0,
+            "ink width growth {growth} should be ~{} (no overlap at the size boundary)",
+            3.0 * d
+        );
+    }
+
+    #[test]
+    fn faux_trailing_extra_included_in_alignment_width() {
+        // Right-aligned two-line text: the line ending in a faux-bold glyph
+        // must not overshoot the flush margin relative to the plain line
+        // below it — the trailing glyph's faux advance growth is part of the
+        // logical line width.
+        let mut params = base_params();
+        params.text = "<b=12>HH</b>\nHH".to_string();
+        params.enable_inline_style_tags = true;
+        params.font_size_px = 48.0;
+        params.align = HorizontalAlign::RIGHT;
+        let render = render_text_to_image(&params, None).expect("aligned render");
+        let h = render.height as usize;
+        let top_right = max_ink_x_in_rows(render.width, render.height, &render.rgba, 0, h / 2)
+            .expect("top line ink");
+        let bottom_right = max_ink_x_in_rows(render.width, render.height, &render.rgba, h / 2, h)
+            .expect("bottom line ink");
+        assert!(
+            top_right <= bottom_right + 1,
+            "faux line right edge ({top_right}) must not overshoot the plain flush margin \
+             ({bottom_right})"
+        );
+    }
+
+    #[test]
+    fn vertical_columns_do_not_overlap_under_faux_italic_slant() {
+        // Two single-glyph columns at a +/-45 degree faux slant: the column
+        // width must include the shear overhang, so a fully transparent pixel
+        // column still separates the two glyphs' ink.
+        for slant in [45.0f32, -45.0] {
+            let mut params = base_params();
+            params.text = "H\nH".to_string();
+            params.font_size_px = 48.0;
+            params.text_line_mode = TextLineMode::Vertical;
+            // No extra column spacing: adjacent columns are separated only by
+            // the measured visual width, so a missing shear overhang overlaps.
+            params.line_spacing_percent = 0.0;
+            params.force_italic = true;
+            params.faux_italic_slant_deg = Some(slant);
+            let render = render_text_to_image(&params, None).expect("vertical italic render");
+            let (min_x, _, max_x, _) =
+                alpha_box(render.width, render.height, &render.rgba).expect("ink");
+            let width = render.width as usize;
+            let height = render.height as usize;
+            let has_gap = ((min_x + 1)..max_x).any(|x| {
+                (0..height).all(|y| render.rgba[(y * width + x) * 4 + 3] == 0)
+            });
+            assert!(
+                has_gap,
+                "columns must stay separated at slant {slant} (no shear overlap)"
+            );
+        }
+    }
+
+    #[test]
+    fn rotated_faux_bold_italic_stays_within_canvas() {
+        // Global rotation + faux bold + faux italic combined must route
+        // through the rotated placement path without clipping: the trim pass
+        // pads 1px, so ink touching the canvas edge would indicate clipped
+        // bounds.
+        let mut plain = base_params();
+        plain.text = "HH".to_string();
+        plain.font_size_px = 48.0;
+        plain.global_rotation_deg = 30.0;
+        let plain_render = render_text_to_image(&plain, None).expect("plain rotated render");
+
+        let mut faux = plain.clone();
+        faux.force_bold = true;
+        faux.faux_bold = Some(test_faux_bold(8.0, 0.0));
+        faux.force_italic = true;
+        faux.faux_italic_slant_deg = Some(25.0);
+        let render = render_text_to_image(&faux, None).expect("rotated faux render");
+        let (min_x, min_y, max_x, max_y) =
+            alpha_box(render.width, render.height, &render.rgba).expect("ink");
+        assert!(min_x >= 1 && min_y >= 1, "ink must not touch the left/top edge");
+        assert!(
+            (max_x as u32) < render.width - 1 && (max_y as u32) < render.height - 1,
+            "ink must not touch the right/bottom edge (would indicate clipping)"
+        );
+        assert_ne!(
+            (plain_render.width, plain_render.height, &plain_render.rgba),
+            (render.width, render.height, &render.rgba),
+            "rotated faux render must differ from the plain rotated render"
+        );
+    }
+
+    #[test]
+    fn formula_mode_applies_faux_bold_across_effective_sizes() {
+        // Formula/on-path mode with two effective sizes of the same glyph:
+        // each glyph resolves its own quantized d, so the ink cache holds a
+        // separate (CacheKey, faux_bits) entry per size and both glyphs
+        // thicken (the faux render grows in both axes).
+        let mut plain = base_params();
+        plain.text = "H<size=24>H".to_string();
+        plain.enable_inline_style_tags = true;
+        plain.font_size_px = 48.0;
+        plain.text_layout_mode = TextLayoutMode::Formula;
+        let plain_render = render_text_to_image(&plain, None).expect("plain formula render");
+        let (plain_w, plain_h) =
+            alpha_bounds_from_rgba(plain_render.width, plain_render.height, &plain_render.rgba)
+                .expect("plain ink");
+
+        let mut faux = plain.clone();
+        faux.force_bold = true;
+        faux.faux_bold = Some(test_faux_bold(8.0, 0.0));
+        let faux_render = render_text_to_image(&faux, None).expect("faux formula render");
+        let (faux_w, faux_h) =
+            alpha_bounds_from_rgba(faux_render.width, faux_render.height, &faux_render.rgba)
+                .expect("faux ink");
+        assert!(
+            faux_w > plain_w && faux_h > plain_h,
+            "faux bold must thicken the on-path ink ({plain_w}x{plain_h} -> {faux_w}x{faux_h})"
+        );
     }
 
     #[test]

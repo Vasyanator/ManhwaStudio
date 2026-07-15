@@ -163,6 +163,17 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("force_italic")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        faux_bold: (text_params.get("force_bold").and_then(Value::as_bool).unwrap_or(false)
+            && text_params.get("faux_bold").and_then(Value::as_bool).unwrap_or(false))
+            .then(|| crate::tabs::typing::render_next::types::FauxBoldParams {
+                thicken_percent: text_params.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0),
+                expand_percent: text_params.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0),
+                sharp_corners: text_params.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true),
+                outward_only: text_params.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true),
+            }),
+        faux_italic_slant_deg: (text_params.get("force_italic").and_then(Value::as_bool).unwrap_or(false)
+            && text_params.get("faux_italic").and_then(Value::as_bool).unwrap_or(false))
+            .then_some(text_params.get("faux_italic_slant_deg").and_then(value_as_f32).unwrap_or(14.0).clamp(-45.0, 45.0)),
         uppercase_text: text_params
             .get("uppercase_text")
             .and_then(Value::as_bool)
@@ -881,6 +892,13 @@ pub(super) fn normalize_text_params_object(
         "selected_face_index": selected_face_index,
         "force_bold": obj.get("force_bold").and_then(Value::as_bool).unwrap_or(false),
         "force_italic": obj.get("force_italic").and_then(Value::as_bool).unwrap_or(false),
+        "faux_bold": obj.get("faux_bold").and_then(Value::as_bool).unwrap_or(false),
+        "faux_bold_thicken_percent": obj.get("faux_bold_thicken_percent").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 25.0),
+        "faux_bold_expand_percent": obj.get("faux_bold_expand_percent").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 50.0),
+        "faux_bold_sharp_corners": obj.get("faux_bold_sharp_corners").and_then(Value::as_bool).unwrap_or(true),
+        "faux_bold_outward_only": obj.get("faux_bold_outward_only").and_then(Value::as_bool).unwrap_or(true),
+        "faux_italic": obj.get("faux_italic").and_then(Value::as_bool).unwrap_or(false),
+        "faux_italic_slant_deg": obj.get("faux_italic_slant_deg").and_then(value_as_f32).unwrap_or(14.0).clamp(-45.0, 45.0),
         "uppercase_text": obj.get("uppercase_text").and_then(Value::as_bool).unwrap_or(false),
         "enable_inline_style_tags": obj.get("enable_inline_style_tags").and_then(Value::as_bool).unwrap_or(false),
         "text_wrap_mode": text_wrap_mode,
@@ -996,6 +1014,13 @@ pub(super) fn parse_legacy_static_render_data(
             "selected_face_index": 0,
             "force_bold": false,
             "force_italic": false,
+            "faux_bold": false,
+            "faux_bold_thicken_percent": 3.0,
+            "faux_bold_expand_percent": 0.0,
+            "faux_bold_sharp_corners": true,
+            "faux_bold_outward_only": true,
+            "faux_italic": false,
+            "faux_italic_slant_deg": 14.0,
             "uppercase_text": false,
             "enable_inline_style_tags": false,
             "text_wrap_mode": "aggressive",
@@ -1701,6 +1726,13 @@ pub(super) fn default_render_data_for_text(text: &str, width_px: u32) -> Value {
             "selected_face_index": 0,
             "force_bold": false,
             "force_italic": false,
+            "faux_bold": false,
+            "faux_bold_thicken_percent": 3.0,
+            "faux_bold_expand_percent": 0.0,
+            "faux_bold_sharp_corners": true,
+            "faux_bold_outward_only": true,
+            "faux_italic": false,
+            "faux_italic_slant_deg": 14.0,
             "uppercase_text": false,
             "enable_inline_style_tags": false,
             "text_wrap_mode": "aggressive",

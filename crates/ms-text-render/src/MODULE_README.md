@@ -243,6 +243,41 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   CENTER (not the baseline) on the line at 0%, so both line modes share one
   meaning of 0 = center; projects saved before the key default to 0.0 = center.
   Like `global_rotation_deg`, it does not affect layout text.
+- Faux bold/italic (`TextRenderParams.faux_bold: Option<FauxBoldParams>`,
+  `faux_italic_slant_deg: Option<f32>`): synthetic styles applied to the VECTOR
+  outline instead of switching faces. They take effect ONLY together with the
+  matching `force_bold`/`force_italic` flag; `force_* && faux present` keeps the
+  Regular/upright face (no Bold/Italic font matching — `pipeline.rs`
+  `base_attrs_real_bold_italic`), `force_*` without faux keeps the legacy
+  real-face behavior byte-identically. Faux bold offsets the flattened outline
+  by `d = thicken_percent/100 * glyph em` (`vector::offset_outline`:
+  outer-vs-hole decided by the actual NonZero winding at a point just inside
+  each ring — convention-free across TrueType/CFF; outer contours move
+  outward, holes shrink only when `outward_only == false`, and a counter
+  narrower than `2*d` collapses — the inverted/degenerate ring is dropped, not
+  emitted; miter limit ~4 or round joins; offset self-intersections are
+  absorbed by the NonZero fill) and grows each horizontal pen step by
+  `2*d + expand_px` (`Fixed`/`Auto`; the trailing glyph's extra is folded into
+  the logical `line_width_px` so alignment never overshoots; `Optical` instead
+  measures the offset outlines and normalizes the true ink gaps — no pen
+  growth, and `expand` does not apply). Faux italic is a baseline shear
+  `x' = x - tan(slant) * y` between scale and rotation in `GlyphTransform`
+  (advances unchanged), wired once through
+  `glyph_blit::glyph_outline_transform` so all three draw paths get it.
+  Per-variant caching: `OutlineKey`, `OpticalContourCache`, and the formula ink
+  cache all carry the quantized faux bits (`vector::FauxOutlineParams`,
+  1/64 px fixed point; `0` = plain, so plain geometry keys are untouched).
+  Bounds are widened by the faux pads (`pipeline::faux_bounds_pads`; miter
+  overhang up to `4*d`, shear overhang `|shear| * dy`), the vertical
+  ink-height stacking grows via the padded ink profile and the column visual
+  width includes the same bold+shear overhangs, and per-glyph resolution
+  follows the inline-span-over-global rule (`pipeline::faux_style_for_glyph`).
+  Inline grammar: `<b=thicken[,sharp|round][,out|both][,expand]>` /
+  `<b=default>` / `<i=slant_deg>` (machine keys `b=`/`i=` take the same value
+  payload); bare `<b>`/`<i>`/valueless machine keys keep the real faces. Faux
+  spans EXPLICITLY reset attrs to `Weight::NORMAL`/`Style::Normal`
+  (`inline_styles.rs`), so a global real bold/italic can never leak under the
+  faux geometry.
 - `RenderedTextImage.rgba` must always be `width * height * 4` bytes in unmultiplied
   RGBA order. Empty/transparent output must still use valid dimensions where possible.
 - Public renderer errors are `Result<_, String>` because callers surface them directly
@@ -343,6 +378,12 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   the same axis the gap is measured on, the "final gap >= 0.5px" / "gaps converge to
   the median" contracts hold on the measured layout and are only sub-pixel-approximate
   on screen.
+- To change faux bold/italic, the geometry (polyline offset, joins, shear) lives
+  in `vector.rs` (`offset_outline`, `GlyphTransform.shear_x`,
+  `FauxOutlineParams`); per-glyph resolution, advances, and bounds pads live in
+  `pipeline.rs` (`FauxGlyphStyle`, `faux_style_for_glyph`,
+  `faux_advance_extra_px_for_glyph`, `faux_bounds_pads`); the inline
+  `<b=...>`/`<i=...>` grammar lives in `inline_styles.rs`.
 - To change wrapping behavior, edit `wrap/`; keep measurement/scoring in
   `horizontal.rs`, dictionary/safety rules in `hyphenation.rs`, shape profiles in
   `shape.rs`, and vertical pre-layout in `vertical.rs`.

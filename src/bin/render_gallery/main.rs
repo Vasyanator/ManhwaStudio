@@ -90,6 +90,8 @@ fn base_params() -> TextRenderParams {
         selected_face_index: 0,
         force_bold: false,
         force_italic: false,
+        faux_bold: None,
+        faux_italic_slant_deg: None,
         uppercase_text: false,
         trim_extra_spaces: true,
         hanging_punctuation: false,

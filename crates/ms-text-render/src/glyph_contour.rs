@@ -18,6 +18,7 @@ Key structures:
 
 Key functions:
 - GlyphContour::placed
+- GlyphContour::placed_sheared (adds the faux-italic baseline shear)
 - GlyphContour::is_empty
 - min_placed_distance
 
@@ -78,6 +79,28 @@ impl GlyphContour {
         tx: f32,
         ty: f32,
     ) -> PlacedContour {
+        self.placed_sheared(cos, sin, scale_x, scale_y, 0.0, tx, ty)
+    }
+
+    /// [`GlyphContour::placed`] with an additional baseline shear between the
+    /// scale and the rotation: `x' = x - shear_x * y` in the scaled local frame
+    /// (the local baseline is the `y = 0` line; a positive `shear_x` leans
+    /// tops right in the y-down frame). `shear_x = 0.0` is bit-exact to
+    /// [`GlyphContour::placed`]. Matches `vector::GlyphTransform` so measured
+    /// contours land on the exact pixels the (possibly faux-italic) outline is
+    /// rasterized to.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Mirrors `placed` plus the one shear scalar.
+    pub fn placed_sheared(
+        &self,
+        cos: f32,
+        sin: f32,
+        scale_x: f32,
+        scale_y: f32,
+        shear_x: f32,
+        tx: f32,
+        ty: f32,
+    ) -> PlacedContour {
         let mut placed = PlacedContour::default();
         let mut min = [f32::INFINITY, f32::INFINITY];
         let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
@@ -85,8 +108,9 @@ impl GlyphContour {
         for component in &self.components {
             let mut world = Vec::with_capacity(component.len());
             for vertex in component {
-                let sx = vertex[0] * scale_x;
                 let sy = vertex[1] * scale_y;
+                // Baseline shear (faux italic); 0.0 is bit-exact to no shear.
+                let sx = vertex[0] * scale_x - shear_x * sy;
                 let wx = sx * cos - sy * sin + tx;
                 let wy = sx * sin + sy * cos + ty;
                 min[0] = min[0].min(wx);

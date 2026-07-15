@@ -12,11 +12,16 @@ Main responsibilities:
 Notes:
 - модель span уже хранит и attrs-совместимые, и будущие raster/layout override поля;
 - текущий pipeline шага 5 использует здесь только rich-text shaping через `Attrs`;
-- color/kerning/stretch/offset/line-spacing пока лишь сохраняются в span-модели для следующих этапов.
+- color/kerning/stretch/offset/line-spacing пока лишь сохраняются в span-модели для следующих этапов;
+- parameterized `<b=...>`/`<i=...>` (and machine `b=`/`i=`) request FAUX
+  bold/italic: the span is marked bold/italic but deliberately does NOT get
+  Weight/Style in attrs — the style is synthesized geometrically at the glyph
+  seam (`pipeline.rs`, `FauxGlyphStyle`); bare `<b>`/`<i>` keep the legacy
+  real-Bold/Italic-face behavior.
 */
 
 use super::font_registry::{InlineFontRegistry, normalize_inline_font_label};
-use super::types::{HorizontalAlign, PxOrPercent, parse_machine_tag};
+use super::types::{FauxBoldParams, HorizontalAlign, PxOrPercent, parse_machine_tag};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
 const VERTICAL_HALF_SPACE: char = '\u{200A}';
@@ -28,6 +33,16 @@ pub(crate) struct InlineStyleSpan {
     pub(crate) end: usize,
     pub(crate) bold: bool,
     pub(crate) italic: bool,
+    /// Faux-bold parameters when the innermost bold tag is a parameterized
+    /// `<b=...>` (or machine `b=...`). `Some` implies `bold == true` and means
+    /// the span must KEEP the Regular face (no `Weight::BOLD` in attrs) and be
+    /// thickened geometrically instead. `None` with `bold == true` = real bold.
+    pub(crate) faux_bold: Option<FauxBoldParams>,
+    /// Faux-italic slant (degrees, −45..45, positive = top leans right) when
+    /// the innermost italic tag is a parameterized `<i=slant>`. `Some` implies
+    /// `italic == true` and means the span keeps the upright face (no
+    /// `Style::Italic`) and is sheared instead. `None` + `italic` = real italic.
+    pub(crate) faux_italic_slant_deg: Option<f32>,
     pub(crate) align: Option<HorizontalAlign>,
     pub(crate) font_label: Option<String>,
     pub(crate) font_size_px: Option<f32>,
@@ -70,6 +85,8 @@ impl InlineStyleSpan {
             end,
             bold: false,
             italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             align: None,
             font_label: None,
             font_size_px: None,
@@ -97,8 +114,12 @@ pub(crate) struct ParsedInlineStyles {
 
 #[derive(Debug, Default)]
 struct InlineStyleState {
-    bold_depth: usize,
-    italic_depth: usize,
+    /// One entry per open bold tag: `None` = real bold (`<b>`/`<strong>`),
+    /// `Some` = faux bold with parameters (`<b=...>`). The innermost entry wins.
+    bold_stack: Vec<Option<FauxBoldParams>>,
+    /// One entry per open italic tag: `None` = real italic (`<i>`/`<em>`),
+    /// `Some(slant_deg)` = faux italic (`<i=slant>`). The innermost entry wins.
+    italic_stack: Vec<Option<f32>>,
     align_stack: Vec<HorizontalAlign>,
     font_stack: Vec<String>,
     size_stack: Vec<f32>,
@@ -133,8 +154,10 @@ impl InlineStyleState {
         InlineStyleSpan {
             start,
             end,
-            bold: self.bold_depth > 0,
-            italic: self.italic_depth > 0,
+            bold: !self.bold_stack.is_empty(),
+            italic: !self.italic_stack.is_empty(),
+            faux_bold: self.bold_stack.last().copied().flatten(),
+            faux_italic_slant_deg: self.italic_stack.last().copied().flatten(),
             align: self.align_stack.last().copied(),
             font_label: self.font_stack.last().cloned(),
             font_size_px: self.size_stack.last().copied(),
@@ -176,22 +199,24 @@ pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> Par
             let handled_tag = match compact.as_str() {
                 "b" | "strong" => {
                     flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.bold_depth = state.bold_depth.saturating_add(1);
+                    // Bare tag = real Bold face (legacy behavior, no faux params).
+                    state.bold_stack.push(None);
                     true
                 }
                 "/b" | "/strong" => {
                     flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.bold_depth = state.bold_depth.saturating_sub(1);
+                    state.bold_stack.pop();
                     true
                 }
                 "i" | "em" => {
                     flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.italic_depth = state.italic_depth.saturating_add(1);
+                    // Bare tag = real Italic face (legacy behavior, no faux slant).
+                    state.italic_stack.push(None);
                     true
                 }
                 "/i" | "/em" => {
                     flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
-                    state.italic_depth = state.italic_depth.saturating_sub(1);
+                    state.italic_stack.pop();
                     true
                 }
                 "no-break" | "nobreak" | "nobr" | "/no-break" | "/nobreak" | "/nobr" => {
@@ -254,6 +279,18 @@ pub(crate) fn parse_inline_style_tags(text: &str, base_font_size_px: f32) -> Par
                 continue;
             }
 
+            if let Some(faux_bold) = parse_faux_bold_tag(raw) {
+                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                state.bold_stack.push(Some(faux_bold));
+                i = end + 1;
+                continue;
+            }
+            if let Some(slant_deg) = parse_faux_italic_tag(raw) {
+                flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
+                state.italic_stack.push(Some(slant_deg));
+                i = end + 1;
+                continue;
+            }
             if let Some(align) = parse_align_tag_value(raw) {
                 flush_active_span(&plain_text, &mut spans, &mut span_start, &state);
                 state.align_stack.push(align);
@@ -436,11 +473,24 @@ pub(crate) fn apply_inline_style_to_attrs<'a>(
     inline_font_registry: &InlineFontRegistry,
 ) -> AttrsOwned {
     let mut styled_attrs = AttrsOwned::new(attrs);
+    // Faux spans EXPLICITLY reset to the Regular/upright face: the whole point
+    // of the parameterized `<b=...>`/`<i=...>` tags is to synthesize the style
+    // geometrically at the glyph seam. Merely leaving Weight/Style untouched
+    // would let a GLOBAL real bold/italic (force flag without faux) leak into
+    // the span and stack faux geometry on top of the real Bold/Italic face.
     if style.bold {
-        styled_attrs.weight = Weight::BOLD;
+        styled_attrs.weight = if style.faux_bold.is_some() {
+            Weight::NORMAL
+        } else {
+            Weight::BOLD
+        };
     }
     if style.italic {
-        styled_attrs.style = Style::Italic;
+        styled_attrs.style = if style.faux_italic_slant_deg.is_some() {
+            Style::Normal
+        } else {
+            Style::Italic
+        };
     }
     if let Some(font_label) = style.font_label.as_deref()
         && let Some(font_attrs) = inline_font_registry.get(&normalize_inline_font_label(font_label))
@@ -525,6 +575,8 @@ fn push_or_extend_inline_style_span(
         && last.end == start
         && last.bold == style.bold
         && last.italic == style.italic
+        && last.faux_bold == style.faux_bold
+        && last.faux_italic_slant_deg == style.faux_italic_slant_deg
         && last.align == style.align
         && last.font_label == style.font_label
         && last.font_size_px == style.font_size_px
@@ -544,6 +596,85 @@ fn push_or_extend_inline_style_span(
     cloned.start = start;
     cloned.end = end;
     spans.push(cloned);
+}
+
+/// Parse a parameterized bold tag `<b=...>` / `<strong=...>` (faux bold).
+///
+/// Returns `None` for any other tag AND for an unreadable value — the tag is
+/// then not recognized and, per the parser's convention, ends up in the plain
+/// text literally.
+fn parse_faux_bold_tag(raw_tag: &str) -> Option<FauxBoldParams> {
+    let value = tag_value(raw_tag, "b").or_else(|| tag_value(raw_tag, "strong"))?;
+    parse_faux_bold_value(value)
+}
+
+/// Parse a parameterized italic tag `<i=slant_deg>` / `<em=...>` (faux italic).
+///
+/// Returns the slant in degrees (clamped to -45..45). `None` for another tag
+/// or an unreadable value (the tag then ends up in the text literally).
+fn parse_faux_italic_tag(raw_tag: &str) -> Option<f32> {
+    let value = tag_value(raw_tag, "i").or_else(|| tag_value(raw_tag, "em"))?;
+    parse_faux_italic_value(value)
+}
+
+/// Faux-bold value grammar: `thicken[,sharp|round][,out|both][,expand]`.
+///
+/// - the first token is the `thicken_percent` number (0..25, % of font size);
+/// - the remaining tokens come in any order: `sharp`/`round` (join style),
+///   `out`/`both` (counters), and at most ONE extra number — `expand_percent`
+///   (0..50, extra letter-spacing);
+/// - `default` (or an empty value) = the default parameters
+///   (thicken 3, expand 0, sharp, out — see `FauxBoldParams::default`).
+///
+/// Returns `None` for an unreadable value (unknown token, a second stray
+/// number, or a non-numeric thicken).
+pub(crate) fn parse_faux_bold_value(value: &str) -> Option<FauxBoldParams> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+        .trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Some(FauxBoldParams::default());
+    }
+    let mut tokens = trimmed.split(',').map(str::trim);
+    let thicken = tokens.next()?.parse::<f32>().ok()?;
+    if !thicken.is_finite() {
+        return None;
+    }
+    let mut params = FauxBoldParams {
+        thicken_percent: thicken.clamp(0.0, 25.0),
+        ..FauxBoldParams::default()
+    };
+    let mut has_expand = false;
+    for token in tokens {
+        match token.to_ascii_lowercase().as_str() {
+            "sharp" => params.sharp_corners = true,
+            "round" => params.sharp_corners = false,
+            "out" => params.outward_only = true,
+            "both" => params.outward_only = false,
+            other => {
+                // Exactly one extra number is allowed: expand_percent.
+                let expand = other.parse::<f32>().ok()?;
+                if !expand.is_finite() || has_expand {
+                    return None;
+                }
+                params.expand_percent = expand.clamp(0.0, 50.0);
+                has_expand = true;
+            }
+        }
+    }
+    Some(params)
+}
+
+/// Faux-italic value: a single number — the slant in degrees, clamped to
+/// -45..45. `None` for an unreadable/non-finite value.
+pub(crate) fn parse_faux_italic_value(value: &str) -> Option<f32> {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | ' '))
+        .trim();
+    let slant = trimmed.parse::<f32>().ok()?;
+    slant.is_finite().then(|| slant.clamp(-45.0, 45.0))
 }
 
 fn parse_align_tag_value(raw_tag: &str) -> Option<HorizontalAlign> {
@@ -688,11 +819,26 @@ fn apply_machine_tag(
     for (key, value) in attrs {
         match key {
             'b' => {
-                state.bold_depth = state.bold_depth.saturating_add(1);
+                // Optional value payload = faux bold (same grammar as `<b=...>`).
+                // A valueless `b` (and, defensively, an unreadable value) keeps
+                // the legacy real-Bold-face flag semantics.
+                let faux = if value.is_empty() {
+                    None
+                } else {
+                    parse_faux_bold_value(value)
+                };
+                state.bold_stack.push(faux);
                 frame.bold = true;
             }
             'i' => {
-                state.italic_depth = state.italic_depth.saturating_add(1);
+                // Optional value payload = faux italic slant in degrees; a
+                // valueless `i` (or unreadable value) = real Italic face.
+                let faux = if value.is_empty() {
+                    None
+                } else {
+                    parse_faux_italic_value(value)
+                };
+                state.italic_stack.push(faux);
                 frame.italic = true;
             }
             'a' => {
@@ -805,10 +951,10 @@ fn close_machine_tag(state: &mut InlineStyleState) {
         return;
     };
     if frame.bold {
-        state.bold_depth = state.bold_depth.saturating_sub(1);
+        state.bold_stack.pop();
     }
     if frame.italic {
-        state.italic_depth = state.italic_depth.saturating_sub(1);
+        state.italic_stack.pop();
     }
     if frame.align {
         state.align_stack.pop();
@@ -945,7 +1091,7 @@ mod tests {
         remap_inline_style_spans,
     };
     use crate::font_registry::InlineFontRegistry;
-    use crate::types::HorizontalAlign;
+    use crate::types::{FauxBoldParams, HorizontalAlign};
     use cosmic_text::{Attrs, Metrics, Style, Weight};
 
     #[test]
@@ -957,6 +1103,8 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             align: None,
             font_label: None,
             font_size_px: None,
@@ -988,6 +1136,8 @@ mod tests {
                 end: 2,
                 bold: false,
                 italic: false,
+                faux_bold: None,
+                faux_italic_slant_deg: None,
                 align: None,
                 font_label: None,
                 font_size_px: None,
@@ -1004,6 +1154,8 @@ mod tests {
                 end: source.len(),
                 bold: true,
                 italic: false,
+                faux_bold: None,
+                faux_italic_slant_deg: None,
                 align: None,
                 font_label: None,
                 font_size_px: None,
@@ -1035,6 +1187,8 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             align: None,
             font_label: None,
             font_size_px: None,
@@ -1064,6 +1218,8 @@ mod tests {
             end: source.len(),
             bold: true,
             italic: false,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             align: None,
             font_label: None,
             font_size_px: None,
@@ -1205,6 +1361,170 @@ mod tests {
     }
 
     #[test]
+    fn bare_bold_italic_tags_stay_real_face() {
+        // Legacy `<b>`/`<i>` must keep the pre-faux semantics: bold/italic flags
+        // set, NO faux parameters attached.
+        let parsed = parse_inline_style_tags("a<b><i>bc</i></b>d", 24.0);
+        assert_eq!(parsed.plain_text, "abcd");
+        let span = &parsed.spans[1];
+        assert!(span.bold && span.italic);
+        assert_eq!(span.faux_bold, None);
+        assert_eq!(span.faux_italic_slant_deg, None);
+    }
+
+    #[test]
+    fn faux_bold_tag_parses_thicken_only() {
+        let parsed = parse_inline_style_tags("a<b=3>bc</b>d", 24.0);
+        assert_eq!(parsed.plain_text, "abcd");
+        let span = &parsed.spans[1];
+        assert!(span.bold, "faux bold still marks the span bold");
+        assert_eq!(
+            span.faux_bold,
+            Some(FauxBoldParams {
+                thicken_percent: 3.0,
+                expand_percent: 0.0,
+                sharp_corners: true,
+                outward_only: true,
+            })
+        );
+        assert_eq!(parsed.spans[2].faux_bold, None);
+    }
+
+    #[test]
+    fn faux_bold_tag_parses_full_token_list_in_any_order() {
+        let parsed = parse_inline_style_tags("a<b=3,round,both,1.5>bc</b>d", 24.0);
+        let span = &parsed.spans[1];
+        assert_eq!(
+            span.faux_bold,
+            Some(FauxBoldParams {
+                thicken_percent: 3.0,
+                expand_percent: 1.5,
+                sharp_corners: false,
+                outward_only: false,
+            })
+        );
+        // Token order after the leading thicken number is free.
+        let reordered = parse_inline_style_tags("a<b=3,1.5,both,round>bc</b>d", 24.0);
+        assert_eq!(reordered.spans[1].faux_bold, span.faux_bold);
+    }
+
+    #[test]
+    fn faux_bold_default_keyword_uses_defaults() {
+        let parsed = parse_inline_style_tags("a<b=default>bc</b>d", 24.0);
+        assert_eq!(parsed.spans[1].faux_bold, Some(FauxBoldParams::default()));
+        assert!(parsed.spans[1].bold);
+    }
+
+    #[test]
+    fn faux_italic_tag_parses_signed_slant() {
+        let parsed = parse_inline_style_tags("a<i=-14>bc</i>d", 24.0);
+        let span = &parsed.spans[1];
+        assert!(span.italic, "faux italic still marks the span italic");
+        assert_eq!(span.faux_italic_slant_deg, Some(-14.0));
+        // Slant clamps to the documented -45..45 range.
+        let clamped = parse_inline_style_tags("a<i=90>bc</i>d", 24.0);
+        assert_eq!(clamped.spans[1].faux_italic_slant_deg, Some(45.0));
+    }
+
+    #[test]
+    fn unreadable_faux_values_fall_back_to_literal_text() {
+        // The file's convention for unrecognized tags: they are not consumed and
+        // appear literally in the plain text.
+        let parsed = parse_inline_style_tags("a<b=abc>b", 24.0);
+        assert_eq!(parsed.plain_text, "a<b=abc>b");
+        let parsed = parse_inline_style_tags("a<b=3,round,1,2>b", 24.0);
+        assert_eq!(
+            parsed.plain_text, "a<b=3,round,1,2>b",
+            "a second bare number is invalid"
+        );
+        let parsed = parse_inline_style_tags("a<i=wide>b", 24.0);
+        assert_eq!(parsed.plain_text, "a<i=wide>b");
+    }
+
+    #[test]
+    fn machine_tag_b_i_value_payload_round_trip() {
+        // Machine keys accept the same value grammar; valueless keys keep the
+        // legacy real-face flags.
+        let parsed = parse_inline_style_tags("a<m b=5,round,both,2 i=-10>bc</m>d", 24.0);
+        let span = &parsed.spans[1];
+        assert!(span.bold && span.italic);
+        assert_eq!(
+            span.faux_bold,
+            Some(FauxBoldParams {
+                thicken_percent: 5.0,
+                expand_percent: 2.0,
+                sharp_corners: false,
+                outward_only: false,
+            })
+        );
+        assert_eq!(span.faux_italic_slant_deg, Some(-10.0));
+        // Closed cleanly by </m>.
+        assert!(!parsed.spans[2].bold);
+        assert_eq!(parsed.spans[2].faux_bold, None);
+
+        let legacy = parse_inline_style_tags("a<m b i>bc</m>d", 24.0);
+        let legacy_span = &legacy.spans[1];
+        assert!(legacy_span.bold && legacy_span.italic);
+        assert_eq!(legacy_span.faux_bold, None);
+        assert_eq!(legacy_span.faux_italic_slant_deg, None);
+    }
+
+    #[test]
+    fn faux_spans_do_not_set_weight_or_style_on_attrs() {
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        let parsed = parse_inline_style_tags("<b=3><i=12>x</i></b>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_bold.is_some())
+            .expect("faux span");
+        let applied = apply_inline_style_to_attrs(&attrs, span, &InlineFontRegistry::default());
+        assert_ne!(applied.weight, Weight::BOLD, "faux bold keeps Regular face");
+        assert_ne!(applied.style, Style::Italic, "faux italic keeps upright face");
+    }
+
+    #[test]
+    fn faux_spans_reset_global_real_bold_italic_to_regular_face() {
+        // Base attrs carrying a GLOBAL real bold + italic (force flags without
+        // faux): an inline faux span must explicitly reset to the
+        // Regular/upright face, never stack faux geometry on the real faces.
+        let attrs = Attrs::new()
+            .metrics(Metrics::new(20.0, 24.0))
+            .weight(Weight::BOLD)
+            .style(Style::Italic);
+
+        let parsed = parse_inline_style_tags("<b=3>x</b>", 24.0);
+        let bold_span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_bold.is_some())
+            .expect("faux bold span");
+        let applied = apply_inline_style_to_attrs(&attrs, bold_span, &InlineFontRegistry::default());
+        assert_eq!(
+            applied.weight,
+            Weight::NORMAL,
+            "faux bold span must force the Regular weight over a global real bold"
+        );
+        // The italic flag is not set on this span, so the global italic stays.
+        assert_eq!(applied.style, Style::Italic);
+
+        let parsed = parse_inline_style_tags("<i=14>x</i>", 24.0);
+        let italic_span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_italic_slant_deg.is_some())
+            .expect("faux italic span");
+        let applied =
+            apply_inline_style_to_attrs(&attrs, italic_span, &InlineFontRegistry::default());
+        assert_eq!(
+            applied.style,
+            Style::Normal,
+            "faux italic span must force the upright style over a global real italic"
+        );
+        assert_eq!(applied.weight, Weight::BOLD);
+    }
+
+    #[test]
     fn apply_inline_style_to_attrs_updates_weight_style_and_metrics() {
         let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
         let style = InlineStyleSpan {
@@ -1212,6 +1532,8 @@ mod tests {
             end: 3,
             bold: true,
             italic: true,
+            faux_bold: None,
+            faux_italic_slant_deg: None,
             align: None,
             font_label: None,
             font_size_px: Some(30.0),

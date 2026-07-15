@@ -68,7 +68,8 @@ use crate::inline_styles::{
 };
 use crate::optical::optical_base_advance;
 use crate::pipeline::{
-    GlyphScaleSettings, KerningSettings, effective_spacing_percent, horizontal_line_offset,
+    FauxGlyphStyle, GlyphScaleSettings, KerningSettings, effective_spacing_percent,
+    faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
 };
 use crate::raster::{
     PixelBounds, RigidPlacement, bilinear_sample_rgba, blend_pixel_over, build_glyph_rgba_buffer,
@@ -138,6 +139,39 @@ struct FormulaGlyphSeed {
     glyph_idx_in_line: usize,
     glyphs_in_line: usize,
     advance_px: f32,
+    /// Faux bold/italic style resolved once per seed; the outline seam
+    /// (`resolve_glyph_outline`) and the draw transforms consume it.
+    /// `FauxGlyphStyle::NONE` keeps every seam byte-identical to no faux.
+    faux: FauxGlyphStyle,
+}
+
+impl FormulaGlyphSeed {
+    /// The scaled glyph rect widened by the faux bounds pads
+    /// (`faux_bounds_pads`); exactly the plain `scaled_rect` when faux is off
+    /// (the pads are hard zeros). `placement_top` is the bitmap y placement
+    /// (pen-relative top above the baseline) the shear pad keys off.
+    fn padded_scaled_rect(
+        &self,
+        src_left: f32,
+        src_top: f32,
+        glyph_w: f32,
+        glyph_h: f32,
+        placement_top: f32,
+    ) -> (f32, f32, f32, f32) {
+        let pads = faux_bounds_pads(
+            self.faux,
+            placement_top,
+            glyph_h,
+            self.glyph_scale.width_mul,
+            self.glyph_scale.height_mul,
+        );
+        self.glyph_scale.scaled_rect(
+            src_left - pads[0],
+            src_top - pads[1],
+            glyph_w + 2.0 * pads[0],
+            glyph_h + 2.0 * pads[1],
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -239,16 +273,17 @@ fn drawn_line_glyph_destination_center_raw(
 
 /// Resolve a seed glyph's true font outline through the per-render cache.
 ///
-/// Thin wrapper over [`resolve_outline_for_glyph`] keyed on the seed's glyph.
-/// Returns `None` when the font is missing or the glyph has no fillable
-/// monochrome outline (space or COLR/bitmap color glyph); callers then fall back
-/// to the bitmap blit.
+/// Thin wrapper over [`resolve_outline_for_glyph`] keyed on the seed's glyph
+/// and its faux-bold variant (`seed.faux.bold`), so the on-path modes draw and
+/// measure the same offset outline the other paths use. Returns `None` when
+/// the font is missing or the glyph has no fillable monochrome outline (space
+/// or COLR/bitmap color glyph); callers then fall back to the bitmap blit.
 fn resolve_glyph_outline(
     seed: &FormulaGlyphSeed,
     font_system: &mut FontSystem,
     outline_cache: &mut OutlineCache,
 ) -> Option<std::sync::Arc<Outline>> {
-    resolve_outline_for_glyph(font_system, outline_cache, &seed.glyph)
+    resolve_outline_for_glyph(font_system, outline_cache, &seed.glyph, seed.faux.bold)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -466,7 +501,7 @@ fn render_text_with_drawn_lines_layout_once(
     // render so glyph rasterization and ink-contour tracing happen at most once
     // per distinct glyph, and are reused by the bounds and composite passes.
     let mut cache = SwashCache::new();
-    let mut contour_cache: HashMap<CacheKey, CachedGlyphInk> = HashMap::new();
+    let mut contour_cache: HashMap<(CacheKey, u32), CachedGlyphInk> = HashMap::new();
     // Resolution-independent glyph outlines: shared by the ink-distance search
     // (via the transforms below) and the composite pass so each glyph is
     // extracted at most once per render.
@@ -525,9 +560,19 @@ fn render_text_with_drawn_lines_layout_once(
             }
             let src_left = physical.x + image.placement.left;
             let src_top = physical.y - image.placement.top;
-            let (scaled_left, scaled_top, scaled_width, scaled_height) = seed
+            // Placement (line centering) keys off the UNPADDED scaled height —
+            // exactly what the draw pass uses; only the included rect is
+            // widened by the faux pads (hard zeros without faux).
+            let (_, _, _, scaled_height) = seed
                 .glyph_scale
                 .scaled_rect(src_left as f32, src_top as f32, glyph_w as f32, glyph_h as f32);
+            let (padded_left, padded_top, padded_width, padded_height) = seed.padded_scaled_rect(
+                src_left as f32,
+                src_top as f32,
+                glyph_w as f32,
+                glyph_h as f32,
+                image.placement.top as f32,
+            );
             let (dst_center_x, dst_center_y) = drawn_line_glyph_destination_center_raw(
                 transform,
                 scaled_height,
@@ -535,10 +580,10 @@ fn render_text_with_drawn_lines_layout_once(
             );
             include_rotated_rect_bounds(
                 &mut pre_box,
-                scaled_left,
-                scaled_top,
-                scaled_width,
-                scaled_height,
+                padded_left,
+                padded_top,
+                padded_width,
+                padded_height,
                 dst_center_x,
                 dst_center_y,
                 transform.rotation_rad,
@@ -581,20 +626,29 @@ fn render_text_with_drawn_lines_layout_once(
         }
         let src_left = physical.x + image.placement.left;
         let src_top = physical.y - image.placement.top;
-        let (scaled_left, scaled_top, scaled_width, scaled_height) = seed.glyph_scale.scaled_rect(
+        // Same split as the warp pre-box: unpadded height for the placement,
+        // faux-padded rect for the bounds so offset/sheared ink never clips.
+        let (_, _, _, scaled_height) = seed.glyph_scale.scaled_rect(
             src_left as f32,
             src_top as f32,
             glyph_w as f32,
             glyph_h as f32,
         );
+        let (padded_left, padded_top, padded_width, padded_height) = seed.padded_scaled_rect(
+            src_left as f32,
+            src_top as f32,
+            glyph_w as f32,
+            glyph_h as f32,
+            image.placement.top as f32,
+        );
         let (dst_center_x, dst_center_y) =
             drawn_line_glyph_destination_center_raw(transform, scaled_height, line_placement_frac);
         include_rotated_rect_bounds(
             &mut bounds,
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
+            padded_left,
+            padded_top,
+            padded_width,
+            padded_height,
             dst_center_x,
             dst_center_y,
             transform.rotation_rad,
@@ -731,6 +785,7 @@ fn render_text_with_drawn_lines_layout_once(
                 seed.glyph_scale.width_mul,
                 seed.glyph_scale.height_mul,
                 glyph_subpixel_offset(physical.cache_key),
+                seed.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
@@ -829,7 +884,7 @@ fn build_drawn_line_transforms(
     paths: &[Option<DrawnLinePath>],
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
-    contour_cache: &mut HashMap<CacheKey, CachedGlyphInk>,
+    contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
     outline_cache: &mut OutlineCache,
     line_placement_frac: f32,
 ) -> Vec<Option<DrawnLineTransform>> {
@@ -874,7 +929,7 @@ struct DrawnLinePlacementCtx<'a> {
     letter_spacing_px: f32,
     font_system: &'a mut FontSystem,
     cache: &'a mut SwashCache,
-    contour_cache: &'a mut HashMap<CacheKey, CachedGlyphInk>,
+    contour_cache: &'a mut HashMap<(CacheKey, u32), CachedGlyphInk>,
     outline_cache: &'a mut OutlineCache,
 }
 
@@ -955,6 +1010,7 @@ fn drawn_line_seed_transform(
                     g.glyph_h,
                     seed.glyph_scale.width_mul,
                     seed.glyph_scale.height_mul,
+                    seed.faux.shear_x,
                     g.scaled_height,
                     layout.line_placement_frac,
                     g.subpixel,
@@ -1053,7 +1109,7 @@ fn seed_ink_geometry(
     seed: &FormulaGlyphSeed,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
-    contour_cache: &mut HashMap<CacheKey, CachedGlyphInk>,
+    contour_cache: &mut HashMap<(CacheKey, u32), CachedGlyphInk>,
     outline_cache: &mut OutlineCache,
 ) -> Option<SeedInkGeometry> {
     let physical = seed.glyph.physical(
@@ -1064,6 +1120,9 @@ fn seed_ink_geometry(
         1.0,
     );
     let key = physical.cache_key;
+    // The ink cache is per faux-bold variant (same bits as `OutlineKey`), so a
+    // faux span's offset contour never aliases the plain one within a render.
+    let ink_key = (key, seed.faux.bold_key_bits());
 
     // Bitmap placement + horizontal ink extent, copied out before the image
     // borrow of `cache` ends.
@@ -1095,12 +1154,16 @@ fn seed_ink_geometry(
             [gw, gh],
             [seed.glyph.w.max(1.0), 1.0],
         );
-        ink_width_px = (ink.right_px - ink.left_px).max(0.0);
+        // Faux bold moves the ink boundary outward by `d` on each side; the
+        // bitmap-measured extent must grow with it so the min-distance base
+        // gap matches the drawn (offset) ink. `d == 0.0` adds exact zeros.
+        ink_width_px = (ink.right_px - ink.left_px).max(0.0) + 2.0 * seed.faux.d_px();
     }
 
-    // Trace the ink contour from the true outline once per distinct glyph key.
-    // A glyph with no fillable monochrome outline is treated as "no ink".
-    if let std::collections::hash_map::Entry::Vacant(entry) = contour_cache.entry(key) {
+    // Trace the ink contour from the true outline once per distinct glyph key
+    // (and faux-bold variant). A glyph with no fillable monochrome outline is
+    // treated as "no ink".
+    if let std::collections::hash_map::Entry::Vacant(entry) = contour_cache.entry(ink_key) {
         let outline = resolve_glyph_outline(seed, font_system, outline_cache)?;
         let contour = glyph_contour_from_outline(&outline, CONTOUR_SIMPLIFY_TOLERANCE_PX);
         entry.insert(CachedGlyphInk {
@@ -1113,7 +1176,7 @@ fn seed_ink_geometry(
         });
     }
 
-    let cached = contour_cache.get(&key)?;
+    let cached = contour_cache.get(&ink_key)?;
     let src_left = physical.x as f32 + placement_left;
     let src_top = physical.y as f32 - placement_top;
     let (_scaled_left, _scaled_top, _scaled_width, scaled_height) =
@@ -1193,6 +1256,7 @@ fn place_seed_contour_at(
         geom.glyph_h,
         seed.glyph_scale.width_mul,
         seed.glyph_scale.height_mul,
+        seed.faux.shear_x,
         geom.scaled_height,
         layout.line_placement_frac,
         geom.subpixel,
@@ -1220,6 +1284,7 @@ fn placed_contour_for_transform(
     glyph_h: f32,
     width_mul: f32,
     height_mul: f32,
+    shear_x: f32,
     scaled_height: f32,
     line_frac: f32,
     subpixel: [f32; 2],
@@ -1227,8 +1292,8 @@ fn placed_contour_for_transform(
 ) -> PlacedContour {
     let (dst_center_x, dst_center_y) =
         drawn_line_glyph_destination_center_raw(transform, scaled_height, line_frac);
-    // Same subpixel-corrected pivot the outline rasterizer uses, so the measured
-    // contour matches the drawn ink exactly.
+    // Same subpixel-corrected pivot (and faux-italic shear) the outline
+    // rasterizer uses, so the measured contour matches the drawn ink exactly.
     let glyph_transform = glyph_outline_transform(
         dst_center_x,
         dst_center_y,
@@ -1240,6 +1305,7 @@ fn placed_contour_for_transform(
         width_mul,
         height_mul,
         subpixel,
+        shear_x,
     );
     glyph_transform.place_contour(contour)
 }
@@ -1775,13 +1841,21 @@ fn render_text_with_formula_layout_once(
             }
             let src_left = physical.x + image.placement.left;
             let src_top = physical.y - image.placement.top;
-            let (scaled_left, scaled_top, scaled_width, scaled_height) =
-                seed.glyph_scale.scaled_rect(
-                    src_left as f32,
-                    src_top as f32,
-                    glyph_w as f32,
-                    glyph_h as f32,
-                );
+            // Placement keys off the UNPADDED scaled height (matching the draw
+            // pass); the included rect is widened by the faux pads.
+            let (_, _, _, scaled_height) = seed.glyph_scale.scaled_rect(
+                src_left as f32,
+                src_top as f32,
+                glyph_w as f32,
+                glyph_h as f32,
+            );
+            let (padded_left, padded_top, padded_width, padded_height) = seed.padded_scaled_rect(
+                src_left as f32,
+                src_top as f32,
+                glyph_w as f32,
+                glyph_h as f32,
+                image.placement.top as f32,
+            );
             let (placed_center_x, placed_center_y) = apply_line_placement(
                 transform.center_x,
                 transform.center_y,
@@ -1791,10 +1865,10 @@ fn render_text_with_formula_layout_once(
             );
             include_rotated_rect_bounds(
                 &mut pre_box,
-                scaled_left,
-                scaled_top,
-                scaled_width,
-                scaled_height,
+                padded_left,
+                padded_top,
+                padded_width,
+                padded_height,
                 placed_center_x,
                 placed_center_y,
                 transform.rotation_rad,
@@ -1834,11 +1908,21 @@ fn render_text_with_formula_layout_once(
         }
         let src_left = physical.x + image.placement.left;
         let src_top = physical.y - image.placement.top;
-        let (scaled_left, scaled_top, scaled_width, scaled_height) = seed.glyph_scale.scaled_rect(
+        // Placement keys off the UNPADDED scaled height (matching the draw
+        // pass); the included rect is widened by the faux pads (hard zeros
+        // without faux).
+        let (_, _, _, scaled_height) = seed.glyph_scale.scaled_rect(
             src_left as f32,
             src_top as f32,
             glyph_w as f32,
             glyph_h as f32,
+        );
+        let (padded_left, padded_top, padded_width, padded_height) = seed.padded_scaled_rect(
+            src_left as f32,
+            src_top as f32,
+            glyph_w as f32,
+            glyph_h as f32,
+            image.placement.top as f32,
         );
         // Perpendicular line placement: shift the glyph off the curve point by
         // `line_placement_frac * ink_height / 2` toward the top/bottom side. The
@@ -1853,10 +1937,10 @@ fn render_text_with_formula_layout_once(
         );
         include_rotated_rect_bounds(
             &mut bounds,
-            scaled_left,
-            scaled_top,
-            scaled_width,
-            scaled_height,
+            padded_left,
+            padded_top,
+            padded_width,
+            padded_height,
             placed_center_x,
             placed_center_y,
             transform.rotation_rad,
@@ -1970,6 +2054,7 @@ fn render_text_with_formula_layout_once(
                 seed.glyph_scale.width_mul,
                 seed.glyph_scale.height_mul,
                 glyph_subpixel_offset(physical.cache_key),
+                seed.faux.shear_x,
             );
             rasterize_outline_into(
                 &mut raster_scratch,
@@ -2254,6 +2339,13 @@ fn collect_formula_glyph_seeds(
                 glyph_idx_in_line,
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
                 advance_px: 0.0,
+                faux: faux_style_for_glyph(
+                    params,
+                    inline_style_spans,
+                    layout_line_offsets,
+                    run.line_i,
+                    glyph,
+                ),
             });
         }
 
@@ -2280,6 +2372,17 @@ fn collect_formula_glyph_seeds(
                 })
                 .unwrap_or(0);
             let style_offset = soft_hyphen_style_offset(&run, runs.peek(), layout_line_offsets);
+            // Resolved before the struct literal below moves `hyphen_glyph`.
+            let hyphen_faux = style_offset
+                .map(|offset| {
+                    faux_style_at_offset(
+                        params,
+                        inline_style_spans,
+                        offset,
+                        hyphen_glyph.font_size,
+                    )
+                })
+                .unwrap_or(FauxGlyphStyle::NONE);
             out.push(FormulaGlyphSeed {
                 glyph: hyphen_glyph,
                 text_color: style_offset
@@ -2310,6 +2413,7 @@ fn collect_formula_glyph_seeds(
                 glyph_idx_in_line,
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
                 advance_px: 0.0,
+                faux: hyphen_faux,
             });
         }
         line_idx += 1;
@@ -3265,6 +3369,7 @@ mod tests {
             glyph_h,
             width_mul,
             height_mul,
+            0.0,
             scaled_height,
             line_frac,
             [0.0, 0.0],

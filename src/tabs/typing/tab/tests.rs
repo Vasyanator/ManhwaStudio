@@ -1227,6 +1227,8 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         selected_face_index: 0,
         force_bold: false,
         force_italic: false,
+        faux_bold: None,
+        faux_italic_slant_deg: None,
         uppercase_text: false,
         trim_extra_spaces: false,
         hanging_punctuation: false,
@@ -1832,6 +1834,83 @@ fn normalize_preserves_raster_transform() {
             .map(Vec::len),
         Some(4)
     );
+}
+
+/// Finding 10 (d): the codec leg keeps the seven faux keys through `normalize`
+/// (with clamping) and applies the same `force_*` gate when building params.
+#[test]
+fn normalize_and_render_params_handle_faux_keys() {
+    let obj = serde_json::json!({
+        "text": "hi",
+        "force_bold": true,
+        "faux_bold": true,
+        "faux_bold_thicken_percent": 99.0,
+        "faux_bold_expand_percent": 4.0,
+        "faux_bold_sharp_corners": false,
+        "faux_bold_outward_only": false,
+        "force_italic": true,
+        "faux_italic": true,
+        "faux_italic_slant_deg": -90.0,
+    });
+    let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+    assert_eq!(normalized.get("faux_bold").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        normalized.get("faux_bold_thicken_percent").and_then(value_as_f32),
+        Some(25.0) // 99 clamps to 25
+    );
+    assert_eq!(
+        normalized.get("faux_bold_expand_percent").and_then(value_as_f32),
+        Some(4.0)
+    );
+    assert_eq!(
+        normalized.get("faux_bold_sharp_corners").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        normalized.get("faux_bold_outward_only").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(normalized.get("faux_italic").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        normalized.get("faux_italic_slant_deg").and_then(value_as_f32),
+        Some(-45.0) // -90 clamps to -45
+    );
+
+    // force_* off -> faux gated to None even with faux_* on.
+    let gated = serde_json::json!({
+        "text_params": {
+            "text": "hi",
+            "font_path": "/tmp/font.ttf",
+            "force_bold": false,
+            "faux_bold": true,
+            "faux_bold_thicken_percent": 7.5,
+            "force_italic": false,
+            "faux_italic": true,
+            "faux_italic_slant_deg": -30.0,
+        },
+        "effects": [],
+    });
+    let params = text_render_params_from_render_data(&gated).expect("params should parse");
+    assert!(params.faux_bold.is_none());
+    assert!(params.faux_italic_slant_deg.is_none());
+
+    // force_* on + faux_* on -> Some with the carried values.
+    let enabled = serde_json::json!({
+        "text_params": {
+            "text": "hi",
+            "font_path": "/tmp/font.ttf",
+            "force_bold": true,
+            "faux_bold": true,
+            "faux_bold_thicken_percent": 7.5,
+            "force_italic": true,
+            "faux_italic": true,
+            "faux_italic_slant_deg": -30.0,
+        },
+        "effects": [],
+    });
+    let params = text_render_params_from_render_data(&enabled).expect("params should parse");
+    assert_eq!(params.faux_bold.map(|f| f.thicken_percent), Some(7.5));
+    assert_eq!(params.faux_italic_slant_deg, Some(-30.0));
 }
 
 /// The canvas Shift+wheel font handler must defer ONLY when a real floating panel/popup

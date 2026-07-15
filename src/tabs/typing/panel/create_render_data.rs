@@ -175,6 +175,15 @@ impl TypingCreatePanelState {
             },
             "effects": self.effects_value_array(),
         });
+        if let Some(text_params) = render_data.get_mut("text_params").and_then(Value::as_object_mut) {
+            text_params.insert("faux_bold".to_string(), json!(self.faux_bold));
+            text_params.insert("faux_bold_thicken_percent".to_string(), json!(self.faux_bold_thicken_percent));
+            text_params.insert("faux_bold_expand_percent".to_string(), json!(self.faux_bold_expand_percent));
+            text_params.insert("faux_bold_sharp_corners".to_string(), json!(self.faux_bold_sharp_corners));
+            text_params.insert("faux_bold_outward_only".to_string(), json!(self.faux_bold_outward_only));
+            text_params.insert("faux_italic".to_string(), json!(self.faux_italic));
+            text_params.insert("faux_italic_slant_deg".to_string(), json!(self.faux_italic_slant_deg));
+        }
         // Carry the canvas-authored vector mesh warp verbatim (Phase 3). Only
         // emit the key when present so old overlays stay byte-stable/clean.
         if let Some(raster_transform) = self.pending_raster_transform.clone()

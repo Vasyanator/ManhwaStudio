@@ -12,13 +12,14 @@ Key functions:
 - hash_font_id: stable `u64` identity for a `fontdb::ID` (slotmap key with no
   public numeric accessor) to key the `OutlineCache`.
 - resolve_outline_for_glyph: per-render cached outline lookup for a laid-out
-  glyph at its shaped em size.
+  glyph at its shaped em size, per faux-bold variant (`FauxOutlineParams`).
 - nominal_glyph_advance_px: font `hmtx` (un-kerned) advance of a glyph, the base
   step for `KerningMode::Fixed` (cosmic-text bakes pair kerning into
   `LayoutGlyph.w`, so the shaped advance cannot express "no pair kerning").
 - glyph_outline_transform: local->world `GlyphTransform` reproducing the bitmap
   blit's scale+rotation about the bitmap center (the single source of truth for
-  the outline->world pivot).
+  the outline->world pivot), plus the faux-italic baseline shear applied
+  between scale and rotation.
 
 Notes:
 These helpers were lifted out of `formula/render.rs` so the horizontal path can
@@ -27,7 +28,7 @@ glyph's shaped `font_size` (the exact ppem the bitmap path feeds to swash);
 per-glyph scale is applied later as a transform, never baked into the outline.
 */
 
-use super::vector::{GlyphTransform, Outline, OutlineCache, OutlineKey};
+use super::vector::{FauxOutlineParams, GlyphTransform, Outline, OutlineCache, OutlineKey};
 use cosmic_text::{CacheKey, FontSystem, LayoutGlyph};
 use std::sync::Arc;
 
@@ -63,21 +64,25 @@ pub(crate) fn hash_font_id(font_id: impl std::hash::Hash) -> u64 {
 ///
 /// The extraction em is `glyph.font_size` (the exact ppem the bitmap path feeds
 /// to `physical`/`get_image`); the per-glyph scale is applied later as a
-/// transform, never baked into the outline. Returns `None` when the font is
-/// missing or the glyph has no fillable monochrome outline (space or COLR/bitmap
-/// color glyph); callers then fall back to the bitmap blit. Never panics.
+/// transform, never baked into the outline. `faux` selects the faux-bold offset
+/// variant of the outline (`None` = the plain extracted geometry, byte-identical
+/// to the pre-faux behavior); variants are cached separately per quantized
+/// parameters. Returns `None` when the font is missing or the glyph has no
+/// fillable monochrome outline (space or COLR/bitmap color glyph); callers then
+/// fall back to the bitmap blit (faux bold never applies there). Never panics.
 #[must_use]
 pub(crate) fn resolve_outline_for_glyph(
     font_system: &mut FontSystem,
     outline_cache: &mut OutlineCache,
     glyph: &LayoutGlyph,
+    faux: Option<FauxOutlineParams>,
 ) -> Option<Arc<Outline>> {
     let font_id = glyph.font_id;
     let glyph_id = glyph.glyph_id;
     let em_px = glyph.font_size;
     let font = font_system.get_font(font_id)?;
     let key = OutlineKey::new(hash_font_id(font_id), glyph_id, em_px);
-    outline_cache.get_or_extract(key, &font.as_swash(), glyph_id, em_px)
+    outline_cache.get_or_extract_with_faux(key, &font.as_swash(), glyph_id, em_px, faux)
 }
 
 /// Nominal (un-kerned) horizontal advance of a laid-out glyph in layout px.
@@ -125,9 +130,17 @@ pub(crate) fn nominal_glyph_advance_px(
 /// bitmap coverage occupies. The color-glyph bitmap fallback must pass
 /// `subpixel = [0.0, 0.0]`: `get_image` already baked the fraction into that
 /// coverage, so re-adding it would double-apply.
+///
+/// `shear_x` is the faux-italic baseline shear (`tan(slant)`, positive = top
+/// leans right; `0.0` = none, bit-exact to the pre-shear transform). It is
+/// forwarded into `GlyphTransform.shear_x` and applies between the scale and
+/// the rotation, in the SCALED glyph-local frame whose `y = 0` line is the
+/// glyph baseline. The pivot/`pos` math below is deliberately NOT sheared: the
+/// pen sits on the baseline, so the baseline (and the pen anchor) stays fixed
+/// while the ink leans — the contract of a baseline shear.
 // The placement is an irreducible list of independent scalars (bitmap center,
-// rotation, per-axis scale, bitmap placement/size, subpixel fraction); bundling
-// them into a one-off struct would not add clarity.
+// rotation, per-axis scale, bitmap placement/size, subpixel fraction, shear);
+// bundling them into a one-off struct would not add clarity.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub(crate) fn glyph_outline_transform(
@@ -141,6 +154,7 @@ pub(crate) fn glyph_outline_transform(
     width_mul: f32,
     height_mul: f32,
     subpixel: [f32; 2],
+    shear_x: f32,
 ) -> GlyphTransform {
     let (sin_a, cos_a) = rotation_rad.sin_cos();
     // pivot = -scale * O_center (bitmap center in the outline's pen-relative frame).
@@ -157,6 +171,7 @@ pub(crate) fn glyph_outline_transform(
         ],
         rot: rotation_rad,
         scale: [width_mul, height_mul],
+        shear_x,
     }
 }
 
@@ -169,9 +184,12 @@ mod tests {
     /// must translate `pos` by exactly that offset.
     #[test]
     fn subpixel_translates_pos_at_identity() {
-        let base = glyph_outline_transform(100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.0, 0.0]);
-        let shifted =
-            glyph_outline_transform(100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.5, 0.75]);
+        let base = glyph_outline_transform(
+            100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.0, 0.0], 0.0,
+        );
+        let shifted = glyph_outline_transform(
+            100.0, 50.0, 0.0, 2.0, 3.0, 10.0, 12.0, 1.0, 1.0, [0.5, 0.75], 0.0,
+        );
         assert!((shifted.pos[0] - base.pos[0] - 0.5).abs() < 1e-5);
         assert!((shifted.pos[1] - base.pos[1] - 0.75).abs() < 1e-5);
     }
@@ -181,9 +199,9 @@ mod tests {
     #[test]
     fn subpixel_scales_with_glyph() {
         let base =
-            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.0, 0.0]);
+            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.0, 0.0], 0.0);
         let shifted =
-            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.5, 0.5]);
+            glyph_outline_transform(0.0, 0.0, 0.0, 0.0, 0.0, 8.0, 8.0, 2.0, 3.0, [0.5, 0.5], 0.0);
         assert!((shifted.pos[0] - base.pos[0] - 0.5 * 2.0).abs() < 1e-5);
         assert!((shifted.pos[1] - base.pos[1] - 0.5 * 3.0).abs() < 1e-5);
     }
@@ -193,10 +211,26 @@ mod tests {
     #[test]
     fn subpixel_rotates_with_glyph() {
         let rot = std::f32::consts::FRAC_PI_2;
-        let base = glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [0.0, 0.0]);
+        let base =
+            glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [0.0, 0.0], 0.0);
         let shifted =
-            glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [1.0, 0.0]);
+            glyph_outline_transform(0.0, 0.0, rot, 0.0, 0.0, 8.0, 8.0, 1.0, 1.0, [1.0, 0.0], 0.0);
         assert!((shifted.pos[0] - base.pos[0]).abs() < 1e-5, "x ~ unchanged at 90deg");
         assert!((shifted.pos[1] - base.pos[1] - 1.0).abs() < 1e-5, "x fraction maps to +y");
+    }
+
+    /// The faux-italic shear must leave `pos` (the pen-derived anchor) untouched
+    /// and only flow into `GlyphTransform.shear_x` — the baseline stays fixed.
+    #[test]
+    fn shear_flows_into_transform_without_moving_pos() {
+        let base = glyph_outline_transform(
+            100.0, 50.0, 0.3, 2.0, 3.0, 10.0, 12.0, 1.5, 0.8, [0.25, 0.5], 0.0,
+        );
+        let sheared = glyph_outline_transform(
+            100.0, 50.0, 0.3, 2.0, 3.0, 10.0, 12.0, 1.5, 0.8, [0.25, 0.5], 0.4,
+        );
+        assert_eq!(base.pos, sheared.pos, "shear must not move the pen anchor");
+        assert_eq!(sheared.shear_x, 0.4);
+        assert_eq!(base.shear_x, 0.0);
     }
 }
