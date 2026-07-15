@@ -27,6 +27,7 @@ pub(crate) enum EffectSpec {
     Gradient4(Gradient4EffectParams),
     Reflect(ReflectAxis),
     Shake(ShakeEffectParams),
+    Interference(InterferenceEffectParams),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +137,52 @@ pub(crate) struct DryMediaEffectParams {
     pub(crate) color: [u8; 4],
 }
 
+/// Sub-kind of the `interference` (помехи/glitch) post-effect. Every kind reads the full
+/// `InterferenceEffectParams` (the UI serializes all keys); only the fields relevant to the
+/// selected kind take effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterferenceKind {
+    /// Per-pixel static: modulates lightness (and optionally alpha) of existing pixels.
+    WhiteNoise,
+    /// Horizontal band displacement with per-band RGB channel split (digital glitch).
+    Digital,
+    /// Chromatic aberration: R/B channels sampled offset along an angle.
+    RgbSplit,
+    /// Periodic darkened horizontal scanlines with optional per-line horizontal jitter.
+    Scanlines,
+}
+
+/// Parameters of the `interference` post-effect. Holds the fields of all four sub-kinds; the
+/// active `kind` selects which subset the renderer applies. Seed-stable: a given `seed`
+/// reproduces the same output.
+#[derive(Debug, Clone)]
+pub(crate) struct InterferenceEffectParams {
+    pub(crate) kind: InterferenceKind,
+    pub(crate) seed: u64,
+    // white_noise
+    pub(crate) amount: f32,
+    pub(crate) scale_px: f32,
+    pub(crate) density: f32,
+    pub(crate) monochrome: bool,
+    pub(crate) alpha_noise: f32,
+    // digital
+    pub(crate) slice_height_px: i32,
+    pub(crate) height_jitter: f32,
+    pub(crate) max_shift_px: f32,
+    pub(crate) probability: f32,
+    pub(crate) rgb_split_px: f32,
+    pub(crate) autogrow: bool,
+    // rgb_split
+    pub(crate) offset_px: f32,
+    pub(crate) angle_deg: f32,
+    pub(crate) per_row_jitter: f32,
+    // scanlines
+    pub(crate) line_height_px: i32,
+    pub(crate) gap_px: i32,
+    pub(crate) darken: f32,
+    pub(crate) jitter_px: f32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GlowEffectParams {
     pub(crate) radius_px: f32,
@@ -237,6 +284,9 @@ pub(crate) fn parse_effects_json(effects_json: &str) -> Result<Vec<EffectSpec>, 
             "gradient4" => EffectSpec::Gradient4(parse_gradient4_effect_params(obj)?),
             "reflect" | "mirror" | "flip" => EffectSpec::Reflect(parse_reflect_axis(obj)?),
             "shake" => EffectSpec::Shake(parse_shake_effect_params(obj)?),
+            "interference" => {
+                EffectSpec::Interference(parse_interference_effect_params(obj)?)
+            }
             other => {
                 return Err(format!(
                     "effects[{idx}]: эффект '{other}' пока не поддержан"
@@ -646,6 +696,128 @@ fn parse_shake_effect_params(
     })
 }
 
+/// Parses the `interference` post-effect. Reads `kind` (defaulting to `white_noise`, with
+/// aliases; an unknown kind is a hard error — no silent fallback) and every sub-kind field,
+/// applying the documented defaults and ranges regardless of the selected kind.
+fn parse_interference_effect_params(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<InterferenceEffectParams, String> {
+    let kind = match obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
+    {
+        None => InterferenceKind::WhiteNoise,
+        Some(kind) => match kind.as_str() {
+            "white_noise" | "noise" => InterferenceKind::WhiteNoise,
+            "digital" | "glitch" | "slices" => InterferenceKind::Digital,
+            "rgb_split" | "chromatic" => InterferenceKind::RgbSplit,
+            "scanlines" | "scan_lines" => InterferenceKind::Scanlines,
+            other => {
+                return Err(format!(
+                    "interference.kind: неизвестное значение '{other}', ожидалось \
+                     white_noise/digital/rgb_split/scanlines"
+                ));
+            }
+        },
+    };
+
+    Ok(InterferenceEffectParams {
+        kind,
+        seed: parse_effect_u64(obj.get("seed"), "interference.seed", 1)?,
+        amount: parse_effect_f32_range(obj.get("amount"), "interference.amount", 0.5, 0.0, 1.0)?,
+        scale_px: parse_effect_f32_range(
+            obj.get("scale_px"),
+            "interference.scale_px",
+            1.0,
+            0.5,
+            64.0,
+        )?,
+        density: parse_effect_f32_range(obj.get("density"), "interference.density", 1.0, 0.0, 1.0)?,
+        monochrome: parse_effect_bool(obj.get("monochrome"), "interference.monochrome", true)?,
+        alpha_noise: parse_effect_f32_range(
+            obj.get("alpha_noise"),
+            "interference.alpha_noise",
+            0.0,
+            0.0,
+            1.0,
+        )?,
+        slice_height_px: parse_effect_i32(
+            obj.get("slice_height_px"),
+            "interference.slice_height_px",
+            8,
+            1,
+            256,
+        )?,
+        height_jitter: parse_effect_f32_range(
+            obj.get("height_jitter"),
+            "interference.height_jitter",
+            0.5,
+            0.0,
+            1.0,
+        )?,
+        max_shift_px: parse_effect_f32_range(
+            obj.get("max_shift_px"),
+            "interference.max_shift_px",
+            16.0,
+            0.0,
+            512.0,
+        )?,
+        probability: parse_effect_f32_range(
+            obj.get("probability"),
+            "interference.probability",
+            0.4,
+            0.0,
+            1.0,
+        )?,
+        rgb_split_px: parse_effect_f32_range(
+            obj.get("rgb_split_px"),
+            "interference.rgb_split_px",
+            4.0,
+            0.0,
+            64.0,
+        )?,
+        autogrow: parse_effect_bool(obj.get("autogrow"), "interference.autogrow", true)?,
+        offset_px: parse_effect_f32_range(
+            obj.get("offset_px"),
+            "interference.offset_px",
+            3.0,
+            0.0,
+            64.0,
+        )?,
+        angle_deg: parse_effect_f32_range(
+            obj.get("angle_deg"),
+            "interference.angle_deg",
+            0.0,
+            -3600.0,
+            3600.0,
+        )?,
+        per_row_jitter: parse_effect_f32_range(
+            obj.get("per_row_jitter"),
+            "interference.per_row_jitter",
+            0.0,
+            0.0,
+            1.0,
+        )?,
+        line_height_px: parse_effect_i32(
+            obj.get("line_height_px"),
+            "interference.line_height_px",
+            2,
+            1,
+            64,
+        )?,
+        gap_px: parse_effect_i32(obj.get("gap_px"), "interference.gap_px", 2, 1, 64)?,
+        darken: parse_effect_f32_range(obj.get("darken"), "interference.darken", 0.35, 0.0, 1.0)?,
+        jitter_px: parse_effect_f32_range(
+            obj.get("jitter_px"),
+            "interference.jitter_px",
+            0.0,
+            0.0,
+            32.0,
+        )?,
+    })
+}
+
 fn parse_glow_effect_params(
     obj: &serde_json::Map<String, Value>,
 ) -> Result<GlowEffectParams, String> {
@@ -1021,17 +1193,48 @@ fn parse_effect_f32_range(
     Ok((raw as f32).clamp(min, max))
 }
 
+/// Parses an optional `u64` effect field (seeds), preserving all 64 bits.
+///
+/// Missing value -> `default`. JSON integers within `0..=u64::MAX` take the exact
+/// `as_u64` path (no `f64` round-trip, which would corrupt seeds above 2^53). Other
+/// JSON numbers (floats like `5.0`, negatives, integers above `u64::MAX` which
+/// serde_json stores as `f64`) are accepted only when finite, integral, and strictly
+/// below 2^64; anything else is a typed error (no rounding, no saturation).
 fn parse_effect_u64(value: Option<&Value>, label: &str, default: u64) -> Result<u64, String> {
     let Some(value) = value else {
         return Ok(default);
     };
+    // Exact path: serde_json keeps JSON integers up to u64::MAX losslessly.
+    if let Some(raw) = value.as_u64() {
+        return Ok(raw);
+    }
     let Some(raw) = value.as_f64() else {
         return Err(format!("{label} должен быть числом"));
     };
-    if !raw.is_finite() || raw < 0.0 || raw > u64::MAX as f64 {
-        return Err(format!("{label} должен быть в диапазоне 0..u64::MAX"));
+    // 2^64 exactly; `u64::MAX as f64` rounds UP to this same value, so the bound must be
+    // exclusive or u64::MAX + 1 would saturate instead of erroring.
+    const U64_RANGE_END: f64 = 18_446_744_073_709_551_616.0;
+    // The range check also rejects NaN and both infinities (contains is false for them).
+    if !(0.0..U64_RANGE_END).contains(&raw) || raw.fract() != 0.0 {
+        return Err(format!(
+            "{label} должен быть целым числом в диапазоне 0..=u64::MAX"
+        ));
     }
-    Ok(raw.round() as u64)
+    // Safe cast: raw is a non-negative integral f64 strictly below 2^64, so every such
+    // value is exactly representable in u64 (f64 integrals below 2^64 have <= 64 bits).
+    Ok(raw as u64)
+}
+
+/// Parses an optional boolean effect field: missing -> `default`, a JSON bool -> its
+/// value, any other type -> a typed error naming `label` (a malformed value like the
+/// string `"false"` must not silently become the default).
+fn parse_effect_bool(value: Option<&Value>, label: &str, default: bool) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{label} должен быть булевым значением"))
 }
 
 fn parse_effect_color(value: Option<&Value>) -> Result<Option<[u8; 4]>, String> {
@@ -1086,4 +1289,165 @@ fn value_to_u8(value: &Value, label: &str) -> Result<u8, String> {
         return Err(format!("{label} должен быть в диапазоне 0..255"));
     }
     Ok(raw.round() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EffectSpec, InterferenceKind, parse_effects_json};
+
+    /// Extracts the single `Interference` params from a one-effect JSON array.
+    ///
+    /// Test-only helper: the fixture invariant is "this JSON parses to exactly one
+    /// Interference effect", so any deviation panics with a diagnostic — the panic IS
+    /// the test failure, not swallowed error handling.
+    fn parse_single_interference(json: &str) -> super::InterferenceEffectParams {
+        let effects = match parse_effects_json(json) {
+            Ok(effects) => effects,
+            Err(error) => panic!("fixture json must parse: {error}"),
+        };
+        assert_eq!(effects.len(), 1, "fixture must contain exactly one effect");
+        match effects.into_iter().next() {
+            Some(EffectSpec::Interference(params)) => params,
+            other => panic!("fixture must parse to Interference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interference_defaults_when_only_name_present() {
+        let params = parse_single_interference(r#"[{"effect":"interference"}]"#);
+        assert_eq!(params.kind, InterferenceKind::WhiteNoise);
+        assert_eq!(params.seed, 1);
+        assert!((params.amount - 0.5).abs() < 1e-6);
+        assert!((params.scale_px - 1.0).abs() < 1e-6);
+        assert!((params.density - 1.0).abs() < 1e-6);
+        assert!(params.monochrome);
+        assert!((params.alpha_noise - 0.0).abs() < 1e-6);
+        assert_eq!(params.slice_height_px, 8);
+        assert!((params.max_shift_px - 16.0).abs() < 1e-6);
+        assert!((params.probability - 0.4).abs() < 1e-6);
+        assert!(params.autogrow);
+        assert!((params.offset_px - 3.0).abs() < 1e-6);
+        assert!((params.angle_deg - 0.0).abs() < 1e-6);
+        assert_eq!(params.line_height_px, 2);
+        assert_eq!(params.gap_px, 2);
+        assert!((params.darken - 0.35).abs() < 1e-6);
+        assert!((params.jitter_px - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interference_kind_aliases_resolve() {
+        for (alias, expected) in [
+            ("white_noise", InterferenceKind::WhiteNoise),
+            ("noise", InterferenceKind::WhiteNoise),
+            ("digital", InterferenceKind::Digital),
+            ("glitch", InterferenceKind::Digital),
+            ("slices", InterferenceKind::Digital),
+            ("rgb_split", InterferenceKind::RgbSplit),
+            ("chromatic", InterferenceKind::RgbSplit),
+            ("scanlines", InterferenceKind::Scanlines),
+            ("scan_lines", InterferenceKind::Scanlines),
+        ] {
+            let json = format!(r#"[{{"effect":"interference","kind":"{alias}"}}]"#);
+            let params = parse_single_interference(&json);
+            assert_eq!(params.kind, expected, "alias '{alias}' mismatch");
+        }
+    }
+
+    #[test]
+    fn interference_kind_is_case_insensitive_and_trimmed() {
+        let params = parse_single_interference(r#"[{"effect":"interference","kind":"  Digital "}]"#);
+        assert_eq!(params.kind, InterferenceKind::Digital);
+    }
+
+    #[test]
+    fn interference_unknown_kind_is_error() {
+        let err = parse_effects_json(r#"[{"effect":"interference","kind":"plasma"}]"#)
+            .expect_err("unknown kind must error");
+        assert!(err.contains("interference.kind"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn interference_out_of_range_field_is_error() {
+        // amount range is 0..1; 5.0 is out of range and must be rejected (no silent clamp).
+        let err = parse_effects_json(r#"[{"effect":"interference","amount":5.0}]"#)
+            .expect_err("out-of-range amount must error");
+        assert!(err.contains("interference.amount"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn interference_malformed_bool_is_error() {
+        // A string "false" must NOT silently fall back to the default (true).
+        let err = parse_effects_json(r#"[{"effect":"interference","monochrome":"false"}]"#)
+            .expect_err("string monochrome must error");
+        assert!(
+            err.contains("interference.monochrome"),
+            "unexpected error: {err}"
+        );
+
+        let err = parse_effects_json(r#"[{"effect":"interference","autogrow":1}]"#)
+            .expect_err("numeric autogrow must error");
+        assert!(
+            err.contains("interference.autogrow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn effect_seed_preserves_full_u64_precision() {
+        // 2^53 + 1: the first integer an f64 round-trip corrupts.
+        let params =
+            parse_single_interference(r#"[{"effect":"interference","seed":9007199254740993}]"#);
+        assert_eq!(params.seed, 9_007_199_254_740_993);
+
+        // u64::MAX must round-trip exactly.
+        let params = parse_single_interference(
+            r#"[{"effect":"interference","seed":18446744073709551615}]"#,
+        );
+        assert_eq!(params.seed, u64::MAX);
+    }
+
+    #[test]
+    fn effect_seed_rejects_overflow_negative_and_fractional() {
+        // u64::MAX + 1 must be a hard error, not a saturation to u64::MAX.
+        let err =
+            parse_effects_json(r#"[{"effect":"interference","seed":18446744073709551616}]"#)
+                .expect_err("u64::MAX + 1 must error");
+        assert!(err.contains("interference.seed"), "unexpected error: {err}");
+
+        let err = parse_effects_json(r#"[{"effect":"interference","seed":-1}]"#)
+            .expect_err("negative seed must error");
+        assert!(err.contains("interference.seed"), "unexpected error: {err}");
+
+        let err = parse_effects_json(r#"[{"effect":"interference","seed":1.5}]"#)
+            .expect_err("fractional seed must error");
+        assert!(err.contains("interference.seed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn effect_seed_accepts_integral_float() {
+        // `5.0` is stored by serde_json as f64; integral floats stay accepted.
+        let params = parse_single_interference(r#"[{"effect":"interference","seed":5.0}]"#);
+        assert_eq!(params.seed, 5);
+    }
+
+    #[test]
+    fn interference_parses_all_fields() {
+        let json = r#"[{
+            "effect":"interference","kind":"digital","seed":42,
+            "amount":0.25,"scale_px":4.0,"density":0.7,"monochrome":false,"alpha_noise":0.5,
+            "slice_height_px":12,"height_jitter":0.8,"max_shift_px":20.0,"probability":0.9,
+            "rgb_split_px":6.0,"autogrow":false,
+            "offset_px":5.0,"angle_deg":45.0,"per_row_jitter":0.5,
+            "line_height_px":3,"gap_px":4,"darken":0.6,"jitter_px":8.0
+        }]"#;
+        let params = parse_single_interference(json);
+        assert_eq!(params.kind, InterferenceKind::Digital);
+        assert_eq!(params.seed, 42);
+        assert!(!params.monochrome);
+        assert_eq!(params.slice_height_px, 12);
+        assert!(!params.autogrow);
+        assert!((params.angle_deg - 45.0).abs() < 1e-6);
+        assert_eq!(params.gap_px, 4);
+        assert!((params.jitter_px - 8.0).abs() < 1e-6);
+    }
 }

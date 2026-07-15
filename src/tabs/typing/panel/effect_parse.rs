@@ -286,6 +286,60 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                     ),
                 }))
             }
+            "interference" => out.push(EffectCard::Interference(InterferenceEffectCard {
+                kind: match obj
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    // Mirror the renderer's kind aliases (ms-text-render effects/parse.rs)
+                    // so externally authored JSON keeps its kind when edited in the UI.
+                    "digital" | "glitch" | "slices" => InterferenceKind::Digital,
+                    "rgb_split" | "chromatic" => InterferenceKind::RgbSplit,
+                    "scanlines" | "scan_lines" => InterferenceKind::Scanlines,
+                    _ => InterferenceKind::WhiteNoise,
+                },
+                seed: obj
+                    .get("seed")
+                    .and_then(value_as_u64)
+                    .unwrap_or_else(random_seed),
+                amount: obj.get("amount").and_then(value_as_f32).unwrap_or(0.5).clamp(0.0, 1.0),
+                scale_px: obj.get("scale_px").and_then(value_as_f32).unwrap_or(1.0).clamp(0.5, 64.0),
+                density: obj.get("density").and_then(value_as_f32).unwrap_or(1.0).clamp(0.0, 1.0),
+                monochrome: obj.get("monochrome").and_then(Value::as_bool).unwrap_or(true),
+                alpha_noise: obj.get("alpha_noise").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 1.0),
+                slice_height_px: obj
+                    .get("slice_height_px")
+                    .and_then(value_as_u64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(8)
+                    .clamp(1, 256),
+                height_jitter: obj.get("height_jitter").and_then(value_as_f32).unwrap_or(0.5).clamp(0.0, 1.0),
+                max_shift_px: obj.get("max_shift_px").and_then(value_as_f32).unwrap_or(16.0).clamp(0.0, 512.0),
+                probability: obj.get("probability").and_then(value_as_f32).unwrap_or(0.4).clamp(0.0, 1.0),
+                rgb_split_px: obj.get("rgb_split_px").and_then(value_as_f32).unwrap_or(4.0).clamp(0.0, 64.0),
+                autogrow: obj.get("autogrow").and_then(Value::as_bool).unwrap_or(true),
+                offset_px: obj.get("offset_px").and_then(value_as_f32).unwrap_or(3.0).clamp(0.0, 64.0),
+                angle_deg: obj.get("angle_deg").and_then(value_as_f32).unwrap_or(0.0).clamp(-3_600.0, 3_600.0),
+                per_row_jitter: obj.get("per_row_jitter").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 1.0),
+                line_height_px: obj
+                    .get("line_height_px")
+                    .and_then(value_as_u64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(2)
+                    .clamp(1, 64),
+                gap_px: obj
+                    .get("gap_px")
+                    .and_then(value_as_u64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(2)
+                    .clamp(1, 64),
+                darken: obj.get("darken").and_then(value_as_f32).unwrap_or(0.35).clamp(0.0, 1.0),
+                jitter_px: obj.get("jitter_px").and_then(value_as_f32).unwrap_or(0.0).clamp(0.0, 32.0),
+            })),
             "glow_v1" | "glow_v2" => out.push(EffectCard::Glow(GlowEffectCard {
                 version: if kind == "glow_v2" {
                     GlowEffectVersion::V2

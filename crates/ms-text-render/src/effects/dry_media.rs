@@ -14,7 +14,8 @@ use super::super::raster::blend_pixel_over;
 use super::super::types::RenderedTextImage;
 use super::image_ops::{
     average_opaque_rgba, blend_full_image_over, draw_image_with_opacity,
-    euclidean_distance_transform_to_mask, gaussian_blur_alpha_in_place,
+    euclidean_distance_transform_to_mask, gaussian_blur_alpha_in_place, smoothstep01,
+    value_noise_signed,
 };
 use super::parse::{DryMediaEffectMaterial, DryMediaEffectParams};
 use rayon::prelude::*;
@@ -347,58 +348,16 @@ fn dry_media_stripe_factor(
     (phase.sin() * 0.5 + 0.5).clamp(0.0, 1.0)
 }
 
-fn value_noise_signed(seed: u64, x: f32, y: f32, scale_px: f32) -> f32 {
-    let scale_px = scale_px.max(0.001);
-    let sample_x = x / scale_px;
-    let sample_y = y / scale_px;
-    let x0 = sample_x.floor();
-    let y0 = sample_y.floor();
-    let tx = smoothstep01(sample_x - x0);
-    let ty = smoothstep01(sample_y - y0);
-    let ix = x0 as i32;
-    let iy = y0 as i32;
-    let v00 = hash_noise_signed(seed, ix, iy);
-    let v10 = hash_noise_signed(seed, ix.saturating_add(1), iy);
-    let v01 = hash_noise_signed(seed, ix, iy.saturating_add(1));
-    let v11 = hash_noise_signed(seed, ix.saturating_add(1), iy.saturating_add(1));
-    let top = lerp_f32(v00, v10, tx);
-    let bottom = lerp_f32(v01, v11, tx);
-    lerp_f32(top, bottom, ty)
-}
-
-fn hash_noise_signed(seed: u64, x: i32, y: i32) -> f32 {
-    let mut value = seed
-        .wrapping_add(i32_to_u64_wrapping(x).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        .wrapping_add(i32_to_u64_wrapping(y).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^= value >> 31;
-    let unit = ((value >> 40) as f32) / ((1u64 << 24) as f32);
-    unit * 2.0 - 1.0
-}
-
-fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-fn i32_to_u64_wrapping(value: i32) -> u64 {
-    u64::from_ne_bytes(i64::from(value).to_ne_bytes())
-}
-
-fn smoothstep01(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::image_ops::{draw_image_with_opacity, euclidean_distance_transform_to_mask};
+    use super::super::image_ops::{
+        draw_image_with_opacity, euclidean_distance_transform_to_mask, smoothstep01,
+        value_noise_signed,
+    };
     use super::super::parse::{DryMediaEffectMaterial, DryMediaEffectParams};
     use super::{
         apply_dry_media_effect, dry_media_material_factors, dry_media_required_pad_px,
-        dry_media_stripe_factor, smoothstep01, value_noise_signed,
+        dry_media_stripe_factor,
     };
     use crate::types::RenderedTextImage;
 

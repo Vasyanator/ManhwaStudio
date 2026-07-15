@@ -14,7 +14,7 @@ Notes:
 - preprocess-эффекты работают до inline-style parsing и генерируют inline-теги;
 - общий image/math helper-слой лежит в `image_ops.rs`;
 - конкретные эффекты разнесены по модулям `stroke_shadow`, `blur`, `glow`,
-  `gradients`, `reflect_shake`, `dry_media`.
+  `gradients`, `reflect_shake`, `dry_media`, `interference`.
 */
 
 use super::types::RenderedTextImage;
@@ -28,12 +28,14 @@ mod dry_media;
 mod glow;
 mod gradients;
 mod image_ops;
+mod interference;
 mod parse;
 mod reflect_shake;
 mod stroke_shadow;
 
 use blur::{apply_blur_effect, apply_motion_blur_effect};
 use dry_media::apply_dry_media_effect;
+use interference::apply_interference_effect;
 use glow::{apply_glow_effect_v1, apply_glow_effect_v2, apply_soft_glow_effect};
 use gradients::{apply_gradient2_effect, apply_gradient4_effect};
 use parse::{
@@ -78,6 +80,7 @@ pub(crate) fn apply_effects_pipeline(
                 EffectSpec::Gradient4(_) => "gradient4",
                 EffectSpec::Reflect(_) => "reflect",
                 EffectSpec::Shake(_) => "shake",
+                EffectSpec::Interference(_) => "interference",
             };
             ms_log::trace_log!(cat::RENDER, "effect apply={}", name);
         }
@@ -95,6 +98,7 @@ pub(crate) fn apply_effects_pipeline(
             EffectSpec::Gradient4(params) => apply_gradient4_effect(image, &params),
             EffectSpec::Reflect(axis) => apply_reflect_effect(image, axis),
             EffectSpec::Shake(params) => apply_shake_effect(image, &params),
+            EffectSpec::Interference(params) => apply_interference_effect(image, &params),
         }
     }
 

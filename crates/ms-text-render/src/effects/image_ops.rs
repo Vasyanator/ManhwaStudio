@@ -619,6 +619,70 @@ pub(crate) fn average_opaque_rgba(rgba: &[u8]) -> [u8; 4] {
     ]
 }
 
+/// Deterministic value noise in `[-1, 1]`, bilinearly interpolated over an integer lattice.
+///
+/// `x`/`y` are pixel coordinates; `scale_px` is the lattice cell size in pixels (clamped to a
+/// small positive floor). At `scale_px == 1.0` the sample coordinates land exactly on lattice
+/// nodes (fractional part `0`), so the result collapses to the per-pixel hash
+/// [`hash_noise_signed`]; larger scales blend neighboring nodes into smooth grain. Seed-stable:
+/// identical `(seed, x, y, scale_px)` always yields the same value. Shared by `dry_media` grain
+/// and `interference` static so both use one tested noise implementation.
+pub(crate) fn value_noise_signed(seed: u64, x: f32, y: f32, scale_px: f32) -> f32 {
+    let scale_px = scale_px.max(0.001);
+    let sample_x = x / scale_px;
+    let sample_y = y / scale_px;
+    let x0 = sample_x.floor();
+    let y0 = sample_y.floor();
+    let tx = smoothstep01(sample_x - x0);
+    let ty = smoothstep01(sample_y - y0);
+    let ix = x0 as i32;
+    let iy = y0 as i32;
+    let v00 = hash_noise_signed(seed, ix, iy);
+    let v10 = hash_noise_signed(seed, ix.saturating_add(1), iy);
+    let v01 = hash_noise_signed(seed, ix, iy.saturating_add(1));
+    let v11 = hash_noise_signed(seed, ix.saturating_add(1), iy.saturating_add(1));
+    let top = lerp_f32(v00, v10, tx);
+    let bottom = lerp_f32(v01, v11, tx);
+    lerp_f32(top, bottom, ty)
+}
+
+/// Deterministic per-lattice-node hash mapped to `[-1, 1)`.
+///
+/// A splitmix64-style avalanche of `(seed, x, y)`; the top 24 bits form the unit mantissa, so
+/// the result is a stable pseudo-random value with no spatial correlation between adjacent
+/// nodes. Used directly for per-pixel / per-band / per-row decorrelated decisions and as the
+/// lattice sampler for [`value_noise_signed`]. Decorrelate independent features by adding
+/// distinct odd constants to `seed`.
+pub(crate) fn hash_noise_signed(seed: u64, x: i32, y: i32) -> f32 {
+    let mut value = seed
+        .wrapping_add(i32_to_u64_wrapping(x).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(i32_to_u64_wrapping(y).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^= value >> 31;
+    let unit = ((value >> 40) as f32) / ((1u64 << 24) as f32);
+    unit * 2.0 - 1.0
+}
+
+/// Linear interpolation `a + (b - a) * t`.
+pub(crate) fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Reinterprets an `i32` as a `u64` via sign-extension, for mixing signed coordinates into the
+/// hash without a value-changing numeric cast.
+pub(crate) fn i32_to_u64_wrapping(value: i32) -> u64 {
+    u64::from_ne_bytes(i64::from(value).to_ne_bytes())
+}
+
+/// Smoothstep on `[0, 1]`: `3x^2 - 2x^3`, with the input clamped to the unit interval.
+pub(crate) fn smoothstep01(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
 #[cfg(test)]
 #[must_use]
 pub(crate) fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) -> bool {

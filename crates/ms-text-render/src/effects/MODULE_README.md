@@ -59,7 +59,15 @@ max 0/255 for both the RGBA and alpha paths).
 - `gradients.rs`: two-color and four-corner gradient fills over the text alpha bounds.
 - `reflect_shake.rs`: axis reflection and shake-trail composition.
 - `dry_media.rs`: deterministic pencil/chalk texture erosion and dust/grain effects.
-- `image_ops.rs`: shared low-level image helpers used by multiple effects. The EDT comes in
+- `interference.rs`: deterministic interference (помехи/glitch) post-effect with four sub-kinds
+  (`white_noise` per-pixel static, `digital` band displacement + RGB split, `rgb_split`
+  chromatic aberration, `scanlines`). Every pass is a pure row gather from an immutable source
+  snapshot (parallel == sequential); growing kinds pad the canvas (digital/scanlines: horizontal;
+  rgb_split: all sides) and update `content_origin`. Shares the noise helpers in `image_ops.rs`.
+- `image_ops.rs`: shared low-level image helpers used by multiple effects. Also owns the shared
+  deterministic noise primitives (`hash_noise_signed` splitmix64 hash, `value_noise_signed`
+  bilinear value noise, `smoothstep01`, `lerp_f32`, `i32_to_u64_wrapping`) used by both
+  `dry_media` and `interference` so there is one tested noise implementation. The EDT comes in
   two forms: `euclidean_distance_transform_to_mask` (binary 0/1 seeding) is a thin wrapper over
   `euclidean_distance_transform_with_costs`, the Felzenszwalb-Huttenlocher transform evaluated
   in `f32` over an arbitrary squared-distance cost field (a valid seed cost is in
@@ -86,6 +94,11 @@ max 0/255 for both the RGBA and alpha paths).
 ## Editing map
 - To add or rename an effect, start in `parse.rs`, then route it in `mod.rs`, implement
   the image logic in a focused module, and add parser/image tests.
+- To change interference (помехи/glitch) behavior or add a sub-kind, edit `interference.rs`
+  (the sub-kind dispatch + `*_fill_row` kernels) and, for a new sub-kind, `InterferenceKind`
+  and its parsing in `parse.rs`.
+- To change the shared noise (grain/static) math, edit the noise helpers in `image_ops.rs`;
+  both `dry_media` and `interference` depend on them.
 - To change legacy JSON compatibility, edit `parse.rs` and update parent typing
   serialization only if the persisted contract changes.
 - To change blur, dilation, distance transform, blitting, or shared sampling behavior,

@@ -690,6 +690,7 @@ enum AvailableEffectKind {
     Blur,
     MotionBlur,
     DryMedia,
+    Interference,
     GlowV1,
     GlowV2,
     SoftGlow,
@@ -708,6 +709,7 @@ impl AvailableEffectKind {
             Self::Blur => t!("typing.effects.blur_title"),
             Self::MotionBlur => t!("typing.effects.motion_blur_title"),
             Self::DryMedia => t!("typing.effects.dry_media_title"),
+            Self::Interference => t!("typing.effects.interference_title"),
             Self::GlowV1 => t!("typing.effects.glow_v1_title"),
             Self::GlowV2 => t!("typing.effects.glow_v2_title"),
             Self::SoftGlow => t!("typing.effects.soft_glow_title"),
@@ -726,6 +728,7 @@ enum EffectCard {
     Blur(BlurEffectCard),
     MotionBlur(MotionBlurEffectCard),
     DryMedia(DryMediaEffectCard),
+    Interference(InterferenceEffectCard),
     Glow(GlowEffectCard),
     Gradient2(Gradient2EffectCard),
     Gradient4(Gradient4EffectCard),
@@ -739,7 +742,7 @@ impl EffectCard {
             Self::TextShake(_) => false,
             Self::Stroke(card) => card.color.eyedropper_active(),
             Self::Shadow(card) => card.color.eyedropper_active(),
-            Self::Blur(_) | Self::MotionBlur(_) => false,
+            Self::Blur(_) | Self::MotionBlur(_) | Self::Interference(_) => false,
             Self::DryMedia(card) => !card.use_source_color && card.color.eyedropper_active(),
             Self::Glow(card) => card.color.eyedropper_active(),
             Self::Gradient2(card) => {
@@ -763,7 +766,7 @@ impl EffectCard {
             Self::TextShake(_) => false,
             Self::Stroke(card) => card.color.eyedropper_consumed_primary_click_this_frame(),
             Self::Shadow(card) => card.color.eyedropper_consumed_primary_click_this_frame(),
-            Self::Blur(_) | Self::MotionBlur(_) => false,
+            Self::Blur(_) | Self::MotionBlur(_) | Self::Interference(_) => false,
             Self::DryMedia(card) => {
                 !card.use_source_color && card.color.eyedropper_consumed_primary_click_this_frame()
             }
@@ -931,6 +934,43 @@ struct DryMediaEffectCard {
     softness_px: f32,
     use_source_color: bool,
     color: ColorField,
+}
+
+/// Sub-type selector of the interference effect card; serialized as the
+/// JSON `kind` string (`white_noise`/`digital`/`rgb_split`/`scanlines`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterferenceKind {
+    WhiteNoise,
+    Digital,
+    RgbSplit,
+    Scanlines,
+}
+
+/// UI model of the "interference" (glitch/noise) effect. Holds the parameters
+/// of ALL kinds simultaneously so switching `kind` never loses values; every
+/// field is always serialized (see `effect_card_to_value`). Contract twin of
+/// `InterferenceEffectParams` in ms-text-render `effects/parse.rs`.
+struct InterferenceEffectCard {
+    kind: InterferenceKind,
+    seed: u64,
+    amount: f32,
+    scale_px: f32,
+    density: f32,
+    monochrome: bool,
+    alpha_noise: f32,
+    slice_height_px: i32,
+    height_jitter: f32,
+    max_shift_px: f32,
+    probability: f32,
+    rgb_split_px: f32,
+    autogrow: bool,
+    offset_px: f32,
+    angle_deg: f32,
+    per_row_jitter: f32,
+    line_height_px: i32,
+    gap_px: i32,
+    darken: f32,
+    jitter_px: f32,
 }
 
 struct GlowEffectCard {

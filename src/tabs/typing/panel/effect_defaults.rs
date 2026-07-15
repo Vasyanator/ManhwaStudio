@@ -43,13 +43,14 @@ use std::sync::{OnceLock, RwLock};
 const NEUTRAL_EDITOR_COLOR: Color32 = Color32::BLACK;
 
 /// Every effect kind, in the same order the "Добавить эффект" combo lists them.
-const ALL_EFFECT_KINDS: [AvailableEffectKind; 13] = [
+const ALL_EFFECT_KINDS: [AvailableEffectKind; 14] = [
     AvailableEffectKind::TextShake,
     AvailableEffectKind::Stroke,
     AvailableEffectKind::Shadow,
     AvailableEffectKind::Blur,
     AvailableEffectKind::MotionBlur,
     AvailableEffectKind::DryMedia,
+    AvailableEffectKind::Interference,
     AvailableEffectKind::GlowV1,
     AvailableEffectKind::GlowV2,
     AvailableEffectKind::SoftGlow,
@@ -71,6 +72,7 @@ pub(super) fn effect_kind_key(kind: AvailableEffectKind) -> &'static str {
         AvailableEffectKind::Blur => "blur",
         AvailableEffectKind::MotionBlur => "motion_blur",
         AvailableEffectKind::DryMedia => "dry_media",
+        AvailableEffectKind::Interference => "interference",
         AvailableEffectKind::GlowV1 => "glow_v1",
         AvailableEffectKind::GlowV2 => "glow_v2",
         AvailableEffectKind::SoftGlow => "soft_glow",
@@ -336,6 +338,7 @@ mod tests {
             AvailableEffectKind::SoftGlow,
             AvailableEffectKind::Shake,
             AvailableEffectKind::Blur,
+            AvailableEffectKind::Interference,
         ] {
             let card = TypingCreatePanelState::default_effect_card(kind, NEUTRAL_EDITOR_COLOR);
             let value = effect_card_to_value(&card);
@@ -349,6 +352,40 @@ mod tests {
                 "round-trip mismatch for {}",
                 effect_kind_key(kind)
             );
+        }
+    }
+
+    #[test]
+    fn interference_card_round_trips_all_parameters() {
+        let card = EffectCard::Interference(InterferenceEffectCard {
+            kind: InterferenceKind::Scanlines,
+            seed: 9_876_543_210,
+            amount: 0.13,
+            scale_px: 63.5,
+            density: 0.27,
+            monochrome: false,
+            alpha_noise: 0.91,
+            slice_height_px: 255,
+            height_jitter: 0.82,
+            max_shift_px: 511.5,
+            probability: 0.67,
+            rgb_split_px: 63.0,
+            autogrow: false,
+            offset_px: 62.5,
+            angle_deg: -3_599.0,
+            per_row_jitter: 0.76,
+            line_height_px: 63,
+            gap_px: 61,
+            darken: 0.24,
+            jitter_px: 31.5,
+        });
+        let value = effect_card_to_value(&card);
+        let reparsed = parse_effect_cards(std::slice::from_ref(&value), NEUTRAL_EDITOR_COLOR)
+            .into_iter()
+            .next();
+        assert!(reparsed.is_some(), "parse must reproduce the interference card");
+        if let Some(reparsed) = reparsed {
+            assert_eq!(effect_card_to_value(&reparsed), value);
         }
     }
 

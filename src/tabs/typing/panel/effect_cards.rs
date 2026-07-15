@@ -31,6 +31,7 @@ pub(super) fn effect_card_title(effect: &EffectCard) -> &'static str {
         EffectCard::Blur(_) => t!("typing.effects.blur_title"),
         EffectCard::MotionBlur(_) => t!("typing.effects.motion_blur_title"),
         EffectCard::DryMedia(_) => t!("typing.effects.dry_media_title"),
+        EffectCard::Interference(_) => t!("typing.effects.interference_title"),
         EffectCard::Glow(glow) => match glow.version {
             GlowEffectVersion::V1 => t!("typing.effects.glow_v1_title"),
             GlowEffectVersion::V2 => t!("typing.effects.glow_v2_title"),
@@ -120,6 +121,35 @@ pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
             "softness_px": dry_media.softness_px,
             "use_source_color": dry_media.use_source_color,
             "color": dry_media.color.rgba(),
+        }),
+        EffectCard::Interference(interference) => json!({
+            "effect": "interference",
+            "enabled": true,
+            "kind": match interference.kind {
+                InterferenceKind::WhiteNoise => "white_noise",
+                InterferenceKind::Digital => "digital",
+                InterferenceKind::RgbSplit => "rgb_split",
+                InterferenceKind::Scanlines => "scanlines",
+            },
+            "seed": interference.seed,
+            "amount": interference.amount,
+            "scale_px": interference.scale_px,
+            "density": interference.density,
+            "monochrome": interference.monochrome,
+            "alpha_noise": interference.alpha_noise,
+            "slice_height_px": interference.slice_height_px,
+            "height_jitter": interference.height_jitter,
+            "max_shift_px": interference.max_shift_px,
+            "probability": interference.probability,
+            "rgb_split_px": interference.rgb_split_px,
+            "autogrow": interference.autogrow,
+            "offset_px": interference.offset_px,
+            "angle_deg": interference.angle_deg,
+            "per_row_jitter": interference.per_row_jitter,
+            "line_height_px": interference.line_height_px,
+            "gap_px": interference.gap_px,
+            "darken": interference.darken,
+            "jitter_px": interference.jitter_px,
         }),
         EffectCard::Glow(glow) => match glow.version {
             GlowEffectVersion::V1 | GlowEffectVersion::V2 => json!({
@@ -440,6 +470,81 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
             ui.add_enabled_ui(!dry_media.use_source_color, |ui| {
                 changed |= dry_media.color.draw(ui, t!("typing.effects.color_label"));
             });
+        }
+        EffectCard::Interference(interference) => {
+            let mut kind_idx = match interference.kind {
+                InterferenceKind::WhiteNoise => 0,
+                InterferenceKind::Digital => 1,
+                InterferenceKind::RgbSplit => 2,
+                InterferenceKind::Scanlines => 3,
+            };
+            let kind_prev = kind_idx;
+            let kind_combo = WheelComboBox::from_label(t!("typing.effects.interference_kind_combo_id"))
+                .id_salt("typing.effects.interference_kind_combo_id")
+                .selected_text(match interference.kind {
+                    InterferenceKind::WhiteNoise => t!("typing.effects.interference_kind_white_noise"),
+                    InterferenceKind::Digital => t!("typing.effects.interference_kind_digital"),
+                    InterferenceKind::RgbSplit => t!("typing.effects.interference_kind_rgb_split"),
+                    InterferenceKind::Scanlines => t!("typing.effects.interference_kind_scanlines"),
+                })
+                .show_ui_with_wheel(ui, |ui| {
+                    if ui.selectable_label(kind_idx == 0, t!("typing.effects.interference_kind_white_noise")).clicked() {
+                        kind_idx = 0;
+                    }
+                    if ui.selectable_label(kind_idx == 1, t!("typing.effects.interference_kind_digital")).clicked() {
+                        kind_idx = 1;
+                    }
+                    if ui.selectable_label(kind_idx == 2, t!("typing.effects.interference_kind_rgb_split")).clicked() {
+                        kind_idx = 2;
+                    }
+                    if ui.selectable_label(kind_idx == 3, t!("typing.effects.interference_kind_scanlines")).clicked() {
+                        kind_idx = 3;
+                    }
+                });
+            if let Some(steps) = kind_combo.wheel_steps {
+                cycle_wrapped_index(&mut kind_idx, 4, steps);
+            }
+            changed |= kind_idx != kind_prev;
+            interference.kind = match kind_idx {
+                0 => InterferenceKind::WhiteNoise,
+                1 => InterferenceKind::Digital,
+                2 => InterferenceKind::RgbSplit,
+                3 => InterferenceKind::Scanlines,
+                _ => InterferenceKind::WhiteNoise,
+            };
+
+            match interference.kind {
+                InterferenceKind::WhiteNoise => {
+                    changed |= ui.add(WheelSlider::new(&mut interference.amount, 0.0..=1.0).text(t!("typing.effects.interference_amount_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.scale_px, 0.5..=64.0).text(t!("typing.effects.interference_scale_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.density, 0.0..=1.0).text(t!("typing.effects.interference_density_label"))).changed();
+                    changed |= ui.checkbox(&mut interference.monochrome, t!("typing.effects.interference_monochrome_label")).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.alpha_noise, 0.0..=1.0).text(t!("typing.effects.interference_alpha_noise_label"))).changed();
+                }
+                InterferenceKind::Digital => {
+                    changed |= ui.add(WheelSlider::new(&mut interference.slice_height_px, 1..=256).text(t!("typing.effects.interference_slice_height_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.height_jitter, 0.0..=1.0).text(t!("typing.effects.interference_height_jitter_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.max_shift_px, 0.0..=512.0).text(t!("typing.effects.interference_max_shift_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.probability, 0.0..=1.0).text(t!("typing.effects.interference_probability_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.rgb_split_px, 0.0..=64.0).text(t!("typing.effects.interference_rgb_split_px_label"))).changed();
+                    changed |= ui.checkbox(&mut interference.autogrow, t!("typing.effects.interference_autogrow_label")).changed();
+                }
+                InterferenceKind::RgbSplit => {
+                    changed |= ui.add(WheelSlider::new(&mut interference.offset_px, 0.0..=64.0).text(t!("typing.effects.interference_offset_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.angle_deg, -3_600.0..=3_600.0).text(t!("typing.effects.interference_angle_deg_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.per_row_jitter, 0.0..=1.0).text(t!("typing.effects.interference_per_row_jitter_label"))).changed();
+                }
+                InterferenceKind::Scanlines => {
+                    changed |= ui.add(WheelSlider::new(&mut interference.line_height_px, 1..=64).text(t!("typing.effects.interference_line_height_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.gap_px, 1..=64).text(t!("typing.effects.interference_gap_px_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.darken, 0.0..=1.0).text(t!("typing.effects.interference_darken_label"))).changed();
+                    changed |= ui.add(WheelSlider::new(&mut interference.jitter_px, 0.0..=32.0).text(t!("typing.effects.interference_jitter_px_label"))).changed();
+                }
+            }
+            changed |= SeedSpinBox::new(&mut interference.seed)
+                .prefix(t!("typing.effects.interference_seed_label"))
+                .draw(ui)
+                .changed();
         }
         EffectCard::Glow(glow) => {
             changed |= ui
