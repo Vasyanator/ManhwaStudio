@@ -48,11 +48,24 @@ max 0/255 for both the RGBA and alpha paths).
 - `stroke_shadow.rs`: alpha-contour stroke and shadow layers with optional blur/source
   color behavior.
 - `blur.rs`: Gaussian blur and motion blur post-effects.
-- `glow.rs`: contour glow, soft glow, falloff, dilation, and distance-transform usage.
+- `glow.rs`: contour glow (`glow_v1`/`glow_v2`), soft glow, and falloff. Both contour
+  variants hold the glow-only alpha in `f32` end to end (no intermediate `u8` rounding) and
+  post-blur it with a small sigma (`glow_smoothing_sigma`, ~1px, clamped `[0.8, 2.0]`) before
+  compositing, so iso-distance plateaus no longer band; overlap and the color-alpha factor are
+  applied after the blur with a single final `u8` round, and the canvas is padded by the glow
+  reach plus the blur kernel half-width. `glow_v2` additionally seeds the EDT sub-pixel:
+  partial coverage becomes a `d0*d0` initial cost (`d0 = (0.5 - a/255).max(0.0)`) instead of a
+  binary 0/1 mask. `glow_v1` keeps its legacy integer disc-splat seeding (no sub-pixel EDT).
 - `gradients.rs`: two-color and four-corner gradient fills over the text alpha bounds.
 - `reflect_shake.rs`: axis reflection and shake-trail composition.
 - `dry_media.rs`: deterministic pencil/chalk texture erosion and dust/grain effects.
-- `image_ops.rs`: shared low-level image helpers used by multiple effects.
+- `image_ops.rs`: shared low-level image helpers used by multiple effects. The EDT comes in
+  two forms: `euclidean_distance_transform_to_mask` (binary 0/1 seeding) is a thin wrapper over
+  `euclidean_distance_transform_with_costs`, the Felzenszwalb-Huttenlocher transform evaluated
+  in `f32` over an arbitrary squared-distance cost field (a valid seed cost is in
+  `[0, EDT_COST_INF)`; anything else is normalized to the non-seed sentinel). Blur has a `u8`
+  form and an `f32` form (`gaussian_blur_alpha_f32_in_place`) for banding-free pre-composite
+  smoothing; `gaussian_blur_kernel_radius` gives the padding a caller needs for the blur tail.
 
 ## Contracts and invariants
 - Missing `effect_type` in JSON means a post-effect for backward compatibility.

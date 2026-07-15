@@ -80,6 +80,45 @@ pub(crate) fn gaussian_blur_alpha_in_place(alpha: &mut [u8], width: u32, height:
     separable_gaussian_blur_interleaved(alpha, width as usize, height as usize, 1, sigma);
 }
 
+/// Gaussian-blurs a single-channel `f32` alpha field in place using the separable kernel.
+///
+/// Same kernel construction and replicate (clamp-to-edge) handling as
+/// `gaussian_blur_alpha_in_place`, but the data stays in `f32` end to end: there is no
+/// intermediate or final quantization to `u8`. Callers that must blur a pre-composite
+/// glow/alpha field without introducing banding blur here and round to `u8` only once,
+/// at composite time. Determinism and the parallel/sequential equivalence hold because
+/// every output element is a pure function of the immutable input.
+pub(crate) fn gaussian_blur_alpha_f32_in_place(
+    alpha: &mut [f32],
+    width: u32,
+    height: u32,
+    sigma: f32,
+) {
+    if sigma <= f32::EPSILON || width == 0 || height == 0 {
+        return;
+    }
+    let expected_len = width as usize * height as usize;
+    if alpha.len() != expected_len {
+        return;
+    }
+    separable_gaussian_blur_f32(alpha, width as usize, height as usize, sigma);
+}
+
+/// Half-width, in pixels, of the separable Gaussian kernel used for `sigma`.
+///
+/// A caller that blurs a padded canvas must expand its padding by this many pixels so the
+/// blur tail is not clipped at the canvas rim. Returns `0` for a non-positive `sigma`
+/// (no blur is applied there). The `usize -> u32` conversion saturates, so a required
+/// padding can never be silently dropped to zero; production glow sigmas (clamped <= 2.0)
+/// yield single-digit radii, far from the saturation point.
+#[must_use]
+pub(crate) fn gaussian_blur_kernel_radius(sigma: f32) -> u32 {
+    if sigma <= f32::EPSILON {
+        return 0;
+    }
+    u32::try_from(image_kernel_size_from_sigma(sigma) / 2).unwrap_or(u32::MAX)
+}
+
 /// Derives the odd 1D kernel size for `sigma`, identical to image 0.25's
 /// `GaussianBlurParameters::kernel_size_from_sigma`.
 ///
@@ -188,6 +227,53 @@ fn separable_gaussian_blur_interleaved(
                     // image rounds half-away-from-zero via f32::round, then casts to u8.
                     out_row[x * channels + c] = acc.round().clamp(0.0, 255.0) as u8;
                 }
+            }
+        });
+}
+
+/// Runs a separable Gaussian blur over a single-channel `f32` buffer in place.
+///
+/// Identical kernel and replicate-edge handling to `separable_gaussian_blur_interleaved`
+/// (channels = 1) but keeps full `f32` precision throughout: the horizontal pass writes an
+/// `f32` scratch, the vertical pass reads it and writes back into `buffer` with no rounding
+/// or clamping. Both passes are parallelized over rows and read from an immutable source, so
+/// the result is deterministic and bit-identical between the parallel and a sequential pass.
+fn separable_gaussian_blur_f32(buffer: &mut [f32], width: usize, height: usize, sigma: f32) {
+    let kernel = gaussian_kernel_1d(sigma);
+    let radius = kernel.len() / 2;
+
+    // Horizontal pass: read `buffer`, write `f32` scratch.
+    let mut scratch = vec![0.0f32; buffer.len()];
+    scratch
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let in_row = &buffer[y * width..(y + 1) * width];
+            for (x, out_px) in out_row.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for (k, &w) in kernel.iter().enumerate() {
+                    let sx = (x as isize + k as isize - radius as isize)
+                        .clamp(0, width as isize - 1) as usize;
+                    acc += w * in_row[sx];
+                }
+                *out_px = acc;
+            }
+        });
+
+    // Vertical pass: read the immutable `scratch`, write `buffer`.
+    buffer
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            for (x, out_px) in out_row.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for (k, &w) in kernel.iter().enumerate() {
+                    let sy = (y as isize + k as isize - radius as isize)
+                        .clamp(0, height as isize - 1)
+                        as usize;
+                    acc += w * scratch[sy * width + x];
+                }
+                *out_px = acc;
             }
         });
 }
@@ -338,22 +424,91 @@ pub(crate) fn draw_image_with_opacity(
     }
 }
 
+/// Sentinel initial cost marking a non-seed pixel for the cost-seeded EDT.
+///
+/// A valid seed cost lies in `[0.0, EDT_COST_INF)`. Any other input — `>= EDT_COST_INF`,
+/// negative, infinite, or NaN — is treated as "no seed here"; pixels with no reachable
+/// seed keep this value in the output.
+pub(crate) const EDT_COST_INF: f32 = 1.0e15;
+
+/// Maps a caller-supplied EDT cost onto the valid seed range.
+///
+/// Values in `[0.0, EDT_COST_INF)` pass through unchanged; anything else (negative,
+/// `>= EDT_COST_INF`, infinite, or NaN — the range check rejects NaN) becomes the
+/// non-seed sentinel `EDT_COST_INF`.
+fn normalize_edt_cost(value: f32) -> f32 {
+    if (0.0..EDT_COST_INF).contains(&value) {
+        value
+    } else {
+        EDT_COST_INF
+    }
+}
+
+/// Felzenszwalb-Huttenlocher squared-distance transform of a binary mask.
+///
+/// Covered pixels (`mask[i] > 0`) are seeds at squared distance `0.0`; empty pixels are
+/// non-seeds. Returns each pixel's squared Euclidean distance (px²) to the nearest covered
+/// pixel; unreachable pixels keep `EDT_COST_INF`. Thin wrapper over
+/// `euclidean_distance_transform_with_costs` with `{0.0, EDT_COST_INF}` seeding; it also
+/// inherits that function's shape contract (`mask.len()` must equal `width * height`).
 pub(crate) fn euclidean_distance_transform_to_mask(
     mask: &[u8],
     width: usize,
     height: usize,
 ) -> Vec<f32> {
-    const INF: f32 = 1.0e15;
+    let costs: Vec<f32> = mask
+        .iter()
+        .map(|&m| if m > 0 { 0.0 } else { EDT_COST_INF })
+        .collect();
+    euclidean_distance_transform_with_costs(&costs, width, height)
+}
 
-    let mut tmp = vec![INF; width * height];
-    let mut dist2 = vec![INF; width * height];
+/// Felzenszwalb-Huttenlocher squared-distance transform, evaluated in `f32`, over an
+/// arbitrary squared-distance cost field.
+///
+/// `costs` is row-major, length `width * height`, in px² units: `0.0` is a fully-covered
+/// seed, a finite value in `(0.0, EDT_COST_INF)` is a sub-pixel seed whose squared edge
+/// distance is already known (e.g. `d0*d0` for a partially covered pixel), and any other
+/// value — `>= EDT_COST_INF`, negative, infinite, or NaN — is normalized to the non-seed
+/// sentinel. Returns, for each pixel, `min_p (dx*dx + dy*dy + costs[p])` — the squared
+/// Euclidean distance to the nearest seed, biased by that seed's own initial cost. Pixels
+/// with no reachable seed keep `EDT_COST_INF`. Runs in `O(width * height)`.
+///
+/// The lower-envelope algorithm is exact in real arithmetic and supports an arbitrary
+/// finite initial `f` naturally (the second pass already consumes finite squared distances
+/// from the first). Evaluating it in `f32` can shift envelope intersections by rounding at
+/// large magnitudes; at the px²-scale costs used by the effects in this module the error
+/// is negligible.
+///
+/// # Shape contract
+/// `width * height` must not overflow `usize` and `costs.len()` must equal it. Following
+/// this module's guard style (see the blur helpers), an invalid shape does not panic: the
+/// function returns an all-`EDT_COST_INF` buffer of the expected size, or an empty buffer
+/// when the size itself overflows.
+pub(crate) fn euclidean_distance_transform_with_costs(
+    costs: &[f32],
+    width: usize,
+    height: usize,
+) -> Vec<f32> {
+    const INF: f32 = EDT_COST_INF;
+
+    let Some(expected_len) = width.checked_mul(height) else {
+        // Dimension product overflows usize: no valid buffer shape exists.
+        return Vec::new();
+    };
+    if costs.len() != expected_len {
+        // Invalid shape: keep the documented output size, mark everything unreachable.
+        return vec![INF; expected_len];
+    }
+
+    let mut tmp = vec![INF; expected_len];
+    let mut dist2 = vec![INF; expected_len];
     let mut f = vec![0.0f32; width.max(height)];
     let mut d = vec![0.0f32; width.max(height)];
 
     for x in 0..width {
         for (y, fi) in f[..height].iter_mut().enumerate() {
-            let idx = y * width + x;
-            *fi = if mask[idx] > 0 { 0.0 } else { INF };
+            *fi = normalize_edt_cost(costs[y * width + x]);
         }
         edt_1d(f[..height].as_ref(), d[..height].as_mut(), INF);
         for y in 0..height {
@@ -376,7 +531,10 @@ fn edt_1d(f: &[f32], out: &mut [f32], inf: f32) {
     if n == 0 {
         return;
     }
-    if !f.iter().any(|&value| value < inf * 0.5) {
+    // Inputs are normalized upstream to [0, inf) for seeds and exactly `inf` for non-seeds
+    // (first-pass outputs are either `inf` exactly or a finite seed-derived value), so a
+    // strict `< inf` comparison identifies "this scanline has at least one seed" precisely.
+    if !f.iter().any(|&value| value < inf) {
         out.fill(inf);
         return;
     }
@@ -498,7 +656,8 @@ pub(crate) fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) 
 #[cfg(test)]
 mod tests {
     use super::{
-        blend_full_image_over, dilate_alpha_max_filter3, gaussian_blur_alpha_in_place,
+        EDT_COST_INF, blend_full_image_over, dilate_alpha_max_filter3,
+        euclidean_distance_transform_with_costs, gaussian_blur_alpha_in_place,
         gaussian_blur_rgba_in_place, image_has_alpha_on_edge, sample_rgba_premultiplied_bilinear,
     };
     use crate::raster::blend_pixel_over;
@@ -756,6 +915,160 @@ mod tests {
 
         assert!(!image_has_alpha_on_edge(&image, 0));
         assert!(image_has_alpha_on_edge(&image, 1));
+    }
+
+    /// Verifies the cost-seeded EDT against a brute-force `O(n^2 m^2)` reference on a small
+    /// grid mixing exact seeds (`0.0`), fractional sub-pixel seeds, and non-seeds (`INF`).
+    /// The lower-envelope algorithm is exact in real arithmetic; the tolerance absorbs the
+    /// f32 rounding of envelope intersections.
+    #[test]
+    fn edt_with_costs_matches_bruteforce() {
+        let width = 7usize;
+        let height = 5usize;
+        let inf = EDT_COST_INF;
+
+        // Seed field: a mix of exact and fractional sub-pixel seeds; everything else empty.
+        let mut costs = vec![inf; width * height];
+        costs[width + 1] = 0.0;
+        costs[3 * width + 5] = 0.25;
+        costs[4 * width + 2] = 0.16;
+        costs[6] = 0.09;
+
+        let got = euclidean_distance_transform_with_costs(&costs, width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let mut best = inf;
+                for sy in 0..height {
+                    for sx in 0..width {
+                        let c = costs[sy * width + sx];
+                        if c >= inf {
+                            continue;
+                        }
+                        let dx = x as f32 - sx as f32;
+                        let dy = y as f32 - sy as f32;
+                        let candidate = dx * dx + dy * dy + c;
+                        if candidate < best {
+                            best = candidate;
+                        }
+                    }
+                }
+                let g = got[y * width + x];
+                if best >= inf {
+                    assert!(
+                        g >= inf * 0.5,
+                        "pixel ({x},{y}) should be unreachable but got {g}"
+                    );
+                } else {
+                    assert!(
+                        (g - best).abs() <= 1e-2,
+                        "pixel ({x},{y}): EDT={g}, brute-force={best}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A single zero-cost seed must produce the plain squared Euclidean distance everywhere.
+    #[test]
+    fn edt_with_costs_single_zero_seed_is_squared_distance() {
+        let width = 6usize;
+        let height = 5usize;
+        let (sx, sy) = (2usize, 1usize);
+        let mut costs = vec![EDT_COST_INF; width * height];
+        costs[sy * width + sx] = 0.0;
+
+        let got = euclidean_distance_transform_with_costs(&costs, width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - sx as f32;
+                let dy = y as f32 - sy as f32;
+                let expected = dx * dx + dy * dy;
+                let g = got[y * width + x];
+                assert!(
+                    (g - expected).abs() <= 1e-3,
+                    "pixel ({x},{y}): EDT={g}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    /// A field with no seeds must keep every pixel at the unreachable sentinel.
+    #[test]
+    fn edt_with_costs_all_inf_stays_unreachable() {
+        let width = 5usize;
+        let height = 4usize;
+        let costs = vec![EDT_COST_INF; width * height];
+
+        let got = euclidean_distance_transform_with_costs(&costs, width, height);
+
+        assert!(got.iter().all(|&v| v >= EDT_COST_INF), "expected all-INF, got {got:?}");
+    }
+
+    /// A cost just below the sentinel is still a valid seed per the contract: the whole
+    /// grid must resolve as reachable (below `EDT_COST_INF`) with roughly that cost. This
+    /// guards the seed-detection threshold (a `< INF * 0.5` style check would misclassify
+    /// this field as all-INF).
+    #[test]
+    fn edt_with_costs_accepts_cost_just_below_sentinel() {
+        let width = 4usize;
+        let height = 3usize;
+        let near_inf_cost = EDT_COST_INF * 0.999;
+        let mut costs = vec![EDT_COST_INF; width * height];
+        costs[width + 1] = near_inf_cost;
+
+        let got = euclidean_distance_transform_with_costs(&costs, width, height);
+
+        for (idx, &v) in got.iter().enumerate() {
+            assert!(
+                v < EDT_COST_INF,
+                "pixel {idx} treated as unreachable despite a valid near-sentinel seed"
+            );
+            // The px^2-scale grid offsets vanish in f32 next to the huge seed cost.
+            assert!(
+                (v - near_inf_cost).abs() <= near_inf_cost * 1e-3,
+                "pixel {idx}: got {v}, expected ~{near_inf_cost}"
+            );
+        }
+    }
+
+    /// NaN and negative costs are invalid and must be normalized to non-seeds: the output
+    /// is driven solely by the remaining valid seed and contains no NaN.
+    #[test]
+    fn edt_with_costs_ignores_nan_and_negative_costs() {
+        let width = 5usize;
+        let height = 4usize;
+        let (sx, sy) = (4usize, 3usize);
+        let mut costs = vec![EDT_COST_INF; width * height];
+        costs[width + 1] = f32::NAN;
+        costs[2 * width + 3] = -5.0;
+        costs[sy * width + sx] = 0.0;
+
+        let got = euclidean_distance_transform_with_costs(&costs, width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - sx as f32;
+                let dy = y as f32 - sy as f32;
+                let expected = dx * dx + dy * dy;
+                let g = got[y * width + x];
+                assert!(!g.is_nan(), "pixel ({x},{y}) is NaN");
+                assert!(
+                    (g - expected).abs() <= 1e-3,
+                    "pixel ({x},{y}): EDT={g}, expected={expected} (only the 0.0 seed counts)"
+                );
+            }
+        }
+    }
+
+    /// A cost buffer whose length does not match `width * height` must not panic: the
+    /// documented guard returns an all-sentinel buffer of the expected size.
+    #[test]
+    fn edt_with_costs_rejects_mismatched_length() {
+        let got = euclidean_distance_transform_with_costs(&[0.0f32; 7], 4, 3);
+        assert_eq!(got.len(), 12);
+        assert!(got.iter().all(|&v| v >= EDT_COST_INF));
     }
 
     #[test]
