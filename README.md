@@ -4,7 +4,7 @@
 
 A simple mini-studio for translating manhwa on your own. It works well for less popular titles without complicated cleaning; complex titles are better left to teams working in Photoshop.
 
-Read more in the Wiki: https://github.com/Vasyanator/ManhwaStudio/tree/master/wiki — although the up-to-date version ships inside the program itself.
+> 📖 **The features are described in much more detail in the [Wiki](https://github.com/Vasyanator/ManhwaStudio/tree/master/wiki/en).** The most up-to-date version also ships inside the program itself.
 
 **For suggestions, questions, support and community, join the Discord server or Telegram**:
 - https://discord.gg/invite/mZjZszwDbH
