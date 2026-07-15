@@ -725,6 +725,16 @@ impl TypingTextOverlayLayer {
         if self.edit_render_latest_token.load(Ordering::Acquire) != result.token {
             return false;
         }
+        // While the layout editor is open on THIS text overlay, the rendered layer must FOLLOW the
+        // editor frame, not stay centered on its previous position. `result.size_px` (the actual
+        // rendered bitmap size) may differ from the optimistic frame-derived size set in
+        // `rerender_layout_editor_overlay`, so re-sync the center to the frame center here too — this
+        // is also the center that `transform_rec()` pushes into the shared doc below.
+        let layout_editor_frame_center = self
+            .layout_editor
+            .as_ref()
+            .filter(|editor| !result.is_image_effects && editor.overlay_idx == result.overlay_idx)
+            .map(|editor| editor.frame_page_rect.center());
         {
             let Some(overlay) = self.overlays.get_mut(result.overlay_idx) else {
                 return false;
@@ -746,6 +756,9 @@ impl TypingTextOverlayLayer {
             overlay.render_data_json = Some(result.render_data_json.clone());
             overlay.size_px = result.size_px;
             overlay.source_rgba = result.rgba.clone();
+            if let Some(center) = layout_editor_frame_center {
+                overlay.center_page_px = [center.x, center.y];
+            }
         }
         // Route a TEXT overlay's re-render (render_data + rendered image) to the shared doc, the
         // source of truth for text MODEL state, then re-project. Image-effect overlays are not doc

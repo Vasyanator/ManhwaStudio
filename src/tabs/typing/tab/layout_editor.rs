@@ -22,7 +22,20 @@ module's types and imports.
 
 use super::*;
 
-pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mut TypingLayoutEditorState) {
+/// Draws the layout editor's vector-lines side panel: the line list (select/add/remove) and the
+/// active line's params (corner smoothing, text direction, distance mode, flip).
+///
+/// Returns `true` when a discrete edit that changes the rendered layout happened this frame —
+/// a line was added/removed, or an active-line param settled (combo/checkbox change, or the
+/// smoothing slider on wheel-notch / drag release, NOT mid-drag). The caller re-renders the
+/// layer on `true`, mirroring the on-canvas frame-resize settle path. Selecting a different
+/// active line is NOT a layout change and does not request a re-render.
+#[must_use]
+pub(super) fn draw_layout_editor_vector_lines_tab(
+    ui: &mut egui::Ui,
+    editor: &mut TypingLayoutEditorState,
+) -> bool {
+    let mut needs_rerender = false;
     ensure_layout_editor_has_line(editor);
     ui.label(egui::RichText::new(t!("typing.layout_editor.lines_heading")).strong());
     ui.add_space(6.0);
@@ -67,6 +80,8 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
             }
             if let Some(idx) = remove_idx {
                 remove_layout_editor_line(editor, idx);
+                // Removing a line drops its text path from the layout -> re-render.
+                needs_rerender = true;
             }
             let plus_response = egui::Frame::default()
                 .fill(Color32::from_rgb(34, 35, 38))
@@ -104,47 +119,71 @@ pub(super) fn draw_layout_editor_vector_lines_tab(ui: &mut egui::Ui, editor: &mu
     ui.separator();
     ui.label(egui::RichText::new(t!("typing.layout_editor.line_params_heading")).strong());
     if let Some(line) = editor.lines.get_mut(editor.active_line_idx) {
-        ui.add(WheelSlider::new(&mut line.corner_smoothing_px, 0.0..=256.0).text(t!("typing.layout_editor.antialias_label")));
+        let smoothing = ui.add(
+            WheelSlider::new(&mut line.corner_smoothing_px, 0.0..=256.0)
+                .text(t!("typing.layout_editor.antialias_label")),
+        );
+        // Re-render on a wheel notch / drag release, not on every mid-drag frame, so a slow
+        // slider drag does not spawn a render job per frame (mirrors the frame-resize settle path).
+        if smoothing.drag_stopped() || (smoothing.changed() && !smoothing.dragged()) {
+            needs_rerender = true;
+        }
         // `egui::ComboBox` has no `id_salt()` builder; `new(id_salt, label)` sets a
         // stable, language-independent id while still showing the localized label.
+        let mut direction_changed = false;
         egui::ComboBox::new(
             "typing.layout_editor.text_direction_combo_id",
             t!("typing.layout_editor.text_direction_combo_id"),
         )
             .selected_text(vector_line_text_direction_label(line.text_direction))
             .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut line.text_direction,
-                    TextVectorLineTextDirection::LeftToRight,
-                    vector_line_text_direction_label(TextVectorLineTextDirection::LeftToRight),
-                );
-                ui.selectable_value(
-                    &mut line.text_direction,
-                    TextVectorLineTextDirection::RightToLeft,
-                    vector_line_text_direction_label(TextVectorLineTextDirection::RightToLeft),
-                );
+                direction_changed |= ui
+                    .selectable_value(
+                        &mut line.text_direction,
+                        TextVectorLineTextDirection::LeftToRight,
+                        vector_line_text_direction_label(TextVectorLineTextDirection::LeftToRight),
+                    )
+                    .changed();
+                direction_changed |= ui
+                    .selectable_value(
+                        &mut line.text_direction,
+                        TextVectorLineTextDirection::RightToLeft,
+                        vector_line_text_direction_label(TextVectorLineTextDirection::RightToLeft),
+                    )
+                    .changed();
             });
+        let mut distance_changed = false;
         egui::ComboBox::new(
             "typing.layout_editor.distance_mode_combo_id",
             t!("typing.layout_editor.distance_mode_combo_id"),
         )
             .selected_text(vector_line_distance_mode_label(line.distance_mode))
             .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut line.distance_mode,
-                    TextVectorLineDistanceMode::ByLineLength,
-                    vector_line_distance_mode_label(TextVectorLineDistanceMode::ByLineLength),
-                );
-                ui.selectable_value(
-                    &mut line.distance_mode,
-                    TextVectorLineDistanceMode::MinimumPreviousDistance,
-                    vector_line_distance_mode_label(
+                distance_changed |= ui
+                    .selectable_value(
+                        &mut line.distance_mode,
+                        TextVectorLineDistanceMode::ByLineLength,
+                        vector_line_distance_mode_label(TextVectorLineDistanceMode::ByLineLength),
+                    )
+                    .changed();
+                distance_changed |= ui
+                    .selectable_value(
+                        &mut line.distance_mode,
                         TextVectorLineDistanceMode::MinimumPreviousDistance,
-                    ),
-                );
+                        vector_line_distance_mode_label(
+                            TextVectorLineDistanceMode::MinimumPreviousDistance,
+                        ),
+                    )
+                    .changed();
             });
-        ui.checkbox(&mut line.flip_text, t!("typing.layout_editor.flip_text"));
+        let flip_changed = ui
+            .checkbox(&mut line.flip_text, t!("typing.layout_editor.flip_text"))
+            .changed();
+        if direction_changed || distance_changed || flip_changed {
+            needs_rerender = true;
+        }
     }
+    needs_rerender
 }
 
 pub(super) fn vector_line_text_direction_label(direction: TextVectorLineTextDirection) -> &'static str {

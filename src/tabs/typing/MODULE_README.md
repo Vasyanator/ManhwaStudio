@@ -402,6 +402,11 @@ saving, and export.
   `Value`, is loaded on edit and re-emitted on every render_data rebuild, and is decoded for
   the renderer via `codec::decode_vector_mesh_warp` (rejects malformed input -> `None`, never
   panics). The legacy `normalize_text_params_object` passes the key through unchanged.
+- Layout editor (`tab/panels.rs`): while the vector-line layout editor is open on a text overlay,
+  every re-render syncs the overlay's `center_page_px` to `frame_page_rect.center()` (in
+  `rerender_layout_editor_overlay` for the optimistic redraw and in `apply_edit_overlay_render_result`
+  for the doc-persisted result). The overlay quad is drawn `from_center_size`, so without this the
+  layer would grow/shrink about its STALE center and drift off the editor frame on a frame resize.
 - Deformation is represented by a high-resolution page-space mesh. Perspective, bend,
   frame, grid, and brush tools edit the shared mesh rather than storing separate tool
   parameters as persistent transform state.

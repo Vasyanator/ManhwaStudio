@@ -309,6 +309,8 @@ impl TypingTextOverlayLayer {
     /// Editing/Preview toggle, and — only in Editing — the "Векторные" vector-lines params
     /// (in a bounded scroll area) plus a "Прозрачность превью" slider bound to
     /// `TypingLayoutEditorState::preview_opacity`. The panel is widened in Editing to fit the params.
+    /// A settled line-param edit (smoothing / direction / distance mode / flip / add-remove line)
+    /// re-renders the layer via `rerender_layout_editor_overlay`, like an on-canvas frame resize.
     pub(super) fn draw_layout_editor_mode_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         let controls_rect =
             ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
@@ -323,6 +325,9 @@ impl TypingTextOverlayLayer {
         } else {
             TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX
         };
+        // Set by the vector-lines params sub-panel when a line param settles this frame; the layer
+        // is re-rendered after the panel closes (its `&mut self` borrow must end first).
+        let mut params_changed = false;
         egui::Area::new("typing_layout_editor_mode_panel".into())
             .order(egui::Order::Foreground)
             .movable(true)
@@ -389,7 +394,8 @@ impl TypingTextOverlayLayer {
                                 .max_height(360.0)
                                 .show(ui, |ui| {
                                     if let Some(editor) = self.layout_editor.as_mut() {
-                                        draw_layout_editor_vector_lines_tab(ui, editor);
+                                        params_changed |=
+                                            draw_layout_editor_vector_lines_tab(ui, editor);
                                     }
                                 });
                             ui.separator();
@@ -404,6 +410,12 @@ impl TypingTextOverlayLayer {
                         }
                     });
             });
+        // A settled line-param edit on the panel re-renders the layer, matching the on-canvas
+        // frame-resize / point-edit path. The `&mut self` borrow held by the panel above has
+        // ended here, so re-rendering (which also needs `&mut self`) is safe.
+        if params_changed {
+            self.rerender_layout_editor_overlay(ctx);
+        }
     }
 
     pub(super) fn begin_layout_editor_for_overlay(&mut self, overlay_idx: usize, image_rect: Rect, zoom: f32) {
@@ -504,9 +516,17 @@ impl TypingTextOverlayLayer {
     /// dimmed Editing-mode preview) reflects the new layout. No-op if the editor is closed or
     /// the overlay is not text. Called both when entering Preview and after a completed
     /// Editing-mode line/frame edit.
+    ///
+    /// While the editor is open the layer's `center_page_px` is synced to the frame center (here
+    /// and in `apply_edit_overlay_render_result`) so the resized layer follows the frame instead
+    /// of staying centered on its previous position.
     pub(super) fn rerender_layout_editor_overlay(&mut self, ctx: &egui::Context) {
-        let (overlay_idx, vector_layout) = match self.layout_editor.as_ref() {
-            Some(editor) => (editor.overlay_idx, vector_lines_layout_from_editor(editor)),
+        let (overlay_idx, vector_layout, frame_center) = match self.layout_editor.as_ref() {
+            Some(editor) => (
+                editor.overlay_idx,
+                vector_lines_layout_from_editor(editor),
+                editor.frame_page_rect.center(),
+            ),
             None => return,
         };
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
@@ -542,6 +562,13 @@ impl TypingTextOverlayLayer {
             usize::try_from(vector_layout.width_px).unwrap_or(usize::MAX),
             usize::try_from(vector_layout.height_px).unwrap_or(usize::MAX),
         ];
+        // While the layout editor is open, the layer must FOLLOW the editor frame instead of
+        // staying centered on its previous position. The on-canvas quad is rebuilt as
+        // `Rect::from_center_size(center_page_px, size_px)`, so a size change (frame resize, line
+        // edit, or Editing->Preview) that leaves `center_page_px` stale drifts the layer off the
+        // frame. Sync the center to the frame center here for the optimistic redraw; the authored
+        // center is pushed to the doc when the render result lands (`apply_edit_overlay_render_result`).
+        overlay.center_page_px = [frame_center.x, frame_center.y];
         self.edit_render_data_dirty = true;
         let edit_request = TypingEditOverlayRequest {
             token: 0,
