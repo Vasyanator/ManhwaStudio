@@ -348,22 +348,42 @@ impl TypingCreatePanelState {
                 changed,
                 block_hscroll_by_hovered_param,
             );
-            px_or_percent_param_row(
-                ui,
-                t!("typing.params.inline_offset_along_line_label"),
-                &mut offset.line,
-                PxOrPercentRowCfg {
-                    range: -300.0..=300.0,
-                    wheel_step: 1.0,
-                    font_size_px: inline_font_size_px,
-                },
-                changed,
-                block_hscroll_by_hovered_param,
+            // Смещение по линии — линейная концепция: строка показывается только
+            // для линейных раскладок (формула и кастомные векторные линии), как и
+            // «Размещение по линии». В остальных режимах значение сохраняется, но
+            // и сама строка, и её подпараметр скрыты.
+            let line_based_layout = matches!(
+                self.text_layout_mode,
+                TextLayoutMode::Formula | TextLayoutMode::CustomVectorLines
             );
+            if line_based_layout {
+                px_or_percent_param_row(
+                    ui,
+                    t!("typing.params.inline_offset_along_line_label"),
+                    &mut offset.line,
+                    PxOrPercentRowCfg {
+                        range: -300.0..=300.0,
+                        wheel_step: 1.0,
+                        font_size_px: inline_font_size_px,
+                    },
+                    changed,
+                    block_hscroll_by_hovered_param,
+                );
 
-            *changed |= ui
-                .checkbox(&mut offset.shift_following, t!("typing.params.inline_shift_following"))
-                .changed();
+                // «Сдвигать следующие символы» — подпараметр смещения по линии:
+                // группируется под отступ-линией (как параметры faux bold под
+                // чекбоксом) и появляется только при ненулевом смещении.
+                if offset.line.value != 0.0 {
+                    ui.indent(Id::new("typing_inline_shift_following"), |ui| {
+                        *changed |= ui
+                            .checkbox(
+                                &mut offset.shift_following,
+                                t!("typing.params.inline_shift_following"),
+                            )
+                            .changed();
+                    });
+                }
+            }
 
             let group_enabled = inline_style
                 .as_ref()
