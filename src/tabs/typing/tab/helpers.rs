@@ -314,24 +314,25 @@ pub(super) fn merge_loaded_overlays(
     touched
 }
 
-pub(super) fn next_created_overlay_file_name(text_images_dir: &Path, page_idx: usize) -> String {
-    let unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_millis())
-        .unwrap_or(0);
+/// Mints the in-session `file_name` handle for a newly created overlay, from its uid.
+///
+/// The name is `typing_overlay_p{page+1:04}_{uid}.png`. `uid` must be the overlay's own uid (a fresh
+/// v4 UUID from the create worker), which makes uniqueness STRUCTURAL — no filesystem probe, and no
+/// dependence on wall-clock resolution. (The previous shape stamped `unix_ms` and probed the dir to
+/// disambiguate; the probe could not do that job once the create path stopped writing a PNG under
+/// this name, since then nothing it looked for existed and two creates in one millisecond collided.)
+///
+/// This is a RUNTIME handle, not the overlay's persisted image name: the doc's text flush writes the
+/// rendered pixels under its own uid-keyed `ps_p{page:04}_{uid}_text.png`, and a reloaded overlay's
+/// `file_name` is rebuilt from the uid (`text_runtime_from_doc_node`). The only disk artifact keyed to
+/// this name is the `CustomRasterLines` `_layout.png` sibling.
+///
+/// The `typing_overlay_p{page:04}_` prefix is preserved: `page_ops` documents it as the typing overlay
+/// PNG shape in `text_images/`.
+#[must_use]
+pub(super) fn created_overlay_file_name(page_idx: usize, uid: &str) -> String {
     let page_token = page_idx.saturating_add(1);
-    for attempt in 0..10_000usize {
-        let suffix = if attempt == 0 {
-            String::new()
-        } else {
-            format!("_{attempt}")
-        };
-        let candidate = format!("typing_overlay_p{page_token:04}_{unix_ms}{suffix}.png");
-        if !text_images_dir.join(&candidate).exists() {
-            return candidate;
-        }
-    }
-    format!("typing_overlay_p{page_token:04}_{unix_ms}_fallback.png")
+    format!("typing_overlay_p{page_token:04}_{uid}.png")
 }
 
 pub(super) fn layout_image_file_name_for_overlay(file_name: &str) -> String {

@@ -122,7 +122,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use ms_thread as thread;
-use web_time::{SystemTime, UNIX_EPOCH};
 
 mod geometry;
 use geometry::{ctrl_wheel_raster_rotation_step_rad, lerp, normalize_angle_deg, normalize_angle_rad};
@@ -183,6 +182,15 @@ const LAYERS_PANEL_DEFAULT_ROWS: usize = 8;
 /// width and the per-width char budget so they stay consistent.
 const LAYERS_PANEL_ROW_OVERHEAD_PX: f32 = 116.0;
 const TEXT_EDITOR_STATUS_ERROR_SECONDS: f64 = 4.0;
+/// Seconds of no further text-layer edits before a deferred placement save is flushed anyway.
+///
+/// Edit writes are deferred to focus loss (selection / page / tab change), which is what stops a drag
+/// from writing every frame. This idle timer is the safety net for the case where focus is never lost:
+/// a user who edits one layer and then walks away (or whose process is killed) would otherwise have
+/// nothing in the `_unsaved` staging dir to recover from. Long enough that a continuous gesture keeps
+/// pushing the deadline out and writes once on settle; short enough to bound crash-recovery loss.
+/// Precedent: `canvas::TEXT_UPSERT_DEBOUNCE_SECS` (1.0) for bubble text.
+const PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS: f64 = 1.5;
 const TEXT_RENDER_DATA_FALLBACK_WIDTH_PX: u32 = 500;
 const TEXT_LAYOUT_IMAGE_SUFFIX: &str = "_layout";
 const TEXT_SHAPE_VARIANT_GRID_SIDE: usize = 3;
@@ -361,6 +369,131 @@ pub struct TypingTabState {
     save_busy: bool,
 }
 
+/// Why a deferred text-layer save was flushed. Diagnostics only — every reason performs the same
+/// write; the value exists so a `PERSIST` trace can attribute a write to the event that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypingSaveFlushReason {
+    /// The overlay/raster selection changed — a focus loss for the layer just edited.
+    SelectionChange,
+    /// The canvas's derived current page changed (continuous-scroll page crossing).
+    PageChange,
+    /// `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS` elapsed with no further edits.
+    Idle,
+    /// The user switched away from the Text tab.
+    TabLeave,
+    /// The user left the vector-line layout editor — a focus loss for the layer being edited there.
+    LayoutEditorExit,
+    /// The application is closing; the flush must land before the layer-saver barrier.
+    Exit,
+}
+
+impl TypingSaveFlushReason {
+    /// Stable, language-independent token for the `PERSIST` trace line (never user-facing).
+    #[must_use]
+    fn as_trace_str(self) -> &'static str {
+        match self {
+            Self::SelectionChange => "selection",
+            Self::PageChange => "page",
+            Self::Idle => "idle",
+            Self::TabLeave => "tab_leave",
+            Self::LayoutEditorExit => "layout_editor_exit",
+            Self::Exit => "exit",
+        }
+    }
+}
+
+/// Outcome of one placement-save DISPATCH attempt (`request_overlay_placement_save`).
+///
+/// The distinction is load-bearing for the deferred-save policy: a flush point may clear its dirty
+/// state ONLY once the write is genuinely owned by the save pipeline. `Started` and `Parked` both
+/// mean that (the parked request is re-fired by `poll_save_jobs` / `poll_edit_overlay_jobs` when the
+/// slot frees); `NotWired` means nothing was written and nothing will be, so the dirty state MUST
+/// survive for a later retry — clearing it there would make the edit look saved forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlacementSaveDispatch {
+    /// A save worker was spawned for the current state.
+    Started,
+    /// A save/create/edit render is in flight, so the request was recorded in
+    /// `save_requested_while_busy` and will be re-fired when that job completes.
+    Parked,
+    /// No staging `layers/` dir or no shared `LayerDoc` is wired: there is nowhere to write.
+    NotWired,
+}
+
+impl PlacementSaveDispatch {
+    /// Stable, language-independent token for the `PERSIST` trace line (never user-facing).
+    #[must_use]
+    fn as_trace_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Parked => "parked",
+            Self::NotWired => "not_wired",
+        }
+    }
+}
+
+/// Why a whole-doc text flush ([`TypingTabState::flush_text_layers`]) could not run AT ALL.
+///
+/// Distinguished from "ran and wrote nothing" (an `Ok` outcome with an empty owned set, which is the
+/// legitimate no-resident-pages case) so a caller can tell a real failure from a no-op: the deferred
+/// flush points keep their dirty state on `Err` instead of treating the edit as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TypingTextFlushError {
+    /// The tab has no staging `layers/` dir wired yet (no chapter loader started).
+    #[error("no staging layers dir is wired")]
+    NoLayersDir,
+    /// The tab has no shared `LayerDoc` wired (text has no store).
+    #[error("no shared layer document is wired")]
+    NoLayerDoc,
+    /// The shared `LayerDoc` mutex is poisoned — another thread panicked holding it.
+    #[error("the shared layer document lock is poisoned")]
+    DocLockPoisoned,
+}
+
+/// Result of a whole-doc text flush that RAN.
+///
+/// `owned_pages` keeps the exact contract the save-to-project merge depends on: the doc-resident
+/// pages whose text reached the saver, which the merge replaces wholesale (authoritative, including
+/// deletions), leaving committed text intact for every page NOT listed. `failed_pages` counts pages
+/// whose enqueue errored — they are deliberately absent from `owned_pages`, and their presence means
+/// the flush did not fully persist the live state, so a deferred edit must stay dirty.
+#[derive(Debug, Default, Clone)]
+pub struct TypingTextFlushOutcome {
+    /// Doc-resident pages successfully enqueued to the layer saver.
+    pub owned_pages: std::collections::HashSet<usize>,
+    /// Number of resident pages whose enqueue failed (already logged per page).
+    pub failed_pages: usize,
+}
+
+/// Pure per-frame core of the idle-debounce decision for a deferred text-layer save.
+///
+/// Given whether an unsaved edit exists, when the current idle window started, and the frame's app
+/// time, returns `(next_window_start, should_flush_now)`.
+///
+/// `window_start_s` is `None` both when nothing is dirty and when an edit was marked but has not yet
+/// been seen by a frame; in the latter case this frame seeds the window at `now_s`. That lazy seed is
+/// what lets `mark_placement_save_dirty` restart the window without a clock: a continuous drag re-marks
+/// every frame, so the window never accumulates and no write happens until the gesture settles.
+///
+/// Returns `should_flush_now` only once the window has been open for at least
+/// `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS`, and clears the window when it does (the flush resets state).
+#[must_use]
+fn placement_save_debounce_tick(
+    dirty: bool,
+    window_start_s: Option<f64>,
+    now_s: f64,
+) -> (Option<f64>, bool) {
+    if !dirty {
+        return (None, false);
+    }
+    let start = window_start_s.unwrap_or(now_s);
+    if now_s - start >= PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS {
+        (None, true)
+    } else {
+        (Some(start), false)
+    }
+}
+
 /// A to-folder/PSD export deferred until the whole-project page preload completes (Phase 2). Carries
 /// only the destination directory and format; the clip-mask snapshot is captured when the export
 /// actually runs, not when it is deferred, so it reflects the final mask state.
@@ -413,11 +546,70 @@ impl TypingTabState {
     }
 
     /// Flushes the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
-    /// legacy chapter that was only viewed still migrates its text on save-to-project. Returns the set
-    /// of OWNED text pages (doc-resident this session) for the save-to-project merge to treat as
-    /// authoritative; pages NOT in it keep their committed text. Delegates to the overlay layer.
-    pub fn flush_text_layers(&mut self) -> std::collections::HashSet<usize> {
+    /// legacy chapter that was only viewed still migrates its text on save-to-project.
+    ///
+    /// On success returns a [`TypingTextFlushOutcome`] whose `owned_pages` is the set of OWNED text
+    /// pages (doc-resident this session) for the save-to-project merge to treat as authoritative;
+    /// pages NOT in it keep their committed text.
+    ///
+    /// # Errors
+    /// Returns [`TypingTextFlushError`] when the flush could not run at all (no staging dir, no shared
+    /// doc, or a poisoned doc lock). That is distinct from an `Ok` outcome with an empty owned set,
+    /// which legitimately means "ran, no resident pages" — callers that defer writes rely on the
+    /// difference to decide whether the pending edit was actually persisted.
+    pub fn flush_text_layers(
+        &mut self,
+    ) -> Result<TypingTextFlushOutcome, TypingTextFlushError> {
         self.text_overlays.flush_text_layers()
+    }
+
+    /// Writes any DEFERRED text-layer edit, inline on the calling thread. A no-op when nothing is
+    /// pending, so it is cheap to call unconditionally.
+    ///
+    /// Text-layer edits are not written as they happen (that would write on every drag frame); they are
+    /// written at a focus-loss point. This is the flush for the two focus losses the tab cannot observe
+    /// itself, and `MangaApp` owns both:
+    /// - leaving the Text tab (`apply_shared_viewport_to_active_canvas`) — the tab stops being drawn,
+    ///   so its own per-frame flush points stop running;
+    /// - application exit (`on_exit`) — REQUIRED, and required BEFORE the layer-saver barrier: the
+    ///   barrier is the only thing that guarantees bytes on disk, and it cannot cover a write that has
+    ///   not been enqueued yet. This enqueues inline (never the detached placement-save worker, which
+    ///   would race the barrier), so the barrier that follows covers it.
+    ///
+    /// NOT to be called on the discard path (`start_exit_cleanup`): discarding deliberately drops the
+    /// staging dir, and flushing would write edits the user asked to throw away.
+    pub fn flush_text_layers_if_dirty(&mut self, reason: TypingSaveFlushReason) {
+        self.text_overlays.flush_text_layers_if_dirty(reason);
+    }
+
+    /// Whether a text-layer edit has been made but not yet written to the staging dir.
+    ///
+    /// Exists because deferral broke an inference `MangaApp::refresh_unsaved_changes_cache` used to be
+    /// able to make: it detects typing changes by the `_unsaved` staging dir EXISTING, which held while
+    /// every edit wrote immediately. A deferred edit is real unsaved work that has not touched the disk
+    /// yet, so the staging probe alone would miss it and the close dialog could be skipped for an edit
+    /// made seconds before closing. Reporting it here keeps that dialog honest.
+    ///
+    /// Conservative by design (it reports `save_requested_while_busy`, which a successful inline
+    /// `flush_text_layers` does not retire), so it may say "pending" for work that is in fact already
+    /// enqueued. That over-reporting is harmless for an unsaved-changes prompt, but it makes this
+    /// unusable as a post-flush "did everything land?" check. `MangaApp::start_page_op`, the other
+    /// caller, therefore reads it BEFORE its flush and only to answer "was there anything to lose?".
+    #[must_use]
+    pub fn has_pending_text_edits(&self) -> bool {
+        self.text_overlays.has_pending_placement_save()
+    }
+
+    /// DROPS every pending text-layer edit without writing it. For the DISCARD path only
+    /// (`MangaApp::start_exit_cleanup`), which deletes the `_unsaved` staging dir on purpose.
+    ///
+    /// Required, not cosmetic: discard shuts the layer saver down and deletes the staging dir, so any
+    /// surviving pending write would be re-dispatched afterwards — through the saver's SYNC fallback,
+    /// which re-creates the staging dir it just deleted and resurrects the edits the user discarded.
+    /// It would also keep `has_pending_text_edits` true, which re-latches the unsaved-changes cache and
+    /// re-opens the exit dialog, making discard-and-exit impossible.
+    pub fn discard_pending_text_edits(&mut self) {
+        self.text_overlays.discard_pending_placement_save();
     }
 
     pub fn set_canvas_scroll_area_id_salt(&mut self, id_salt: &'static str) {
@@ -627,6 +819,16 @@ impl TypingTabState {
         needs_repaint |= self.text_overlays.poll_vector_transform_base_render(ctx);
         needs_repaint |= self.text_overlays.poll_save_jobs(ctx);
         needs_repaint |= self.text_overlays.poll_export_jobs(ctx);
+        // Page-change flush point, driven once per frame and placed AFTER `poll_save_jobs`: that poll
+        // releases the in-flight save slot, so a flush decided here can dispatch immediately instead
+        // of parking in `save_requested_while_busy` for another frame.
+        //
+        // Page change is a focus loss on this continuous-scroll canvas. It runs after `poll_loader`
+        // (above) so a chapter load completing THIS frame re-seeds the page tracker rather than
+        // reading a page change across the chapter boundary. (The idle debounce is driven at the END
+        // of this fn — see there for why it may not run before `canvas.draw`.)
+        self.text_overlays
+            .flush_placement_save_on_page_change(self.canvas.current_page_idx());
         needs_repaint |= self.mask_layer.poll_loader(ctx);
         needs_repaint |= self.mask_layer.poll_save_jobs(ctx);
         needs_repaint |= self.mask_layer.poll_fill_jobs(ctx);
@@ -687,6 +889,17 @@ impl TypingTabState {
             hooks.text_overlays.clear_selection();
             needs_repaint = true;
         }
+
+        // Idle-debounce safety net for an edit that never loses focus, driven LAST — it MUST run after
+        // `canvas.draw`, because nearly every `mark_placement_save_dirty` lives inside `canvas.draw`'s
+        // callees (`draw_page`, `selection_rasters`, `vector_transform`). Driving it earlier observed a
+        // mark only on the NEXT frame, which broke the debounce in both directions: if frame N was the
+        // last frame drawn (a drag release, a context-menu action that requests no repaint), no
+        // `request_repaint_after` was ever armed and the write stranded until some unrelated
+        // interaction; and after a gesture the tick following the last mark only RE-SEEDED the window,
+        // so the flush landed at ~2x `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS` after two wakeups. Seeing the
+        // mark on the same frame restores the documented single 1.5 s window.
+        self.text_overlays.drive_placement_save_debounce(ctx);
 
         if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.is_panel_open() {
             ctx.request_repaint();
@@ -1831,6 +2044,31 @@ pub(super) struct TypingTextOverlayLayer {
     edit_render_latest_token: Arc<AtomicU64>,
     edit_render_next_token: u64,
     edit_render_data_dirty: bool,
+    /// An EDIT (placement/geometry/render-data) changed a text layer and has not been written yet.
+    ///
+    /// Edit writes are DEFERRED: marking this is the whole cost of an edit, and the actual
+    /// `request_overlay_placement_save` happens at a flush point (focus loss / page change / tab leave
+    /// / idle debounce / exit). This is what stops a drag from spawning a save worker every frame.
+    /// STRUCTURAL changes (deleting an overlay or raster, band reorder) do NOT use this — they save
+    /// eagerly, so a deletion can never be resurrected by a lost flush.
+    placement_save_dirty: bool,
+    /// App time (`ctx.input(|i| i.time)`) at which the CURRENT idle window opened, or `None` when
+    /// nothing is dirty or a fresh mark is still waiting for a frame to seed it.
+    ///
+    /// Not the timestamp of the marking edit: `mark_placement_save_dirty` resets this to `None` and the
+    /// next frame's `drive_placement_save_debounce` seeds it. That indirection keeps every edit site
+    /// clock-free (several run in poll paths with no frame context) while still restarting the window on
+    /// each edit — see `placement_save_debounce_tick`.
+    placement_save_dirty_since_s: Option<f64>,
+    /// Canvas page index observed on the previous frame, for page-change flush detection. `None` before
+    /// the first frame of a chapter (and reset to `None` on chapter load), so the first observation
+    /// SEEDS without flushing rather than firing against an uninitialized page.
+    last_page_idx: Option<usize>,
+    /// Raster selection `(page, idx)` observed at the last selection-change check, mirroring
+    /// `last_selected_overlay_idx` for the raster axis. Tracked so an overlay→raster switch (which
+    /// leaves `selected_overlay_idx` at `None` on both sides of the change in some orders) still
+    /// registers as a focus loss.
+    last_selected_raster: Option<(usize, usize)>,
     shape_variant_preview_next_id: u64,
     shape_variant_preview: Option<TypingShapeVariantPreviewState>,
     last_selected_overlay_idx: Option<usize>,
@@ -1994,6 +2232,10 @@ impl Default for TypingTextOverlayLayer {
             edit_render_latest_token: Arc::new(AtomicU64::new(0)),
             edit_render_next_token: 0,
             edit_render_data_dirty: false,
+            placement_save_dirty: false,
+            placement_save_dirty_since_s: None,
+            last_page_idx: None,
+            last_selected_raster: None,
             shape_variant_preview_next_id: 0,
             shape_variant_preview: None,
             last_selected_overlay_idx: None,

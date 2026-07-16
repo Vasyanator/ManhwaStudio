@@ -489,11 +489,13 @@ impl TypingTextOverlayLayer {
         self.drag_has_changes = false;
     }
 
+    /// Leaves the vector-line layout editor, writing any pending edit first.
+    ///
+    /// Leaving the editor IS a focus loss, so this stays an eager flush point. It goes through the
+    /// shared `flush_placement_save_if_dirty` so it clears BOTH dirty axes (a layout-editor session can
+    /// mark placement dirty as well as `edit_render_data_dirty`) rather than only the render-data one.
     pub(super) fn exit_layout_editor(&mut self) {
-        if self.edit_render_data_dirty {
-            self.request_overlay_placement_save();
-            self.edit_render_data_dirty = false;
-        }
+        self.flush_placement_save_if_dirty(TypingSaveFlushReason::LayoutEditorExit);
         self.layout_editor = None;
     }
 

@@ -39,5 +39,14 @@ pub(crate) use panel::seed_effect_defaults_from_config;
 // Startup seeding of the runtime-global imported-system-fonts store from user config.
 pub(crate) use panel::seed_imported_system_fonts_from_config;
 pub use tab::TypingTabState;
+// Reason tag for `TypingTabState::flush_text_layers_if_dirty`; `app.rs` names it at the tab-leave and
+// exit flush points.
+pub use tab::TypingSaveFlushReason;
+// Failure of `TypingTabState::flush_text_layers` — a flush that could not run at all, as opposed to
+// one that ran and owned no pages. `app.rs` names it: its page-op quiesce gate treats an unwired text
+// store (the Text tab was never opened) differently from a poisoned document lock.
+// `tab::TypingTextFlushOutcome` stays unexported: callers match the `Ok` value without naming it, and
+// an unused re-export is a warning.
+pub use tab::TypingTextFlushError;
 // Re-export the shared text-preview helper so other tabs (PS editor) reuse the same logic.
 pub(crate) use tab::text_preview_label;

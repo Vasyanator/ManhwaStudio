@@ -373,9 +373,72 @@ saving, and export.
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask
   flood fill, export, or auto-typing detection. Use worker threads and poll receivers
   from the frame loop.
-- Known structural-operation limitation: the detached `spawn_overlay_placement_save` writer has
-  no explicit quiescence handle. The layer-saver barrier covers shared-document writes, but a
-  placement worker already detached before a page operation cannot currently be joined directly.
+- **Text-layer EDIT writes are DEFERRED; STRUCTURAL writes stay EAGER.** An edit (placement, geometry,
+  mask-clip toggle, render-data) only calls `mark_placement_save_dirty` (`tab/persist.rs`), which
+  writes nothing. The write happens at a FLUSH POINT. This is what stops a drag from spawning a save
+  worker every frame — the worst offender was `vector_transform::dispatch_vector_rerender`, reached per
+  drag frame from `draw_page.rs` via `resize_selected_overlay_width`. Deferral is safe because
+  durability never came from the individual writes in the first place: it comes from the barriers (see
+  `README_AGENT.md`, "Что важно не ломать").
+  **A flush point may retire its dirty state ONLY once a write is genuinely dispatched.** Both writers
+  report that, and neither may be assumed to have written: `request_overlay_placement_save` returns
+  `PlacementSaveDispatch` (`Started`/`Parked` = the pipeline owns the write; `NotWired` = nothing was
+  or will be written), and `flush_text_layers` returns `Result<TypingTextFlushOutcome,
+  TypingTextFlushError>` (an `Err` could not run; an `Ok` with an empty `owned_pages` legitimately ran
+  with no resident pages). Clearing before the dispatch made a failed one look saved forever — the
+  debounce stops arming its repaint, `has_pending_placement_save` goes false, and tab-leave/exit stop
+  retrying, which at exit is silent data loss.
+  The `Err` vs `Ok`-with-empty-`owned_pages` distinction binds `app.rs` too, and in BOTH of its eager
+  callers an unverified set means ABORT, never proceed: save-to-project would otherwise let the merge
+  preserve stale committed text, delete the staging dir, and report success, and a page operation would
+  remap the page-keyed trees without the pending edits. See `README_AGENT.md`. One asymmetry belongs
+  here: `NoLayersDir`/`NoLayerDoc` mean the store was never wired, because `ensure_loader_started`
+  wires it on the tab's FIRST DRAW. A session that never opened the Text tab therefore gets `Err` from
+  a tab that owes nothing — which is why `app.rs`'s page-op gate treats those variants as "quiesced
+  unless an edit is actually pending" instead of aborting on any `Err`.
+  `has_pending_placement_save` covers THREE axes — `placement_save_dirty`, `edit_render_data_dirty`,
+  and `save_requested_while_busy` (a flush that could only PARK behind an in-flight render has not
+  written yet, so exit/tab-leave must still see it). `clear_placement_save_dirty` retires the first two
+  only: the parked flag is the sole record of a re-fire that `poll_save_jobs` /
+  `poll_edit_overlay_jobs` own. The flush points:
+  - **Selection change** — `flush_edit_save_on_selection_change` (`tab/selection_rasters.rs`), the
+    primary focus loss. Observes BOTH selection axes (overlay AND raster `(page, idx)`), so an
+    overlay→raster switch counts; the first selection of a session only seeds the trackers.
+  - **Page change** — `flush_placement_save_on_page_change`, driven per frame from `TypingTabState::draw`
+    off `canvas.current_page_idx()`. The canvas is a continuous scroll strip, so this fires per page
+    crossed (cheap and desirable). `last_page_idx` starts/resets to `None` so a freshly loaded chapter
+    seeds instead of flushing.
+  - **Idle debounce** — `drive_placement_save_debounce`, `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS` (1.5 s) of
+    no further edits. The safety net for an edit that never loses focus, so a walk-away or a crash is
+    recoverable from the `_unsaved` staging dir. Its `ctx.request_repaint_after` is LOAD-BEARING: egui
+    draws no frames while idle, so without it the deadline is unreachable and the write never happens.
+    It is driven at the END of `TypingTabState::draw`, AFTER `canvas.draw`, and must stay there: nearly
+    every `mark_placement_save_dirty` lives inside `canvas.draw`'s callees, so an earlier tick observes
+    a mark only on the NEXT frame — which strands the write entirely when the marking frame is the last
+    one drawn (no repaint armed), and otherwise doubles the delay to ~2 windows across two wakeups.
+  - **Tab leave / app exit** — `TypingTabState::flush_text_layers_if_dirty`, called by `app.rs` (the
+    tab cannot see either event: both stop its `draw`). The EXIT flush is REQUIRED and must run BEFORE
+    `on_exit`'s layer-saver barrier — see the quiescence note below.
+  - Eager, deliberately NOT deferred: `remove_overlay` / `remove_raster` (anti-resurrection durability
+    must not depend on reaching a flush point; both go through `dispatch_structural_placement_save`),
+    the internal `save_requested_while_busy` re-fire, `flush_target_page_text_to_staging`,
+    `save_page_band_order`, and `exit_layout_editor` (leaving the editor IS a focus loss, so it flushes
+    rather than defers).
+  - NOT a flush point at all — the DISCARD path (`app.rs::start_exit_cleanup`) calls
+    `TypingTabState::discard_pending_text_edits`, which DROPS everything unwritten, including the
+    parked re-fire. Discard deletes the staging dir and shuts the saver down, so any surviving pending
+    write would be re-dispatched into `enqueue_page_text_save`'s sync fallback and re-create that dir
+    with the edits the user threw away; a surviving `has_pending_text_edits` would also re-latch
+    `app.rs`'s unsaved cache and re-open the exit dialog.
+  The decision core `placement_save_debounce_tick` (`tab.rs`) is a pure fn and is unit-tested;
+  `mark_placement_save_dirty` clears the window seed and the next frame re-seeds it, which is how a
+  re-mark restarts the window without any edit site needing a clock.
+- Quiescence: the detached `spawn_overlay_placement_save` writer has no explicit quiescence handle. The
+  layer-saver barrier covers shared-document writes, but a placement worker already detached before a
+  page operation cannot be joined directly. This is why the tab-leave/exit flush
+  (`flush_text_layers_if_dirty`) routes through `flush_text_layers`, which enqueues INLINE on the
+  calling thread: an enqueue placed in the saver's FIFO before the barrier IS covered by it, whereas a
+  detached `thread::spawn` would race it and could lose the edit on close.
 - Overlay texture upload happens only on the GUI thread and must respect the existing
   per-frame count and byte budgets.
 - Memory-pressure eviction may clear only tiled mask textures and text/image overlay display
@@ -387,6 +450,24 @@ saving, and export.
   legacy — it is read on initial load of un-migrated chapters (then migrated to inline on first flush)
   and NEVER written. New code must preserve the legacy READ normalization paths for `style/static`,
   `transform_uv`, and older render-data shapes.
+- **The typing render never writes the rendered text PNG.** The create/edit render workers
+  (`tab/render_store.rs`) return the pixels in their result; `insert_runtime_overlay` /
+  `apply_edit_overlay_render_result` hand them to `doc.set_text_render`, which stores the image and
+  marks the node `pixels_dirty`, so the doc's text flush encodes the PNG under its own uid-keyed
+  `ps_p{page:04}_{uid}_text.png`. The renderers previously ALSO wrote the pixels to
+  `overlay.file_name` on every completed render (i.e. per drag frame, outside the coalescing saver):
+  byte-identical to what the doc writes, read by nobody, and — since `file_name` for an in-session
+  create is not the doc's name — a permanent orphan that `prune_orphan_pngs` (which matches only the
+  `ps_p{page:04}_` prefix) never collects.
+  EXCEPTION: `save_drawn_lines_layout_image_if_needed` stays — the `CustomRasterLines` `_layout.png`
+  has disk as its SOLE store (the renderer reads it back) and derives from `file_name` + dimensions
+  only, so it is the only disk artifact keyed to a created overlay's `file_name`.
+- A created overlay's `file_name` is `typing_overlay_p{page+1:04}_{uid}.png`
+  (`created_overlay_file_name`), minted from the overlay's own fresh v4 uid, so uniqueness is
+  STRUCTURAL — no filesystem probe, no wall-clock resolution to trust. It is a RUNTIME handle only:
+  the doc owns the persisted name, and a reloaded overlay's handle is rebuilt from the uid by
+  `text_runtime_from_doc_node`. The `typing_overlay_p{page:04}_` prefix is kept because `page_ops`
+  documents it as the typing overlay PNG shape in `text_images/`; nothing parses what follows it.
 - Text overlays store both placement fields and `render_data`; image overlays use the
   same runtime layer, store an effects-only `render_data` (`{ "effects": [...] }`), and expose
   the post-effect cards (stroke/glow/shadow/etc.) in the panel's Effects tab. Image-overlay text

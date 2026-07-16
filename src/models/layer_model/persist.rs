@@ -859,9 +859,12 @@ pub struct TextInlineIn {
 ///
 /// PS-owned fields (`pinned` / `pinned_by_group` / `z` / `group_uid`) on an existing text node are
 /// carried onto the incoming node by [`merge_preserved_text_fields`] (same as the typing rewrite), so
-/// a doc flush does not clobber a pin / Z / PS group set in the PS editor. Does NO PNG IO: the
-/// rendered text PNG is written by the typing render and named in `rendered_file`; this only writes the
-/// manifest. Runs under `MANIFEST_LOCK`.
+/// a doc flush does not clobber a pin / Z / PS group set in the PS editor. Does NO PNG IO: it only
+/// records each node's rendered-PNG NAME in `rendered_file` and writes the manifest. Writing those
+/// pixels is the CALLER's job — `LayerDoc::flush_page` / `flush_page_text` (and the saver worker that
+/// replays them) call [`write_text_image`] for every text node whose in-memory render is dirty or
+/// whose file is missing, immediately before calling this. The typing render itself never writes the
+/// rendered text PNG. Runs under `MANIFEST_LOCK`.
 pub fn write_page_text_payload(
     layers_dir: &Path,
     fallback_dir: Option<&Path>,

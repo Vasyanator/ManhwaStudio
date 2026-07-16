@@ -119,15 +119,31 @@ impl TypingTextOverlayLayer {
         })
     }
 
+    /// Flushes a deferred text-layer save when the SELECTION changes — the primary focus-loss point.
+    ///
+    /// Observes BOTH selection axes: the text/image overlay (`selected_overlay_idx`) and the raster
+    /// (`selected_raster_page` + `selected_raster_idx`). Watching the overlay axis alone missed the
+    /// overlay→raster switch, which is a focus loss for the overlay just as much as deselecting it.
+    /// The raster index is meaningless without its page (the same index exists on every page), so the
+    /// two are tracked as one pair, matching how the selection itself is stored.
+    ///
+    /// A change is only flushed when SOMETHING was previously selected: on the first selection of a
+    /// session there is no prior focus to lose, and any edit pending from elsewhere is still covered by
+    /// the idle debounce.
     pub(super) fn flush_edit_save_on_selection_change(&mut self) {
-        if self.last_selected_overlay_idx == self.selected_overlay_idx {
+        let raster = self.selected_raster_page.zip(self.selected_raster_idx);
+        if self.last_selected_overlay_idx == self.selected_overlay_idx
+            && self.last_selected_raster == raster
+        {
             return;
         }
-        if self.last_selected_overlay_idx.is_some() && self.edit_render_data_dirty {
-            self.request_overlay_placement_save();
-            self.edit_render_data_dirty = false;
-        }
+        let had_selection =
+            self.last_selected_overlay_idx.is_some() || self.last_selected_raster.is_some();
         self.last_selected_overlay_idx = self.selected_overlay_idx;
+        self.last_selected_raster = raster;
+        if had_selection {
+            self.flush_placement_save_if_dirty(TypingSaveFlushReason::SelectionChange);
+        }
     }
 
     pub(super) fn remove_overlay(&mut self, overlay_idx: usize) {
@@ -226,14 +242,18 @@ impl TypingTextOverlayLayer {
             }
         }
         self.drag_has_changes = false;
-        self.edit_render_data_dirty = false;
         // Drop the matching node from the shared doc (the source of truth), then re-project bands.
         if let Some((page_idx, uid)) = doc_node {
             self.route_to_doc(page_idx, move |doc| {
                 doc.remove_node(page_idx, &uid);
             });
         }
-        self.request_overlay_placement_save();
+        // STRUCTURAL — stays EAGER, deliberately NOT deferred. A deletion's durability must not depend
+        // on a later flush point being reached: `write_page_text_payload` keeps an emptied page
+        // present-but-empty precisely so a deletion survives reload, and a lost deferral would let the
+        // overlay resurrect from the stale on-disk set. The save persists the whole live state, so it
+        // settles any deferred edit on this overlay too — but only once actually dispatched.
+        self.dispatch_structural_placement_save("overlay delete");
     }
 
     /// Removes a raster layer from the current page: drops the doc node (the source of truth), removes
@@ -301,7 +321,9 @@ impl TypingTextOverlayLayer {
                 crate::runtime_log::log_warn(format!("[typing] persist raster delete: {err}"));
             }
         }
-        self.request_overlay_placement_save();
+        // STRUCTURAL — stays EAGER (see `remove_overlay`): anti-resurrection durability must not wait
+        // on a flush point. This also persists the live text state, settling any deferred edit.
+        self.dispatch_structural_placement_save("raster delete");
     }
 
     /// Ctrl/Cmd+wheel rotation of the selected text overlay by ±2° per notch. Which rotation is driven
@@ -430,7 +452,9 @@ impl TypingTextOverlayLayer {
         }
 
         self.mark_overlay_geometry_changed(selected_idx, false);
-        self.request_overlay_placement_save();
+        // EDIT (Ctrl+wheel raster rotation): deferred — a wheel spin marks once per notch and writes
+        // once the gesture settles, instead of once per notch.
+        self.mark_placement_save_dirty();
     }
 
     /// Applies a Ctrl+wheel VECTOR rotation to a text overlay: adds `delta_deg` to its render param
@@ -566,7 +590,8 @@ impl TypingTextOverlayLayer {
 
         if changed {
             self.mark_overlay_geometry_changed(selected_idx, false);
-            self.request_overlay_placement_save();
+            // EDIT (`-`/`=`/`0` scale): deferred; key repeat marks per frame and writes once on settle.
+            self.mark_placement_save_dirty();
             ui.ctx().request_repaint();
         }
     }
@@ -1575,7 +1600,8 @@ impl TypingTextOverlayLayer {
             zoom,
             strict_pixel_movement,
         );
-        self.request_overlay_placement_save();
+        // EDIT (arrow-key nudge): deferred; held arrows mark every frame and write once on settle.
+        self.mark_placement_save_dirty();
         ui.ctx().request_repaint();
     }
 

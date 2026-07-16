@@ -95,7 +95,8 @@ impl TypingTextOverlayLayer {
                     )
                 {
                     self.mark_overlay_geometry_changed(selected_idx, false);
-                    self.request_overlay_placement_save();
+                    // EDIT (visibility-limit clamp): deferred.
+                    self.mark_placement_save_dirty();
                 }
             }
             self.clear_selection();
@@ -106,7 +107,8 @@ impl TypingTextOverlayLayer {
                 if let Some(state) = self.drag_state.as_ref() {
                     self.flush_overlay_texture_if_stale(state.overlay_idx);
                 }
-                self.request_overlay_placement_save();
+                // EDIT (move/rotate drag released off-widget): deferred.
+                self.mark_placement_save_dirty();
             }
             self.drag_state = None;
             self.drag_has_changes = false;
@@ -187,7 +189,9 @@ impl TypingTextOverlayLayer {
             }
         }
         if adjusted_by_visibility_limit {
-            self.request_overlay_placement_save();
+            // EDIT (per-frame visibility-limit clamp of every overlay on the page): deferred. This ran
+            // on any frame a clamp moved a layer, e.g. throughout a zoom gesture.
+            self.mark_placement_save_dirty();
         }
         let painter = ui.painter().with_clip_rect(clip_rect);
         let mut needs_texture_upload = Vec::new();
@@ -667,7 +671,8 @@ impl TypingTextOverlayLayer {
                                 overlay.deform_mesh = None;
                             }
                             self.mark_overlay_geometry_changed(entry.idx, false);
-                            self.request_overlay_placement_save();
+                            // EDIT (reset raster transform from the context menu): deferred.
+                            self.mark_placement_save_dirty();
                             self.drag_state = None;
                             self.drag_has_changes = false;
                             menu_ui.close();
@@ -693,7 +698,8 @@ impl TypingTextOverlayLayer {
                                 new_state
                             );
                             self.mark_overlay_pixels_dirty(entry.idx);
-                            self.request_overlay_placement_save();
+                            // EDIT (mask-clip toggle from the context menu): deferred.
+                            self.mark_placement_save_dirty();
                             menu_ui.close();
                         }
                     }
@@ -1193,7 +1199,8 @@ impl TypingTextOverlayLayer {
                     }
                     if self.drag_has_changes {
                         self.flush_overlay_texture_if_stale(entry.idx);
-                        self.request_overlay_placement_save();
+                        // EDIT (move/rotate drag end): deferred.
+                        self.mark_placement_save_dirty();
                     }
                     self.drag_state = None;
                     self.drag_has_changes = false;
@@ -1271,7 +1278,9 @@ impl TypingTextOverlayLayer {
                             page_size_from_image_rect(image_rect, zoom),
                         );
                         self.mark_overlay_geometry_changed(selected_idx, false);
-                        self.request_overlay_placement_save();
+                        // EDIT (clamp on click-away). The deselect immediately below is itself a focus
+                        // loss, so `flush_edit_save_on_selection_change` writes this on the same frame.
+                        self.mark_placement_save_dirty();
                     }
                     if self.transform_mode_overlay_idx == self.selected_overlay_idx {
                         self.transform_mode_overlay_idx = None;

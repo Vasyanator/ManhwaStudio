@@ -228,7 +228,8 @@ impl TypingTextOverlayLayer {
             }
         }
         self.mark_overlay_geometry_changed(job.overlay_idx, false);
-        self.request_overlay_placement_save();
+        // EDIT (auto-typing recentered the overlay): deferred to the next flush point.
+        self.mark_placement_save_dirty();
         true
     }
 

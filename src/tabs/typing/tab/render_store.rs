@@ -3,13 +3,21 @@ File: tab/render_store.rs
 
 Purpose:
 Worker-side render-and-store helpers for the typing tab: rendering created and
-edited text/image overlays to disk, rendering raster effect chains, and building
-the shape-variant preview grid (layout, checkerboard, and per-tile render).
+edited text/image overlays, rendering raster effect chains, and building the
+shape-variant preview grid (layout, checkerboard, and per-tile render).
+
+TEXT renders do NOT write their pixels here. They travel back in the result struct
+and reach disk through the shared `LayerDoc` (`set_text_render` -> `pixels_dirty` ->
+the doc's text flush writes the uid-keyed `ps_p{page:04}_{uid}_text.png` via the
+coalescing saver). Writing them here too produced a byte-identical duplicate under a
+name no reader consults. The `_layout.png` (`save_drawn_lines_layout_image_if_needed`)
+is the EXCEPTION and still written: for `CustomRasterLines` the disk is its only store.
+IMAGE-overlay effects and created rasters DO still write their own PNGs here.
 
 Main responsibilities:
-- render newly created text/image overlays and created rasters, persisting their
-  PNGs / layer nodes;
-- re-render edited text overlays and image-effect overlays to their staging files;
+- render newly created text/image overlays and created rasters, persisting the
+  layer nodes (and, for images/rasters, their PNGs);
+- re-render edited text overlays and image-effect overlays;
 - render a raster's non-destructive effects chain from its base PNG;
 - compute shape-variant grid geometry, paint its checkerboard, render its preview
   tiles, and build the apply payload for a chosen variant.
@@ -29,7 +37,11 @@ pub(super) fn render_and_store_created_overlay(
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
         tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
-    let file_name = next_created_overlay_file_name(&request.text_images_dir, request.page_idx);
+    // Mint the uid FIRST: the overlay's `file_name` handle is derived from it, which is what makes the
+    // handle unique by construction (see `created_overlay_file_name`). The name is needed before the
+    // render because the `CustomRasterLines` layout path is adjacent to it.
+    let overlay_uid = uuid::Uuid::new_v4().to_string();
+    let file_name = created_overlay_file_name(request.page_idx, &overlay_uid);
     let render_params = render_params_with_adjacent_layout_path(
         &request.text_images_dir,
         &file_name,
@@ -52,16 +64,16 @@ pub(super) fn render_and_store_created_overlay(
         return Err(t!("typing.render.zero_size_render_error").to_string());
     }
 
-    let image_path = request.text_images_dir.join(&file_name);
-    image::save_buffer(
-        &image_path,
-        rendered.rgba.as_slice(),
-        rendered.width,
-        rendered.height,
-        image::ColorType::Rgba8,
-    )
-    .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
-    let layout_image_path = save_drawn_lines_layout_image_if_needed(
+    // The rendered pixels are NOT written here. Persistence is owned by the shared doc: the caller
+    // adds this overlay as a doc Text node via `set_text_render`, which stores this exact image and
+    // marks the node `pixels_dirty`, so the doc's text flush re-encodes the identical PNG under its
+    // own uid-keyed `ps_p{page:04}_{uid}_text.png` name. Writing `file_name` here produced a byte-identical
+    // duplicate under a name NO reader consults — and, because `file_name` is not the doc's name, an
+    // orphan that `prune_orphan_pngs` (which only matches the `ps_p{page:04}_` prefix) never collects.
+    // The `_layout.png` below is a DIFFERENT store and must stay: for `CustomRasterLines` the disk is
+    // its SOLE home (the renderer reads it back), and it needs only the dir + name + dimensions. Its
+    // returned path is not needed here — the renderer re-derives it from `file_name`.
+    save_drawn_lines_layout_image_if_needed(
         &request.text_images_dir,
         &file_name,
         &render_params,
@@ -71,12 +83,6 @@ pub(super) fn render_and_store_created_overlay(
 
     // Для нового оверлея не подгоняем PNG под выделение: показываем в исходном масштабе.
     let user_scale = 1.0_f32;
-    let overlay_uid = uuid::Uuid::new_v4().to_string();
-    // Persistence is owned by the shared doc: the caller adds this overlay as a doc Text node and the
-    // following placement save flushes the INLINE v3 payload to `layers.json`. The create path no
-    // longer writes `text_info.json` (the doc is the sole text writer). The rendered PNG above is kept
-    // on disk only as the create-job artifact; the doc flush writes its own uid-keyed `_text.png`.
-    let _ = &layout_image_path;
 
     Ok(TypingOverlayDecoded {
         uid: overlay_uid,
@@ -117,7 +123,10 @@ pub(super) fn render_and_store_created_image_overlay(
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
         tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
-    let file_name = next_created_overlay_file_name(&request.text_images_dir, request.page_idx);
+    // Uid first: the file name is derived from it, so this path's PNG (unlike the text path's, which
+    // is written by the doc) lands under a name that is unique by construction.
+    let overlay_uid = uuid::Uuid::new_v4().to_string();
+    let file_name = created_overlay_file_name(request.page_idx, &overlay_uid);
     let image_path = request.text_images_dir.join(&file_name);
     image::save_buffer(
         &image_path,
@@ -129,9 +138,6 @@ pub(super) fn render_and_store_created_image_overlay(
     .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
 
     let render_data_json = default_render_data_for_image();
-    let overlay_uid = uuid::Uuid::new_v4().to_string();
-    // (Superseded path.) Persistence is owned by the shared doc; no `text_info.json` write here.
-    let _ = &image_path;
 
     Ok(TypingOverlayDecoded {
         uid: overlay_uid,
@@ -327,18 +333,16 @@ pub(super) fn render_and_store_edited_overlay(
     fs::create_dir_all(&request.text_images_dir).map_err(|err| {
         tf!("typing.render.create_dir_error", request = request.text_images_dir.display(), err = err)
     })?;
-    let image_path = request.text_images_dir.join(&request.file_name);
     if request.latest_token.load(Ordering::Acquire) != request.token {
         return Ok(None);
     }
-    image::save_buffer(
-        &image_path,
-        rendered.rgba.as_slice(),
-        rendered.width,
-        rendered.height,
-        image::ColorType::Rgba8,
-    )
-    .map_err(|err| tf!("typing.render.save_image_error", image_path = image_path.display(), err = err))?;
+    // The re-rendered pixels are NOT written here: they travel back in `TypingEditOverlayResult.rgba`
+    // and reach disk through the shared doc. `apply_edit_overlay_render_result` hands them to
+    // `doc.set_text_render`, which stores the image and marks the node `pixels_dirty`, so the doc's
+    // text flush re-encodes the identical PNG. This write was a byte-identical duplicate that fired on
+    // EVERY completed edit render — i.e. per drag frame on a width/rotation gesture — outside the
+    // coalescing saver entirely. The `_layout.png` below is a separate store (disk is its only home for
+    // `CustomRasterLines`) and is derived from `file_name` + dimensions, so it needs no rendered PNG.
     save_drawn_lines_layout_image_if_needed(
         &request.text_images_dir,
         &request.file_name,

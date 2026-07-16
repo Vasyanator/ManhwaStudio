@@ -2290,3 +2290,298 @@ fn width_guide_drag_clamps_to_settable_range() {
         TEXT_OVERLAY_WIDTH_MAX_PX
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Deferred text-layer save: the idle-debounce decision core.
+//
+// `placement_save_debounce_tick` is the whole state machine of the debounce, factored out of the
+// frame loop so it can be tested without an `egui::Context`. The GUI-coupled half is deliberately
+// not unit-tested (see the note at the end of this block).
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn debounce_does_not_flush_when_nothing_is_dirty() {
+    // Not dirty => never a flush, and no window is kept open (so no repaint is scheduled).
+    let (window, flush) = placement_save_debounce_tick(false, None, 100.0);
+    assert_eq!(window, None);
+    assert!(!flush);
+
+    // Even if a window somehow lingered, clearing the dirty flag must retire it rather than fire.
+    let (window, flush) = placement_save_debounce_tick(false, Some(1.0), 100.0);
+    assert_eq!(window, None, "a stale window must not survive going clean");
+    assert!(!flush);
+}
+
+#[test]
+fn debounce_seeds_the_window_on_the_first_frame_after_a_mark() {
+    // `mark_placement_save_dirty` leaves the window unseeded (`None`); the first frame to observe the
+    // mark starts the clock at its own time and must NOT flush, however late that frame is.
+    let (window, flush) = placement_save_debounce_tick(true, None, 500.0);
+    assert_eq!(
+        window,
+        Some(500.0),
+        "the first frame after a mark seeds the window at `now`"
+    );
+    assert!(
+        !flush,
+        "seeding must never flush: the debounce is measured from the seed, not from time zero"
+    );
+}
+
+#[test]
+fn debounce_holds_until_the_window_elapses_then_flushes() {
+    let start = 10.0;
+
+    // Inside the window: hold, and keep the SAME start so the deadline does not drift later each frame.
+    let (window, flush) = placement_save_debounce_tick(true, Some(start), start + 0.1);
+    assert_eq!(window, Some(start));
+    assert!(!flush);
+
+    let (window, flush) = placement_save_debounce_tick(
+        true,
+        Some(start),
+        start + PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS - 0.001,
+    );
+    assert_eq!(window, Some(start));
+    assert!(!flush, "must not flush one tick short of the debounce");
+
+    // Exactly at the boundary the window has elapsed (the check is `>=`).
+    let (window, flush) =
+        placement_save_debounce_tick(true, Some(start), start + PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS);
+    assert!(flush, "the window elapses at exactly the debounce duration");
+    assert_eq!(window, None, "flushing retires the window");
+
+    // Well past the deadline (e.g. the app was busy and skipped frames) still flushes exactly once.
+    let (window, flush) = placement_save_debounce_tick(true, Some(start), start + 60.0);
+    assert!(flush);
+    assert_eq!(window, None);
+}
+
+#[test]
+fn re_marking_restarts_the_debounce_window_so_a_drag_writes_nothing() {
+    // This is the property that makes a continuous gesture cheap: every frame of a drag re-marks, and
+    // a re-mark clears the seed (`mark_placement_save_dirty` sets `since = None`), so the next frame
+    // re-seeds at ITS time and the window can never accumulate.
+    let mut window: Option<f64> = None;
+
+    // Simulate a 3-second drag at 10 fps: mark, tick, mark, tick, ...
+    let mut now = 0.0_f64;
+    for _ in 0..30 {
+        window = None; // the frame's edit re-marks -> `mark_placement_save_dirty` clears the seed
+        let (next_window, flush) = placement_save_debounce_tick(true, window, now);
+        assert!(
+            !flush,
+            "a continuous drag must never reach the debounce, however long it runs (t={now})"
+        );
+        window = next_window;
+        now += 0.1;
+    }
+
+    // The gesture settles: no more marks, so the window now survives from frame to frame and elapses.
+    let settle_start = now;
+    let (window_after_settle, flush) = placement_save_debounce_tick(true, window, now);
+    assert!(!flush, "the frame right after the last mark must not flush");
+    assert_eq!(
+        window_after_settle,
+        Some(settle_start - 0.1),
+        "the window dates from the last marking frame's seed, not from the drag start"
+    );
+
+    let (_, flush) = placement_save_debounce_tick(
+        true,
+        window_after_settle,
+        settle_start + PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS,
+    );
+    assert!(flush, "once the marks stop, the debounce fires");
+}
+
+#[test]
+fn debounce_fires_one_window_after_the_last_mark_not_two() {
+    // Ordering contract of the CALL SITE, expressed against the pure core: `drive_placement_save_debounce`
+    // runs AFTER `canvas.draw`, so a mark made during frame L is observed by frame L's own tick and seeds
+    // the window at L. Driving the tick BEFORE the marks (as it was first written) made the L-frame tick
+    // see the PREVIOUS state: the frame after the last mark only re-seeded, pushing the flush to
+    // ~L + 2 * PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS across two wakeups instead of one window.
+    let last_mark_at = 4.0_f64;
+
+    // Frame L: the edit marks (seed cleared), then this frame's tick observes it and seeds at L.
+    let (window, flush) = placement_save_debounce_tick(true, None, last_mark_at);
+    assert!(!flush);
+    assert_eq!(window, Some(last_mark_at), "the marking frame seeds its own window");
+
+    // The wake armed for exactly one window lands at L + 1.5 and flushes — no re-seed, no second wait.
+    let (window, flush) = placement_save_debounce_tick(
+        true,
+        window,
+        last_mark_at + PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS,
+    );
+    assert!(
+        flush,
+        "the write lands one debounce window after the last edit, not two"
+    );
+    assert_eq!(window, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deferred text-layer save: dirty state may retire ONLY when a write is genuinely dispatched.
+// ---------------------------------------------------------------------------------------------
+
+/// A layer whose text persistence IS wired (staging dir + shared doc), so dispatch decisions are not
+/// short-circuited by `NotWired`. The dir need not exist: these tests never let a write reach disk.
+fn wired_overlay_layer() -> TypingTextOverlayLayer {
+    TypingTextOverlayLayer {
+        layers_primary_dir: Some(std::env::temp_dir().join("typing_deferred_save_tests")),
+        layer_doc: Some(Arc::new(Mutex::new(
+            crate::models::layer_model::layer_doc::LayerDoc::new(),
+        ))),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn unwired_flush_keeps_the_edit_dirty_instead_of_dropping_it() {
+    // B1: `request_overlay_placement_save` silently writes NOTHING when no staging dir / doc is wired.
+    // Clearing the dirty state before/regardless of that made the edit clean FOREVER: the debounce stops
+    // arming repaints, `has_pending_placement_save` goes false, and tab-leave/exit never retry — at exit
+    // that is silent data loss, because the barrier cannot cover a job that was never enqueued.
+    let mut layer = TypingTextOverlayLayer::default(); // nothing wired
+    layer.mark_placement_save_dirty();
+
+    assert_eq!(
+        layer.request_overlay_placement_save(),
+        PlacementSaveDispatch::NotWired,
+        "no dir/doc ⇒ the dispatch reports that nothing was written"
+    );
+
+    layer.flush_placement_save_if_dirty(TypingSaveFlushReason::SelectionChange);
+    assert!(
+        layer.has_pending_placement_save(),
+        "a flush that dispatched nothing must leave the edit dirty for the next flush point"
+    );
+    assert!(layer.placement_save_dirty, "the placement axis specifically survives");
+}
+
+#[test]
+fn unwired_inline_flush_keeps_the_edit_dirty_and_reports_why() {
+    // Same contract on the INLINE (tab-leave / exit) path: `flush_text_layers` used to answer an empty
+    // page set both when it could not run and when it ran with nothing resident, so the caller cleared
+    // the dirty state either way. It now distinguishes them with a typed error.
+    let mut layer = TypingTextOverlayLayer::default(); // nothing wired
+    layer.mark_placement_save_dirty();
+
+    assert!(
+        matches!(
+            layer.flush_text_layers(),
+            Err(TypingTextFlushError::NoLayersDir)
+        ),
+        "a flush that could not run is an Err, not an empty owned set"
+    );
+
+    layer.flush_text_layers_if_dirty(TypingSaveFlushReason::Exit);
+    assert!(
+        layer.has_pending_placement_save(),
+        "an exit flush that could not run must not mark the edit written"
+    );
+
+    // Wiring only the dir still leaves no store for the text: also an error, still dirty.
+    layer.layers_primary_dir = Some(std::env::temp_dir().join("typing_deferred_save_tests"));
+    assert!(matches!(
+        layer.flush_text_layers(),
+        Err(TypingTextFlushError::NoLayerDoc)
+    ));
+    assert!(layer.has_pending_placement_save());
+}
+
+#[test]
+fn flush_that_ran_with_no_resident_pages_is_ok_and_settles_the_edit() {
+    // The other side of the disambiguation: a wired flush over a doc with NO resident pages RAN — it
+    // persisted the (empty) live state — so it returns Ok and legitimately retires the dirty flag. This
+    // is the case an empty `HashSet` used to be conflated with.
+    let mut layer = wired_overlay_layer();
+    layer.mark_placement_save_dirty();
+
+    let outcome = layer
+        .flush_text_layers()
+        .expect("a wired flush over an empty doc RUNS; it simply owns no pages");
+    assert!(outcome.owned_pages.is_empty());
+    assert_eq!(outcome.failed_pages, 0);
+    assert!(
+        !layer.has_pending_placement_save(),
+        "a flush that ran and fully succeeded settles the deferred edit"
+    );
+}
+
+#[test]
+fn busy_parked_save_still_counts_as_pending() {
+    // B4: `request_overlay_placement_save` PARKS (writes nothing) while a save/create/edit render is in
+    // flight; `poll_save_jobs` / `poll_edit_overlay_jobs` re-fire it later. Until then the edit is as
+    // unwritten as a dirty flag, so `has_pending_placement_save` must say so — otherwise an exit or
+    // tab-leave flush sees "nothing pending", no-ops, and the parked write is dropped on close.
+    let mut layer = wired_overlay_layer();
+    // Stand in for a placement save already in flight. The sender is irrelevant: nothing polls `rx`.
+    let (_unused_sender, rx) = mpsc::channel::<Result<(), String>>();
+    layer.save_rx = Some(rx);
+    layer.mark_placement_save_dirty();
+
+    assert_eq!(
+        layer.request_overlay_placement_save(),
+        PlacementSaveDispatch::Parked,
+        "a wired request behind an in-flight job parks rather than spawning a second writer"
+    );
+
+    let mut layer = wired_overlay_layer();
+    let (_unused_sender, rx) = mpsc::channel::<Result<(), String>>();
+    layer.save_rx = Some(rx);
+    layer.mark_placement_save_dirty();
+    layer.flush_placement_save_if_dirty(TypingSaveFlushReason::Idle);
+
+    assert!(
+        layer.save_requested_while_busy,
+        "the flush handed the write to the parked re-fire"
+    );
+    assert!(
+        !layer.placement_save_dirty,
+        "parking IS a successful dispatch: the pipeline owns the write, so the axis retires"
+    );
+    assert!(
+        layer.has_pending_placement_save(),
+        "but the write has not happened yet, so exit/tab-leave must still see it as pending"
+    );
+}
+
+#[test]
+fn discarding_drops_the_parked_re_fire_too() {
+    // B2: on the DISCARD path the staging dir is deleted and the saver is shut down. A surviving parked
+    // re-fire would be dispatched afterwards and take `enqueue_page_text_save`'s SYNC fallback,
+    // re-creating the deleted dir with the discarded edits — so discard must drop it, unlike the normal
+    // `clear_placement_save_dirty` (where the flag is a write to protect, not one to cancel).
+    let mut layer = wired_overlay_layer();
+    layer.mark_placement_save_dirty();
+    layer.save_requested_while_busy = true;
+
+    layer.clear_placement_save_dirty();
+    assert!(
+        layer.save_requested_while_busy,
+        "a normal clear must never cancel a parked re-fire (it may be an eager structural save)"
+    );
+    assert!(layer.has_pending_placement_save());
+
+    layer.discard_pending_placement_save();
+    assert!(!layer.save_requested_while_busy, "discard cancels the re-fire");
+    assert!(
+        !layer.has_pending_placement_save(),
+        "after a discard nothing is pending: the exit dialog must not re-latch and reopen"
+    );
+}
+
+// NOT unit-tested here, and why: the surrounding `drive_placement_save_debounce` needs a live
+// `egui::Context` (it reads `input(|i| i.time)` and calls `request_repaint_after`), and the flush
+// points that write for real (`flush_placement_save_on_page_change`,
+// `flush_edit_save_on_selection_change`) need staging dirs and a running saver thread — i.e. an
+// integration harness, not a unit test. The decision they all delegate to is the pure fn above, and
+// the dispatch/dirty contract they share is covered by the tests above; `flush_text_layers`'s own
+// per-page persistence contract is covered by the `layer_model::persist` tests.
+//
+// Also NOT unit-tested (needs a running GUI): that `MangaApp::start_exit_cleanup` → `on_exit` performs
+// no write, and that the exit dialog does not reopen after "Не сохранять". Both live in `MangaApp`,
+// which cannot be constructed without a project, an eframe context, and the loader threads.

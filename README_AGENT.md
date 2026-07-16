@@ -795,6 +795,52 @@ because a screenshot looked plausible.
   ownership owned-page merge не менять — async меняет ТОЛЬКО где/когда происходит запись, не сами байты.
   Исключение, остающееся синхронным: `flush_target_page_text_to_staging` (воркер raster-create читает
   staging сразу — async race resurrect'ил бы удалённый текст).
+  **Typing text EDITS are DEFERRED, and that makes the exit flush REQUIRED, not optional.** The typing
+  tab no longer writes a text edit as it happens (that wrote on every drag frame); it marks state dirty
+  and writes at a focus-loss point — selection change, page change, tab leave, a 1.5 s idle debounce, or
+  exit (see `src/tabs/typing/MODULE_README.md`). This is safe precisely BECAUSE durability comes only
+  from the barrier — but a barrier can only cover a write that is already ENQUEUED. So
+  `MangaApp::on_exit` MUST call `typing_tab.flush_text_layers_if_dirty(..)` BEFORE its
+  `barrier_blocking`, and that flush MUST enqueue inline on the calling thread (`flush_text_layers`),
+  never via the detached `spawn_overlay_placement_save` worker, which has no quiescence handle and
+  would race the barrier. The same call covers the tab-leave focus loss in
+  `apply_shared_viewport_to_active_canvas`. Because that barrier is now the ONLY durability signal a
+  deferred edit gets, `on_exit` must INSPECT its failed-page set and report it — exit still proceeds
+  (no retry is possible at teardown), but it must not log success falsely.
+  A deferred write may retire its dirty state ONLY once genuinely dispatched; the typing writers report
+  that with typed outcomes (`PlacementSaveDispatch` / `TypingTextFlushError`), and a flush point that
+  cleared before/regardless of the dispatch would make the edit look saved forever.
+  The DISCARD path (`start_exit_cleanup`) must NOT flush: it deletes the staging dir on purpose. It
+  must instead DROP the tab's pending edits (`typing_tab.discard_pending_text_edits()`) and latch
+  `discarding_unsaved_changes`, which suppresses the `on_exit` flush and freezes
+  `refresh_unsaved_changes_cache`. Both are load-bearing: discard shuts the saver down, so any
+  surviving pending write takes `enqueue_page_text_save`'s SYNC fallback and re-creates the staging dir
+  it just deleted, and a surviving `has_pending_text_edits()` re-latches the unsaved cache after
+  `poll_pending_exit_cleanup` clears it, re-opening the exit dialog and making discard-and-exit
+  impossible. Deletions stay EAGER so anti-resurrection never depends on a flush point being reached.
+  `discarding_unsaved_changes` is latched on the assumption that the process ends moments later, so it
+  is only valid while that holds: if the cleanup FAILS, `poll_pending_exit_cleanup` MUST release it
+  (`abort_discard_after_failed_cleanup`) and re-report the session as unsaved before control returns to
+  the running app. Left set, it pins `has_unsaved_changes_cached` to false forever (no save prompt on
+  any later close) and permanently disables the `on_exit` flush.
+  **A `flush_text_layers` `Err` is NOT an empty owned set, and no caller may degrade it into one.**
+  `Err` = could not run; `Ok` + empty `owned_pages` = ran, nothing resident. The two produce the same
+  value but license opposite actions, and both callers must ABORT rather than proceed with an
+  unverified set:
+  - `start_save_to_project` — an empty set tells the merge the session owns no text, so it preserves
+    COMMITTED text everywhere, drops staging's text, deletes the staging dir, and reports SUCCESS. Post
+    deferral the newest text may be in memory only, and staging is the sole on-disk copy of earlier
+    deferred writes and of anything recovered from a crash. Also abort on `outcome.failed_pages != 0`
+    and on the merge worker's `owned ∩ barrier_failed_pages`; an aborting worker must
+    `restore_dirty_save_snapshots` for the clean-overlay snapshots it took. Nothing is merged, staging
+    stays, and the user is told the save did not happen.
+  - `start_page_op` — the quiesce is a PRECONDITION: the transaction remaps the page-keyed trees and
+    the reload behind it replaces the in-memory doc, so unstaged text is lost or re-keyed to an
+    obsolete page index. Abort BEFORE any worker shutdown or disk move (`page_op_text_quiesce`, a pure
+    tested gate). It is deliberately NOT a blanket `Err` abort: `NoLayersDir`/`NoLayerDoc` mean the
+    Text tab was never opened this session (the store is wired lazily by its first draw), so the tab
+    owes nothing and page operations MUST keep working — only an unwritten edit or a poisoned doc lock
+    aborts there.
 - **Python backend** — сбои не должны зависать GUI; всегда проверять `ensure_ai_backend_healthy()` перед запросами.
 - **App-managed AI models** — Rust worker paths call `src/ai_models.rs` before Python backend
   model initialization; EasyOCR and Surya remain library-cache managed.

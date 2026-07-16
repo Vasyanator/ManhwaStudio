@@ -62,8 +62,14 @@ impl TypingTextOverlayLayer {
         self.export_rx = None;
         self.export_status = TypingExportUiStatus::Hidden;
         self.cancel_active_edit_overlay_render();
-        self.edit_render_data_dirty = false;
+        // Chapter/project (re)load: drop any deferred edit from the OUTGOING chapter. Its overlays are
+        // about to be replaced, so a surviving dirty flag would fire the next flush point against the
+        // freshly loaded chapter. `last_page_idx` resets too, so the first frame of the new chapter
+        // re-seeds the page tracker instead of reading a page change across the chapter boundary.
+        self.clear_placement_save_dirty();
+        self.last_page_idx = None;
         self.last_selected_overlay_idx = None;
+        self.last_selected_raster = None;
         self.selected_overlay_idx = None;
         self.transform_mode_overlay_idx = None;
         self.drag_state = None;
@@ -318,8 +324,12 @@ impl TypingTextOverlayLayer {
                         self.export_status = TypingExportUiStatus::Hidden;
                         self.last_load_error = None;
                         self.cancel_active_edit_overlay_render();
-                        self.edit_render_data_dirty = false;
+                        // Chapter load completed: the selection and any deferred edit belong to the
+                        // outgoing chapter and are dropped along with it (see `ensure_loader_started`).
+                        self.clear_placement_save_dirty();
+                        self.last_page_idx = None;
                         self.last_selected_overlay_idx = None;
+                        self.last_selected_raster = None;
                         self.selected_overlay_idx = None;
                         self.transform_mode_overlay_idx = None;
                         self.drag_state = None;
@@ -341,6 +351,10 @@ impl TypingTextOverlayLayer {
                         self.export_status = TypingExportUiStatus::Hidden;
                         self.last_load_error = Some(err);
                         self.cancel_active_edit_overlay_render();
+                        // Only the render-data flag is cleared (the cancelled render will never land).
+                        // Deliberately NOT `clear_placement_save_dirty`: unlike the paths above, this
+                        // one KEEPS the doc-created runtimes, so a deferred placement edit against a
+                        // surviving overlay is still live and must still reach disk.
                         self.edit_render_data_dirty = false;
                     }
                 }
@@ -358,8 +372,12 @@ impl TypingTextOverlayLayer {
                 self.last_load_error =
                     Some(t!("typing.render.text_info_load_error").to_string());
                 self.cancel_active_edit_overlay_render();
-                self.edit_render_data_dirty = false;
+                // Loader channel dropped: this tears the chapter's overlay state down entirely, so any
+                // deferred edit against it is moot (same reasoning as the load-completed path).
+                self.clear_placement_save_dirty();
+                self.last_page_idx = None;
                 self.last_selected_overlay_idx = None;
+                self.last_selected_raster = None;
                 self.selected_overlay_idx = None;
                 self.transform_mode_overlay_idx = None;
                 self.drag_state = None;
@@ -409,7 +427,10 @@ impl TypingTextOverlayLayer {
                     self.set_create_warning(ctx, decoded.warnings.join("; "));
                 }
                 self.insert_runtime_overlay(decoded);
-                self.request_overlay_placement_save();
+                // EDIT (a newly created overlay's initial placement): deferred. The overlay already
+                // lives in the shared doc, so it is not lost — only its write is postponed to the next
+                // flush point (which the create gesture reaches almost immediately via focus loss).
+                self.mark_placement_save_dirty();
                 true
             }
             Ok(Err(err)) | Err(err) => {
@@ -831,7 +852,9 @@ impl TypingTextOverlayLayer {
                         overlay.angle_deg = normalize_angle_deg(rotation_deg);
                     }
                     self.mark_overlay_geometry_changed(overlay_idx, false);
-                    self.request_overlay_placement_save();
+                    // EDIT (image-overlay scale/rotation from the edit panel): deferred — the panel
+                    // emits one of these per widget interaction frame.
+                    self.mark_placement_save_dirty();
                 }
             },
             TypingOverlayEditRequest::ImageEffects {

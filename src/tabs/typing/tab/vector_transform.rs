@@ -426,9 +426,11 @@ impl TypingTextOverlayLayer {
             font_provider: Arc::clone(&self.font_provider),
         };
         self.start_edit_overlay_render_job(request);
-        // Persist the render_data (already carrying/clearing the warp) via the normal save path; it
-        // coalesces behind the in-flight render.
-        self.request_overlay_placement_save();
+        // EDIT (vector mesh warp). DEFERRED, and this is the hottest of the converted sites: this fn is
+        // reached per DRAG FRAME (via `dispatch_vector_rerender` ← `resize_selected_overlay_width` ←
+        // `draw_page_overlays`), so an eager request here spawned a save worker on every frame of a
+        // width or transform drag. Marking instead means the whole gesture writes once, on settle.
+        self.mark_placement_save_dirty();
         true
     }
 

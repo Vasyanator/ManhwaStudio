@@ -88,7 +88,7 @@ use crate::tabs::translation::{
     HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
     HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, TranslationHotkeyHints, TranslationTabState,
 };
-use crate::tabs::typing::TypingTabState;
+use crate::tabs::typing::{TypingSaveFlushReason, TypingTabState, TypingTextFlushError};
 use crate::tabs::wiki::WikiTabState;
 use eframe::egui;
 use egui::{Align2, ColorImage, TextureOptions};
@@ -270,6 +270,18 @@ pub struct MangaApp {
     pending_project_reload: bool,
     has_unsaved_changes_cached: bool,
     next_unsaved_dir_check_s: f64,
+    /// Latched by `start_exit_cleanup`: the user chose to DISCARD the unsaved chapter and the staging
+    /// dir is being deleted. While it is set every remaining persistence path goes quiet — `on_exit`
+    /// must not flush (it would re-create the deleted staging dir with the discarded edits) and
+    /// `refresh_unsaved_changes_cache` must not re-latch (it would re-open the exit dialog).
+    ///
+    /// The latch is only justified while the process really is closing. It survives a SUCCESSFUL
+    /// cleanup (that branch dispatches the window close in the same call, so the few remaining frames
+    /// must stay quiet), but a FAILED cleanup hands control back to a still-running app, and
+    /// `poll_pending_exit_cleanup` must then clear it via `abort_discard_after_failed_cleanup` — left
+    /// set, it would silence the unsaved-changes prompt and the `on_exit` text flush for the rest of
+    /// the session.
+    discarding_unsaved_changes: bool,
     /// Windows can misplace a maximized root window when maximize is requested at native creation.
     #[cfg(target_os = "windows")]
     maximize_root_window_on_first_frame: bool,
@@ -780,6 +792,7 @@ impl MangaApp {
             pending_project_reload: false,
             has_unsaved_changes_cached,
             next_unsaved_dir_check_s: 0.0,
+            discarding_unsaved_changes: false,
             #[cfg(target_os = "windows")]
             maximize_root_window_on_first_frame: true,
             return_to_launcher: false,
@@ -824,6 +837,12 @@ impl MangaApp {
     }
 
     /// Starts a structural page operation after quiescing every writer that owns page-indexed data.
+    ///
+    /// The typing-text quiesce is a hard PRECONDITION, not best-effort: this transaction remaps the
+    /// page-keyed trees and is followed by a project reload that replaces the in-memory document, so a
+    /// deferred text edit that is not in staging when it starts is lost or re-keyed to an obsolete
+    /// page index. If it cannot be established (`page_op_text_quiesce`), the request is REFUSED with a
+    /// user-visible message and nothing is started, shut down, or moved on disk.
     fn start_page_op(&mut self, op: PageOpKind) {
         if self.page_op_rx.is_some()
             || self.page_op_error.is_some()
@@ -844,7 +863,51 @@ impl MangaApp {
         }
         self.canvas.flush_pending_bubble_upserts_now(&self.project);
         self.ps_editor_tab.flush_layers(&self.project);
-        drop(self.typing_tab.flush_text_layers());
+        // Quiesce the typing text writer. The owned-page set is irrelevant here (no merge follows —
+        // the page-op transaction remaps both trees), but the quiesce SUCCEEDING is not: this
+        // transaction renames the page-keyed trees and the project reload behind it replaces the
+        // in-memory document, so a text edit that is not in staging when it starts is lost or re-keyed
+        // to an obsolete page index. Deferral makes that the normal state of a fresh edit, and the
+        // tab's own dirty state does not survive the reload. So gate the whole operation on it — and
+        // gate it HERE, before any worker is shut down and before anything on disk moves, so an abort
+        // leaves the session exactly as it was.
+        //
+        // `had_pending_edits` is read BEFORE the flush: a successful flush clears the dirty state.
+        let had_pending_text_edits = self.typing_tab.has_pending_text_edits();
+        let flush_result = self.typing_tab.flush_text_layers();
+        let (flush_error, failed_pages) = match &flush_result {
+            Ok(outcome) => (None, outcome.failed_pages),
+            Err(err) => (Some(*err), 0),
+        };
+        match page_op_text_quiesce(flush_error, failed_pages, had_pending_text_edits) {
+            PageOpTextQuiesce::Quiesced => {}
+            PageOpTextQuiesce::EditsUnwritten => {
+                runtime_log::log_error(format!(
+                    "[page_op] request aborted: the typing tab still owes text to the staging dir \
+                     (flush_error={flush_error:?}, failed_pages={failed_pages}, \
+                     had_pending_edits={had_pending_text_edits}). The transaction would have remapped \
+                     the page-keyed trees without those edits and the reload behind it would drop \
+                     them, so nothing was started and the chapter is untouched."
+                ));
+                // Reported on the app-wide persistence status line rather than through `page_op_error`:
+                // that dialog says files on disk may have changed and offers only "Reload project",
+                // which would discard the very in-memory edits this abort exists to protect. Nothing
+                // has changed and nothing must be reloaded.
+                self.save_to_project_status =
+                    Some((t!("page_manager.op_blocked_text_unwritten").to_string(), 0.0));
+                return;
+            }
+            PageOpTextQuiesce::DocUnreadable => {
+                runtime_log::log_error(
+                    "[page_op] request aborted: the shared layer document lock is poisoned, so no \
+                     tab's layer state could be staged or even inspected. A structural transaction \
+                     against an unreadable document cannot be made safe; nothing was started.",
+                );
+                self.save_to_project_status =
+                    Some((t!("page_manager.op_blocked_doc_unreadable").to_string(), 0.0));
+                return;
+            }
+        }
 
         self.overlay_autosave_shutdown
             .store(true, AtomicOrdering::Release);
@@ -984,10 +1047,34 @@ impl MangaApp {
     /// `next_unsaved_dir_check_s` timer; this keeps the GUI thread off the shared model
     /// locks every frame while still surfacing new unsaved state within ~1s.
     fn refresh_unsaved_changes_cache(&mut self, now: f64) {
+        // The DISCARD path is already committed: the staging dir is being deleted and every pending
+        // write was dropped, so there is nothing left to report and recomputing can only do harm.
+        // `next_unsaved_dir_check_s` is not advanced while the latch is set, so WITHOUT this guard the
+        // very next frame would recompute, re-latch (the typing tab still draws during the cleanup
+        // frames and can re-mark itself dirty), and `close_requested` would re-open the exit dialog —
+        // the user could never discard-and-exit.
+        //
+        // The latch is released only if the cleanup FAILS: `poll_pending_exit_cleanup` then calls
+        // `abort_discard_after_failed_cleanup`, which clears it and re-reports the session as unsaved,
+        // so this fn starts answering honestly again for the app that keeps running. On SUCCESS the
+        // latch stays set — that branch dispatches the window close itself, so the quiet is correct.
+        if self.discarding_unsaved_changes {
+            self.has_unsaved_changes_cached = false;
+            return;
+        }
         if self.has_unsaved_changes_cached || now < self.next_unsaved_dir_check_s {
             return;
         }
         self.next_unsaved_dir_check_s = now + 1.0;
+        // A DEFERRED typing text edit is unsaved work that has not reached the disk yet, so the
+        // staging-dir probe at the end of this fn cannot see it. Ask the tab directly: otherwise an
+        // edit made shortly before closing (still inside its idle-debounce window, with no other
+        // unsaved state to have created the staging dir) would leave this false and the exit dialog
+        // would not offer to save the chapter.
+        if self.typing_tab.has_pending_text_edits() {
+            self.has_unsaved_changes_cached = true;
+            return;
+        }
         if let Ok(model) = self.bubbles_model.lock()
             && model.has_unsaved_changes()
         {
@@ -1094,6 +1181,13 @@ impl MangaApp {
 
     /// Snapshot dirty overlay pages, save them in a background thread, then merge the
     /// unsaved staging dir into the project folder and remove the staging dir on completion.
+    ///
+    /// ABORTS (reporting a save failure and leaving the staging dir and the dirty state untouched)
+    /// whenever the typing text flush cannot be shown to have persisted the live state: the flush
+    /// could not run, a resident page failed to enqueue, or the merge worker's barrier reports a
+    /// failed text write for an owned page. The merge is destructive — it deletes the staging dir —
+    /// and its `owned_text_pages` contract makes an unverified empty set indistinguishable from
+    /// "this session owns nothing", so proceeding on one silently discards the user's newest text.
     fn start_save_to_project(&mut self) {
         if self.save_to_project_rx.is_some() {
             return;
@@ -1108,7 +1202,56 @@ impl MangaApp {
         // before the unsaved→committed merge. The typing tab owns text persistence now. The returned set
         // is the OWNED text pages (doc-resident this session) — the merge replaces those pages' text and
         // preserves committed text for pages NOT in it (no silent drop on a PS raster-only edit).
-        let owned_text_pages = self.typing_tab.flush_text_layers();
+        //
+        // The owned set is only meaningful if the flush RAN. Degrading an `Err` into an empty set is
+        // not the safe outcome it looks like: an empty set tells the merge that this session owns no
+        // page's text, so it preserves the COMMITTED text everywhere, drops whatever staging holds, and
+        // then deletes the staging dir — and it reports success. Since text edits are deferred, the
+        // newest text may exist ONLY in memory, and staging is the only on-disk copy of every earlier
+        // deferred write (and of anything recovered from a crashed session). Abort instead: nothing is
+        // merged, staging is untouched, the dirty state survives, and the user is told the save did not
+        // happen.
+        //
+        // `NoLayersDir`/`NoLayerDoc` here would mean a project with no pages at all: any real save
+        // wires the typing loader first — either `all_pages_loaded` was true (which requires the loader
+        // to have run) or the deferred path called `begin_preload_all_pages`, which wires it. Refusing
+        // such a save is harmless; weakening this guard to wave those variants through would re-open
+        // the silent-destruction hole for a session that recovered a staging dir without opening the
+        // Text tab.
+        let owned_text_pages = match self.typing_tab.flush_text_layers() {
+            Ok(outcome) if outcome.failed_pages == 0 => outcome.owned_pages,
+            // Same class, one step earlier than the barrier check in the worker below: a resident page
+            // whose enqueue FAILED is absent from `owned_pages`, so the merge would preserve that
+            // page's stale committed text, delete staging, and report success — while the edit the
+            // user just made is still only in memory.
+            Ok(outcome) => {
+                runtime_log::log_error(format!(
+                    "[save_to_project] aborted: {} of {} resident page(s) could not enqueue their text \
+                     to the layer saver (cause logged per page). Nothing was merged, '{}' is intact, \
+                     and the session stays unsaved — merging now would have preserved stale committed \
+                     text for those pages and then deleted the staging dir.",
+                    outcome.failed_pages,
+                    outcome.failed_pages + outcome.owned_pages.len(),
+                    self.project.paths.unsaved_dir.display()
+                ));
+                self.save_to_project_status = Some((
+                    tf!("app.save.error", err = t!("app.save.text_not_written")),
+                    0.0,
+                ));
+                return;
+            }
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[save_to_project] aborted: the typing text flush could not run: {err}. Nothing \
+                     was merged and '{}' is intact; the session's text edits are still live in memory \
+                     and remain unsaved.",
+                    self.project.paths.unsaved_dir.display()
+                ));
+                self.save_to_project_status =
+                    Some((tf!("app.save.error", err = tf!("app.save.text_flush_error", err = err)), 0.0));
+                return;
+            }
+        };
         // Capture the background layer-saver handle on the GUI thread (cheap Sender clone; no doc lock
         // held during the merge). The PS `flush_layers` + typing `flush_text_layers` above now ENQUEUE
         // their page writes; the merge worker must BARRIER the saver before reading the staging
@@ -1134,12 +1277,38 @@ impl MangaApp {
             // + effects from the flushes above) is on disk, so the merge reads a complete staging
             // `layers.json`. This barrier runs in the worker, never on the GUI thread.
             let failed_pages = saver_handle.map_or_else(HashSet::new, |handle| handle.barrier_blocking());
-            // A failed staging write is not authoritative: preserve its committed text instead of
-            // overwriting it with incomplete or stale staging data.
-            let effective_owned_text_pages: HashSet<usize> = owned_text_pages
-                .difference(&failed_pages)
-                .copied()
-                .collect();
+            // The barrier reports the pages whose latest TEXT write FAILED. For a page this session
+            // OWNS, neither merge option is correct: taking staging writes text that never landed, and
+            // dropping the page from the owned set preserves the committed text the user just edited
+            // away. Either way the merge would then delete the staging dir and the save would report
+            // success, while the newer text — post-deferral, possibly only ever in memory — is gone.
+            // Abort with staging intact instead of degrading silently.
+            let mut unwritten_owned: Vec<usize> =
+                owned_text_pages.intersection(&failed_pages).copied().collect();
+            unwritten_owned.sort_unstable();
+            if !unwritten_owned.is_empty() {
+                // This thread TOOK the clean-overlay dirty snapshots from the model and is not going to
+                // write them; without the restore their dirty state would be lost with the abort.
+                if let Ok(mut overlays) = clean_overlays_model.lock() {
+                    overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
+                }
+                runtime_log::log_error(format!(
+                    "[save_to_project] aborted: the layer saver barrier reported a FAILED text write \
+                     for {} owned page(s): {unwritten_owned:?} (cause logged per page by the saver). \
+                     Nothing was merged and '{}' is intact, so the session keeps its edits and stays \
+                     unsaved.",
+                    unwritten_owned.len(),
+                    unsaved_dir.display()
+                ));
+                if tx.send(Err(t!("app.save.text_not_written").to_string())).is_err() {
+                    runtime_log::log_error(
+                        "[save_to_project] result receiver dropped before the text-write abort could be reported",
+                    );
+                }
+                return;
+            }
+            // Every owned page's text is on disk: the set is authoritative for the merge as it stands.
+            let effective_owned_text_pages: HashSet<usize> = owned_text_pages;
             if let Err(err) = save_overlay_snapshots_guarded(
                 &unsaved_clean_layers_dir,
                 &dirty_overlay_snapshots,
@@ -1220,6 +1389,18 @@ impl MangaApp {
         if self.pending_exit_cleanup.is_some() {
             return;
         }
+        // This is the DISCARD path: latch it before anything else. `on_exit` must not flush after this
+        // (its typing flush would re-create the staging dir being deleted, with the very edits the user
+        // discarded), and `refresh_unsaved_changes_cache` must stop recomputing (a re-latch would
+        // re-open the exit dialog and make discard-and-exit impossible).
+        self.discarding_unsaved_changes = true;
+        // Drop the typing tab's DEFERRED text edits. Nothing else clears them, and every remaining
+        // writer path would otherwise resurrect them: the saver is shut down just below, so a pending
+        // write re-dispatched afterwards takes `enqueue_page_text_save`'s SYNC fallback and re-creates
+        // `_unsaved/layers/` after the delete job removed it. Keeping them also keeps
+        // `has_pending_text_edits` true, which re-latches the unsaved-changes cache. Deliberately a
+        // DROP, not a flush: `README_AGENT.md` — "The DISCARD path must NOT flush".
+        self.typing_tab.discard_pending_text_edits();
         // Stop the layer saver BEFORE deleting the unsaved dir. The discard path removes the staging
         // folder the saver writes into; a still-running saver could recreate files mid/post deletion,
         // leaving the staging dir partially present. `shutdown_saver` drains the queue then JOINS the
@@ -1233,6 +1414,32 @@ impl MangaApp {
         let rx = Self::spawn_unsaved_delete_job(self.project.paths.unsaved_dir.clone());
         self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
         self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
+    }
+
+    /// Un-latches the DISCARD path after its staging cleanup FAILED, handing a coherent state back to
+    /// the app that is about to keep running.
+    ///
+    /// `start_exit_cleanup` latches `discarding_unsaved_changes` and silences every persistence path on
+    /// the assumption that the process ends moments later. When the cleanup fails instead, that
+    /// assumption is void and the latch becomes a permanent lie: `refresh_unsaved_changes_cache` would
+    /// pin `has_unsaved_changes_cached` to false forever (no unsaved-changes prompt on any later close)
+    /// and `on_exit` would skip the typing text flush for the rest of the session, so every later
+    /// deferred edit would be dropped without a word.
+    ///
+    /// The session is re-reported as UNSAVED rather than recomputed. The discard did not complete, so
+    /// the staging dir is in an unknown, possibly partial state (a `remove_dir_all` failure means it is
+    /// still there) while the shared document still holds every text edit of the session. A recompute
+    /// could answer "clean" — `start_exit_cleanup` has already dropped the typing tab's pending-edit
+    /// flags — and claiming a clean session right after a failed discard is exactly the false negative
+    /// that hides the exit dialog. Being sticky-unsaved is the conservative, correct direction: the
+    /// next close offers save/discard again.
+    ///
+    /// Known degradation this does NOT undo: `start_exit_cleanup` also shut the layer saver down, so
+    /// later text writes take `enqueue_page_text_save`'s synchronous fallback. Writes still land; only
+    /// the coalescing is gone, and restarting the saver is out of scope for a failed-teardown path.
+    fn abort_discard_after_failed_cleanup(&mut self) {
+        self.discarding_unsaved_changes = false;
+        self.has_unsaved_changes_cached = true;
     }
 
     fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
@@ -1272,16 +1479,27 @@ impl MangaApp {
             Ok(Err(err)) => {
                 self.pending_exit_cleanup = None;
                 self.exit_dialog = None;
+                // The discard did not happen and the window is NOT being closed: control returns to a
+                // running app, so the discard latch must go with it.
+                self.abort_discard_after_failed_cleanup();
                 let msg = tf!("app.cleanup.error", err = err);
                 self.save_to_project_status = Some((msg.clone(), now));
-                runtime_log::log_error(format!("[exit] {msg}"));
+                runtime_log::log_error(format!(
+                    "[exit] {msg}. The staging dir was not removed; the discard latch is released and \
+                     the session is reported as unsaved again so the next close offers save/discard."
+                ));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.pending_exit_cleanup = None;
+                // Same as above: the cleanup worker died without a verdict, the app keeps running.
+                self.abort_discard_after_failed_cleanup();
                 let msg = t!("app.cleanup.thread_crashed").to_string();
                 self.save_to_project_status = Some((msg.clone(), now));
-                runtime_log::log_error(format!("[exit] {msg}"));
+                runtime_log::log_error(format!(
+                    "[exit] {msg} The staging dir's state is unknown; the discard latch is released \
+                     and the session is reported as unsaved again."
+                ));
             }
         }
     }
@@ -1797,6 +2015,15 @@ impl MangaApp {
         // unchanged page skips a redundant snapshot+enqueue on every tab switch.
         if entering_from_ps && self.active_tab != AppTab::PsEditor {
             self.ps_editor_tab.flush_layers_if_dirty(&self.project);
+        }
+        // Leaving the Text tab: write any DEFERRED text-layer edit. Typing defers edit writes to a
+        // focus-loss point, and its own flush points (selection change, page change, idle debounce) all
+        // run from its per-frame `draw` — which stops being called the moment the tab is switched away.
+        // Without this, the layer that had focus at the switch would keep its edit unwritten until the
+        // user came back. Same dirty-gated shape as the PS block above.
+        if self.prev_view_tab == Some(AppTab::Typing) && self.active_tab != AppTab::Typing {
+            self.typing_tab
+                .flush_text_layers_if_dirty(TypingSaveFlushReason::TabLeave);
         }
         match self.active_tab {
             AppTab::Translation | AppTab::Cleaning | AppTab::Typing => {
@@ -2983,11 +3210,12 @@ impl eframe::App for MangaApp {
     }
 
     /// Final shutdown drain for the background layer saver: called by eframe on real process exit
-    /// (window close, return-to-launcher, or any other teardown). Blocks until every queued layer
-    /// write is flushed and the worker thread is joined, so no pending raster/text/effects write is
-    /// lost on exit. Must NOT hold the doc lock across the barrier: it clones the handle, drops the
-    /// lock, then barriers; finally `shutdown_saver` drains the queue + joins the worker. Relying on
-    /// Arc-drop ordering alone is unsafe (a lingering Arc clone in a worker could skip the join).
+    /// (window close, return-to-launcher, or any other teardown). Flushes the typing tab's deferred
+    /// text edits, then blocks until every queued layer write is flushed and the worker thread is
+    /// joined, so no pending raster/text/effects write is lost on exit. Must NOT hold the doc lock
+    /// across the barrier: it clones the handle, drops the lock, then barriers; finally
+    /// `shutdown_saver` drains the queue + joins the worker. Relying on Arc-drop ordering alone is
+    /// unsafe (a lingering Arc clone in a worker could skip the join).
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_overlay_autosave();
         // Release decode workers parked on the look-ahead window: after this frame nothing
@@ -2995,15 +3223,40 @@ impl eframe::App for MangaApp {
         // parked workers (and the pool joiner) would leak. Workers blocked on `send` exit on
         // their own once the receivers drop with `self`.
         self.loader_shutdown.store(true, AtomicOrdering::Release);
+        // 0) Write the typing tab's DEFERRED text edits — necessarily BEFORE the barrier below.
+        // Typing does not write an edit as it happens (that would write every drag frame); it writes at
+        // a focus-loss point, and closing the app is a focus loss no in-tab flush point observes. The
+        // barrier is what guarantees bytes on disk, but it can only cover writes already ENQUEUED, so a
+        // still-deferred edit must be enqueued first or it is lost on close. This flush enqueues INLINE
+        // on this thread (not via the detached placement-save worker, which has no quiescence handle and
+        // would race the barrier), so step 1 covers it. No-op when nothing is dirty.
+        //
+        // SKIPPED on the discard path: `start_exit_cleanup` deletes the staging dir on purpose and has
+        // already dropped the pending edits, so a flush here would write back exactly what the user
+        // asked to throw away — and, with the saver already shut down, `enqueue_page_text_save`'s
+        // synchronous fallback would re-create the deleted `_unsaved/layers/` dir to do it.
+        if self.discarding_unsaved_changes {
+            runtime_log::log_info(
+                "[app] on_exit: discard path — pending typing text edits dropped, not flushed",
+            );
+        } else {
+            self.typing_tab
+                .flush_text_layers_if_dirty(TypingSaveFlushReason::Exit);
+        }
         // 1) Barrier without holding the lock (clone the handle, drop the guard, then block).
         let handle = self
             .layer_doc
             .lock()
             .ok()
             .and_then(|guard| guard.saver_handle());
+        // Pages the barrier reported as FAILED writes. Teardown has no project merge left to reconcile
+        // them with, but the result must still be inspected and reported: since typing text edits are
+        // deferred, this barrier is the ONLY durability signal a deferred edit ever gets, and exiting
+        // with a cheerful "drained" line while pages silently failed to write hides real data loss.
+        let mut barrier_failed_pages: Vec<usize> = Vec::new();
         if let Some(handle) = handle {
-            // Teardown only drains writes; no project merge remains to reconcile failed pages.
-            let _ = handle.barrier_blocking();
+            barrier_failed_pages = handle.barrier_blocking().into_iter().collect();
+            barrier_failed_pages.sort_unstable();
         }
         // 2) Drain remaining queue + join the worker thread (idempotent; safe if already shut down).
         if let Ok(mut guard) = self.layer_doc.lock() {
@@ -3011,7 +3264,19 @@ impl eframe::App for MangaApp {
         } else {
             runtime_log::log_error("[app] on_exit: shared doc lock poisoned, saver not joined");
         }
-        runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
+        if barrier_failed_pages.is_empty() {
+            runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
+        } else {
+            // Exit still proceeds — nothing can retry a write at teardown — but it must not claim success.
+            runtime_log::log_error(format!(
+                "[app] on_exit: layer saver shut down, but the teardown barrier reported {} page(s) \
+                 whose layer write FAILED: {:?}. Their layer data (including any deferred typing text \
+                 edit flushed above) is NOT in the staging dir. Cause is logged per page by the saver; \
+                 exit continues because no retry is possible at teardown.",
+                barrier_failed_pages.len(),
+                barrier_failed_pages
+            ));
+        }
 
         // 3) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
         // `on_exit` fires on both program close and return-to-launcher, so this is the one save point.
@@ -3070,6 +3335,65 @@ fn save_trigger_decision(
 #[must_use]
 fn deferred_save_ready(preload_active: bool) -> bool {
     !preload_active
+}
+
+/// Verdict of the typing-text quiesce that must precede a structural page operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageOpTextQuiesce {
+    /// The typing tab owes nothing to the disk: the transaction may start.
+    Quiesced,
+    /// Text edits exist that did not reach the staging dir. Starting the transaction would strand them.
+    EditsUnwritten,
+    /// The shared layer document could not be read at all, so nothing about it can be trusted.
+    DocUnreadable,
+}
+
+/// Pure gate for the typing-text quiesce in [`MangaApp::start_page_op`]: may the structural page
+/// transaction start?
+///
+/// A page operation remaps the page-keyed trees on disk and is followed by a project RELOAD that
+/// replaces the in-memory document. Anything the typing tab still owes the disk when it starts is
+/// therefore lost, or resurfaces keyed to an obsolete page index — and since text edits are deferred,
+/// that can be everything the user typed since the last flush point. The quiesce is a PRECONDITION,
+/// not a courtesy.
+///
+/// Arguments are the flush attempt's outcome: `flush_error` is its failure (if any), `failed_pages` is
+/// `TypingTextFlushOutcome::failed_pages`, and `had_pending_edits` is `has_pending_text_edits()` read
+/// BEFORE the flush (a successful flush clears the dirty state, so reading it after would always say
+/// "nothing pending").
+///
+/// The `NoLayersDir`/`NoLayerDoc` arm is why this is not a blanket "abort on `Err`": those mean the
+/// typing text store was never wired this session — the user never opened the Text tab — so the tab
+/// has written nothing and owes nothing, and page operations must keep working for them. Only an
+/// unwritten edit makes an unwired store an abort, and the tab cannot hold one without having been
+/// drawn (which wires the store). `DocLockPoisoned` is not in that arm: it means the shared document
+/// itself is unreadable, so the PS editor's text is equally unaccounted for and `had_pending_edits`
+/// cannot speak for it.
+#[must_use]
+fn page_op_text_quiesce(
+    flush_error: Option<TypingTextFlushError>,
+    failed_pages: usize,
+    had_pending_edits: bool,
+) -> PageOpTextQuiesce {
+    match flush_error {
+        Some(TypingTextFlushError::DocLockPoisoned) => PageOpTextQuiesce::DocUnreadable,
+        Some(TypingTextFlushError::NoLayersDir | TypingTextFlushError::NoLayerDoc) => {
+            if had_pending_edits {
+                PageOpTextQuiesce::EditsUnwritten
+            } else {
+                PageOpTextQuiesce::Quiesced
+            }
+        }
+        // The flush ran, so it is authoritative for every resident page it enqueued. A page it could
+        // NOT enqueue is a real write failure whose text is not in staging for the remap to carry.
+        None => {
+            if failed_pages == 0 {
+                PageOpTextQuiesce::Quiesced
+            } else {
+                PageOpTextQuiesce::EditsUnwritten
+            }
+        }
+    }
 }
 
 fn ai_backend_version_warning_message(studio_version: &str, backend_version: &str) -> String {
@@ -3988,13 +4312,91 @@ fn copy_dir_overwrite_except(src: &Path, dst: &Path, skip: &Path) -> Result<(), 
 mod tests {
     use super::{
         CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
-        CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, SaveGateDecision,
-        ai_backend_version_warning_message, apply_hint_collapsed_to_config_root,
-        decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
-        save_trigger_decision, should_seed_page_cache_on_initial_load,
+        CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, PageOpTextQuiesce, SaveGateDecision,
+        TypingTextFlushError, ai_backend_version_warning_message,
+        apply_hint_collapsed_to_config_root, decode_idx_within_window, deferred_save_ready,
+        hint_collapsed_from_user_settings, page_op_text_quiesce, save_trigger_decision,
+        should_seed_page_cache_on_initial_load,
     };
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
     use serde_json::{Value, json};
+
+    #[test]
+    fn page_op_quiesce_proceeds_when_the_flush_enqueued_every_resident_page() {
+        // The normal path: the flush ran and nothing failed, so the transaction may remap the trees.
+        // Whether an edit was pending before the flush is irrelevant — it has just been staged.
+        assert_eq!(
+            page_op_text_quiesce(None, 0, true),
+            PageOpTextQuiesce::Quiesced
+        );
+        assert_eq!(
+            page_op_text_quiesce(None, 0, false),
+            PageOpTextQuiesce::Quiesced
+        );
+    }
+
+    #[test]
+    fn page_op_quiesce_aborts_when_a_resident_page_failed_to_enqueue() {
+        // The flush ran but a page's text never reached the saver: it is not in staging for the remap
+        // to carry, so the transaction must not start regardless of the tab's dirty flags.
+        assert_eq!(
+            page_op_text_quiesce(None, 1, false),
+            PageOpTextQuiesce::EditsUnwritten
+        );
+        assert_eq!(
+            page_op_text_quiesce(None, 3, true),
+            PageOpTextQuiesce::EditsUnwritten
+        );
+    }
+
+    #[test]
+    fn page_op_quiesce_aborts_when_a_pending_edit_could_not_be_flushed() {
+        // The flush could not run at all AND the tab was holding an unwritten edit: the transaction
+        // would remap the page-keyed trees without it and the reload behind it would drop it.
+        for err in [
+            TypingTextFlushError::NoLayersDir,
+            TypingTextFlushError::NoLayerDoc,
+        ] {
+            assert_eq!(
+                page_op_text_quiesce(Some(err), 0, true),
+                PageOpTextQuiesce::EditsUnwritten,
+                "{err:?} with a pending edit must abort"
+            );
+        }
+    }
+
+    #[test]
+    fn page_op_quiesce_proceeds_when_the_text_store_was_never_wired() {
+        // Regression guard: the typing text store is wired lazily, by the Text tab's first draw. A
+        // user who goes straight to the page manager without ever opening Text gets `NoLayersDir` on
+        // every page operation. The tab has written nothing and owes nothing there, so a blanket
+        // "abort on Err" would break page operations outright for them.
+        for err in [
+            TypingTextFlushError::NoLayersDir,
+            TypingTextFlushError::NoLayerDoc,
+        ] {
+            assert_eq!(
+                page_op_text_quiesce(Some(err), 0, false),
+                PageOpTextQuiesce::Quiesced,
+                "{err:?} with nothing pending must not block the page operation"
+            );
+        }
+    }
+
+    #[test]
+    fn page_op_quiesce_aborts_on_a_poisoned_doc_lock_even_with_nothing_pending() {
+        // A poisoned lock is not "the store was never wired": the shared document is unreadable, so
+        // the PS editor's text is unaccounted for too and the typing tab's dirty flags cannot speak
+        // for it. Never start a structural transaction against it.
+        assert_eq!(
+            page_op_text_quiesce(Some(TypingTextFlushError::DocLockPoisoned), 0, false),
+            PageOpTextQuiesce::DocUnreadable
+        );
+        assert_eq!(
+            page_op_text_quiesce(Some(TypingTextFlushError::DocLockPoisoned), 0, true),
+            PageOpTextQuiesce::DocUnreadable
+        );
+    }
 
     #[test]
     fn apply_hint_collapsed_writes_two_flags_and_preserves_other_keys() {

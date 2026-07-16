@@ -5,8 +5,27 @@ Purpose:
 Text-overlay persistence for the typing tab: reconciling live overlay MODEL state
 into the shared `LayerDoc` and flushing/saving it to the on-disk `layers.json`
 staging payload. Covers background save-job polling, save requests/spawning,
-per-page and whole-doc text flushes, and pixel-rounding of overlay positions
-(which triggers a placement save).
+per-page and whole-doc text flushes, pixel-rounding of overlay positions, and the
+DEFERRED-save policy that decides WHEN an edit is written.
+
+Deferred-save policy (see `MODULE_README.md` "Contracts and invariants"):
+an EDIT calls `mark_placement_save_dirty` and writes nothing; the write happens at a
+flush point — selection change, page change, tab leave, idle debounce, or app exit.
+STRUCTURAL changes (deletions) bypass this and write eagerly.
+
+A flush point may retire its dirty state ONLY once a write is genuinely dispatched:
+`request_overlay_placement_save` reports that through `PlacementSaveDispatch`, and
+`flush_text_layers` through `Result<TypingTextFlushOutcome, TypingTextFlushError>`.
+
+Key functions:
+- mark_placement_save_dirty() / has_pending_placement_save() / clear_placement_save_dirty()
+- discard_pending_placement_save(): drop everything unwritten (DISCARD path only)
+- flush_placement_save_if_dirty(): in-session flush, detached writer
+- drive_placement_save_debounce(): per-frame idle timer + the repaint that makes it fire
+- flush_placement_save_on_page_change(): page-crossing flush
+- flush_text_layers_if_dirty(): INLINE flush for tab leave / exit (barrier-safe)
+- request_overlay_placement_save() / spawn_overlay_placement_save(): the writer itself
+- flush_text_layers(): whole-doc flush for save-to-project (returns OWNED pages)
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods keep their original visibility
@@ -58,7 +77,217 @@ impl TypingTextOverlayLayer {
         true
     }
 
-    pub(super) fn request_overlay_placement_save(&mut self) {
+    /// Records that an EDIT changed a text layer, WITHOUT writing anything.
+    ///
+    /// The write happens later, at a flush point (`flush_placement_save_if_dirty` /
+    /// `flush_text_layers_if_dirty`). Re-marking while already dirty RESTARTS the idle window (by
+    /// clearing the seed, which the next frame re-seeds), so a continuous gesture — a drag re-marking
+    /// every frame — keeps pushing the deadline out and writes ONCE on settle instead of per frame.
+    ///
+    /// Use this for edits only. STRUCTURAL changes (deletions) must keep saving EAGERLY through
+    /// `dispatch_structural_placement_save`: their durability must not depend on a flush point being
+    /// reached, or a deleted layer could resurrect from stale on-disk state.
+    pub(super) fn mark_placement_save_dirty(&mut self) {
+        self.placement_save_dirty = true;
+        self.placement_save_dirty_since_s = None;
+    }
+
+    /// Whether any text-layer write is still owed to the disk.
+    ///
+    /// Covers all THREE axes:
+    /// - `placement_save_dirty` — geometry/placement edits marked but not yet flushed;
+    /// - `edit_render_data_dirty` — a completed edit render whose `render_data` is not yet persisted;
+    /// - `save_requested_while_busy` — a flush that already ran but could only PARK behind an in-flight
+    ///   save/create/edit render. It writes nothing until `poll_save_jobs` / `poll_edit_overlay_jobs`
+    ///   re-fires it, so until then the edit is exactly as unwritten as a dirty flag: leaving it out
+    ///   let a parked write be dropped by an exit or tab-leave flush that saw "nothing pending".
+    ///
+    /// The three have separate clear rules but mean the same thing to the writer
+    /// (`request_overlay_placement_save` persists whatever is live), so flush points consult them
+    /// through this one helper rather than deciding per flag.
+    #[must_use]
+    pub(super) fn has_pending_placement_save(&self) -> bool {
+        self.placement_save_dirty || self.edit_render_data_dirty || self.save_requested_while_busy
+    }
+
+    /// Clears both dirty axes and the idle window. Call only when the pending edit has been WRITTEN
+    /// (dispatched to the save pipeline) or has become moot (chapter reset, or an eager save that
+    /// already persisted it) — never before a write attempt, or a failed attempt would leave the edit
+    /// looking clean forever.
+    ///
+    /// Deliberately does NOT clear `save_requested_while_busy`: that flag is the only record of a
+    /// parked write, and `poll_save_jobs` / `poll_edit_overlay_jobs` own its lifetime. Dropping it here
+    /// would silently cancel a re-fire — including one requested by an EAGER structural save.
+    pub(super) fn clear_placement_save_dirty(&mut self) {
+        self.placement_save_dirty = false;
+        self.placement_save_dirty_since_s = None;
+        self.edit_render_data_dirty = false;
+    }
+
+    /// DROPS all pending text-save state without writing: both dirty axes, the idle window, AND the
+    /// parked re-fire. DISCARD path only (`app.rs::start_exit_cleanup`).
+    ///
+    /// Unlike `clear_placement_save_dirty` this also cancels `save_requested_while_busy`, because on
+    /// the discard path a re-fire is not a lost write to protect but an unwanted one: it would run
+    /// against a staging dir that is being deleted, and (with the saver already shut down) take
+    /// `enqueue_page_text_save`'s synchronous fallback, re-creating that dir with the discarded edits.
+    pub(super) fn discard_pending_placement_save(&mut self) {
+        self.clear_placement_save_dirty();
+        self.save_requested_while_busy = false;
+    }
+
+    /// Writes a deferred edit if one is pending, via the normal detached placement-save worker.
+    ///
+    /// This is the in-session flush point used by focus loss, page change, and the idle debounce. It is
+    /// NOT sufficient at app exit: `request_overlay_placement_save` detaches a `thread::spawn` that
+    /// would race the layer-saver barrier. Exit and tab-leave use `flush_text_layers_if_dirty`, which
+    /// enqueues inline on the calling thread.
+    ///
+    /// The dirty state is cleared ONLY once the write is genuinely owned by the save pipeline
+    /// (`Started` or `Parked`). On `NotWired` nothing was written and the state stays dirty, so the
+    /// next flush point retries; clearing there would mark the edit saved forever — the debounce would
+    /// stop arming its repaint, `has_pending_placement_save` would go false, and tab-leave/exit would
+    /// no longer retry, which at exit is silent data loss (the barrier cannot cover a job that was
+    /// never enqueued).
+    pub(super) fn flush_placement_save_if_dirty(&mut self, reason: TypingSaveFlushReason) {
+        if !self.has_pending_placement_save() {
+            return;
+        }
+        let dispatch = self.request_overlay_placement_save();
+        match dispatch {
+            PlacementSaveDispatch::Started | PlacementSaveDispatch::Parked => {
+                self.clear_placement_save_dirty();
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "deferred text save flushed reason={} dispatch={}",
+                    reason.as_trace_str(),
+                    dispatch.as_trace_str()
+                );
+            }
+            PlacementSaveDispatch::NotWired => {
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "deferred text save NOT dispatched (persistence not wired), staying dirty reason={}",
+                    reason.as_trace_str()
+                );
+            }
+        }
+    }
+
+    /// Dispatches an EAGER structural save (a deletion) and settles the deferred-edit state with it.
+    ///
+    /// Structural writes are never deferred: a deletion's durability must not wait on a flush point
+    /// being reached, or the layer could resurrect from the stale on-disk set. The dispatch persists
+    /// the whole live text state, so it also satisfies any pending deferred edit — but only if it was
+    /// really dispatched, hence the same clear-after-dispatch rule the deferred flush points follow.
+    ///
+    /// `what` is a short English description of the structural change, used only for the diagnostic log.
+    pub(super) fn dispatch_structural_placement_save(&mut self, what: &str) {
+        match self.request_overlay_placement_save() {
+            PlacementSaveDispatch::Started | PlacementSaveDispatch::Parked => {
+                self.clear_placement_save_dirty();
+            }
+            PlacementSaveDispatch::NotWired => {
+                crate::runtime_log::log_warn(format!(
+                    "[typing] {what} was not persisted: no staging layers dir / shared document is \
+                     wired, so nothing was written and the on-disk set is unchanged."
+                ));
+            }
+        }
+    }
+
+    /// Per-frame idle-debounce tick: seeds the window for a fresh mark, flushes once the window has
+    /// been open for `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS`, and otherwise schedules the wake that makes
+    /// the deadline reachable.
+    ///
+    /// The `request_repaint_after` is load-bearing, not an optimization: egui does not draw frames
+    /// while idle, so with no pending input NOTHING would call this again and the debounce would never
+    /// fire — the edit would sit unwritten until the user happened to interact. This is the only thing
+    /// that makes a walk-away edit crash-recoverable from the `_unsaved` staging dir.
+    pub(super) fn drive_placement_save_debounce(&mut self, ctx: &egui::Context) {
+        let now_s = ctx.input(|i| i.time);
+        let (window_start_s, should_flush) = placement_save_debounce_tick(
+            self.has_pending_placement_save(),
+            self.placement_save_dirty_since_s,
+            now_s,
+        );
+        self.placement_save_dirty_since_s = window_start_s;
+        if should_flush {
+            self.flush_placement_save_if_dirty(TypingSaveFlushReason::Idle);
+            return;
+        }
+        if let Some(start) = window_start_s {
+            let remaining = (PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS - (now_s - start)).max(0.0);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+        }
+    }
+
+    /// Flushes a deferred edit when the canvas's derived current page changes.
+    ///
+    /// The typing canvas is a continuous scroll strip, so the page is derived per frame and changes as
+    /// the user scrolls; a flush per page crossed is cheap and is a genuine focus loss for the layer
+    /// being edited. The FIRST observation only seeds `last_page_idx` — without that guard a
+    /// freshly-loaded chapter would flush against an uninitialized page on its first frame.
+    pub(super) fn flush_placement_save_on_page_change(&mut self, page_idx: usize) {
+        let changed = self.last_page_idx.is_some_and(|last| last != page_idx);
+        self.last_page_idx = Some(page_idx);
+        if changed {
+            self.flush_placement_save_if_dirty(TypingSaveFlushReason::PageChange);
+        }
+    }
+
+    /// Flushes a deferred edit INLINE on the calling thread, for the two points where the detached
+    /// worker path is unsafe.
+    ///
+    /// Routes through `flush_text_layers` (which enqueues each resident page to the coalescing saver on
+    /// THIS thread) rather than `request_overlay_placement_save` (which detaches a `thread::spawn`).
+    /// At exit that distinction is the whole point: the detached writer has no quiescence handle, so it
+    /// would race `on_exit`'s layer-saver barrier and the edit could be lost. Enqueuing inline puts the
+    /// job in the saver's FIFO BEFORE the barrier runs, so the barrier covers it.
+    ///
+    /// Does no PNG encoding on this thread (the saver worker does that), so it is safe at a tab switch.
+    ///
+    /// The dirty state is cleared by `flush_text_layers` itself, and only when the flush actually ran
+    /// and every resident page enqueued. A flush that could not run (no dir/doc, poisoned lock) leaves
+    /// it dirty so a later flush point retries instead of treating the edit as saved.
+    pub(super) fn flush_text_layers_if_dirty(&mut self, reason: TypingSaveFlushReason) {
+        if !self.has_pending_placement_save() {
+            return;
+        }
+        match self.flush_text_layers() {
+            Ok(outcome) => {
+                crate::trace_log!(
+                    cat::PERSIST,
+                    "deferred text save flushed inline reason={} owned_pages={} failed_pages={}",
+                    reason.as_trace_str(),
+                    outcome.owned_pages.len(),
+                    outcome.failed_pages
+                );
+            }
+            Err(err) => {
+                // Left dirty on purpose. At a tab switch a later flush point retries; at EXIT there is
+                // no later point, so this line is the only record that the edit did not reach the disk.
+                crate::runtime_log::log_warn(format!(
+                    "[typing] deferred text flush (reason={}) could not run: {err}. \
+                     The pending text edit stays dirty and was NOT written.",
+                    reason.as_trace_str()
+                ));
+            }
+        }
+    }
+
+    /// Dispatches a placement save for the CURRENT live state and reports whether the save pipeline
+    /// took ownership of the write. See [`PlacementSaveDispatch`]: only `Started`/`Parked` mean the
+    /// write will happen, so only they may retire a caller's dirty state.
+    ///
+    /// Wiring is checked BEFORE the busy check so `Parked` cannot be a lie: `spawn_overlay_placement_save`
+    /// silently returns when no dir/doc is wired, so a request parked without this check could re-fire
+    /// straight into that return and drop the write with the dirty flag already cleared.
+    #[must_use]
+    pub(super) fn request_overlay_placement_save(&mut self) -> PlacementSaveDispatch {
+        if !self.text_persistence_wired() {
+            return PlacementSaveDispatch::NotWired;
+        }
         if self.save_rx.is_some()
             || self.create_render_state.is_some()
             || self.create_raster_state.is_some()
@@ -66,9 +295,20 @@ impl TypingTextOverlayLayer {
             || self.edit_render_rx.is_some()
         {
             self.save_requested_while_busy = true;
-            return;
+            return PlacementSaveDispatch::Parked;
         }
         self.spawn_overlay_placement_save();
+        PlacementSaveDispatch::Started
+    }
+
+    /// Whether text persistence has a destination at all: a staging `layers/` dir AND the shared doc.
+    ///
+    /// Both are wired once when the chapter loader starts (`ensure_loader_started` / `set_layer_doc`)
+    /// and are never unset for the session, so a `true` here stays true — which is what lets a parked
+    /// request assume it will still have somewhere to write when it re-fires.
+    #[must_use]
+    fn text_persistence_wired(&self) -> bool {
+        self.layers_primary_dir.is_some() && self.layer_doc.is_some()
     }
 
     /// Syncs every text overlay's full MODEL state (geometry + deform + grouping + mask_clip) from the
@@ -166,12 +406,20 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// Spawns the detached placement-save worker for the current live state.
+    ///
+    /// Callers must have established that persistence is wired (`text_persistence_wired`) — the
+    /// early returns below are the last line of defence, and they LOG rather than return silently:
+    /// reaching them means a caller believed a write was dispatched when none was.
     pub(super) fn spawn_overlay_placement_save(&mut self) {
         // Text persistence is now owned by the shared doc: route each text overlay's MODEL state into
         // the doc, then flush the doc's INLINE v3 text payload to `layers.json` (staging `layers/`
         // dir). Nothing writes `text_info.json` anymore — the doc is the sole text writer, mirroring
         // how rasters persist.
         let Some(layers_dir) = self.layers_primary_dir.clone() else {
+            crate::runtime_log::log_warn(
+                "[typing] placement save skipped: no staging layers dir is wired, nothing was written",
+            );
             return;
         };
         let fallback_dir = self.layers_fallback_dir.clone();
@@ -181,6 +429,9 @@ impl TypingTextOverlayLayer {
         // doc lock is shared via the Arc; `flush_page_text` writes only text nodes, leaving rasters
         // untouched on disk.
         let Some(doc) = self.layer_doc.clone() else {
+            crate::runtime_log::log_warn(
+                "[typing] placement save skipped: no shared layer document is wired, nothing was written",
+            );
             return;
         };
         let pages: Vec<usize> = pages_with_text.into_iter().collect();
@@ -209,26 +460,40 @@ impl TypingTextOverlayLayer {
     /// Synchronously flushes text into the staging `layers/` dir for EVERY page the shared doc has
     /// resident (not just pages with typing-tab overlays), so staging is text-complete for every page
     /// the session loaded — including deletions and pages only PS visited (which load text into the doc
-    /// too). Returns the set of OWNED text pages (the doc-resident pages flushed): the save-to-project
-    /// merge replaces those pages wholesale (authoritative, incl. deletions) and PRESERVES committed
-    /// text for pages NOT in this set (never loaded this session → the session doesn't own their text,
-    /// so a raster-only PS edit must not drop their committed text). Mirrors the PS editor's
-    /// `flush_layers`; best-effort per page.
-    pub fn flush_text_layers(&mut self) -> std::collections::HashSet<usize> {
+    /// too). `outcome.owned_pages` is the set of OWNED text pages (the doc-resident pages flushed) and
+    /// keeps its exact meaning: the save-to-project merge replaces those pages wholesale (authoritative,
+    /// incl. deletions) and PRESERVES committed text for pages NOT in this set (never loaded this
+    /// session → the session doesn't own their text, so a raster-only PS edit must not drop their
+    /// committed text). Mirrors the PS editor's `flush_layers`; best-effort per page.
+    ///
+    /// Also settles the DEFERRED-save state, but only on a fully successful run: this flush is a
+    /// superset of whatever a deferred edit was waiting to write, so the eager callers
+    /// (save-to-project, the page-op quiesce) make the next flush point a cheap no-op — while a partial
+    /// or impossible flush leaves the edit dirty to be retried.
+    ///
+    /// # Errors
+    /// Returns [`TypingTextFlushError`] when the flush could not run AT ALL: no staging dir, no shared
+    /// doc, or a poisoned doc lock. An `Ok` outcome with an empty `owned_pages` means the flush RAN and
+    /// there were simply no resident pages — the two were indistinguishable while this returned a bare
+    /// set, so a deferred flush point could not tell a failed dispatch from an empty one and cleared
+    /// its dirty state either way.
+    pub fn flush_text_layers(
+        &mut self,
+    ) -> Result<TypingTextFlushOutcome, TypingTextFlushError> {
         let _persist_span = crate::trace_scope!(cat::PERSIST, "flush_text_layers");
-        let mut owned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut outcome = TypingTextFlushOutcome::default();
         let Some(layers_dir) = self.layers_primary_dir.clone() else {
-            return owned;
+            return Err(TypingTextFlushError::NoLayersDir);
         };
         let fallback_dir = self.layers_fallback_dir.clone();
         // Push the live overlay MODEL state into the doc first (geometry/group/mask-clip edits), then
         // flush EVERY resident doc page's text — not only pages with overlays loaded in this tab.
         self.sync_overlay_state_into_doc();
         let Some(doc) = self.layer_doc.clone() else {
-            return owned;
+            return Err(TypingTextFlushError::NoLayerDoc);
         };
         let Ok(mut guard) = doc.lock() else {
-            return owned;
+            return Err(TypingTextFlushError::DocLockPoisoned);
         };
         for page_idx in guard.resident_pages() {
             // ASYNC: enqueue each resident page's text to the coalescing saver (PNG encode off the GUI
@@ -240,15 +505,35 @@ impl TypingTextOverlayLayer {
             // saver, `enqueue_page_text_save` falls back to a synchronous flush, also correct.
             match guard.enqueue_page_text_save(page_idx, &layers_dir, fallback_dir.as_deref()) {
                 Ok(()) => {
-                    owned.insert(page_idx);
+                    outcome.owned_pages.insert(page_idx);
                 }
-                Err(err) => crate::runtime_log::log_warn(format!(
-                    "[typing] flush text page {page_idx} to layers.json failed: {err}"
-                )),
+                Err(err) => {
+                    outcome.failed_pages += 1;
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] flush text page {page_idx} to layers.json failed: {err}"
+                    ));
+                }
             }
         }
-        crate::trace_log!(cat::PERSIST, "flush_text_layers owned_pages={}", owned.len());
-        owned
+        drop(guard);
+        // This flush persists EVERY resident page's text, which is a superset of whatever a deferred
+        // edit was waiting to write, so a fully successful run satisfies any pending deferral. Clearing
+        // here means the eager callers (save-to-project, the page-op quiesce) also settle the deferred
+        // state, making a later flush point a cheap no-op instead of a redundant second write.
+        //
+        // Cleared only AFTER the writes were dispatched, and only when EVERY resident page enqueued: an
+        // early return above wrote nothing, and a partial failure did not persist the live state, so in
+        // both cases the edit must stay dirty for the next flush point to retry.
+        if outcome.failed_pages == 0 {
+            self.clear_placement_save_dirty();
+        }
+        crate::trace_log!(
+            cat::PERSIST,
+            "flush_text_layers owned_pages={} failed_pages={}",
+            outcome.owned_pages.len(),
+            outcome.failed_pages
+        );
+        Ok(outcome)
     }
 
     pub(super) fn round_all_overlay_positions_to_pixels(&mut self) {
@@ -269,6 +554,7 @@ impl TypingTextOverlayLayer {
         for idx in changed_indices {
             self.mark_overlay_geometry_changed(idx, false);
         }
-        self.request_overlay_placement_save();
+        // EDIT (pixel-rounding of placements): deferred to the next flush point.
+        self.mark_placement_save_dirty();
     }
 }
