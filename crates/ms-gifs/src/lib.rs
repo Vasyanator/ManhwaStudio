@@ -81,9 +81,9 @@ pub struct Animation {
 
 /// Decodes an embedded hint into fully composited, non-premultiplied RGBA8 frames.
 ///
-/// This operation is expensive and may allocate tens of megabytes for roughly one
-/// hundred frames. Callers must run it off the GUI thread. Invalid, static, empty,
-/// or dimensionally inconsistent assets return [`GifError`] without panicking.
+/// This operation is expensive: shipped assets reach 175 frames and about 106 MB
+/// of decoded RGBA pixels. Callers must run it off the GUI thread. Invalid, static,
+/// empty, or dimensionally inconsistent assets return [`GifError`] without panicking.
 ///
 /// # Errors
 /// Returns [`GifError::NotAnimated`] for a static WebP, [`GifError::Decoder`] for

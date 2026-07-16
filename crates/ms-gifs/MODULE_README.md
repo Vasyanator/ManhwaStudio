@@ -3,14 +3,14 @@
 ## Purpose
 GUI-free storage and decoding for animated WebP help hints used by ManhwaStudio.
 The assets live in this small crate so ordinary edits to the main crate's `src/`
-do not recompile roughly 1.2 MB of embedded bytes.
+do not recompile roughly 2.9 MB of embedded bytes.
 
 ## Architecture
 `typing` defines each asset as a `Hint`, combining a stable name with bytes
 embedded by `include_bytes!`. The crate root validates the WebP animation layout,
 uses `image-webp` to produce fully composited frames, and normalizes RGB output to
 RGBA. The normalization path supports future alpha-less assets but is not exercised
-by the four currently shipped alpha-bearing animations. The crate has no dependency
+by the eight currently shipped alpha-bearing animations. The crate has no dependency
 on egui or the `image` crate; GUI consumers perform texture upload separately.
 
 Data flow: `typing::<HINT>` -> `decode(Hint)` -> `image-webp` compositing ->

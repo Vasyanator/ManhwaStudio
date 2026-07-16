@@ -721,35 +721,43 @@ impl TypingCreatePanelState {
                                         }
 
                                         let prev_anti_aliasing = self.anti_aliasing;
-                                        let aa_combo = WheelComboBox::from_label(t!("typing.edit.antialias_combo_id")).id_salt("typing.edit.antialias_combo_id")
-                                            .selected_text(anti_aliasing_label(self.anti_aliasing))
-                                            .show_ui_with_wheel(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut self.anti_aliasing,
-                                                    AntiAliasingMode::None,
-                                                    anti_aliasing_label(AntiAliasingMode::None),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.anti_aliasing,
-                                                    AntiAliasingMode::Sharp,
-                                                    anti_aliasing_label(AntiAliasingMode::Sharp),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.anti_aliasing,
-                                                    AntiAliasingMode::Crisp,
-                                                    anti_aliasing_label(AntiAliasingMode::Crisp),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.anti_aliasing,
-                                                    AntiAliasingMode::Strong,
-                                                    anti_aliasing_label(AntiAliasingMode::Strong),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut self.anti_aliasing,
-                                                    AntiAliasingMode::Smooth,
-                                                    anti_aliasing_label(AntiAliasingMode::Smooth),
-                                                );
-                                            });
+                                        // Horizontal row so the animated help icon
+                                        // sits after the combo's right-hand label.
+                                        let aa_combo = ui
+                                            .horizontal(|ui| {
+                                                let aa_combo = WheelComboBox::from_label(t!("typing.edit.antialias_combo_id")).id_salt("typing.edit.antialias_combo_id")
+                                                    .selected_text(anti_aliasing_label(self.anti_aliasing))
+                                                    .show_ui_with_wheel(ui, |ui| {
+                                                        ui.selectable_value(
+                                                            &mut self.anti_aliasing,
+                                                            AntiAliasingMode::None,
+                                                            anti_aliasing_label(AntiAliasingMode::None),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut self.anti_aliasing,
+                                                            AntiAliasingMode::Sharp,
+                                                            anti_aliasing_label(AntiAliasingMode::Sharp),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut self.anti_aliasing,
+                                                            AntiAliasingMode::Crisp,
+                                                            anti_aliasing_label(AntiAliasingMode::Crisp),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut self.anti_aliasing,
+                                                            AntiAliasingMode::Strong,
+                                                            anti_aliasing_label(AntiAliasingMode::Strong),
+                                                        );
+                                                        ui.selectable_value(
+                                                            &mut self.anti_aliasing,
+                                                            AntiAliasingMode::Smooth,
+                                                            anti_aliasing_label(AntiAliasingMode::Smooth),
+                                                        );
+                                                    });
+                                                crate::widgets::HelpHint::new(ms_gifs::typing::ANTI_ALIASING).show(ui);
+                                                aa_combo
+                                            })
+                                            .inner;
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
                                             &aa_combo.inner.response,
@@ -888,10 +896,18 @@ impl TypingCreatePanelState {
                                                 "typing_edit_faux",
                                             );
                                         }
-                                        let hanging_punct_resp = ui.checkbox(
-                                            &mut self.hanging_punctuation,
-                                            t!("typing.params.hanging_punctuation"),
-                                        );
+                                        // Horizontal row so the animated help icon
+                                        // sits after the checkbox label.
+                                        let hanging_punct_resp = ui
+                                            .horizontal(|ui| {
+                                                let resp = ui.checkbox(
+                                                    &mut self.hanging_punctuation,
+                                                    t!("typing.params.hanging_punctuation"),
+                                                );
+                                                crate::widgets::HelpHint::new(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
+                                                resp
+                                            })
+                                            .inner;
                                         mark_hscroll_block_on_hover(
                                             &mut block_hscroll_by_hovered_param,
                                             &hanging_punct_resp,

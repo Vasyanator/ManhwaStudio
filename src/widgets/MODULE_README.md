@@ -51,7 +51,9 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - `seed_spin_box.rs`: seed value input with random generation support.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip plays an animated WebP
   hint from the `ms-gifs` crate. The tooltip contains only the animation (no text, no i18n
-  keys). Decoding always runs on a background `ms_thread` worker (the single `decoding` slot
+  keys), rendered 1:1 (texel = point) and only scaled down, uniformly, when it exceeds
+  500x400 pt — never stretched up to the tooltip width. A decoded hint is up to ~106 MB of
+  RGBA frames. Decoding always runs on a background `ms_thread` worker (the single `decoding` slot
   is released through an RAII guard, so even a panicking worker cannot wedge it); the GUI
   thread uploads one frame at a time into a single reused `TextureHandle`. A process-wide
   single-slot cache (egui temp memory, `Arc<Mutex<..>>`) keeps at most one decoded animation

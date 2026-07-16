@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 # Embedded animated WebP hint assets and their GUI-free decoder. Keeping the
-# ~1.2 MB assets in this crate prevents ordinary edits to the main crate's `src/`
+# ~2.9 MB assets in this crate prevents ordinary edits to the main crate's `src/`
 # from recompiling the embedded bytes. No egui / image dependency by design.
 [dependencies]
 image-webp = "0.2"

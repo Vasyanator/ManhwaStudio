@@ -795,19 +795,24 @@ impl TypingCreatePanelState {
                 // Глобальный поворот всего блока: применяется к векторным контурам
                 // глифов ДО растеризации, поэтому получается чётче, чем поворот уже
                 // готового растра оверлея.
-                let rotation_resp = ui
-                    .add(
-                        WheelSlider::new(&mut self.global_rotation_deg, -180.0..=180.0)
-                            .text(t!("typing.params.global_rotation_label"))
-                            .wheel_step(1.0),
-                    )
-                    .on_hover_text(t!("typing.params.global_rotation_tooltip"));
-                mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &rotation_resp);
-                *changed |= rotation_resp.changed();
-                if let Some(steps) = wheel_steps_if_hovered(ui, &rotation_resp) {
-                    *changed |=
-                        apply_wheel_step_f32(&mut self.global_rotation_deg, steps, 1.0, -180.0, 180.0);
-                }
+                ui.horizontal(|ui| {
+                    // Deliberately two tooltips: the slider keeps its existing
+                    // text tooltip, the "?" icon plays the animated hint.
+                    let rotation_resp = ui
+                        .add(
+                            WheelSlider::new(&mut self.global_rotation_deg, -180.0..=180.0)
+                                .text(t!("typing.params.global_rotation_label"))
+                                .wheel_step(1.0),
+                        )
+                        .on_hover_text(t!("typing.params.global_rotation_tooltip"));
+                    mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &rotation_resp);
+                    *changed |= rotation_resp.changed();
+                    if let Some(steps) = wheel_steps_if_hovered(ui, &rotation_resp) {
+                        *changed |=
+                            apply_wheel_step_f32(&mut self.global_rotation_deg, steps, 1.0, -180.0, 180.0);
+                    }
+                    crate::widgets::HelpHint::new(ms_gifs::typing::GLOBAL_ROTATION).show(ui);
+                });
 
                 // Размещение по линии: перпендикулярный сдвиг глифов относительно
                 // линии/пути. Показывается только для линейных раскладок (формула и
@@ -996,35 +1001,43 @@ impl TypingCreatePanelState {
                 }
 
                 let prev_anti_aliasing = self.anti_aliasing;
-                let aa_combo = WheelComboBox::from_label(t!("typing.create.antialias_combo_id")).id_salt("typing.create.antialias_combo_id")
-                    .selected_text(anti_aliasing_label(self.anti_aliasing))
-                    .show_ui_with_wheel(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.anti_aliasing,
-                            AntiAliasingMode::None,
-                            anti_aliasing_label(AntiAliasingMode::None),
-                        );
-                        ui.selectable_value(
-                            &mut self.anti_aliasing,
-                            AntiAliasingMode::Sharp,
-                            anti_aliasing_label(AntiAliasingMode::Sharp),
-                        );
-                        ui.selectable_value(
-                            &mut self.anti_aliasing,
-                            AntiAliasingMode::Crisp,
-                            anti_aliasing_label(AntiAliasingMode::Crisp),
-                        );
-                        ui.selectable_value(
-                            &mut self.anti_aliasing,
-                            AntiAliasingMode::Strong,
-                            anti_aliasing_label(AntiAliasingMode::Strong),
-                        );
-                        ui.selectable_value(
-                            &mut self.anti_aliasing,
-                            AntiAliasingMode::Smooth,
-                            anti_aliasing_label(AntiAliasingMode::Smooth),
-                        );
-                    });
+                // Horizontal row so the animated help icon sits after the
+                // combo's right-hand label.
+                let aa_combo = ui
+                    .horizontal(|ui| {
+                        let aa_combo = WheelComboBox::from_label(t!("typing.create.antialias_combo_id")).id_salt("typing.create.antialias_combo_id")
+                            .selected_text(anti_aliasing_label(self.anti_aliasing))
+                            .show_ui_with_wheel(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.anti_aliasing,
+                                    AntiAliasingMode::None,
+                                    anti_aliasing_label(AntiAliasingMode::None),
+                                );
+                                ui.selectable_value(
+                                    &mut self.anti_aliasing,
+                                    AntiAliasingMode::Sharp,
+                                    anti_aliasing_label(AntiAliasingMode::Sharp),
+                                );
+                                ui.selectable_value(
+                                    &mut self.anti_aliasing,
+                                    AntiAliasingMode::Crisp,
+                                    anti_aliasing_label(AntiAliasingMode::Crisp),
+                                );
+                                ui.selectable_value(
+                                    &mut self.anti_aliasing,
+                                    AntiAliasingMode::Strong,
+                                    anti_aliasing_label(AntiAliasingMode::Strong),
+                                );
+                                ui.selectable_value(
+                                    &mut self.anti_aliasing,
+                                    AntiAliasingMode::Smooth,
+                                    anti_aliasing_label(AntiAliasingMode::Smooth),
+                                );
+                            });
+                        crate::widgets::HelpHint::new(ms_gifs::typing::ANTI_ALIASING).show(ui);
+                        aa_combo
+                    })
+                    .inner;
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &aa_combo.inner.response);
                 if let Some(steps) = aa_combo.wheel_steps {
                     *changed |= cycle_anti_aliasing(&mut self.anti_aliasing, steps);
@@ -1161,8 +1174,15 @@ impl TypingCreatePanelState {
         let selection_mode = inline_style.is_some();
         ui.add_enabled_ui(!font_missing, |ui| {
             ui.add_enabled_ui(!selection_mode, |ui| {
-                let hanging_punct_resp =
-                    ui.checkbox(&mut self.hanging_punctuation, t!("typing.params.hanging_punctuation"));
+                // Horizontal row so the animated help icon sits after the checkbox label.
+                let hanging_punct_resp = ui
+                    .horizontal(|ui| {
+                        let resp = ui
+                            .checkbox(&mut self.hanging_punctuation, t!("typing.params.hanging_punctuation"));
+                        crate::widgets::HelpHint::new(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
+                        resp
+                    })
+                    .inner;
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &hanging_punct_resp);
                 *changed |= hanging_punct_resp.changed();
                 let trim_spaces_resp =
@@ -1369,6 +1389,13 @@ impl TypingCreatePanelState {
                 align.justify = !align.justify;
                 *changed = true;
             }
+
+            // Animated help for the whole alignment row. Kept OUTSIDE the
+            // `add_enabled_ui(!free_align, ..)` scope above: a disabled icon
+            // would never show its tooltip (`on_hover_ui` is enabled-only,
+            // egui-0.35.0/src/response.rs:645), and the hint must stay
+            // reachable while justify is on.
+            crate::widgets::HelpHint::new(ms_gifs::typing::ALIGNMENT).show(ui);
         });
     }
 

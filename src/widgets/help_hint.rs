@@ -10,7 +10,7 @@ FILE HEADER (widgets/help_hint.rs)
     instance (the same parameter row is drawn from several panels, so the
     cache cannot live in one panel's state).
   - `spawn_decode_thread`: background decode via `ms_thread` (never on the
-    GUI thread — a decoded hint is ~40 MB / ~100+ frames).
+    GUI thread — a decoded hint is up to ~106 MB / up to ~175 frames).
 - Memory contract: at most ONE decoded animation is resident (CPU frames +
   one `TextureHandle` updated in place per frame via `TextureHandle::set`);
   it is evicted a few seconds after the tooltip was last visible. Eviction is
@@ -39,11 +39,15 @@ const ICON_FONT_PT: f32 = 9.0;
 /// How long the decoded animation (CPU frames + GPU texture) stays cached
 /// after its tooltip was last visible, in seconds. 5 s absorbs the common
 /// "re-read the hint" hover pattern while bounding the idle cost of the
-/// largest asset (~40 MB RAM + one ~280 KB texture) to a short window.
+/// largest asset (~106 MB RAM + one ~1.5 MB texture) to a short window.
 const CACHE_RETENTION_SECS: f64 = 5.0;
 /// Lower bound for scheduled repaints, so zero-delay animation frames cannot
 /// degenerate into a busy repaint loop (caps the animation at 120 fps).
 const MIN_REPAINT_DELAY_SECS: f64 = 1.0 / 120.0;
+/// Upper bound (logical points) for the animation inside the tooltip. The
+/// animation renders 1:1 (texel = point) and is only scaled DOWN, uniformly,
+/// when it exceeds this box — never stretched up to the tooltip width.
+const TOOLTIP_MAX_IMAGE_SIZE_PT: Vec2 = Vec2::new(500.0, 400.0);
 
 /// Shared handle to the process-wide hint-animation cache.
 type SharedHelpHintCache = Arc<Mutex<HelpHintCache>>;
@@ -178,8 +182,9 @@ impl HelpHint {
                     // ms-gifs frames are straight (non-premultiplied) RGBA, so
                     // `from_rgba_unmultiplied` is the correct conversion. The
                     // buffer length was validated at decode time, so this
-                    // cannot panic. The upload is a bounded memcpy (~280 KB),
-                    // not long work, so doing it under the cache lock is fine.
+                    // cannot panic. The upload is a bounded memcpy (up to
+                    // ~1.5 MB, i.e. well under a millisecond), not long work,
+                    // so doing it under the cache lock is fine.
                     let image =
                         egui::ColorImage::from_rgba_unmultiplied(active.size, &frame.rgba);
                     match active.texture.as_mut() {
@@ -216,7 +221,16 @@ impl HelpHint {
         }
         match texture {
             Some(handle) => {
-                ui.image(&handle);
+                // 1:1 texel-to-point rendering (user decision): egui's default
+                // `shrink_to_fit` would STRETCH small animations to the tooltip
+                // width (~488 pt) and blur them. `fit_to_original_size(1.0)`
+                // keeps the native size; `max_size` scales oversized assets
+                // DOWN uniformly (`maintain_aspect_ratio` defaults to true).
+                ui.add(
+                    egui::Image::from_texture(&handle)
+                        .fit_to_original_size(1.0)
+                        .max_size(TOOLTIP_MAX_IMAGE_SIZE_PT),
+                );
             }
             None => {
                 // Decode in flight: egui's spinner requests its own repaints
