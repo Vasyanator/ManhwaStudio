@@ -88,10 +88,12 @@ The main data flow is:
    together in `select_raster`, cleared together everywhere). The page pairing is REQUIRED because
    `draw_page_overlays` runs once per visible page — the per-page shortcut handlers (rotate/scale/nudge)
    guard on `selected_raster_page == Some(page_idx)` so one gesture only affects the raster on its own
-   page, not the same bare index on other simultaneously-visible pages. The Ctrl+wheel rotate DEFERS its
-   disk write off the GUI thread via `persist_raster_transform_deferred` (routes the transform to the
-   doc live, then `doc.enqueue_page_save` — the coalescing background saver) instead of a per-notch
-   synchronous manifest rewrite.
+   page, not the same bare index on other simultaneously-visible pages. Ctrl+wheel rotation, keyboard
+   scale/nudge, and image-panel transform sliders DEFER their disk writes off the GUI thread via
+   `persist_raster_transform_deferred`; deformed keyboard nudges use
+   `persist_raster_deform_deferred`. Both route geometry to the doc live, then call
+   `doc.enqueue_page_save` inline so the coalescing background saver and its later durability barriers
+   cover the edit instead of performing a per-event synchronous manifest rewrite.
    Selecting a raster opens the **same right-side edit panel that image
    overlays use** (scale + rotation + the effects cards, no text params): `selected_item_for_edit`
    builds an `Image`-kind `TypingSelectedOverlayForEdit` carrying a `TypingEditTarget::Raster{page,uid}`,

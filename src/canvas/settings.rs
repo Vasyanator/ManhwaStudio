@@ -343,22 +343,27 @@ pub(crate) fn save_canvas_settings_to_project_file(
     Ok(())
 }
 
+/// Persists the shared canvas subset through the serialized user-config RMW boundary.
+///
+/// The process-wide lock is acquired inside [`config::update_user_config_file`] and
+/// remains held from the initial read through the full-file write, preventing a stale
+/// canvas snapshot from erasing a concurrently persisted ORT crash-guard marker.
 pub(crate) fn save_canvas_settings_to_user_file(
     user_settings_file: &Path,
     snapshot: &SharedCanvasSettings,
 ) -> Result<(), String> {
-    let mut root = load_json_object_root(user_settings_file, "user canvas settings file")?;
-    let Some(root_obj) = root.as_object_mut() else {
-        return Err(format!(
-            "user canvas settings root became non-object unexpectedly: '{}'",
-            user_settings_file.display()
-        ));
-    };
-    let mut canvas_obj = root_obj
-        .get("Canvas")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    config::update_user_config_file(user_settings_file, |root| {
+        let Some(root_obj) = root.as_object_mut() else {
+            return Err(anyhow::anyhow!(
+                "user canvas settings root became non-object unexpectedly: '{}'",
+                user_settings_file.display()
+            ));
+        };
+        let mut canvas_obj = root_obj
+            .get("Canvas")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
 
     canvas_obj.insert(
         "bubble_status_rules".to_string(),
@@ -405,12 +410,8 @@ pub(crate) fn save_canvas_settings_to_user_file(
         "translation_status_display".to_string(),
         Value::String(snapshot.translation_status_display.clone()),
     );
-    root_obj.insert("Canvas".to_string(), Value::Object(canvas_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())?;
-    Ok(())
+        root_obj.insert("Canvas".to_string(), Value::Object(canvas_obj));
+        Ok(())
+    })
+    .map_err(|err| err.to_string())
 }

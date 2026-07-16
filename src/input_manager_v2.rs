@@ -308,30 +308,52 @@ impl InputManagerV2 {
     }
 }
 
+/// Persists one command's hotkey override into `user_config.json`.
+///
+/// Routed through [`crate::config::update_user_config_file`], which serializes the whole
+/// read-modify-write on the process-wide user-config lock. That serialization is load-bearing:
+/// an unlocked writer here can drop the fsync'd ORT SIGILL guard marker written concurrently by
+/// `write_ort_load_state`, re-arming an uncatchable crash on the next launch.
+///
+/// # Errors
+/// Returns the boundary's error text when the file cannot be read, is malformed JSON, or cannot
+/// be written. A malformed file is reported, never silently replaced.
 pub fn save_hotkey_override(
     user_settings_file: &Path,
     command_id: &str,
     binding: &HotkeyBindingV2,
 ) -> Result<(), String> {
-    let mut root = load_root_json(user_settings_file);
-    let root_obj = ensure_object(&mut root);
-    let hotkeys_value = root_obj
-        .entry(HOTKEYS_CONFIG_SECTION.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let hotkeys_obj = ensure_object(hotkeys_value);
-    hotkeys_obj.insert(command_id.to_string(), binding_to_json(binding));
-    save_root_json(user_settings_file, &root)
+    crate::config::update_user_config_file(user_settings_file, |root| {
+        let root_obj = ensure_object(root);
+        let hotkeys_value = root_obj
+            .entry(HOTKEYS_CONFIG_SECTION.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let hotkeys_obj = ensure_object(hotkeys_value);
+        hotkeys_obj.insert(command_id.to_string(), binding_to_json(binding));
+        Ok(())
+    })
+    .map_err(|err| err.to_string())
 }
 
+/// Removes one command's hotkey override from `user_config.json`, restoring its default bind.
+///
+/// Shares [`save_hotkey_override`]'s serialized read-modify-write boundary and its guarantee that a
+/// malformed config is reported rather than overwritten.
+///
+/// # Errors
+/// Returns the boundary's error text when the file cannot be read, is malformed JSON, or cannot
+/// be written.
 pub fn clear_hotkey_override(user_settings_file: &Path, command_id: &str) -> Result<(), String> {
-    let mut root = load_root_json(user_settings_file);
-    let root_obj = ensure_object(&mut root);
-    if let Some(hotkeys) = root_obj.get_mut(HOTKEYS_CONFIG_SECTION)
-        && let Some(hotkeys_obj) = hotkeys.as_object_mut()
-    {
-        hotkeys_obj.remove(command_id);
-    }
-    save_root_json(user_settings_file, &root)
+    crate::config::update_user_config_file(user_settings_file, |root| {
+        let root_obj = ensure_object(root);
+        if let Some(hotkeys) = root_obj.get_mut(HOTKEYS_CONFIG_SECTION)
+            && let Some(hotkeys_obj) = hotkeys.as_object_mut()
+        {
+            hotkeys_obj.remove(command_id);
+        }
+        Ok(())
+    })
+    .map_err(|err| err.to_string())
 }
 
 fn load_hotkey_overrides(user_settings_file: &Path) -> HashMap<String, HotkeyBindingV2> {
@@ -356,14 +378,6 @@ fn load_root_json(user_settings_file: &Path) -> Value {
         }
         Err(_) => Value::Object(Map::new()),
     }
-}
-
-fn save_root_json(user_settings_file: &Path, root: &Value) -> Result<(), String> {
-    let payload = serde_json::to_string_pretty(root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {

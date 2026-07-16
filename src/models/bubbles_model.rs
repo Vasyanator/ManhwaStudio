@@ -5,7 +5,8 @@ Shared runtime model for translation bubbles and canvas settings snapshots.
 Main items:
 - `SharedCanvasSettings`: lightweight cross-tab canvas settings payload, including
   editable/readonly default display types for `default` bubbles.
-- `BubblesModel`: thread-safe mutable bubbles store with revisions and async saver.
+- `BubblesModel`: thread-safe mutable bubbles store with revisions, async saver, and
+  flush/hold barriers for destructive staging operations.
 - `runtime_bubble_to_record`: adapter from canvas runtime fields to persisted `Bubble`,
   including per-bubble `bubble_class` and text display `bubble_type`.
 
@@ -26,9 +27,63 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use ms_thread as thread;
+use ms_thread::{self as thread, JoinHandle};
+
+/// Commands accepted by the bubbles saver worker.
+#[derive(Debug)]
+enum BubblesSaverMessage {
+    Snapshot(Arc<Vec<Bubble>>),
+    BarrierAndHold(Sender<Result<(), String>>),
+    Resume,
+    Shutdown(Sender<()>),
+}
+
+/// Cloneable worker endpoint used by non-GUI persistence workers.
+#[derive(Debug, Clone)]
+pub struct BubblesSaverHandle {
+    sender: Sender<BubblesSaverMessage>,
+}
+
+/// Keeps post-barrier snapshots queued until a destructive staging operation finishes.
+#[derive(Debug)]
+pub struct BubblesSaverBarrierGuard {
+    sender: Sender<BubblesSaverMessage>,
+}
+
+impl Drop for BubblesSaverBarrierGuard {
+    fn drop(&mut self) {
+        if self.sender.send(BubblesSaverMessage::Resume).is_err() {
+            eprintln!("ERROR bubbles saver stopped before a held barrier could resume");
+        }
+    }
+}
+
+impl BubblesSaverHandle {
+    /// Persists all snapshots enqueued before this call and holds later snapshots in memory.
+    ///
+    /// The returned guard resumes normal writes when dropped. `Err` means the barrier could not be
+    /// verified; callers must not perform a destructive staging operation in that case.
+    pub fn barrier_and_hold_blocking(&self) -> Result<BubblesSaverBarrierGuard, String> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.sender
+            .send(BubblesSaverMessage::BarrierAndHold(ack_tx))
+            .map_err(|err| format!("failed to enqueue bubbles saver barrier: {err}"))?;
+        let outcome = ack_rx
+            .recv()
+            .map_err(|err| format!("bubbles saver stopped before barrier acknowledgement: {err}"))?;
+        if let Err(err) = outcome {
+            if self.sender.send(BubblesSaverMessage::Resume).is_err() {
+                return Err(format!("{err}; saver also stopped before it could resume"));
+            }
+            return Err(err);
+        }
+        Ok(BubblesSaverBarrierGuard {
+            sender: self.sender.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SharedCanvasSettings {
@@ -101,7 +156,8 @@ pub struct BubblesModel {
     revision: u64,
     canvas_settings: SharedCanvasSettings,
     canvas_revision: u64,
-    saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
+    saver_tx: Arc<Mutex<Sender<BubblesSaverMessage>>>,
+    saver_thread: Option<JoinHandle<()>>,
     /// Serializes saver writes with a structural page operation's final synchronous snapshot.
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
 }
@@ -109,7 +165,7 @@ pub struct BubblesModel {
 #[derive(Clone)]
 pub struct BubblesSaveTask {
     snapshot: Arc<Vec<Bubble>>,
-    saver_tx: Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
+    saver_tx: Arc<Mutex<Sender<BubblesSaverMessage>>>,
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
     unsaved_bubbles_path: PathBuf,
     bubbles_path: PathBuf,
@@ -142,10 +198,11 @@ impl BubblesModel {
         canvas_settings: SharedCanvasSettings,
     ) -> Self {
         let saver_gate = Arc::new(Mutex::new(BubblesSaverGate::default()));
-        let saver_tx = Arc::new(Mutex::new(spawn_bubbles_saver_thread(
+        let (saver_sender, saver_thread) = spawn_bubbles_saver_thread(
             unsaved_bubbles_path.clone(),
             Arc::clone(&saver_gate),
-        )));
+        );
+        let saver_tx = Arc::new(Mutex::new(saver_sender));
         let bubble_index_by_id = build_bubble_index(&bubbles);
         // Query the storage seam for the staging file so the web build checks its
         // in-memory/IndexedDB store instead of the desktop filesystem.
@@ -163,6 +220,7 @@ impl BubblesModel {
             canvas_settings,
             canvas_revision: 1,
             saver_tx,
+            saver_thread: Some(saver_thread),
             saver_gate,
         }
     }
@@ -185,6 +243,44 @@ impl BubblesModel {
         Arc::clone(&self.bubbles)
     }
 
+    /// Returns a cheap clone of the saver endpoint for use by a background merge worker.
+    #[must_use]
+    pub fn saver_handle(&self) -> BubblesSaverHandle {
+        let sender = match self.saver_tx.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        BubblesSaverHandle { sender }
+    }
+
+    /// Flushes all queued snapshots, waits for every active hold, then drains and joins its worker.
+    ///
+    /// This is a blocking teardown operation and must only be called from an exit path or worker.
+    pub fn shutdown_saver(&mut self) -> Result<(), String> {
+        let handle = self.saver_handle();
+        let barrier_error = match handle.barrier_and_hold_blocking() {
+            Ok(barrier) => {
+                drop(barrier);
+                None
+            }
+            Err(err) => Some(err),
+        };
+        let (ack_tx, ack_rx) = mpsc::channel();
+        handle
+            .sender
+            .send(BubblesSaverMessage::Shutdown(ack_tx))
+            .map_err(|err| format!("failed to request bubbles saver shutdown: {err}"))?;
+        ack_rx
+            .recv()
+            .map_err(|err| format!("bubbles saver stopped before shutdown acknowledgement: {err}"))?;
+        if let Some(join_handle) = self.saver_thread.take() {
+            join_handle
+                .join()
+                .map_err(|_| "bubbles saver thread panicked during shutdown".to_string())?;
+        }
+        barrier_error.map_or(Ok(()), Err)
+    }
+
     /// Stops future asynchronous writes after any in-progress write has left the critical section.
     ///
     /// Callers use this immediately before a structural page transaction and must reload the
@@ -196,6 +292,26 @@ impl BubblesModel {
             Err(poisoned) => poisoned.into_inner().paused = true,
         }
         self.snapshot_shared()
+    }
+
+    /// Re-enables persistence after a discard cleanup failed and republishes current state.
+    ///
+    /// The failed cleanup returns control to the editor, so the otherwise permanent discard pause
+    /// must be reversed. Republishing the latest full snapshot also covers edits accepted while the
+    /// cleanup worker was running and snapshot publication was suppressed.
+    pub fn resume_saver_after_failed_discard(&mut self) {
+        match self.saver_gate.lock() {
+            Ok(mut gate) => gate.paused = false,
+            Err(poisoned) => poisoned.into_inner().paused = false,
+        }
+        self.has_unsaved_changes = true;
+        send_snapshot_to_bubbles_saver(
+            &self.saver_tx,
+            &self.unsaved_bubbles_path,
+            &self.bubbles_path,
+            &self.bubbles,
+            &self.saver_gate,
+        );
     }
 
     /// Runs `f` against the bubble with id `bid` without cloning the whole list.
@@ -384,7 +500,10 @@ impl BubblesModel {
     }
 
     pub fn mark_saved_to_project(&mut self) {
-        self.has_unsaved_changes = false;
+        // A mutation accepted while the save barrier was held is written to a newly recreated
+        // staging file after the merge. Preserve that post-save dirty state instead of clearing it.
+        let unsaved_path = self.unsaved_bubbles_path.to_string_lossy();
+        self.has_unsaved_changes = crate::storage::storage().exists(unsaved_path.as_ref());
     }
 
     fn touch_and_save(&mut self) -> Result<()> {
@@ -409,35 +528,153 @@ impl BubblesModel {
 fn spawn_bubbles_saver_thread(
     bubbles_path: PathBuf,
     saver_gate: Arc<Mutex<BubblesSaverGate>>,
-) -> Sender<Arc<Vec<Bubble>>> {
-    let (tx, rx) = mpsc::channel::<Arc<Vec<Bubble>>>();
-    thread::spawn(move || {
+) -> (Sender<BubblesSaverMessage>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<BubblesSaverMessage>();
+    let handle = thread::spawn(move || {
         // Coalesce queued snapshots and persist only the latest one. The channel now carries
         // shared `Arc<Vec<Bubble>>` snapshots, so superseded snapshots are dropped (refcount
         // decrement) without an extra deep clone of the bubble list.
-        while let Ok(first) = rx.recv() {
+        let mut held_snapshot = None;
+        let mut last_write_error = None;
+        while let Ok(message) = rx.recv() {
+            let BubblesSaverMessage::Snapshot(first) = message else {
+                if process_bubbles_saver_control(
+                    message,
+                    &rx,
+                    &bubbles_path,
+                    &saver_gate,
+                    &mut held_snapshot,
+                    &mut last_write_error,
+                ) {
+                    break;
+                }
+                continue;
+            };
             let mut latest = first;
+            let mut control = None;
             while let Ok(next) = rx.try_recv() {
-                latest = next;
+                match next {
+                    BubblesSaverMessage::Snapshot(snapshot) => latest = snapshot,
+                    other => {
+                        control = Some(other);
+                        break;
+                    }
+                }
             }
             let gate = match saver_gate.lock() {
                 Ok(gate) => gate,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if gate.paused {
-                continue;
+            if !gate.paused {
+                // Keep the gate locked through the filesystem write. `pause_saver_for_page_op`
+                // therefore returns only after any already-selected coalesced snapshot is done.
+                last_write_error = write_bubbles_snapshot_to(&bubbles_path, latest.as_slice())
+                    .map_err(|err| {
+                        let message = format!(
+                            "failed to persist bubbles {}: {err:#}",
+                            bubbles_path.display()
+                        );
+                        eprintln!("{message}");
+                        message
+                    })
+                    .err();
             }
-            // Keep the gate locked through the filesystem write. `pause_saver_for_page_op`
-            // therefore returns only after any already-selected coalesced snapshot is done.
-            if let Err(err) = write_bubbles_snapshot_to(&bubbles_path, latest.as_slice()) {
-                eprintln!(
-                    "failed to persist bubbles {}: {err:#}",
-                    bubbles_path.display()
-                );
+            drop(gate);
+            if control.is_some_and(|message| {
+                process_bubbles_saver_control(
+                    message,
+                    &rx,
+                    &bubbles_path,
+                    &saver_gate,
+                    &mut held_snapshot,
+                    &mut last_write_error,
+                )
+            }) {
+                break;
             }
         }
     });
-    tx
+    (tx, handle)
+}
+
+/// Processes a saver control message. Returns true when the worker must exit.
+fn process_bubbles_saver_control(
+    message: BubblesSaverMessage,
+    rx: &Receiver<BubblesSaverMessage>,
+    bubbles_path: &Path,
+    saver_gate: &Arc<Mutex<BubblesSaverGate>>,
+    held_snapshot: &mut Option<Arc<Vec<Bubble>>>,
+    last_write_error: &mut Option<String>,
+) -> bool {
+    match message {
+        BubblesSaverMessage::Snapshot(snapshot) => *held_snapshot = Some(snapshot),
+        BubblesSaverMessage::BarrierAndHold(ack) => {
+            let outcome = last_write_error.clone().map_or(Ok(()), Err);
+            if ack.send(outcome).is_err() {
+                eprintln!("ERROR bubbles saver barrier requester dropped before acknowledgement");
+            }
+            let mut hold_depth = 1_usize;
+            let mut shutdown_ack = None;
+            while hold_depth > 0 {
+                let Ok(message) = rx.recv() else {
+                    eprintln!("ERROR bubbles saver channel disconnected while snapshots were held");
+                    break;
+                };
+                match message {
+                    BubblesSaverMessage::Snapshot(snapshot) => *held_snapshot = Some(snapshot),
+                    BubblesSaverMessage::Resume => hold_depth -= 1,
+                    BubblesSaverMessage::BarrierAndHold(nested_ack) => {
+                        hold_depth = hold_depth.saturating_add(1);
+                        let outcome = last_write_error.clone().map_or(Ok(()), Err);
+                        if nested_ack.send(outcome).is_err() {
+                            eprintln!("ERROR nested bubbles saver barrier requester dropped");
+                        }
+                    }
+                    BubblesSaverMessage::Shutdown(ack) => {
+                        if shutdown_ack.replace(ack).is_some() {
+                            eprintln!("ERROR bubbles saver received duplicate shutdown requests");
+                        }
+                    }
+                }
+            }
+            if let Some(snapshot) = held_snapshot.take() {
+                let gate = match saver_gate.lock() {
+                    Ok(gate) => gate,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if !gate.paused {
+                    *last_write_error = write_bubbles_snapshot_to(bubbles_path, snapshot.as_slice())
+                        .map_err(|err| {
+                            let message = format!(
+                                "failed to persist bubbles {}: {err:#}",
+                                bubbles_path.display()
+                            );
+                            eprintln!("{message}");
+                            message
+                        })
+                        .err();
+                } else {
+                    eprintln!(
+                        "INFO bubbles saver intentionally dropped a held snapshot while paused"
+                    );
+                }
+            }
+            if let Some(ack) = shutdown_ack {
+                if ack.send(()).is_err() {
+                    eprintln!("ERROR bubbles saver shutdown requester dropped");
+                }
+                return true;
+            }
+        }
+        BubblesSaverMessage::Resume => {}
+        BubblesSaverMessage::Shutdown(ack) => {
+            if ack.send(()).is_err() {
+                eprintln!("ERROR bubbles saver shutdown requester dropped");
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Synchronously persists a bubbles snapshot to the supplied unsaved staging path.
@@ -504,9 +741,10 @@ fn rebuild_bubble_index(index_by_id: &mut HashMap<i64, usize>, bubbles: &[Bubble
 /// Sends a shared bubble snapshot to the coalescing saver thread.
 ///
 /// The snapshot is shared (`Arc<Vec<Bubble>>`); only the `Arc` is cloned, never the
-/// underlying bubble list. Respawns the saver thread once if it has gone away.
+/// underlying bubble list. A stopped saver is reported; it cannot be replaced without also
+/// replacing the model-owned join handle.
 fn send_snapshot_to_bubbles_saver(
-    saver_tx: &Arc<Mutex<Sender<Arc<Vec<Bubble>>>>>,
+    saver_tx: &Arc<Mutex<Sender<BubblesSaverMessage>>>,
     unsaved_bubbles_path: &Path,
     bubbles_path: &Path,
     snapshot: &Arc<Vec<Bubble>>,
@@ -523,28 +761,18 @@ fn send_snapshot_to_bubbles_saver(
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
-    if sender.send(Arc::clone(snapshot)).is_ok() {
+    if sender
+        .send(BubblesSaverMessage::Snapshot(Arc::clone(snapshot)))
+        .is_ok()
+    {
         return;
     }
 
     eprintln!(
-        "WARN bubbles saver thread gone, respawning: {}",
+        "ERROR bubbles saver unavailable; snapshot for '{}' could not be queued to staging '{}'",
+        bubbles_path.display(),
         unsaved_bubbles_path.display()
     );
-    let new_sender = spawn_bubbles_saver_thread(
-        unsaved_bubbles_path.to_path_buf(),
-        Arc::clone(saver_gate),
-    );
-    match saver_tx.lock() {
-        Ok(mut guard) => *guard = new_sender.clone(),
-        Err(poisoned) => *poisoned.into_inner() = new_sender.clone(),
-    }
-    if new_sender.send(Arc::clone(snapshot)).is_err() {
-        eprintln!(
-            "ERROR failed to send to newly spawned bubbles saver thread: {}",
-            bubbles_path.display()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -634,5 +862,110 @@ mod tests {
             Some("third")
         );
         assert!(model.extra_of(1).is_none());
+    }
+
+    /// A successful barrier means every mutation enqueued before it is present in staging.
+    #[test]
+    fn saver_barrier_persists_preceding_mutation() {
+        let mut model = model_with(Vec::new());
+        let staging_path = model.unsaved_bubbles_path.clone();
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "before")).is_ok());
+        let barrier = model.saver_handle().barrier_and_hold_blocking();
+        assert!(barrier.is_ok(), "barrier must verify the queued write");
+        drop(barrier);
+
+        let Ok(raw) = std::fs::read_to_string(&staging_path) else {
+            panic!("barrier returned success without a readable staging file");
+        };
+        let Ok(saved) = serde_json::from_str::<Vec<Bubble>>(&raw) else {
+            panic!("barrier returned success with invalid staging JSON");
+        };
+        assert_eq!(saved.first().map(|bubble| bubble.id), Some(1));
+        assert!(model.shutdown_saver().is_ok());
+        assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    /// Releasing a barrier resumes persistence instead of permanently pausing the saver.
+    #[test]
+    fn saver_continues_after_barrier() {
+        let mut model = model_with(Vec::new());
+        let staging_path = model.unsaved_bubbles_path.clone();
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "before")).is_ok());
+        let Ok(barrier) = model.saver_handle().barrier_and_hold_blocking() else {
+            panic!("first barrier failed");
+        };
+        drop(barrier);
+        assert!(model.create_or_replace(bubble_with_extra(2, "k", "after")).is_ok());
+        let second_barrier = model.saver_handle().barrier_and_hold_blocking();
+        assert!(second_barrier.is_ok(), "saver did not accept a barrier after resume");
+        drop(second_barrier);
+
+        let Ok(raw) = std::fs::read_to_string(&staging_path) else {
+            panic!("resumed saver did not produce a readable staging file");
+        };
+        let Ok(saved) = serde_json::from_str::<Vec<Bubble>>(&raw) else {
+            panic!("resumed saver produced invalid staging JSON");
+        };
+        assert!(saved.iter().any(|bubble| bubble.id == 2));
+        assert!(model.shutdown_saver().is_ok());
+        assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    /// Pausing for discard drops an already-held snapshot and cannot recreate deleted staging.
+    #[test]
+    fn paused_saver_shutdown_does_not_recreate_staging() {
+        let staging_dir = unique_unsaved_path().with_extension("staging");
+        let staging_path = staging_dir.join("translation_bubbles.json");
+        if staging_dir.exists() {
+            assert!(std::fs::remove_dir_all(&staging_dir).is_ok());
+        }
+        let mut model = BubblesModel::new(
+            Vec::new(),
+            staging_dir.join("committed.json"),
+            staging_path.clone(),
+            SharedCanvasSettings::default(),
+        );
+        let Ok(barrier) = model.saver_handle().barrier_and_hold_blocking() else {
+            panic!("initial barrier failed");
+        };
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "discarded")).is_ok());
+        model.pause_saver_for_page_op();
+        assert!(std::fs::remove_dir_all(&staging_dir).is_ok() || !staging_dir.exists());
+        drop(barrier);
+        assert!(model.shutdown_saver().is_ok());
+        assert!(!staging_dir.exists(), "paused shutdown recreated discarded staging");
+    }
+
+    /// Each barrier owns one hold level; releasing an outer guard cannot release a nested hold.
+    #[test]
+    fn nested_barrier_requires_every_guard_to_resume() {
+        let mut model = model_with(Vec::new());
+        let staging_path = model.unsaved_bubbles_path.clone();
+        if staging_path.exists() {
+            assert!(std::fs::remove_file(&staging_path).is_ok());
+        }
+        let handle = model.saver_handle();
+        let Ok(first) = handle.barrier_and_hold_blocking() else {
+            panic!("first barrier failed");
+        };
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "held")).is_ok());
+        let Ok(second) = handle.barrier_and_hold_blocking() else {
+            panic!("nested barrier failed");
+        };
+        drop(first);
+        let Ok(probe) = handle.barrier_and_hold_blocking() else {
+            panic!("probe barrier failed");
+        };
+        assert!(!staging_path.exists(), "first resume released a nested hold");
+        drop(second);
+        assert!(!staging_path.exists(), "second resume released the probe hold");
+        drop(probe);
+        let Ok(flushed) = handle.barrier_and_hold_blocking() else {
+            panic!("post-resume barrier failed");
+        };
+        drop(flushed);
+        assert!(staging_path.exists(), "final resume did not persist the held snapshot");
+        assert!(model.shutdown_saver().is_ok());
+        assert!(std::fs::remove_file(staging_path).is_ok());
     }
 }

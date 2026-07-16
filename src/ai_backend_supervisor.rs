@@ -49,7 +49,7 @@ use crate::runtime_log;
 use crate::tabs::translation::backend_health::{
     AiBackendHealthSnapshot, AiBackendProbeCommand, spawn_ai_backend_probe,
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
@@ -875,33 +875,23 @@ pub fn load_ai_backend_autostart(user_settings_file: &Path) -> bool {
 }
 
 pub fn save_ai_backend_autostart(user_settings_file: &Path, enabled: bool) -> Result<(), String> {
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
+    config::update_user_config_file(user_settings_file, |root| {
+        let root_obj = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("user config root must be an object"))?;
+        let general = root_obj
+            .entry("General".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !general.is_object() {
+            *general = Value::Object(serde_json::Map::new());
         }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general_obj.insert(AI_BACKEND_AUTOSTART_KEY.to_string(), Value::Bool(enabled));
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+        let general_obj = general
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("General must be an object"))?;
+        general_obj.insert(AI_BACKEND_AUTOSTART_KEY.to_string(), Value::Bool(enabled));
+        Ok(())
+    })
+    .map_err(|err| err.to_string())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

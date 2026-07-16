@@ -119,7 +119,10 @@ X range before the old overflow point.
   max width when on). Far links stay roughly horizontal while the near column packs invisible spacers
   at far anchor heights so its cards spread and far links thread the gaps.
 - `bubble_on_top_ui.rs`: on-page bubble widgets, focus controls, move, and resize handling.
-- `settings.rs`: canvas settings snapshots and persistence worker.
+- `settings.rs`: canvas settings snapshots and persistence worker. Its `user_config.json` half writes
+  through `config::update_user_config_file` (the serialized read-modify-write boundary), never a bare
+  `fs::write`: this worker runs off the GUI thread and an unlocked read-modify-write here could drop
+  the ORT SIGILL guard marker written concurrently under the same lock.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
 - `types.rs`: passive DTOs and runtime payload types.
 - `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`). The `ScrollArea` still allocates the page strip and owns scrolling, but each page's authoritative screen `image_rect` and its `page_in_view` visibility are now produced by this transform: `reserve_canvas_page_frame` establishes one per-frame transform from the first laid-out page (`scale == state.zoom`, `translation = old_image_left_top - world_min*scale`) and maps every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the transform-derived rect drifts >0.5px from the old ad-hoc rect. Future increments will remove the `ScrollArea` and make the transform the sole camera.

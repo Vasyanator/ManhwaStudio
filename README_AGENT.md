@@ -534,10 +534,24 @@ original, and a bbox relative to the sent image) and the model returns
   оставляет `succeeded=false` → следующий запуск читает scope как `Suspect` и не трогает ORT
   (fallback на backend). Graceful-ошибка (процесс выжил → это не SIGILL) сбрасывает маркер, НО
   только когда процесс-глобальный in-flight-счётчик (`native_runtime::IN_FLIGHT`) вернулся к 0 —
-  иначе другой guarded-оп ещё может SIGILL'нуть, и маркер должен остаться. Все `save_*`/маркер-
-  writer'ы `user_config.json` сериализованы `settings::USER_CONFIG_WRITE_LOCK` (RMW не теряет
-  `attempted`-маркер под гонкой); маркер-write ещё fsync'ает родительский каталог при первом создании
-  файла (Unix).
+  иначе другой guarded-оп ещё может SIGILL'нуть, и маркер должен остаться. Маркер-write fsync'ает
+  родительский каталог при первом создании файла (Unix).
+  **Сериализация `user_config.json`** держится на `config::lock_user_config_write()` (приватный
+  статик в `config.rs`; НЕ `settings::`). Лок берётся ВНУТРИ пишущих путей, а не вызывающими:
+  `config::update_user_config_file` (единая RMW-граница: читает, даёт мутатору править root, пишет —
+  всё под локом) и `JsonConfig::{new, save, set, set_path}` + `load_user_config`, которые берут лок
+  path-aware (только для `user_config.json`, по флагу `is_user_config`, снятому при конструировании)
+  и внутри зовут приватный `save_unlocked`. Лок **не реентрантный**: код под ним обязан звать
+  `*_unlocked`-вариант, а мутатор `update_user_config_file` не вправе вызывать другой user-config
+  writer. `set`/`set_path` перечитывают файл под локом (reload-RMW), поэтому не затирают чужие ключи
+  своей устаревшей in-memory копией.
+  **На границе `update_user_config_file`/`JsonConfig` малформед-JSON — ошибка, а НЕ повод перезаписать
+  файл пустым объектом.** Это НЕ общее свойство: несколько прямых `save_*` в `tabs/settings/mod.rs`
+  (`save_typing_panel_layout`, `save_hanging_punctuation`, `save_rotation_ctrl_wheel_mode`,
+  `save_text_language`) и `app.rs::persist_canvas_hint_collapsed_state` берут лок, но при нечитаемом/
+  битом файле всё ещё деградируют root до пустого объекта и пишут его целиком — то есть один сбой
+  чтения стирает все настройки вместе с ORT-маркером. Лост-апдейта там нет (лок держат), но
+  clobber-класс остаётся; мигрировать их на `update_user_config_file` — отдельная задача.
 - **Роутинг**: OCR — `tabs/translation/ocr.rs::ocr_route` (чистая функция): Native при
   `ai_runtime==native` И guard не `Suspect` И (движок MangaOCR с ONNX-вариантом `base_onnx`/`2025_onnx`,
   НЕ `base_torch` → `NativeManga`; ЛИБО движок PaddleOCR → `NativePaddle`, любой язык). Детекция —
@@ -782,6 +796,28 @@ because a screenshot looked plausible.
 - **CanvasView** — общий движок; логика вкладки добавляется через `CanvasHooks` и отдельные runtime-слои, не форком canvas-кода.
 - **CleanOverlaysModel** — держать двойное представление (ColorImage + RgbaImage); одностороннее разрушает export и инструменты.
 - **Сохранение** — через saver-thread с coalescing; sync-запись из GUI-потока — ошибка архитектуры.
+- **Пузыри (`BubblesModel`)** — saver владеет `JoinHandle`, канал несёт `BubblesSaverMessage`
+  (не голый `Arc<Vec<Bubble>>`), и у него есть барьер. Контракты:
+  - `barrier_and_hold_blocking` УДЕРЖИВАЕТ сейвер: `start_save_to_project` берёт его ДО merge (иначе
+    merge копирует staging, который сейвер ещё не обновил, а гоночная запись пересоздаёт staging уже
+    ПОСЛЕ его удаления — коммит молча без правки). После merge сейвер возобновляется, и ВТОРОЙ барьер
+    проверяет, что правки, сделанные во время сохранения, дошли до нового staging. Холды
+    **счётчиковые**: каждый `Resume` снимает ровно один уровень, held-снапшот пишется на нуле —
+    булев холд ломался вторым (конкурентным) держателем, снимавшим чужой.
+  - Неподтверждаемый барьер = **abort**, а не «пусто, значит нечего сохранять»: ничего не merge'ится,
+    staging цел, пользователю сказано, что сохранение не прошло (та же дисциплина, что у
+    typing-flush: `Err` — это не пустой owned-набор).
+  - Правки, принятые ВО ВРЕМЯ сохранения, остаются несохранёнными и после успешного сохранения —
+    `mark_saved_to_project` проверяет существование staging, а не гасит флаг безусловно. Это ВЕРНО
+    (правка действительно не в коммите) и не «баг», который надо «починить» в `= false`.
+  - **DISCARD не флашит.** `start_exit_cleanup` ПАУЗИТ сейвер (`pause_saver_for_page_op`) ДО удаления
+    staging: пауза дожидается активной записи, дропает поздние публикации и превращает
+    `shutdown_saver` в drain-and-join БЕЗ записи. Иначе отброшенные правки воскресают — запись
+    пересоздаёт `_unsaved/` после удаления (`write_bubbles_snapshot_to` делает `create_dir_all`), и
+    следующий запуск предлагает восстановить ровно то, что пользователь выбросил. При ПРОВАЛЕ
+    очистки `abort_discard_after_failed_cleanup` обязан вернуть сейвер в работу
+    (`resume_saver_after_failed_discard`) — это единственный resume, и он существует только для
+    этого пути; page-op'овская пауза остаётся ПЕРМАНЕНТНОЙ (её спасает reload проекта).
 - **Слои (layer_model)** — запись на диск асинхронна и коалесцируется через `layer_model/saver.rs`
   (`LayerDoc::enable_background_saver`, включается один раз в `app.rs`). PS per-edit/raster и typing
   text/effects flush'и ENQUEUE'ят задания (`enqueue_page_save` / `enqueue_page_text_save` /

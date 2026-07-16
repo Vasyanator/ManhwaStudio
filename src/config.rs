@@ -8,7 +8,9 @@ Main items:
   writable runtime data, with executable directory fallback.
 - `default_projects_root` / `projects_root_from_user_settings`: resolve projects directory
   (default `{Documents}/manhwastudio_projects`, override from `user_config.json`).
-- `JsonConfig`: load/merge/save wrapper for JSON configs with default backfilling.
+- `JsonConfig`: load/merge/save wrapper for JSON configs with default backfilling that
+  preserves an already-complete file without rewriting it.
+- `update_user_config_file`: serialized read-modify-write boundary for `user_config.json`.
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
 - `AiRuntime`: selected AI runtime (`backend`/`native`) recorded under `General.ai_runtime`.
@@ -670,21 +672,38 @@ pub fn ensure_model_dirs() -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct JsonConfig {
     pub path: PathBuf,
+    is_user_config: bool,
     defaults: Value,
     pub data: Value,
 }
 
 #[allow(dead_code)]
 impl JsonConfig {
+    /// Loads `path`, backfills missing defaults, and persists only a semantic change.
+    ///
+    /// When `path` is [`user_config_path`], the user-config write lock covers the
+    /// complete load/decide/write transaction so a concurrent full-file update cannot
+    /// be lost. Formatting-only differences are intentionally not normalized.
     pub fn new(path: impl Into<PathBuf>, defaults: Value) -> Result<Self> {
+        let path = path.into();
         let mut cfg = Self {
-            path: path.into(),
+            is_user_config: path == user_config_path(),
+            path,
             defaults,
             data: Value::Object(Map::new()),
         };
+        if cfg.is_user_config {
+            let _write_guard = lock_user_config_write();
+            cfg.load()?;
+            if cfg.apply_defaults() {
+                cfg.save_unlocked()?;
+            }
+            return Ok(cfg);
+        }
         cfg.load()?;
-        cfg.apply_defaults();
-        cfg.save()?;
+        if cfg.apply_defaults() {
+            cfg.save()?;
+        }
         Ok(cfg)
     }
 
@@ -709,6 +728,18 @@ impl JsonConfig {
     }
 
     pub fn save(&self) -> Result<()> {
+        if self.is_user_config {
+            let _write_guard = lock_user_config_write();
+            return self.save_unlocked();
+        }
+        self.save_unlocked()
+    }
+
+    /// Serializes and writes the current value without acquiring the user-config lock.
+    ///
+    /// Callers must use [`JsonConfig::save`]; this split keeps its path-aware lock held
+    /// across directory creation, serialization, and the final full-file write.
+    fn save_unlocked(&self) -> Result<()> {
         let store = crate::storage::storage();
         if let Some(parent) = self.path.parent() {
             let parent_str = parent.to_string_lossy();
@@ -726,8 +757,12 @@ impl JsonConfig {
         Ok(())
     }
 
-    pub fn apply_defaults(&mut self) {
-        merge_missing(&mut self.data, &self.defaults);
+    /// Merges absent defaults and returns whether the in-memory JSON changed.
+    ///
+    /// Callers use this result to avoid rewriting files that already contain the
+    /// complete semantic configuration, including files with different whitespace.
+    pub fn apply_defaults(&mut self) -> bool {
+        merge_missing(&mut self.data, &self.defaults)
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -743,18 +778,42 @@ impl JsonConfig {
     }
 
     pub fn set(&mut self, key: &str, value: Value) -> Result<()> {
-        let Some(obj) = self.data.as_object_mut() else {
-            self.data = Value::Object(Map::new());
-            return self.set(key, value);
-        };
-        obj.insert(key.to_owned(), value);
+        if self.is_user_config {
+            let _write_guard = lock_user_config_write();
+            self.load()?;
+            self.set_in_memory(key, value);
+            return self.save_unlocked();
+        }
+        self.set_in_memory(key, value);
         self.save()
     }
 
+    /// Changes one top-level value without persistence; the caller owns serialization.
+    fn set_in_memory(&mut self, key: &str, value: Value) {
+        let Some(obj) = self.data.as_object_mut() else {
+            self.data = Value::Object(Map::new());
+            self.set_in_memory(key, value);
+            return;
+        };
+        obj.insert(key.to_owned(), value);
+    }
+
     pub fn set_path(&mut self, path: &[&str], value: Value) -> Result<()> {
+        if self.is_user_config {
+            let _write_guard = lock_user_config_write();
+            self.load()?;
+            self.set_path_in_memory(path, value);
+            return self.save_unlocked();
+        }
+        self.set_path_in_memory(path, value);
+        self.save()
+    }
+
+    /// Changes one nested value without persistence; the caller owns serialization.
+    fn set_path_in_memory(&mut self, path: &[&str], value: Value) {
         if path.is_empty() {
             self.data = value;
-            return self.save();
+            return;
         }
         if !self.data.is_object() {
             self.data = Value::Object(Map::new());
@@ -770,21 +829,24 @@ impl JsonConfig {
             cur = entry.as_object_mut().expect("object ensured");
         }
         cur.insert(path[path.len() - 1].to_owned(), value);
-        self.save()
     }
 }
 
-fn merge_missing(dst: &mut Value, defaults: &Value) {
+/// Inserts defaults absent from `dst`, returning whether at least one value changed.
+fn merge_missing(dst: &mut Value, defaults: &Value) -> bool {
+    let mut changed = false;
     if let (Value::Object(dst_obj), Value::Object(def_obj)) = (dst, defaults) {
         for (k, v) in def_obj {
             match dst_obj.get_mut(k) {
-                Some(existing) => merge_missing(existing, v),
+                Some(existing) => changed |= merge_missing(existing, v),
                 None => {
                     dst_obj.insert(k.clone(), v.clone());
+                    changed = true;
                 }
             }
         }
     }
+    changed
 }
 
 pub fn user_config_defaults() -> Value {
@@ -1068,16 +1130,63 @@ pub(crate) fn lock_user_config_write() -> MutexGuard<'static, ()> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Updates one `user_config.json` file while holding the process-wide write lock
+/// across the complete read-modify-write transaction.
+///
+/// A missing file starts as an empty object. Existing malformed JSON is returned as
+/// an error and is never overwritten. The mutator runs while the lock is held and
+/// may change any part of the object root; it must not call another user-config
+/// writer because [`USER_CONFIG_WRITE_LOCK`] is intentionally non-reentrant.
+pub(crate) fn update_user_config_file(
+    path: &Path,
+    mutator: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<()> {
+    let _write_guard = lock_user_config_write();
+    let store = crate::storage::storage();
+    let path_str = path.to_string_lossy();
+    let mut root = if store.exists(path_str.as_ref()) {
+        let raw = store
+            .read_to_string(path_str.as_ref())
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        serde_json::from_str::<Value>(&raw)
+            .with_context(|| format!("failed to parse config {}", path.display()))?
+    } else {
+        Value::Object(Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    mutator(&mut root)?;
+    if let Some(parent) = path.parent() {
+        let parent_str = parent.to_string_lossy();
+        store.create_dir_all(parent_str.as_ref()).with_context(|| {
+            format!("failed to create config parent directory {}", parent.display())
+        })?;
+    }
+    let payload = serde_json::to_string_pretty(&root).context("failed to serialize config")?;
+    store.write(path_str.as_ref(), payload.as_bytes())
+        .with_context(|| format!("failed to write config {}", path.display()))?;
+    Ok(())
+}
+
+/// Loads the canonical user config and persists only required migrations/defaults.
+///
+/// The user-config lock remains held from the initial read through the conditional
+/// write, preventing a concurrent full-file update from being lost.
 pub fn load_user_config() -> Result<JsonConfig> {
+    let _write_guard = lock_user_config_write();
     let mut cfg = JsonConfig {
         path: user_config_path(),
+        is_user_config: true,
         defaults: user_config_defaults(),
         data: Value::Object(Map::new()),
     };
     cfg.load()?;
-    migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
-    cfg.apply_defaults();
-    cfg.save()?;
+    let migrated = migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
+    let defaults_applied = cfg.apply_defaults();
+    if migrated || defaults_applied {
+        cfg.save_unlocked()?;
+    }
     Ok(cfg)
 }
 
@@ -1115,22 +1224,19 @@ pub fn load_user_settings_for_startup() -> Result<Value> {
     Ok(data)
 }
 
-fn migrate_missing_memory_profile_from_legacy_cache_pages(data: &mut Value) {
+/// Backfills the global memory profile from the legacy Canvas preference.
+///
+/// Returns `true` only when the JSON tree was changed, allowing persistent callers
+/// to retain an already-complete file byte-for-byte.
+fn migrate_missing_memory_profile_from_legacy_cache_pages(data: &mut Value) -> bool {
+    let mut changed = false;
     if !data.is_object() {
         *data = Value::Object(Map::new());
+        changed = true;
     }
     let Some(root_obj) = data.as_object_mut() else {
-        return;
+        return changed;
     };
-    let mut general_obj = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    if general_obj.contains_key(GENERAL_MEMORY_PROFILE_KEY) {
-        root_obj.insert("General".to_string(), Value::Object(general_obj));
-        return;
-    }
 
     let profile = root_obj
         .get("Canvas")
@@ -1145,16 +1251,153 @@ fn migrate_missing_memory_profile_from_legacy_cache_pages(data: &mut Value) {
             }
         })
         .unwrap_or_default();
+    let general = root_obj
+        .entry("General".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !general.is_object() {
+        *general = Value::Object(Map::new());
+        changed = true;
+    }
+    let Some(general_obj) = general.as_object_mut() else {
+        return changed;
+    };
+    if general_obj.contains_key(GENERAL_MEMORY_PROFILE_KEY) {
+        return changed;
+    }
     general_obj.insert(
         GENERAL_MEMORY_PROFILE_KEY.to_string(),
         Value::String(profile.as_config_str().to_string()),
     );
-    root_obj.insert("General".to_string(), Value::Object(general_obj));
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_config_new_keeps_complete_config_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(PROJECT_SETTINGS_FILE);
+        let defaults = json!({"Canvas": {"zoom": 1}, "General": {"enabled": true}});
+        // Deliberately compact and differently ordered: semantic completeness must
+        // prevent the pretty serializer from normalizing the file on construction.
+        let sentinel = r#"{"General":{"enabled":true},"Canvas":{"zoom":1}}"#;
+        fs::write(&path, sentinel)?;
+
+        let config = JsonConfig::new(&path, defaults.clone())?;
+
+        assert_eq!(config.data, defaults);
+        assert_eq!(fs::read_to_string(path)?, sentinel);
+        Ok(())
+    }
+
+    #[test]
+    fn json_config_new_backfills_missing_defaults_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(PROJECT_SETTINGS_FILE);
+        let defaults = json!({"Canvas": {"zoom": 1}, "General": {"enabled": true}});
+        let incomplete = r#"{"General":{"enabled":true}}"#;
+        fs::write(&path, incomplete)?;
+
+        let config = JsonConfig::new(&path, defaults.clone())?;
+        let backfilled = fs::read_to_string(&path)?;
+
+        assert_eq!(config.data, defaults);
+        assert_ne!(backfilled, incomplete);
+        assert_eq!(serde_json::from_str::<Value>(&backfilled)?, defaults);
+
+        let second_load = JsonConfig::new(&path, defaults)?;
+        assert_eq!(
+            second_load.data,
+            serde_json::from_str::<Value>(&backfilled)?
+        );
+        assert_eq!(fs::read_to_string(path)?, backfilled);
+        Ok(())
+    }
+
+    #[test]
+    fn user_config_update_holds_lock_while_mutating() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(USER_CONFIG_FILE);
+
+        update_user_config_file(&path, |root| {
+            let lock = USER_CONFIG_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            let Some(root_obj) = root.as_object_mut() else {
+                return Err(anyhow::anyhow!("update root must be an object"));
+            };
+            root_obj.insert("held".to_string(), Value::Bool(true));
+            Ok(())
+        })?;
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        assert_eq!(saved.get("held"), Some(&Value::Bool(true)));
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_updates_preserve_ort_marker_after_stale_canvas_window() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(USER_CONFIG_FILE);
+        fs::write(&path, serde_json::to_vec_pretty(&json!({"General": {"other": 1}}))?)?;
+        let (canvas_read_tx, canvas_read_rx) = std::sync::mpsc::channel();
+        let (release_canvas_tx, release_canvas_rx) = std::sync::mpsc::channel();
+        let canvas_path = path.clone();
+        let canvas_thread = std::thread::spawn(move || -> Result<()> {
+            update_user_config_file(&canvas_path, |root| {
+                canvas_read_tx.send(())?;
+                release_canvas_rx.recv()?;
+                let Some(root_obj) = root.as_object_mut() else {
+                    return Err(anyhow::anyhow!("canvas update root must be an object"));
+                };
+                root_obj.insert("Canvas".to_string(), json!({"cache_pages": true}));
+                Ok(())
+            })
+        });
+        canvas_read_rx.recv()?;
+
+        let (marker_started_tx, marker_started_rx) = std::sync::mpsc::channel();
+        let marker_path = path.clone();
+        let marker_thread = std::thread::spawn(move || -> Result<()> {
+            marker_started_tx.send(())?;
+            update_user_config_file(&marker_path, |root| {
+                let Some(root_obj) = root.as_object_mut() else {
+                    return Err(anyhow::anyhow!("marker update root must be an object"));
+                };
+                let general = root_obj
+                    .entry("General".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Some(general_obj) = general.as_object_mut() else {
+                    return Err(anyhow::anyhow!("General must be an object"));
+                };
+                general_obj.insert(
+                    GENERAL_ORT_LOAD_STATE_KEY.to_string(),
+                    json!({"cpu@1.20.1": {"attempted": true, "succeeded": false}}),
+                );
+                Ok(())
+            })
+        });
+        marker_started_rx.recv()?;
+        release_canvas_tx.send(())?;
+        canvas_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("canvas updater panicked"))??;
+        marker_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("marker updater panicked"))??;
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        assert_eq!(saved.pointer("/Canvas/cache_pages"), Some(&Value::Bool(true)));
+        assert_eq!(
+            saved.pointer("/General/ort_load_state/cpu@1.20.1/attempted"),
+            Some(&Value::Bool(true))
+        );
+        Ok(())
+    }
 
     #[test]
     fn ai_install_type_parses_user_settings_values() {

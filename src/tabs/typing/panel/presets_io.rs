@@ -602,26 +602,15 @@ pub(super) fn load_text_tab_effect_defaults() -> HashMap<String, Value> {
 /// file. Returns a human-readable error string on any I/O or serialization failure.
 /// Callers must invoke this off the GUI thread.
 pub(super) fn save_text_tab_effect_defaults(defaults: &HashMap<String, Value>) -> Result<(), String> {
-    let user_settings_file = config::user_config_path();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(&user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    save_text_tab_effect_defaults_to(&config::user_config_path(), defaults)
+}
+
+/// Path-parameterized effect-default saver used by tests to verify the same
+/// serialized transaction as the production `user_config.json` writer.
+fn save_text_tab_effect_defaults_to(
+    user_settings_file: &Path,
+    defaults: &HashMap<String, Value>,
+) -> Result<(), String> {
     let mut defaults_obj = Map::new();
     let mut keys: Vec<&String> = defaults.keys().collect();
     keys.sort();
@@ -630,17 +619,33 @@ pub(super) fn save_text_tab_effect_defaults(defaults: &HashMap<String, Value>) -
             defaults_obj.insert(key.clone(), value.clone());
         }
     }
-    text_tab_obj.insert(
-        TEXT_TAB_EFFECT_DEFAULTS_KEY.to_string(),
+    update_text_tab_value(
+        user_settings_file,
+        TEXT_TAB_EFFECT_DEFAULTS_KEY,
         Value::Object(defaults_obj),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+    )
+}
 
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+/// Updates one `TextTab` member through config's serialized user-config transaction.
+/// Existing malformed JSON is reported instead of being replaced by this subsection.
+fn update_text_tab_value(user_settings_file: &Path, key: &str, value: Value) -> Result<(), String> {
+    config::update_user_config_file(user_settings_file, move |root| {
+        let root_obj = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("user config root must be an object"))?;
+        let text_tab = root_obj
+            .entry("TextTab".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !text_tab.is_object() {
+            *text_tab = Value::Object(Map::new());
+        }
+        let text_tab_obj = text_tab
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("TextTab must be an object"))?;
+        text_tab_obj.insert(key.to_string(), value);
+        Ok(())
+    })
+    .map_err(|err| err.to_string())
 }
 
 /// Loads the user-imported system font FILE paths from `TextTab.imported_system_fonts`.
@@ -703,66 +708,20 @@ fn save_imported_system_fonts_to(
     user_settings_file: &Path,
     paths: &[PathBuf],
 ) -> Result<(), String> {
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     let array = paths
         .iter()
         .map(|path| Value::String(path.to_string_lossy().to_string()))
         .collect::<Vec<_>>();
-    text_tab_obj.insert(
-        crate::config::TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY.to_string(),
+    update_text_tab_value(
+        user_settings_file,
+        crate::config::TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY,
         Value::Array(array),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    )
 }
 
 pub(super) fn save_text_tab_create_presets(
     presets: &HashMap<String, TypingCreatePreset>,
 ) -> Result<(), String> {
-    let user_settings_file = config::user_config_path();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(&user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
     let mut presets_obj = Map::new();
     let mut names: Vec<&String> = presets.keys().collect();
     names.sort();
@@ -791,42 +750,16 @@ pub(super) fn save_text_tab_create_presets(
             }),
         );
     }
-    text_tab_obj.insert(
-        TEXT_TAB_CREATE_PRESETS_KEY.to_string(),
+    update_text_tab_value(
+        &config::user_config_path(),
+        TEXT_TAB_CREATE_PRESETS_KEY,
         Value::Object(presets_obj),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    )
 }
 
 pub(super) fn save_text_tab_formula_presets(
     presets: &HashMap<String, TypingFormulaPreset>,
 ) -> Result<(), String> {
-    let user_settings_file = config::user_config_path();
-    let mut root = if user_settings_file.exists() {
-        match fs::read_to_string(&user_settings_file) {
-            Ok(raw) => {
-                serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| Value::Object(Map::new()))
-            }
-            Err(_) => Value::Object(Map::new()),
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-    if !root.is_object() {
-        root = Value::Object(Map::new());
-    }
-    let root_obj = root.as_object_mut().expect("object ensured");
-    let mut text_tab_obj = root_obj
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     let mut presets_obj = Map::new();
     let mut names: Vec<&String> = presets.keys().collect();
     names.sort();
@@ -836,17 +769,11 @@ pub(super) fn save_text_tab_formula_presets(
         };
         presets_obj.insert(name.clone(), text_formula_layout_to_value(&preset.layout));
     }
-    text_tab_obj.insert(
-        TEXT_TAB_FORMULA_PRESETS_KEY.to_string(),
+    update_text_tab_value(
+        &config::user_config_path(),
+        TEXT_TAB_FORMULA_PRESETS_KEY,
         Value::Object(presets_obj),
-    );
-    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
-
-    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
-    if let Some(parent) = user_settings_file.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+    )
 }
 
 #[cfg(test)]
@@ -924,5 +851,75 @@ mod tests {
             vec![PathBuf::from("/fonts/A.ttf")]
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// Effect-default persistence and the ORT crash marker share the serialized
+    /// user-config transaction, so neither full-file update can erase the other.
+    #[test]
+    fn effect_defaults_save_preserves_concurrent_ort_marker() -> anyhow::Result<()> {
+        let path = unique_temp_config_path("effect_defaults_ort_marker");
+        let seed = json!({"General": {"other": true}});
+        fs::write(&path, serde_json::to_string(&seed)?)?;
+
+        let mut defaults = HashMap::new();
+        defaults.insert("stroke".to_string(), json!({"width": 3}));
+        let effect_path = path.clone();
+        let effect_thread = std::thread::spawn(move || {
+            save_text_tab_effect_defaults_to(&effect_path, &defaults)
+        });
+        let marker_path = path.clone();
+        let marker_thread = std::thread::spawn(move || {
+            config::update_user_config_file(&marker_path, |root| {
+                let root_obj = root
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("test root must be an object"))?;
+                let general = root_obj
+                    .entry("General".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let general_obj = general
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("test General must be an object"))?;
+                general_obj.insert(
+                    crate::config::GENERAL_ORT_LOAD_STATE_KEY.to_string(),
+                    json!({"cpu@1.20.1": {"attempted": true, "succeeded": false}}),
+                );
+                Ok(())
+            })
+        });
+
+        let effect_result = effect_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("effect-default worker panicked"))?;
+        effect_result.map_err(anyhow::Error::msg)?;
+        marker_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("ORT-marker worker panicked"))??;
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        assert_eq!(
+            saved.pointer("/TextTab/effect_defaults/stroke/width"),
+            Some(&Value::from(3))
+        );
+        assert_eq!(
+            saved.pointer("/General/ort_load_state/cpu@1.20.1/attempted"),
+            Some(&Value::Bool(true))
+        );
+        fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    /// A malformed config is never replaced by a one-section effect-default file.
+    #[test]
+    fn malformed_config_makes_effect_defaults_save_fail_without_truncation() -> anyhow::Result<()> {
+        let path = unique_temp_config_path("effect_defaults_malformed");
+        let malformed = "{ this is not valid JSON";
+        fs::write(&path, malformed)?;
+        let mut defaults = HashMap::new();
+        defaults.insert("stroke".to_string(), json!({"width": 3}));
+
+        assert!(save_text_tab_effect_defaults_to(&path, &defaults).is_err());
+        assert_eq!(fs::read_to_string(&path)?, malformed);
+        fs::remove_file(&path)?;
+        Ok(())
     }
 }

@@ -71,6 +71,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   launch/exe directory, except on macOS when the executable runs inside a `*.app` bundle: there the
   read-only bundle forces the writable root to `~/Library/Application Support/ManhwaStudio`
   (`#[cfg(target_os = "macos")]`, no effect on Linux/Windows).
+  `JsonConfig` backfills missing defaults but does not rewrite a semantically complete JSON file;
+  user-config load/default/write transactions remain serialized by the config-layer lock.
   `General.enabled_tabs` object keys are the stable English `AppTab::key()` ids
   (`tabs/mod.rs`) — the persistence contract, byte-stable across releases and UI languages, so they
   are NEVER localized (`docs/i18n_exclusions.md` A3/B1). The field has NO reader today (verified

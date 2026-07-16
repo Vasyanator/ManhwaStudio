@@ -100,7 +100,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use web_time::{Duration, Instant};
 
 const DECODE_TILE_SIDE: u32 = 2048;
@@ -1195,8 +1195,6 @@ impl MangaApp {
         // Flush the PS editor's active-page raster layers into the staging dir so the merge below
         // picks them up. Other visited pages were already written on their page switch.
         self.ps_editor_tab.flush_layers(&self.project);
-        // Bubble upserts intentionally are not forced here: the live model remains active during
-        // a normal save, so its existing debounce/flush path catches up before later persistence.
         // Flush the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
         // legacy chapter that was only viewed (no edits → no placement save) still migrates its text
         // before the unsaved→committed merge. The typing tab owns text persistence now. The returned set
@@ -1263,6 +1261,22 @@ impl MangaApp {
             .lock()
             .ok()
             .and_then(|guard| guard.saver_handle());
+        // The worker barriers the bubble saver and holds post-barrier snapshots until the merge
+        // finishes. This makes the committed bubbles file a precise snapshot while edits made during
+        // the save remain queued for fresh staging after the destructive merge removes the old tree.
+        let bubbles_saver_handle = match self.bubbles_model.lock() {
+            Ok(model) => model.saver_handle(),
+            Err(_) => {
+                runtime_log::log_error(
+                    "[save_to_project] aborted: bubbles model lock poisoned; saver barrier unavailable",
+                );
+                self.save_to_project_status = Some((
+                    tf!("app.save.error", err = t!("app.save.thread_crashed")),
+                    0.0,
+                ));
+                return;
+            }
+        };
         let unsaved_dir = self.project.paths.unsaved_dir.clone();
         let project_dir = self.project.paths.project_dir.clone();
         let unsaved_clean_layers_dir = self.project.paths.unsaved_clean_layers_dir.clone();
@@ -1273,6 +1287,26 @@ impl MangaApp {
         };
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         thread::spawn(move || {
+            // Hold later bubble snapshots until every destructive staging operation below is done.
+            // Dropping this guard on any return path resumes the saver.
+            let bubbles_barrier = match bubbles_saver_handle.barrier_and_hold_blocking() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    if let Ok(mut overlays) = clean_overlays_model.lock() {
+                        overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
+                    }
+                    runtime_log::log_error(format!(
+                        "[save_to_project] aborted: bubbles saver barrier failed: {err}. Nothing was merged and '{}' is intact",
+                        unsaved_dir.display()
+                    ));
+                    if tx.send(Err(t!("app.save.thread_crashed").to_string())).is_err() {
+                        runtime_log::log_error(
+                            "[save_to_project] result receiver dropped before the bubbles barrier failure could be reported",
+                        );
+                    }
+                    return;
+                }
+            };
             // Drain the layer saver FIRST: block until every enqueued layer page write (rasters + text
             // + effects from the flushes above) is on disk, so the merge reads a complete staging
             // `layers.json`. This barrier runs in the worker, never on the GUI thread.
@@ -1317,14 +1351,39 @@ impl MangaApp {
                 if let Ok(mut overlays) = clean_overlays_model.lock() {
                     overlays.restore_dirty_save_snapshots(&dirty_overlay_snapshots);
                 }
-                let _ = tx.send(Err(format!(
+                if tx.send(Err(format!(
                     "failed to flush dirty overlays into '{}': {err}",
                     unsaved_clean_layers_dir.display()
-                )));
+                ))).is_err() {
+                    runtime_log::log_error(
+                        "[save_to_project] result receiver dropped after overlay flush failure",
+                    );
+                }
                 return;
             }
             let result = merge_unsaved_into_project(&unsaved_dir, &project_dir, &effective_owned_text_pages);
-            let _ = tx.send(result);
+            // Resume before reporting completion, then issue a second barrier so any edit accepted
+            // during the merge is on fresh staging before the GUI clears/recomputes dirty state.
+            drop(bubbles_barrier);
+            let resumed_barrier = bubbles_saver_handle.barrier_and_hold_blocking();
+            if let Ok(guard) = resumed_barrier {
+                drop(guard);
+            } else if result.is_ok() {
+                runtime_log::log_error(
+                    "[save_to_project] committed merge completed, but post-merge bubbles staging could not be verified",
+                );
+                if tx.send(Err(t!("app.save.thread_crashed").to_string())).is_err() {
+                    runtime_log::log_error(
+                        "[save_to_project] result receiver dropped after post-merge bubbles barrier failure",
+                    );
+                }
+                return;
+            }
+            if tx.send(result).is_err() {
+                runtime_log::log_error(
+                    "[save_to_project] result receiver dropped before completion was reported",
+                );
+            }
         });
         self.save_to_project_rx = Some(rx);
         self.save_to_project_status = Some((t!("app.save.saving").to_string(), 0.0));
@@ -1411,6 +1470,17 @@ impl MangaApp {
         if let Ok(mut guard) = self.layer_doc.lock() {
             guard.shutdown_saver();
         }
+        // Quiesce bubble persistence before removing staging. The pause gate waits for any selected
+        // write to finish, drops all later publications, and makes shutdown drain-and-join without
+        // writing held snapshots. This is deliberately permanent on the successful discard path.
+        // Poison is RECOVERED, not reported: a poisoned lock here must not leave the saver running.
+        // Logging and continuing would spawn the delete job with an unpaused saver, which is exactly
+        // the resurrection this pause exists to prevent. The `()`-payload model stays usable after a
+        // panic, and every other holder recovers the same way.
+        self.bubbles_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pause_saver_for_page_op();
         let rx = Self::spawn_unsaved_delete_job(self.project.paths.unsaved_dir.clone());
         self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
         self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
@@ -1440,6 +1510,12 @@ impl MangaApp {
     fn abort_discard_after_failed_cleanup(&mut self) {
         self.discarding_unsaved_changes = false;
         self.has_unsaved_changes_cached = true;
+        // Poison is RECOVERED, not reported: leaving the saver paused in a session that keeps running
+        // would silently drop every later bubble edit for the rest of the process.
+        self.bubbles_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resume_saver_after_failed_discard();
     }
 
     fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
@@ -3278,7 +3354,26 @@ impl eframe::App for MangaApp {
             ));
         }
 
-        // 3) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
+        // 3) Drain and join the bubbles saver. Normally its barrier flushes queued snapshots. The
+        // discard path paused its gate before deleting staging, so this only drains and joins there:
+        // queued snapshots are intentionally dropped and cannot recreate `_unsaved/`.
+        // Poison is RECOVERED here too: a poisoned lock must not cost the user their last edits by
+        // skipping the flush entirely. A shutdown FAILURE is still reported — exit proceeds (no retry
+        // is possible at teardown), but it must not claim success it did not observe.
+        if let Err(err) = self
+            .bubbles_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shutdown_saver()
+        {
+            runtime_log::log_error(format!(
+                "[app] on_exit: bubbles saver could not be flushed and joined: {err}"
+            ));
+        } else {
+            runtime_log::log_info("[app] on_exit: bubbles saver drained and shut down");
+        }
+
+        // 4) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
         // `on_exit` fires on both program close and return-to-launcher, so this is the one save point.
         persist_canvas_hint_collapsed_state(
             self.canvas.bottom_hint_collapsed(),

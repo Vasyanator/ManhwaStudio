@@ -136,7 +136,9 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
     // on a disk re-read that can silently drop the raster.
     let dir = std::env::temp_dir().join(format!("typ_flat_snap_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        panic!("could not create deferred-raster test directory: {err}");
+    }
     let base = dir.join("page.png");
     image::save_buffer(
         &base,
@@ -145,7 +147,7 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
         20,
         image::ColorType::Rgba8,
     )
-    .unwrap();
+    .unwrap_or_else(|err| panic!("could not seed deferred-raster test layer: {err}"));
     // A 10x10 RED straight-alpha snapshot centered at (10,10), no disk dirs.
     let snap = TypingExportRasterSnapshot {
         visible: true,
@@ -2572,6 +2574,124 @@ fn discarding_drops_the_parked_re_fire_too() {
         !layer.has_pending_placement_save(),
         "after a discard nothing is pending: the exit dialog must not re-latch and reopen"
     );
+}
+
+#[test]
+fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform() {
+    use crate::models::layer_model::{
+        layer_doc::LayerDoc,
+        manifest::{DeformRec, TransformRec},
+        persist,
+    };
+
+    // This exercises the same deferred helpers used by keyboard scale/nudge and the image-panel
+    // slider. `page_has_pending_save` proves the caller enqueued a saver job rather than performing
+    // the old targeted manifest RMW; the FIFO barrier is the durability boundary before reload.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "typing_deferred_raster_geometry_{}_{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = ColorImage::filled([2, 2], Color32::WHITE);
+    persist::add_page_raster(
+        &dir,
+        None,
+        0,
+        "raster",
+        "Raster",
+        true,
+        1.0,
+        TransformRec {
+            cx: 1.0,
+            cy: 2.0,
+            rotation: 0.0,
+            scale: 1.0,
+        },
+        &image,
+    )
+    .unwrap();
+
+    let mut page_sizes = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    let mut doc = LayerDoc::new();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes)
+        .unwrap_or_else(|err| panic!("could not load deferred-raster test layer: {err}"));
+    doc.enable_background_saver();
+    let doc = Arc::new(Mutex::new(doc));
+    let mut layer = TypingTextOverlayLayer {
+        layers_primary_dir: Some(dir.clone()),
+        layer_doc: Some(Arc::clone(&doc)),
+        ..Default::default()
+    };
+
+    let transform = TransformRec {
+        cx: 30.0,
+        cy: 40.0,
+        rotation: 0.5,
+        scale: 1.5,
+    };
+    layer.persist_raster_transform_deferred(0, "raster", transform);
+    let handle = {
+        let guard = doc
+            .lock()
+            .unwrap_or_else(|_| panic!("deferred-raster test document lock poisoned"));
+        assert!(
+            guard.page_has_pending_save(0),
+            "the deferred transform must enqueue a page save before a durability barrier"
+        );
+        guard
+            .saver_handle()
+            .unwrap_or_else(|| panic!("deferred-raster test saver was not enabled"))
+    };
+    let failed_text_pages = handle.barrier_blocking();
+    assert!(failed_text_pages.is_empty(), "deferred transform save failed");
+
+    let after_transform = persist::load_page_rasters(&dir, None, 0)
+        .unwrap_or_else(|err| panic!("could not reload deferred transform: {err}"));
+    let persisted_transform = after_transform.layers[0].transform;
+    assert_eq!(persisted_transform.cx, transform.cx);
+    assert_eq!(persisted_transform.cy, transform.cy);
+    assert_eq!(persisted_transform.rotation, transform.rotation);
+    assert_eq!(persisted_transform.scale, transform.scale);
+
+    let deform = DeformRec {
+        cols: 2,
+        rows: 2,
+        points_px: vec![[10.0, 20.0], [30.0, 20.0], [10.0, 40.0], [30.0, 40.0]],
+    };
+    layer.persist_raster_deform_deferred(0, "raster", transform, Some(deform.clone()));
+    let handle = doc
+        .lock()
+        .unwrap_or_else(|_| panic!("deferred-raster test document lock poisoned"))
+        .saver_handle()
+        .unwrap_or_else(|| panic!("deferred-raster test saver was not enabled"));
+    let failed_text_pages = handle.barrier_blocking();
+    assert!(failed_text_pages.is_empty(), "deferred deform save failed");
+
+    let after_deform = persist::load_page_rasters(&dir, None, 0)
+        .unwrap_or_else(|err| panic!("could not reload deferred deform: {err}"));
+    let persisted_transform = after_deform.layers[0].transform;
+    assert_eq!(persisted_transform.cx, transform.cx);
+    assert_eq!(persisted_transform.cy, transform.cy);
+    assert_eq!(persisted_transform.rotation, transform.rotation);
+    assert_eq!(persisted_transform.scale, transform.scale);
+    let Some(persisted_deform) = after_deform.layers[0].deform.as_ref() else {
+        panic!("the barrier must persist the deferred deform mesh");
+    };
+    assert_eq!(persisted_deform.cols, deform.cols);
+    assert_eq!(persisted_deform.rows, deform.rows);
+    assert_eq!(persisted_deform.points_px, deform.points_px);
+
+    doc.lock()
+        .unwrap_or_else(|_| panic!("deferred-raster test document lock poisoned"))
+        .shutdown_saver();
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        panic!("could not remove deferred-raster test directory: {err}");
+    }
 }
 
 // NOT unit-tested here, and why: the surrounding `drive_placement_save_debounce` needs a live

@@ -13,7 +13,9 @@ models and release locks before doing rendering, image processing, file I/O, or 
 `BubblesModel` owns the shared bubble list, a lookup index by bubble id, canvas settings
 snapshots, and monotonic revisions. Runtime bubble writes are coalesced through a background saver
 and go to the unsaved staging path; the main project file is updated only by explicit project save
-flows.
+flows. The model owns the saver's `JoinHandle`, and the saver is quiescable: it takes a barrier
+(hold/resume, reference-counted), a pause gate, and an explicit shutdown. Those are the only
+mechanisms that make "the bytes are on disk" true — see the contracts below.
 
 `CleanOverlaysModel` keeps both `egui::ColorImage` for canvas/UI upload and
 `image::RgbaImage` for disk/export when an overlay is materialized. Pages with no clean layer stay
@@ -45,8 +47,38 @@ to refresh local mask caches.
 - Do not hold model locks during long operations or disk I/O. Clone snapshots first.
 - To read a single bubble (or its `extra` map) by id, use `BubblesModel::with_bubble` /
   `extra_of` instead of `snapshot()`; they look up via `bubble_index_by_id` and avoid cloning
-  the whole list. The saver channel carries `Arc<Vec<Bubble>>`, so publishing a save shares the
-  snapshot rather than deep-cloning it.
+  the whole list. The saver channel carries `BubblesSaverMessage`, whose snapshot variant holds an
+  `Arc<Vec<Bubble>>`, so publishing a save shares the snapshot rather than deep-cloning it.
+- **Saver quiescence — the durability contract.** Coalescing means an enqueued edit is not yet on
+  disk; only these make it so, and each caller uses a different one deliberately:
+  - `barrier_and_hold_blocking` — flush + HOLD, for save-to-project (taken before the merge, so the
+    merge cannot copy a staging file the saver has not written yet, and the saver cannot re-create
+    staging after the merge deleted it). Holds are **reference-counted**: each guard's `Resume`
+    releases exactly one level and the held snapshot is written at zero. A boolean hold was broken
+    by a second concurrent holder releasing someone else's. Shutdown during a hold waits for every
+    holder, then persists the held snapshot — it must never drop it silently.
+    Never call it on the GUI thread; the one exception is `shutdown_saver`, which uses it internally
+    on the exit path where the drain is bounded and the process is ending anyway. Its "flushes
+    everything enqueued before this call" guarantee is exact only for the FIRST holder: a barrier
+    nested inside an active hold acks immediately while pre-barrier snapshots still sit in
+    `held_snapshot`. Safe today (only `shutdown_saver` nests, and Shutdown waits + persists), but do
+    not build a new caller on the flush semantic under concurrency without fixing that.
+  - `pause_saver_for_page_op` — PERMANENT pause: waits for the in-flight write, then drops all later
+    publications and makes shutdown drain-and-join **without writing**. Safe for page-ops only
+    because they reload the project afterwards, and used by DISCARD because it must not write at all.
+  - `resume_saver_after_failed_discard` — the ONLY resume. Exists solely because a failed discard
+    hands a still-running app back to the user; do not generalize it into a `resume(scope)` (a
+    post-remap resume would write obsolete page indices).
+  - `shutdown_saver` — drain + join at exit.
+- **The discard path must not flush.** `start_exit_cleanup` pauses the saver before deleting the
+  staging dir. Otherwise a write landing after the delete re-creates `_unsaved/`
+  (`write_bubbles_snapshot_to` does `create_dir_all`) and the next launch offers to restore exactly
+  what the user discarded. Deletions stay eager; anti-resurrection never depends on a flush point.
+- `mark_saved_to_project` probes staging EXISTENCE rather than clearing the dirty flag outright, so
+  an edit accepted while the save was running is correctly still reported as unsaved afterwards.
+- The saver is not respawned on demand (the model owns its handle). If the thread ever dies, each
+  dropped publication is logged and persistence stops until `shutdown_saver` surfaces the error at
+  exit.
 - Model revisions and dirty sets are the synchronization contract with canvas/runtime
   subscribers; update them whenever visible shared state changes.
 - Bubble ids are the stable identity for updates. Maintain the id index whenever the stored bubble

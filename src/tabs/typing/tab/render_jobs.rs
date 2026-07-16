@@ -491,8 +491,9 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Applies a scale/rotation edit from the image panel to a raster layer (by uid), persisting the
-    /// transform. Rotation arrives in degrees (panel space) and is converted to radians.
+    /// Applies a scale/rotation edit from the image panel to a raster layer (by uid), enqueueing its
+    /// persistence through the shared document saver. Rotation arrives in degrees (panel space) and is
+    /// converted to radians.
     pub(super) fn apply_raster_transform_edit(
         &mut self,
         page_idx: usize,
@@ -510,7 +511,7 @@ impl TypingTextOverlayLayer {
         layer.transform.scale = user_scale.clamp(0.05, 20.0);
         layer.transform.rotation = rotation_deg.to_radians();
         let transform = layer.transform;
-        self.persist_raster_transform(page_idx, uid, transform);
+        self.persist_raster_transform_deferred(page_idx, uid, transform);
     }
 
     /// Applies an effects edit (non-destructive) from the image panel to a raster: updates the

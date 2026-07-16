@@ -640,7 +640,7 @@ impl TypingTextOverlayLayer {
             return;
         }
         let (uid, transform) = (layer.uid.clone(), layer.transform);
-        self.persist_raster_transform(page_idx, &uid, transform);
+        self.persist_raster_transform_deferred(page_idx, &uid, transform);
         ui.ctx().request_repaint();
     }
 
@@ -868,6 +868,39 @@ impl TypingTextOverlayLayer {
             fallback.as_deref(),
         ) {
             crate::runtime_log::log_warn(format!("[typing] persist raster deform: {err}"));
+        }
+    }
+
+    /// Like [`persist_raster_deform`] but enqueues the whole-page persistence through the shared
+    /// document saver. The saver captures both the affine transform and the full deform mesh, so
+    /// rapid keyboard nudges update the live doc immediately without rewriting `layers.json` on the
+    /// GUI thread. As with [`persist_raster_transform_deferred`], no saver keeps the existing
+    /// synchronous `flush_page` fallback.
+    pub(super) fn persist_raster_deform_deferred(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        transform: crate::models::layer_model::manifest::TransformRec,
+        deform: Option<crate::models::layer_model::manifest::DeformRec>,
+    ) {
+        let Some(dir) = self.layers_primary_dir.clone() else {
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        let uid_owned = uid.to_string();
+        let deform_for_doc = deform.clone();
+        self.route_to_doc(page_idx, |doc| {
+            doc.set_transform(page_idx, &uid_owned, transform);
+            doc.set_deform(page_idx, &uid_owned, deform_for_doc);
+        });
+        let Some(doc) = self.layer_doc.clone() else {
+            return;
+        };
+        let Ok(mut guard) = doc.lock() else {
+            return;
+        };
+        if let Err(err) = guard.enqueue_page_save(page_idx, &dir, fallback.as_deref()) {
+            crate::runtime_log::log_warn(format!("[typing] defer raster deform save: {err}"));
         }
     }
 
@@ -1609,7 +1642,8 @@ impl TypingTextOverlayLayer {
     /// overlay nudge `try_move_selected_overlay_by_arrow_shortcuts`). SHIFT moves by 5 px. Mirrors the
     /// raster mouse-drag Move path: a perspective-deformed raster translates its mesh, otherwise the
     /// affine `transform.cx/cy` move (clamped to the page, snapped to whole pixels when
-    /// `strict_pixel_movement`). The change is routed to the shared doc and persisted to disk.
+    /// `strict_pixel_movement`). The change is routed to the shared doc and enqueued for persistence,
+    /// so OS key-repeat never performs manifest I/O on the GUI thread.
     ///
     /// Gated on `selected_raster_idx` (mutually exclusive with `selected_overlay_idx`, so it only
     /// consumes the arrow keys when a raster is selected; the overlay nudge, called first, returns
@@ -1687,7 +1721,7 @@ impl TypingTextOverlayLayer {
             });
             let (uid, transform, deform) =
                 (layer.uid.clone(), layer.transform, layer.deform.clone());
-            self.persist_raster_deform(page_idx, &uid, transform, deform);
+            self.persist_raster_deform_deferred(page_idx, &uid, transform, deform);
         } else {
             let mut center = clamp_page_point(
                 [
@@ -1702,7 +1736,7 @@ impl TypingTextOverlayLayer {
             layer.transform.cx = center[0];
             layer.transform.cy = center[1];
             let (uid, transform) = (layer.uid.clone(), layer.transform);
-            self.persist_raster_transform(page_idx, &uid, transform);
+            self.persist_raster_transform_deferred(page_idx, &uid, transform);
         }
         ui.ctx().request_repaint();
     }
