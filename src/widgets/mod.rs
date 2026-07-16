@@ -25,10 +25,17 @@ FILE HEADER (widgets/mod.rs)
   - `AiButton`: an AI-tool launch button that gates its own availability on the
     process-global capability signals (backend/torch/onnxruntime) and paints an
     optional corner marker badge with the painter only.
+  - `HelpHint`: a light-gray circled "?" icon whose hover tooltip plays an
+    animated WebP hint (`ms-gifs` asset); decoding runs on a background thread
+    and at most one animation stays cached process-wide. The companion
+    `maintain_help_hint_cache(ctx)` must be called once per frame from the app
+    root (`MangaApp::ui`) — it is what guarantees the cached animation is
+    evicted after its retention window even when no icon is drawn anymore.
 */
 mod ai_button;
 mod autocomplete_line;
 mod editable_combo_box;
+mod help_hint;
 mod marked_scroll;
 mod seed_spin_box;
 mod spellchecked_line;
@@ -45,6 +52,8 @@ pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement};
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
+#[allow(unused_imports)]
+pub use help_hint::{HelpHint, maintain as maintain_help_hint_cache};
 #[allow(unused_imports)]
 pub use marked_scroll::{
     ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,

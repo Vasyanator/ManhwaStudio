@@ -2969,6 +2969,10 @@ impl eframe::App for MangaApp {
         // panels mutably borrow it.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        // Help-hint animation cache eviction must run from this always-drawn root:
+        // the "?" icons stop drawing the moment the user leaves their panel, so the
+        // widget alone cannot guarantee freeing the decoded animation (tens of MB).
+        crate::widgets::maintain_help_hint_cache(ctx);
         // Advance the puffin frame and open the top-level scope for this frame. `new_frame`
         // must run exactly once per frame before any `profile_scope!` so recorded scopes are
         // attributed to the correct frame; the scope guard stays alive for the whole body.

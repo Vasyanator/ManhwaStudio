@@ -4,7 +4,7 @@ version = "3.5.1"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/puffin_egui"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/puffin_egui"]
 
 [features]
 active-logs = []
@@ -52,6 +52,7 @@ ms-actions = { path = "crates/ms-actions", features = ["raster"] }
 ms-storage = { path = "crates/ms-storage" }
 ms-thread = { path = "crates/ms-thread" }
 ms-i18n = { path = "crates/ms-i18n" }
+ms-gifs = { path = "crates/ms-gifs" }
 web-time = "1"
 anyhow = "1"
 chrono = "0.4"

@@ -189,6 +189,9 @@ pub(super) struct PxOrPercentRowCfg {
     pub(super) wheel_step: f32,
     /// Размер шрифта в px, используемый для конверсии px ↔ % от кегля.
     pub(super) font_size_px: f32,
+    /// Optional animated help hint: when set, a "?" icon is drawn at the end of
+    /// the row and its hover tooltip plays the hint animation (`HelpHint`).
+    pub(super) help: Option<ms_gifs::Hint>,
 }
 
 /// Строка параметра «значение + переключатель X / X%» (пиксели или проценты от кегля).
@@ -242,6 +245,10 @@ pub(super) fn px_or_percent_param_row(
             value.value = converted.clamp(min, max);
             value.is_percent = want_percent;
             *changed = true;
+        }
+        if let Some(hint) = cfg.help {
+            // Animated help for this parameter, after the X/X% unit switch.
+            crate::widgets::HelpHint::new(hint).show(ui);
         }
     });
 }

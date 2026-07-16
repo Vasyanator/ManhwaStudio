@@ -52,6 +52,11 @@
 !crates/**/*.toml
 !crates/**/*.md
 
+# Animated hint assets embedded by ms-gifs via include_bytes!. Without this the
+# crate does not build from a Git clone: the .webp files would be absent while
+# `include_bytes!` still references them.
+!crates/ms-gifs/assets/*.webp
+
 # ag-psd is a standalone project (github.com/Vasyanator/ag-psd-rs) consumed from
 # crates.io (ag-psd = "0.1.0"); its local dev checkout is not part of this repo.
 crates/ag-psd/

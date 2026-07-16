@@ -49,6 +49,17 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   mouse-wheel changes without scrolling parent views.
 - `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets.
 - `seed_spin_box.rs`: seed value input with random generation support.
+- `help_hint.rs`: light-gray circled "?" icon whose hover tooltip plays an animated WebP
+  hint from the `ms-gifs` crate. The tooltip contains only the animation (no text, no i18n
+  keys). Decoding always runs on a background `ms_thread` worker (the single `decoding` slot
+  is released through an RAII guard, so even a panicking worker cannot wedge it); the GUI
+  thread uploads one frame at a time into a single reused `TextureHandle`. A process-wide
+  single-slot cache (egui temp memory, `Arc<Mutex<..>>`) keeps at most one decoded animation
+  resident and evicts it a few seconds after the tooltip was last visible. Eviction is
+  guaranteed by `maintain_help_hint_cache(ctx)`, called once per frame from the app root
+  (`MangaApp::ui`) — icons alone stop drawing when the user leaves the panel, so without the
+  root hook a decoded animation could stay resident indefinitely. A hint whose decode failed
+  is logged once and blacklisted for the session.
 
 ## Contracts and invariants
 - Widget drawing must not perform blocking file, network, build, model, or parsing work on the
