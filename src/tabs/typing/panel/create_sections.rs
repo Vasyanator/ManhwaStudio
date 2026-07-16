@@ -483,17 +483,30 @@ impl TypingCreatePanelState {
                     }
                 });
             }
-            if self.preview_enabled && ui.button(t!("typing.export.overlay_and_save_button")).clicked()
-            {
-                // Native folder picker; on web there is no OS dialog (folder export
-                // is handled by a zip download in the web-glue phase).
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let mut dialog = FileDialog::new();
-                    if let Some(path) = export_default_dir {
-                        dialog = dialog.set_directory(path);
+            if self.preview_enabled {
+                // Primary export action: painted green to stand out among the
+                // neutral secondary buttons in this panel. The surrounding group
+                // keeps the theme's default stroke.
+                let clicked = egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        let label = egui::RichText::new(t!("typing.export.overlay_and_save_button"))
+                            .color(Color32::from_rgb(230, 230, 230));
+                        ui.add(egui::Button::new(label).fill(Color32::from_rgb(46, 140, 56)))
+                            .clicked()
+                    })
+                    .inner;
+                if clicked {
+                    // Native folder picker; on web there is no OS dialog (folder export
+                    // is handled by a zip download in the web-glue phase).
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let mut dialog = FileDialog::new();
+                        if let Some(path) = export_default_dir {
+                            dialog = dialog.set_directory(path);
+                        }
+                        out.export_to_folder = dialog.pick_folder();
                     }
-                    out.export_to_folder = dialog.pick_folder();
                 }
             }
             if self.preview_enabled {
