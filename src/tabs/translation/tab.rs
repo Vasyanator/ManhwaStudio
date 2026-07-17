@@ -129,7 +129,8 @@ Composition/settings handling:
 Module-level utility functions:
 - Character names / detector geometry:
   `build_translation_character_names`, `detector_blocks_with_options`, `detector_expand_blocks`,
-  `detector_merge_blocks`, `detector_rects_touch_or_near`, `source_rect_to_scene_rect`.
+  `detector_merge_blocks`, `detector_rects_touch_or_near`, `detector_rects_to_blocks_px`,
+  `source_rect_to_scene_rect`.
 - Detector mask rendering:
   `draw_text_detector_mask_overlay_on_page`, `build_text_detector_mask_texture_page`,
   `build_text_detector_mask_tile_image`.
@@ -2470,14 +2471,21 @@ impl TranslationTabState {
             }
             return;
         };
+        // The stored mask is the RAW backend glyph mask (`result.mask_alpha`), not a
+        // raster of the expanded/merged blocks, so mirror the RAW detector boxes
+        // (`result.blocks`) alongside it. Autoclean's box candidate must match what the
+        // mask represents; resolved boxes belong only to the synthesized-rect path in
+        // `materialize_text_mask_page_from_blocks_if_missing`.
+        let blocks = detector_rects_to_blocks_px(&result.blocks);
         if let Some(model) = self.text_mask_model.as_ref()
             && let Ok(mut model) = model.lock()
         {
-            model.set_page(
+            model.set_page_with_blocks(
                 page_idx,
                 result.source_size,
                 result.mask_size,
                 result.mask_alpha.clone(),
+                blocks,
             );
         }
     }
@@ -2519,12 +2527,20 @@ impl TranslationTabState {
         if mask_w == 0 || mask_h == 0 {
             return;
         }
+        // The synthesized mask IS a raster of the resolved (expanded/merged) blocks, so
+        // store those same resolved blocks as the page's box set — they match the mask.
+        let resolved = detector_blocks_with_options(result, &self.text_detector_options);
         let mut mask_alpha = vec![0u8; mask_w.saturating_mul(mask_h)];
-        for rect in detector_blocks_with_options(result, &self.text_detector_options) {
-            let x0 = rect.x1.floor().max(0.0) as usize;
-            let y0 = rect.y1.floor().max(0.0) as usize;
-            let x1 = rect.x2.ceil().min(mask_size[0] as f32) as usize;
-            let y1 = rect.y2.ceil().min(mask_size[1] as f32) as usize;
+        for rect in &resolved {
+            // Same checked float->int rounding as the block set, then clamp the covering
+            // rect into the mask raster (negative edges -> 0, far edges -> mask extent).
+            let Some([rx1, ry1, rx2, ry2]) = detector_rect_to_px_rect(rect) else {
+                continue;
+            };
+            let x0 = usize::try_from(rx1.max(0)).unwrap_or(0).min(mask_w);
+            let y0 = usize::try_from(ry1.max(0)).unwrap_or(0).min(mask_h);
+            let x1 = usize::try_from(rx2.max(0)).unwrap_or(0).min(mask_w);
+            let y1 = usize::try_from(ry2.max(0)).unwrap_or(0).min(mask_h);
             if x0 >= x1 || y0 >= y1 {
                 continue;
             }
@@ -2538,10 +2554,12 @@ impl TranslationTabState {
         if !mask_alpha.iter().any(|&px| px != 0) {
             return;
         }
+        let blocks = detector_rects_to_blocks_px(&resolved);
+        let source_size = result.source_size;
         if let Some(model) = self.text_mask_model.as_ref()
             && let Ok(mut model) = model.lock()
         {
-            model.set_page(page_idx, result.source_size, mask_size, mask_alpha);
+            model.set_page_with_blocks(page_idx, source_size, mask_size, mask_alpha, blocks);
         }
     }
 
@@ -6027,6 +6045,62 @@ fn recent_character_rank_from_text(text: &str, shift_down: bool) -> Option<usize
 fn characters_file_mtime(project: &ProjectData) -> Option<SystemTime> {
     let path = project.paths.characters_dir.join("characters.json");
     fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Rounds one float detector rect outward into an integer `[x1, y1, x2, y2]` covering
+/// rect in source-page pixel space, or `None` when it cannot be represented.
+///
+/// `x1`/`y1` are floored, `x2`/`y2` ceiled, so the integer rect fully covers the float
+/// rect. Any non-finite coordinate, or one whose rounded form falls outside the `i32`
+/// range, makes the whole rect unrepresentable: it is skipped (with a warning log)
+/// rather than wrapped into a bogus box. In-range negative coordinates are preserved so
+/// callers can clamp them to their own raster as needed.
+fn detector_rect_to_px_rect(rect: &TextDetectorRect) -> Option<[i32; 4]> {
+    let round = |value: f32, ceil: bool| -> Option<i32> {
+        if !value.is_finite() {
+            return None;
+        }
+        let rounded = if ceil { value.ceil() } else { value.floor() };
+        // Bounds-check before converting so a stray coordinate is skipped, never
+        // truncated or wrapped into a valid-looking box.
+        if rounded < i32::MIN as f32 || rounded > i32::MAX as f32 {
+            return None;
+        }
+        Some(rounded as i32)
+    };
+    match (
+        round(rect.x1, false),
+        round(rect.y1, false),
+        round(rect.x2, true),
+        round(rect.y2, true),
+    ) {
+        (Some(x1), Some(y1), Some(x2), Some(y2)) => Some([x1, y1, x2, y2]),
+        _ => {
+            crate::runtime_log::log_warn(format!(
+                "autoclean: skipping detector rect with non-finite or out-of-i32-range coordinates: {rect:?}"
+            ));
+            None
+        }
+    }
+}
+
+/// Converts float detector rects into integer `[x1, y1, x2, y2]` covering rects in
+/// source-page pixel space for `TextMaskModel`.
+///
+/// Each edge is rounded outward via [`detector_rect_to_px_rect`], which skips any rect
+/// with a non-finite or out-of-range coordinate. Returns `None` for an empty slice, and
+/// also when every rect was skipped, so the model's "`None` == no detector boxes known"
+/// contract holds (an empty box vector is never stored).
+fn detector_rects_to_blocks_px(rects: &[TextDetectorRect]) -> Option<Vec<[i32; 4]>> {
+    if rects.is_empty() {
+        return None;
+    }
+    let blocks: Vec<[i32; 4]> = rects.iter().filter_map(detector_rect_to_px_rect).collect();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
+    }
 }
 
 fn detector_blocks_with_options(

@@ -132,6 +132,12 @@ the user enables that context option.
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
 - Text-detector mask GPU eviction must drop only tiled `TextureHandle` pages and preserve detector
   result data, text-mask model data, and pending storage jobs.
+- When mirroring a detection into `TextMaskModel`, the tab passes the detector boxes that match the
+  stored mask: `sync_text_mask_page_from_result` stores the RAW backend glyph mask and so passes the
+  RAW `result.blocks`; `materialize_text_mask_page_from_blocks_if_missing` rasterizes the RESOLVED
+  (expanded/merged) blocks and so passes those resolved blocks. `detector_rects_to_blocks_px`
+  converts float `TextDetectorRect`s to integer source-pixel `[x1,y1,x2,y2]` covering rects; boxes
+  stay in source-page pixel space (the model is responsible for no scaling).
 - Persisted detector results live under `ProjectPaths::text_detection_dir`; storage jobs must load
   and save real block/mask data rather than synthesizing success.
 - Footer metadata and ImageBubble metadata live in `Bubble.extra` fields and are synchronized

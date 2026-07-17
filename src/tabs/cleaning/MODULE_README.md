@@ -31,7 +31,15 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 
 ## Files and submodules
 - `tab.rs`: tab state, canvas orchestration, floating panels, mask loading, save jobs,
-  quick text cleanup, and history hotkeys.
+  quick text-clean job orchestration, and history hotkeys.
+- `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
+  clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
+  (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->
+  `evolve_mask_to_homogeneous` on both in parallel (`rayon::join`) -> coverage/area selection
+  -> universal `clip_fill_to_bubble_interior` -> conditional background-only padding ->
+  `final_sanity_trim`. The thin `autoclean_page` wrapper is the only egui-touching part; it
+  rasterizes the winning `RegionFill`s into the overlay patch. Includes synthetic pipeline and
+  characterization tests. Detector boxes arrive from `tab.rs` already in page-pixel space.
 - `tools/`: cleaning tool trait, brush/region-edit bases, local fill tools, stamp tool, and
   AI-backed inpaint tools. See `tools/MODULE_README.md`.
 - `mod.rs`: module wiring and public re-export of `CleaningTabState`.
@@ -54,6 +62,11 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 ## Editing map
 - To change top-level cleaning UI, save behavior, history, or quick-clean orchestration,
   edit `tab.rs`.
+- To change quick text-clean pixel classification, mask evolution (grow/shrink), candidate
+  selection, bubble-interior clipping, or conditional padding, edit `autoclean.rs`; keep
+  worker/job coordination, mask resize, and detector-box source->page scaling
+  (`scale_blocks_source_to_page`) in `tab.rs`. The engine core must stay GUI-free; only the
+  `autoclean_page` boundary and `paint_patch_from_mask` may touch egui.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
 - To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
   `TextMaskModel` contracts in `src/models/`.

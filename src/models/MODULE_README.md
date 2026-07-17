@@ -27,9 +27,11 @@ composition. The model also owns the optional decoded source-page cache so tools
 page images across tabs. That cache is reconstructable and is bounded by explicit byte/item policy,
 LRU order, and optional page-window pins.
 
-`TextMaskModel` stores detector mask alpha planes by page index with source and mask dimensions.
-Writers replace whole pages or use closure-based in-place edits; readers track the model revision
-to refresh local mask caches.
+`TextMaskModel` stores detector mask alpha planes by page index with source and mask dimensions,
+plus the optional detector text boxes (`TextMaskPage.blocks`) that describe the same detection.
+Writers replace whole pages (mask + blocks) or use closure-based in-place edits; readers track the
+model revision to refresh local mask caches. Autoclean reads `blocks` to build a box-based mask
+candidate.
 
 ## Files and submodules
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
@@ -90,6 +92,13 @@ to refresh local mask caches.
   bypass writer that can race this quiescence boundary.
 - RGBA image buffers must match `width * height * 4`; mask buffers must match
   `width * height`.
+- `TextMaskPage.blocks` are detector text boxes as `[x1, y1, x2, y2]` covering integer rects in
+  **source-page pixel space** (same space as `source_size`, NOT `mask_size`); mask-space consumers
+  must apply the source→mask scale themselves. Writers pass the boxes matching what the mask
+  contains (raw boxes for the raw glyph mask, resolved/expanded/merged boxes for a rasterized-box
+  mask). `blocks == None` means "no detector boxes known"; the model never stores `Some(vec![])`.
+  A manual mask edit (`edit_page_mask` closure reporting a change) invalidates `blocks` to `None`,
+  because a hand-edited mask no longer matches the detector boxes.
 - PNG/export-facing clean overlay buffers must be straight-alpha RGBA. Convert from
   `Color32` with `to_srgba_unmultiplied()` before writing to `RgbaImage`.
 - Undo/redo for clean overlays uses `ms_actions::ActionHistory<CleanOverlayDiffOp>`: each committed

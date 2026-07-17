@@ -1,3 +1,4 @@
+mod autoclean;
 mod tab;
 mod tools;
 

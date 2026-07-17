@@ -22,7 +22,8 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `active_cursor_occluder`: вычисляет scene-область активного курсора кисти для скрытия on_top/aside пузырей.
   - `start_text_mask_load_job_if_needed/poll_text_mask_load_job`: фоновые загрузка и применение масок.
   - `start_quick_text_clean_job/poll_quick_text_clean_job`: многопоточная обработка страниц по маске текста
-    с прогрессом и применением patch-ов в `CleanOverlaysModel`.
+    с прогрессом и применением patch-ов в `CleanOverlaysModel`; pixel-level autoclean algorithm lives in
+    `autoclean.rs`.
   - `handle_history_hotkeys`: Ctrl+Z / Ctrl+Shift+Z для committed overlay-дельт из shared history.
   - `handle_active_tool_input/hotkeys/wheel`: маршрутизация ввода в активный инструмент.
   - `canvas_pointer_occluded`: общий гейт ввода, когда pointer занят floating UI/popup/dialog поверх canvas.
@@ -33,6 +34,7 @@ FILE HEADER (tabs/cleaning/tab.rs)
   Для инструментов, которым нужен `Ctrl+ЛКМ` (например, `Замазка` для прямоугольника),
   zoom также блокируется адресно на эту комбинацию.
 */
+use super::autoclean::{autoclean_page, UnevenBackgroundTool};
 use super::tools::{
     AotInpaintTool, CleaningCursorOccluder, CleaningTool, FluxFillInpaintTool, GradientFillTool,
     LamaInpaintTool, LamaMpeInpaintTool, SdxlInpaintTool, StampTool, StrokeModifiers, StrokePoint,
@@ -55,7 +57,6 @@ use crate::tabs::translation::backend_health::AiBackendHealthSnapshot;
 use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Pos2, Rect};
-use std::collections::VecDeque;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -65,48 +66,6 @@ use ms_thread as thread;
 const STROKE_OVERLAY_UPLOAD_MIN_INTERVAL_S: f64 = 1.0 / 30.0;
 const TEXT_MASK_TILE_SIDE: usize = 1024;
 const TEXT_MASK_VISUAL_ALPHA_MAX: u8 = 96;
-// --- Autoclean (продвинутый алгоритм клина текста по однородному фону) --------
-// Портирован из ZITS-PlusPlus/dataset_generator_v2/naver_rs/src/autoclean.rs и
-// адаптирован под единую бинарную маску текста + связные компоненты MS.
-//
-// Идея: для каждой области текста заполняются внутренности букв, маска слегка
-// утолщается, отбраковываются однородные не-текстовые пятна (лицо/волосы), затем
-// маска растёт только в сторону пикселей, отличных от фона (штрихи текста), пока
-// весь периметр не станет однородным. Фон — устойчивая (медианная) краска кольца
-// вокруг маски. Если маска не сошлась к однородному периметру — пробуем залить
-// прямоугольник bbox с защитой `box_interior_fillable`.
-
-/// Поканальная начальная дилатация (часто тонкой) маски текста, пиксели.
-const AUTOCLEAN_INITIAL_DILATE: i32 = 2;
-/// Запас заливки наружу, пиксели. Заливка расширяется на столько в заведомо
-/// фоновую зону, чтобы при LINEAR-фильтрации оверлея на обычном масштабе
-/// полупрозрачный край заливки приходился на фон, а не на кромку текста (иначе
-/// из-под клина «просвечивает» тёмная кромка исходника). Альфа остаётся строго
-/// бинарной (0/255) — дорисовываются только полностью непрозрачные пиксели фона,
-/// поэтому в программе и в экспорте всё композитится одинаково.
-const AUTOCLEAN_FILL_PADDING: i32 = 2;
-/// Поканальный допуск «одинакового цвета». Намеренно маленький и фиксированный:
-/// допуск, масштабируемый дисперсией, взорвался бы на разноцветном периметре
-/// (волосы + кожа + одежда) и ошибочно счёл бы его однородным.
-const AUTOCLEAN_SAME_TOL: i32 = 16;
-/// Пока не более этой доли периметра отличается от фона, отличающиеся пиксели
-/// считаются штрихами текста и поглощаются ростом. Выше — периметр это реальный
-/// контент/градиент, область отвергается сразу.
-const AUTOCLEAN_GROW_LIMIT: f32 = 0.30;
-/// Мин. доля пикселей маски, которые должны быть «чернилами» (иначе это
-/// однородная область, а не текст).
-const AUTOCLEAN_MIN_INK_FRAC: f32 = 0.02;
-/// Макс. доля пикселей маски, допустимая как «чернила» (выше — это сплошной
-/// отличающийся объект, а не разреженный текст на фоне).
-const AUTOCLEAN_MAX_INK_FRAC: f32 = 0.65;
-/// Мин. доля «чернильных» пикселей на границе чернила/фон. Тонкие штрихи → высоко;
-/// сплошная заливка (лицо/волосы) → низко.
-const AUTOCLEAN_MIN_EDGE_RATIO: f32 = 0.16;
-/// Защита box-fill: макс. доля внутренности прямоугольника, которая может
-/// отличаться от фона. Текстовые боксы — в основном фон с редкими чернилами.
-const AUTOCLEAN_BOX_INK_LIMIT: f32 = 0.45;
-/// Объединять компоненты текста, чьи пиксели в пределах стольких пикселей.
-const AUTOCLEAN_CLUSTER_SLACK: usize = 4;
 /// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
 #[must_use]
 fn save_hint_text() -> &'static str {
@@ -123,18 +82,6 @@ const MASK_REMOVAL_TOOL_INDICES: [usize; 5] = [2, 3, 4, 5, 6];
 // Инструменты редактирования области (SDXL, FLUX.1 Fill) — отдельной строкой.
 const AREA_EDIT_TOOL_INDICES: [usize; 2] = [7, 8];
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum UnevenBackgroundTool {
-    NoProcessing,
-}
-
-impl UnevenBackgroundTool {
-    fn title(self) -> &'static str {
-        match self {
-            Self::NoProcessing => t!("cleaning.tab.no_processing_title"),
-        }
-    }
-}
 
 #[derive(Clone)]
 struct TextMaskTextureTile {
@@ -157,8 +104,14 @@ struct TextMaskTexturePage {
 #[derive(Debug, Clone)]
 struct TextMaskLoadPage {
     page_idx: usize,
+    /// Source-page pixel size `[w, h]` — the space `blocks` live in. Used to scale
+    /// detector boxes into page space for autoclean; `[0, 0]` when unknown.
+    source_size: [u32; 2],
     mask_size: [u32; 2],
     mask_alpha: Vec<u8>,
+    /// Detector text boxes `[x1, y1, x2, y2]` in source-page pixel space, or `None`
+    /// when unknown (manual mask edit, or the disk fallback which has no blocks JSON).
+    blocks: Option<Vec<[i32; 4]>>,
 }
 
 #[derive(Debug)]
@@ -184,6 +137,7 @@ struct QuickTextCleanPageResult {
     regions_total: usize,
     regions_filled: usize,
     regions_skipped: usize,
+    regions_partial: usize,
     error: Option<String>,
     missing_mask: bool,
 }
@@ -202,6 +156,7 @@ struct QuickTextCleanProgress {
     regions_total: usize,
     regions_filled: usize,
     regions_skipped: usize,
+    regions_partial: usize,
     failed_pages: usize,
     missing_masks: usize,
 }
@@ -868,7 +823,7 @@ impl CleaningTabState {
                         / self.quick_clean_progress.total_pages as f32)
                         .clamp(0.0, 1.0);
                     ui.add(egui::ProgressBar::new(progress).text(tf!("cleaning.tab.pages_progress_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages)));
-                    ui.small(tf!("cleaning.tab.regions_progress_status", filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, page_errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
+                    ui.small(tf!("cleaning.tab.regions_progress_status", filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, partial = self.quick_clean_progress.regions_partial, page_errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
                 }
                 if let Some(status) = self.quick_clean_status_text.as_ref() {
                     ui.small(status);
@@ -1047,8 +1002,10 @@ impl CleaningTabState {
                 .and_then(|model| model.page(page_idx).cloned())
                 .map(|page| TextMaskLoadPage {
                     page_idx,
+                    source_size: page.source_size,
                     mask_size: page.mask_size,
                     mask_alpha: page.mask_alpha,
+                    blocks: page.blocks,
                 });
             tasks.push(QuickTextCleanTask {
                 page_idx,
@@ -1159,6 +1116,10 @@ impl CleaningTabState {
                         .quick_clean_progress
                         .regions_skipped
                         .saturating_add(result.regions_skipped);
+                    self.quick_clean_progress.regions_partial = self
+                        .quick_clean_progress
+                        .regions_partial
+                        .saturating_add(result.regions_partial);
                     if result.missing_mask {
                         self.quick_clean_progress.missing_masks =
                             self.quick_clean_progress.missing_masks.saturating_add(1);
@@ -1170,12 +1131,12 @@ impl CleaningTabState {
                     if let Some(patch) = result.patch {
                         self.apply_quick_text_patch_to_overlay(result.page_idx, patch);
                     }
-                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_page_done_status", page = result.page_idx, regions = result.regions_total, filled = result.regions_filled, skipped = result.regions_skipped));
+                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_page_done_status", page = result.page_idx, regions = result.regions_total, filled = result.regions_filled, skipped = result.regions_skipped, partial = result.regions_partial));
                 }
                 Ok(QuickTextCleanJobEvent::Finished) => {
                     self.quick_clean_job_in_progress = false;
                     self.quick_clean_job_rx = None;
-                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_finished_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages, filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
+                    self.quick_clean_status_text = Some(tf!("cleaning.tab.quick_clean_finished_status", done = self.quick_clean_progress.done_pages, total = self.quick_clean_progress.total_pages, filled = self.quick_clean_progress.regions_filled, skipped = self.quick_clean_progress.regions_skipped, partial = self.quick_clean_progress.regions_partial, errors = self.quick_clean_progress.failed_pages, missing = self.quick_clean_progress.missing_masks));
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1701,6 +1662,7 @@ fn run_quick_text_clean_on_page(
             regions_total: 0,
             regions_filled: 0,
             regions_skipped: 0,
+            regions_partial: 0,
             error: Some(error),
             missing_mask: false,
         },
@@ -1718,8 +1680,11 @@ fn run_quick_text_clean_on_page_impl(
             tf!("cleaning.tab.open_page_error", path = task.page_path.display(), err = err)
         })?
         .to_rgba8();
-    let width = base_rgba.width() as usize;
-    let height = base_rgba.height() as usize;
+    // `image` dimensions are u32; widening to usize is lossless on the supported 64-bit
+    // targets. try_from keeps the narrowing-back path (below) honest and degrades a
+    // pathological dimension to 0, which the engine treats as an empty page.
+    let width = usize::try_from(base_rgba.width()).unwrap_or(0);
+    let height = usize::try_from(base_rgba.height()).unwrap_or(0);
     let Some(mask_page) = resolve_quick_clean_mask_page(&task) else {
         return Ok(QuickTextCleanPageResult {
             page_idx,
@@ -1727,6 +1692,7 @@ fn run_quick_text_clean_on_page_impl(
             regions_total: 0,
             regions_filled: 0,
             regions_skipped: 0,
+            regions_partial: 0,
             error: None,
             missing_mask: true,
         });
@@ -1738,13 +1704,31 @@ fn run_quick_text_clean_on_page_impl(
             regions_total: 0,
             regions_filled: 0,
             regions_skipped: 0,
+            regions_partial: 0,
             error: None,
             missing_mask: true,
         });
     }
 
+    // Detector blocks live in source-page pixel space (`mask_page.source_size`).
+    // Autoclean operates in page-pixel space (`width`/`height` of the opened page),
+    // which is the SAME space the mask is resized into below. Blocks must therefore be
+    // scaled by the source->page transform, NOT by the mask->page resize (mask_size ->
+    // page). When source_size already equals the page size (the normal case) this is the
+    // identity. See the plan's "Data plumbing" note.
+    let blocks_page_space = mask_page.blocks.as_ref().map(|blocks| {
+        scale_blocks_source_to_page(blocks, mask_page.source_size, width, height)
+    });
+
+    // Narrow the page size back to u32 for the mask-size comparison. `width`/`height`
+    // originate from a u32 image dimension, so try_from cannot actually fail here; the
+    // saturating fallback only guards against a future oversized source.
+    let page_size_u32 = [
+        u32::try_from(width).unwrap_or(u32::MAX),
+        u32::try_from(height).unwrap_or(u32::MAX),
+    ];
     let mut binary_mask = mask_page.mask_alpha;
-    if mask_page.mask_size != [width as u32, height as u32] {
+    if mask_page.mask_size != page_size_u32 {
         binary_mask = resize_binary_mask_nearest(
             &binary_mask,
             mask_page.mask_size[0] as usize,
@@ -1764,6 +1748,7 @@ fn run_quick_text_clean_on_page_impl(
         height,
         spread_radius_px,
         uneven_tool,
+        blocks_page_space.as_deref(),
     );
     let has_patch = outcome.patch.pixels.iter().any(|px| px.a() > 0);
     Ok(QuickTextCleanPageResult {
@@ -1772,738 +1757,79 @@ fn run_quick_text_clean_on_page_impl(
         regions_total: outcome.regions_total,
         regions_filled: outcome.regions_filled,
         regions_skipped: outcome.regions_skipped,
+        regions_partial: outcome.regions_partial,
         error: None,
         missing_mask: false,
     })
 }
 
-/// Результат продвинутого автоклина одной страницы.
-struct AutocleanPageOutcome {
-    patch: egui::ColorImage,
-    regions_total: usize,
-    regions_filled: usize,
-    regions_skipped: usize,
-}
-
-/// Продвинутый автоклин страницы по бинарной маске текста.
+/// Scale detector blocks from source-page pixel space to page-pixel space.
 ///
-/// Связные компоненты маски, расширенной на `AUTOCLEAN_CLUSTER_SLACK`, образуют
-/// области (кластеры близких штрихов/букв). Для каждой области:
-///   1. **mask-fill** — локальная маска из исходных пикселей текста кластера,
-///      заполнение внутренностей букв, лёгкая дилатация, отбраковка не-текстовых
-///      пятен и рост к однородному периметру;
-///   2. **box-fill** — если mask-fill не сошёлся, пробуем залить прямоугольник
-///      bbox кластера с проверкой `box_interior_fillable`.
+/// `blocks` are `[x1, y1, x2, y2]` in `source_size` pixel space. When `source_size`
+/// already matches `page_w`/`page_h` (the normal case) the boxes are returned
+/// unchanged; otherwise each edge is scaled by the source->page ratio, flooring the
+/// min corner and ceiling the max corner to preserve a covering rect. This is the
+/// source->page transform only — the mask nearest-resize (mask_size -> page) never
+/// touches blocks.
 ///
-/// `spread_radius_px` — радиус «расползания»: на столько пикселей маска готова
-/// расползтись вдоль выбивающегося из фона штриха (и на столько же отступить от
-/// него), а также на столько наружу зондируется фон при классификации
-/// штрих-vs-объект.
-fn autoclean_page(
-    base_rgba: &image::RgbaImage,
-    binary_mask: &[u8],
-    width: usize,
-    height: usize,
-    spread_radius_px: usize,
-    uneven_tool: UnevenBackgroundTool,
-) -> AutocleanPageOutcome {
-    let mut patch =
-        egui::ColorImage::filled([width.max(1), height.max(1)], egui::Color32::TRANSPARENT);
-    let (mut regions_total, mut regions_filled, mut regions_skipped) = (0usize, 0usize, 0usize);
-    if binary_mask.is_empty() || width == 0 || height == 0 {
-        return AutocleanPageOutcome {
-            patch,
-            regions_total,
-            regions_filled,
-            regions_skipped,
-        };
+/// Returns NO blocks (an empty vector) when the source size is degenerate (zero width
+/// or height) — a zero dimension defines no scale factor, so the caller must fall back
+/// to the cluster bbox rather than pass the boxes through unscaled. Individual boxes
+/// whose scaled edges are non-finite or fall outside the `i32` range are dropped (the
+/// same graceful degrade); an all-dropped set also falls back to the cluster bbox.
+fn scale_blocks_source_to_page(
+    blocks: &[[i32; 4]],
+    source_size: [u32; 2],
+    page_w: usize,
+    page_h: usize,
+) -> Vec<[i32; 4]> {
+    let (sw, sh) = (source_size[0], source_size[1]);
+    // A degenerate source size cannot define a scale factor. Drop the blocks (return
+    // none, NOT the unscaled set) so candidate B falls back to the cluster bbox.
+    if sw == 0 || sh == 0 {
+        return Vec::new();
     }
-
-    // Единый радиус расползания управляет ростом, отступлением и зондированием.
-    // Зонд (`stroke_probe`) равен бюджету роста: штрих длиной ≤ радиуса находит
-    // фон в пределах зонда → классифицируется как штрих → маска расползается по
-    // нему; то, что тянется дальше радиуса → объект → маска отступает от пика.
-    // Так длинные хвосты букв покрываются, а не ошибочно стираются эрозией.
-    let radius = spread_radius_px.min(128) as i32;
-    let max_expand = radius;
-    let retreat_max = radius;
-    let stroke_probe = radius;
-    // Запас crop: рост наружу до `radius` + поле для кольца фона.
-    let pad = radius + 6;
-
-    // Кластеризация: компоненты исходной маски, раздутой на CLUSTER_SLACK, дают
-    // области близкого текста без явного union-find.
-    let cluster_mask = if AUTOCLEAN_CLUSTER_SLACK > 0 {
-        dilate_binary_mask(binary_mask, width, height, AUTOCLEAN_CLUSTER_SLACK)
-    } else {
-        binary_mask.to_vec()
+    // Identity fast path ONLY for an exact nonzero size match.
+    if usize::try_from(sw) == Ok(page_w) && usize::try_from(sh) == Ok(page_h) {
+        return blocks.to_vec();
+    }
+    // Page dims come from a decoded image (<= u32::MAX). If they somehow do not fit u32
+    // we cannot form a scale — drop the blocks (graceful: cluster-bbox fallback).
+    let (Ok(pw), Ok(ph)) = (u32::try_from(page_w), u32::try_from(page_h)) else {
+        return Vec::new();
     };
-    let clusters = extract_connected_components(&cluster_mask, width, height);
-
-    let (sw, sh) = (width as i32, height as i32);
-    for (label, cluster_pixels) in clusters.pixels.iter().enumerate() {
-        if cluster_pixels.is_empty() {
-            continue;
-        }
-        regions_total = regions_total.saturating_add(1);
-        let cluster_label = label as i32;
-
-        // bbox кластера (x2/y2 — эксклюзивны).
-        let (mut x1, mut y1, mut x2, mut y2) = (sw, sh, 0i32, 0i32);
-        for &idx in cluster_pixels {
-            let x = (idx % width) as i32;
-            let y = (idx / width) as i32;
-            x1 = x1.min(x);
-            y1 = y1.min(y);
-            x2 = x2.max(x + 1);
-            y2 = y2.max(y + 1);
-        }
-
-        // Crop с запасом, чтобы внешнее кольцо и рост оставались в реальном фоне.
-        let ox = (x1 - pad).max(0);
-        let oy = (y1 - pad).max(0);
-        let ex = (x2 + pad).min(sw);
-        let ey = (y2 + pad).min(sh);
-        let (cw, ch) = ((ex - ox) as u32, (ey - oy) as u32);
-        if cw == 0 || ch == 0 {
-            regions_skipped = regions_skipped.saturating_add(1);
-            continue;
-        }
-        let rgb = crop_rgb_from_rgba(base_rgba, ox, oy, cw, ch);
-
-        // Локальная маска: исходные пиксели текста, принадлежащие этому кластеру.
-        let mut mask = image::GrayImage::new(cw, ch);
-        for &idx in cluster_pixels {
-            if binary_mask.get(idx).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            if clusters.labels.get(idx).copied().unwrap_or(-1) != cluster_label {
-                continue;
-            }
-            let lx = (idx % width) as i32 - ox;
-            let ly = (idx / width) as i32 - oy;
-            if lx >= 0 && ly >= 0 && lx < cw as i32 && ly < ch as i32 {
-                mask.put_pixel(lx as u32, ly as u32, image::Luma([255]));
-            }
-        }
-
-        // --- попытка 1: заливка по маске ---------------------------------
-        // Клон: оригинальные штрихи текста нужны box-fallback'у как seed
-        // интерьера пузыря (см. clip_fill_to_bubble_interior).
-        if let Some((final_mask, bg, retreated)) =
-            autoclean_try_mask_fill(&rgb, mask.clone(), max_expand, retreat_max, stroke_probe)
-        {
-            if retreated {
-                // Маска отступила с чужого объекта — bbox заливать нельзя (затёрли
-                // бы объект), красим только по штрихам маски.
-                paint_patch_from_mask(&mut patch, width, height, ox, oy, &final_mask, bg);
-            } else {
-                paint_autoclean_fill(&mut patch, (width, height), ox, oy, &final_mask, bg);
-            }
-            regions_filled = regions_filled.saturating_add(1);
-            continue;
-        }
-
-        // --- попытка 2: заливка прямоугольника bbox ----------------------
-        let mut bmask = image::GrayImage::new(cw, ch);
-        let bx1 = (x1 - ox).clamp(0, cw as i32);
-        let by1 = (y1 - oy).clamp(0, ch as i32);
-        let bx2 = (x2 - ox).clamp(0, cw as i32);
-        let by2 = (y2 - oy).clamp(0, ch as i32);
-        for y in by1..by2 {
-            for x in bx1..bx2 {
-                bmask.put_pixel(x as u32, y as u32, image::Luma([255]));
-            }
-        }
-        let mut box_filled = false;
-        if has_foreground(&bmask)
-            && let Some((bg, _retreated)) =
-                grow_until_homogeneous(&rgb, &mut bmask, max_expand, retreat_max, stroke_probe)
-            && box_interior_fillable(&rgb, bx1, by1, bx2, by2, bg)
-        {
-            // Запас наружу против «просвечивания» исходника на LINEAR-крае
-            // (см. AUTOCLEAN_FILL_PADDING).
-            dilate_gray_inplace(&mut bmask, AUTOCLEAN_FILL_PADDING);
-            // Прямоугольный box по углам заходит за контур баббла; рост и padding
-            // могут расползтись через тонкий контур наружу. Обрезаем заливку по
-            // интерьеру пузыря, чтобы не затереть его контур и фон за ним.
-            clip_fill_to_bubble_interior(&mut bmask, &rgb, &mask, bg);
-            paint_patch_from_mask(&mut patch, width, height, ox, oy, &bmask, bg);
-            regions_filled = regions_filled.saturating_add(1);
-            box_filled = true;
-        }
-
-        if !box_filled {
-            match uneven_tool {
-                UnevenBackgroundTool::NoProcessing => {
-                    regions_skipped = regions_skipped.saturating_add(1);
-                }
-            }
-        }
-    }
-
-    AutocleanPageOutcome {
-        patch,
-        regions_total,
-        regions_filled,
-        regions_skipped,
-    }
+    let (fx, fy) = (f64::from(pw) / f64::from(sw), f64::from(ph) / f64::from(sh));
+    blocks
+        .iter()
+        .filter_map(|&[x1, y1, x2, y2]| {
+            Some([
+                scale_edge_to_i32(f64::from(x1) * fx, false)?,
+                scale_edge_to_i32(f64::from(y1) * fy, false)?,
+                scale_edge_to_i32(f64::from(x2) * fx, true)?,
+                scale_edge_to_i32(f64::from(y2) * fy, true)?,
+            ])
+        })
+        .collect()
 }
 
-/// Crop из RGBA-страницы в локальный RGB-буфер (за границами — чёрный).
-fn crop_rgb_from_rgba(
-    base: &image::RgbaImage,
-    ox: i32,
-    oy: i32,
-    cw: u32,
-    ch: u32,
-) -> image::RgbImage {
-    let (bw, bh) = (base.width() as i32, base.height() as i32);
-    let mut out = image::RgbImage::new(cw, ch);
-    for y in 0..ch as i32 {
-        for x in 0..cw as i32 {
-            let (gx, gy) = (ox + x, oy + y);
-            if gx >= 0 && gy >= 0 && gx < bw && gy < bh {
-                let p = base.get_pixel(gx as u32, gy as u32);
-                out.put_pixel(x as u32, y as u32, image::Rgb([p[0], p[1], p[2]]));
-            }
-        }
-    }
-    out
-}
-
-/// Одна попытка заливки по маске: заполнить внутренности букв, утолстить,
-/// отбраковать не-текстовые пятна, затем дорастить до однородного периметра.
-/// Возвращает финальную (выросшую) маску, цвет фона и флаг `retreated` (маска
-/// где-то отступила с чужого объекта → bbox заливать нельзя) на успехе.
-fn autoclean_try_mask_fill(
-    rgb: &image::RgbImage,
-    mut mask: image::GrayImage,
-    max_expand: i32,
-    retreat_max: i32,
-    stroke_probe: i32,
-) -> Option<(image::GrayImage, image::Rgb<u8>, bool)> {
-    if !has_foreground(&mask) {
+/// Round a scaled block edge to `i32`, rejecting values that cannot be represented.
+///
+/// `ceil` rounds up (max corner) versus down (min corner) so the integer rect still
+/// covers the float rect. Returns `None` when `value` is non-finite or its rounded form
+/// falls outside the `i32` range, so the caller drops that block instead of wrapping a
+/// stray coordinate into a valid-looking box.
+fn scale_edge_to_i32(value: f64, ceil: bool) -> Option<i32> {
+    if !value.is_finite() {
         return None;
     }
-    fill_holes(&mut mask);
-    dilate_gray_inplace(&mut mask, AUTOCLEAN_INITIAL_DILATE);
-    // Отбраковать маски без структуры текста (ложное срабатывание на однородном
-    // пятне лица/волос), сверяясь с начальным фоном периметра.
-    let ring0 = outer_ring(&mask);
-    if ring0.is_empty() {
+    let rounded = if ceil { value.ceil() } else { value.floor() };
+    if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
         return None;
     }
-    let bg0 = ring_background(rgb, &ring0);
-    if !has_text_structure(rgb, &mask, bg0) {
-        return None;
-    }
-    let (bg, retreated) =
-        grow_until_homogeneous(rgb, &mut mask, max_expand, retreat_max, stroke_probe)?;
-    Some((mask, bg, retreated))
+    // Bounds-checked, integral f64 -> i32: exact, no truncation.
+    Some(rounded as i32)
 }
 
-/// Закрасить пиксели маски в patch сплошным цветом фона (по глоб. координатам).
-fn paint_patch_from_mask(
-    patch: &mut egui::ColorImage,
-    pw: usize,
-    ph: usize,
-    ox: i32,
-    oy: i32,
-    mask: &image::GrayImage,
-    bg: image::Rgb<u8>,
-) {
-    let color = egui::Color32::from_rgb(bg[0], bg[1], bg[2]);
-    for y in 0..mask.height() as i32 {
-        for x in 0..mask.width() as i32 {
-            if mask.get_pixel(x as u32, y as u32)[0] == 0 {
-                continue;
-            }
-            let (gx, gy) = (ox + x, oy + y);
-            if gx >= 0 && gy >= 0 && (gx as usize) < pw && (gy as usize) < ph {
-                let didx = gy as usize * pw + gx as usize;
-                if let Some(px) = patch.pixels.get_mut(didx) {
-                    *px = color;
-                }
-            }
-        }
-    }
-}
-
-/// Залить успешно проверенную область текста в patch.
-///
-/// `grow_until_homogeneous` уже доказал, что **весь периметр выросшей маски —
-/// единый однородный цвет фона** (возврат `Some` только при нулевом числе
-/// отличий). Значит вся область внутри периметра окружена однородным фоном и её
-/// можно целиком залить bbox'ом маски: тонкие штрихи не покрывают зазоры между
-/// буквами и сглаживающий ореол по краям, и заливка только по штрихам оставляла
-/// бы призрачные артефакты текста. Доп. проверка `box_interior_fillable` здесь
-/// не нужна (и вредна — она отбраковывала плотные строки текста, чей bbox почти
-/// весь «чернила»): структура текста и однородность периметра уже подтверждены.
-///
-/// bbox дополнительно расширяется на `AUTOCLEAN_FILL_PADDING` в фоновую зону —
-/// см. константу: это убирает «просвечивание» исходника на крае при LINEAR.
-fn paint_autoclean_fill(
-    patch: &mut egui::ColorImage,
-    (pw, ph): (usize, usize),
-    ox: i32,
-    oy: i32,
-    mask: &image::GrayImage,
-    bg: image::Rgb<u8>,
-) {
-    let Some((bx1, by1, bx2, by2)) = gray_mask_bbox(mask) else {
-        return;
-    };
-    let (mw, mh) = (mask.width() as i32, mask.height() as i32);
-    let p = AUTOCLEAN_FILL_PADDING;
-    let (bx1, by1, bx2, by2) = (
-        (bx1 - p).max(0),
-        (by1 - p).max(0),
-        (bx2 + p).min(mw),
-        (by2 + p).min(mh),
-    );
-    let color = egui::Color32::from_rgb(bg[0], bg[1], bg[2]);
-    for y in by1..by2 {
-        for x in bx1..bx2 {
-            let (gx, gy) = (ox + x, oy + y);
-            if gx >= 0 && gy >= 0 && (gx as usize) < pw && (gy as usize) < ph {
-                let didx = gy as usize * pw + gx as usize;
-                if let Some(px) = patch.pixels.get_mut(didx) {
-                    *px = color;
-                }
-            }
-        }
-    }
-}
-
-/// Bounding box (локальные координаты crop, x2/y2 эксклюзивны) пикселей маски.
-fn gray_mask_bbox(mask: &image::GrayImage) -> Option<(i32, i32, i32, i32)> {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let (mut x1, mut y1, mut x2, mut y2) = (w, h, 0i32, 0i32);
-    let mut found = false;
-    for y in 0..h {
-        for x in 0..w {
-            if mask.get_pixel(x as u32, y as u32)[0] != 0 {
-                found = true;
-                x1 = x1.min(x);
-                y1 = y1.min(y);
-                x2 = x2.max(x + 1);
-                y2 = y2.max(y + 1);
-            }
-        }
-    }
-    found.then_some((x1, y1, x2, y2))
-}
-
-fn has_foreground(mask: &image::GrayImage) -> bool {
-    mask.as_raw().iter().any(|&v| v != 0)
-}
-
-/// Заполнить фоновые пиксели, полностью окружённые маской (внутренности букв):
-/// заливка фона от границы crop, всё недостигнутое — дырка.
-fn fill_holes(mask: &mut image::GrayImage) {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let mut outside = vec![false; (w * h) as usize];
-    let mut stack: Vec<(i32, i32)> = Vec::new();
-    let push = |x: i32, y: i32, outside: &mut Vec<bool>, stack: &mut Vec<(i32, i32)>| {
-        let idx = (y * w + x) as usize;
-        if !outside[idx] && mask.get_pixel(x as u32, y as u32)[0] == 0 {
-            outside[idx] = true;
-            stack.push((x, y));
-        }
-    };
-    for x in 0..w {
-        push(x, 0, &mut outside, &mut stack);
-        push(x, h - 1, &mut outside, &mut stack);
-    }
-    for y in 0..h {
-        push(0, y, &mut outside, &mut stack);
-        push(w - 1, y, &mut outside, &mut stack);
-    }
-    while let Some((x, y)) = stack.pop() {
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let (nx, ny) = (x + dx, y + dy);
-            if nx >= 0 && ny >= 0 && nx < w && ny < h {
-                push(nx, ny, &mut outside, &mut stack);
-            }
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) as usize;
-            if !outside[idx] && mask.get_pixel(x as u32, y as u32)[0] == 0 {
-                mask.put_pixel(x as u32, y as u32, image::Luma([255]));
-            }
-        }
-    }
-}
-
-/// 8-связная дилатация на `r` пикс. (r итераций роста на 1 пиксель).
-fn dilate_gray_inplace(mask: &mut image::GrayImage, r: i32) {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    for _ in 0..r {
-        let src = mask.clone();
-        for y in 0..h {
-            for x in 0..w {
-                if src.get_pixel(x as u32, y as u32)[0] != 0 {
-                    continue;
-                }
-                let mut hit = false;
-                'n: for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let (nx, ny) = (x + dx, y + dy);
-                        if nx >= 0
-                            && ny >= 0
-                            && nx < w
-                            && ny < h
-                            && src.get_pixel(nx as u32, ny as u32)[0] != 0
-                        {
-                            hit = true;
-                            break 'n;
-                        }
-                    }
-                }
-                if hit {
-                    mask.put_pixel(x as u32, y as u32, image::Luma([255]));
-                }
-            }
-        }
-    }
-}
-
-/// 1-px фоновое кольцо, 4-смежное с маской.
-fn outer_ring(mask: &image::GrayImage) -> Vec<(u32, u32)> {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let mut ring = Vec::new();
-    for y in 0..h {
-        for x in 0..w {
-            if mask.get_pixel(x as u32, y as u32)[0] != 0 {
-                continue;
-            }
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let (nx, ny) = (x + dx, y + dy);
-                if nx >= 0
-                    && ny >= 0
-                    && nx < w
-                    && ny < h
-                    && mask.get_pixel(nx as u32, ny as u32)[0] != 0
-                {
-                    ring.push((x as u32, y as u32));
-                    break;
-                }
-            }
-        }
-    }
-    ring
-}
-
-fn chan_dist(a: image::Rgb<u8>, b: image::Rgb<u8>) -> i32 {
-    let mut d = 0;
-    for k in 0..3 {
-        d = d.max((a[k] as i32 - b[k] as i32).abs());
-    }
-    d
-}
-
-fn median_u8(values: &mut [u8]) -> u8 {
-    values.sort_unstable();
-    values[values.len() / 2]
-}
-
-/// Цвет фона = поканальная медиана кольца (устойчива к пикселям штрихов текста,
-/// затёкшим в кольцо).
-fn ring_background(rgb: &image::RgbImage, ring: &[(u32, u32)]) -> image::Rgb<u8> {
-    let mut ch: [Vec<u8>; 3] = std::array::from_fn(|_| Vec::with_capacity(ring.len()));
-    for &(x, y) in ring {
-        let p = rgb.get_pixel(x, y);
-        for k in 0..3 {
-            ch[k].push(p[k]);
-        }
-    }
-    image::Rgb([
-        median_u8(&mut ch[0]),
-        median_u8(&mut ch[1]),
-        median_u8(&mut ch[2]),
-    ])
-}
-
-/// Свести периметр к единому однородному цвету фона. Возвращает цвет фона и флаг
-/// `retreated` (было ли хоть одно отступление-эрозия). Каждый отличающийся
-/// пиксель периметра классифицируется зондированием наружу: фон в пределах
-/// `stroke_probe` ⇒ штрих → маска **расползается** на него (≤`max_expand`);
-/// иначе разница тянется дальше (чужой объект) ⇒ маска **отступает** от пика
-/// (≤`retreat_max`). Несколько пиков обрабатываются за один проход: каждая
-/// итерация классифицирует и двигает весь отличающийся фронт сразу.
-/// `None`, если маска заполнила crop, если >`AUTOCLEAN_GROW_LIMIT` периметра
-/// отличается (контент, не текст), или бюджеты исчерпаны, а периметр всё грязный.
-fn grow_until_homogeneous(
-    rgb: &image::RgbImage,
-    mask: &mut image::GrayImage,
-    max_expand: i32,
-    retreat_max: i32,
-    stroke_probe: i32,
-) -> Option<(image::Rgb<u8>, bool)> {
-    let (mut grow_used, mut retreat_used) = (0i32, 0i32);
-    let mut retreated = false;
-    loop {
-        let ring = outer_ring(mask);
-        if ring.is_empty() {
-            return None; // маска заполнила crop — фон не проверить.
-        }
-        let bg = ring_background(rgb, &ring);
-        let mut grow_set = Vec::new();
-        let mut retreat_set = Vec::new();
-        for &(x, y) in &ring {
-            if chan_dist(*rgb.get_pixel(x, y), bg) <= AUTOCLEAN_SAME_TOL {
-                continue;
-            }
-            if probe_outward_bg(rgb, mask, x, y, bg, stroke_probe) {
-                grow_set.push((x, y));
-            } else {
-                retreat_set.push((x, y));
-            }
-        }
-        let diff_count = grow_set.len() + retreat_set.len();
-        if diff_count == 0 {
-            return Some((bg, retreated)); // весь периметр однороден.
-        }
-        if diff_count as f32 > AUTOCLEAN_GROW_LIMIT * ring.len() as f32 {
-            return None; // периметр в основном не-фон → контент, не текст.
-        }
-
-        let mut acted = false;
-        if grow_used < max_expand && !grow_set.is_empty() {
-            for (x, y) in grow_set {
-                mask.put_pixel(x, y, image::Luma([255]));
-            }
-            grow_used += 1;
-            acted = true;
-        }
-        if retreat_used < retreat_max && !retreat_set.is_empty() {
-            for (x, y) in retreat_set {
-                erode_around(mask, x, y);
-            }
-            retreat_used += 1;
-            retreated = true;
-            acted = true;
-        }
-        if !acted {
-            return None; // бюджеты исчерпаны, периметр всё ещё грязный.
-        }
-    }
-}
-
-/// Зондировать наружу от отличающегося пикселя периметра (прочь от маски): true,
-/// если фон возвращается в пределах `stroke_probe` пикс. (ограниченный штрих),
-/// false — если разница продолжается или уходит за crop (объект).
-fn probe_outward_bg(
-    rgb: &image::RgbImage,
-    mask: &image::GrayImage,
-    x: u32,
-    y: u32,
-    bg: image::Rgb<u8>,
-    stroke_probe: i32,
-) -> bool {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let (xi, yi) = (x as i32, y as i32);
-    // Направление наружу = прочь от 4-соседнего пикселя маски.
-    let mut dir = None;
-    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-        let (mx, my) = (xi + dx, yi + dy);
-        if mx >= 0 && my >= 0 && mx < w && my < h && mask.get_pixel(mx as u32, my as u32)[0] != 0 {
-            dir = Some((-dx, -dy));
-            break;
-        }
-    }
-    let Some((ox, oy)) = dir else { return true };
-    for k in 1..=stroke_probe {
-        let (px, py) = (xi + ox * k, yi + oy * k);
-        if px < 0 || py < 0 || px >= w || py >= h {
-            return false; // ушли за crop, всё ещё отличаясь → объект.
-        }
-        if chan_dist(*rgb.get_pixel(px as u32, py as u32), bg) <= AUTOCLEAN_SAME_TOL {
-            return true; // фон в пределах зонда → ограниченный штрих.
-        }
-    }
-    false
-}
-
-/// Отступить границу маски у отличающегося пикселя периметра, стерев его
-/// 4-соседние пиксели маски (стянуть маску на 1 пиксель с чужого объекта).
-fn erode_around(mask: &mut image::GrayImage, x: u32, y: u32) {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-        if nx >= 0 && ny >= 0 && nx < w && ny < h && mask.get_pixel(nx as u32, ny as u32)[0] != 0 {
-            mask.put_pixel(nx as u32, ny as u32, image::Luma([0]));
-        }
-    }
-}
-
-/// true, если пиксели под маской похожи на текст (чернила-на-фоне с тонкими
-/// штрихами), а не на однородное пятно лица/волос. «Чернила» = пиксели,
-/// отличающиеся от фона `bg` больше `AUTOCLEAN_SAME_TOL`.
-fn has_text_structure(rgb: &image::RgbImage, mask: &image::GrayImage, bg: image::Rgb<u8>) -> bool {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let is_ink = |x: i32, y: i32| -> bool {
-        x >= 0
-            && y >= 0
-            && x < w
-            && y < h
-            && mask.get_pixel(x as u32, y as u32)[0] != 0
-            && chan_dist(*rgb.get_pixel(x as u32, y as u32), bg) > AUTOCLEAN_SAME_TOL
-    };
-    let (mut area, mut ink, mut edge) = (0u64, 0u64, 0u64);
-    for y in 0..h {
-        for x in 0..w {
-            if mask.get_pixel(x as u32, y as u32)[0] == 0 {
-                continue;
-            }
-            area += 1;
-            if !is_ink(x, y) {
-                continue;
-            }
-            ink += 1;
-            let on_boundary = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-                .iter()
-                .any(|&(dx, dy)| !is_ink(x + dx, y + dy));
-            if on_boundary {
-                edge += 1;
-            }
-        }
-    }
-    if area == 0 || ink == 0 {
-        return false;
-    }
-    let ink_frac = ink as f32 / area as f32;
-    let edge_ratio = edge as f32 / ink as f32;
-    (AUTOCLEAN_MIN_INK_FRAC..=AUTOCLEAN_MAX_INK_FRAC).contains(&ink_frac)
-        && edge_ratio >= AUTOCLEAN_MIN_EDGE_RATIO
-}
-
-/// true, если прямоугольник в основном цвета фона (редкие чернила текста), так
-/// что заливка лишь стирает текст. false для панелей, заполненных контентом.
-fn box_interior_fillable(
-    rgb: &image::RgbImage,
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
-    bg: image::Rgb<u8>,
-) -> bool {
-    let (mut total, mut ink) = (0u64, 0u64);
-    for y in y1.max(0)..y2.min(rgb.height() as i32) {
-        for x in x1.max(0)..x2.min(rgb.width() as i32) {
-            total += 1;
-            if chan_dist(*rgb.get_pixel(x as u32, y as u32), bg) > AUTOCLEAN_SAME_TOL {
-                ink += 1;
-            }
-        }
-    }
-    total > 0 && (ink as f32) <= AUTOCLEAN_BOX_INK_LIMIT * (total as f32)
-}
-
-/// Обрезать маску box-заливки по интерьеру пузыря, в котором лежит текст.
-///
-/// Box-fallback заливает bbox кластера сплошным фоном, но прямоугольник по углам
-/// заходит за контур баббла (тонкую тёмную кривую) в наружный фон. Рост до
-/// однородного периметра и `AUTOCLEAN_FILL_PADDING` классифицируют контур как
-/// тонкий штрих и расползаются через него — сплошная заливка затирает контур по
-/// углам и фон снаружи. Здесь интерьер пузыря вычисляется заливкой:
-///   1. фон, связный со штрихами текста и не пересекающий контур (`interior_bg`);
-///   2. «снаружи» — заливка от рамки crop по не-интерьерным пикселям; контур
-///      достижим от рамки, поэтому попадает в «снаружи».
-///
-/// Всё, что оказалось «снаружи» (контур, наружный фон, чужой контент за углами),
-/// из заливки убирается; интерьерный фон и замкнутые им буквы остаются.
-///
-/// Без выраженного контура (текст на открытом фоне) `interior_bg` разливается до
-/// рамки, «снаружи» пусто и маска не меняется — заливка прежняя.
-fn clip_fill_to_bubble_interior(
-    fill: &mut image::GrayImage,
-    rgb: &image::RgbImage,
-    text: &image::GrayImage,
-    bg: image::Rgb<u8>,
-) {
-    let (w, h) = (rgb.width() as i32, rgb.height() as i32);
-    if w == 0 || h == 0 {
-        return;
-    }
-    let at = |x: i32, y: i32| (y * w + x) as usize;
-    let near_bg =
-        |x: i32, y: i32| chan_dist(*rgb.get_pixel(x as u32, y as u32), bg) <= AUTOCLEAN_SAME_TOL;
-
-    // 1. Интерьерный фон: заливка near-bg пикселей от seed'ов — near-bg соседей
-    //    штрихов текста (заведомо внутри пузыря). Контур (тёмный) — стена.
-    let mut interior_bg = vec![false; (w * h) as usize];
-    let mut stack: Vec<(i32, i32)> = Vec::new();
-    let try_push = |x: i32, y: i32, vis: &mut Vec<bool>, st: &mut Vec<(i32, i32)>| {
-        if x >= 0 && y >= 0 && x < w && y < h && !vis[at(x, y)] && near_bg(x, y) {
-            vis[at(x, y)] = true;
-            st.push((x, y));
-        }
-    };
-    for y in 0..h {
-        for x in 0..w {
-            if text.get_pixel(x as u32, y as u32)[0] == 0 {
-                continue;
-            }
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                try_push(x + dx, y + dy, &mut interior_bg, &mut stack);
-            }
-        }
-    }
-    while let Some((x, y)) = stack.pop() {
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            try_push(x + dx, y + dy, &mut interior_bg, &mut stack);
-        }
-    }
-    // Seed'ов не нашлось (текст вплотную окружён не-фоном) — клипать нечем,
-    // оставляем box как есть, чтобы не сорвать заливку.
-    if !interior_bg.iter().any(|&v| v) {
-        return;
-    }
-
-    // 2. «Снаружи» = заливка от рамки crop по не-интерьерным пикселям. Контур
-    //    пузыря достижим от рамки → «снаружи»; буквы, замкнутые интерьерным
-    //    фоном, недостижимы → остаются.
-    let mut outside = vec![false; (w * h) as usize];
-    let mut q: Vec<(i32, i32)> = Vec::new();
-    let seed_out = |x: i32, y: i32, out: &mut Vec<bool>, q: &mut Vec<(i32, i32)>| {
-        if x >= 0 && y >= 0 && x < w && y < h && !out[at(x, y)] && !interior_bg[at(x, y)] {
-            out[at(x, y)] = true;
-            q.push((x, y));
-        }
-    };
-    for x in 0..w {
-        seed_out(x, 0, &mut outside, &mut q);
-        seed_out(x, h - 1, &mut outside, &mut q);
-    }
-    for y in 0..h {
-        seed_out(0, y, &mut outside, &mut q);
-        seed_out(w - 1, y, &mut outside, &mut q);
-    }
-    while let Some((x, y)) = q.pop() {
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            seed_out(x + dx, y + dy, &mut outside, &mut q);
-        }
-    }
-
-    // 3. Гасим пиксели заливки, попавшие «снаружи» интерьера пузыря.
-    for y in 0..h {
-        for x in 0..w {
-            if outside[at(x, y)] {
-                fill.put_pixel(x as u32, y as u32, image::Luma([0]));
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ConnectedComponents {
-    labels: Vec<i32>,
-    pixels: Vec<Vec<usize>>,
-}
 
 fn resolve_quick_clean_mask_page(task: &QuickTextCleanTask) -> Option<TextMaskLoadPage> {
     if let Some(mask) = task.mask_from_model.as_ref() {
@@ -2524,77 +1850,15 @@ fn resolve_quick_clean_mask_page(task: &QuickTextCleanTask) -> Option<TextMaskLo
     }
     Some(TextMaskLoadPage {
         page_idx: task.page_idx,
+        // Disk fallback has no source_size/blocks JSON yet (remaining Phase 2 work):
+        // report the mask raster size and no blocks, so candidate B uses the cluster
+        // bbox fallback. `blocks` are only scaled against source_size, so its value is
+        // inert while blocks is None.
+        source_size: [w as u32, h as u32],
         mask_size: [w as u32, h as u32],
         mask_alpha: alpha,
+        blocks: None,
     })
-}
-
-fn extract_connected_components(mask: &[u8], width: usize, height: usize) -> ConnectedComponents {
-    let mut labels = vec![-1i32; width.saturating_mul(height)];
-    let mut pixels = Vec::<Vec<usize>>::new();
-    if mask.is_empty() || width == 0 || height == 0 {
-        return ConnectedComponents { labels, pixels };
-    }
-
-    let mut queue = VecDeque::<usize>::new();
-    let mut label = 0i32;
-    for seed in 0..mask.len() {
-        if mask[seed] == 0 || labels[seed] >= 0 {
-            continue;
-        }
-        labels[seed] = label;
-        queue.clear();
-        queue.push_back(seed);
-        let mut component_pixels = Vec::<usize>::new();
-        while let Some(idx) = queue.pop_front() {
-            component_pixels.push(idx);
-            let x = idx % width;
-            let y = idx / width;
-            for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
-                for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
-                    let nidx = ny.saturating_mul(width).saturating_add(nx);
-                    if mask[nidx] == 0 || labels[nidx] >= 0 {
-                        continue;
-                    }
-                    labels[nidx] = label;
-                    queue.push_back(nidx);
-                }
-            }
-        }
-        pixels.push(component_pixels);
-        label = label.saturating_add(1);
-    }
-    ConnectedComponents { labels, pixels }
-}
-
-fn dilate_binary_mask(mask: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
-    if mask.is_empty() || width == 0 || height == 0 {
-        return Vec::new();
-    }
-    if radius == 0 {
-        return mask.to_vec();
-    }
-    let mut out = vec![0u8; mask.len()];
-    for y in 0..height {
-        let y0 = y.saturating_sub(radius);
-        let y1 = (y + radius).min(height - 1);
-        for x in 0..width {
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(width - 1);
-            let mut any = false;
-            'scan: for yy in y0..=y1 {
-                let row = yy.saturating_mul(width);
-                for xx in x0..=x1 {
-                    if mask[row + xx] != 0 {
-                        any = true;
-                        break 'scan;
-                    }
-                }
-            }
-            out[y.saturating_mul(width).saturating_add(x)] = if any { 255 } else { 0 };
-        }
-    }
-    out
 }
 
 fn resize_binary_mask_nearest(
@@ -2684,8 +1948,11 @@ fn load_text_masks_from_storage(
                 }
                 pages.push(TextMaskLoadPage {
                     page_idx: *page_idx,
+                    // Display-cache load: mask raster only, no detector blocks.
+                    source_size: [w, h],
                     mask_size: [w, h],
                     mask_alpha: alpha,
+                    blocks: None,
                 });
                 loaded = loaded.saturating_add(1);
             }
@@ -2909,4 +2176,44 @@ fn build_text_mask_tile_image(
         }
     }
     egui::ColorImage::from_rgba_premultiplied([tile_w, tile_h], &raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scale_blocks_source_to_page, scale_edge_to_i32};
+
+    #[test]
+    fn scale_blocks_identity_passthrough_on_exact_size_match() {
+        let blocks = [[1, 2, 3, 4], [10, 20, 30, 40]];
+        // Nonzero source size equal to the page size returns the blocks unchanged.
+        let out = scale_blocks_source_to_page(&blocks, [100, 200], 100, 200);
+        assert_eq!(out, blocks.to_vec());
+    }
+
+    #[test]
+    fn scale_blocks_degenerate_source_drops_blocks() {
+        let blocks = [[1, 2, 3, 4]];
+        // Finding 5: a zero source dimension yields NO blocks (not the unscaled set), so
+        // candidate B falls back to the cluster bbox.
+        assert!(scale_blocks_source_to_page(&blocks, [0, 200], 100, 200).is_empty());
+        assert!(scale_blocks_source_to_page(&blocks, [100, 0], 100, 200).is_empty());
+    }
+
+    #[test]
+    fn scale_blocks_scales_and_rounds_outward() {
+        let blocks = [[10, 20, 30, 40]];
+        // Source 100x200 -> page 200x400 doubles every edge; min floored, max ceiled.
+        let out = scale_blocks_source_to_page(&blocks, [100, 200], 200, 400);
+        assert_eq!(out, vec![[20, 40, 60, 80]]);
+    }
+
+    #[test]
+    fn scale_edge_rejects_non_finite_and_out_of_range() {
+        assert_eq!(scale_edge_to_i32(f64::NAN, false), None);
+        assert_eq!(scale_edge_to_i32(f64::INFINITY, true), None);
+        assert_eq!(scale_edge_to_i32(f64::from(i32::MAX) + 1.0, true), None);
+        assert_eq!(scale_edge_to_i32(f64::from(i32::MIN) - 1.0, false), None);
+        assert_eq!(scale_edge_to_i32(2.3, false), Some(2));
+        assert_eq!(scale_edge_to_i32(2.3, true), Some(3));
+    }
 }
