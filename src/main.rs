@@ -238,6 +238,12 @@ fn run_main() -> anyhow::Result<()> {
     }
 
     runtime_log::log_info("starting main application flow");
+    // MUST be the first startup call: every following call that touches
+    // `load_user_config()` (AI install-type detection, language/effect seeding) persists
+    // the full defaults tree, which materializes `General.ui_language` /
+    // `TextTab.text_language` and erases the "language keys absent" signal this fresh-
+    // install detection depends on. Run it before any of them so the marker is recorded.
+    config::mark_first_run_languages_if_needed();
     auto_detect_missing_ai_install_type_for_startup();
     seed_hanging_punctuation_from_config();
     seed_text_language_from_config();

@@ -3352,6 +3352,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "swash",
+ "sys-locale",
  "tar",
  "tempfile",
  "texture-synthesis",

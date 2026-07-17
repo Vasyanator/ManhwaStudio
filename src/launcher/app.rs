@@ -19,6 +19,7 @@ use crate::config;
 use crate::launcher::background::{
     self, BackgroundImageLoadRequest, BackgroundImagePlan, LoadedBackgroundImage,
 };
+use crate::launcher::first_run_language::FirstRunLanguageState;
 use crate::launcher::main_page;
 use crate::launcher::new_project::window::NewProjectWindowState;
 use crate::launcher::pages::base::{self, PageLayer, PageNavAction};
@@ -84,6 +85,11 @@ pub struct LauncherApp {
     tutorial_prev_page: Option<LauncherPage>,
     output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
     pub(crate) update_notification: Option<UpdateNotification>,
+    /// First-run language-selection modal. `Some` until the user confirms it (or
+    /// `None` when both languages were already chosen). While it is `Some` the
+    /// main-menu tutorial autoplay is suppressed; on confirm the tutorial is handed
+    /// off exactly once. See `first_run_language.rs`.
+    first_run_language: Option<FirstRunLanguageState>,
     pub(crate) ai_install_type: config::AiInstallType,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     pending_plan: Option<Receiver<BackgroundImagePlan>>,
@@ -116,6 +122,19 @@ impl LauncherApp {
         ai_backend: AiBackendHandle,
     ) -> Self {
         let ai_install_type = config::AiInstallType::from_user_settings(user_settings);
+        // First-run language modal: shown only when the RAW (unmerged) config lacks
+        // the interface and/or typesetting language. A config read error is bounded
+        // degradation — log it and never block the user behind the modal.
+        let first_run_language = match config::load_raw_user_settings_for_startup() {
+            Ok(raw) => FirstRunLanguageState::from_startup(&raw),
+            Err(err) => {
+                crate::runtime_log::log_error(format!(
+                    "[launcher] could not read raw settings for the first-run language modal; \
+                     skipping it; error={err:#}"
+                ));
+                None
+            }
+        };
         // One shared progress handle: the controller autoplays against it and the
         // settings "Обучение" pane resets it, so both stay in sync within the run.
         #[cfg(feature = "tutorial")]
@@ -160,6 +179,7 @@ impl LauncherApp {
             tutorial_prev_page: None,
             output_outcome,
             update_notification: None,
+            first_run_language,
             ai_install_type,
             update_check_rx,
             pending_plan: None,
@@ -840,7 +860,11 @@ impl eframe::App for LauncherApp {
             let entering_main = self.state.current_page == LauncherPage::Main
                 && self.tutorial_prev_page != Some(LauncherPage::Main);
             self.tutorial_prev_page = Some(self.state.current_page);
-            if entering_main {
+            // The first-run language modal and the tutorial are mutually exclusive:
+            // while the modal is open the tour must not autoplay. On confirm the modal
+            // resets `tutorial_prev_page` to `None` (below), so this same edge re-fires
+            // on the next frame with the modal gate now open — a single natural handoff.
+            if entering_main && self.first_run_language.is_none() {
                 self.tutorial.maybe_autoplay(TutorialId::LauncherMain);
             }
             // Run any pending step `on_enter` before the UI is built, then clear the
@@ -875,9 +899,34 @@ impl eframe::App for LauncherApp {
                     self.draw_pages(ctx, ui, rect);
                 });
         }
-        self.draw_new_project_window(ui);
-        self.draw_psd_import_window(ui);
-        self.draw_wiki_guide_window(ui);
+
+        // First-run language modal: rendered above the page content (its blocker
+        // occludes all input beneath) and before the child windows. On confirm it
+        // clears itself and hands off to the main-menu tutorial exactly once.
+        let first_run_confirmed = self
+            .first_run_language
+            .as_mut()
+            .is_some_and(|modal| modal.show(ctx));
+        if first_run_confirmed {
+            self.first_run_language = None;
+            // Hand off to the tutorial through the normal entering-main edge instead of
+            // a direct autoplay: clearing the tracked page makes the edge gate at the
+            // top of `ui` re-fire next frame, and only when the current page is really
+            // Main and the modal-open gate (`first_run_language.is_none()`) now passes.
+            #[cfg(feature = "tutorial")]
+            {
+                self.tutorial_prev_page = None;
+            }
+        }
+
+        // Child viewports are independent native windows the root-viewport blocker
+        // cannot occlude; none can legitimately be open on a true first run, so skip
+        // drawing them entirely while the modal is up — this is a hard guarantee.
+        if self.first_run_language.is_none() {
+            self.draw_new_project_window(ui);
+            self.draw_psd_import_window(ui);
+            self.draw_wiki_guide_window(ui);
+        }
 
         // Overlay last so its full-viewport hitbox occludes the page content and
         // its spotlight/callout sit above everything on the root viewport.

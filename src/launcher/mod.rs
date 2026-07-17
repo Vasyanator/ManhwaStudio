@@ -12,6 +12,7 @@ Main responsibilities:
 Key modules:
 - `app`: root `eframe::App` implementation
 - `background`: background catalog/validation workers
+- `first_run_language`: first-run interface/typesetting language-selection modal
 - `main_page`: rendering of the current main page
 - `new_project`: detached "New Project" window runtime and UI
 - `pages`: animated fullscreen launcher subpages
@@ -27,6 +28,7 @@ spawning a second app process.
 
 pub mod app;
 pub mod background;
+pub mod first_run_language;
 pub mod main_page;
 pub mod new_project;
 pub mod pages;

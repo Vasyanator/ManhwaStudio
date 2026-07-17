@@ -37,6 +37,14 @@ Key items:
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
   language combos), also called by the studio "Тайп" pane; takes a per-call-site
   `id_salt` prefix so the two rendered instances keep distinct egui ids.
+
+Reuse by the launcher first-run modal:
+The launcher's first-run language modal (`src/launcher/first_run_language.rs`) reuses
+this module's `pub(crate)` helpers so the two surfaces never drift: `scan_locale_options`
+(identical option set/order), `install_selected_ui_locale` (live locale install) and
+`persist_config_keys` (one atomic `General.ui_language` + `TextTab.text_language` write on
+confirm). It renders its own radio-based UI instead of the combo-based `draw_*` functions,
+but persists through the same paths.
 */
 
 use crate::i18n_resolve::resolve_key;
@@ -431,8 +439,11 @@ fn apply_ui_language_change(ui: &egui::Ui, state: &mut GeneralSettingsPanelState
 /// Live-installs the selected locale on desktop: loads it from the on-disk
 /// `locale/` folder (with embedded / English fallback) and installs it into the
 /// `ms-i18n` runtime by reusing the startup install path.
+///
+/// `pub(crate)` so the launcher's first-run language modal live-installs the
+/// preselected/clicked locale through the same path (no duplication).
 #[cfg(not(target_arch = "wasm32"))]
-fn install_selected_ui_locale(tag: &str) {
+pub(crate) fn install_selected_ui_locale(tag: &str) {
     // Hand the startup installer a minimal settings object carrying only the chosen
     // tag; it performs the disk-load + embedded/English fallback and the install.
     let settings =
@@ -444,7 +455,7 @@ fn install_selected_ui_locale(tag: &str) {
 /// for the tag directly. An invalid tag / missing embedded catalog is logged and
 /// the UI language is left unchanged (never a panic).
 #[cfg(target_arch = "wasm32")]
-fn install_selected_ui_locale(tag: &str) {
+pub(crate) fn install_selected_ui_locale(tag: &str) {
     match ms_i18n::LocaleTag::parse(tag) {
         Ok(locale_tag) => {
             if let Err(err) = ms_i18n::set_locale(&locale_tag) {
@@ -485,7 +496,11 @@ const DEFAULT_UI_LANGUAGE_TAG: &str = "ru";
 /// language or an override of an embedded one) wins its `_meta.name`; the embedded
 /// `en`/`ru` fill any gaps, guaranteeing the list is never empty. Called ONCE at
 /// construction — never on the per-frame draw path.
-fn scan_locale_options() -> Vec<LocaleOption> {
+///
+/// `pub(crate)` so the launcher's first-run language modal reuses the exact same
+/// scan (identical option set and ordering as the settings pane) instead of
+/// duplicating the disk/embedded merge.
+pub(crate) fn scan_locale_options() -> Vec<LocaleOption> {
     let mut pairs = disk_locale_pairs();
     pairs.extend(embedded_locale_pairs());
     build_locale_options(pairs)
@@ -655,18 +670,23 @@ fn normalize_projects_dir_value(raw_value: &str) -> String {
     PathBuf::from(trimmed).to_string_lossy().into_owned()
 }
 
-/// Synchronously persists a single `General.<key>` value in `user_config.json`,
-/// serialized on the process-wide write lock so it never clobbers the ORT load-guard
-/// marker (see `README_AGENT`'s user_config write-lock invariant).
+/// Synchronously persists several `<section>.<key>` values in `user_config.json` in one
+/// atomic locked read-modify-write, serialized on the process-wide write lock so it
+/// never clobbers the ORT load-guard marker (see `README_AGENT`'s user_config write-lock
+/// invariant).
 ///
-/// Performs one targeted read-modify-write while holding
-/// `config::lock_user_config_write()`: reads the current file (a missing file starts
-/// from an empty object), sets `General.<key> = value`, and rewrites the file exactly
-/// once, preserving every unrelated key. A parse error is surfaced rather than
-/// silently resetting the config, so a temporarily unreadable file is never clobbered.
-/// Returns a user-facing (Cyrillic) error string on failure. Synchronous disk I/O, but
-/// a single tiny write triggered by an explicit user action.
-fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String> {
+/// `entries` is a list of `(section, key, value)`: each `value` is inserted at
+/// `root[section][key]`, creating the section object if absent and preserving every
+/// unrelated key. Reads the current file once while holding
+/// `config::lock_user_config_write()` (a missing file starts from an empty object),
+/// applies all entries, and rewrites the file exactly once. A parse error is surfaced
+/// rather than silently resetting the config, so a temporarily unreadable file is never
+/// clobbered. Returns a user-facing (Cyrillic) error string on failure. Synchronous disk
+/// I/O, but a single tiny write triggered by an explicit user action.
+///
+/// `pub(crate)` so the launcher's first-run language modal persists both language keys
+/// (`General.ui_language` + `TextTab.text_language`) atomically through this one path.
+pub(crate) fn persist_config_keys(entries: &[(&str, &str, serde_json::Value)]) -> Result<(), String> {
     use serde_json::{Map, Value};
 
     let _guard = crate::config::lock_user_config_write();
@@ -684,19 +704,26 @@ fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String
     let Some(root_obj) = root.as_object_mut() else {
         return Err(t!("settings.general.config_root_error").to_string());
     };
-    let mut general = root_obj
-        .get("General")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    general.insert(key.to_string(), value);
-    root_obj.insert("General".to_string(), Value::Object(general));
+    for (section, key, value) in entries {
+        let mut section_obj = root_obj
+            .get(*section)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        section_obj.insert((*key).to_string(), value.clone());
+        root_obj.insert((*section).to_string(), Value::Object(section_obj));
+    }
 
     let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     std::fs::write(&path, payload).map_err(|err| err.to_string())
+}
+
+/// Thin wrapper over [`persist_config_keys`] for a single `General.<key>` write.
+fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String> {
+    persist_config_keys(&[("General", key, value)])
 }
 
 #[cfg(test)]

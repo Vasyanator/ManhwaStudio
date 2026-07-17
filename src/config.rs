@@ -19,12 +19,16 @@ Main items:
   decision logic (state persisted under `General.ort_load_state`).
 - `MemoryProfile`: persisted global image-cache memory policy recorded under `General`.
 - `load_user_config`: canonical entry-point for `user_config.json` with persistence.
+- `mark_first_run_languages_if_needed` / `user_settings_first_run_languages_pending`:
+  fresh-install detection and gate for the launcher's first-run language modal via the
+  tri-state marker `General.first_run_languages_confirmed` (never in the defaults tree).
 - `load_raw_user_settings_for_startup`: startup-safe read before default backfilling.
 - `load_user_settings_for_startup`: startup-safe read of user settings without creating files.
 */
 
 use crate::bubble_status::default_bubble_status_rules_value;
 use crate::memory_manager::MemoryProfile;
+use crate::runtime_log;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -106,6 +110,21 @@ pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
 /// a custom on-disk locale tag). Read at startup by `locale_store::install_ui_locale`
 /// and written by the shared general-settings widget's UI-language selector.
 pub const GENERAL_UI_LANGUAGE_KEY: &str = "ui_language";
+/// `General.first_run_languages_confirmed`: tri-state marker gating the launcher's
+/// first-run language modal.
+///
+/// Deliberately ABSENT from [`user_config_defaults`] — [`JsonConfig::apply_defaults`]
+/// must NEVER materialize it, because its very absence is a meaningful state:
+/// - key absent: the feature never triggered (an existing install whose language keys
+///   were already set, or a pre-feature install) — the modal must never show;
+/// - `false`: a fresh install was detected but the user has not confirmed yet — show
+///   the modal;
+/// - `true`: the user confirmed the languages — never show the modal again.
+///
+/// Written to `false` by [`mark_first_run_languages_if_needed`] and to `true` by the
+/// launcher modal's confirm path. Gate the modal with
+/// [`user_settings_first_run_languages_pending`].
+pub const GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY: &str = "first_run_languages_confirmed";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
 /// `TextTab` key holding the selected typesetting language as a BCP-47-style tag
@@ -1213,6 +1232,140 @@ pub fn user_settings_has_ai_install_type(user_settings: &Value) -> bool {
         .is_some()
 }
 
+/// Whether the raw (unmerged) user settings already carry a working
+/// `General.ui_language` choice: a key counts as present only when it holds a string
+/// whose trimmed value is non-empty. A `null`, empty, whitespace-only, or non-string
+/// value means the user never made a working choice.
+///
+/// Feeds [`mark_first_run_languages_if_needed`]: an existing install with BOTH
+/// language keys already set must not be marked for the first-run modal. The modal
+/// itself does NOT gate on this — it gates on the persisted
+/// `General.first_run_languages_confirmed` marker
+/// ([`user_settings_first_run_languages_pending`]), because the startup path persists
+/// the defaults tree (materializing both language keys) before the launcher reads the
+/// config, which would otherwise erase the "keys absent" signal.
+///
+/// Pass the RAW settings from [`load_raw_user_settings_for_startup`]; the merged
+/// startup settings backfill the default and would always report `true`.
+#[must_use]
+pub fn user_settings_has_ui_language(user_settings: &Value) -> bool {
+    user_settings
+        .get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_UI_LANGUAGE_KEY))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Whether the raw (unmerged) user settings already carry a working
+/// `TextTab.text_language` choice. Companion to [`user_settings_has_ui_language`] for
+/// the typesetting language: present only when the key holds a non-empty (trimmed)
+/// string; a `null`/empty/non-string value means the user never made a working choice.
+///
+/// Like [`user_settings_has_ui_language`], this feeds
+/// [`mark_first_run_languages_if_needed`] (an existing install with both language keys
+/// present is not marked) and NOT the modal's gate, which uses the persisted marker.
+///
+/// Pass the RAW settings from [`load_raw_user_settings_for_startup`] (see
+/// [`user_settings_has_ui_language`] for why the merged settings must not be used).
+#[must_use]
+pub fn user_settings_has_text_language(user_settings: &Value) -> bool {
+    user_settings
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(TEXT_TAB_TEXT_LANGUAGE_KEY))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Whether the launcher must show the first-run language modal, decided purely from
+/// the tri-state marker `General.first_run_languages_confirmed`.
+///
+/// Returns `true` ONLY when the marker is present AND holds the boolean `false`
+/// (first run detected, not yet confirmed). A missing marker (feature never triggered
+/// or an existing install), a `true` marker (already confirmed), or a non-boolean
+/// value all return `false`.
+///
+/// Pass the RAW settings from [`load_raw_user_settings_for_startup`]; the marker is
+/// deliberately absent from the defaults tree, so the merged settings carry the same
+/// value.
+#[must_use]
+pub fn user_settings_first_run_languages_pending(user_settings: &Value) -> bool {
+    user_settings
+        .get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+/// Records the first-run language marker when a fresh install is detected, so the
+/// launcher can later show the first-run language modal.
+///
+/// This MUST run before any other startup call that touches [`load_user_config`]:
+/// those calls persist the full defaults tree (materializing `General.ui_language`
+/// and `TextTab.text_language`), which would destroy the "language keys absent"
+/// signal this detection relies on and make every fresh install look like an existing
+/// one.
+///
+/// It reads the RAW settings via [`load_raw_user_settings_for_startup`] and returns
+/// early, doing nothing, in three cases:
+/// - a read error (logged; startup is never blocked);
+/// - the marker key is already present (the first-run decision was already recorded
+///   on an earlier launch — `false` pending or `true` confirmed);
+/// - both language keys are already set — an existing install that predates this
+///   feature, which must never trigger the modal.
+///
+/// Otherwise it persists `General.first_run_languages_confirmed = false`; persistence
+/// errors are logged and swallowed so startup is never blocked.
+pub fn mark_first_run_languages_if_needed() {
+    let raw = match load_raw_user_settings_for_startup() {
+        Ok(raw) => raw,
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "[startup] failed to read user config before first-run language detection: {err:#}"
+            ));
+            return;
+        }
+    };
+    // The marker already exists (in any form): the first-run decision was made on an
+    // earlier launch. Never re-evaluate or overwrite it.
+    let marker_present = raw
+        .get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY))
+        .is_some();
+    if marker_present {
+        return;
+    }
+    // Both language keys already chosen: an existing install from before this feature.
+    // It must never show the modal, so leave the marker absent (key-absent state).
+    if user_settings_has_ui_language(&raw) && user_settings_has_text_language(&raw) {
+        return;
+    }
+
+    runtime_log::log_info(
+        "[startup] fresh install detected; marking first-run language selection as pending",
+    );
+    let mut cfg = match load_user_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "[startup] failed to load user config for first-run language marker: {err:#}"
+            ));
+            return;
+        }
+    };
+    if let Err(err) = cfg.set_path(
+        &["General", GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY],
+        Value::Bool(false),
+    ) {
+        runtime_log::log_warn(format!(
+            "[startup] failed to persist first-run language marker: {err:#}"
+        ));
+    }
+}
+
 pub fn load_user_settings_for_startup() -> Result<Value> {
     let mut data = load_raw_user_settings_for_startup()?;
     if !data.is_object() {
@@ -1426,6 +1579,96 @@ mod tests {
         assert!(user_settings_has_ai_install_type(
             &json!({"General": {"ai_install_type": "Base"}})
         ));
+    }
+
+    #[test]
+    fn user_settings_has_ui_language_detects_presence() {
+        // Absent General object, absent key, and a present non-empty string are the
+        // basic cases.
+        assert!(!user_settings_has_ui_language(&json!({})));
+        assert!(!user_settings_has_ui_language(&json!({"General": {}})));
+        assert!(user_settings_has_ui_language(
+            &json!({"General": {"ui_language": "ru"}})
+        ));
+        // A key that holds no working value counts as "not set": null, empty,
+        // whitespace-only, or a non-string (numeric) value.
+        assert!(!user_settings_has_ui_language(
+            &json!({"General": {"ui_language": null}})
+        ));
+        assert!(!user_settings_has_ui_language(
+            &json!({"General": {"ui_language": ""}})
+        ));
+        assert!(!user_settings_has_ui_language(
+            &json!({"General": {"ui_language": "   "}})
+        ));
+        assert!(!user_settings_has_ui_language(
+            &json!({"General": {"ui_language": 42}})
+        ));
+    }
+
+    #[test]
+    fn user_settings_has_text_language_detects_presence() {
+        // Absent TextTab object, absent key, and a present non-empty string.
+        assert!(!user_settings_has_text_language(&json!({})));
+        assert!(!user_settings_has_text_language(&json!({"TextTab": {}})));
+        assert!(user_settings_has_text_language(
+            &json!({"TextTab": {"text_language": "en"}})
+        ));
+        // A key that holds no working value counts as "not set": null, empty,
+        // whitespace-only, or a non-string (numeric) value.
+        assert!(!user_settings_has_text_language(
+            &json!({"TextTab": {"text_language": null}})
+        ));
+        assert!(!user_settings_has_text_language(
+            &json!({"TextTab": {"text_language": ""}})
+        ));
+        assert!(!user_settings_has_text_language(
+            &json!({"TextTab": {"text_language": "   "}})
+        ));
+        assert!(!user_settings_has_text_language(
+            &json!({"TextTab": {"text_language": 7}})
+        ));
+    }
+
+    #[test]
+    fn first_run_languages_pending_only_for_false_marker() {
+        // Absent marker (feature never triggered / existing install): not pending.
+        assert!(!user_settings_first_run_languages_pending(&json!({})));
+        assert!(!user_settings_first_run_languages_pending(
+            &json!({"General": {}})
+        ));
+        // `true`: already confirmed — not pending.
+        assert!(!user_settings_first_run_languages_pending(
+            &json!({"General": {"first_run_languages_confirmed": true}})
+        ));
+        // `false`: first run detected, awaiting confirmation — the only pending case.
+        assert!(user_settings_first_run_languages_pending(
+            &json!({"General": {"first_run_languages_confirmed": false}})
+        ));
+        // A non-boolean value is malformed and never counts as pending.
+        assert!(!user_settings_first_run_languages_pending(
+            &json!({"General": {"first_run_languages_confirmed": "false"}})
+        ));
+        assert!(!user_settings_first_run_languages_pending(
+            &json!({"General": {"first_run_languages_confirmed": null}})
+        ));
+    }
+
+    #[test]
+    fn user_config_defaults_omit_first_run_marker() {
+        // Contract guard: the first-run marker must never be materialized by
+        // `apply_defaults`, so it must be absent from the defaults tree. Its absence is
+        // the "feature never triggered" state; a default would make every fresh install
+        // look already-decided.
+        let defaults = user_config_defaults();
+        let general = defaults
+            .get("General")
+            .and_then(Value::as_object)
+            .expect("user_config_defaults must contain a General object");
+        assert!(
+            !general.contains_key(GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY),
+            "General.first_run_languages_confirmed must not be part of the defaults tree"
+        );
     }
 
     #[test]
