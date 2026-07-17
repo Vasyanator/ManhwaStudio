@@ -11,7 +11,7 @@ Main responsibilities:
 
 Key structures:
 - CanvasUiStatus
-- CanvasHintRow / CanvasBottomHint
+- CanvasHintHelp / CanvasHintRow / CanvasBottomHint
 - SourceTextureUploadBudget
 - BubbleAction / BubbleClass / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
 - RectCoords
@@ -42,12 +42,62 @@ pub struct CanvasUiStatus {
     pub load_errors_count: usize,
 }
 
+/// Optional "?" help attached to a bottom-hint row, shown between the label and the keys.
+///
+/// Closed by design: every variant carries at least one payload, so "help is present but has
+/// nothing to show" is unrepresentable. The text is expected to be already localized.
+#[derive(Debug, Clone)]
+pub enum CanvasHintHelp {
+    /// Tooltip shows only this text line.
+    // `dead_code`: mirrors `widgets::HelpHint::text`, which is shipped and documented, but no hint
+    // row is text-only yet. Remove the allow at the first text-only `with_help` call; remove the
+    // variant instead if the text-only tooltip is dropped from `HelpHint`.
+    #[allow(dead_code)]
+    Text(String),
+    /// Tooltip shows only this animation.
+    Animation(ms_gifs::Hint),
+    /// Tooltip shows `text` above `animation`.
+    // `dead_code`: mirrors `widgets::HelpHint::animated(..).with_text(..)`, shipped and documented,
+    // but no hint row combines both yet. Same removal conditions as `Text`.
+    #[allow(dead_code)]
+    TextAndAnimation {
+        text: String,
+        animation: ms_gifs::Hint,
+    },
+}
+
 /// One row of the canvas bottom hint: a localized action label and its key combination.
-/// `keys` may be empty for a plain full-width informational line.
+/// `keys` may be empty for a plain full-width informational line. `help == None` means the row
+/// carries no "?" icon; build rows through [`CanvasHintRow::new`] / [`CanvasHintRow::with_help`].
 #[derive(Debug, Clone)]
 pub struct CanvasHintRow {
     pub label: String,
     pub keys: String,
+    pub help: Option<CanvasHintHelp>,
+}
+
+impl CanvasHintRow {
+    /// Creates a row with no help icon: `label` is the localized action description and `keys`
+    /// its localized combination (empty `keys` renders as a full-width informational line).
+    #[must_use]
+    pub fn new(label: impl Into<String>, keys: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            keys: keys.into(),
+            help: None,
+        }
+    }
+
+    /// Attaches the "?" help icon drawn between the label and the keys, replacing any help set
+    /// earlier on this builder.
+    ///
+    /// Only rows drawn by the bottom-hint panel may carry help: the icon's own tooltip cannot
+    /// open inside a tooltip (see `scene.rs::draw_hint_rows_grid`).
+    #[must_use]
+    pub fn with_help(mut self, help: CanvasHintHelp) -> Self {
+        self.help = Some(help);
+        self
+    }
 }
 
 /// Per-tab content of the collapsible bottom hint overlay.

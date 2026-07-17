@@ -44,7 +44,13 @@ the owning tab pushes `Option<CanvasBottomHint>` (label + key rows) every frame 
 `set_bottom_hint`, and `None` hides it. Rows are FIXED, hand-authored, localized pairs (built in
 `app.rs::build_translation_hint_rows` / `build_typing_hint_rows` from `canvas.bottom_hint.*` `t!`
 keys), NOT derived from the hotkey registry; rebuilding them per frame re-localizes on a runtime
-language switch. Only Translation and Typing set a hint; the Cleaning tab leaves `bottom_hint` at
+language switch. A row may also carry an optional `CanvasHintHelp` (`CanvasHintRow::with_help`):
+a circled "?" (`widgets::HelpHint`) whose hover tooltip shows text, an animation, or both, drawn
+between the label and the keys. `scene.rs::draw_hint_rows_grid` switches to a three-column grid
+(plus `min_col_width(0.0)`, since the default ~40pt minimum would inflate the 14pt icon column)
+as soon as ANY row has help, and keeps the exact two-column layout otherwise; the same grid also
+backs the shortcuts chip, whose rows must stay help-free because it renders inside a tooltip.
+Only Translation and Typing set a hint; the Cleaning tab leaves `bottom_hint` at
 `None`, so the overlay is not drawn there. The overlay is bottom-pinned just above the horizontal
 scrollbar (or the inner viewport bottom when no bar is drawn) and never overlaps the bar. Collapsed
 shows only an up-arrow toggle; expanded slides a popup panel up with the arrow riding above it.

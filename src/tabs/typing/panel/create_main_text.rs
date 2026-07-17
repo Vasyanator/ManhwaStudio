@@ -811,7 +811,7 @@ impl TypingCreatePanelState {
                         *changed |=
                             apply_wheel_step_f32(&mut self.global_rotation_deg, steps, 1.0, -180.0, 180.0);
                     }
-                    crate::widgets::HelpHint::new(ms_gifs::typing::GLOBAL_ROTATION).show(ui);
+                    crate::widgets::HelpHint::animated(ms_gifs::typing::GLOBAL_ROTATION).show(ui);
                 });
 
                 // Размещение по линии: перпендикулярный сдвиг глифов относительно
@@ -1034,7 +1034,7 @@ impl TypingCreatePanelState {
                                     anti_aliasing_label(AntiAliasingMode::Smooth),
                                 );
                             });
-                        crate::widgets::HelpHint::new(ms_gifs::typing::ANTI_ALIASING).show(ui);
+                        crate::widgets::HelpHint::animated(ms_gifs::typing::ANTI_ALIASING).show(ui);
                         aa_combo
                     })
                     .inner;
@@ -1179,7 +1179,7 @@ impl TypingCreatePanelState {
                     .horizontal(|ui| {
                         let resp = ui
                             .checkbox(&mut self.hanging_punctuation, t!("typing.params.hanging_punctuation"));
-                        crate::widgets::HelpHint::new(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
+                        crate::widgets::HelpHint::animated(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
                         resp
                     })
                     .inner;
@@ -1395,7 +1395,7 @@ impl TypingCreatePanelState {
             // would never show its tooltip (`on_hover_ui` is enabled-only,
             // egui-0.35.0/src/response.rs:645), and the hint must stay
             // reachable while justify is on.
-            crate::widgets::HelpHint::new(ms_gifs::typing::ALIGNMENT).show(ui);
+            crate::widgets::HelpHint::animated(ms_gifs::typing::ALIGNMENT).show(ui);
         });
     }
 

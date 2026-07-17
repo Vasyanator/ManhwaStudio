@@ -754,7 +754,7 @@ impl TypingCreatePanelState {
                                                             anti_aliasing_label(AntiAliasingMode::Smooth),
                                                         );
                                                     });
-                                                crate::widgets::HelpHint::new(ms_gifs::typing::ANTI_ALIASING).show(ui);
+                                                crate::widgets::HelpHint::animated(ms_gifs::typing::ANTI_ALIASING).show(ui);
                                                 aa_combo
                                             })
                                             .inner;
@@ -904,7 +904,7 @@ impl TypingCreatePanelState {
                                                     &mut self.hanging_punctuation,
                                                     t!("typing.params.hanging_punctuation"),
                                                 );
-                                                crate::widgets::HelpHint::new(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
+                                                crate::widgets::HelpHint::animated(ms_gifs::typing::HANGING_PUNCTUATION).show(ui);
                                                 resp
                                             })
                                             .inner;

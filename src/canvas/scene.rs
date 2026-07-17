@@ -43,13 +43,13 @@ use super::types::{
 };
 use super::view_transform::DVec2;
 use super::{
-    BubbleCopyPasteTarget, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode,
-    ViewTransform,
+    BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
+    OnTopFocusMode, ViewTransform,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::project::ProjectData;
 use crate::runtime_log;
-use crate::widgets::WheelSlider;
+use crate::widgets::{HelpHint, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
 use std::collections::HashMap;
@@ -1512,8 +1512,10 @@ impl CanvasView {
     }
 
     /// Renders the bottom-hint popup body (title + shortcut rows) into `ui` and returns its frame
-    /// response. Each row shows its label left and monospaced `keys` right; a row with empty `keys`
-    /// renders as a full-width informational line. Stateless: no `self` access.
+    /// response. Each row shows its label left and monospaced `keys` right, with an optional "?"
+    /// help icon between them; a row with empty `keys` renders as a full-width informational line.
+    /// Unlike the shortcuts chip, this body is a real panel, so its rows may carry `help`.
+    /// Stateless: no `self` access.
     fn draw_bottom_hint_body(ui: &mut egui::Ui, rows: &[CanvasHintRow]) -> egui::Response {
         egui::Frame::popup(ui.style())
             .show(ui, |ui| {
@@ -1524,52 +1526,113 @@ impl CanvasView {
             .response
     }
 
-    /// Renders shortcut rows as a two-column grid: `label` left, monospaced `keys` right. A row with
-    /// empty `keys` renders as a full-width label. `grid_id` must be unique per live call site.
+    /// Number of grid columns `rows` needs: 3 when any row carries help (label / "?" / keys),
+    /// otherwise 2 (label / keys). Pure; the extra column exists only when something fills it.
+    #[must_use]
+    fn hint_grid_columns(rows: &[CanvasHintRow]) -> usize {
+        if rows.iter().any(|row| row.help.is_some()) {
+            3
+        } else {
+            2
+        }
+    }
+
+    /// Builds the `HelpHint` widget for one row's typed help payload.
+    fn hint_help_widget(help: &CanvasHintHelp) -> HelpHint {
+        match help {
+            CanvasHintHelp::Text(text) => HelpHint::text(text.clone()),
+            CanvasHintHelp::Animation(hint) => HelpHint::animated(*hint),
+            CanvasHintHelp::TextAndAnimation { text, animation } => {
+                HelpHint::animated(*animation).with_text(text.clone())
+            }
+        }
+    }
+
+    /// Renders shortcut rows as a grid: `label` left, monospaced `keys` right. A row with empty
+    /// `keys` renders as a full-width label. `grid_id` must be unique per live call site.
+    ///
+    /// When at least one row carries `help`, the grid gains a third column between label and keys
+    /// holding that row's "?" icon (`Self::hint_grid_columns`); rows without help allocate an empty
+    /// cell there so `keys` cannot slide into the help column. `egui::Grid` hard-codes cell
+    /// alignment to `Align2::LEFT_CENTER` (`egui-0.35.0/src/grid.rs:189-195`) and `Ui::add_space` is
+    /// debug-asserted against inside a grid (`egui-0.35.0/src/placer.rs:150-156`), so the empty cell
+    /// is a zero-size `Ui::allocate_space`, which advances the cell cursor like any widget.
+    ///
+    /// # Warnings
+    /// - **`help` does not work inside a tooltip.** The icon reveals its payload through its own
+    ///   hover tooltip, and egui cannot open a tooltip inside a tooltip. Call sites that render this
+    ///   grid within `on_hover_ui` (see `Self::canvas_shortcut_rows`) must keep every `help` at
+    ///   `None`.
+    /// - **`min_col_width(0.0)` assumes wide label/keys.** `Grid::min_col_width` is global to all
+    ///   columns (`egui-0.35.0/src/grid.rs:372-378`) and defaults to `Spacing::interact_size.x`
+    ///   (~40pt), which would inflate the ~14pt icon column. Dropping it to 0 is therefore required
+    ///   in three-column mode, and is only visually neutral while the label and keys columns are
+    ///   wider than 40pt by content; shorter content would render narrower than in two-column mode.
     fn draw_hint_rows_grid(ui: &mut egui::Ui, grid_id: &str, rows: &[CanvasHintRow]) {
-        egui::Grid::new(grid_id)
-            .num_columns(2)
-            .spacing(egui::vec2(16.0, 2.0))
-            .show(ui, |ui| {
-                for row in rows {
-                    ui.label(&row.label);
-                    if !row.keys.is_empty() {
-                        ui.monospace(&row.keys);
+        let columns = Self::hint_grid_columns(rows);
+        let has_help = columns > 2;
+        let mut grid = egui::Grid::new(grid_id)
+            .num_columns(columns)
+            .spacing(egui::vec2(16.0, 2.0));
+        if has_help {
+            grid = grid.min_col_width(0.0);
+        }
+        grid.show(ui, |ui| {
+            for row in rows {
+                ui.label(&row.label);
+                if has_help {
+                    match row.help.as_ref() {
+                        Some(help) => {
+                            Self::hint_help_widget(help).show(ui);
+                        }
+                        // Keep the keys in their own column: an empty cell still has to be
+                        // allocated for the grid cursor to advance past the help column.
+                        None => {
+                            ui.allocate_space(Vec2::ZERO);
+                        }
                     }
-                    ui.end_row();
                 }
-            });
+                if !row.keys.is_empty() {
+                    ui.monospace(&row.keys);
+                }
+                ui.end_row();
+            }
+        });
     }
 
     /// Fixed, localized list of the canvas's own navigation shortcuts (zoom, pan, scroll) shown by
     /// the canvas-shortcuts hover chip. These are canvas-intrinsic behaviours, identical across all
     /// tabs; rebuilt each call so a runtime language switch is reflected.
+    ///
+    /// # Warning
+    /// These rows must never carry `help`: the chip renders them inside its hover tooltip
+    /// (`Self::draw_canvas_shortcuts_chip`), and a "?" icon there could not open its own tooltip.
     fn canvas_shortcut_rows() -> Vec<CanvasHintRow> {
         vec![
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.zoom_cursor_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.zoom_cursor_keys").to_string(),
-            },
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.zoom_in_out_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.zoom_in_out_keys").to_string(),
-            },
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.zoom_reset_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.zoom_reset_keys").to_string(),
-            },
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.pan_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.pan_keys").to_string(),
-            },
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.scroll_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.scroll_keys").to_string(),
-            },
-            CanvasHintRow {
-                label: t!("canvas.shortcuts_hint.scroll_horizontal_label").to_string(),
-                keys: t!("canvas.shortcuts_hint.scroll_horizontal_keys").to_string(),
-            },
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.zoom_cursor_label"),
+                t!("canvas.shortcuts_hint.zoom_cursor_keys"),
+            ),
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.zoom_in_out_label"),
+                t!("canvas.shortcuts_hint.zoom_in_out_keys"),
+            ),
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.zoom_reset_label"),
+                t!("canvas.shortcuts_hint.zoom_reset_keys"),
+            ),
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.pan_label"),
+                t!("canvas.shortcuts_hint.pan_keys"),
+            ),
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.scroll_label"),
+                t!("canvas.shortcuts_hint.scroll_keys"),
+            ),
+            CanvasHintRow::new(
+                t!("canvas.shortcuts_hint.scroll_horizontal_label"),
+                t!("canvas.shortcuts_hint.scroll_horizontal_keys"),
+            ),
         ]
     }
 
@@ -1875,10 +1938,7 @@ mod tests {
         assert!(!view.bottom_hint_collapsed(), "default state is expanded");
 
         view.set_bottom_hint(Some(CanvasBottomHint {
-            rows: vec![CanvasHintRow {
-                label: "Save".to_string(),
-                keys: "Ctrl+S".to_string(),
-            }],
+            rows: vec![CanvasHintRow::new("Save", "Ctrl+S")],
         }));
         assert!(view.bottom_hint.is_some(), "content is stored");
         assert!(
@@ -1894,6 +1954,65 @@ mod tests {
         assert!(
             view.bottom_hint_collapsed(),
             "hiding content leaves collapsed state untouched"
+        );
+    }
+
+    #[test]
+    fn bottom_hint_row_builder_controls_help_presence() {
+        // Contract: `CanvasHintRow::new` never attaches help, and `with_help` is the only way to
+        // attach it. Labels and keys pass through unchanged.
+        let plain = CanvasHintRow::new("Rotate", "Ctrl+Wheel");
+        assert_eq!(plain.label, "Rotate");
+        assert_eq!(plain.keys, "Ctrl+Wheel");
+        assert!(plain.help.is_none(), "a fresh row carries no help");
+
+        let helped = CanvasHintRow::new("Rotate", "Ctrl+Wheel")
+            .with_help(CanvasHintHelp::Text("Rotates the selection".to_string()));
+        assert_eq!(helped.label, "Rotate", "with_help must not touch the label");
+        assert_eq!(helped.keys, "Ctrl+Wheel", "with_help must not touch the keys");
+        assert!(
+            matches!(helped.help, Some(CanvasHintHelp::Text(ref text)) if text == "Rotates the selection"),
+            "with_help stores the payload verbatim"
+        );
+    }
+
+    #[test]
+    fn bottom_hint_grid_columns_follow_help_presence() {
+        // Contract: the help column exists only when a row can fill it, so the help-free grid
+        // (which the shortcuts chip also renders) keeps its exact two-column layout.
+        assert_eq!(
+            CanvasView::hint_grid_columns(&[]),
+            2,
+            "an empty row set needs no help column"
+        );
+        assert_eq!(
+            CanvasView::hint_grid_columns(&[
+                CanvasHintRow::new("Zoom", "Ctrl+Wheel"),
+                CanvasHintRow::new("Pan", "Space+Drag"),
+            ]),
+            2,
+            "rows without help stay two-column"
+        );
+        assert_eq!(
+            CanvasView::hint_grid_columns(&[
+                CanvasHintRow::new("Zoom", "Ctrl+Wheel"),
+                CanvasHintRow::new("Pan", "Space+Drag")
+                    .with_help(CanvasHintHelp::Text("Hold space".to_string())),
+            ]),
+            3,
+            "a single helped row switches the whole grid to three columns"
+        );
+    }
+
+    #[test]
+    fn canvas_shortcut_rows_carry_no_help() {
+        // Contract: the shortcuts chip renders these rows inside its hover tooltip, where a "?"
+        // icon could not open its own tooltip. Every row must stay help-free.
+        assert!(
+            CanvasView::canvas_shortcut_rows()
+                .iter()
+                .all(|row| row.help.is_none()),
+            "shortcut chip rows must not carry help"
         );
     }
 }

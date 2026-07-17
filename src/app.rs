@@ -52,7 +52,7 @@ Profiling (optional, behind the `profiling` cargo feature):
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleTextField, BubbleType,
-    CanvasBottomHint, CanvasDrawParams, CanvasHintRow, CanvasUiStatus, CanvasView,
+    CanvasBottomHint, CanvasDrawParams, CanvasHintHelp, CanvasHintRow, CanvasUiStatus, CanvasView,
     CanvasViewportSnapshot, OnTopFocusMode, SourceTextureUploadBudget, TranslationStatusDisplay,
     spawn_overlay_autosave_thread,
 };
@@ -3529,44 +3529,43 @@ fn hint_collapsed_from_user_settings(user_settings: &Value, key: &str) -> bool {
 ///
 /// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
 /// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
-/// canonical and must match the documented Translation shortcut set.
+/// canonical and must match the documented Translation shortcut set. No row carries help, so this
+/// hint stays two-column; attach one with `CanvasHintRow::with_help` when a shortcut needs it.
 #[must_use]
 fn build_translation_hint_rows() -> Vec<CanvasHintRow> {
     vec![
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.create_bubble_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.create_bubble_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.create_bubble_recent_char_label")
-                .to_string(),
-            keys: t!("canvas.bottom_hint.translation.create_bubble_recent_char_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.ocr_bubble_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.ocr_bubble_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.advanced_ocr_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.advanced_ocr_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.create_image_bubble_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.create_image_bubble_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.create_image_bubble_crop_label")
-                .to_string(),
-            keys: t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.translation.delete_bubble_label").to_string(),
-            keys: t!("canvas.bottom_hint.translation.delete_bubble_keys").to_string(),
-        },
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.create_bubble_label"),
+            t!("canvas.bottom_hint.translation.create_bubble_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.create_bubble_recent_char_label"),
+            t!("canvas.bottom_hint.translation.create_bubble_recent_char_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.ocr_bubble_label"),
+            t!("canvas.bottom_hint.translation.ocr_bubble_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label"),
+            t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.advanced_ocr_label"),
+            t!("canvas.bottom_hint.translation.advanced_ocr_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.create_image_bubble_label"),
+            t!("canvas.bottom_hint.translation.create_image_bubble_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.create_image_bubble_crop_label"),
+            t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.delete_bubble_label"),
+            t!("canvas.bottom_hint.translation.delete_bubble_keys"),
+        ),
     ]
 }
 
@@ -3574,30 +3573,32 @@ fn build_translation_hint_rows() -> Vec<CanvasHintRow> {
 ///
 /// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
 /// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
-/// canonical and must match the documented Typing shortcut set.
+/// canonical and must match the documented Typing shortcut set. The select-text-area row carries an
+/// animated "?" help icon, which puts this hint into the grid's three-column mode.
 #[must_use]
 fn build_typing_hint_rows() -> Vec<CanvasHintRow> {
     vec![
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.typing.select_text_area_label").to_string(),
-            keys: t!("canvas.bottom_hint.typing.select_text_area_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.typing.quick_font_size_label").to_string(),
-            keys: t!("canvas.bottom_hint.typing.quick_font_size_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.typing.rotate_label").to_string(),
-            keys: t!("canvas.bottom_hint.typing.rotate_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.typing.scale_label").to_string(),
-            keys: t!("canvas.bottom_hint.typing.scale_keys").to_string(),
-        },
-        CanvasHintRow {
-            label: t!("canvas.bottom_hint.typing.nudge_label").to_string(),
-            keys: t!("canvas.bottom_hint.typing.nudge_keys").to_string(),
-        },
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.select_text_area_label"),
+            t!("canvas.bottom_hint.typing.select_text_area_keys"),
+        )
+        .with_help(CanvasHintHelp::Animation(ms_gifs::typing::SELECT_TEXT_AREA)),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.quick_font_size_label"),
+            t!("canvas.bottom_hint.typing.quick_font_size_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.rotate_label"),
+            t!("canvas.bottom_hint.typing.rotate_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.scale_label"),
+            t!("canvas.bottom_hint.typing.scale_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.nudge_label"),
+            t!("canvas.bottom_hint.typing.nudge_keys"),
+        ),
     ]
 }
 

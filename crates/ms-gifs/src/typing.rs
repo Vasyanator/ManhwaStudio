@@ -2,8 +2,9 @@
 File: crates/ms-gifs/src/typing.rs
 
 Purpose:
-Declares the embedded animated hints for character-metric controls in the typing
-tab, pairing each WebP byte stream with its stable cache identity.
+Declares the embedded animated hints explaining typing-tab behavior — character
+metrics, per-overlay text options, and canvas gestures — pairing each WebP byte
+stream with its stable cache identity.
 */
 
 use crate::Hint;
@@ -56,8 +57,17 @@ pub const HANGING_PUNCTUATION: Hint = Hint::new(
     include_bytes!("../assets/hanging_punctuation.webp"),
 );
 
+/// Hint animation for the canvas gesture that selects a text area.
+///
+/// The name intentionally matches the `canvas.bottom_hint.typing.select_text_area_*`
+/// localization key stem: this hint explains that shortcut in the canvas bottom hint.
+pub const SELECT_TEXT_AREA: Hint = Hint::new(
+    "typing.select_text_area",
+    include_bytes!("../assets/select_text_area.webp"),
+);
+
 /// Complete stable-order inventory of typing hint assets.
-pub(crate) const ALL: [Hint; 8] = [
+pub(crate) const ALL: [Hint; 9] = [
     KERNING,
     CHAR_WIDTH,
     CHAR_HEIGHT,
@@ -66,4 +76,5 @@ pub(crate) const ALL: [Hint; 8] = [
     GLOBAL_ROTATION,
     ANTI_ALIASING,
     HANGING_PUNCTUATION,
+    SELECT_TEXT_AREA,
 ];

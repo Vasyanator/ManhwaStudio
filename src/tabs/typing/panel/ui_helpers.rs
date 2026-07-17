@@ -248,7 +248,7 @@ pub(super) fn px_or_percent_param_row(
         }
         if let Some(hint) = cfg.help {
             // Animated help for this parameter, after the X/X% unit switch.
-            crate::widgets::HelpHint::new(hint).show(ui);
+            crate::widgets::HelpHint::animated(hint).show(ui);
         }
     });
 }

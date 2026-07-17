@@ -25,8 +25,9 @@ FILE HEADER (widgets/mod.rs)
   - `AiButton`: an AI-tool launch button that gates its own availability on the
     process-global capability signals (backend/torch/onnxruntime) and paints an
     optional corner marker badge with the painter only.
-  - `HelpHint`: a light-gray circled "?" icon whose hover tooltip streams an
-    animated WebP hint (`ms-gifs` asset) on a short-lived background worker.
+  - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
+    localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
+    short-lived background worker, or both — text above the animation.
 */
 mod ai_button;
 mod autocomplete_line;

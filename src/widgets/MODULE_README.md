@@ -49,10 +49,17 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   mouse-wheel changes without scrolling parent views.
 - `wheel_input_guard.rs`: shared popup/wheel guard used by wheel-aware widgets.
 - `seed_spin_box.rs`: seed value input with random generation support.
-- `help_hint.rs`: light-gray circled "?" icon whose hover tooltip plays an animated WebP
-  hint from the `ms-gifs` crate. The tooltip contains only the animation (no text, no i18n
-  keys), rendered 1:1 (texel = point) and only scaled down, uniformly, when it exceeds
-  500x400 pt — never stretched up to the tooltip width. Playback streams one frame at a time
+- `help_hint.rs`: light-gray circled "?" icon whose hover tooltip explains a control. The
+  tooltip may carry a localized text line, an animated WebP hint from the `ms-gifs` crate, or
+  both — text first, animation below it — selected by the constructors (`animated`, `text`,
+  `with_text`, `with_animation`); callers pass already-localized text. The text line wraps at
+  320 pt in a width-capped child ui, so it never stretches the tooltip out to the animation's
+  full width, and a short line still leaves the tooltip narrow. The animation is rendered 1:1
+  (texel = point) and only scaled down, uniformly, when it exceeds 500x400 pt — never
+  stretched up to the tooltip width. A hint with no animation never reaches the playback cache
+  and never starts a worker, so the text-only mode is independent of `ms-gifs`; a hint whose
+  animation is blacklisted still shows its text, and the tooltip is dropped only when there is
+  neither text nor a usable animation. Playback streams one frame at a time
   on a background `ms_thread` worker through two reusable RGBA buffers, so CPU memory is one
   compositing canvas plus publication buffers (about 1.6 MB each for the largest asset) and is
   independent of frame count. The GUI uploads the latest ready frame into one reused

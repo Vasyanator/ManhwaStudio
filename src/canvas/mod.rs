@@ -6,8 +6,9 @@ Compact canvas facade for page rendering, bubble editing, and clean-overlay pain
 
 Main types:
 - `CanvasUiStatus`: per-frame loading status for canvas overlays/hooks.
-- `CanvasHintRow` / `CanvasBottomHint`: per-tab content of the collapsible bottom-center
-  keyboard-shortcut hint overlay (label + key rows); `bottom_hint == None` hides it.
+- `CanvasHintRow` / `CanvasHintHelp` / `CanvasBottomHint`: per-tab content of the collapsible
+  bottom-center keyboard-shortcut hint overlay (label + key rows, each row optionally carrying a
+  "?" help icon); `bottom_hint == None` hides it.
 - `CanvasFrameParams`: per-frame viewport/interaction flags shared by scene + viewport passes.
 - `CanvasScenePageFrame`: geometry snapshot for one page row within the scene pass.
 - `OverlayUploadBudget`: per-frame clean-overlay upload budget used to keep GUI responsive.
@@ -262,9 +263,9 @@ pub(crate) use self::types::ImageTextArea;
 
 pub use self::types::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleAction, BubbleClass, BubbleCopyPasteTarget,
-    BubbleMode, BubbleTextField, BubbleType, CanvasBottomHint, CanvasHintRow, CanvasState,
-    CanvasUiStatus, OnTopFocusMode, OverlayRectPx, RectCoords, SourceTextureUploadBudget,
-    TranslationStatusDisplay,
+    BubbleMode, BubbleTextField, BubbleType, CanvasBottomHint, CanvasHintHelp, CanvasHintRow,
+    CanvasState, CanvasUiStatus, OnTopFocusMode, OverlayRectPx, RectCoords,
+    SourceTextureUploadBudget, TranslationStatusDisplay,
 };
 
 const TEXT_UPSERT_DEBOUNCE_SECS: f64 = 1.0;
