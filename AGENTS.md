@@ -62,6 +62,7 @@ Standard pipeline:
 
 Rules:
 
+* Before launching explorers, the manager must personally read the documentation down to the `MODULE_README.md` level (`README_AGENT.md`, then the relevant `MODULE_README.md` files). This is documentation reading, not code reading — use it to scope the task and write precise explorer prompts.
 * When the user asks to fix a specific bug, launch 2-3 explorers in parallel with the same task. Independent explorers surface findings the others miss.
 * Launch independent agents in a single batch so they run concurrently.
 * The "read before editing" obligations in this document (sections 1 and 9) apply to the agents doing the work: explorers and workers must read the relevant `README_AGENT.md`, `MODULE_README.md`, headers, and declaration comments. As manager, instruct them to do so instead of reading the code yourself.
@@ -78,8 +79,10 @@ In those cases, do the work directly.
 ### 2.2 Sub-Agent Model Selection
 
 Two agent pools are available. Built-in sub-agents (the Agent tool) run on Anthropic
-models: **Fable** (the session model, most capable and most expensive) and **Opus**
-(pass `model: "opus"`, cheaper). External sub-agents run through the codex CLI:
+models: **Fable** (the session model — the most capable, but also the slowest and most
+expensive; reserve it, see the table), **Opus** (pass `model: "opus"`, cheaper — the
+default workhorse), **Sonnet** (`model: "sonnet"`) and **Haiku** (`model: "haiku"`,
+cheapest/fastest — for light exploration). External sub-agents run through the codex CLI:
 **Sol** (`gpt-5.6-sol`) and **Terra** (`gpt-5.6-terra`). Codex may be UNAVAILABLE
 (CLI missing, no auth, session limits) — always smoke-test it before relying on it
 (`codex -m gpt-5.6-sol exec --sandbox read-only "Reply OK"`); when it is unavailable,
@@ -89,8 +92,9 @@ Who is good at what (observed on real rotated task classes in this repo):
 
 | Model | Best at | Use for | Watch out for |
 |---|---|---|---|
-| **Fable** (built-in) | Hardest design work: fixes requiring new invariants (undo invalidation, generation tombstones), systematic reviews that RUN tests and verify claims, clean first-pass implementations | The most complex task of a round: subtle concurrency fixes, integration reviews, anything where a wrong design is expensive. It is the most expensive model — do not spend it on routine work | Can stall on long reads (watchdog); resume it with a message. Delegate large files in chunks |
-| **Opus** (built-in) | Standard implementation, exploration, routine reviews at lower cost | Default workhorse when Fable is overkill and codex is unavailable or busy: scoped features, explorer/worker roles, mechanical refactors | Less depth on cross-subsystem invariants than Fable — pair with a strong reviewer |
+| **Fable** (built-in) | Hardest analysis and design work: diagnosing complex bugs, advanced planning, fixes requiring new invariants (undo invalidation, generation tombstones), reviewing high-performance code, finding optimization opportunities, systematic reviews that RUN tests and verify claims | Diagnosis, planning, and review only — the most complex task of a round: subtle concurrency bugs, integration reviews, optimization hunting. **Do NOT use it to write code** — hand implementation to Opus (or codex). It is the slowest and most expensive model — never spend it on routine work | Can stall on long reads (watchdog); resume it with a message. Delegate large files in chunks |
+| **Opus** (built-in) | Standard implementation, exploration, routine reviews at lower cost | The preferred default for writing code, and the workhorse when codex is unavailable or busy: scoped features, worker roles, mechanical refactors | Less depth on cross-subsystem invariants than Fable — pair with a strong reviewer |
+| **Sonnet** / **Haiku** (built-in) | Fast, cheap codebase search and simple fact-finding | Plain code search: locating integration points, mapping where a symbol/feature lives, other non-complex exploration (explorer roles) | Not for design, review, or implementation — escalate anything requiring judgment to Opus or Fable |
 | **Sol** (codex) | Adversarial review of low-level protocols (crash-safety, journals, filesystem atomicity, concurrency races); disciplined verify-then-fix passes; accurate GUI-free layers | Reviewing anything transactional or lock-heavy; applying confirmed review findings without scope creep; small precise engine modules | Sandbox blocks socket binds and read-only blocks cargo — its "environmental" test-failure claims must be re-verified outside the sandbox |
 | **Terra** (codex) | High-volume implementation against a detailed written spec (integrations, UI panels) — fast and complete | Big scoped implementation tasks where the spec already pins the design | Repeatedly misses cross-subsystem races (gate holes on frame boundaries, writer lifecycles). ALWAYS have Sol or Fable review its work before merge |
 
