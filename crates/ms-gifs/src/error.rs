@@ -45,4 +45,15 @@ pub enum GifError {
         /// Stable identity of the empty hint.
         name: &'static str,
     },
+
+    /// The caller supplied a frame output buffer with the wrong byte length.
+    #[error("hint \"{name}\" requires a {expected}-byte frame buffer, received {actual} bytes")]
+    BufferLen {
+        /// Stable identity of the hint being played.
+        name: &'static str,
+        /// Required non-premultiplied RGBA8 buffer length.
+        expected: usize,
+        /// Supplied buffer length.
+        actual: usize,
+    },
 }

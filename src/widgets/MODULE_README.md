@@ -52,16 +52,14 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip plays an animated WebP
   hint from the `ms-gifs` crate. The tooltip contains only the animation (no text, no i18n
   keys), rendered 1:1 (texel = point) and only scaled down, uniformly, when it exceeds
-  500x400 pt — never stretched up to the tooltip width. A decoded hint is up to ~106 MB of
-  RGBA frames. Decoding always runs on a background `ms_thread` worker (the single `decoding` slot
-  is released through an RAII guard, so even a panicking worker cannot wedge it); the GUI
-  thread uploads one frame at a time into a single reused `TextureHandle`. A process-wide
-  single-slot cache (egui temp memory, `Arc<Mutex<..>>`) keeps at most one decoded animation
-  resident and evicts it a few seconds after the tooltip was last visible. Eviction is
-  guaranteed by `maintain_help_hint_cache(ctx)`, called once per frame from the app root
-  (`MangaApp::ui`) — icons alone stop drawing when the user leaves the panel, so without the
-  root hook a decoded animation could stay resident indefinitely. A hint whose decode failed
-  is logged once and blacklisted for the session.
+  500x400 pt — never stretched up to the tooltip width. Playback streams one frame at a time
+  on a background `ms_thread` worker through two reusable RGBA buffers, so CPU memory is one
+  compositing canvas plus publication buffers (about 1.6 MB each for the largest asset) and is
+  independent of frame count. The GUI uploads the latest ready frame into one reused
+  `TextureHandle`. A process-wide single slot stops the previous worker and drops its texture
+  when another hint is hovered; a tooltip-body heartbeat stops the worker when the tooltip is
+  no longer shown. The worker slot is released through an RAII guard, so a panic cannot wedge
+  playback. A hint whose open or frame decode fails is logged once and blacklisted for the session.
 
 ## Contracts and invariants
 - Widget drawing must not perform blocking file, network, build, model, or parsing work on the

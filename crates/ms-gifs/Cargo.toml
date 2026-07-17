@@ -3,9 +3,10 @@ name = "ms-gifs"
 version = "0.1.0"
 edition = "2024"
 
-# Embedded animated WebP hint assets and their GUI-free decoder. Keeping the
+# Embedded animated WebP hint assets and their GUI-free streaming player. Keeping the
 # ~2.9 MB assets in this crate prevents ordinary edits to the main crate's `src/`
-# from recompiling the embedded bytes. No egui / image dependency by design.
+# from recompiling the embedded bytes. Playback memory is independent of frame count;
+# per-frame decoding still belongs off the GUI thread. No egui / image dependency.
 [dependencies]
 image-webp = "0.2"
 thiserror = "2"
