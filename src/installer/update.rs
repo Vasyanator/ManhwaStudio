@@ -27,7 +27,7 @@ use crate::config;
 
 use super::install::TorchInstallSelection;
 use super::utils::{
-    ExternalUpdateTarget, UpdateWorkerEvent, load_embedded_icon_data,
+    ExternalUpdateTarget, UpdateWorkerEvent, github_api_get, load_embedded_icon_data,
     run_external_update_binary_stage, run_update_binary_stage, run_update_continuation_stage,
 };
 
@@ -539,28 +539,9 @@ impl eframe::App for UpdateApp {
 }
 
 fn fetch_latest_app_release_tag() -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
-    let mut req = agent
-        .get(APP_RELEASES_API)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "ManhwaStudio/update-window");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-
-    let response = req
-        .call()
+    // Shared installer helper: retries transient network failures with backoff.
+    let body = github_api_get(APP_RELEASES_API, "ManhwaStudio/update-window")
         .map_err(|e| tf!("installer.update.get_releases_error", e = e))?;
-    let body = response
-        .into_string()
-        .map_err(|e| tf!("installer.update.read_releases_error", e = e))?;
     let releases: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.update.parse_releases_error", e = e))?;
     let releases = releases

@@ -43,6 +43,10 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - GPU capability probes must go through `gpu_utils.rs`.
 - Release asset lookup, uv download, app archive extraction, dependency installation, shortcuts,
   registry writes, and uninstall cleanup belong in `utils.rs`, not in egui window code.
+- Direct HTTP file downloads must go through `utils.rs::download_asset` (retry with exponential
+  backoff, HTTP Range resume into a `.part` file, size verification, atomic rename into place —
+  the destination path never holds a partial file). GitHub API metadata requests must go through
+  `utils.rs::github_api_get`, which retries transient failures and is shared with `update.rs`.
 - Unsupported installer operations must return explicit user-facing errors.
 - Initial installation must not eagerly download AI model weights.
 - Fast installation must install only the base dependency group.

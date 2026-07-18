@@ -17,6 +17,10 @@ Main responsibilities:
 Notes:
 The initial install flow intentionally does not download application AI model weights. Runtime
 code downloads app-managed models lazily through `ai_models.rs` when a feature needs them.
+Direct HTTP downloads are connection-failure tolerant: `download_asset` streams into a `.part`
+file, retries with exponential backoff, resumes via HTTP Range requests, verifies the final size
+against the server-reported total, and renames the finished file into place. GitHub API metadata
+requests go through `github_api_get`, which retries transient failures.
 */
 
 use std::collections::HashMap;
@@ -3399,29 +3403,71 @@ fn lerp(start: f32, end: f32, t: f32) -> f32 {
     start + (end - start) * t.clamp(0.0, 1.0)
 }
 
-fn fetch_latest_uv_asset(platform: Platform, arch: &str) -> Result<GithubAsset, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(45))
-        .build();
+/// User-Agent header sent with installer HTTP requests.
+const INSTALLER_USER_AGENT: &str = "ManhwaStudioMiniLauncher/installer";
 
-    let mut req = agent
-        .get(UV_RELEASE_API)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "ManhwaStudioMiniLauncher/installer");
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
+/// Number of attempts `github_api_get` makes before giving up.
+const GITHUB_API_ATTEMPTS: u32 = 5;
+
+/// Returns true when an HTTP status is worth retrying: request timeout (408),
+/// rate limiting (429), or any server-side failure (5xx). Other statuses are
+/// deterministic and retrying cannot change the outcome.
+fn is_retryable_http_status(code: u16) -> bool {
+    matches!(code, 408 | 429) || code >= 500
+}
+
+/// Performs a GitHub API GET with retries for transient network failures.
+///
+/// `user_agent` identifies the calling window. Transport errors, mid-body
+/// disconnects, and retryable HTTP statuses (see `is_retryable_http_status`)
+/// are retried with exponential backoff; other HTTP errors fail immediately.
+/// Returns the response body on success and the last error text on failure;
+/// callers wrap that text into their own localized message.
+pub(crate) fn github_api_get(url: &str, user_agent: &str) -> Result<String, String> {
+    let mut last_error = String::new();
+    for attempt in 0..GITHUB_API_ATTEMPTS {
+        if attempt > 0 {
+            // 1s, 2s, 4s, 8s between attempts.
+            std::thread::sleep(Duration::from_secs(1_u64 << (attempt - 1)));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(45))
+            .build();
+        let mut req = agent
+            .get(url)
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", user_agent);
+        if let Ok(token) = env::var("GITHUB_TOKEN") {
+            let token = token.trim();
+            if !token.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+        }
+        match req.call() {
+            Ok(response) => match response.into_string() {
+                Ok(body) => return Ok(body),
+                // The connection dropped mid-body; the request is worth retrying.
+                Err(e) => last_error = e.to_string(),
+            },
+            Err(e) => {
+                let retryable = match &e {
+                    ureq::Error::Status(code, _) => is_retryable_http_status(*code),
+                    ureq::Error::Transport(_) => true,
+                };
+                last_error = e.to_string();
+                if !retryable {
+                    return Err(last_error);
+                }
+            }
         }
     }
+    Err(last_error)
+}
 
-    let response = req
-        .call()
+fn fetch_latest_uv_asset(platform: Platform, arch: &str) -> Result<GithubAsset, String> {
+    let body = github_api_get(UV_RELEASE_API, INSTALLER_USER_AGENT)
         .map_err(|e| tf!("installer.utils.get_uv_release_error", e = e))?;
-    let body = response
-        .into_string()
-        .map_err(|e| tf!("installer.utils.read_uv_release_error", e = e))?;
     let release: GithubRelease = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.utils.parse_uv_release_error", e = e))?;
 
@@ -3441,28 +3487,8 @@ fn fetch_latest_app_release_tag_with_required_asset(asset_name: &str) -> Result<
 }
 
 fn fetch_latest_app_release_with_asset(asset_name: &str) -> Result<(String, GithubAsset), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(45))
-        .build();
-
-    let mut req = agent
-        .get(APP_RELEASES_API)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "ManhwaStudioMiniLauncher/installer");
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-
-    let response = req
-        .call()
+    let body = github_api_get(APP_RELEASES_API, INSTALLER_USER_AGENT)
         .map_err(|e| tf!("installer.utils.get_releases_error", e = e))?;
-    let body = response
-        .into_string()
-        .map_err(|e| tf!("installer.utils.read_releases_error", e = e))?;
     let releases: Vec<GithubReleaseListItem> = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.utils.parse_releases_error", e = e))?;
 
@@ -3508,6 +3534,44 @@ fn select_uv_asset(
         })
 }
 
+/// Consecutive download attempts that may fail without adding a single new
+/// byte before `download_asset` gives up. Attempts that grow the partial file
+/// reset this budget, so a flaky-but-alive connection can finish arbitrarily
+/// large files as long as each round makes some progress.
+const DOWNLOAD_STALLED_ATTEMPT_LIMIT: u32 = 10;
+
+/// Progress-reporting context shared by `download_asset` retry attempts.
+struct DownloadProgressCtx<'a> {
+    tx: &'a mpsc::Sender<InstallEvent>,
+    progress_start: f32,
+    progress_end: f32,
+    label_prefix: &'a str,
+}
+
+/// Failure of a single `download_asset_attempt`.
+enum DownloadAttemptError {
+    /// Retrying cannot help (deterministic HTTP error, local filesystem failure).
+    Permanent(String),
+    /// Network-shaped failure; a retry resuming from the partial file may succeed.
+    Transient(String),
+}
+
+/// Extracts the total size from a `Content-Range: bytes <start>-<end>/<total>`
+/// header value. Returns `None` when the total is absent (`*`) or malformed.
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    value.rsplit('/').next()?.trim().parse::<u64>().ok()
+}
+
+/// Downloads `url` into `dst_path`, tolerating an unreliable connection.
+///
+/// The body streams into a sibling `<file>.part` file; failed attempts are
+/// retried with exponential backoff and resumed via HTTP `Range` requests, and
+/// the completed file is renamed into place, so `dst_path` never holds a
+/// partial download. When the server reports a size, a stream that ends early
+/// is treated as a failure and resumed. Consecutive attempts without byte
+/// progress are limited by `DOWNLOAD_STALLED_ATTEMPT_LIMIT`; attempts that
+/// advance the file reset that budget. Progress events sent through `tx` map
+/// onto `progress_start..=progress_end`.
 fn download_asset(
     url: &str,
     dst_path: &Path,
@@ -3516,71 +3580,89 @@ fn download_asset(
     progress_end: f32,
     label_prefix: &str,
 ) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(120))
-        .build();
-    let mut req = agent
-        .get(url)
-        .set("User-Agent", "ManhwaStudioMiniLauncher/installer");
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
+    let part_file_name = dst_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.part"))
+        .ok_or_else(|| {
+            tf!("installer.utils.create_dst_path_error", dst_path = dst_path.display(), e = "invalid file name")
+        })?;
+    let part_path = dst_path.with_file_name(part_file_name);
+    let progress = DownloadProgressCtx {
+        tx,
+        progress_start,
+        progress_end,
+        label_prefix,
+    };
 
-    let response = req
-        .call()
-        .map_err(|e| tf!("installer.utils.download_error", label_prefix = label_prefix, e = e))?;
-    let total = response
-        .header("Content-Length")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let mut reader = response.into_reader();
-    let mut file = File::create(dst_path)
-        .map_err(|e| tf!("installer.utils.create_dst_path_error", dst_path = dst_path.display(), e = e))?;
-
-    let mut downloaded: u64 = 0;
-    let mut buf = vec![0_u8; 256 * 1024];
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let mut expected_total: Option<u64> = None;
+    let mut stalled_attempts: u32 = 0;
+    let mut attempt: u32 = 0;
     loop {
-        let read = reader
-            .read(&mut buf)
-            .map_err(|e| tf!("installer.utils.read_http_stream_error", e = e))?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buf[..read])
-            .map_err(|e| tf!("installer.utils.write_dst_path_error", dst_path = dst_path.display(), e = e))?;
-        downloaded += read as u64;
-
-        if last_emit.elapsed() >= Duration::from_millis(120) {
-            let stage_progress = if total > 0 {
-                downloaded as f32 / total as f32
-            } else {
-                0.0
-            };
-            send_progress(
-                tx,
-                stage_progress.clamp(0.0, 1.0),
-                if total > 0 {
-                    format!(
-                        "{label_prefix}: {} / {}",
-                        format_bytes(downloaded),
-                        format_bytes(total)
-                    )
+        attempt += 1;
+        // Attempt 1 always starts from zero: a leftover `.part` file from an
+        // older run may belong to a different asset with the same name, so
+        // resume only within this call.
+        let offset = if attempt == 1 {
+            0
+        } else {
+            fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+        };
+        match download_asset_attempt(url, &part_path, offset, &mut expected_total, &progress) {
+            Ok(()) => break,
+            Err(DownloadAttemptError::Permanent(message)) => return Err(message),
+            Err(DownloadAttemptError::Transient(message)) => {
+                let new_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                if new_len > offset {
+                    stalled_attempts = 0;
                 } else {
-                    format!("{label_prefix}: {}", format_bytes(downloaded))
-                },
-                progress_start + stage_progress.clamp(0.0, 1.0) * (progress_end - progress_start),
-                tf!("installer.utils.downloading_progress", label_prefix = label_prefix),
-            );
-            last_emit = Instant::now();
+                    stalled_attempts += 1;
+                }
+                if stalled_attempts >= DOWNLOAD_STALLED_ATTEMPT_LIMIT {
+                    return Err(tf!(
+                        "installer.utils.download_failed_after_retries_error",
+                        label_prefix = label_prefix,
+                        attempts = attempt,
+                        e = message
+                    ));
+                }
+                send_console_line(
+                    tx,
+                    tf!(
+                        "installer.utils.download_retry_status",
+                        label_prefix = label_prefix,
+                        attempt = attempt + 1,
+                        e = message
+                    ),
+                );
+                // Exponential backoff capped at 16s, so a long download over a
+                // flaky link is not dominated by waiting between attempts.
+                let backoff_exp = stalled_attempts.min(5);
+                std::thread::sleep(Duration::from_millis(500_u64 << backoff_exp));
+            }
         }
     }
-    file.flush()
-        .map_err(|e| tf!("installer.utils.finalize_file_error", dst_path = dst_path.display(), e = e))?;
+
+    // Move the finished `.part` file into place; remove a stale destination
+    // first because `fs::rename` does not replace existing files on Windows.
+    if dst_path.exists() {
+        fs::remove_file(dst_path).map_err(|e| {
+            tf!(
+                "installer.utils.download_finalize_rename_error",
+                part_path = part_path.display(),
+                dst_path = dst_path.display(),
+                e = e
+            )
+        })?;
+    }
+    fs::rename(&part_path, dst_path).map_err(|e| {
+        tf!(
+            "installer.utils.download_finalize_rename_error",
+            part_path = part_path.display(),
+            dst_path = dst_path.display(),
+            e = e
+        )
+    })?;
 
     send_progress(
         tx,
@@ -3589,6 +3671,174 @@ fn download_asset(
         progress_end,
         tf!("installer.utils.download_done_progress", label_prefix = label_prefix),
     );
+    Ok(())
+}
+
+/// Runs one HTTP attempt for `download_asset`, writing into `part_path`.
+///
+/// `offset > 0` resumes with an HTTP `Range` request appending to the partial
+/// file; a server that ignores the range restarts the file from zero.
+/// `expected_total` is filled from response headers the first time the server
+/// reports a size and is used to reject streams that end early.
+fn download_asset_attempt(
+    url: &str,
+    part_path: &Path,
+    mut offset: u64,
+    expected_total: &mut Option<u64>,
+    progress: &DownloadProgressCtx<'_>,
+) -> Result<(), DownloadAttemptError> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        // Short per-read timeout: a stalled link should fail fast and resume
+        // with a `Range` request instead of hanging for minutes.
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    let mut req = agent.get(url).set("User-Agent", INSTALLER_USER_AGENT);
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+    }
+    if offset > 0 {
+        req = req.set("Range", &format!("bytes={offset}-"));
+    }
+
+    let response = match req.call() {
+        Ok(response) => response,
+        Err(e) => {
+            let retryable = match &e {
+                ureq::Error::Status(code, _) => is_retryable_http_status(*code),
+                ureq::Error::Transport(_) => true,
+            };
+            let message =
+                tf!("installer.utils.download_error", label_prefix = progress.label_prefix, e = e);
+            return Err(if retryable {
+                DownloadAttemptError::Transient(message)
+            } else {
+                DownloadAttemptError::Permanent(message)
+            });
+        }
+    };
+
+    // 206 means the server honored the resume request; a plain 200 means it
+    // ignored the `Range` header and is sending the whole body again.
+    if offset > 0 && response.status() != 206 {
+        offset = 0;
+    }
+    if offset == 0 {
+        if let Some(total) = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|total| *total > 0)
+        {
+            *expected_total = Some(total);
+        }
+    } else if expected_total.is_none() {
+        // A resumed response reports only the remaining length in
+        // Content-Length; the full size lives in Content-Range.
+        *expected_total = response
+            .header("Content-Range")
+            .and_then(parse_content_range_total);
+    }
+
+    let mut reader = response.into_reader();
+    let mut file = if offset > 0 {
+        OpenOptions::new().append(true).open(part_path)
+    } else {
+        File::create(part_path)
+    }
+    .map_err(|e| {
+        DownloadAttemptError::Permanent(
+            tf!("installer.utils.create_dst_path_error", dst_path = part_path.display(), e = e),
+        )
+    })?;
+
+    let mut downloaded = offset;
+    let mut buf = vec![0_u8; 256 * 1024];
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    loop {
+        let read = match reader.read(&mut buf) {
+            Ok(read) => read,
+            // Bytes written so far stay in the `.part` file, so the next
+            // attempt resumes from them instead of restarting.
+            Err(e) => {
+                return Err(DownloadAttemptError::Transient(
+                    tf!("installer.utils.read_http_stream_error", e = e),
+                ));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buf[..read]).map_err(|e| {
+            DownloadAttemptError::Permanent(
+                tf!("installer.utils.write_dst_path_error", dst_path = part_path.display(), e = e),
+            )
+        })?;
+        downloaded += read as u64;
+
+        if last_emit.elapsed() >= Duration::from_millis(120) {
+            let total = expected_total.unwrap_or(0);
+            let stage_progress = if total > 0 {
+                downloaded as f32 / total as f32
+            } else {
+                0.0
+            };
+            send_progress(
+                progress.tx,
+                stage_progress.clamp(0.0, 1.0),
+                if total > 0 {
+                    format!(
+                        "{}: {} / {}",
+                        progress.label_prefix,
+                        format_bytes(downloaded),
+                        format_bytes(total)
+                    )
+                } else {
+                    format!("{}: {}", progress.label_prefix, format_bytes(downloaded))
+                },
+                progress.progress_start
+                    + stage_progress.clamp(0.0, 1.0)
+                        * (progress.progress_end - progress.progress_start),
+                tf!("installer.utils.downloading_progress", label_prefix = progress.label_prefix),
+            );
+            last_emit = Instant::now();
+        }
+    }
+    file.flush().map_err(|e| {
+        DownloadAttemptError::Permanent(
+            tf!("installer.utils.finalize_file_error", dst_path = part_path.display(), e = e),
+        )
+    })?;
+
+    if let Some(total) = *expected_total {
+        if downloaded < total {
+            // The server closed the stream early; the next attempt resumes.
+            return Err(DownloadAttemptError::Transient(tf!(
+                "installer.utils.download_incomplete_error",
+                label_prefix = progress.label_prefix,
+                downloaded = format_bytes(downloaded),
+                total = format_bytes(total)
+            )));
+        }
+        if downloaded > total {
+            // Overlapping resume or an asset that changed mid-download: the
+            // partial file cannot be trusted, restart from scratch.
+            drop(file);
+            fs::remove_file(part_path).map_err(|e| {
+                DownloadAttemptError::Permanent(
+                    tf!("installer.utils.remove_partial_error", path = part_path.display(), e = e),
+                )
+            })?;
+            return Err(DownloadAttemptError::Transient(tf!(
+                "installer.utils.download_incomplete_error",
+                label_prefix = progress.label_prefix,
+                downloaded = format_bytes(downloaded),
+                total = format_bytes(total)
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3933,12 +4183,129 @@ impl Display for Platform {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_version_strings, dependency_package_name, normalize_package_name,
-        parse_executable_version_output, parse_pip_freeze_packages,
-        platform_binary_asset_name, platform_executable_file_name,
+        compare_version_strings, dependency_package_name, is_retryable_http_status,
+        normalize_package_name, parse_content_range_total, parse_executable_version_output,
+        parse_pip_freeze_packages, platform_binary_asset_name, platform_executable_file_name,
         sanitize_windows_archive_path_component,
     };
     use std::cmp::Ordering;
+
+    #[test]
+    fn parse_content_range_total_extracts_total_size() {
+        assert_eq!(parse_content_range_total("bytes 100-199/12345"), Some(12345));
+        assert_eq!(parse_content_range_total("bytes 0-0/1"), Some(1));
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_unknown_or_malformed_totals() {
+        assert_eq!(parse_content_range_total("bytes 100-199/*"), None);
+        assert_eq!(parse_content_range_total("garbage"), None);
+        assert_eq!(parse_content_range_total(""), None);
+    }
+
+    #[test]
+    fn retryable_http_statuses_are_timeouts_rate_limits_and_server_errors() {
+        assert!(is_retryable_http_status(408));
+        assert!(is_retryable_http_status(429));
+        assert!(is_retryable_http_status(500));
+        assert!(is_retryable_http_status(503));
+        assert!(!is_retryable_http_status(400));
+        assert!(!is_retryable_http_status(403));
+        assert!(!is_retryable_http_status(404));
+        assert!(!is_retryable_http_status(416));
+    }
+
+    /// Reads one HTTP request head (through the blank line) from `stream`.
+    fn read_request_head(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => break,
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// Extracts the start offset from a `Range: bytes=<start>-` request header.
+    fn parse_range_start(request_head: &str) -> Option<u64> {
+        let lower = request_head.to_ascii_lowercase();
+        let after = lower.split("range: bytes=").nth(1)?;
+        after.split('-').next()?.trim().parse::<u64>().ok()
+    }
+
+    #[test]
+    fn download_asset_resumes_after_mid_body_disconnect() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        // Deterministic 400 KB payload so a mid-body cut is unambiguous.
+        let body: Vec<u8> = (0..100_000_u32).flat_map(u32::to_le_bytes).collect();
+        let half = body.len() / 2;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server_body = body.clone();
+        let server = std::thread::spawn(move || {
+            // First request: full Content-Length, but only half the bytes
+            // arrive before the connection drops.
+            let (mut stream, _) = listener.accept().expect("accept first request");
+            let _ = read_request_head(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write first head");
+            stream
+                .write_all(&server_body[..half])
+                .expect("write first half");
+            drop(stream);
+
+            // Second request must resume with a Range header; serve the rest.
+            let (mut stream, _) = listener.accept().expect("accept resume request");
+            let request_head = read_request_head(&mut stream);
+            let start_u64 = parse_range_start(&request_head).expect("resume request has Range");
+            let start = usize::try_from(start_u64).expect("range offset fits usize");
+            assert_eq!(start, half, "resume must continue exactly where the cut happened");
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                server_body.len() - start,
+                start,
+                server_body.len() - 1,
+                server_body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write resume head");
+            stream
+                .write_all(&server_body[start..])
+                .expect("write resume body");
+        });
+
+        let dir = std::env::temp_dir().join(format!("ms_download_asset_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let dst_path = dir.join("asset.bin");
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let result = super::download_asset(
+            &format!("http://{addr}/asset.bin"),
+            &dst_path,
+            &tx,
+            0.0,
+            1.0,
+            "test-asset",
+        );
+
+        server.join().expect("server thread");
+        assert_eq!(result, Ok(()));
+        let downloaded = std::fs::read(&dst_path).expect("read downloaded file");
+        assert_eq!(downloaded, body, "resumed file must match the original byte-for-byte");
+        assert!(
+            !dir.join("asset.bin.part").exists(),
+            "no partial file may remain after a successful download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_pip_freeze_packages_normalizes_distribution_names() {
