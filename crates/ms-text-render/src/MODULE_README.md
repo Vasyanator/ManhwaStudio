@@ -108,6 +108,16 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
   shared `glyph_blit.rs` helpers; only color-glyph fallbacks and bitmap
   measurement/bounds still use `raster.rs` bitmaps.
+- `extra_info.rs`: pure geometry core for the optional "extra render info"
+  payload (`RenderExtraInfoRequest` -> `RenderedTextExtraInfo`). Owns
+  `ExtraInfoAccumulator` (collects per-glyph placement-box corner/center samples
+  in content space; a true no-op when nothing is requested), the monotone-chain
+  convex hull + polygon area centroid (mean center, point-average fallback for
+  degenerate hulls), the per-axis median (median center), `finish` which maps
+  the accumulated samples from content space to final-image pixels, and the shared
+  `rotated_box_samples` helper (a scaled glyph box's rotated corners/center) used by
+  the rotated draw paths. Knows nothing about fonts/layout/raster. Unit-tested in
+  place.
 - `optical.rs`: axis-agnostic pure numeric core for optical kerning
   (`median_of_gaps`, `optical_delta`, `optical_base_advance`) plus the shared
   directional gap metric (`optical_pair_gap` over `OpticalAxis`, returning the
@@ -289,6 +299,48 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   spans EXPLICITLY reset attrs to `Weight::NORMAL`/`Style::Normal`
   (`inline_styles.rs`), so a global real bold/italic can never leak under the
   faux geometry.
+- `TextRenderParams.extra_info` (`RenderExtraInfoRequest`) selects which optional
+  "extra render info" items the renderer computes alongside the pixels — today the
+  MEAN center (area centroid of the convex hull of all included glyphs'
+  placement-box corners) and the MEDIAN center (per-axis median of their box
+  centers), returned in `RenderedTextImage.extra` (`RenderedTextExtraInfo`, two
+  `Option<[f32; 2]>` in FINAL-IMAGE pixels, fractional and possibly outside the
+  image). The DEFAULT (nothing requested) is a true no-op with the byte-identical
+  fast path and zero per-glyph sampling. Like `anti_aliasing`, it does NOT affect
+  layout, so it is excluded from `TextRenderShapeCompareParams`; it is a per-render
+  compute request and is NOT persisted in project JSON (codec/panel construction
+  sites pass `default()`). Samples are taken at the VECTOR stage from the same
+  placement box the draw pass uses (scaled/rotated, then mesh-warped through the
+  same `MeshWarpContext::warp_world`); glyphs in a line's leading/trailing
+  hanging-punctuation runs are excluded when `hanging_punctuation` is on (same
+  edge-run semantics as `hanging_metrics_for_layout`). Offset consistency: the
+  `finish` offset maps content->canvas, `raster::trim_rendered_image_to_alpha_bounds`
+  shifts the centers by the crop origin, and `effects::apply_effects_pipeline`
+  shifts them by the `content_origin_x/y` delta at its single exit (so effect
+  order vs trim no longer matters). The contract now covers EVERY layout mode:
+  horizontal Normal + `render_horizontal_rotated` (`pipeline.rs`), vertical
+  (`layout/vertical.rs`), and formula/on-path + `Shape` + custom raster/vector
+  lines (`formula/render.rs`). The shared accumulator API: build one
+  `ExtraInfoAccumulator::new(params.extra_info)` per render, gate work on
+  `is_active()`, call `add_glyph(corners, center, warpable)` per drawn glyph AFTER all
+  placement transforms (post block/group/global rotation), apply the mesh warp once
+  via `map_points(|p| ctx.warp_world(p))` when a warp is active, then
+  `finish(x_offset, y_offset)` with that path's content->canvas offset and store the
+  result into the image's `extra` before trim/effects. The `warpable` flag mirrors
+  the draw branch: outline glyphs pass `true`, but color-glyph BITMAP-fallback glyphs
+  pass `false` so `map_points` leaves their samples UNWARPED — matching the "bitmap
+  fallback is not warped" pixel contract, so a bitmap-fallback sample contributes
+  unwarped, aligned with its unwarped pixels. Each call site resolves the flag the
+  same way the draw code does (`placement.outline.is_some()` on the horizontal
+  Normal/rotated paths; the resolved outline `Option` on the vertical and
+  formula/on-path + `Shape` + custom-line paths). The rotated draw paths build
+  their per-glyph box via the shared `extra_info::rotated_box_samples` (scaled box
+  half-extents rotated by the glyph's total rotation). Hanging-punctuation exclusion
+  applies to the HORIZONTAL paths only (vertical/formula never read
+  `hanging_punctuation`). Both formula render functions accumulate INSIDE their
+  `_once` body, so the formula retry loop (`render_margin_pad` growth) naturally
+  rebuilds a FRESH accumulator every iteration and the stored extras always match
+  the accepted image.
 - `RenderedTextImage.rgba` must always be `width * height * 4` bytes in unmultiplied
   RGBA order. Empty/transparent output must still use valid dimensions where possible.
 - Public renderer errors are `Result<_, String>` because callers surface them directly
@@ -331,6 +383,14 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 ## Editing map
 - To change caller-visible render parameters or result shape, start in `types.rs`, then
   update `mod.rs` smoke anchors and parent typing serialization/parsing.
+- To change the mean/median extra-info math (hull centroid, median, degenerate
+  fallbacks, offset mapping, or the shared `rotated_box_samples` corner geometry),
+  edit `extra_info.rs`. To change WHERE it is sampled per layout mode, edit that
+  mode's draw pass (`pipeline.rs` for horizontal Normal/rotated; `layout/vertical.rs`
+  for vertical; `formula/render.rs` for formula/on-path + custom raster/vector
+  lines). The trim/effects center-shift seams live in
+  `raster::trim_rendered_image_to_alpha_bounds` and
+  `effects::apply_effects_pipeline`.
 - To change normal horizontal rendering, glyph scaling, kerning, hanging punctuation,
   line spacing, shape comparison, or routing, edit `pipeline.rs`. The normal
   horizontal path is SINGLE-PASS: `horizontal_run_layout` + `get_image` run once per

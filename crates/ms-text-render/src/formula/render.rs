@@ -26,6 +26,13 @@ Custom VECTOR lines drop their FIXED canvas on a non-identity warp (like a globa
 rotation) and grow to the warped bounds. `None`/identity is byte-identical; the
 color-glyph bitmap fallback is not warped.
 
+Extra render info (`TextRenderParams.extra_info`):
+Both `_once` functions build their OWN `ExtraInfoAccumulator` (so the formula retry
+loop rebuilds it fresh each iteration) and feed it the final line-placed, rotated
+glyph box (shared `extra_info::rotated_box_samples`) for both outline and bitmap
+glyphs, warp once via `map_points`, then store `finish`'s centers into the returned
+image before the caller trims/effects. No hanging exclusion. Default = no-op.
+
 Glyph-ink spacing (MinimumPreviousDistance mode):
 - `seed_ink_geometry`/`CachedGlyphInk` derive a glyph's ink contour from its outline
   (`glyph_contour_from_outline`, cached by cosmic-text `CacheKey`) plus a horizontal
@@ -51,6 +58,7 @@ use super::{FormulaEvalInput, FormulaProgramBundle};
 use crate::drawn_lines::{
     DrawnLinePath, build_vector_line_paths, load_raster_line_paths,
 };
+use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::font_registry::InlineFontRegistry;
 use crate::glyph_blit::{
     glyph_outline_transform, glyph_subpixel_offset, nominal_glyph_advance_px,
@@ -542,6 +550,11 @@ fn render_text_with_drawn_lines_layout_once(
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Optional extra-info (mean/median centers). A FRESH accumulator per `_once`
+    // call (this function is re-run from scratch by the retry loop), so the stored
+    // extras always match the accepted image. Inactive by default -> a true no-op.
+    let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
+    let extra_active = extra_acc.is_active();
     // Shared band for the LineBox line-placement reference: the primary font's ascent
     // (baseline..ascender top) at the line size, in the SAME scaled px space as each
     // glyph's `scaled_height` (so it also carries the base vertical stretch). Computed
@@ -733,6 +746,7 @@ fn render_text_with_drawn_lines_layout_once(
                 warnings,
                 content_origin_x: 0,
                 content_origin_y: 0,
+                extra: crate::types::RenderedTextExtraInfo::default(),
             });
         }
         return Ok(RenderedTextImage {
@@ -746,6 +760,7 @@ fn render_text_with_drawn_lines_layout_once(
             warnings,
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
         });
     }
 
@@ -840,10 +855,30 @@ fn render_text_with_drawn_lines_layout_once(
             ascent_scaled,
         );
 
+        // Resolve the outline up front so the extra-info sample knows whether this
+        // glyph draws warped (outline) or as an UNWARPED color-glyph bitmap fallback.
+        let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut outline_cache);
+
+        // Extra-info sample: the final line-placed, rotated glyph box the composite
+        // pass draws. Both kinds contribute, but only the outline sample is warpable;
+        // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
+        if extra_active {
+            let (scaled_w, scaled_h) =
+                seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
+            let (corners, center) = rotated_box_samples(
+                dst_center_x,
+                dst_center_y,
+                scaled_w,
+                scaled_h,
+                transform.rotation_rad,
+            );
+            extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+        }
+
         // Prefer the true font outline: rasterize it directly into the output at
         // the exact world placement the bitmap blit would have used. Color/emoji
         // glyphs have no monochrome outline and keep the bitmap blit below.
-        if let Some(outline) = resolve_glyph_outline(&seed, font_system, &mut outline_cache) {
+        if let Some(outline) = glyph_outline {
             let glyph_transform = glyph_outline_transform(
                 dst_center_x,
                 dst_center_y,
@@ -926,6 +961,14 @@ fn render_text_with_drawn_lines_layout_once(
         }
     }
 
+    // Extra-info centers: warp the raw content-space samples through the same mesh
+    // context the composite pass used, then map to canvas pixels via the pass
+    // offset. Runs BEFORE the caller's trim/effects; both seams self-correct.
+    if let Some(ctx) = warp_ctx.as_ref() {
+        extra_acc.map_points(|point| ctx.warp_world(point));
+    }
+    let extra = extra_acc.finish(x_offset as f32, y_offset as f32);
+
     Ok(RenderedTextImage {
         width: out_width,
         height: out_height,
@@ -933,6 +976,7 @@ fn render_text_with_drawn_lines_layout_once(
         warnings,
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     })
 }
 
@@ -1808,6 +1852,11 @@ fn render_text_with_formula_layout_once(
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Optional extra-info (mean/median centers). A FRESH accumulator per `_once`
+    // call (the retry loop re-runs this function from scratch), so the stored
+    // extras always match the accepted image. Inactive by default -> a true no-op.
+    let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
+    let extra_active = extra_acc.is_active();
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
     let default_extra_line_spacing_px = line_extra_spacing_table.first().copied().unwrap_or(0.0);
@@ -2139,10 +2188,30 @@ fn render_text_with_formula_layout_once(
             line_placement_frac,
         );
 
+        // Resolve the outline up front so the extra-info sample knows whether this
+        // glyph draws warped (outline) or as an UNWARPED color-glyph bitmap fallback.
+        let glyph_outline = resolve_glyph_outline(&seed, font_system, &mut outline_cache);
+
+        // Extra-info sample: the final line-placed, rotated glyph box the composite
+        // pass draws. Both kinds contribute, but only the outline sample is warpable;
+        // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
+        if extra_active {
+            let (scaled_w, scaled_h) =
+                seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
+            let (corners, center) = rotated_box_samples(
+                placed_center_x,
+                placed_center_y,
+                scaled_w,
+                scaled_h,
+                transform.rotation_rad,
+            );
+            extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+        }
+
         // Prefer the true font outline; keep the bitmap blit for outline-less
         // glyphs. The (line-placed) transform center is the glyph bitmap center in
         // world space, so it is the outline destination center directly.
-        if let Some(outline) = resolve_glyph_outline(&seed, font_system, &mut outline_cache) {
+        if let Some(outline) = glyph_outline {
             let glyph_transform = glyph_outline_transform(
                 placed_center_x,
                 placed_center_y,
@@ -2225,6 +2294,14 @@ fn render_text_with_formula_layout_once(
         }
     }
 
+    // Extra-info centers: warp the raw content-space samples through the same mesh
+    // context the composite pass used, then map to canvas pixels via the pass
+    // offset. Runs BEFORE the caller's trim/effects; both seams self-correct.
+    if let Some(ctx) = warp_ctx.as_ref() {
+        extra_acc.map_points(|point| ctx.warp_world(point));
+    }
+    let extra = extra_acc.finish(x_offset as f32, y_offset as f32);
+
     Ok(RenderedTextImage {
         width: out_width,
         height: out_height,
@@ -2232,6 +2309,7 @@ fn render_text_with_formula_layout_once(
         warnings: Vec::new(),
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     })
 }
 

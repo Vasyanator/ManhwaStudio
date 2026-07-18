@@ -21,6 +21,7 @@ Public surface:
 
 pub mod drawn_lines;
 mod effects;
+mod extra_info;
 mod font_provider;
 mod font_registry;
 mod font_system_pool;
@@ -81,6 +82,8 @@ const _: usize = std::mem::size_of::<types::TextRenderParams>()
     + std::mem::size_of::<types::TextVectorPoint>()
     + std::mem::size_of::<types::AntiAliasingMode>()
     + std::mem::size_of::<types::FauxBoldParams>()
+    + std::mem::size_of::<types::RenderExtraInfoRequest>()
+    + std::mem::size_of::<types::RenderedTextExtraInfo>()
     + types::TEXT_FORMULA_USER_VAR_COUNT;
 
 const _: fn(&types::TextRenderParams) -> Result<types::RenderedTextImage, String> =
@@ -210,6 +213,7 @@ pub fn touch_runtime_smoke_contract() {
         line_placement_percent: 0.0,
         line_placement_reference: types::LinePlacementReference::GlyphHeight,
         raster_transform: None,
+        extra_info: types::RenderExtraInfoRequest::default(),
     };
 
     let image = match pipeline::smoke_render_text_to_image(&params) {
@@ -258,8 +262,17 @@ pub fn touch_runtime_smoke_contract() {
         params.anti_aliasing,
         params.global_rotation_deg,
         params.line_placement_percent,
+        params.extra_info,
     ));
     std::hint::black_box((image.width, image.height, &image.rgba, &image.warnings));
+    std::hint::black_box((image.extra.mean_center, image.extra.median_center));
+    std::hint::black_box([
+        types::RenderExtraInfoRequest::default(),
+        types::RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        },
+    ]);
     std::hint::black_box((
         &formula_layout.x_expr,
         &formula_layout.y_expr,
@@ -405,6 +418,7 @@ mod tests {
             line_placement_percent: 0.0,
             line_placement_reference: crate::types::LinePlacementReference::GlyphHeight,
             raster_transform: None,
+            extra_info: crate::types::RenderExtraInfoRequest::default(),
         };
 
         let image = match smoke_render_text_to_image(&params) {

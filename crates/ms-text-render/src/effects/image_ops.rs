@@ -959,6 +959,7 @@ mod tests {
             warnings: Vec::new(),
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
         };
         image.rgba[((4 * 5) + 2) * 4 + 3] = 255;
 
@@ -974,6 +975,7 @@ mod tests {
             warnings: Vec::new(),
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
         };
         image.rgba[(5 + 2) * 4 + 3] = 255;
 

@@ -77,6 +77,13 @@ trimming, and the color-glyph bitmap blit remain in `raster.rs`.
   `global_rotation_rad` + `vertical_layout_centroid` the draw pass rotates about, the
   outline seam passes `Some(&ctx)`, and `for_each_warped_bound_point` grows the canvas.
   `None`/identity stays byte-identical; the color-glyph bitmap fallback does not warp.
+- `TextRenderParams.extra_info` (optional mean/median centers) IS wired on this path:
+  the draw pass feeds one `ExtraInfoAccumulator` a per-glyph placement box (the shared
+  `extra_info::rotated_box_samples`, its center carried through the block rotation)
+  for BOTH cell kinds (outline glyph and color-glyph bitmap fallback), applies the
+  mesh warp once via `map_points`, then `finish(x_offset, y_offset)` stores the
+  centers into the built image. Vertical text never reads `hanging_punctuation`, so
+  no glyph is excluded. The default (no request) is a byte-identical no-op.
 - Glyph bounds, optical profiles, and blank cells must tolerate missing glyph alpha
   data without panics.
 - Coordinate names should stay explicit: column positions, cell tops, glyph origins,

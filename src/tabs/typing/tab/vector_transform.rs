@@ -390,13 +390,23 @@ impl TypingTextOverlayLayer {
             );
             return false;
         };
-        let Some(render_params) = text_render_params_from_render_data(&render_data) else {
+        let Some(mut render_params) = text_render_params_from_render_data(&render_data) else {
             self.set_create_error(
                 ctx,
                 t!("typing.vector_transform.build_params_error"),
             );
             return false;
         };
+        // TEMPORARY debug-only: this re-render lands in the live overlay runtime (via
+        // `apply_edit_overlay_render_result`), so request the renderer's mean/median centers while the
+        // "Отладка центра" flag is on to keep the markers live through Ctrl+wheel rotation / width drag /
+        // vector-transform settle. Remove with the center-debug feature.
+        if self.debug_center_markers {
+            render_params.extra_info = RenderExtraInfoRequest {
+                mean_center: true,
+                median_center: true,
+            };
+        }
         let (file_name, user_scale, rotation_deg) = {
             let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
                 return false;

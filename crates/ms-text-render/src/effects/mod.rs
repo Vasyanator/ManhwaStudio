@@ -45,7 +45,38 @@ use parse::{
 use reflect_shake::{apply_reflect_effect, apply_shake_effect};
 use stroke_shadow::{apply_shadow_effect, apply_stroke_effect};
 
+/// Apply the JSON post-effects pipeline to `image`.
+///
+/// Canvas-growing effects (stroke/shadow/glow/blur/...) advance
+/// `content_origin_x/y`. This wrapper snapshots the origin at entry and, at the
+/// SINGLE exit, shifts the image's extra-info centers by the accumulated origin
+/// delta so they stay fixed relative to the glyphs no matter which effect (or
+/// mid-chain cancellation) ended the pass. Individual effect modules never touch
+/// `extra`.
 pub(crate) fn apply_effects_pipeline(
+    image: &mut RenderedTextImage,
+    effects_json: &str,
+    cancel: Option<(&Arc<AtomicU64>, u64)>,
+) -> Result<(), String> {
+    let origin_before_x = image.content_origin_x;
+    let origin_before_y = image.content_origin_y;
+    let result = apply_effects_pipeline_inner(image, effects_json, cancel);
+    // Shift the extra centers by however far the content origin moved during this
+    // pass (0 for empty effects / immediate cancellation -> a no-op). Origins only
+    // ever GROW, so compute the delta in integer space first: above 2^24 two adjacent
+    // u32 values collapse to the same f32, so subtracting after the cast could drop a
+    // 1px pad. `saturating_sub` yields a non-negative image-dimension delta, far below
+    // f32's 2^24 integer-exact range, so the `as f32` is lossless.
+    let dx = image.content_origin_x.saturating_sub(origin_before_x) as f32;
+    let dy = image.content_origin_y.saturating_sub(origin_before_y) as f32;
+    image.extra.shift(dx, dy);
+    result
+}
+
+/// Run the parsed post-effects in order. Returns early (leaving the origin at its
+/// last value) on empty effects or cooperative cancellation; the wrapper
+/// [`apply_effects_pipeline`] performs the extra-center shift for every exit.
+fn apply_effects_pipeline_inner(
     image: &mut RenderedTextImage,
     effects_json: &str,
     cancel: Option<(&Arc<AtomicU64>, u64)>,

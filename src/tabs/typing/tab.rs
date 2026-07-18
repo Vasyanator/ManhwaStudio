@@ -88,6 +88,7 @@ use super::render_next::{FontContentSet, FontProvider};
 use super::render_next::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, LinePlacementReference, PxOrPercent,
     TEXT_FORMULA_USER_VAR_COUNT,
+    RenderExtraInfoRequest, RenderedTextExtraInfo,
     TextDrawnLinesLayoutParams,
     TextFormulaLayoutParams, TextLayoutMode, TextLineMode, TextRenderParams,
     TextRenderShapeCompareParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -1137,6 +1138,7 @@ impl CanvasHooks for TypingHooks<'_> {
             eyedropper_blocks_focus_clear,
             auto_typing_settings,
             self.top_panel.strict_pixel_movement(),
+            self.top_panel.debug_center_markers(),
         );
         self.page_overlay_occluders.insert(page_idx, occluders);
     }
@@ -1155,6 +1157,10 @@ impl CanvasHooks for TypingHooks<'_> {
         // list so background renders resolve fonts by name (and pick up reloads).
         self.text_overlays
             .set_font_provider(self.top_panel.font_provider());
+        // TEMPORARY debug-only: mirror the panel's "Отладка центра" flag onto the layer so its re-render
+        // dispatch sites request the renderer's mean/median centers. Remove with the center-debug feature.
+        self.text_overlays
+            .set_debug_center_markers(self.top_panel.debug_center_markers());
         self.text_overlays.flush_edit_save_on_selection_change();
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
@@ -1614,6 +1620,9 @@ struct TypingEditOverlayResult {
     size_px: [usize; 2],
     rgba: Vec<u8>,
     warnings: Vec<String>,
+    /// TEMPORARY debug-only: renderer's mean/median centers (final-image px) for the re-rendered text,
+    /// else all-`None`. Applied onto the overlay runtime for the "Отладка центра" markers.
+    extra: RenderedTextExtraInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -1723,6 +1732,9 @@ struct TypingOverlayDecoded {
     size_px: [usize; 2],
     rgba: Vec<u8>,
     warnings: Vec<String>,
+    /// TEMPORARY debug-only: renderer's mean/median centers (final-image px) for this decoded overlay,
+    /// else all-`None`. Carried into the overlay runtime for the "Отладка центра" markers.
+    extra: RenderedTextExtraInfo,
 }
 
 /// A read-only PS-editor raster layer cached for display under the text overlays in the typing tab.
@@ -1773,6 +1785,11 @@ struct TypingOverlayRuntime {
     render_data_json: Option<Value>,
     size_px: [usize; 2],
     source_rgba: Vec<u8>,
+    /// TEMPORARY debug-only: renderer's mean/median centers (final-image px) for the currently rendered
+    /// pixels, else all-`None`. Read by `draw_center_debug_markers` for the "Отладка центра" markers,
+    /// and reset to default whenever `source_rgba`/`size_px` change without matching extras (doc
+    /// reconcile). Remove together with that feature.
+    extra: RenderedTextExtraInfo,
     texture: Option<egui::TextureHandle>,
     display_texture_stale: bool,
     last_texture_used_frame: u64,
@@ -2210,6 +2227,11 @@ pub(super) struct TypingTextOverlayLayer {
     /// no export is pending. The clip-mask snapshot is intentionally NOT stored here — it is captured at
     /// the actual run point (`TypingTabState::run_pending_export_if_ready`), so it reflects final state.
     pending_export_after_preload: Option<PendingTypingExport>,
+    /// TEMPORARY debug-only mirror of the top panel's "Отладка центра" flag, synced each frame from
+    /// `TypingTopPanelState::debug_center_markers` so the layer's re-render dispatch sites (which run on
+    /// `TypingTextOverlayLayer`, without panel access) can request the renderer's mean/median centers and
+    /// draw the center markers. Transient; remove together with the center-debug feature.
+    debug_center_markers: bool,
 }
 
 impl Default for TypingTextOverlayLayer {
@@ -2298,6 +2320,7 @@ impl Default for TypingTextOverlayLayer {
             preload_all_state: None,
             preload_all_progress: (0, 0),
             pending_export_after_preload: None,
+            debug_center_markers: false,
         }
     }
 }

@@ -248,6 +248,9 @@ pub(super) fn text_runtime_from_doc_node(
         render_data_json,
         size_px,
         source_rgba,
+        // A doc-materialized overlay carries no text-center info (the doc image has none by design); it
+        // is recomputed only on a re-render with the "Отладка центра" flag on.
+        extra: RenderedTextExtraInfo::default(),
         texture: None,
         display_texture_stale: true,
         last_texture_used_frame: 0,
@@ -272,6 +275,8 @@ pub(super) fn runtime_from_decoded(entry: TypingOverlayDecoded) -> TypingOverlay
         render_data_json: entry.render_data_json,
         size_px: entry.size_px,
         source_rgba: entry.rgba,
+        // TEMPORARY debug-only: carry the decoded overlay's mean/median centers for the center markers.
+        extra: entry.extra,
         texture: None,
         display_texture_stale: true,
         last_texture_used_frame: 0,

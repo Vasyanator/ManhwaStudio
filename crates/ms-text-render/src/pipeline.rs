@@ -46,6 +46,7 @@ Notes:
 use ms_log::trace::cat;
 
 use super::effects::{apply_effects_pipeline, apply_text_preprocess_effects};
+use super::extra_info::ExtraInfoAccumulator;
 use super::font_provider::FontProvider;
 use super::font_registry::{build_inline_font_registry, load_font_content};
 use super::font_system_pool::with_leased_font_system;
@@ -79,8 +80,8 @@ use super::vector::{
     faux_key_bits, glyph_contour_from_outline, rasterize_outline_into,
 };
 use super::types::{
-    FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
-    TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
+    FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextExtraInfo, RenderedTextImage,
+    TextLayoutMode, TextLineMode, TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
 };
 use super::wrap::{
     HyphenationDictionaries, LayoutTextResult, ShapeWrapRequest, VerticalWrapRequest,
@@ -331,6 +332,8 @@ pub fn apply_effects_to_image(
         warnings: Vec::new(),
         content_origin_x: 0,
         content_origin_y: 0,
+        // Arbitrary-image effects reuse has no glyph layout to sample from.
+        extra: RenderedTextExtraInfo::default(),
     };
 
     if !effects_json.trim().is_empty() {
@@ -502,6 +505,7 @@ pub fn render_text_to_image(
                     warnings,
                     content_origin_x: 0,
                     content_origin_y: 0,
+                    extra: RenderedTextExtraInfo::default(),
                 });
             }
         }
@@ -734,6 +738,13 @@ pub fn render_text_to_image(
     // Reused per-glyph rasterizer buffers for the draw pass (see `RasterScratch`).
     let mut raster_scratch = RasterScratch::new();
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Optional extra-info (mean/median centers). Inactive by default -> every
+    // `add_glyph`/`map_points`/`finish` call is a no-op with no per-glyph cost.
+    // Samples are collected in raw content space here; the optional mesh warp is
+    // applied once below (after the warp context is built), and the content->canvas
+    // offset is applied in `finish`.
+    let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
+    let extra_active = extra_acc.is_active();
     let mut placements: Vec<HorizontalGlyphPlacement> = Vec::new();
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
@@ -741,6 +752,13 @@ pub fn render_text_to_image(
         if is_cancelled(cancel) {
             return Err("render_next render cancelled".to_string());
         }
+        // Leading/trailing hanging-punctuation runs are excluded from the extra-info
+        // sampling only when hanging punctuation is enabled (see the contract).
+        let hanging_bounds = if extra_active && params.hanging_punctuation {
+            hanging_edge_run_bounds(&run)
+        } else {
+            (0, run.glyphs.len())
+        };
         let run_layout = horizontal_run_layout(
             params,
             &run,
@@ -771,7 +789,12 @@ pub fn render_text_to_image(
             };
         let baseline_y = line_baselines.get(line_idx).copied().unwrap_or(run.line_y);
 
-        for (glyph, glyph_x) in run.glyphs.iter().zip(run_layout.glyph_xs.iter().copied()) {
+        for (glyph_idx, (glyph, glyph_x)) in run
+            .glyphs
+            .iter()
+            .zip(run_layout.glyph_xs.iter().copied())
+            .enumerate()
+        {
             let glyph_text_color = inline_text_color_for_glyph(
                 params.text_color,
                 mapped_inline_style_spans.as_deref(),
@@ -810,6 +833,15 @@ pub fn render_text_to_image(
                 glyph_text_color,
                 glyph_faux,
             ) {
+                // Feed the extra-info sampler from the SAME placement box the draw
+                // pass uses; skip glyphs in the line's hanging-punctuation edge runs.
+                // The sample is warpable only when the glyph draws from its outline;
+                // a color-glyph bitmap fallback (no outline) draws unwarped pixels,
+                // so its sample must stay unwarped too.
+                if extra_active && !is_edge_run_hanging(hanging_bounds, glyph_idx) {
+                    let (corners, center) = horizontal_placement_extra_samples(&placement);
+                    extra_acc.add_glyph(corners, center, placement.outline.is_some());
+                }
                 placements.push(placement);
             }
         }
@@ -881,6 +913,13 @@ pub fn render_text_to_image(
                 hyphen_text_color,
                 hyphen_faux,
             ) {
+                // The wrapped soft hyphen is real ink and never hangs, so it always
+                // contributes to the extra-info samples when active. Warpable only
+                // when it draws from its outline (bitmap fallback stays unwarped).
+                if extra_active {
+                    let (corners, center) = horizontal_placement_extra_samples(&placement);
+                    extra_acc.add_glyph(corners, center, placement.outline.is_some());
+                }
                 placements.push(placement);
             }
         }
@@ -974,6 +1013,14 @@ pub fn render_text_to_image(
         );
     }
 
+    // Extra-info centers: warp the raw content-space samples through the same mesh
+    // context the draw pass used, then map to canvas pixels with the same offset.
+    // This runs BEFORE effects/trim; those stages self-correct the centers.
+    if let Some(ctx) = warp_ctx.as_ref() {
+        extra_acc.map_points(|point| ctx.warp_world(point));
+    }
+    let extra = extra_acc.finish(x_offset as f32, y_offset as f32);
+
     let mut rendered = RenderedTextImage {
         width: out_width,
         height: out_height,
@@ -981,6 +1028,7 @@ pub fn render_text_to_image(
         warnings,
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     };
     apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
     rendered = trim_rendered_image_to_alpha_bounds(rendered, 1);
@@ -1234,6 +1282,10 @@ struct RotatedGlyphPlacement {
     rotation_rad: f32,
     group_key: Option<(usize, usize)>,
     group_rotation_rad: f32,
+    /// `true` when this glyph is in its line's leading/trailing hanging-punctuation
+    /// run and must be excluded from the extra-info sampling (set by the collection
+    /// loop; defaults to `false`, e.g. for the wrapped hyphen).
+    hanging_excluded: bool,
 }
 
 impl RotatedGlyphPlacement {
@@ -1315,6 +1367,8 @@ fn build_rotated_placement(
         rotation_rad: glyph_rotation_rad,
         group_key,
         group_rotation_rad,
+        // Set by the collection loop when hanging punctuation is enabled.
+        hanging_excluded: false,
     })
 }
 
@@ -1404,6 +1458,10 @@ fn render_horizontal_rotated(
     let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Optional extra-info sampler; per-glyph exclusion of hanging punctuation is
+    // recorded on each placement and read after the global rotation is baked in.
+    let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
+    let extra_active = extra_acc.is_active();
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
     let inline_line_aligns =
         compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
@@ -1414,6 +1472,11 @@ fn render_horizontal_rotated(
         if is_cancelled(cancel) {
             return Err("render_next render cancelled".to_string());
         }
+        let hanging_bounds = if extra_active && params.hanging_punctuation {
+            hanging_edge_run_bounds(&run)
+        } else {
+            (0, run.glyphs.len())
+        };
         let run_layout = horizontal_run_layout(
             params,
             &run,
@@ -1444,7 +1507,12 @@ fn render_horizontal_rotated(
             };
         let baseline_y = line_baselines.get(line_idx).copied().unwrap_or(run.line_y);
 
-        for (glyph, glyph_x) in run.glyphs.iter().zip(run_layout.glyph_xs.iter().copied()) {
+        for (glyph_idx, (glyph, glyph_x)) in run
+            .glyphs
+            .iter()
+            .zip(run_layout.glyph_xs.iter().copied())
+            .enumerate()
+        {
             let glyph_text_color = inline_text_color_for_glyph(
                 params.text_color,
                 inline_style_spans,
@@ -1482,7 +1550,7 @@ fn render_horizontal_rotated(
             } else {
                 None
             };
-            if let Some(placement) = build_rotated_placement(
+            if let Some(mut placement) = build_rotated_placement(
                 font_system,
                 &mut cache,
                 &mut outline_cache,
@@ -1496,6 +1564,7 @@ fn render_horizontal_rotated(
                 group_key,
                 offset.group_rotation_rad,
             ) {
+                placement.hanging_excluded = is_edge_run_hanging(hanging_bounds, glyph_idx);
                 placements.push(placement);
             }
         }
@@ -1661,6 +1730,25 @@ fn render_horizontal_rotated(
     let x_offset = -bounds.min_x + pad;
     let y_offset = -bounds.min_y + pad;
 
+    // Extra-info centers: the placement centers/rotations are final (post global
+    // rotation), so the sample boxes match the draw pass. Warp through the same
+    // context (peel/reapply is baked in) and map to canvas pixels via the offset.
+    if extra_active {
+        for placement in &placements {
+            if placement.hanging_excluded {
+                continue;
+            }
+            let (corners, center) = rotated_placement_extra_samples(placement);
+            // Warpable only for outline glyphs; a color-glyph bitmap fallback draws
+            // unwarped pixels, so its sample must not be warped either.
+            extra_acc.add_glyph(corners, center, placement.outline.is_some());
+        }
+        if let Some(ctx) = warp_ctx.as_ref() {
+            extra_acc.map_points(|point| ctx.warp_world(point));
+        }
+    }
+    let extra = extra_acc.finish(x_offset as f32, y_offset as f32);
+
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
     for placement in &placements {
         if is_cancelled(cancel) {
@@ -1730,6 +1818,7 @@ fn render_horizontal_rotated(
         warnings: Vec::new(),
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     })
 }
 
@@ -2988,14 +3077,101 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
     !slice.is_empty() && slice.chars().all(is_hanging_punctuation)
 }
 
+/// Index bounds of a layout run's non-hanging glyphs: returns `(leading_end,
+/// trailing_start)` such that glyphs at index `< leading_end` or `>=
+/// trailing_start` belong to the line's LEADING/TRAILING hanging-punctuation
+/// runs and must be excluded from the extra-info sampling (same edge-run
+/// semantics as [`hanging_metrics_for_layout`]). A run that is entirely hanging
+/// punctuation (or empty) excludes nothing and returns `(0, len)`.
+fn hanging_edge_run_bounds(run: &LayoutRun<'_>) -> (usize, usize) {
+    let len = run.glyphs.len();
+    let Some(first_non) = run
+        .glyphs
+        .iter()
+        .position(|glyph| !glyph_is_hanging_punctuation(run.text, glyph))
+    else {
+        return (0, len);
+    };
+    let last_non = run
+        .glyphs
+        .iter()
+        .rposition(|glyph| !glyph_is_hanging_punctuation(run.text, glyph))
+        .unwrap_or(first_non);
+    (first_non, last_non + 1)
+}
+
+/// `true` when the glyph at `index` is in the leading/trailing hanging run given
+/// `(leading_end, trailing_start)` from [`hanging_edge_run_bounds`].
+#[must_use]
+fn is_edge_run_hanging(bounds: (usize, usize), index: usize) -> bool {
+    index < bounds.0 || index >= bounds.1
+}
+
+/// Content-space placement-box `(corners, center)` of a normal (unrotated)
+/// horizontal glyph, matching the scaled draw box (per-glyph width/height scale,
+/// no rotation). Corners are counter-clockwise starting at the top-left.
+#[must_use]
+fn horizontal_placement_extra_samples(
+    placement: &HorizontalGlyphPlacement,
+) -> ([[f32; 2]; 4], [f32; 2]) {
+    let (left, top, width, height) = placement.scale.scaled_rect(
+        placement.src_left_i as f32,
+        placement.src_top_i as f32,
+        placement.glyph_w as f32,
+        placement.glyph_h as f32,
+    );
+    let corners = [
+        [left, top],
+        [left + width, top],
+        [left + width, top + height],
+        [left, top + height],
+    ];
+    let center = [left + width * 0.5, top + height * 0.5];
+    (corners, center)
+}
+
+/// Content-space placement-box `(corners, center)` of a rotated horizontal glyph
+/// AFTER all rotations are baked into `center_x/center_y`/`rotation_rad`. The
+/// scaled box half-extents are rotated about the final center with the shared
+/// screen (y-down) `[cos -sin; sin cos]` convention (same as
+/// `rotated_rect_world_bounds`).
+#[must_use]
+fn rotated_placement_extra_samples(
+    placement: &RotatedGlyphPlacement,
+) -> ([[f32; 2]; 4], [f32; 2]) {
+    let (_, _, width, height) = placement.scale.scaled_rect(
+        placement.src_left,
+        placement.src_top,
+        placement.glyph_w as f32,
+        placement.glyph_h as f32,
+    );
+    let center = [placement.center_x, placement.center_y];
+    let (sin_a, cos_a) = placement.rotation_rad.sin_cos();
+    let half_w = width * 0.5;
+    let half_h = height * 0.5;
+    let local = [
+        [-half_w, -half_h],
+        [half_w, -half_h],
+        [half_w, half_h],
+        [-half_w, half_h],
+    ];
+    let corners = local.map(|[lx, ly]| {
+        [
+            center[0] + lx * cos_a - ly * sin_a,
+            center[1] + lx * sin_a + ly * cos_a,
+        ]
+    });
+    (corners, center)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_effects_to_image, base_attrs_real_bold_italic};
     use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
-        AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextImage,
-        TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
-        TextRenderParams, TextRenderShapeCompareParams, TextShape, TextVectorLine,
+        AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, RenderExtraInfoRequest,
+        RenderedTextImage, TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode,
+        TextLineMode, TextRenderParams, TextRenderShapeCompareParams, TextShape, TextVectorLine,
         TextVectorLineDistanceMode, TextVectorLineTextDirection, TextVectorLinesLayoutParams,
         TextVectorPoint, TextWrapMode, VectorMeshWarp, VerticalLineDirection,
     };
@@ -3079,6 +3255,7 @@ mod tests {
             line_placement_percent: 0.0,
             line_placement_reference: crate::types::LinePlacementReference::GlyphHeight,
             raster_transform: None,
+            extra_info: crate::types::RenderExtraInfoRequest::default(),
         }
     }
 
@@ -4692,5 +4869,266 @@ mod tests {
             (result.width * result.height * 4) as usize,
             "RGBA buffer must stay width*height*4 after effects"
         );
+    }
+
+    /// Alpha bounding box `(min_x, min_y, max_x, max_y)` in pixels, or `None` when
+    /// the image is fully transparent.
+    fn alpha_bbox(image: &RenderedTextImage) -> Option<(f32, f32, f32, f32)> {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (width, height, 0usize, 0usize);
+        let mut found = false;
+        for y in 0..height {
+            for x in 0..width {
+                if image.rgba[(y * width + x) * 4 + 3] == 0 {
+                    continue;
+                }
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+        found.then_some((min_x as f32, min_y as f32, max_x as f32, max_y as f32))
+    }
+
+    #[test]
+    fn extra_info_mean_and_median_land_near_symmetric_line_center() {
+        // A short symmetric single line: both centers must be Some, sit inside the
+        // image, and land near the inked alpha box center (loose tolerance).
+        let mut params = base_params();
+        params.text = "HH".to_string();
+        params.align = HorizontalAlign::LEFT;
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render_text_to_image(&params, None).expect("render should succeed");
+        let mean = image.extra.mean_center.expect("mean center requested");
+        let median = image.extra.median_center.expect("median center requested");
+
+        for center in [mean, median] {
+            assert!(
+                center[0] >= 0.0 && center[0] <= image.width as f32,
+                "center x {center:?} must lie within the image width {}",
+                image.width
+            );
+            assert!(
+                center[1] >= 0.0 && center[1] <= image.height as f32,
+                "center y {center:?} must lie within the image height {}",
+                image.height
+            );
+        }
+
+        let (min_x, min_y, max_x, max_y) = alpha_bbox(&image).expect("inked content");
+        let box_cx = (min_x + max_x) * 0.5;
+        let box_cy = (min_y + max_y) * 0.5;
+        let tol = params.font_size_px; // loose: within one em of the ink center
+        for center in [mean, median] {
+            assert!(
+                (center[0] - box_cx).abs() <= tol,
+                "center x {center:?} should be near the ink center x {box_cx} (tol {tol})"
+            );
+            assert!(
+                (center[1] - box_cy).abs() <= tol,
+                "center y {center:?} should be near the ink center y {box_cy} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_info_default_request_yields_default_extra() {
+        // No request -> byte-identical fast path and a default (all-None) payload.
+        let params = base_params();
+        assert!(!params.extra_info.is_active());
+        let image = render_text_to_image(&params, None).expect("render should succeed");
+        assert_eq!(image.extra, crate::types::RenderedTextExtraInfo::default());
+    }
+
+    #[test]
+    fn extra_info_tracks_glyphs_through_canvas_growing_effect() {
+        // A stroke grows the canvas symmetrically around the glyph, then trim crops
+        // back. The effects+trim seams must shift the extra centers so they keep
+        // pointing at the glyph: the mean center stays near the (symmetric) alpha
+        // box center. Without the shift it would be stale by ~the stroke pad.
+        let mut plain = base_params();
+        plain.text = "O".to_string();
+        plain.align = HorizontalAlign::LEFT;
+        plain.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: false,
+        };
+        let plain_image = render_text_to_image(&plain, None).expect("plain render");
+        let plain_mean = plain_image.extra.mean_center.expect("mean requested");
+        let (pmin_x, pmin_y, pmax_x, pmax_y) = alpha_bbox(&plain_image).expect("plain ink");
+        let plain_off = [
+            plain_mean[0] - (pmin_x + pmax_x) * 0.5,
+            plain_mean[1] - (pmin_y + pmax_y) * 0.5,
+        ];
+
+        let mut stroked = plain.clone();
+        stroked.effects_json = r#"[{"effect":"stroke","width_px":8,"color":[0,0,0,255]}]"#.to_string();
+        let stroked_image = render_text_to_image(&stroked, None).expect("stroked render");
+        let stroked_mean = stroked_image.extra.mean_center.expect("mean requested");
+        let (smin_x, smin_y, smax_x, smax_y) = alpha_bbox(&stroked_image).expect("stroked ink");
+        let stroked_off = [
+            stroked_mean[0] - (smin_x + smax_x) * 0.5,
+            stroked_mean[1] - (smin_y + smax_y) * 0.5,
+        ];
+
+        // The stroke is symmetric, so the glyph center relative to the alpha box
+        // center is stable across both renders (a stale, unshifted center would be
+        // off by roughly the 8px stroke pad).
+        assert!(
+            (plain_off[0] - stroked_off[0]).abs() <= 2.0,
+            "mean-center offset drifted in x: plain {plain_off:?} vs stroked {stroked_off:?}"
+        );
+        assert!(
+            (plain_off[1] - stroked_off[1]).abs() <= 2.0,
+            "mean-center offset drifted in y: plain {plain_off:?} vs stroked {stroked_off:?}"
+        );
+    }
+
+    #[test]
+    fn extra_info_excludes_trailing_hanging_punctuation_when_enabled() {
+        // Left-aligned text with a trailing '.' draws identically whether hanging
+        // punctuation is on or off (only leading hang shifts layout), so the only
+        // difference is the extra-info sampling: with hanging on, the trailing '.'
+        // contributes nothing and both centers move LEFT.
+        let mut off = base_params();
+        off.text = "Hi.".to_string();
+        off.align = HorizontalAlign::LEFT;
+        off.hanging_punctuation = false;
+        off.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let mut on = off.clone();
+        on.hanging_punctuation = true;
+
+        let off_image = render_text_to_image(&off, None).expect("hanging-off render");
+        let on_image = render_text_to_image(&on, None).expect("hanging-on render");
+
+        let off_mean = off_image.extra.mean_center.expect("mean off");
+        let on_mean = on_image.extra.mean_center.expect("mean on");
+        assert!(
+            on_mean[0] < off_mean[0] - 0.5,
+            "excluding the trailing '.' must move the mean center left: on {on_mean:?} vs off {off_mean:?}"
+        );
+
+        let off_median = off_image.extra.median_center.expect("median off");
+        let on_median = on_image.extra.median_center.expect("median on");
+        assert_ne!(
+            on_median, off_median,
+            "excluding the trailing '.' must change the median center"
+        );
+    }
+
+    /// Assert both requested centers are present and land inside the image plane.
+    fn assert_centers_in_bounds(image: &RenderedTextImage) {
+        let mean = image.extra.mean_center.expect("mean center requested");
+        let median = image.extra.median_center.expect("median center requested");
+        for center in [mean, median] {
+            assert!(
+                center[0] >= 0.0 && center[0] <= image.width as f32,
+                "center x {center:?} must lie within width {}",
+                image.width
+            );
+            assert!(
+                center[1] >= 0.0 && center[1] <= image.height as f32,
+                "center y {center:?} must lie within height {}",
+                image.height
+            );
+        }
+    }
+
+    #[test]
+    fn extra_info_populated_on_formula_path() {
+        // Formula mode routes through `formula::render` (retry loop). The extras
+        // must be populated (both centers Some) and land inside the rendered image.
+        let mut params = base_params();
+        params.text = "FORMULA".to_string();
+        params.width_px = 320;
+        params.text_layout_mode = TextLayoutMode::Formula;
+        params.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * w".to_string(),
+            y_expr: "sin(t * tau) * 20".to_string(),
+            rotation_expr: "0".to_string(),
+            use_tangent_rotation: false,
+            offset_y_px: 40.0,
+            ..TextFormulaLayoutParams::default()
+        };
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render_text_to_image(&params, None).expect("formula render");
+        assert_centers_in_bounds(&image);
+
+        // No request -> default (all-None) payload on the same path.
+        let mut plain = params.clone();
+        plain.extra_info = RenderExtraInfoRequest::default();
+        let plain_image = render_text_to_image(&plain, None).expect("formula plain render");
+        assert_eq!(
+            plain_image.extra,
+            crate::types::RenderedTextExtraInfo::default()
+        );
+    }
+
+    #[test]
+    fn extra_info_populated_on_vector_lines_path() {
+        // Custom vector lines route through `formula::render`'s drawn-lines path
+        // (fixed canvas). Extras must be populated and inside the fixed canvas.
+        let mut params = base_params();
+        params.text = "VECTOR".to_string();
+        params.width_px = 260;
+        params.text_layout_mode = TextLayoutMode::CustomVectorLines;
+        params.vector_lines_layout = TextVectorLinesLayoutParams {
+            width_px: 260,
+            height_px: 80,
+            lines: vec![TextVectorLine {
+                points: vec![
+                    TextVectorPoint { x: 8.0, y: 40.0 },
+                    TextVectorPoint { x: 120.0, y: 40.0 },
+                    TextVectorPoint { x: 240.0, y: 40.0 },
+                ],
+                corner_smoothing_px: 16.0,
+                text_direction: TextVectorLineTextDirection::LeftToRight,
+                distance_mode: TextVectorLineDistanceMode::ByLineLength,
+                flip_text: false,
+            }],
+            ..TextVectorLinesLayoutParams::default()
+        };
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render_text_to_image(&params, None).expect("vector-lines render");
+        assert_centers_in_bounds(&image);
+    }
+
+    #[test]
+    fn extra_info_centers_stay_in_bounds_under_formula_rotation() {
+        // A 90° global rotation grows the formula canvas to the rotated bounds; the
+        // extras, sampled post-rotation, must still lie inside the rotated image.
+        let mut params = base_params();
+        params.text = "FORMULA".to_string();
+        params.width_px = 320;
+        params.text_layout_mode = TextLayoutMode::Formula;
+        params.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * w".to_string(),
+            y_expr: "0".to_string(),
+            rotation_expr: "0".to_string(),
+            use_tangent_rotation: false,
+            ..TextFormulaLayoutParams::default()
+        };
+        params.global_rotation_deg = 90.0;
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render_text_to_image(&params, None).expect("formula rotated render");
+        assert_centers_in_bounds(&image);
     }
 }

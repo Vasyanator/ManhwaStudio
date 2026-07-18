@@ -577,6 +577,9 @@ impl TypingTextOverlayLayer {
             render_data_json: decoded.render_data_json,
             size_px: decoded.size_px,
             source_rgba: decoded.rgba,
+            // TEMPORARY debug-only: carry the freshly-created overlay's mean/median centers for the
+            // "Отладка центра" markers (all-`None` unless the flag requested them).
+            extra: decoded.extra,
             texture: None,
             display_texture_stale: true,
             last_texture_used_frame: 0,

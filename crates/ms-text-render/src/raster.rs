@@ -559,6 +559,14 @@ pub(crate) fn trim_rendered_image_to_alpha_bounds(
         rgba[dst_start..dst_end].copy_from_slice(&image.rgba[src_start..src_end]);
     }
 
+    // Preserve the extra-info centers, shifted by the actual crop origin so they
+    // stay fixed relative to the glyphs (the new top-left is `(crop_min_x,
+    // crop_min_y)`). `content_origin_x/y` keep their historical reset to 0.
+    let mut extra = image.extra;
+    // Crop origins are image-pixel coordinates, far below f32's 2^24 integer-exact
+    // range, so the usize->f32 conversion is lossless here.
+    extra.shift(-(crop_min_x as f32), -(crop_min_y as f32));
+
     RenderedTextImage {
         width: crop_width as u32,
         height: crop_height as u32,
@@ -566,6 +574,7 @@ pub(crate) fn trim_rendered_image_to_alpha_bounds(
         warnings: image.warnings,
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     }
 }
 
@@ -690,6 +699,7 @@ mod tests {
         let image = RenderedTextImage {
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
             width: 4,
             height: 3,
             rgba: vec![

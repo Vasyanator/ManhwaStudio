@@ -1031,6 +1031,7 @@ fn decoded_text_overlay(uid: &str, page_idx: usize, center: [f32; 2]) -> TypingO
         size_px: [2, 2],
         rgba: vec![0u8; 2 * 2 * 4],
         warnings: Vec::new(),
+        extra: RenderedTextExtraInfo::default(),
     }
 }
 
@@ -1254,6 +1255,7 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         line_placement_percent: 0.0,
         line_placement_reference: LinePlacementReference::GlyphHeight,
         raster_transform: None,
+        extra_info: crate::tabs::typing::render_next::types::RenderExtraInfoRequest::default(),
     }
 }
 

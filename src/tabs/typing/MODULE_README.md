@@ -655,6 +655,18 @@ saving, and export.
   and (2) the PSD export LAYER NAMES in `psd_export.rs` (§A5 — written verbatim into the
   exported `.psd`, so the export format must not depend on the interface language). Each
   such site carries a justifying comment. Do not route them through the catalog.
+- TEMPORARY DEBUG ELEMENT — "Отладка центра" (center-debug markers). The «Действия» panel arm
+  (`panel/facade.rs`) hosts a non-localized `ui.checkbox` ("Отладка центра") on a transient
+  `TypingTopPanelState::debug_center_markers` flag (mirrored onto `TypingTextOverlayLayer` each frame).
+  When on, the production text renders request the renderer's mean/median centers
+  (`RenderExtraInfoRequest`) at the dispatch sites that land in the live overlay runtime (create, edit,
+  vector re-render / Ctrl+wheel / width drag, layout-editor re-render, shape-variant apply), the result
+  is plumbed through `TypingOverlayDecoded`/`TypingEditOverlayResult`/`TypingOverlayRuntime.extra`, and
+  `draw_page.rs::draw_center_debug_markers` paints plain/mean/median markers over the selected text layer.
+  REASON: to visually debug the new renderer center-info feature. SCOPE: debug-only; the label is
+  intentionally NOT localized. REMOVAL: delete the checkbox, the `debug_center_markers` flag/accessor/
+  mirror, the `extra` plumbing gate, and `draw_center_debug_markers` together when the consuming feature
+  ships.
 - Widget-id-deriving calls that show a localized label (`WheelComboBox::from_label`,
   `CollapsingHeader::new`, `egui::Window::new`) must seed a stable, language-independent
   id (`.id_salt("typing.…")` / `egui::Id::new`). `egui::ComboBox` has no `id_salt()`

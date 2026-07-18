@@ -65,6 +65,18 @@ the line paths.
   the warped bounds so nothing clips; its normalization box is the fixed canvas dims
   when honored, else the content bounds. `None`/identity is byte-identical; the
   color-glyph bitmap fallback does not warp.
+- `TextRenderParams.extra_info` (optional mean/median centers) IS wired on BOTH
+  render functions (all four modes: Formula, Shape, CustomRasterLines,
+  CustomVectorLines). Each `_once` body builds its OWN `ExtraInfoAccumulator`, so the
+  formula retry loop (`render_margin_pad` growth) naturally rebuilds a FRESH
+  accumulator per iteration and the stored extras match the accepted image. The
+  composite pass feeds it the final line-placed, rotated glyph box (the shared
+  `extra_info::rotated_box_samples` at `dst_center`/`placed_center` with the
+  transform's total `rotation_rad`) for BOTH the outline and bitmap-fallback glyphs,
+  applies the mesh warp once via `map_points`, then `finish(x_offset, y_offset)`
+  stores the centers into the returned image BEFORE the caller's trim/effects (both
+  self-correct the centers). These paths never read `hanging_punctuation`. The
+  default (no request) is a byte-identical no-op.
 - The on-path glyph transform has a single source of truth (`drawn_line_transform_at` +
   `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the ink-distance
   search, and `placed_contour_for_transform` all build the outline->world placement with

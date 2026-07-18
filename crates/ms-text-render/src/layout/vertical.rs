@@ -42,6 +42,12 @@ normalizes over it and peels/reapplies the SAME `global_rotation_rad` +
 `vertical_layout_centroid` the draw uses, so the warp is exact. `None`/identity is
 byte-identical; the color-glyph bitmap fallback is not warped.
 
+Extra render info (`TextRenderParams.extra_info`):
+The draw pass feeds one `ExtraInfoAccumulator` a per-glyph placement box (shared
+`extra_info::rotated_box_samples`, center carried through the block rotation) for
+both cell kinds, warps it once via `map_points`, and stores `finish`'s centers into
+the built image. No hanging-punctuation exclusion here. Default request = no-op.
+
 Source:
 - `render_vertical_text`
 - `collect_vertical_render_columns`
@@ -51,6 +57,7 @@ Source:
 частично из старого `src/tabs/typing/render.rs`
 */
 
+use crate::extra_info::{ExtraInfoAccumulator, rotated_box_samples};
 use crate::glyph_blit::{
     glyph_outline_transform, glyph_subpixel_offset, hash_font_id, resolve_outline_for_glyph,
 };
@@ -366,6 +373,13 @@ pub(crate) fn render_vertical_text(
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
+    // Optional extra-info (mean/median centers). Inactive by default -> every
+    // `add_glyph`/`map_points`/`finish` call is a no-op with no per-glyph cost.
+    // Samples are collected in raw content space (post block rotation) here; the
+    // optional mesh warp is applied once below and the content->canvas offset in
+    // `finish`. Vertical text never reads `hanging_punctuation`, so no exclusion.
+    let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
+    let extra_active = extra_acc.is_active();
 
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
@@ -424,13 +438,35 @@ pub(crate) fn render_vertical_text(
                 rot_cos,
             );
 
+            // Resolve the outline up front so the extra-info sample knows whether
+            // this cell draws warped (outline) or as an UNWARPED color-glyph bitmap
+            // fallback, matching the draw branch below.
+            let glyph_outline =
+                resolve_outline_for_glyph(font_system, &mut outline_cache, glyph, faux.bold);
+
+            // Extra-info sample: the SAME scaled placement box the draw pass
+            // rasterizes, its center carried through the block rotation. BOTH cell
+            // kinds contribute, but only the outline sample is warpable: the
+            // bitmap-fallback box is drawn unwarped, so `map_points` must leave its
+            // sample in place to match the unwarped pixels.
+            if extra_active {
+                let (scaled_w, scaled_h) =
+                    glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
+                let (corners, center) = rotated_box_samples(
+                    dst_center_x,
+                    dst_center_y,
+                    scaled_w,
+                    scaled_h,
+                    global_rotation_rad,
+                );
+                extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+            }
+
             // Prefer the true font outline: rasterize it at the exact world placement
             // the bitmap blit used (scale about the bitmap center). Vertical cells are
             // upright; the only rotation is the global block rotation. The canvas
             // offset is folded into the rasterizer origin as the horizontal path does.
-            if let Some(outline) =
-                resolve_outline_for_glyph(font_system, &mut outline_cache, glyph, faux.bold)
-            {
+            if let Some(outline) = glyph_outline {
                 // Re-add the subpixel fraction baked into the bitmap coverage so the
                 // outline lands on the same pixels (physical.x/y are integer-only).
                 let transform = glyph_outline_transform(
@@ -542,6 +578,14 @@ pub(crate) fn render_vertical_text(
         }
     }
 
+    // Extra-info centers: warp the raw content-space samples through the same mesh
+    // context the draw pass used, then map to canvas pixels with the pass offset.
+    // Runs BEFORE effects; the effects seam self-corrects the centers.
+    if let Some(ctx) = warp_ctx.as_ref() {
+        extra_acc.map_points(|point| ctx.warp_world(point));
+    }
+    let extra = extra_acc.finish(x_offset as f32, y_offset as f32);
+
     Ok(RenderedTextImage {
         width: out_width,
         height: out_height,
@@ -549,6 +593,7 @@ pub(crate) fn render_vertical_text(
         warnings: Vec::new(),
         content_origin_x: 0,
         content_origin_y: 0,
+        extra,
     })
 }
 
@@ -1337,6 +1382,7 @@ mod tests {
             line_placement_percent: 0.0,
             line_placement_reference: crate::types::LinePlacementReference::GlyphHeight,
             raster_transform: None,
+            extra_info: crate::types::RenderExtraInfoRequest::default(),
         }
     }
 
@@ -1426,6 +1472,104 @@ mod tests {
         assert_eq!(metric.width, optical.width);
         assert_eq!(metric.height, optical.height);
         assert_eq!(metric.rgba, optical.rgba);
+    }
+
+    /// Alpha bounding box `(min_x, min_y, max_x, max_y)` of the inked pixels, or
+    /// `None` when the image is fully transparent.
+    fn alpha_bbox(image: &RenderedTextImage) -> Option<(f32, f32, f32, f32)> {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        let mut found = false;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                let idx = ((y * image.width + x) * 4 + 3) as usize;
+                if image.rgba.get(idx).copied().unwrap_or(0) > 0 {
+                    found = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        found.then_some((min_x as f32, min_y as f32, max_x as f32, max_y as f32))
+    }
+
+    #[test]
+    fn extra_info_default_request_yields_default_extra() {
+        // No request -> byte-identical fast path and a default (all-None) payload.
+        let params = vertical_params("ГРОМ");
+        assert!(!params.extra_info.is_active());
+        let image = render(&params);
+        assert_eq!(image.extra, crate::types::RenderedTextExtraInfo::default());
+    }
+
+    #[test]
+    fn extra_info_centers_land_near_vertical_column_center() {
+        // A short symmetric vertical column: both centers must be Some, sit inside
+        // the image, and land near the inked alpha box center (loose tolerance).
+        let mut params = vertical_params("ОО");
+        params.extra_info = crate::types::RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render(&params);
+        let mean = image.extra.mean_center.expect("mean center requested");
+        let median = image.extra.median_center.expect("median center requested");
+
+        for center in [mean, median] {
+            assert!(
+                center[0] >= 0.0 && center[0] <= image.width as f32,
+                "center x {center:?} must lie within the image width {}",
+                image.width
+            );
+            assert!(
+                center[1] >= 0.0 && center[1] <= image.height as f32,
+                "center y {center:?} must lie within the image height {}",
+                image.height
+            );
+        }
+
+        let (min_x, min_y, max_x, max_y) = alpha_bbox(&image).expect("inked content");
+        let box_cx = (min_x + max_x) * 0.5;
+        let box_cy = (min_y + max_y) * 0.5;
+        let tol = params.font_size_px; // loose: within one em of the ink center
+        for center in [mean, median] {
+            assert!(
+                (center[0] - box_cx).abs() <= tol,
+                "center x {center:?} should be near the ink center x {box_cx} (tol {tol})"
+            );
+            assert!(
+                (center[1] - box_cy).abs() <= tol,
+                "center y {center:?} should be near the ink center y {box_cy} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_info_centers_stay_in_bounds_under_global_rotation() {
+        // A rotated vertical block still grows the canvas to its rotated bounds; the
+        // extra centers, sampled post-rotation, must remain inside the rotated image.
+        let mut params = vertical_params("ГРОМ");
+        params.global_rotation_deg = 37.0;
+        params.extra_info = crate::types::RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        let image = render(&params);
+        let mean = image.extra.mean_center.expect("mean requested");
+        let median = image.extra.median_center.expect("median requested");
+        for center in [mean, median] {
+            assert!(
+                center[0] >= 0.0 && center[0] <= image.width as f32,
+                "rotated center x {center:?} must lie within width {}",
+                image.width
+            );
+            assert!(
+                center[1] >= 0.0 && center[1] <= image.height as f32,
+                "rotated center y {center:?} must lie within height {}",
+                image.height
+            );
+        }
     }
 
     #[test]

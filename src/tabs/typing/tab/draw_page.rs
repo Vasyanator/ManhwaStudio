@@ -35,7 +35,12 @@ impl TypingTextOverlayLayer {
         eyedropper_blocks_focus_clear: bool,
         auto_typing_settings: TypingAutoTypingSettings,
         strict_pixel_movement: bool,
+        debug_center_markers: bool,
     ) -> Vec<[Pos2; 4]> {
+        // TEMPORARY debug-only: keep the layer's mirror of the "Отладка центра" flag fresh for the
+        // re-render dispatch sites reached from within this draw (Ctrl+wheel rotation, width drag,
+        // vector-transform, shape variant). Remove with the center-debug feature.
+        self.debug_center_markers = debug_center_markers;
         if self
             .selected_overlay_idx
             .is_some_and(|idx| idx >= self.overlays.len())
@@ -1383,6 +1388,21 @@ impl TypingTextOverlayLayer {
                     entry.mesh_rows,
                 );
                 draw_dashed_selection_path(&painter, &selection_path);
+                // TEMPORARY debug-only: draw the plain / mean / median center markers over the SELECTED
+                // text overlay when the "Отладка центра" flag is on. A `None` extra silently skips that
+                // marker (doc-reconciled/legacy overlays have no centers until re-rendered). Remove with
+                // the center-debug feature.
+                if debug_center_markers
+                    && let Some(overlay) = self.overlays.get(entry.idx)
+                    && overlay.kind == TypingOverlayKind::Text
+                {
+                    draw_center_debug_markers(
+                        &painter,
+                        &entry.quad_scene,
+                        overlay.size_px,
+                        &overlay.extra,
+                    );
+                }
                 if let Some(render_width_px) = entry.render_width_px {
                     // Rotation-invariant source->screen scale (matches `default_overlay_quad_scene`):
                     // the specified width must not stretch with the overlay's raster rotation.
@@ -1611,5 +1631,68 @@ impl TypingTextOverlayLayer {
             break;
         }
         (page_idx, clamp_overlay_page_coord(y_px, page_size[1]))
+    }
+}
+
+/// TEMPORARY debug-only: paints the plain / mean / median center markers over a selected text overlay
+/// for the "Отладка центра" feature. `quad_scene` is the overlay's on-screen quad (top-left, top-right,
+/// bottom-right, bottom-left); `size_px` is its rendered image size; `extra` carries the renderer's
+/// mean/median centers in final-image pixels (a `None` metric is silently skipped).
+///
+/// Each image-pixel point `P` maps to screen via the same building blocks the visual-center logic uses:
+/// normalize `uv = (P.x / size_px[0], P.y / size_px[1])`, then `bilinear_quad_point(quad, uv.0, uv.1)`.
+/// Markers use a cross+circle style (mirroring the auto-typing debug precedent), one distinct color each:
+/// plain full-image center = white, mean = red, median = cyan. Remove together with the center-debug
+/// markers when the consuming feature ships.
+///
+/// Known debug-only limitation: when a raster deform mesh is active, the overlay pixels are drawn
+/// through the full `mesh_scene` grid while markers interpolate over the four OUTER quad corners
+/// only — exact for plain/affine overlays, an approximation under multi-cell mesh deformation
+/// (same approximation the visual-center logic already accepts).
+fn draw_center_debug_markers(
+    painter: &egui::Painter,
+    quad_scene: &[Pos2; 4],
+    size_px: [usize; 2],
+    extra: &RenderedTextExtraInfo,
+) {
+    // Cross+circle marker at a screen position, matching the auto-typing debug visual style.
+    let paint_marker = |center: Pos2, color: Color32| {
+        painter.line_segment(
+            [center + Vec2::new(-7.0, 0.0), center + Vec2::new(7.0, 0.0)],
+            Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [center + Vec2::new(0.0, -7.0), center + Vec2::new(0.0, 7.0)],
+            Stroke::new(1.5, color),
+        );
+        painter.circle_stroke(center, 10.0, Stroke::new(1.5, color));
+    };
+
+    // Intentional usize -> f32 casts: overlay dimensions are image sizes far below f32's
+    // 2^24 integer-exact range, so the conversion is lossless in practice; `.max(1)` also
+    // guards the divisions below against a zero-sized overlay.
+    let width = size_px[0].max(1) as f32;
+    let height = size_px[1].max(1) as f32;
+    // Map an image-pixel center to the overlay's on-screen quad.
+    let marker_pos = |point: [f32; 2]| {
+        bilinear_quad_point(
+            *quad_scene,
+            (point[0] / width).clamp(0.0, 1.0),
+            (point[1] / height).clamp(0.0, 1.0),
+        )
+    };
+
+    // Plain geometric center of the full rendered image (always available).
+    paint_marker(
+        bilinear_quad_point(*quad_scene, 0.5, 0.5),
+        Color32::WHITE,
+    );
+    // Mean center (convex-hull area centroid), when the renderer computed it.
+    if let Some(mean) = extra.mean_center {
+        paint_marker(marker_pos(mean), Color32::RED);
+    }
+    // Median center (per-axis median of glyph-box centers), when the renderer computed it.
+    if let Some(median) = extra.median_center {
+        paint_marker(marker_pos(median), Color32::from_rgb(0, 220, 220));
     }
 }

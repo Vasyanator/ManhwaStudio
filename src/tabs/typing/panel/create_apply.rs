@@ -648,6 +648,8 @@ impl TypingCreatePanelState {
             allow_moderate_trees: self.allow_moderate_trees,
             effects_json: self.effects_json(),
             anti_aliasing: self.anti_aliasing,
+            // Live preview never requests extra render info (mean/median centers).
+            extra_info: crate::tabs::typing::render_next::types::RenderExtraInfoRequest::default(),
         })
     }
 

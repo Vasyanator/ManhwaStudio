@@ -531,6 +531,10 @@ impl TypingTextOverlayLayer {
             ),
             None => return,
         };
+        // TEMPORARY debug-only: snapshot the "Отладка центра" flag before borrowing the overlay below, so
+        // the gated `extra_info` set does not conflict with the `&mut overlay` borrow. Remove with the
+        // center-debug feature.
+        let debug_center_markers = self.debug_center_markers;
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
             self.layout_editor = None;
             return;
@@ -546,10 +550,18 @@ impl TypingTextOverlayLayer {
             self.set_create_error(ctx, t!("typing.layout_editor.update_vector_params_error"));
             return;
         };
-        let Some(render_params) = text_render_params_from_render_data(&render_data_json) else {
+        let Some(mut render_params) = text_render_params_from_render_data(&render_data_json) else {
             self.set_create_error(ctx, t!("typing.layout_editor.build_preview_params_error"));
             return;
         };
+        // TEMPORARY debug-only: this re-render lands in the live overlay runtime, so request the
+        // renderer's mean/median centers while the "Отладка центра" flag is on.
+        if debug_center_markers {
+            render_params.extra_info = RenderExtraInfoRequest {
+                mean_center: true,
+                median_center: true,
+            };
+        }
         let Some(text_images_dir) = self.text_images_save_dir.clone() else {
             self.set_create_error(
                 ctx,
@@ -564,6 +576,11 @@ impl TypingTextOverlayLayer {
             usize::try_from(vector_layout.width_px).unwrap_or(usize::MAX),
             usize::try_from(vector_layout.height_px).unwrap_or(usize::MAX),
         ];
+        // The optimistic resize above invalidates any renderer-computed centers: they were
+        // measured against the previous image size, so drawing them against the new size_px
+        // would mislead. Cleared here; the matching render result restores fresh extras
+        // together with the real size in `apply_edit_overlay_render_result`.
+        overlay.extra = RenderedTextExtraInfo::default();
         // While the layout editor is open, the layer must FOLLOW the editor frame instead of
         // staying centered on its previous position. The on-canvas quad is rebuilt as
         // `Rect::from_center_size(center_page_px, size_px)`, so a size change (frame resize, line

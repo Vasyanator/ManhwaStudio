@@ -234,6 +234,7 @@ mod tests {
             warnings: Vec::new(),
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: crate::types::RenderedTextExtraInfo::default(),
         }
     }
 

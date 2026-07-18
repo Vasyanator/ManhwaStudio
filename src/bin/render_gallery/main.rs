@@ -116,6 +116,7 @@ fn base_params() -> TextRenderParams {
         line_placement_percent: 0.0,
         line_placement_reference: ms_text_render::types::LinePlacementReference::GlyphHeight,
         raster_transform: None,
+        extra_info: ms_text_render::types::RenderExtraInfoRequest::default(),
     }
 }
 

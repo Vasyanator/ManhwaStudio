@@ -1309,8 +1309,12 @@ impl MeshWarpContext {
 
     /// Warp one layout-space `world` point: peel global rotation, warp over the
     /// box, reapply global rotation. Never panics (indices are clamped).
+    ///
+    /// `pub(crate)` so the extra-info sampler (`extra_info.rs` via `pipeline.rs`)
+    /// can warp its per-glyph sample points through the SAME context the
+    /// rasterizer uses, keeping the reported centers aligned with the warped ink.
     #[must_use]
-    fn warp_world(&self, world: [f32; 2]) -> [f32; 2] {
+    pub(crate) fn warp_world(&self, world: [f32; 2]) -> [f32; 2] {
         // Peel R^-1 (rotate by -angle about the centroid) to pre-rotation space.
         let pre = if self.has_rotation {
             rotate_about(world, self.centroid, self.cos, -self.sin)

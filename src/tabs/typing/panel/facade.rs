@@ -511,6 +511,17 @@ impl TypingTopPanelState {
                                 self.strict_pixel_movement = strict_pixel_movement;
                             }
                             self.draw_auto_typing_controls(ui);
+                            // TEMPORARY debug-only element ("Отладка центра"): intentionally not localized; remove together with the center-debug markers.
+                            let debug_center_toggle =
+                                ui.checkbox(&mut self.debug_center_markers, "Отладка центра");
+                            if debug_center_toggle.changed()
+                                && self.debug_center_markers
+                                && self.mode == TypingTopPanelMode::EditText
+                            {
+                                // Toggled ON while editing: re-render the selected overlay immediately so
+                                // its centers are computed and the markers appear without another edit.
+                                self.emit_edit_request();
+                            }
                         }
                         TypingActionsPanelTab::Layers => {
                             text_overlays.draw_layers_tab_body(ui, page_idx);
@@ -530,12 +541,20 @@ impl TypingTopPanelState {
         text: String,
         width_px: u32,
     ) -> Result<(TextRenderParams, Value), String> {
-        let render_params = self
+        let mut render_params = self
             .create_panel
             .build_render_params_for(text.clone(), width_px.max(1))
             .ok_or_else(|| {
                 tf!("typing.errors.fonts_not_found", arg = self.create_panel.fonts_dir.display())
             })?;
+        // TEMPORARY debug-only: request the renderer's mean/median centers only while the "Отладка
+        // центра" flag is on (the default is the byte-identical no-compute fast path).
+        if self.debug_center_markers {
+            render_params.extra_info = RenderExtraInfoRequest {
+                mean_center: true,
+                median_center: true,
+            };
+        }
         let render_data_json = self
             .create_panel
             .build_render_data_json_for(text, width_px.max(1))
@@ -647,6 +666,13 @@ impl TypingTopPanelState {
         self.strict_pixel_movement
     }
 
+    /// TEMPORARY debug-only accessor for the "Отладка центра" flag. When `true`, production text
+    /// renders request the renderer's mean/median centers and the canvas draws center markers over the
+    /// selected text layer. Remove together with the center-debug markers when the feature ships.
+    pub(in crate::tabs::typing) fn debug_center_markers(&self) -> bool {
+        self.debug_center_markers
+    }
+
     pub(in crate::tabs::typing) fn sync_clean_overlays_visible_from_canvas(&mut self, visible: bool) {
         if self.clean_overlays_initialized {
             return;
@@ -698,9 +724,17 @@ impl TypingTopPanelState {
                 if self.edit_panel.missing_font.is_some() {
                     return;
                 }
-                let Some(render_params) = self.edit_panel.build_render_params() else {
+                let Some(mut render_params) = self.edit_panel.build_render_params() else {
                     return;
                 };
+                // TEMPORARY debug-only: request the renderer's mean/median centers only while the
+                // "Отладка центра" flag is on (the default is the byte-identical no-compute fast path).
+                if self.debug_center_markers {
+                    render_params.extra_info = RenderExtraInfoRequest {
+                        mean_center: true,
+                        median_center: true,
+                    };
+                }
                 let Some(render_data_json) = self.edit_panel.build_render_data_json_for(
                     self.edit_panel.text.clone(),
                     self.edit_panel.width_px.max(1),

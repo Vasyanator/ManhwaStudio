@@ -100,6 +100,9 @@ pub(super) fn render_and_store_created_overlay(
         size_px: [rendered.width as usize, rendered.height as usize],
         rgba: rendered.rgba,
         warnings: rendered.warnings,
+        // TEMPORARY debug-only: carry the renderer's mean/median centers (populated only when the
+        // "Отладка центра" flag requested them upstream; default all-`None` otherwise).
+        extra: rendered.extra,
     })
 }
 
@@ -155,6 +158,8 @@ pub(super) fn render_and_store_created_image_overlay(
         size_px: [width, height],
         rgba,
         warnings: Vec::new(),
+        // Image overlays carry no text-center info.
+        extra: RenderedTextExtraInfo::default(),
     })
 }
 
@@ -363,6 +368,9 @@ pub(super) fn render_and_store_edited_overlay(
         size_px: [rendered.width as usize, rendered.height as usize],
         rgba: rendered.rgba,
         warnings: rendered.warnings,
+        // TEMPORARY debug-only: carry the renderer's mean/median centers (populated only when the
+        // "Отладка центра" flag requested them upstream; default all-`None` otherwise).
+        extra: rendered.extra,
     }))
 }
 
@@ -504,6 +512,8 @@ pub(super) fn render_and_store_image_effects_overlay(
         size_px: [rendered.width as usize, rendered.height as usize],
         rgba: rendered.rgba,
         warnings: rendered.warnings,
+        // Image-effects renders carry no text-center info.
+        extra: RenderedTextExtraInfo::default(),
     }))
 }
 

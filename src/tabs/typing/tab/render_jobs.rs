@@ -778,6 +778,10 @@ impl TypingTextOverlayLayer {
             overlay.render_data_json = Some(result.render_data_json.clone());
             overlay.size_px = result.size_px;
             overlay.source_rgba = result.rgba.clone();
+            // TEMPORARY debug-only: update the center markers' data IN THE SAME block as `size_px`/
+            // `source_rgba` so the centers and the pixels they index never fall out of sync. Image-effects
+            // renders return default (all-`None`) extras, which correctly clears any stale text centers.
+            overlay.extra = result.extra.clone();
             if let Some(center) = layout_editor_frame_center {
                 overlay.center_page_px = [center.x, center.y];
             }
@@ -960,6 +964,13 @@ impl TypingTextOverlayLayer {
     /// each frame from the canvas hook so a font reload in the panel propagates here.
     pub(in crate::tabs::typing) fn set_font_provider(&mut self, provider: Arc<dyn FontProvider>) {
         self.font_provider = provider;
+    }
+
+    /// TEMPORARY debug-only: mirrors the top panel's "Отладка центра" flag onto the layer each frame so
+    /// the re-render dispatch sites (which run on `TypingTextOverlayLayer`, without panel access) can
+    /// request the renderer's mean/median centers. Remove together with the center-debug markers.
+    pub(in crate::tabs::typing) fn set_debug_center_markers(&mut self, on: bool) {
+        self.debug_center_markers = on;
     }
 
     pub(super) fn start_edit_overlay_render_job(&mut self, mut request: TypingEditOverlayRequest) {
@@ -1233,11 +1244,19 @@ impl TypingTextOverlayLayer {
         let Some(current_render_data) = overlay.render_data_json.as_ref() else {
             return;
         };
-        let Some((render_params, render_data_json)) =
+        let Some((mut render_params, render_data_json)) =
             build_shape_variant_apply_payload(current_render_data, &variant)
         else {
             return;
         };
+        // TEMPORARY debug-only: the shape-variant apply lands in the live overlay runtime, so request the
+        // renderer's mean/median centers while the "Отладка центра" flag is on.
+        if self.debug_center_markers {
+            render_params.extra_info = RenderExtraInfoRequest {
+                mean_center: true,
+                median_center: true,
+            };
+        }
 
         let edit_request = TypingEditOverlayRequest {
             token: 0,

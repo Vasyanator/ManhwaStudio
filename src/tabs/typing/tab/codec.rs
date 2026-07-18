@@ -259,6 +259,9 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .and_then(Value::as_str)
             .and_then(parse_anti_aliasing_config_str)
             .unwrap_or(AntiAliasingMode::Strong),
+        // Extra render info (mean/median centers) is a per-render compute request,
+        // not persisted state; decoded params always start with nothing requested.
+        extra_info: crate::tabs::typing::render_next::types::RenderExtraInfoRequest::default(),
     })
 }
 
@@ -1937,6 +1940,9 @@ pub(super) fn decode_overlay_from_storage_entry(
         size_px: [w as usize, h as usize],
         rgba: decoded.into_raw(),
         warnings: Vec::new(),
+        // A legacy-loaded overlay carries no text-center info; it is recomputed only on a re-render with
+        // the "Отладка центра" flag on.
+        extra: RenderedTextExtraInfo::default(),
     })
 }
 

@@ -27,6 +27,8 @@ Source compatibility:
 - `TextVectorLineDistanceMode`
 - `AntiAliasingMode`
 - `FauxBoldParams`
+- `RenderExtraInfoRequest`
+- `RenderedTextExtraInfo`
 - `TEXT_FORMULA_USER_VAR_COUNT`
 */
 
@@ -371,6 +373,81 @@ pub struct TextRenderParams {
     /// honors it on the horizontal path (Normal, and the rotated variant); other
     /// layout modes currently ignore it.
     pub raster_transform: Option<VectorMeshWarp>,
+    /// Which extra "additional info" items the renderer should compute alongside
+    /// the pixels (see [`RenderExtraInfoRequest`] and [`RenderedTextExtraInfo`]).
+    /// The DEFAULT (nothing requested) is a true no-op: no per-glyph sampling and
+    /// the byte-identical fast path. Like `anti_aliasing`/`global_rotation_deg`,
+    /// it does NOT affect layout, so it is intentionally excluded from
+    /// [`TextRenderShapeCompareParams`]. It is a per-render compute selection and
+    /// is NOT persisted in project JSON.
+    pub extra_info: RenderExtraInfoRequest,
+}
+
+/// Caller selection of which "extra render info" items to compute.
+///
+/// Each flag enables one optional metric that the renderer measures from glyph
+/// placements at the vector stage and returns in [`RenderedTextExtraInfo`]. The
+/// default (all `false`) means COMPUTE NOTHING — the renderer takes its
+/// byte-identical fast path with zero per-glyph sampling cost. Because these
+/// metrics do not affect layout, this field is deliberately kept out of
+/// [`TextRenderShapeCompareParams`] (mirroring `anti_aliasing`), and it is a
+/// per-render request that is never serialized into project JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderExtraInfoRequest {
+    /// Compute the MEAN center: the area centroid of the convex hull of all
+    /// included glyphs' placement-box corners (`RenderedTextExtraInfo::mean_center`).
+    pub mean_center: bool,
+    /// Compute the MEDIAN center: the per-axis median of all included glyphs'
+    /// placement-box centers (`RenderedTextExtraInfo::median_center`).
+    pub median_center: bool,
+}
+
+impl RenderExtraInfoRequest {
+    /// `true` when at least one extra metric is requested. When `false` the
+    /// renderer skips all per-glyph sampling and returns
+    /// `RenderedTextExtraInfo::default()`.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        self.mean_center || self.median_center
+    }
+}
+
+/// Extra "additional info" computed alongside the rendered pixels.
+///
+/// Every populated coordinate is in FINAL-IMAGE pixels: top-left origin, with
+/// pixel `(0, 0)` spanning `[0, 1)` on each axis. Values may be fractional and
+/// may even lie OUTSIDE the image bounds — extreme trim or canvas-growing effects
+/// still keep the centers consistent relative to the glyphs. A metric that was
+/// not requested (or had zero contributing glyphs) is `None`. The default (all
+/// `None`) is what the renderer returns when nothing was requested.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RenderedTextExtraInfo {
+    /// Area centroid of the convex hull of all included glyphs' placement-box
+    /// corners, in final-image pixels. `None` when not requested or when no glyph
+    /// contributed (e.g. every glyph excluded as hanging punctuation).
+    pub mean_center: Option<[f32; 2]>,
+    /// Per-axis median of all included glyphs' placement-box centers, in
+    /// final-image pixels. `None` when not requested or when no glyph contributed.
+    pub median_center: Option<[f32; 2]>,
+}
+
+impl RenderedTextExtraInfo {
+    /// Translate every populated center by `(dx, dy)` final-image pixels.
+    ///
+    /// Used by the trim and effects stages to keep the centers fixed relative to
+    /// the glyphs when the canvas is cropped or grown. A translation commutes with
+    /// both the hull-centroid and the per-axis-median computation, so shifting the
+    /// finished centers is exact. `None` metrics stay `None`.
+    pub fn shift(&mut self, dx: f32, dy: f32) {
+        if let Some(center) = self.mean_center.as_mut() {
+            center[0] += dx;
+            center[1] += dy;
+        }
+        if let Some(center) = self.median_center.as_mut() {
+            center[0] += dx;
+            center[1] += dy;
+        }
+    }
 }
 
 /// What the perpendicular line placement (`TextRenderParams::line_placement_percent`)
@@ -435,6 +512,12 @@ pub struct RenderedTextImage {
     /// ИСХОДНОГО контента — накопленный верхний паддинг всех увеличивающих
     /// холст post-эффектов. По умолчанию 0.
     pub content_origin_y: u32,
+    /// Optional extra "additional info" (mean/median centers) requested via
+    /// [`TextRenderParams::extra_info`]. Coordinates are in final-image pixels and
+    /// are kept consistent through trim and canvas-growing effects. The default
+    /// (`RenderedTextExtraInfo::default()`, all `None`) is what a render that did
+    /// not request any extra info returns.
+    pub extra: RenderedTextExtraInfo,
 }
 
 impl RenderedTextImage {
@@ -455,6 +538,7 @@ impl RenderedTextImage {
             warnings: Vec::new(),
             content_origin_x: 0,
             content_origin_y: 0,
+            extra: RenderedTextExtraInfo::default(),
         }
     }
 }
