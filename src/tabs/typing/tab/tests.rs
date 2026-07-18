@@ -2707,3 +2707,331 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
 // Also NOT unit-tested (needs a running GUI): that `MangaApp::start_exit_cleanup` → `on_exit` performs
 // no write, and that the exit dialog does not reopen after "Не сохранять". Both live in `MangaApp`,
 // which cannot be constructed without a project, an eframe context, and the loader threads.
+
+// ===================== Centering assist geometry =====================
+
+/// Asserts two page-px points are within a small tolerance.
+fn assert_page_close(a: [f32; 2], b: [f32; 2], what: &str) {
+    let eps = 1e-3;
+    assert!(
+        (a[0] - b[0]).abs() <= eps && (a[1] - b[1]).abs() <= eps,
+        "{what}: {a:?} vs {b:?}"
+    );
+}
+
+/// Looks up one corner's page-px position from a frame at a given total visual angle.
+fn frame_corner_pos(
+    frame: &CenteringFrame,
+    angle_deg: f32,
+    corner: CenteringFrameCorner,
+) -> [f32; 2] {
+    let all = centering_frame_corners_page_px(frame, angle_deg);
+    let idx = CenteringFrameCorner::ALL
+        .iter()
+        .position(|c| *c == corner)
+        .expect("corner is one of ALL");
+    all[idx]
+}
+
+#[test]
+fn centering_affine_chosen_center_maps_offset_scale_and_rotation() {
+    let center = [100.0, 100.0];
+    let size = [40, 20];
+    // No rotation, unit scale: a +10px x offset from the image center lands +10px in page x.
+    assert_page_close(
+        affine_chosen_center_page_px(center, size, 1.0, 0.0, [30.0, 10.0]),
+        [110.0, 100.0],
+        "affine no-rotation offset",
+    );
+    // Scale doubles the local offset before placing it.
+    assert_page_close(
+        affine_chosen_center_page_px(center, size, 2.0, 0.0, [30.0, 10.0]),
+        [120.0, 100.0],
+        "affine scaled offset",
+    );
+    // 90deg (screen y-down) rotates the +x local offset into +y.
+    assert_page_close(
+        affine_chosen_center_page_px(center, size, 1.0, 90.0, [30.0, 10.0]),
+        [100.0, 110.0],
+        "affine rotated offset",
+    );
+    // The exact image center always maps to the placement center regardless of angle/scale.
+    assert_page_close(
+        affine_chosen_center_page_px(center, size, 1.7, 37.0, [20.0, 10.0]),
+        center,
+        "image center is placement center",
+    );
+}
+
+#[test]
+fn centering_chosen_center_falls_back_to_image_center_when_extras_none() {
+    // A doc-materialized overlay carries all-`None` extras; Mean/Median must fall back to the plain
+    // image center, so the chosen center equals the placement center (reconciliation delta zero).
+    let overlay = text_runtime_from_doc_node(
+        "c0",
+        0,
+        [50.0, 60.0],
+        1.0,
+        0.0,
+        None,
+        false,
+        false,
+        0,
+        None,
+        [40, 20],
+        vec![0u8; 40 * 20 * 4],
+    );
+    let page_size = [200, 200];
+    for kind in [
+        CenteringAssistCenterKind::Image,
+        CenteringAssistCenterKind::Mean,
+        CenteringAssistCenterKind::Median,
+    ] {
+        assert_page_close(
+            centering_chosen_center_page_px(&overlay, kind, page_size),
+            [50.0, 60.0],
+            "fallback to image center",
+        );
+    }
+}
+
+#[test]
+fn centering_chosen_center_uses_mean_when_present() {
+    let mut overlay = text_runtime_from_doc_node(
+        "c1",
+        0,
+        [50.0, 60.0],
+        1.0,
+        0.0,
+        None,
+        false,
+        false,
+        0,
+        None,
+        [40, 20],
+        vec![0u8; 40 * 20 * 4],
+    );
+    // Mean center 10px left / 10px up of the image center [20,10] -> page offset (-10, 0).
+    overlay.extra.mean_center = Some([10.0, 10.0]);
+    let page_size = [200, 200];
+    assert_page_close(
+        centering_chosen_center_page_px(&overlay, CenteringAssistCenterKind::Mean, page_size),
+        [40.0, 60.0],
+        "mean center used",
+    );
+    // Median still absent -> falls back to the image center.
+    assert_page_close(
+        centering_chosen_center_page_px(&overlay, CenteringAssistCenterKind::Median, page_size),
+        [50.0, 60.0],
+        "median falls back",
+    );
+}
+
+#[test]
+fn centering_frame_corner_drag_lands_pointer_and_fixes_opposite() {
+    let frame = CenteringFrame {
+        center_page_px: [100.0, 100.0],
+        half_size_page_px: [20.0, 10.0],
+    };
+    let angle = 0.0;
+    let start_tl = frame_corner_pos(&frame, angle, CenteringFrameCorner::TopLeft);
+    // Drag the bottom-right corner far out to [140, 130].
+    let (center, half) = centering_frame_corner_drag(
+        frame.center_page_px,
+        frame.half_size_page_px,
+        CenteringFrameCorner::BottomRight,
+        [140.0, 130.0],
+        angle,
+        4.0,
+    );
+    let result = CenteringFrame {
+        center_page_px: center,
+        half_size_page_px: half,
+    };
+    assert_page_close(
+        frame_corner_pos(&result, angle, CenteringFrameCorner::BottomRight),
+        [140.0, 130.0],
+        "dragged corner lands under pointer",
+    );
+    assert_page_close(
+        frame_corner_pos(&result, angle, CenteringFrameCorner::TopLeft),
+        start_tl,
+        "opposite corner stays fixed",
+    );
+}
+
+#[test]
+fn centering_frame_corner_drag_fixes_opposite_when_rotated() {
+    let frame = CenteringFrame {
+        center_page_px: [100.0, 100.0],
+        half_size_page_px: [20.0, 10.0],
+    };
+    let angle = 30.0;
+    let start_tr = frame_corner_pos(&frame, angle, CenteringFrameCorner::TopRight);
+    // Pick a pointer far from the fixed (top-right) corner and drag the bottom-left corner there.
+    let (center, half) = centering_frame_corner_drag(
+        frame.center_page_px,
+        frame.half_size_page_px,
+        CenteringFrameCorner::BottomLeft,
+        [40.0, 150.0],
+        angle,
+        4.0,
+    );
+    let result = CenteringFrame {
+        center_page_px: center,
+        half_size_page_px: half,
+    };
+    assert_page_close(
+        frame_corner_pos(&result, angle, CenteringFrameCorner::BottomLeft),
+        [40.0, 150.0],
+        "rotated dragged corner lands under pointer",
+    );
+    assert_page_close(
+        frame_corner_pos(&result, angle, CenteringFrameCorner::TopRight),
+        start_tr,
+        "rotated opposite corner stays fixed",
+    );
+}
+
+#[test]
+fn centering_frame_corner_drag_clamps_min_and_keeps_opposite_fixed() {
+    let frame = CenteringFrame {
+        center_page_px: [100.0, 100.0],
+        half_size_page_px: [20.0, 10.0],
+    };
+    let angle = 0.0;
+    let start_tl = frame_corner_pos(&frame, angle, CenteringFrameCorner::TopLeft);
+    // Collapse the frame by dragging BR onto TL: half-size clamps to the minimum, opposite still fixed.
+    let (center, half) = centering_frame_corner_drag(
+        frame.center_page_px,
+        frame.half_size_page_px,
+        CenteringFrameCorner::BottomRight,
+        start_tl,
+        angle,
+        4.0,
+    );
+    assert!(half[0] >= 4.0 - 1e-4 && half[1] >= 4.0 - 1e-4, "half clamped to min: {half:?}");
+    let result = CenteringFrame {
+        center_page_px: center,
+        half_size_page_px: half,
+    };
+    assert_page_close(
+        frame_corner_pos(&result, angle, CenteringFrameCorner::TopLeft),
+        start_tl,
+        "opposite corner fixed even when collapsed",
+    );
+}
+
+#[test]
+fn centering_reconcile_converges_in_one_move_for_unreachable_frame() {
+    // An affine overlay whose chosen center sits 10px right of its placement center. The frame center
+    // is far off the right page edge (unreachable). The reconcile target must land the overlay at the
+    // visibility boundary in ONE move, and a SECOND invocation from that fed-back state must not move
+    // it again — i.e. the constrained target is a fixed point.
+    let page_size = [200usize, 200usize];
+    let half_extent = [20.0f32, 10.0f32]; // affine box half-size (page px)
+    let chosen_offset = [10.0f32, 0.0f32]; // chosen center relative to the placement center
+    let frame_center = [500.0f32, 100.0f32]; // off-page, unreachable
+
+    // Given a placement center, derive the (chosen, page-px bounds) an affine overlay would present.
+    let derive = |center: [f32; 2]| -> ([f32; 2], egui::Rect) {
+        let chosen = [center[0] + chosen_offset[0], center[1] + chosen_offset[1]];
+        let bounds = egui::Rect::from_min_max(
+            egui::Pos2::new(center[0] - half_extent[0], center[1] - half_extent[1]),
+            egui::Pos2::new(center[0] + half_extent[0], center[1] + half_extent[1]),
+        );
+        (chosen, bounds)
+    };
+
+    let start = [100.0f32, 100.0f32];
+    let (chosen0, bounds0) = derive(start);
+    let target1 = centering_reconcile_target_center(
+        start, chosen0, frame_center, bounds0, false, false, page_size,
+    );
+    // It moved (the frame pulls it toward the page edge) and stopped at the visibility boundary: with
+    // TEXT_OVERLAY_MIN_VISIBLE_FRACTION = 0.10 and a 40px-wide box, 4px must stay inside the 200px page,
+    // so the box's right edge lands on x = 200 + 4 - 40 ... i.e. the box left edge sits at 196 and the
+    // center at 216.
+    assert!(
+        (target1[0] - start[0]).abs() > CENTERING_RECONCILE_EPS_PX,
+        "first reconcile must move the overlay: {target1:?}"
+    );
+    assert_page_close(target1, [216.0, 100.0], "converged to visibility boundary");
+
+    // Feed the result back (the box and chosen center translate rigidly with the placement center) and
+    // reconcile again with identical logical inputs: the target must be the SAME point (no movement).
+    let (chosen1, bounds1) = derive(target1);
+    let target2 = centering_reconcile_target_center(
+        target1, chosen1, frame_center, bounds1, false, false, page_size,
+    );
+    assert_page_close(target2, target1, "second reconcile is a no-op (fixed point)");
+    let dx = target2[0] - target1[0];
+    let dy = target2[1] - target1[1];
+    assert!(
+        dx.hypot(dy) <= CENTERING_RECONCILE_EPS_PX,
+        "no further movement within epsilon: {target2:?} vs {target1:?}"
+    );
+}
+
+#[test]
+fn translate_rigid_preserves_mesh_shape_and_clamps_box() {
+    // A rigid translation toward an unreachable target must shift EVERY control point by the same
+    // allowed delta (internal shape preserved) and stop when the control-point box reaches the page's
+    // overlay bound — never squashing points independently.
+    let page_size = [100usize, 100usize];
+    let points = vec![[10.0f32, 10.0], [30.0, 10.0], [10.0, 40.0], [30.0, 40.0]];
+    let before = points.clone();
+    let mut mesh = TypingOverlayDeformMesh::new(2, 2, points, page_size)
+        .expect("2x2 mesh with 4 points is valid");
+
+    // Ask for a far-too-large +x shift; the box (x in [10, 30]) can move until its right edge hits the
+    // overlay bound overlay_uv_max * 100 = 190, i.e. an allowed dx of 160. y stays put.
+    let applied = mesh.translate_rigid(1000.0, 0.0, page_size);
+    assert!(
+        (applied[0] - 160.0).abs() <= 1e-3 && applied[1].abs() <= 1e-3,
+        "allowed delta clamps the box to the page bound: {applied:?}"
+    );
+
+    // Relative offsets between every point and the first are unchanged: the mesh did not deform.
+    for (idx, (after, orig)) in mesh.points_px.iter().zip(before.iter()).enumerate() {
+        let expected = [orig[0] + applied[0], orig[1] + applied[1]];
+        assert!(
+            (after[0] - expected[0]).abs() <= 1e-3 && (after[1] - expected[1]).abs() <= 1e-3,
+            "point {idx} shifted rigidly: {after:?} vs {expected:?}"
+        );
+    }
+    // The whole box stayed within the page's overlay bounds (right edge exactly on the bound).
+    let bounds = deform_mesh_bounds_px(&mesh);
+    assert!(bounds.right() <= 190.0 + 1e-3, "box right within bound: {}", bounds.right());
+}
+
+#[test]
+fn push_rotation_handle_clear_moves_past_obstacles_on_ray() {
+    let corner = Pos2::new(100.0, 100.0);
+    let handle = Pos2::new(124.0, 100.0); // outward dir = +x
+    let clearance = 20.0;
+
+    // No obstacles / far obstacles: untouched.
+    assert_eq!(push_rotation_handle_clear(corner, handle, &[], clearance), handle);
+    let far = [Pos2::new(0.0, 0.0)];
+    assert_eq!(push_rotation_handle_clear(corner, handle, &far, clearance), handle);
+
+    // An obstacle sitting exactly on the handle pushes it forward until `clearance` away.
+    let on_top = [handle];
+    let cleared = push_rotation_handle_clear(corner, handle, &on_top, clearance);
+    assert!(
+        (cleared.distance(handle) - clearance).abs() <= 1e-3 && cleared.x > handle.x,
+        "pushed forward to exactly the clearance: {cleared:?}"
+    );
+
+    // Two obstacles ahead ON the ray with overlapping clearance zones: lands past BOTH.
+    let chain = [Pos2::new(130.0, 100.0), Pos2::new(160.0, 100.0)];
+    let cleared = push_rotation_handle_clear(corner, handle, &chain, clearance);
+    for obstacle in &chain {
+        assert!(
+            cleared.distance(*obstacle) >= clearance - 1e-3,
+            "clear of every obstacle: {cleared:?} vs {obstacle:?}"
+        );
+    }
+    assert!((cleared.y - 100.0).abs() <= 1e-3, "stays on the outward ray: {cleared:?}");
+}

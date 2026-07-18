@@ -136,6 +136,15 @@ const CANVAS_CONFIG_SECTION: &str = "Canvas";
 /// `cleaning_hint_collapsed` may linger in an old config; it is never read or written.
 const CANVAS_TRANSLATION_HINT_COLLAPSED_KEY: &str = "translation_hint_collapsed";
 const CANVAS_TYPING_HINT_COLLAPSED_KEY: &str = "typing_hint_collapsed";
+/// `user_config.json` section holding typing-tab settings (persisted centering-assist flags, etc.).
+const TEXT_TAB_CONFIG_SECTION: &str = "TextTab";
+/// Config keys (under [`TEXT_TAB_CONFIG_SECTION`]) for the two persisted centering-assist checkboxes.
+/// `centering_assist_enabled` defaults (absent) to `false` (off); `centering_show_center` defaults to
+/// `true` (marker shown). Written only on exit; seeded once at construction. The bound-center KIND is
+/// session-only and has no key. The dependent bound-center marker's default-on state is why its key
+/// uses a `true` default while the assist toggle uses `false`.
+const TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY: &str = "centering_assist_enabled";
+const TEXT_TAB_CENTERING_SHOW_CENTER_KEY: &str = "centering_show_center";
 const MEMORY_PRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const SOFT_PRESSURE_TARGET_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_PRESSURE_TARGET_FREE_BYTES: u64 = 768 * 1024 * 1024;
@@ -497,6 +506,16 @@ impl MangaApp {
             hint_collapsed_from_user_settings(&user_settings, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY);
         let typing_hint_collapsed =
             hint_collapsed_from_user_settings(&user_settings, CANVAS_TYPING_HINT_COLLAPSED_KEY);
+        // Persisted centering-assist checkboxes, seeded once from `user_config` (absent => assist off,
+        // marker shown). Read back on exit and persisted via `on_exit`; not saved on every toggle. The
+        // bound-center KIND stays session-only.
+        let typing_centering_assist_enabled = text_tab_bool_from_user_settings(
+            &user_settings,
+            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
+            false,
+        );
+        let typing_centering_show_center =
+            text_tab_bool_from_user_settings(&user_settings, TEXT_TAB_CENTERING_SHOW_CENTER_KEY, true);
         let cache_pages = project.canvas_settings.cache_pages;
         let cache_pages_on_initial_load =
             should_seed_page_cache_on_initial_load(cache_pages, memory_manager.budget());
@@ -662,6 +681,10 @@ impl MangaApp {
         let mut typing_tab = TypingTabState::default();
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
         typing_tab.set_hint_collapsed(typing_hint_collapsed);
+        typing_tab.set_centering_assist_persisted_state(
+            typing_centering_assist_enabled,
+            typing_centering_show_center,
+        );
         typing_tab.set_bubbles_model(Arc::clone(&bubbles_model));
         typing_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut ps_editor_tab = PsEditorTabState::default();
@@ -3379,6 +3402,13 @@ impl eframe::App for MangaApp {
             self.canvas.bottom_hint_collapsed(),
             self.typing_tab.hint_collapsed(),
         );
+
+        // 5) Persist the two typing centering-assist checkboxes (exit-only, single locked RMW). The
+        // bound-center KIND is deliberately session-only, so it is not written here.
+        persist_typing_centering_assist_state(
+            self.typing_tab.centering_assist_enabled(),
+            self.typing_tab.centering_show_center(),
+        );
     }
 }
 
@@ -3523,6 +3553,20 @@ fn hint_collapsed_from_user_settings(user_settings: &Value, key: &str) -> bool {
         .and_then(|canvas| canvas.get(key))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Reads a `TextTab.<key>` boolean flag from the merged startup `user_settings`.
+///
+/// A missing section, missing key, or non-boolean value yields `default`, which differs per flag:
+/// the centering-assist toggle seeds `false` (off) and the show-center marker seeds `true` (shown).
+#[must_use]
+fn text_tab_bool_from_user_settings(user_settings: &Value, key: &str, default: bool) -> bool {
+    user_settings
+        .get(TEXT_TAB_CONFIG_SECTION)
+        .and_then(Value::as_object)
+        .and_then(|text_tab| text_tab.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 /// Builds the fixed, hand-authored Translation-tab bottom-hint rows.
@@ -3688,6 +3732,59 @@ fn persist_canvas_hint_collapsed_state(translation: bool, typing: bool) {
     if let Err(err) = fs::write(&path, payload) {
         runtime_log::log_error(format!(
             "[app::canvas_hint] failed to write user_config.json canvas hint state; path={}; cause={err}",
+            path.display()
+        ));
+    }
+}
+
+/// Inserts the two typing centering-assist flags (`centering_assist_enabled`, `centering_show_center`)
+/// into a `user_config.json` root value, get-or-creating the `TextTab` object and preserving all other
+/// keys. A non-object `root` or a non-object `TextTab` value is replaced with a fresh object so the
+/// flags are never silently dropped. The bound-center KIND is session-only and is not written.
+///
+/// Pure and side-effect-free (the disk write is done by the caller under the config write lock), so
+/// the read-modify-merge contract is unit-testable without touching the filesystem.
+fn apply_centering_assist_to_config_root(root: &mut Value, enabled: bool, show_center: bool) {
+    if !root.is_object() {
+        *root = Value::Object(Map::new());
+    }
+    let Some(root_obj) = root.as_object_mut() else {
+        return;
+    };
+    // Get-or-create the TextTab object; a non-object sibling value is replaced (not merged).
+    let mut text_tab_obj = root_obj
+        .get(TEXT_TAB_CONFIG_SECTION)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    text_tab_obj.insert(
+        TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY.to_string(),
+        Value::Bool(enabled),
+    );
+    text_tab_obj.insert(
+        TEXT_TAB_CENTERING_SHOW_CENTER_KEY.to_string(),
+        Value::Bool(show_center),
+    );
+    root_obj.insert(
+        TEXT_TAB_CONFIG_SECTION.to_string(),
+        Value::Object(text_tab_obj),
+    );
+}
+
+/// Persists the two typing centering-assist flags to `user_config.json`.
+///
+/// Called once from [`MangaApp::on_exit`]. Routes through [`crate::config::update_user_config_file`],
+/// the canonical locked read-modify-write primitive, so unrelated keys survive and the write is
+/// serialized with every other config writer. Teardown-only: on any read/parse/write failure it logs a
+/// warning and returns without panicking, so a failed write never blocks shutdown.
+fn persist_typing_centering_assist_state(enabled: bool, show_center: bool) {
+    let path = crate::config::user_config_path();
+    if let Err(err) = crate::config::update_user_config_file(&path, |root| {
+        apply_centering_assist_to_config_root(root, enabled, show_center);
+        Ok(())
+    }) {
+        runtime_log::log_warn(format!(
+            "[app::centering_assist] failed to persist centering-assist state; path={}; cause={err:#}",
             path.display()
         ));
     }
@@ -4409,10 +4506,12 @@ mod tests {
     use super::{
         CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
         CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, PageOpTextQuiesce, SaveGateDecision,
-        TypingTextFlushError, ai_backend_version_warning_message,
-        apply_hint_collapsed_to_config_root, decode_idx_within_window, deferred_save_ready,
-        hint_collapsed_from_user_settings, page_op_text_quiesce, save_trigger_decision,
-        should_seed_page_cache_on_initial_load,
+        TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
+        TEXT_TAB_CONFIG_SECTION, TypingTextFlushError, ai_backend_version_warning_message,
+        apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
+        decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
+        page_op_text_quiesce, save_trigger_decision, should_seed_page_cache_on_initial_load,
+        text_tab_bool_from_user_settings,
     };
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
     use serde_json::{Value, json};
@@ -4570,6 +4669,111 @@ mod tests {
         assert!(hint_collapsed_from_user_settings(
             &json!({ "Canvas": { "typing_hint_collapsed": true } }),
             CANVAS_TYPING_HINT_COLLAPSED_KEY
+        ));
+    }
+
+    #[test]
+    fn apply_centering_assist_writes_both_flags_and_preserves_siblings_and_sections() {
+        // A pre-existing config with an unrelated TextTab sibling key and an unrelated section must all
+        // survive; only the two centering-assist flags are (re)written.
+        let mut root = json!({
+            "TextTab": { "text_language": "en", "hanging_punctuation": true },
+            "General": { "memory_profile": "Medium" }
+        });
+        apply_centering_assist_to_config_root(&mut root, true, false);
+
+        let text_tab = root
+            .get(TEXT_TAB_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .expect("TextTab section present");
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
+            Some(&Value::Bool(false))
+        );
+        // Unrelated TextTab keys and the unrelated section are untouched.
+        assert_eq!(
+            text_tab.get("text_language"),
+            Some(&Value::String("en".to_string()))
+        );
+        assert_eq!(
+            text_tab.get("hanging_punctuation"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            root.get("General")
+                .and_then(Value::as_object)
+                .and_then(|g| g.get("memory_profile")),
+            Some(&Value::String("Medium".to_string()))
+        );
+    }
+
+    #[test]
+    fn apply_centering_assist_recovers_from_non_object_root_and_texttab() {
+        // A corrupt (non-object) root is replaced with a fresh object; flags are never dropped.
+        let mut root = Value::String("not an object".to_string());
+        apply_centering_assist_to_config_root(&mut root, false, true);
+        let text_tab = root
+            .get(TEXT_TAB_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .expect("TextTab section created");
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
+            Some(&Value::Bool(true))
+        );
+
+        // A non-object TextTab value is replaced (not merged) so the flags still land.
+        let mut root = json!({ "TextTab": "corrupt" });
+        apply_centering_assist_to_config_root(&mut root, true, true);
+        let text_tab = root
+            .get(TEXT_TAB_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .expect("TextTab section replaced with object");
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn text_tab_bool_uses_asymmetric_defaults_when_absent_or_malformed() {
+        // Absent section, absent key, and non-boolean values all yield the per-flag default.
+        assert!(!text_tab_bool_from_user_settings(
+            &json!({}),
+            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
+            false
+        ));
+        assert!(text_tab_bool_from_user_settings(
+            &json!({ "TextTab": {} }),
+            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
+            true
+        ));
+        assert!(text_tab_bool_from_user_settings(
+            &json!({ "TextTab": { "centering_show_center": "yes" } }),
+            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
+            true
+        ));
+        // Present values override the default in both directions.
+        assert!(text_tab_bool_from_user_settings(
+            &json!({ "TextTab": { "centering_assist_enabled": true } }),
+            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
+            false
+        ));
+        assert!(!text_tab_bool_from_user_settings(
+            &json!({ "TextTab": { "centering_show_center": false } }),
+            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
+            true
         ));
     }
 

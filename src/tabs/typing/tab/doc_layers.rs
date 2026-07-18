@@ -622,9 +622,9 @@ impl TypingTextOverlayLayer {
                     if pixels_changed {
                         rt.size_px = size_px;
                         rt.source_rgba = color_image_to_rgba(image);
-                        // TEMPORARY debug-only: the doc image carries no text-center info, so stale
-                        // centers must not survive a pixel change they no longer match. Reset to default;
-                        // a re-render with the "Отладка центра" flag recomputes them.
+                        // Centering-assist centers: the doc image carries no text-center info, so stale
+                        // mean/median centers must not survive a pixel change they no longer match. Reset
+                        // to default; a re-render with the centering assist enabled recomputes them.
                         rt.extra = RenderedTextExtraInfo::default();
                         rt.display_texture_stale = true;
                         self.raster_texture_generations

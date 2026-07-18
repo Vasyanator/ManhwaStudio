@@ -511,16 +511,71 @@ impl TypingTopPanelState {
                                 self.strict_pixel_movement = strict_pixel_movement;
                             }
                             self.draw_auto_typing_controls(ui);
-                            // TEMPORARY debug-only element ("Отладка центра"): intentionally not localized; remove together with the center-debug markers.
-                            let debug_center_toggle =
-                                ui.checkbox(&mut self.debug_center_markers, "Отладка центра");
-                            if debug_center_toggle.changed()
-                                && self.debug_center_markers
+                            // Centering assist ("Помочь с центровкой"): a page-anchored guide frame the
+                            // user drags to a bubble; the selected text layer stays centered in it.
+                            let centering_toggle = ui.checkbox(
+                                &mut self.centering_assist_enabled,
+                                t!("typing.panel.centering_assist_toggle"),
+                            );
+                            if centering_toggle.changed()
+                                && self.centering_assist_enabled
                                 && self.mode == TypingTopPanelMode::EditText
                             {
                                 // Toggled ON while editing: re-render the selected overlay immediately so
-                                // its centers are computed and the markers appear without another edit.
+                                // its mean/median centers are computed and the frame appears without
+                                // another edit.
                                 self.emit_edit_request();
+                            }
+                            if self.centering_assist_enabled {
+                                // Indented (visible only when enabled): the bound-center selector. Both
+                                // centers are already computed while enabled, so switching does NOT
+                                // re-render — the reconciliation re-binds the layer to the new center.
+                                ui.indent(Id::new("typing.panel.centering_kind_combo_label"), |ui| {
+                                    // "Показывать центр": gates ONLY the drawn bound-center marker; the
+                                    // frame, handles, and binding stay governed by the assist toggle.
+                                    ui.checkbox(
+                                        &mut self.centering_show_center,
+                                        t!("typing.panel.centering_show_center"),
+                                    );
+                                    let combo = WheelComboBox::from_label(t!(
+                                        "typing.panel.centering_kind_combo_label"
+                                    ))
+                                    .id_salt("typing.panel.centering_kind_combo_label")
+                                    .selected_text(match self.centering_assist_kind {
+                                        CenteringAssistCenterKind::Image => {
+                                            t!("typing.panel.centering_kind_image")
+                                        }
+                                        CenteringAssistCenterKind::Mean => {
+                                            t!("typing.panel.centering_kind_mean")
+                                        }
+                                        CenteringAssistCenterKind::Median => {
+                                            t!("typing.panel.centering_kind_median")
+                                        }
+                                    })
+                                    .show_ui_with_wheel(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.centering_assist_kind,
+                                            CenteringAssistCenterKind::Image,
+                                            t!("typing.panel.centering_kind_image"),
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.centering_assist_kind,
+                                            CenteringAssistCenterKind::Mean,
+                                            t!("typing.panel.centering_kind_mean"),
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.centering_assist_kind,
+                                            CenteringAssistCenterKind::Median,
+                                            t!("typing.panel.centering_kind_median"),
+                                        );
+                                    });
+                                    if let Some(steps) = combo.wheel_steps {
+                                        self.centering_assist_kind = cycle_centering_assist_kind(
+                                            self.centering_assist_kind,
+                                            steps,
+                                        );
+                                    }
+                                });
                             }
                         }
                         TypingActionsPanelTab::Layers => {
@@ -547,9 +602,10 @@ impl TypingTopPanelState {
             .ok_or_else(|| {
                 tf!("typing.errors.fonts_not_found", arg = self.create_panel.fonts_dir.display())
             })?;
-        // TEMPORARY debug-only: request the renderer's mean/median centers only while the "Отладка
-        // центра" flag is on (the default is the byte-identical no-compute fast path).
-        if self.debug_center_markers {
+        // Request the renderer's mean/median centers only while centering assist is on (the default is
+        // the byte-identical no-compute fast path). Both centers are always requested so the bound-center
+        // selector can switch without a re-render.
+        if self.centering_assist_enabled {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,
@@ -666,11 +722,34 @@ impl TypingTopPanelState {
         self.strict_pixel_movement
     }
 
-    /// TEMPORARY debug-only accessor for the "Отладка центра" flag. When `true`, production text
-    /// renders request the renderer's mean/median centers and the canvas draws center markers over the
-    /// selected text layer. Remove together with the center-debug markers when the feature ships.
-    pub(in crate::tabs::typing) fn debug_center_markers(&self) -> bool {
-        self.debug_center_markers
+    /// Whether centering assist ("Помочь с центровкой") is enabled. When `true`, production text
+    /// renders request the renderer's mean/median centers and the canvas draws the page-anchored guide
+    /// frame over the selected text layer.
+    pub(in crate::tabs::typing) fn centering_assist_enabled(&self) -> bool {
+        self.centering_assist_enabled
+    }
+
+    /// Which overlay center the assist frame currently binds to (image / mean / median).
+    pub(in crate::tabs::typing) fn centering_assist_kind(&self) -> CenteringAssistCenterKind {
+        self.centering_assist_kind
+    }
+
+    /// Whether the bound-center marker ("Показывать центр") is drawn. Gates ONLY the marker; the guide
+    /// frame, handles, and binding are governed by `centering_assist_enabled`. Read on exit to persist.
+    pub(in crate::tabs::typing) fn centering_show_center(&self) -> bool {
+        self.centering_show_center
+    }
+
+    /// Seeds BOTH persisted centering-assist flags ONCE at startup from `user_config.json`
+    /// (`TextTab.centering_assist_enabled` / `centering_show_center`). Must not be called every frame
+    /// (would override the user's live toggles). The bound-center KIND stays session-only.
+    pub(in crate::tabs::typing) fn set_centering_assist_persisted_state(
+        &mut self,
+        enabled: bool,
+        show_center: bool,
+    ) {
+        self.centering_assist_enabled = enabled;
+        self.centering_show_center = show_center;
     }
 
     pub(in crate::tabs::typing) fn sync_clean_overlays_visible_from_canvas(&mut self, visible: bool) {
@@ -727,9 +806,9 @@ impl TypingTopPanelState {
                 let Some(mut render_params) = self.edit_panel.build_render_params() else {
                     return;
                 };
-                // TEMPORARY debug-only: request the renderer's mean/median centers only while the
-                // "Отладка центра" flag is on (the default is the byte-identical no-compute fast path).
-                if self.debug_center_markers {
+                // Request the renderer's mean/median centers only while centering assist is on (the
+                // default is the byte-identical no-compute fast path).
+                if self.centering_assist_enabled {
                     render_params.extra_info = RenderExtraInfoRequest {
                         mean_center: true,
                         median_center: true,

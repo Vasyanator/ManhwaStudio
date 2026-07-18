@@ -397,11 +397,10 @@ impl TypingTextOverlayLayer {
             );
             return false;
         };
-        // TEMPORARY debug-only: this re-render lands in the live overlay runtime (via
-        // `apply_edit_overlay_render_result`), so request the renderer's mean/median centers while the
-        // "Отладка центра" flag is on to keep the markers live through Ctrl+wheel rotation / width drag /
-        // vector-transform settle. Remove with the center-debug feature.
-        if self.debug_center_markers {
+        // This re-render lands in the live overlay runtime (via `apply_edit_overlay_render_result`), so
+        // request the renderer's mean/median centers while centering assist is on to keep the frame's
+        // bound center live through Ctrl+wheel rotation / width drag / vector-transform settle.
+        if self.centering_assist_enabled {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

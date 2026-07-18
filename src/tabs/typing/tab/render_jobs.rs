@@ -778,7 +778,7 @@ impl TypingTextOverlayLayer {
             overlay.render_data_json = Some(result.render_data_json.clone());
             overlay.size_px = result.size_px;
             overlay.source_rgba = result.rgba.clone();
-            // TEMPORARY debug-only: update the center markers' data IN THE SAME block as `size_px`/
+            // Centering-assist centers: update the mean/median center data IN THE SAME block as `size_px`/
             // `source_rgba` so the centers and the pixels they index never fall out of sync. Image-effects
             // renders return default (all-`None`) extras, which correctly clears any stale text centers.
             overlay.extra = result.extra.clone();
@@ -966,11 +966,18 @@ impl TypingTextOverlayLayer {
         self.font_provider = provider;
     }
 
-    /// TEMPORARY debug-only: mirrors the top panel's "Отладка центра" flag onto the layer each frame so
-    /// the re-render dispatch sites (which run on `TypingTextOverlayLayer`, without panel access) can
-    /// request the renderer's mean/median centers. Remove together with the center-debug markers.
-    pub(in crate::tabs::typing) fn set_debug_center_markers(&mut self, on: bool) {
-        self.debug_center_markers = on;
+    /// Mirrors the top panel's centering-assist toggle + bound-center kind onto the layer each frame so
+    /// the re-render dispatch sites and the reconciliation (which run on `TypingTextOverlayLayer`,
+    /// without panel access) can request the renderer's mean/median centers and drive the guide frame.
+    pub(in crate::tabs::typing) fn set_centering_assist(
+        &mut self,
+        enabled: bool,
+        kind: CenteringAssistCenterKind,
+        show_center: bool,
+    ) {
+        self.centering_assist_enabled = enabled;
+        self.centering_assist_kind = kind;
+        self.centering_show_center = show_center;
     }
 
     pub(super) fn start_edit_overlay_render_job(&mut self, mut request: TypingEditOverlayRequest) {
@@ -1249,9 +1256,9 @@ impl TypingTextOverlayLayer {
         else {
             return;
         };
-        // TEMPORARY debug-only: the shape-variant apply lands in the live overlay runtime, so request the
-        // renderer's mean/median centers while the "Отладка центра" flag is on.
-        if self.debug_center_markers {
+        // The shape-variant apply lands in the live overlay runtime, so request the renderer's
+        // mean/median centers while centering assist is on.
+        if self.centering_assist_enabled {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

@@ -531,10 +531,9 @@ impl TypingTextOverlayLayer {
             ),
             None => return,
         };
-        // TEMPORARY debug-only: snapshot the "Отладка центра" flag before borrowing the overlay below, so
-        // the gated `extra_info` set does not conflict with the `&mut overlay` borrow. Remove with the
-        // center-debug feature.
-        let debug_center_markers = self.debug_center_markers;
+        // Snapshot the centering-assist flag before borrowing the overlay below, so the gated
+        // `extra_info` set does not conflict with the `&mut overlay` borrow.
+        let centering_assist_enabled = self.centering_assist_enabled;
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
             self.layout_editor = None;
             return;
@@ -554,9 +553,9 @@ impl TypingTextOverlayLayer {
             self.set_create_error(ctx, t!("typing.layout_editor.build_preview_params_error"));
             return;
         };
-        // TEMPORARY debug-only: this re-render lands in the live overlay runtime, so request the
-        // renderer's mean/median centers while the "Отладка центра" flag is on.
-        if debug_center_markers {
+        // This re-render lands in the live overlay runtime, so request the renderer's mean/median
+        // centers while centering assist is on.
+        if centering_assist_enabled {
             render_params.extra_info = RenderExtraInfoRequest {
                 mean_center: true,
                 median_center: true,

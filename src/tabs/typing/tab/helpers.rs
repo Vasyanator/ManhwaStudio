@@ -249,8 +249,10 @@ pub(super) fn text_runtime_from_doc_node(
         size_px,
         source_rgba,
         // A doc-materialized overlay carries no text-center info (the doc image has none by design); it
-        // is recomputed only on a re-render with the "Отладка центра" flag on.
+        // is recomputed only on a re-render with centering assist enabled.
         extra: RenderedTextExtraInfo::default(),
+        // No centering-assist frame until the reconciliation creates one for the selected overlay.
+        centering_frame: None,
         texture: None,
         display_texture_stale: true,
         last_texture_used_frame: 0,
@@ -275,8 +277,9 @@ pub(super) fn runtime_from_decoded(entry: TypingOverlayDecoded) -> TypingOverlay
         render_data_json: entry.render_data_json,
         size_px: entry.size_px,
         source_rgba: entry.rgba,
-        // TEMPORARY debug-only: carry the decoded overlay's mean/median centers for the center markers.
+        // Carry the decoded overlay's mean/median centers for the centering-assist marker/binding.
         extra: entry.extra,
+        centering_frame: None,
         texture: None,
         display_texture_stale: true,
         last_texture_used_frame: 0,

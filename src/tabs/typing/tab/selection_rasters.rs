@@ -1633,6 +1633,9 @@ impl TypingTextOverlayLayer {
             zoom,
             strict_pixel_movement,
         );
+        // An arrow nudge is an EXPLICIT layer move: the centering frame FOLLOWS the layer, so re-bind
+        // the frame center to the moved chosen center before the reconciliation can yank it back.
+        self.sync_centering_frame_to_layer(selected_idx, page_size);
         // EDIT (arrow-key nudge): deferred; held arrows mark every frame and write once on settle.
         self.mark_placement_save_dirty();
         ui.ctx().request_repaint();

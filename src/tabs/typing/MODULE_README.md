@@ -655,18 +655,47 @@ saving, and export.
   and (2) the PSD export LAYER NAMES in `psd_export.rs` (§A5 — written verbatim into the
   exported `.psd`, so the export format must not depend on the interface language). Each
   such site carries a justifying comment. Do not route them through the catalog.
-- TEMPORARY DEBUG ELEMENT — "Отладка центра" (center-debug markers). The «Действия» panel arm
-  (`panel/facade.rs`) hosts a non-localized `ui.checkbox` ("Отладка центра") on a transient
-  `TypingTopPanelState::debug_center_markers` flag (mirrored onto `TypingTextOverlayLayer` each frame).
-  When on, the production text renders request the renderer's mean/median centers
-  (`RenderExtraInfoRequest`) at the dispatch sites that land in the live overlay runtime (create, edit,
-  vector re-render / Ctrl+wheel / width drag, layout-editor re-render, shape-variant apply), the result
-  is plumbed through `TypingOverlayDecoded`/`TypingEditOverlayResult`/`TypingOverlayRuntime.extra`, and
-  `draw_page.rs::draw_center_debug_markers` paints plain/mean/median markers over the selected text layer.
-  REASON: to visually debug the new renderer center-info feature. SCOPE: debug-only; the label is
-  intentionally NOT localized. REMOVAL: delete the checkbox, the `debug_center_markers` flag/accessor/
-  mirror, the `extra` plumbing gate, and `draw_center_debug_markers` together when the consuming feature
-  ships.
+- CENTERING ASSIST ("Помочь с центровкой"). The «Действия» panel arm (`panel/facade.rs`) hosts a
+  localized `ui.checkbox` (`typing.panel.centering_assist_toggle`) on the transient
+  `TypingTopPanelState::centering_assist_enabled` flag plus an indented block holding a
+  "Показывать центр" `ui.checkbox` (`typing.panel.centering_show_center` →
+  `TypingTopPanelState::centering_show_center`, default TRUE) ABOVE a bound-center `WheelComboBox`
+  (`centering_assist_kind`: image / mean / median, default Mean; `centering_*` i18n keys). All three
+  are mirrored onto `TypingTextOverlayLayer` each frame (`set_centering_assist`). The show-center flag
+  gates ONLY the drawn bound-center marker (the red cross+circle in `draw_page.rs::draw_centering_assist`);
+  the guide frame, corner handles, binding/reconciliation, and renderer center computation stay governed
+  by `centering_assist_enabled` alone. PERSISTENCE: `centering_assist_enabled` and `centering_show_center`
+  persist in `user_config.json` under `TextTab` (keys `centering_assist_enabled`, `centering_show_center`),
+  seeded ONCE in `MangaApp::new` (via `TypingTabState::set_centering_assist_persisted_state`) and written
+  ONCE in `MangaApp::on_exit` (`persist_typing_centering_assist_state` → `config::update_user_config_file`,
+  the canonical locked RMW; enabled defaults absent→false, show-center absent→true). `centering_assist_kind`
+  stays SESSION-ONLY (not persisted). When enabled, the
+  production text renders request BOTH renderer centers (`RenderExtraInfoRequest`) at the five dispatch
+  sites landing in the live overlay runtime (create, edit, vector re-render / Ctrl+wheel / width drag,
+  layout-editor re-render, shape-variant apply); the result is carried on `TypingOverlayRuntime.extra`.
+  When OFF the feature keeps a negligible constant per-frame cost (the flag/kind mirror plus an
+  early-returning `reconcile_centering_frame` call); renders compute no centers and nothing is drawn.
+  STATE HOME: the guide frame is a transient `Option<CenteringFrame>` on `TypingOverlayRuntime`
+  (precedent: `extra`) — NEVER persisted and NOT reset on re-render (only the reconciliation reacts).
+  BINDING INVARIANT: while assist is on for the selected text overlay, the chosen center (page px,
+  computed by `mesh_geometry::centering_chosen_center_page_px`) equals the frame center.
+  `draw_page.rs::reconcile_centering_frame` runs once per frame (before `draw_entries`): it creates the
+  frame lazily, makes the frame FOLLOW a whole-layer move drag, and otherwise (re-render, rotation, kind
+  switch, corner-frame resize) leaves the frame anchored and translates the LAYER back. The anchored
+  move targets a FIXED POINT (`mesh_geometry::centering_reconcile_target_center`): the ideal target is
+  pre-clamped through the SAME constraints the later systems apply — the visibility limit
+  (`clamp_translation_within_visible`, shared with `enforce_overlay_visibility_limit`), strict-pixel
+  snapping, and the apply-step page/box clamp — then compared against the CURRENT center, so an
+  unreachable off-page frame center converges in one move (no ping-pong, no strict-pixel alternation)
+  and a move already at the fixed point marks nothing / requests no repaint. Deform meshes translate
+  RIGIDLY (`TypingOverlayDeformMesh::translate_rigid`, whole-box clamp, shape preserved) so repeated
+  reconciliation cannot cumulatively squash the mesh at a page edge. Corner handles
+  are hit-tested WITHIN the selected overlay's own `ui.interact` (a `centering_frame_drag` state, like
+  the width-guide/rotation handles) — NOT as separate later-registered widgets, because the overlay body
+  still senses `click_and_drag` and egui would not award the drag to a later overlapping widget (see the
+  in-file note at the vector-transform gate). All assist-driven layer moves DEFER their save via
+  `mark_placement_save_dirty` (never eager writes). Pure geometry (chosen-center mapping, frame corners,
+  corner-drag resize) lives in `tab/mesh_geometry.rs` and is unit-tested in `tab/tests.rs`.
 - Widget-id-deriving calls that show a localized label (`WheelComboBox::from_label`,
   `CollapsingHeader::new`, `egui::Window::new`) must seed a stable, language-independent
   id (`.id_salt("typing.…")` / `egui::Id::new`). `egui::ComboBox` has no `id_salt()`

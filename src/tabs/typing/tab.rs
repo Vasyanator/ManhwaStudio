@@ -80,8 +80,9 @@ use super::auto_typing::{
 };
 use super::mask::{TypingMaskExportPage, TypingMaskLayer};
 use super::panel::{
-    TypingCreateImageRequest, TypingEditTarget, TypingEditorFontSpec, TypingExportUiStatus,
-    TypingOverlayEditRequest, TypingOverlayKind, TypingPanelLayout, TypingSelectedOverlayForEdit,
+    CenteringAssistCenterKind, TypingCreateImageRequest, TypingEditTarget, TypingEditorFontSpec,
+    TypingExportUiStatus, TypingOverlayEditRequest, TypingOverlayKind, TypingPanelLayout,
+    TypingSelectedOverlayForEdit,
 };
 use super::render_next::{apply_effects_to_image, render_text_to_image};
 use super::render_next::{FontContentSet, FontProvider};
@@ -205,6 +206,23 @@ const TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX: f32 = 360.0;
 const TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX: f32 = 300.0;
 const TEXT_LAYOUT_EDITOR_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
 const TEXT_LAYOUT_EDITOR_FRAME_MIN_SIDE_PX: f32 = 24.0;
+/// Centering assist: the guide frame is created this factor larger than the layer footprint.
+const CENTERING_FRAME_DEFAULT_SCALE: f32 = 1.25;
+/// Centering assist: minimum half-size (page px) of the frame on each local axis (corner-drag clamp).
+const CENTERING_FRAME_MIN_HALF_SIZE_PX: f32 = 4.0;
+/// Centering assist: below this page-px gap the reconciliation treats the bound center as already on
+/// the frame center (no layer move).
+const CENTERING_RECONCILE_EPS_PX: f32 = 0.05;
+/// Centering assist: visual radius (screen px) of a hollow corner-handle ring.
+const CENTERING_FRAME_HANDLE_RADIUS_PX: f32 = 5.0;
+/// Centering assist: pointer hit radius (screen px) for a corner handle (~4x the visual radius).
+const CENTERING_FRAME_HANDLE_HIT_RADIUS_PX: f32 = 10.0;
+/// Minimum screen-px distance between the ROTATION handle center and a centering-frame corner
+/// handle center; the rotation handle is pushed further out along its own direction to keep it.
+/// = rotate visual radius + centering hit radius + margin, so the rings neither touch visually
+/// nor contest the same pointer position.
+const CENTERING_ROTATE_HANDLE_CLEARANCE_PX: f32 =
+    TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX + CENTERING_FRAME_HANDLE_HIT_RADIUS_PX + 4.0;
 const TEXT_LAYOUT_EDITOR_POINT_RADIUS_PX: f32 = 6.0;
 const TEXT_OVERLAY_DEFORM_SURFACE_COLS: usize = 13;
 const TEXT_OVERLAY_DEFORM_SURFACE_ROWS: usize = 13;
@@ -352,6 +370,26 @@ impl TypingOverlayDeformMesh {
         for point in &mut self.points_px {
             *point = clamp_page_point(*point, page_size);
         }
+    }
+
+    /// Rigidly shifts every control point by the largest part of `(dx_px, dy_px)` that keeps the mesh's
+    /// control-point bounding box inside the page's overlay bounds on each axis, and returns the applied
+    /// delta (page px). Unlike `translate`, it applies ONE shared delta with NO per-point clamp, so the
+    /// mesh's internal shape is preserved and repeated calls toward an unreachable target cannot
+    /// cumulatively squash the mesh against a page edge.
+    fn translate_rigid(&mut self, dx_px: f32, dy_px: f32, page_size: [usize; 2]) -> [f32; 2] {
+        let bounds = deform_mesh_bounds_px(self);
+        let allowed = rigid_box_in_page_delta(
+            [bounds.left(), bounds.top()],
+            [bounds.right(), bounds.bottom()],
+            [dx_px, dy_px],
+            page_size,
+        );
+        for point in &mut self.points_px {
+            point[0] += allowed[0];
+            point[1] += allowed[1];
+        }
+        allowed
     }
 }
 
@@ -627,6 +665,26 @@ impl TypingTabState {
     #[must_use]
     pub fn hint_collapsed(&self) -> bool {
         self.canvas.bottom_hint_collapsed()
+    }
+
+    /// Seeds BOTH persisted centering-assist flags ONCE at construction from `user_config`
+    /// (`TextTab.centering_assist_enabled` / `centering_show_center`). Must not be called every frame
+    /// (would override the user's live toggles). The bound-center KIND stays session-only.
+    pub fn set_centering_assist_persisted_state(&mut self, enabled: bool, show_center: bool) {
+        self.top_panel
+            .set_centering_assist_persisted_state(enabled, show_center);
+    }
+
+    /// Current "Помочь с центровкой" toggle, read on exit to persist to `user_config`.
+    #[must_use]
+    pub fn centering_assist_enabled(&self) -> bool {
+        self.top_panel.centering_assist_enabled()
+    }
+
+    /// Current "Показывать центр" toggle, read on exit to persist to `user_config`.
+    #[must_use]
+    pub fn centering_show_center(&self) -> bool {
+        self.top_panel.centering_show_center()
     }
 
     /// Sets this tab's canvas bottom-hint content for the current frame; `None` hides it.
@@ -1138,7 +1196,9 @@ impl CanvasHooks for TypingHooks<'_> {
             eyedropper_blocks_focus_clear,
             auto_typing_settings,
             self.top_panel.strict_pixel_movement(),
-            self.top_panel.debug_center_markers(),
+            self.top_panel.centering_assist_enabled(),
+            self.top_panel.centering_assist_kind(),
+            self.top_panel.centering_show_center(),
         );
         self.page_overlay_occluders.insert(page_idx, occluders);
     }
@@ -1157,10 +1217,14 @@ impl CanvasHooks for TypingHooks<'_> {
         // list so background renders resolve fonts by name (and pick up reloads).
         self.text_overlays
             .set_font_provider(self.top_panel.font_provider());
-        // TEMPORARY debug-only: mirror the panel's "Отладка центра" flag onto the layer so its re-render
-        // dispatch sites request the renderer's mean/median centers. Remove with the center-debug feature.
-        self.text_overlays
-            .set_debug_center_markers(self.top_panel.debug_center_markers());
+        // Mirror the panel's centering-assist toggle + bound-center kind onto the layer so its re-render
+        // dispatch sites request the renderer's mean/median centers and the reconciliation drives the
+        // guide frame.
+        self.text_overlays.set_centering_assist(
+            self.top_panel.centering_assist_enabled(),
+            self.top_panel.centering_assist_kind(),
+            self.top_panel.centering_show_center(),
+        );
         self.text_overlays.flush_edit_save_on_selection_change();
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
@@ -1785,14 +1849,73 @@ struct TypingOverlayRuntime {
     render_data_json: Option<Value>,
     size_px: [usize; 2],
     source_rgba: Vec<u8>,
-    /// TEMPORARY debug-only: renderer's mean/median centers (final-image px) for the currently rendered
-    /// pixels, else all-`None`. Read by `draw_center_debug_markers` for the "Отладка центра" markers,
-    /// and reset to default whenever `source_rgba`/`size_px` change without matching extras (doc
-    /// reconcile). Remove together with that feature.
+    /// Renderer's mean/median centers (final-image px) for the currently rendered pixels, else
+    /// all-`None`. Populated only while centering assist is enabled; consumed by the assist marker and
+    /// by the frame-binding reconciliation. Reset to default whenever `source_rgba`/`size_px` change
+    /// without matching extras (doc reconcile).
     extra: RenderedTextExtraInfo,
+    /// Transient page-anchored centering-assist guide frame for this overlay, or `None` when no frame
+    /// exists yet. NEVER persisted and NOT reset on re-render (the frame must survive re-renders; only
+    /// the reconciliation reacts to a chosen-center move). Created lazily by the reconciliation when
+    /// assist is on and this overlay is selected.
+    centering_frame: Option<CenteringFrame>,
     texture: Option<egui::TextureHandle>,
     display_texture_stale: bool,
     last_texture_used_frame: u64,
+}
+
+/// Transient page-anchored guide frame for the "Помочь с центровкой" (centering assist) feature.
+/// `center_page_px` is bound to the overlay's chosen center (image/mean/median); `half_size_page_px`
+/// is expressed in the frame's LOCAL (rotated) axes. Never persisted; stored per overlay on
+/// `TypingOverlayRuntime` (precedent: `extra`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct CenteringFrame {
+    pub(super) center_page_px: [f32; 2],
+    pub(super) half_size_page_px: [f32; 2],
+}
+
+/// The four draggable corners of a `CenteringFrame`, in the frame's LOCAL (unrotated) axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CenteringFrameCorner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+impl CenteringFrameCorner {
+    /// All four corners in a stable order matching `centering_frame_corners_page_px`.
+    pub(super) const ALL: [CenteringFrameCorner; 4] = [
+        CenteringFrameCorner::TopLeft,
+        CenteringFrameCorner::TopRight,
+        CenteringFrameCorner::BottomRight,
+        CenteringFrameCorner::BottomLeft,
+    ];
+
+    /// Local-axis sign of this corner: x = -1 (left) / +1 (right), y = -1 (top) / +1 (bottom).
+    pub(super) fn sign(self) -> [f32; 2] {
+        match self {
+            CenteringFrameCorner::TopLeft => [-1.0, -1.0],
+            CenteringFrameCorner::TopRight => [1.0, -1.0],
+            CenteringFrameCorner::BottomRight => [1.0, 1.0],
+            CenteringFrameCorner::BottomLeft => [-1.0, 1.0],
+        }
+    }
+}
+
+/// Active drag of a centering-frame corner handle. Separate from `TypingOverlayDragState` (the
+/// placement/geometry drag) because resizing the frame is not an overlay-transform mutation: it
+/// resizes the transient frame while the per-frame reconciliation moves the LAYER to keep the bound
+/// center on the (possibly moved) frame center — exactly like the anchored branch. `start_frame` is
+/// captured at drag start so the OPPOSITE corner stays fixed throughout the drag.
+#[derive(Debug, Clone, Copy)]
+struct TypingCenteringFrameDragState {
+    overlay_idx: usize,
+    page_idx: usize,
+    corner: CenteringFrameCorner,
+    start_frame: CenteringFrame,
+    /// Total VISUAL rotation (raster `angle_deg` + vector `global_rotation_deg`) captured at drag start.
+    total_angle_deg: f32,
 }
 
 impl TypingOverlayRuntime {
@@ -2227,11 +2350,19 @@ pub(super) struct TypingTextOverlayLayer {
     /// no export is pending. The clip-mask snapshot is intentionally NOT stored here — it is captured at
     /// the actual run point (`TypingTabState::run_pending_export_if_ready`), so it reflects final state.
     pending_export_after_preload: Option<PendingTypingExport>,
-    /// TEMPORARY debug-only mirror of the top panel's "Отладка центра" flag, synced each frame from
-    /// `TypingTopPanelState::debug_center_markers` so the layer's re-render dispatch sites (which run on
-    /// `TypingTextOverlayLayer`, without panel access) can request the renderer's mean/median centers and
-    /// draw the center markers. Transient; remove together with the center-debug feature.
-    debug_center_markers: bool,
+    /// Mirror of the top panel's centering-assist toggle, synced each frame from
+    /// `TypingTopPanelState::centering_assist_enabled` so the layer's re-render dispatch sites and the
+    /// per-frame reconciliation (which run on `TypingTextOverlayLayer`, without panel access) can request
+    /// the renderer's mean/median centers and drive the guide frame. Transient.
+    centering_assist_enabled: bool,
+    /// Mirror of the top panel's bound-center kind (image/mean/median). Selects both the drawn marker
+    /// and the frame-bound center point. Transient.
+    centering_assist_kind: CenteringAssistCenterKind,
+    /// Mirror of the top panel's "Показывать центр" flag. Gates ONLY the drawn bound-center marker; the
+    /// guide frame, handles, and binding stay governed by `centering_assist_enabled`. Transient.
+    centering_show_center: bool,
+    /// Active centering-frame corner-handle drag, if any. Mutually exclusive with the placement drag.
+    centering_frame_drag: Option<TypingCenteringFrameDragState>,
 }
 
 impl Default for TypingTextOverlayLayer {
@@ -2320,7 +2451,10 @@ impl Default for TypingTextOverlayLayer {
             preload_all_state: None,
             preload_all_progress: (0, 0),
             pending_export_after_preload: None,
-            debug_center_markers: false,
+            centering_assist_enabled: false,
+            centering_assist_kind: CenteringAssistCenterKind::Mean,
+            centering_show_center: true,
+            centering_frame_drag: None,
         }
     }
 }

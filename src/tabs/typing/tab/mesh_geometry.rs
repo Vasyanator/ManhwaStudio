@@ -12,7 +12,12 @@ Main responsibilities:
 - hit-test transform handles and classify pointer targets across text/raster
   overlays;
 - sample and deform quad/mesh control points, and convert between page, scene,
-  and UV coordinate spaces with clamping.
+  and UV coordinate spaces with clamping;
+- centering-assist ("Помочь с центровкой") pure math: chosen-center mapping
+  (`centering_chosen_center_page_px` incl. the affine + deform-mesh cases and the
+  image/mean/median fallback), guide-frame corner positions
+  (`centering_frame_corners_page_px`), and the opposite-corner-fixed corner-drag
+  resize (`centering_frame_corner_drag`). Interaction/drawing live in `draw_page.rs`.
 
 Key enums:
 - SampledHandleMode
@@ -27,32 +32,57 @@ module's types and imports.
 
 use super::*;
 
-pub(super) fn draw_dashed_selection_path(painter: &egui::Painter, path: &[Pos2]) {
+/// Dark half of the width-guide dash pair (deep blue, visible on light backgrounds).
+pub(super) const WIDTH_GUIDE_DASH_DARK: Color32 = Color32::from_rgb(0x1E, 0x3C, 0xB4);
+/// Bright half of the width-guide dash pair (orange, visible on dark/mid-gray backgrounds).
+pub(super) const WIDTH_GUIDE_DASH_BRIGHT: Color32 = Color32::from_rgb(0xFF, 0x96, 0x00);
+/// Dark half of the centering-frame dash pair (deep purple, visible on light backgrounds).
+pub(super) const CENTERING_FRAME_DASH_DARK: Color32 = Color32::from_rgb(0x78, 0x1E, 0xB4);
+/// Bright half of the centering-frame dash pair (cyan, visible on dark/mid-gray backgrounds).
+pub(super) const CENTERING_FRAME_DASH_BRIGHT: Color32 = Color32::from_rgb(0x00, 0xC8, 0xE6);
+
+/// Draws `path` as an alternating two-color dashed polyline: `dark` dashes with the
+/// `bright` dashes offset by exactly one dash length so they fill the gaps. Pairing a
+/// dark and a bright color guarantees at least one of them contrasts on any page
+/// background (white paper, black ink, gray screentones).
+pub(super) fn draw_dashed_path_with_colors(
+    painter: &egui::Painter,
+    path: &[Pos2],
+    dark: Color32,
+    bright: Color32,
+) {
     if path.len() < 2 {
         return;
     }
     let dash_length = 8.0;
     let gap_length = 6.0;
-    let white_offset = dash_length;
+    let bright_offset = dash_length;
     let mut shapes = Vec::new();
     for segment in path.windows(2) {
         egui::Shape::dashed_line_many(
             segment,
-            Stroke::new(2.0, Color32::BLACK),
+            Stroke::new(2.0, dark),
             dash_length,
             gap_length,
             &mut shapes,
         );
         egui::Shape::dashed_line_many_with_offset(
             segment,
-            Stroke::new(2.0, Color32::WHITE),
+            Stroke::new(2.0, bright),
             &[dash_length],
             &[gap_length],
-            white_offset,
+            bright_offset,
             &mut shapes,
         );
     }
     painter.extend(shapes);
+}
+
+/// Black-white variant of [`draw_dashed_path_with_colors`], reserved for the SELECTION
+/// outline (the width guide and centering frame use their own color pairs so the three
+/// dashed decorations stay tellable apart).
+pub(super) fn draw_dashed_selection_path(painter: &egui::Painter, path: &[Pos2]) {
+    draw_dashed_path_with_colors(painter, path, Color32::BLACK, Color32::WHITE);
 }
 
 /// Draws the dashed "specified width" guide line + "N px" label above a selected text overlay.
@@ -78,20 +108,29 @@ pub(super) fn draw_text_overlay_width_guide(
     let tick_top_y = line_y - TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX;
     let tick_bottom_y = line_y + TEXT_OVERLAY_WIDTH_GUIDE_TICK_HALF_PX;
 
-    draw_dashed_selection_path(
+    draw_dashed_path_with_colors(
         painter,
         &[
             Pos2::new(left.x, tick_top_y),
             Pos2::new(left.x, tick_bottom_y),
         ],
+        WIDTH_GUIDE_DASH_DARK,
+        WIDTH_GUIDE_DASH_BRIGHT,
     );
-    draw_dashed_selection_path(painter, &[left, right]);
-    draw_dashed_selection_path(
+    draw_dashed_path_with_colors(
+        painter,
+        &[left, right],
+        WIDTH_GUIDE_DASH_DARK,
+        WIDTH_GUIDE_DASH_BRIGHT,
+    );
+    draw_dashed_path_with_colors(
         painter,
         &[
             Pos2::new(right.x, tick_top_y),
             Pos2::new(right.x, tick_bottom_y),
         ],
+        WIDTH_GUIDE_DASH_DARK,
+        WIDTH_GUIDE_DASH_BRIGHT,
     );
 
     let label = format!("{} px", render_width_px.max(1));
@@ -407,8 +446,58 @@ pub(super) fn draw_textured_deform_mesh_wire(painter: &egui::Painter, mesh_scene
     }
 }
 
+/// Pushes the rotation handle OUT along its own corner->handle direction until its center is
+/// at least `clearance` away from every obstacle point (the centering-frame corner handles) —
+/// the rotation handle is the one that yields, so the two handle sets never overlap. Exact
+/// single pass: each obstacle's `< clearance` zone cuts a ray-parameter interval
+/// (circle-ray intersection); walking `t` forward past every interval containing it lands on
+/// the nearest clear spot. A degenerate direction falls back to +X.
+pub(super) fn push_rotation_handle_clear(
+    corner: Pos2,
+    handle: Pos2,
+    obstacles: &[Pos2],
+    clearance: f32,
+) -> Pos2 {
+    let raw_dir = handle - corner;
+    let dir = if raw_dir.length_sq() <= f32::EPSILON {
+        Vec2::new(1.0, 0.0)
+    } else {
+        raw_dir.normalized()
+    };
+    let mut intervals: Vec<(f32, f32)> = obstacles
+        .iter()
+        .filter_map(|obstacle| {
+            let rel = *obstacle - handle;
+            let along = rel.dot(dir);
+            let perp_sq = (rel.length_sq() - along * along).max(0.0);
+            let half_sq = clearance * clearance - perp_sq;
+            if half_sq <= 0.0 {
+                // The ray never comes closer than `clearance` to this obstacle.
+                return None;
+            }
+            let half = half_sq.sqrt();
+            Some((along - half, along + half))
+        })
+        .collect();
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut t = 0.0f32;
+    for (start, end) in intervals {
+        // Sorted by start, so one forward pass resolves the union of overlapping intervals.
+        if start <= t && t < end {
+            t = end;
+        }
+    }
+    handle + dir * t
+}
+
 pub(super) fn draw_rotation_handle(painter: &egui::Painter, quad: &[Pos2; 4], image_rect: Rect) {
     let (corner, handle) = rotation_handle_scene_with_corner(quad, image_rect);
+    draw_rotation_handle_at(painter, corner, handle);
+}
+
+/// Paints the rotation handle at a precomputed position (the text-overlay pass adjusts
+/// `handle` away from the centering-frame corner handles before drawing).
+pub(super) fn draw_rotation_handle_at(painter: &egui::Painter, corner: Pos2, handle: Pos2) {
     painter.line_segment(
         [corner, handle],
         Stroke::new(2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180)),
@@ -922,10 +1011,6 @@ pub(super) fn quad_center_scene(quad: &[Pos2; 4]) -> Pos2 {
     Pos2::new(sum_x / 4.0, sum_y / 4.0)
 }
 
-pub(super) fn rotation_handle_scene(quad: &[Pos2; 4], image_rect: Rect) -> Pos2 {
-    rotation_handle_scene_with_corner(quad, image_rect).1
-}
-
 pub(super) fn rotation_handle_scene_with_corner(quad: &[Pos2; 4], image_rect: Rect) -> (Pos2, Pos2) {
     let corner_idx = select_rotation_handle_corner(quad, image_rect);
     let corner = quad[corner_idx];
@@ -1149,6 +1234,320 @@ pub(super) fn overlay_scene_geometry(
         mesh_cols: deform_mesh.cols,
         mesh_rows: deform_mesh.rows,
         bounds_rect,
+    }
+}
+
+// ===================== Centering assist geometry (pure) =====================
+// The "Помочь с центровкой" (centering assist) feature anchors a guide FRAME to the page and keeps a
+// chosen text center bound to the frame center. These are the pure math primitives; the interaction,
+// drawing, and per-frame reconciliation live in `draw_page.rs`, the state on `TypingOverlayRuntime`.
+
+/// Rotates a page-space vector by `angle_deg` about the origin. Matches the screen y-down rotation of
+/// `default_overlay_quad_scene`, so a page-px offset rotates consistently with the drawn overlay quad.
+pub(super) fn rotate_page_vec_deg(v: [f32; 2], angle_deg: f32) -> [f32; 2] {
+    let (sin_a, cos_a) = angle_deg.to_radians().sin_cos();
+    [v[0] * cos_a - v[1] * sin_a, v[0] * sin_a + v[1] * cos_a]
+}
+
+/// The chosen center in IMAGE pixels for `kind`, falling back to the plain geometric image center
+/// (`size_px / 2`) when the requested renderer metric is absent (mean/median not computed).
+pub(super) fn centering_chosen_img_px(
+    size_px: [usize; 2],
+    extra: &RenderedTextExtraInfo,
+    kind: CenteringAssistCenterKind,
+) -> [f32; 2] {
+    // Image dimensions are far below f32's 2^24 integer-exact range, so `usize as f32` is lossless.
+    let plain = [size_px[0] as f32 * 0.5, size_px[1] as f32 * 0.5];
+    match kind {
+        CenteringAssistCenterKind::Image => plain,
+        CenteringAssistCenterKind::Mean => extra.mean_center.unwrap_or(plain),
+        CenteringAssistCenterKind::Median => extra.median_center.unwrap_or(plain),
+    }
+}
+
+/// Maps a chosen image-pixel point to PAGE pixels for an AFFINE (non-deform) placement:
+/// `center + R(angle) * ((chosen_img - size/2) * user_scale)`. `angle_deg` is the RASTER angle only —
+/// vector `global_rotation_deg` is already baked into the pixels and into `extra`.
+pub(super) fn affine_chosen_center_page_px(
+    center_page_px: [f32; 2],
+    size_px: [usize; 2],
+    user_scale: f32,
+    angle_deg: f32,
+    chosen_img_px: [f32; 2],
+) -> [f32; 2] {
+    // Image dimensions are far below f32's 2^24 integer-exact range, so `usize as f32` is lossless.
+    let half = [size_px[0] as f32 * 0.5, size_px[1] as f32 * 0.5];
+    let local = [
+        (chosen_img_px[0] - half[0]) * user_scale,
+        (chosen_img_px[1] - half[1]) * user_scale,
+    ];
+    let rotated = rotate_page_vec_deg(local, angle_deg);
+    [center_page_px[0] + rotated[0], center_page_px[1] + rotated[1]]
+}
+
+/// Bilinear interpolation of a page-space quad `[TL, TR, BR, BL]` at `(s, t)` in `[0, 1]`.
+pub(super) fn bilinear_page_quad(quad: [[f32; 2]; 4], s: f32, t: f32) -> [f32; 2] {
+    let lerp2 = |a: [f32; 2], b: [f32; 2], k: f32| [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k];
+    let top = lerp2(quad[0], quad[1], s);
+    let bottom = lerp2(quad[3], quad[2], s);
+    lerp2(top, bottom, t)
+}
+
+/// The overlay's bound center in PAGE pixels for `kind`. Handles both the affine placement and the
+/// deform-mesh (bilinear over the four outer quad corners) approximation, with the kind-based
+/// image-px fallback. This is the point the centering frame binds to.
+pub(super) fn centering_chosen_center_page_px(
+    overlay: &TypingOverlayRuntime,
+    kind: CenteringAssistCenterKind,
+    page_size: [usize; 2],
+) -> [f32; 2] {
+    let chosen_img = centering_chosen_img_px(overlay.size_px, &overlay.extra, kind);
+    if overlay.deform_mesh.is_some() {
+        let mesh = overlay_deform_mesh_for_page(overlay, page_size);
+        let quad = [
+            mesh.point(0, 0),
+            mesh.point(mesh.cols - 1, 0),
+            mesh.point(mesh.cols - 1, mesh.rows - 1),
+            mesh.point(0, mesh.rows - 1),
+        ];
+        // Image dimensions are far below f32's 2^24 integer-exact range, so `usize as f32` is lossless.
+        let w = overlay.size_px[0].max(1) as f32;
+        let h = overlay.size_px[1].max(1) as f32;
+        bilinear_page_quad(
+            quad,
+            (chosen_img[0] / w).clamp(0.0, 1.0),
+            (chosen_img[1] / h).clamp(0.0, 1.0),
+        )
+    } else {
+        affine_chosen_center_page_px(
+            overlay.center_page_px,
+            overlay.size_px,
+            overlay.user_scale.max(0.01),
+            overlay.angle_deg,
+            chosen_img,
+        )
+    }
+}
+
+/// The four PAGE-px corners of a centering frame `[TL, TR, BR, BL]`, rotated by `total_angle_deg`
+/// (raster `angle_deg` + vector `global_rotation_deg`).
+pub(super) fn centering_frame_corners_page_px(
+    frame: &CenteringFrame,
+    total_angle_deg: f32,
+) -> [[f32; 2]; 4] {
+    CenteringFrameCorner::ALL.map(|corner| {
+        let sign = corner.sign();
+        let local = [
+            sign[0] * frame.half_size_page_px[0],
+            sign[1] * frame.half_size_page_px[1],
+        ];
+        let rotated = rotate_page_vec_deg(local, total_angle_deg);
+        [frame.center_page_px[0] + rotated[0], frame.center_page_px[1] + rotated[1]]
+    })
+}
+
+/// Resizes a rotated centering frame by dragging `corner` to `pointer_page_px`. The OPPOSITE corner
+/// stays FIXED in page space; the new `(center, half_size)` (half in the frame's local rotated axes)
+/// is returned. Each local half-size is clamped to at least `min_half_size_px`, keeping the fixed
+/// corner fixed even when the frame is collapsed.
+pub(super) fn centering_frame_corner_drag(
+    start_center_page_px: [f32; 2],
+    start_half_size_page_px: [f32; 2],
+    corner: CenteringFrameCorner,
+    pointer_page_px: [f32; 2],
+    total_angle_deg: f32,
+    min_half_size_px: f32,
+) -> ([f32; 2], [f32; 2]) {
+    // Unrotate the pointer into the frame's LOCAL axes about the OLD center.
+    let rel = [
+        pointer_page_px[0] - start_center_page_px[0],
+        pointer_page_px[1] - start_center_page_px[1],
+    ];
+    let p_local = rotate_page_vec_deg(rel, -total_angle_deg);
+    // The opposite (fixed) corner's local coords are `-sign * half`.
+    let sign = corner.sign();
+    let o_local = [
+        -sign[0] * start_half_size_page_px[0],
+        -sign[1] * start_half_size_page_px[1],
+    ];
+    // New half-size per axis from the two opposite corners, clamped to a minimum.
+    let half = [
+        ((p_local[0] - o_local[0]).abs() * 0.5).max(min_half_size_px),
+        ((p_local[1] - o_local[1]).abs() * 0.5).max(min_half_size_px),
+    ];
+    // Keep the fixed corner truly fixed: place the new center one half-size from it toward the dragged
+    // corner. (When not clamped this equals the midpoint of the two corners.)
+    let dir = [
+        if p_local[0] >= o_local[0] { 1.0 } else { -1.0 },
+        if p_local[1] >= o_local[1] { 1.0 } else { -1.0 },
+    ];
+    let center_local = [o_local[0] + dir[0] * half[0], o_local[1] + dir[1] * half[1]];
+    let rotated = rotate_page_vec_deg(center_local, total_angle_deg);
+    let center = [
+        start_center_page_px[0] + rotated[0],
+        start_center_page_px[1] + rotated[1],
+    ];
+    (center, half)
+}
+
+/// Clamps a desired translation of `bounds` (same units as `region`) so at least `fraction` of the box
+/// stays inside `region` on each axis after the move. Returns the constrained `(dx, dy)`.
+///
+/// A zero desired delta reproduces the pull-back `enforce_overlay_visibility_limit` applies to an
+/// already-off-region box (its extracted core); a non-zero delta yields a target the visibility limiter
+/// will then leave in place — the shared invariant that stops the centering-assist reconcile/limiter
+/// ping-pong. A box far larger than `region` under `fraction` cannot satisfy the constraint by
+/// translation, so its near edge is kept put (no panic on an inverted clamp range).
+pub(super) fn clamp_translation_within_visible(
+    bounds: Rect,
+    region: Rect,
+    fraction: f32,
+    desired_dx: f32,
+    desired_dy: f32,
+) -> (f32, f32) {
+    let clamp_axis =
+        |box_lo: f32, box_len: f32, region_lo: f32, region_hi: f32, desired: f32| -> f32 {
+            let min_visible = box_len * fraction;
+            // Feasible range for the box's near edge: from "mostly past the far side" to "mostly before
+            // the near side", leaving `min_visible` inside `region`.
+            let lo = region_lo + min_visible - box_len;
+            let hi = region_hi - min_visible;
+            let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+            (box_lo + desired).clamp(lo, hi) - box_lo
+        };
+    (
+        clamp_axis(
+            bounds.left(),
+            bounds.width(),
+            region.left(),
+            region.right(),
+            desired_dx,
+        ),
+        clamp_axis(
+            bounds.top(),
+            bounds.height(),
+            region.top(),
+            region.bottom(),
+            desired_dy,
+        ),
+    )
+}
+
+/// Clamps a rigid translation `delta` (page px) so the control-point bounding box `[box_min, box_max]`
+/// stays within the page's overlay bounds (the same extended range `clamp_page_point` enforces) on each
+/// axis. Returns the allowed `(dx, dy)`; an axis where the box is already wider than the allowed span
+/// yields zero (translation cannot make it fit, so it must not shift). Preserves shape: callers shift
+/// ALL points by the returned delta, never per point.
+pub(super) fn rigid_box_in_page_delta(
+    box_min: [f32; 2],
+    box_max: [f32; 2],
+    delta: [f32; 2],
+    page_size: [usize; 2],
+) -> [f32; 2] {
+    [
+        rigid_axis_delta(delta[0], box_min[0], box_max[0], page_size[0]),
+        rigid_axis_delta(delta[1], box_min[1], box_max[1], page_size[1]),
+    ]
+}
+
+/// One-axis rigid clamp for `rigid_box_in_page_delta`: the allowed shift keeps `[box_min, box_max]`
+/// within `[overlay_uv_min * side, overlay_uv_max * side]`; zero when the box already exceeds that span.
+fn rigid_axis_delta(delta: f32, box_min: f32, box_max: f32, side_px: usize) -> f32 {
+    // Page side is far below f32's 2^24 integer-exact range, so `usize as f32` is lossless.
+    let side = side_px.max(1) as f32;
+    let lo = overlay_uv_min() * side - box_min;
+    let hi = overlay_uv_max() * side - box_max;
+    if lo > hi { 0.0 } else { delta.clamp(lo, hi) }
+}
+
+/// Fixed-point target CENTER (page px) for one centering-assist reconciliation step.
+///
+/// Forms the ideal target `current_center + (frame_center - chosen)` (which would place the chosen bound
+/// center exactly on the frame center), then pushes it through the SAME constraints the downstream
+/// position-correcting systems apply afterwards: the visibility limit (`enforce_overlay_visibility_limit`)
+/// and, under `strict_pixel_movement`, whole-pixel snapping — plus the apply-step clamp (a deform mesh
+/// translates rigidly so its whole control-point box stays on the page; an affine placement clamps its
+/// center to the page). `bounds` is the overlay's current page-px extent (`centering_overlay_page_bounds`).
+///
+/// Because both the chosen center and the bounding box translate rigidly with the center, the ideal
+/// target is INDEPENDENT of the current center; the returned target is therefore a fixed point — feeding
+/// it back yields itself. Callers move only when it differs from the current center by more than the
+/// reconcile epsilon, so an unreachable (off-page) frame center converges in ONE move with no ping-pong.
+pub(super) fn centering_reconcile_target_center(
+    current_center: [f32; 2],
+    chosen: [f32; 2],
+    frame_center: [f32; 2],
+    bounds: Rect,
+    is_deform: bool,
+    strict_pixel_movement: bool,
+    page_size: [usize; 2],
+) -> [f32; 2] {
+    // Page dimensions are far below f32's 2^24 integer-exact range, so `usize as f32` is lossless.
+    let page_w = page_size[0].max(1) as f32;
+    let page_h = page_size[1].max(1) as f32;
+    let region = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(page_w, page_h));
+    let box_min = [bounds.left(), bounds.top()];
+    let box_max = [bounds.right(), bounds.bottom()];
+
+    // (a) Visibility limit: clamp the desired move so the overlay stays as visible as the limiter
+    // requires, so the limiter will not pull the result back next frame.
+    let desired_dx = frame_center[0] - chosen[0];
+    let desired_dy = frame_center[1] - chosen[1];
+    let (vdx, vdy) = clamp_translation_within_visible(
+        bounds,
+        region,
+        TEXT_OVERLAY_MIN_VISIBLE_FRACTION,
+        desired_dx,
+        desired_dy,
+    );
+
+    // Second constraint mirrors the APPLY step so target == what actually lands.
+    let apply = |dx: f32, dy: f32| -> [f32; 2] {
+        if is_deform {
+            let allowed = rigid_box_in_page_delta(box_min, box_max, [dx, dy], page_size);
+            [current_center[0] + allowed[0], current_center[1] + allowed[1]]
+        } else {
+            clamp_page_point([current_center[0] + dx, current_center[1] + dy], page_size)
+        }
+    };
+    let mut target = apply(vdx, vdy);
+
+    // (b) Whole-pixel snapping under strict mode, re-applying the apply-step clamp so the snapped target
+    // is still feasible (matches what strict-mode snapping produces downstream).
+    if strict_pixel_movement {
+        let snapped = [target[0].round(), target[1].round()];
+        target = apply(snapped[0] - current_center[0], snapped[1] - current_center[1]);
+    }
+    target
+}
+
+/// The overlay's current page-px axis-aligned extent used by the centering-assist reconciliation. For a
+/// deform mesh it is the raw control-point bounding box (what the rigid translate keeps on the page);
+/// for an affine placement it is the drawn quad's bounds converted from scene to page px. Both match the
+/// extents the visibility limiter / rigid translate reason about.
+pub(super) fn centering_overlay_page_bounds(
+    overlay: &TypingOverlayRuntime,
+    image_rect: Rect,
+    zoom: f32,
+    page_size: [usize; 2],
+) -> Rect {
+    if overlay.deform_mesh.is_some() {
+        let mesh = overlay_deform_mesh_for_page(overlay, page_size);
+        deform_mesh_bounds_px(&mesh)
+    } else {
+        let z = zoom.max(f32::EPSILON);
+        let bounds = quad_bounds(&default_overlay_quad_scene(overlay, image_rect, zoom));
+        let to_page = |x: f32, origin: f32| (x - origin) / z;
+        Rect::from_min_max(
+            Pos2::new(
+                to_page(bounds.left(), image_rect.left()),
+                to_page(bounds.top(), image_rect.top()),
+            ),
+            Pos2::new(
+                to_page(bounds.right(), image_rect.left()),
+                to_page(bounds.bottom(), image_rect.top()),
+            ),
+        )
     }
 }
 

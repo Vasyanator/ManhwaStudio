@@ -460,11 +460,18 @@ pub struct TypingTopPanelState {
     auto_typing_debug_visuals: bool,
     auto_typing_extra_downward_shift_percent: f32,
     strict_pixel_movement: bool,
-    /// TEMPORARY debug-only flag ("Отладка центра"): when on, production text renders request the
-    /// renderer's mean/median centers and the canvas draws center markers over the selected text layer.
-    /// Transient (NOT persisted), like `auto_typing_debug_visuals`. Remove together with the center-debug
-    /// markers when the consuming feature ships.
-    debug_center_markers: bool,
+    /// "Помочь с центровкой" (centering assist) toggle. When on, production text renders request the
+    /// renderer's mean/median centers, the canvas draws a page-anchored guide frame with corner handles
+    /// over the selected text layer, and the layer stays centered on the bound center across re-renders.
+    /// Transient (NOT persisted), like `auto_typing_debug_visuals`.
+    centering_assist_enabled: bool,
+    /// Which overlay center the assist frame binds to (image / mean / median). Transient; default `Mean`.
+    centering_assist_kind: CenteringAssistCenterKind,
+    /// "Показывать центр" (show center) toggle inside the centering-assist block. Gates ONLY the drawn
+    /// bound-center marker (the red cross+circle); the guide frame, corner handles, binding, and
+    /// renderer center computation stay governed by `centering_assist_enabled` alone. Persisted in
+    /// `user_config.json` (`TextTab.centering_show_center`); default `true`.
+    centering_show_center: bool,
     /// Typesetting language the cached font coverage (`FontEntry.coverage`) was
     /// computed against. Font coverage is cached at load time, so a runtime change
     /// of `ms_text_util::language::text_language()` would leave it stale; `draw`
@@ -529,6 +536,34 @@ pub(super) enum TypingEditTarget {
 pub(super) enum TypingOverlayKind {
     Text,
     Image,
+}
+
+/// Which overlay center the "Помочь с центровкой" (centering assist) guide frame is BOUND to. The
+/// selected kind chooses both the drawn marker and the point kept on the frame center. `Mean`/`Median`
+/// come from the renderer's extra-info; when that metric is absent they fall back to the plain image
+/// center (`Image`). Transient UI state (not persisted); default `Mean`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum CenteringAssistCenterKind {
+    Image,
+    Mean,
+    Median,
+}
+
+/// Cycles the bound-center kind by `steps` mouse-wheel notches (positive = forward), wrapping around
+/// the three kinds. Used by the panel's `WheelComboBox` wheel handler.
+pub(super) fn cycle_centering_assist_kind(
+    current: CenteringAssistCenterKind,
+    steps: i32,
+) -> CenteringAssistCenterKind {
+    const ORDER: [CenteringAssistCenterKind; 3] = [
+        CenteringAssistCenterKind::Image,
+        CenteringAssistCenterKind::Mean,
+        CenteringAssistCenterKind::Median,
+    ];
+    let current_idx = ORDER.iter().position(|k| *k == current).unwrap_or(0);
+    let len = i32::try_from(ORDER.len()).unwrap_or(1).max(1);
+    let next_idx = (i32::try_from(current_idx).unwrap_or(0) + steps).rem_euclid(len);
+    ORDER[usize::try_from(next_idx).unwrap_or(0)]
 }
 
 pub(super) enum TypingOverlayEditRequest {
@@ -597,7 +632,9 @@ impl Default for TypingTopPanelState {
             auto_typing_debug_visuals: false,
             auto_typing_extra_downward_shift_percent: 0.0,
             strict_pixel_movement: true,
-            debug_center_markers: false,
+            centering_assist_enabled: false,
+            centering_assist_kind: CenteringAssistCenterKind::Mean,
+            centering_show_center: true,
             coverage_language: text_language(),
         }
     }

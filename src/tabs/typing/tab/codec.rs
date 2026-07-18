@@ -1767,6 +1767,20 @@ pub(super) fn overlay_render_data_width_hint(render_data: Option<&Value>, fallba
         .unwrap_or_else(|| fallback_width_px.max(1))
 }
 
+/// Reads the vector `global_rotation_deg` from an overlay's `render_data_json`, defaulting to 0 when
+/// absent (image overlays, legacy projects). Used to compose the centering frame's VISUAL rotation
+/// (raster `angle_deg` + this). Cheap traversal, safe to call per frame — mirrors
+/// `overlay_render_data_width_hint`.
+pub(super) fn overlay_render_data_global_rotation_deg(render_data: Option<&Value>) -> f32 {
+    render_data
+        .and_then(Value::as_object)
+        .and_then(|rd| rd.get("text_params"))
+        .and_then(Value::as_object)
+        .and_then(|tp| tp.get("global_rotation_deg"))
+        .and_then(value_as_f32)
+        .unwrap_or(0.0)
+}
+
 pub(super) fn parse_overlay_kind(obj: &serde_json::Map<String, Value>) -> TypingOverlayKind {
     match obj
         .get("overlay_type")
