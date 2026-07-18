@@ -128,6 +128,23 @@ pub(super) fn font_in_group(font: &FontEntry, group: &str) -> bool {
     font.groups.iter().any(|g| g.as_deref() == Some(group))
 }
 
+/// Matches a font by its display label OR file-stem, case-insensitively.
+///
+/// `label_norm` MUST already be trimmed and lowercased by the caller (so the
+/// comparison stays allocation-light across the whole font list). Inline
+/// `<font=…>` tags identify a font only by this display label, which is
+/// intentionally ambiguous (a file stem can repeat inside and outside a group),
+/// so callers that must disambiguate should prefer a scoped lookup.
+pub(super) fn font_matches_label(font: &FontEntry, label_norm: &str) -> bool {
+    font.label.to_ascii_lowercase() == label_norm
+        || font
+            .path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .map(|stem| stem.to_ascii_lowercase() == label_norm)
+            .unwrap_or(false)
+}
+
 /// Совпадает ли `raw`-путь с представительным или альтернативным путём шрифта.
 pub(super) fn font_matches_path(font: &FontEntry, raw: &str) -> bool {
     let candidate = Path::new(raw);

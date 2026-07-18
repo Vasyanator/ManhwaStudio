@@ -411,17 +411,47 @@ impl TypingCreatePanelState {
         {
             let label_norm = label_raw.trim().to_ascii_lowercase();
             if !label_norm.is_empty() {
-                selected_idx = self.fonts.iter().position(|font| {
-                    font.label.to_ascii_lowercase() == label_norm
-                        || font
-                            .path
-                            .file_stem()
-                            .and_then(|v| v.to_str())
-                            .map(|stem| stem.to_ascii_lowercase() == label_norm)
-                            .unwrap_or(false)
-                });
+                selected_idx = self
+                    .fonts
+                    .iter()
+                    .position(|font| font_matches_label(font, &label_norm));
             }
         }
         selected_idx
+    }
+
+    /// Resolves a font by its display label, PREFERRING a match among
+    /// `allowed_indices` (the active font group) before falling back to the whole
+    /// font list.
+    ///
+    /// Inline `<font=…>` tags identify a font only by an ambiguous display label
+    /// (a file stem can appear both inside a group and globally, e.g. an imported
+    /// system font colliding with a group member). When a group is selected, the
+    /// in-group copy is the one the user sees and expects, so it must win; only
+    /// when no group member matches does this fall back to the global lookup.
+    /// Returns `None` when the label is empty or matches nothing. Path lookup is
+    /// intentionally NOT offered here — this resolves the label the way the combo
+    /// displays it.
+    pub(super) fn find_font_idx_by_label_preferring_indices(
+        &self,
+        font_label: Option<&str>,
+        allowed_indices: &[usize],
+    ) -> Option<usize> {
+        let label_norm = font_label?.trim().to_ascii_lowercase();
+        if label_norm.is_empty() {
+            return None;
+        }
+        // Prefer an in-group copy so an ambiguous label resolves to the group
+        // member the user is actually looking at, not a same-named outsider.
+        if let Some(idx) = allowed_indices
+            .iter()
+            .copied()
+            .find(|&idx| self.fonts.get(idx).is_some_and(|font| font_matches_label(font, &label_norm)))
+        {
+            return Some(idx);
+        }
+        self.fonts
+            .iter()
+            .position(|font| font_matches_label(font, &label_norm))
     }
 }

@@ -1255,12 +1255,42 @@ impl TypingCreatePanelState {
         }
     }
 
+    /// Wraps the current text selection in inline tags describing
+    /// `desired_effective_style`, returning `true` when the underlying text
+    /// actually changed.
+    ///
+    /// It early-returns `false` (mutating nothing) for a PLAIN UNIFORM selection
+    /// that has nothing to apply — no surrounding tag wrapper, no inline tags
+    /// inside it, and an empty desired style. For such a selection, re-inserting
+    /// the exact substring with empty tags is provably identity, so the early
+    /// return is equivalent to the full-text guard further down. Selections that
+    /// sit inside a wrapper (which a rewrite would normalize/strip) or contain
+    /// internal tags are deliberately EXCLUDED from this fast path, so the guard
+    /// can never suppress a legitimate rewrite.
     pub(super) fn apply_inline_style_to_selection(
         &mut self,
         selection: TypingInlineSelectionContext,
         desired_effective_style: TypingInlineTagStyle,
     ) -> bool {
         let desired_tag_style = self.normalize_desired_inline_tag_style(desired_effective_style);
+        // Strictly conservative idempotency fast path (belt-and-suspenders). It
+        // fires ONLY when the selection is plain and uniform with nothing to
+        // apply: no adjacent wrapper, no internal tags, and an empty desired
+        // style. `effective_inline_tag_style` reads only the wrappers adjacent to
+        // the WHOLE selection (never internal tags), so a broader style-equality
+        // early-out could suppress a normalize/strip the real rewrite performs
+        // (e.g. dropping a redundant `<m f=Base>` wrapper). The full-text guard
+        // below remains the true idempotency check for every other case.
+        if selection.opening_wrapper_range.is_empty()
+            && selection.closing_wrapper_range.is_empty()
+            && desired_tag_style == TypingInlineTagStyle::default()
+            && !selected_text_contains_inline_tag(
+                self.active_inline_text(),
+                &selection.text_byte_range,
+            )
+        {
+            return false;
+        }
         // По умолчанию панель пишет компактный машиночитаемый тег `<m ...>`.
         // Настройка `use_legacy_inline_tags` (пока не подключена к UI) вернёт обычные теги.
         let (opening_tags, closing_tags) = if self.use_legacy_inline_tags {

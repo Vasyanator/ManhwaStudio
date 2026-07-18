@@ -36,6 +36,31 @@ use super::*;
 /// sections keep the same rhythm.
 const PARAM_SECTION_GAP_PX: f32 = 3.0;
 
+/// Decides the font index the user actually PICKED in the font combo this frame,
+/// if any — the edge that is allowed to write an inline span's font label.
+///
+/// - `popup_pick`: the index a popup option click selected (from
+///   `draw_font_combo_option`). A click always counts as a pick, even on the
+///   already-highlighted row (the user explicitly re-affirmed that font).
+/// - `wheel`: `(before, after)` font indices around any applied wheel steps. A
+///   wheel event counts only when it actually moved the index.
+///
+/// Returns `None` when nothing changed this frame, so inline-selection writeback
+/// stays strictly edge-triggered: merely resolving/clamping `font_idx` per frame
+/// never counts as a pick.
+pub(super) fn font_combo_user_pick(
+    popup_pick: Option<usize>,
+    wheel: Option<(usize, usize)>,
+) -> Option<usize> {
+    if let Some(idx) = popup_pick {
+        return Some(idx);
+    }
+    match wheel {
+        Some((before, after)) if before != after => Some(after),
+        _ => None,
+    }
+}
+
 /// Draws a collapsible parameter section styled as a "header bar + left guide
 /// rule".
 ///
@@ -456,17 +481,36 @@ impl TypingCreatePanelState {
                 })
                 .unwrap_or_else(|| t!("typing.params.font_placeholder").to_string())
         };
+        // Resolve the selection's/overlay's current font from its label. When a
+        // group is active this PREFERS the in-group copy over a same-named font
+        // outside the group, so an ambiguous label (e.g. an imported system font
+        // colliding with a group member) does not silently resolve to the wrong
+        // entry.
         let mut font_idx = inline_style
             .as_deref()
             .and_then(|style| {
-                self.find_font_idx_by_path_or_label(None, style.font_label.as_deref())
+                self.find_font_idx_by_label_preferring_indices(
+                    style.font_label.as_deref(),
+                    &filtered_font_indices,
+                )
             })
             .unwrap_or(self.selected_font_idx);
+        // DISPLAY-ONLY clamp: if the resolved font is outside the active group,
+        // move the combo's highlight to the first visible entry so a valid row is
+        // shown as selected. In inline-selection mode this clamped value is NEVER
+        // written back into the span style (see the edge-triggered writeback
+        // below) — otherwise merely selecting text would bounce the label to a
+        // different font and re-insert a `<font>` tag every frame.
         if !filtered_font_indices.contains(&font_idx)
             && let Some(first_filtered_idx) = filtered_font_indices.first().copied()
         {
             font_idx = first_filtered_idx;
         }
+        // A genuine user font pick THIS frame: a popup option click (captured in
+        // `popup_pick`) or a wheel step that actually moved the index. Only such an
+        // edge may mutate the span's font label in inline-selection mode; the
+        // per-frame resolved/clamped `font_idx` alone must not.
+        let mut popup_pick: Option<usize> = None;
         let font_combo = WheelComboBox::from_label(t!("typing.create.font_combo_id")).id_salt("typing.create.font_combo_id")
             .selected_text(selected_font_text)
             .show_ui_with_wheel(ui, |ui| {
@@ -490,6 +534,7 @@ impl TypingCreatePanelState {
                         &coverage,
                     ) {
                         font_idx = idx;
+                        popup_pick = Some(idx);
                     }
                 }
             });
@@ -497,11 +542,23 @@ impl TypingCreatePanelState {
             block_hscroll_by_hovered_param,
             &font_combo.inner.response,
         );
-        if let Some(steps) = font_combo.wheel_steps {
+        // Apply any wheel steps to `font_idx` (used by the non-selection branch),
+        // recording the before/after so the edge detector can tell a real move
+        // from a no-op wheel event.
+        let wheel = font_combo.wheel_steps.map(|steps| {
+            let before = font_idx;
             cycle_wrapped_index_in_values(&mut font_idx, &filtered_font_indices, steps);
-        }
+            (before, font_idx)
+        });
+        let user_picked_font_idx = font_combo_user_pick(popup_pick, wheel);
         if let Some(style) = inline_style.as_mut() {
-            if let Some(label) = self.font_label_by_idx(font_idx) {
+            // Edge-triggered writeback (mirrors the non-selection branch's
+            // `font_idx != prev_font_idx` guard): only a real pick this frame
+            // writes the span font label, so selecting text can never insert a
+            // `<font>` tag on its own.
+            if let Some(picked) = user_picked_font_idx
+                && let Some(label) = self.font_label_by_idx(picked)
+            {
                 style.font_label = Some(label);
             }
         } else {

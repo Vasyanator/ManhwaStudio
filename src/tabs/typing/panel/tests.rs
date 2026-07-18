@@ -467,6 +467,233 @@ paths change.
         assert!(build_inline_machine_tag(&normalized).is_empty());
     }
 
+    /// Char range (Unicode scalar offsets) of the first occurrence of `needle`
+    /// in `haystack`, for building a realistic inline text selection in tests.
+    /// The `expect` documents the setup invariant: the caller always embeds
+    /// `needle` in `haystack` just above the call.
+    fn char_range_of(haystack: &str, needle: &str) -> Range<usize> {
+        let byte_start = haystack
+            .find(needle)
+            .expect("test setup: needle must be embedded in haystack");
+        let char_start = haystack[..byte_start].chars().count();
+        char_start..char_start + needle.chars().count()
+    }
+
+    // Bug fix (font-label collision + selected group): an ambiguous label must
+    // resolve to the IN-GROUP copy, and staying on that copy must emit NO font
+    // token (so merely selecting text can't insert a `<font>` tag).
+    #[test]
+    fn ambiguous_label_resolves_to_in_group_font_and_emits_no_token() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = merge_duplicate_fonts(vec![
+            // "Разговор" exists both inside group "A" and globally (distinct content
+            // → two separate entries sharing the label), plus a global-only font.
+            raw_font("/fonts/groups/A/Разговор.ttf", Some("A"), 1),
+            raw_font("/fonts/Разговор.ttf", None, 2),
+            raw_font("/fonts/Уникальный.ttf", None, 3),
+        ]);
+        // Invariant: the fixture above builds exactly one group-A "Разговор" and
+        // one global "Уникальный", so both lookups below are guaranteed to hit.
+        let in_group_idx = state
+            .fonts
+            .iter()
+            .position(|f| font_in_group(f, "A"))
+            .expect("fixture defines a group-A Разговор");
+        let unique_idx = state
+            .fonts
+            .iter()
+            .position(|f| f.label == "Уникальный")
+            .expect("fixture defines a global Уникальный");
+
+        // Group "A" active → filtered indices contain only the in-group copy.
+        state.selected_font_group = Some("A".to_string());
+        let filtered = state.filtered_font_indices();
+        assert_eq!(filtered, vec![in_group_idx]);
+
+        // The ambiguous label resolves to the in-group copy, not the global twin.
+        assert_eq!(
+            state.find_font_idx_by_label_preferring_indices(Some("Разговор"), &filtered),
+            Some(in_group_idx),
+        );
+        // A label with no in-group match falls back to the global lookup.
+        assert_eq!(
+            state.find_font_idx_by_label_preferring_indices(Some("Уникальный"), &filtered),
+            Some(unique_idx),
+        );
+
+        // With the base font resolved to the in-group copy, an unchanged span
+        // carrying that same label emits no font token (nothing to write back).
+        state.selected_font_idx = in_group_idx;
+        let selection = selection_with_style(TypingInlineTagStyle {
+            font_label: Some("Разговор".to_string()),
+            ..TypingInlineTagStyle::default()
+        });
+        let effective = state.effective_inline_tag_style(&selection);
+        let normalized = state.normalize_desired_inline_tag_style(effective);
+        assert_eq!(normalized.font_label, None);
+        assert!(build_inline_machine_tag(&normalized).is_empty());
+    }
+
+    // Edge-trigger contract (Sol finding 3): the pure decision that gates the
+    // inline font-label writeback. Only a popup click or a wheel step that MOVED
+    // the index counts; a bare per-frame resolve (no input) never does.
+    #[test]
+    fn font_combo_user_pick_is_edge_triggered() {
+        // No input this frame → nothing is written.
+        assert_eq!(create_main_text::font_combo_user_pick(None, None), None);
+        // A wheel step that changes the index is a pick.
+        assert_eq!(create_main_text::font_combo_user_pick(None, Some((0, 2))), Some(2));
+        // A wheel event that does not move the index is NOT a pick.
+        assert_eq!(create_main_text::font_combo_user_pick(None, Some((1, 1))), None);
+        // A popup click counts even on the already-highlighted row.
+        assert_eq!(create_main_text::font_combo_user_pick(Some(3), None), Some(3));
+        // A popup click takes priority over a same-frame no-op wheel.
+        assert_eq!(create_main_text::font_combo_user_pick(Some(1), Some((0, 0))), Some(1));
+        // Every subsequent no-input frame keeps returning None (no re-write).
+        assert_eq!(create_main_text::font_combo_user_pick(None, None), None);
+        assert_eq!(create_main_text::font_combo_user_pick(None, None), None);
+    }
+
+    // `selected_text_contains_inline_tag` detects tags strictly INSIDE the range
+    // and ignores an out-of-range / non-boundary range without panicking.
+    #[test]
+    fn selected_text_contains_inline_tag_detects_internal_tags() {
+        let text = "a<m f=\"X\">b</m>c";
+        // Range covering only "a" (before the tag) → no internal tag.
+        assert!(!selected_text_contains_inline_tag(text, &(0..1)));
+        // Range covering the whole string → the internal tag is found.
+        assert!(selected_text_contains_inline_tag(text, &(0..text.len())));
+        // Plain text never reports a tag.
+        assert!(!selected_text_contains_inline_tag("abc", &(0..3)));
+        // Out-of-range slice is treated as "no tag" (never panics).
+        assert!(!selected_text_contains_inline_tag("abc", &(0..99)));
+    }
+
+    // Idempotency fast path: a plain uniform selection with nothing to apply is a
+    // no-op, built through the REAL selection-context path (no hand-forged state).
+    #[test]
+    fn apply_inline_style_noop_on_plain_uniform_selection() {
+        let mut state = state_with_font();
+        state.text = "abc".to_string();
+        state.text_selection_char_range = Some(char_range_of(&state.text, "abc"));
+        let selection = state
+            .inline_selection_context()
+            .expect("a non-empty selection over 'abc' yields a context");
+        // No wrapper, no internal tags → the effective style is empty.
+        assert!(selection.opening_wrapper_range.is_empty());
+        assert!(selection.closing_wrapper_range.is_empty());
+        let desired = state.effective_inline_tag_style(&selection);
+        let changed = state.apply_inline_style_to_selection(selection, desired);
+        assert!(!changed, "an empty style on a plain selection is a no-op");
+        assert_eq!(state.text, "abc", "no tag may be inserted");
+    }
+
+    // Regression (Sol finding 1): the conservative fast path must NOT suppress a
+    // legitimate rewrite. A redundant `<m f=Base>` wrapper (font == base) has an
+    // empty NORMALIZED style, yet re-applying must STRIP it — the earlier
+    // style-equality guard wrongly early-returned here and left the wrapper.
+    #[test]
+    fn redundant_adjacent_font_wrapper_is_stripped_not_suppressed() {
+        let mut state = state_with_font(); // one font "Test", selected_font_idx = 0
+        let base = state
+            .font_label_by_idx(0)
+            .expect("the single fixture font has a label");
+        let open = build_inline_machine_tag(&TypingInlineTagStyle {
+            font_label: Some(base),
+            ..TypingInlineTagStyle::default()
+        });
+        state.text = format!("{open}abc</m>");
+        state.text_selection_char_range = Some(char_range_of(&state.text, "abc"));
+        let selection = state
+            .inline_selection_context()
+            .expect("selection inside the wrapper yields a context");
+        // The redundant wrapper IS detected as adjacent to the selection, so the
+        // conservative fast path is skipped and the real rewrite runs.
+        assert!(!selection.opening_wrapper_range.is_empty());
+        let desired = state.effective_inline_tag_style(&selection);
+        let changed = state.apply_inline_style_to_selection(selection, desired);
+        assert!(changed, "a redundant font wrapper must be stripped, not suppressed");
+        assert_eq!(state.text, "abc", "the redundant <m f=…> wrapper is removed");
+    }
+
+    // Regression (Sol finding 2): a selection spanning an INTERNAL tag re-applied
+    // with no change must be a no-op that leaves the internal tag intact — the
+    // guard must neither strip nor duplicate it.
+    #[test]
+    fn internal_tag_selection_is_left_intact_on_reapply() {
+        let mut state = state_with_font();
+        let other = build_inline_machine_tag(&TypingInlineTagStyle {
+            font_label: Some("Other".to_string()),
+            ..TypingInlineTagStyle::default()
+        });
+        state.text = format!("a{other}b</m>c");
+        let text_before = state.text.clone();
+        state.text_selection_char_range = Some(0..state.text.chars().count());
+        let selection = state
+            .inline_selection_context()
+            .expect("whole-text selection yields a context");
+        assert!(selected_text_contains_inline_tag(
+            &state.text,
+            &selection.text_byte_range
+        ));
+        let desired = state.effective_inline_tag_style(&selection);
+        let changed = state.apply_inline_style_to_selection(selection, desired);
+        assert!(!changed, "re-applying with no change is a no-op");
+        assert_eq!(state.text, text_before, "the internal tag is left intact");
+    }
+
+    // Unique-name case: picking a DIFFERENT font applies the change exactly once,
+    // then the next frame (no new pick) is a no-op — no per-frame tag growth.
+    #[test]
+    fn distinct_font_pick_applies_once_then_is_idempotent() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = merge_duplicate_fonts(vec![
+            raw_font("/fonts/Alpha.ttf", None, 1),
+            raw_font("/fonts/Beta.ttf", None, 2),
+        ]);
+        // Invariant: the fixture builds exactly these two uniquely-named fonts.
+        let alpha = state
+            .fonts
+            .iter()
+            .position(|f| f.label == "Alpha")
+            .expect("fixture defines Alpha");
+        let beta = state
+            .fonts
+            .iter()
+            .position(|f| f.label == "Beta")
+            .expect("fixture defines Beta");
+        state.selected_font_idx = alpha; // base font is Alpha
+        state.text = "abc".to_string();
+        state.text_selection_char_range = Some(char_range_of(&state.text, "abc"));
+
+        // Frame 1: the edge-triggered writeback sets the span font label to Beta.
+        let selection = state
+            .inline_selection_context()
+            .expect("plain selection over 'abc' yields a context");
+        let mut desired = state.effective_inline_tag_style(&selection);
+        desired.font_label = state.font_label_by_idx(beta);
+        let changed = state.apply_inline_style_to_selection(selection, desired);
+        assert!(changed, "picking a different font inserts a font tag once");
+        assert!(
+            state.text.contains("Beta"),
+            "text must carry the Beta font span, got: {}",
+            state.text
+        );
+
+        // The frame loop moves the restored selection into the active selection.
+        state.text_selection_char_range = state.pending_text_selection_restore.take();
+
+        // Frame 2: no new pick → re-applying the effective style is a no-op.
+        let selection2 = state
+            .inline_selection_context()
+            .expect("restored selection yields a context");
+        let effective2 = state.effective_inline_tag_style(&selection2);
+        let text_before = state.text.clone();
+        let changed2 = state.apply_inline_style_to_selection(selection2, effective2);
+        assert!(!changed2, "re-applying without a new pick must not duplicate the tag");
+        assert_eq!(state.text, text_before, "text unchanged on the second frame");
+    }
+
     #[test]
     fn load_fonts_with_no_imported_paths_matches_dir_only_loading() {
         // On an empty fonts dir, `load_fonts` with no imported paths must equal the plain

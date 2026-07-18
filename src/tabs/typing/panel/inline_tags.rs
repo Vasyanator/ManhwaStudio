@@ -94,6 +94,37 @@ pub(super) fn push_editor_text_color(
     }
 }
 
+/// Returns `true` when `text[byte_range]` contains at least one parseable inline
+/// tag (opening or closing) INSIDE it.
+///
+/// `byte_range` must be a valid char boundary range into `text`; an out-of-range
+/// or non-boundary range yields `false` (treated as "no internal tag") rather
+/// than panicking. Used to keep the inline-style idempotency guard conservative:
+/// a selection with internal tags is never treated as uniform, so a legitimate
+/// normalize/rewrite of that selection is never suppressed.
+pub(super) fn selected_text_contains_inline_tag(text: &str, byte_range: &Range<usize>) -> bool {
+    let Some(slice) = text.get(byte_range.clone()) else {
+        return false;
+    };
+    let mut cursor = 0usize;
+    while cursor < slice.len() {
+        let Some(rel_start) = slice[cursor..].find('<') else {
+            break;
+        };
+        let tag_start = cursor + rel_start;
+        let Some(rel_end) = slice[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + rel_end + 1;
+        let raw = &slice[tag_start + 1..tag_end - 1];
+        if parse_opening_inline_tag(raw).is_some() || parse_closing_inline_tag(raw).is_some() {
+            return true;
+        }
+        cursor = tag_end;
+    }
+    false
+}
+
 pub(super) fn collect_adjacent_opening_inline_tags(
     text: &str,
     selection_start: usize,
