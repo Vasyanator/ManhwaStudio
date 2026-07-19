@@ -270,7 +270,13 @@ impl TypingCreatePanelState {
                                             // the index. Only such an edge may mutate the span
                                             // font label in inline-selection mode.
                                             let mut popup_pick: Option<usize> = None;
-                                            let font_combo = WheelComboBox::from_label(t!("typing.edit.font_combo_id")).id_salt("typing.edit.font_combo_id")
+                                            // Salted with the filtered list: the popup's
+                                            // Area remembers its previous content size and
+                                            // the inner ScrollArea clamps to it, so after a
+                                            // small font group the popup would stay small
+                                            // forever (see the create-panel font combo in
+                                            // create_main_text.rs for the full mechanism).
+                                            let font_combo = WheelComboBox::from_label(t!("typing.edit.font_combo_id")).id_salt(("typing.edit.font_combo_id", &filtered_font_indices))
                                                 .selected_text(selected_font_text)
                                                 .show_ui_with_wheel(ui, |ui| {
                                                     for idx in filtered_font_indices.iter().copied() {

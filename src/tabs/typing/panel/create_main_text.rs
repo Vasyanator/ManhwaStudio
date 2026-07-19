@@ -433,7 +433,9 @@ impl TypingCreatePanelState {
             let group_count = self.font_groups.len() + 1;
             let selected_group_text =
                 self.selected_font_group.as_deref().unwrap_or(t!("typing.params.font_group_all"));
-            let group_combo = WheelComboBox::from_label(t!("typing.create.font_group_combo_id")).id_salt("typing.create.font_group_combo_id")
+            // Same remembered-popup-size trap as the font combo below: salt with the
+            // group list so adding/removing groups re-measures the popup height.
+            let group_combo = WheelComboBox::from_label(t!("typing.create.font_group_combo_id")).id_salt(("typing.create.font_group_combo_id", &self.font_groups))
                 .selected_text(selected_group_text)
                 .show_ui_with_wheel(ui, |ui| {
                     ui.selectable_value(&mut selected_group_idx, 0usize, t!("typing.params.font_group_all"));
@@ -523,7 +525,14 @@ impl TypingCreatePanelState {
         // edge may mutate the span's font label in inline-selection mode; the
         // per-frame resolved/clamped `font_idx` alone must not.
         let mut popup_pick: Option<usize> = None;
-        let font_combo = WheelComboBox::from_label(t!("typing.create.font_combo_id")).id_salt("typing.create.font_combo_id")
+        // The popup's Area remembers the previous content size and hands it back as
+        // the next open's max_rect, while the inner ScrollArea clamps its height to
+        // that available space (egui-0.35.0 area.rs:610,666 + scroll_area.rs:765).
+        // After a small font group the popup would therefore stay ~3 rows tall
+        // forever, even back on "all fonts". Salting the id with the filtered list
+        // discards the remembered size whenever the popup content changes, so the
+        // popup re-measures to its natural height (min(content, combo_height)).
+        let font_combo = WheelComboBox::from_label(t!("typing.create.font_combo_id")).id_salt(("typing.create.font_combo_id", &filtered_font_indices))
             .selected_text(selected_font_text)
             .show_ui_with_wheel(ui, |ui| {
                 for idx in filtered_font_indices.iter().copied() {
