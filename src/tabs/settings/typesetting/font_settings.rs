@@ -137,7 +137,12 @@ impl FontSettingsEditorState {
     /// Renders the font-settings block: three category headers plus the import picker.
     /// Category lists load off-thread and refresh live when the imported-fonts store
     /// mutates. Never blocks the GUI thread with font enumeration.
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// `force_reveal_groups` (set only on a deep-link reveal frame) force-opens the nested
+    /// "Группы" block and scrolls it into view. Returns that block's rect (header+body
+    /// union) when the categories are loaded, for the caller's reveal highlight; `None`
+    /// while the category lists are still loading.
+    pub fn ui(&mut self, ui: &mut egui::Ui, force_reveal_groups: bool) -> Option<egui::Rect> {
         self.maybe_start_categories_load();
         self.poll_categories_load(ui.ctx());
 
@@ -149,19 +154,21 @@ impl FontSettingsEditorState {
         // Move the categories out so the collapsing-header closures can mutate `self`
         // (e.g. open the picker) without aliasing the borrowed lists.
         let categories = self.categories.take();
-        match &categories {
+        let groups_rect = match &categories {
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(t!("typing.font_settings.loading_status"));
                 });
+                None
             }
-            Some(cats) => self.draw_categories(ui, cats),
-        }
+            Some(cats) => Some(self.draw_categories(ui, cats, force_reveal_groups)),
+        };
         self.categories = categories;
 
         self.draw_import_picker(ui.ctx());
         self.draw_properties_window(ui.ctx());
+        groups_rect
     }
 
     /// Opens the per-font properties window for `font` (replacing any currently-open one).
@@ -179,9 +186,16 @@ impl FontSettingsEditorState {
         }
     }
 
-    /// Renders the three category collapsing headers from a loaded snapshot. A font row is a
-    /// button; clicking one opens that font's properties window.
-    fn draw_categories(&mut self, ui: &mut egui::Ui, cats: &FontCategories) {
+    /// Renders the three category collapsing headers from a loaded snapshot plus the fourth
+    /// "Группы" section. A font row is a button; clicking one opens that font's properties
+    /// window. `force_reveal_groups` force-opens and scrolls to the groups block on the
+    /// deep-link reveal frame; returns that block's rect for the caller's reveal highlight.
+    fn draw_categories(
+        &mut self,
+        ui: &mut egui::Ui,
+        cats: &FontCategories,
+        force_reveal_groups: bool,
+    ) -> egui::Rect {
         // A row click sets this; the properties window is opened after the headers so the
         // header closures never need a mutable borrow of `self.properties`.
         let mut to_open: Option<FontEntry> = None;
@@ -262,14 +276,16 @@ impl FontSettingsEditorState {
 
         // Fourth category: virtual font groups. It owns its own collapsing header and the
         // floating group-editor window; the folder-group names and the loaded font lists come
-        // from this off-thread snapshot (no GUI-thread filesystem work).
+        // from this off-thread snapshot (no GUI-thread filesystem work). Returns the block
+        // rect (for the reveal highlight) and force-opens/scrolls on the deep-link frame.
         self.groups_editor.ui(
             ui,
             &cats.folder_group_names,
             &cats.folder,
             &cats.imported,
             cats.loaded_revision,
-        );
+            force_reveal_groups,
+        )
     }
 
     /// Draws a virtualized list of own-typeface font-name rows for a category. Only the rows

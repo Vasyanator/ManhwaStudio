@@ -454,6 +454,12 @@ original, and a bbox relative to the sent image) and the model returns
 - `CanvasSettingsRuntime`: coalescing saver → `settings.json` + `user_config.json`.
 - Python resolve order: `installer_files/venv/`, `venv/`, `installer_files/env/`, `installer_files/python/` (nested scan); mini-installer раскладывает `uv` в `installer_files/uv/` и создаёт managed Python/venv через него.
 - `apply_windows_no_window`: `CREATE_NO_WINDOW` на Windows.
+- **In-app deep links** — `SettingsTabState::navigate_to(SettingsDeepLink)` (enum в `settings_shared`)
+  открывает нужную секцию и раскрывает вложенный блок. Поток: typing-панель (иконка «?» у комбобокса
+  групп) ставит запрос → `app.rs` после `typing.draw` дергает `take_settings_navigation_request`,
+  вызывает `navigate_to` и переключает `active_tab = Settings`. Reveal держит force-open заголовков
+  + `scroll_to_me`, пока целевой блок реально не отрисуется (асинхронная загрузка категорий шрифтов;
+  ограниченное ожидание), затем гаснет и включает подсветку ~2с — после этого блоки можно свернуть снова.
 
 ## Python AI backend
 

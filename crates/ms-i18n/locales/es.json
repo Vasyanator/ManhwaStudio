@@ -3765,6 +3765,8 @@
   "typing.params.direction_left_to_right": "De izquierda a derecha",
   "typing.params.direction_right_to_left": "De derecha a izquierda",
   "typing.params.font_group_all": "Todos los grupos",
+  "typing.params.font_group_help": "Permite restringir la selección solo a las fuentes necesarias para este título",
+  "typing.params.font_group_help_go": "Ir a ajustes",
   "typing.params.font_label": "Fuente",
   "typing.params.font_not_found_option": "{name} (no encontrada)",
   "typing.params.font_placeholder": "<fuente>",

@@ -63,6 +63,27 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   permissively-licensed test font with known `kern`/GPOS pairs was out of scope — add a golden
   test when one is available).
 
+## Font-groups deep-link reveal
+- `draw_typesetting` wraps its whole body in a `ScrollArea::vertical` (id_salt
+  `settings.typesetting.scroll`) — required so `scroll_to_me` reveal targets have an ancestor
+  ScrollArea to consume; the pane had none before, so long content was cut off.
+- While `SettingsTabState::pending_reveal == Some(TypesettingFontGroups)` (set by `navigate_to`),
+  `draw_typesetting` threads a `force_reveal` flag down `FontSettingsEditorState::ui` →
+  `draw_categories` → `FontGroupsEditorState::ui`: BOTH `CollapsingHeader`s ("Настройки шрифтов",
+  "Группы") get `.open(Some(true))` and the groups header calls `scroll_to_me(Align::TOP)`. The
+  groups block rect (header+body union) bubbles back up the call chain. The pending flag is
+  consumed on the FIRST frame that rect actually comes back — the font categories load
+  asynchronously, so on a first visit the nested groups header may not exist for a few frames and
+  consuming earlier would silently lose the reveal. A bounded wait (`REVEAL_PENDING_TIMEOUT`, via
+  `pending_reveal_expires`) abandons the reveal if the load never completes, so the force-open can
+  never stick. Once consumed, `.open(None)` leaves the persisted collapsed state alone (the user
+  can re-collapse).
+- `reveal_highlight_until` (a `web_time::Instant` on `SettingsTabState`, NOT egui memory) arms a
+  ~2 s outline painted by `paint_reveal_highlight` around the groups rect on an `Order::Tooltip`
+  layer painter (pure paint, no hitbox), clipped to the pane ScrollArea's viewport (`inner_rect`)
+  so a partially-scrolled-out block never paints over the tab bar, fading over the final
+  `REVEAL_HIGHLIGHT_FADE_SECS` and requesting repaints until expiry.
+
 ## Contracts and invariants
 - UI ONLY: no font-model logic lives here. The single sanctioned entry point to typing's font
   administration is `crate::tabs::typing::font_admin`; do not add or reach for any other typing

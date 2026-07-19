@@ -687,6 +687,16 @@ impl TypingTabState {
         self.top_panel.centering_show_center()
     }
 
+    /// Drains a pending in-app settings deep-link request raised by the typing panel's
+    /// font-group "?" help icon. `Some(link)` once per click; the caller (`app.rs`) applies
+    /// it by calling `SettingsTabState::navigate_to` and switching to the settings tab.
+    #[must_use]
+    pub fn take_settings_navigation_request(
+        &mut self,
+    ) -> Option<crate::settings_shared::SettingsDeepLink> {
+        self.top_panel.take_settings_link()
+    }
+
     /// Sets this tab's canvas bottom-hint content for the current frame; `None` hides it.
     pub fn set_bottom_hint(&mut self, hint: Option<CanvasBottomHint>) {
         self.canvas.set_bottom_hint(hint);

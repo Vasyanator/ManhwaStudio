@@ -62,6 +62,7 @@ impl TypingCreatePanelState {
             imported_system_fonts,
             imported_fonts_revision,
             pending_font_group_request: None,
+            pending_settings_link_request: None,
             font_reload_rx: None,
             latest_font_reload_token: 0,
             fonts_reload_in_flight: false,
@@ -226,6 +227,14 @@ impl TypingCreatePanelState {
 
     pub(super) fn take_font_group_request(&mut self) -> Option<Option<String>> {
         self.pending_font_group_request.take()
+    }
+
+    /// Drains the pending settings deep-link request raised by the font-group "?" help
+    /// icon (`Some` once until taken). The facade forwards it up to the app tab-switch.
+    pub(super) fn take_settings_link_request(
+        &mut self,
+    ) -> Option<crate::settings_shared::SettingsDeepLink> {
+        self.pending_settings_link_request.take()
     }
 
     /// Применяет выбранную группу шрифтов (для синхронизации между панелями).

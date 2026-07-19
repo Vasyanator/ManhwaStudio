@@ -456,6 +456,10 @@ pub struct TypingTopPanelState {
     export_status: TypingExportUiStatus,
     pending_edit_request: Option<TypingOverlayEditRequest>,
     pending_create_image_request: Option<TypingCreateImageRequest>,
+    /// Pending in-app deep-link request, drained each frame from either sub-panel's
+    /// font-group "?" help icon (`draw`) and exposed to the app via `take_settings_link`
+    /// so it can switch to the settings tab and reveal the target block.
+    pending_settings_link: Option<crate::settings_shared::SettingsDeepLink>,
     auto_typing_panel_open: bool,
     auto_typing_debug_visuals: bool,
     auto_typing_extra_downward_shift_percent: f32,
@@ -627,6 +631,7 @@ impl Default for TypingTopPanelState {
             export_default_dir: None,
             export_status: TypingExportUiStatus::Hidden,
             pending_edit_request: None,
+            pending_settings_link: None,
             pending_create_image_request: None,
             auto_typing_panel_open: false,
             auto_typing_debug_visuals: false,
@@ -1241,6 +1246,10 @@ struct TypingCreatePanelState {
     /// Внешний `Some` — есть запрос; внутреннее значение — новая `selected_font_group`
     /// (`None` = «Все группы»).
     pending_font_group_request: Option<Option<String>>,
+    /// Pending in-app deep-link request raised by the font-group "?" help icon. `Some`
+    /// while a click awaits draining by the facade layer, which forwards it to the app
+    /// so it can switch to the settings tab and reveal the target block. Reset on take.
+    pending_settings_link_request: Option<crate::settings_shared::SettingsDeepLink>,
     font_reload_rx: Option<Receiver<FontReloadResult>>,
     latest_font_reload_token: u64,
     fonts_reload_in_flight: bool,

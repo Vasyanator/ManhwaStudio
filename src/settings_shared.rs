@@ -87,6 +87,18 @@ pub enum SettingsSectionId {
     Hotkeys,
 }
 
+/// An in-app "deep link" request: a target inside the settings surface that another
+/// part of the app asks to reveal (open the right section, expand the relevant block,
+/// scroll to it, highlight it). Consumed by `SettingsTabState::navigate_to`.
+///
+/// Each variant names a concrete reveal target, NOT just a section, so a link can point
+/// at a nested collapsed block. Extend it with a new variant per future target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsDeepLink {
+    /// Settings → "Тайп" (Typesetting) → "Настройки шрифтов" → nested "Группы" block.
+    TypesettingFontGroups,
+}
+
 /// One row of the static section registry: which surfaces list a section and where it
 /// sits in a surface's tab bar.
 ///

@@ -149,6 +149,17 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   typesetting-language selector) is picked up automatically on the next frame the
   typing panel draws — no explicit invalidation call from the settings UI is required.
 
+## Settings deep link (font-group "?" help icon)
+- The font-group combo (`create_main_text::draw_font_section`) has an inline `crate::widgets::HelpHint`
+  "?" icon whose tooltip carries a "Перейти" action button. A click sets
+  `TypingCreatePanelState::pending_settings_link_request` (a `crate::settings_shared::SettingsDeepLink`).
+- Drain chain (mirrors the font-group request): `create_state::take_settings_link_request` →
+  `facade::draw` drains BOTH sub-panels into `TypingTopPanelState::pending_settings_link` →
+  `facade::take_settings_link` → crate-public `TypingTabState::take_settings_navigation_request`.
+  `app.rs` polls it right after `typing.draw`, calls `SettingsTabState::navigate_to(link)`, and
+  switches `active_tab` to `Settings`. The link is a pure payload; the typing side never touches
+  settings state directly.
+
 ## Contracts and invariants
 - The "Параметры" sub-tab is grouped into collapsible sections via
   `create_main_text::collapsing_param_section` (six param sections + presets +

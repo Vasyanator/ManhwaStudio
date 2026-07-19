@@ -435,14 +435,31 @@ impl TypingCreatePanelState {
                 self.selected_font_group.as_deref().unwrap_or(t!("typing.params.font_group_all"));
             // Same remembered-popup-size trap as the font combo below: salt with the
             // group list so adding/removing groups re-measures the popup height.
-            let group_combo = WheelComboBox::from_label(t!("typing.create.font_group_combo_id")).id_salt(("typing.create.font_group_combo_id", &self.font_groups))
-                .selected_text(selected_group_text)
-                .show_ui_with_wheel(ui, |ui| {
-                    ui.selectable_value(&mut selected_group_idx, 0usize, t!("typing.params.font_group_all"));
-                    for (idx, group_name) in self.font_groups.iter().enumerate() {
-                        ui.selectable_value(&mut selected_group_idx, idx + 1, group_name);
-                    }
-                });
+            // The combo and its inline "?" deep-link help icon share one row.
+            let (group_combo, help_go_clicked) = ui
+                .horizontal(|ui| {
+                    let group_combo = WheelComboBox::from_label(t!("typing.create.font_group_combo_id")).id_salt(("typing.create.font_group_combo_id", &self.font_groups))
+                        .selected_text(selected_group_text)
+                        .show_ui_with_wheel(ui, |ui| {
+                            ui.selectable_value(&mut selected_group_idx, 0usize, t!("typing.params.font_group_all"));
+                            for (idx, group_name) in self.font_groups.iter().enumerate() {
+                                ui.selectable_value(&mut selected_group_idx, idx + 1, group_name);
+                            }
+                        });
+                    // "?" icon whose hover tooltip explains font groups and carries a
+                    // "Перейти" button; clicking it requests a deep link to the settings
+                    // font-groups block (drained by the outer facade loop).
+                    let help_go_clicked = crate::widgets::HelpHint::text(t!("typing.params.font_group_help"))
+                        .with_action(t!("typing.params.font_group_help_go"))
+                        .show_with_action(ui)
+                        .action_clicked;
+                    (group_combo, help_go_clicked)
+                })
+                .inner;
+            if help_go_clicked {
+                self.pending_settings_link_request =
+                    Some(crate::settings_shared::SettingsDeepLink::TypesettingFontGroups);
+            }
             mark_hscroll_block_on_hover(
                 block_hscroll_by_hovered_param,
                 &group_combo.inner.response,

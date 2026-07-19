@@ -83,6 +83,10 @@ impl FontGroupsEditorState {
     /// revision of those loaded categories (`FontCategories::loaded_revision`), used to cache
     /// the editor window's path→display-name resolver and rebuild it only when the snapshot is
     /// replaced.
+    ///
+    /// `force_reveal` (set only on a deep-link reveal frame) force-opens the header and
+    /// scrolls it to the top of the ancestor scroll area. Returns the section's block rect
+    /// (header row unioned with the body when expanded), for the caller's reveal highlight.
     pub(crate) fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -90,17 +94,33 @@ impl FontGroupsEditorState {
         folder_fonts: &[FontEntry],
         imported_fonts: &[FontEntry],
         categories_revision: u64,
-    ) {
+        force_reveal: bool,
+    ) -> egui::Rect {
         self.refresh_cache();
 
-        egui::CollapsingHeader::new(t!("typing.font_settings.groups_header"))
+        // `.open(None)` off the reveal frame leaves the persisted collapsed state alone, so
+        // the user can collapse the section again after the deep link opened it.
+        let header = egui::CollapsingHeader::new(t!("typing.font_settings.groups_header"))
             .id_salt("font_settings_groups")
+            .open(force_reveal.then_some(true))
             .default_open(false)
             .show(ui, |ui| {
                 self.draw_create_row(ui, folder_group_names);
                 ui.add_space(6.0);
                 self.draw_group_list(ui);
             });
+
+        if force_reveal {
+            // Bring the freshly-revealed groups block to the top of the settings scroll
+            // area; the ancestor ScrollArea consumes this target on the next frame.
+            header.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
+
+        // Full block rect: header row unioned with the body when expanded, for the highlight.
+        let block_rect = match &header.body_response {
+            Some(body) => header.header_response.rect.union(body.rect),
+            None => header.header_response.rect,
+        };
 
         // The editor window floats independently of the collapsing state, so it is drawn
         // OUTSIDE the header closure: collapsing the section must not close an open window.
@@ -111,6 +131,8 @@ impl FontGroupsEditorState {
             imported_fonts,
             categories_revision,
         );
+
+        block_rect
     }
 
     /// Reloads the cached virtual-group snapshot when the shared font-config revision advances,

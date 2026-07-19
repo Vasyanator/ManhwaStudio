@@ -37,7 +37,9 @@ use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{ComicType, save_comic_type_to_project_file};
 use crate::runtime_log;
-use crate::settings_shared::{SettingsSectionId, SettingsSurface, SharedSettingsPanels};
+use crate::settings_shared::{
+    SettingsDeepLink, SettingsSectionId, SettingsSurface, SharedSettingsPanels,
+};
 use crate::tabs::typing::TypingPanelLayout;
 use crate::widgets::{
     current_spellcheck_words_revision, load_custom_spellcheck_words, load_project_spellcheck_words,
@@ -50,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
-use web_time::Duration;
+use web_time::{Duration, Instant};
 
 pub(super) const GENERAL_TYPING_PANEL_LAYOUT_KEY: &str = "typing_panel_layout";
 
@@ -117,6 +119,22 @@ pub struct SettingsTabState {
     /// `crate::tabs::typing::font_admin` facade, so settings needs no access to the private
     /// font model.
     font_settings_editor: typesetting::FontSettingsEditorState,
+    /// Pending in-app deep-link reveal target set by [`SettingsTabState::navigate_to`].
+    /// Consumed by the matching section draw (font-groups reveal in `draw_typesetting`)
+    /// once the target block has actually RENDERED: while pending, the draw force-opens
+    /// the target collapsed blocks and issues the scroll; the flag clears on the first
+    /// frame the block draws (the font categories load asynchronously, so this may take a
+    /// few frames on first visit), after which the user can freely collapse the blocks.
+    pending_reveal: Option<SettingsDeepLink>,
+    /// Give-up deadline for [`Self::pending_reveal`]: set lazily on the first frame the
+    /// reveal has to WAIT for the async font-category load; if the target block still has
+    /// not rendered by this instant, the pending reveal is abandoned so the force-open can
+    /// never stick indefinitely. `None` while no wait is in progress.
+    pending_reveal_expires: Option<Instant>,
+    /// Deadline until which the freshly-revealed groups block is highlighted with an
+    /// outline. Set when a reveal fires; `None` when no highlight is active. Uses
+    /// `web_time::Instant` so it also works under wasm.
+    reveal_highlight_until: Option<Instant>,
 }
 
 impl Default for SettingsTabState {
@@ -161,6 +179,26 @@ impl SettingsTabState {
             hotkey_capture_command_id: None,
             effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
             font_settings_editor: typesetting::FontSettingsEditorState::new(),
+            pending_reveal: None,
+            pending_reveal_expires: None,
+            reveal_highlight_until: None,
+        }
+    }
+
+    /// Applies an in-app settings deep link: selects the target section and stashes a
+    /// pending reveal that the section's own draw consumes once the target block has
+    /// rendered (force-opens the relevant collapsed blocks, scrolls to them, and
+    /// highlights them for ~2 seconds).
+    ///
+    /// This does NOT switch the active app tab; the caller (`app.rs`) is responsible for
+    /// flipping to the settings tab after calling this.
+    pub fn navigate_to(&mut self, link: SettingsDeepLink) {
+        match link {
+            SettingsDeepLink::TypesettingFontGroups => {
+                self.active_pane = SettingsSectionId::Typesetting;
+                self.pending_reveal = Some(link);
+                self.pending_reveal_expires = None;
+            }
         }
     }
 }

@@ -3765,6 +3765,8 @@
   "typing.params.direction_left_to_right": "De gauche à droite",
   "typing.params.direction_right_to_left": "De droite à gauche",
   "typing.params.font_group_all": "Tous les groupes",
+  "typing.params.font_group_help": "Permet de restreindre la sélection aux seules polices nécessaires pour ce titre",
+  "typing.params.font_group_help_go": "Aller aux paramètres",
   "typing.params.font_label": "Police",
   "typing.params.font_not_found_option": "{name} (introuvable)",
   "typing.params.font_placeholder": "<police>",

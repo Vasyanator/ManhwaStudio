@@ -73,6 +73,10 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   when another hint is hovered; a tooltip-body heartbeat stops the worker when the tooltip is
   no longer shown. The worker slot is released through an RAII guard, so a panic cannot wedge
   playback. A hint whose open or frame decode fails is logged once and blacklisted for the session.
+  Optional action mode: `with_action(label)` adds a clickable button below the tooltip content
+  (the `on_hover_ui` tooltip is interactive in egui 0.35, so it stays open while the pointer moves
+  onto the button). Use `show_with_action`, which returns `HelpHintResponse { response, action_clicked }`;
+  plain `show` still renders the button but discards its click. Callers pass already-localized labels.
 
 ## Contracts and invariants
 - Widget drawing must not perform blocking file, network, build, model, or parsing work on the

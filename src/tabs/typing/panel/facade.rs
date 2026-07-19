@@ -66,6 +66,20 @@ impl TypingTopPanelState {
         }
 
         self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx, layout_editor_active);
+
+        // Drain a settings deep-link request (font-group "?" help icon) from either
+        // sub-panel AFTER the panels have drawn, so a click bubbles up in the SAME
+        // frame the app polls `take_settings_link`. Draining before the draw would
+        // leave a click dormant for a frame — and a rapid second click would then
+        // survive the tab switch and unexpectedly re-navigate to Settings when the
+        // user later returns to the typing tab.
+        if let Some(link) = self
+            .create_panel
+            .take_settings_link_request()
+            .or_else(|| self.edit_panel.take_settings_link_request())
+        {
+            self.pending_settings_link = Some(link);
+        }
     }
 
     pub(in crate::tabs::typing) fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
@@ -712,6 +726,14 @@ impl TypingTopPanelState {
 
     pub(in crate::tabs::typing) fn take_edit_request(&mut self) -> Option<TypingOverlayEditRequest> {
         self.pending_edit_request.take()
+    }
+
+    /// Drains the pending settings deep-link request raised by a font-group "?" help icon
+    /// on either sub-panel (`Some` once until taken), forwarded from `draw`.
+    pub(in crate::tabs::typing) fn take_settings_link(
+        &mut self,
+    ) -> Option<crate::settings_shared::SettingsDeepLink> {
+        self.pending_settings_link.take()
     }
 
     pub(in crate::tabs::typing) fn is_mask_panel_open(&self) -> bool {

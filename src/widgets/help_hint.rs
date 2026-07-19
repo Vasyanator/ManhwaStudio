@@ -8,7 +8,11 @@ FILE HEADER (widgets/help_hint.rs)
     `animated(hint)` (animation only), `text(text)` (text only), and either one
     completed by `with_text` / `with_animation` (text above the animation).
     `show(ui)` draws the icon and attaches the tooltip.
-  - `draw_icon` / `tooltip_text_ui`: the icon and the width-capped text line.
+  - Action mode: `with_action(label)` adds a clickable button below the tooltip
+    content. `show_inner` is the shared tooltip body of `show` and
+    `show_with_action`; only the latter reports the click, via `HelpHintResponse`.
+  - `draw_icon` / `tooltip_text_ui` / `draw_action_button`: the icon, the
+    width-capped text line, and the optional action button.
   - `AnimationPlan` + `resolve_animation` / `draw_animation`: the animation body
     of the tooltip, split so that every cache access (including the paths that
     blacklist a hint) happens while resolving, and painting is then a pure
@@ -51,6 +55,9 @@ const TOOLTIP_MAX_IMAGE_SIZE_PT: Vec2 = Vec2::new(500.0, 400.0);
 const TOOLTIP_MAX_TEXT_WIDTH_PT: f32 = 320.0;
 /// Vertical gap between the tooltip text line and the animation below it.
 const TOOLTIP_TEXT_GAP_PT: f32 = 4.0;
+/// Vertical gap above the optional tooltip action button, separating it from the
+/// content (text and/or animation) rendered above it.
+const TOOLTIP_ACTION_GAP_PT: f32 = 6.0;
 /// Consecutive frame intervals without a tooltip heartbeat before shutdown.
 const MISSED_HEARTBEATS_BEFORE_STOP: u8 = 2;
 
@@ -92,10 +99,25 @@ struct WorkerSlot {
 ///
 /// The tooltip carries a localized text line, a streaming animation, or both (text
 /// above the animation). At least one of the two is always set by the constructors.
+///
+/// Optionally, `with_action` adds a clickable button below that content; its click is
+/// only reported when the widget is shown through `show_with_action`.
 #[derive(Debug, Clone)]
 pub struct HelpHint {
     animation: Option<ms_gifs::Hint>,
     text: Option<String>,
+    /// Already-localized caption of the optional tooltip action button, or `None`.
+    action_label: Option<String>,
+}
+
+/// Outcome of `HelpHint::show_with_action`: the icon response plus the action-button click.
+#[derive(Debug)]
+pub struct HelpHintResponse {
+    /// Response of the "?" icon itself (the same value `show` returns).
+    pub response: egui::Response,
+    /// True only on the frame the tooltip action button was clicked. Always false when the
+    /// hint has no action label.
+    pub action_clicked: bool,
 }
 
 impl HelpHint {
@@ -108,6 +130,7 @@ impl HelpHint {
         Self {
             animation: Some(hint),
             text: None,
+            action_label: None,
         }
     }
 
@@ -120,6 +143,7 @@ impl HelpHint {
         Self {
             animation: None,
             text: Some(text.into()),
+            action_label: None,
         }
     }
 
@@ -141,35 +165,85 @@ impl HelpHint {
         self
     }
 
+    /// Adds a clickable action button below the tooltip content.
+    ///
+    /// `label` must already be localized. The button is rendered by both `show` and
+    /// `show_with_action`, but its click is only reported through the latter; `show`
+    /// draws it and discards the click.
+    #[must_use]
+    pub fn with_action(mut self, label: impl Into<String>) -> Self {
+        self.action_label = Some(label.into());
+        self
+    }
+
     /// Draws the icon and attaches its hover tooltip.
     ///
     /// The tooltip is attached only when it would have something to show. A hint with no
     /// animation never reaches the playback cache; a hint whose animation is blacklisted
     /// for the session still shows its text, and drops the tooltip entirely only when it
-    /// has no text either.
+    /// has no text either. Any action button set via `with_action` is still rendered, but
+    /// its click is discarded — use `show_with_action` to observe it.
     pub fn show(self, ui: &mut egui::Ui) -> egui::Response {
-        let response = draw_icon(ui);
+        let mut action_clicked = false;
+        self.show_inner(ui, &mut action_clicked)
+    }
 
-        // Text-only mode must stay free of `ms-gifs`: no cache handle, no worker.
+    /// Draws the icon and tooltip like `show`, additionally reporting the action-button click.
+    ///
+    /// When no action label is set this behaves exactly like `show` and
+    /// `HelpHintResponse::action_clicked` is always false.
+    pub fn show_with_action(self, ui: &mut egui::Ui) -> HelpHintResponse {
+        let mut action_clicked = false;
+        let response = self.show_inner(ui, &mut action_clicked);
+        HelpHintResponse {
+            response,
+            action_clicked,
+        }
+    }
+
+    /// Shared body of `show` / `show_with_action`: draws the icon, attaches the tooltip, and
+    /// sets `*action_clicked` when the optional action button is pressed this frame.
+    ///
+    /// The tooltip is attached only when it carries content: a text line, a usable animation,
+    /// or an action button. A blacklisted animation with neither text nor an action button
+    /// drops the tooltip entirely.
+    fn show_inner(self, ui: &mut egui::Ui, action_clicked: &mut bool) -> egui::Response {
+        let response = draw_icon(ui);
+        let text = self.text;
+        let action_label = self.action_label;
+
+        // Text-only mode must stay free of `ms-gifs`: no cache handle, no worker. The tooltip
+        // is still worth attaching when it carries only an action button.
         let Some(hint) = self.animation else {
-            return match self.text {
-                Some(text) => {
-                    response.on_hover_ui(|tooltip_ui| tooltip_text_ui(tooltip_ui, &text))
+            if text.is_none() && action_label.is_none() {
+                return response;
+            }
+            return response.on_hover_ui(|tooltip_ui| {
+                if let Some(text) = text.as_deref() {
+                    tooltip_text_ui(tooltip_ui, text);
                 }
-                None => response,
-            };
+                draw_action_button(
+                    tooltip_ui,
+                    action_label.as_deref(),
+                    text.is_some(),
+                    action_clicked,
+                );
+            });
         };
 
         let cache = cache_handle(ui.ctx());
         // Blacklisting is permanent for the session, so this read only ever goes from
         // "available" to "unavailable". It gates whether a tooltip is worth attaching at
         // all; what the tooltip actually paints is decided inside the closure, because a
-        // worker can blacklist the hint after this point.
-        if lock_cache(&cache).failed.contains(&hint.name()) && self.text.is_none() {
+        // worker can blacklist the hint after this point. An action button keeps the
+        // tooltip alive even when the animation is blacklisted and there is no text.
+        if lock_cache(&cache).failed.contains(&hint.name())
+            && text.is_none()
+            && action_label.is_none()
+        {
             return response;
         }
 
-        let text = self.text;
         response.on_hover_ui(|tooltip_ui| {
             // The animation is resolved before the text is laid out, and the gap below is
             // then driven by that same resolution. Deciding the gap from a separate,
@@ -178,14 +252,45 @@ impl HelpHint {
             // paint, leaving the text trailed by a stray space. One decision cannot
             // disagree with itself.
             let plan = resolve_animation(tooltip_ui, hint, &cache);
+            // Captured before the plan is consumed by `draw_animation`; it decides both the
+            // text gap and whether the action button needs a separator above it.
+            let animation_paints = plan.paints();
             if let Some(text) = text.as_deref() {
                 tooltip_text_ui(tooltip_ui, text);
-                if plan.paints() {
+                if animation_paints {
                     tooltip_ui.add_space(TOOLTIP_TEXT_GAP_PT);
                 }
             }
             draw_animation(tooltip_ui, plan);
+            draw_action_button(
+                tooltip_ui,
+                action_label.as_deref(),
+                text.is_some() || animation_paints,
+                action_clicked,
+            );
         })
+    }
+}
+
+/// Draws the optional tooltip action button and records its click.
+///
+/// `label` is the already-localized caption; `None` draws nothing. When `space_above` is
+/// true a small gap separates the button from the content above it. Sets `*clicked` to true
+/// on the frame the button is pressed and never clears it, so callers must start it false.
+fn draw_action_button(
+    ui: &mut egui::Ui,
+    label: Option<&str>,
+    space_above: bool,
+    clicked: &mut bool,
+) {
+    let Some(label) = label else {
+        return;
+    };
+    if space_above {
+        ui.add_space(TOOLTIP_ACTION_GAP_PT);
+    }
+    if ui.button(label).clicked() {
+        *clicked = true;
     }
 }
 
@@ -591,6 +696,21 @@ mod tests {
         let hint = HelpHint::text("explain me").with_animation(HINT);
         assert_eq!(hint.animation, Some(HINT));
         assert_eq!(hint.text.as_deref(), Some("explain me"));
+    }
+
+    #[test]
+    fn constructors_leave_the_action_unset() {
+        assert_eq!(HelpHint::animated(HINT).action_label, None);
+        assert_eq!(HelpHint::text("explain me").action_label, None);
+    }
+
+    #[test]
+    fn with_action_stores_the_localized_label() {
+        let hint = HelpHint::text("explain me").with_action("Do it");
+        assert_eq!(hint.action_label.as_deref(), Some("Do it"));
+        // The action is orthogonal to the existing text/animation content.
+        assert_eq!(hint.text.as_deref(), Some("explain me"));
+        assert_eq!(hint.animation, None);
     }
 
     #[test]

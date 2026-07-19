@@ -27,7 +27,9 @@ FILE HEADER (widgets/mod.rs)
     optional corner marker badge with the painter only.
   - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
     localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
-    short-lived background worker, or both — text above the animation.
+    short-lived background worker, or both — text above the animation. An optional
+    `with_action` button sits below that content; `show_with_action` returns a
+    `HelpHintResponse` reporting its click.
 */
 mod ai_button;
 mod autocomplete_line;
@@ -53,7 +55,7 @@ pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]
 pub use font_preview::{combo_font_family_name, ensure_font_family, is_font_family_bound};
 #[allow(unused_imports)]
-pub use help_hint::HelpHint;
+pub use help_hint::{HelpHint, HelpHintResponse};
 #[allow(unused_imports)]
 pub use marked_scroll::{
     ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,

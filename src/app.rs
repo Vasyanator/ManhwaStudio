@@ -3215,6 +3215,12 @@ impl eframe::App for MangaApp {
                 egui::CentralPanel::default().show(ui, |ui| {
                     typing.draw(ctx, ui, project, page_infos, textures, status);
                 });
+                // In-app deep link from the typing panel's font-group "?" help icon:
+                // switch to the settings tab and reveal the requested block.
+                if let Some(link) = typing.take_settings_navigation_request() {
+                    self.settings_tab.navigate_to(link);
+                    self.active_tab = AppTab::Settings;
+                }
             }
             AppTab::PsEditor => {
                 let project = &self.project;

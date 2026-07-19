@@ -124,6 +124,18 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
 `save_onnx_provider_device` / `save_max_loaded_models`) and the ORT load-guard writers live in
 `mod.rs`.
 
+## In-app deep links (`navigate_to`)
+- `SettingsTabState::navigate_to(SettingsDeepLink)` is the crate-public entry point for in-app
+  deep links (e.g. the typing panel's font-group "?" help icon). It selects the target section
+  (`active_pane`) and stashes a `pending_reveal`; it does NOT switch the app tab (the caller in
+  `app.rs` flips `active_tab` to `Settings`). The target section's draw force-opens its collapsed
+  blocks and issues the scroll while the reveal is pending, consuming the flag on the first frame
+  the target block actually renders (async content may need a few frames; a bounded
+  `pending_reveal_expires` wait prevents a stuck force-open) and arming a ~2 s highlight
+  (`reveal_highlight_until`, a `web_time::Instant`) — see the typesetting submodule for the
+  `TypesettingFontGroups` implementation. After consumption the user can collapse the revealed
+  blocks again. Add a `SettingsDeepLink` variant + a `navigate_to` arm per new target.
+
 ## Contracts and invariants
 - Do not block the GUI thread with file writes, Python process work, backend probes, or command
   output reads. Use the existing workers and command channels.
