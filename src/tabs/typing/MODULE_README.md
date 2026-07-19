@@ -270,7 +270,11 @@ saving, and export.
     edit-panel width stay in sync.
   - `panels.rs`: deformation panel, layers-tab body, layout-editor floating panels.
   - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
-  - `draw_page.rs`: `draw_page_overlays` (master per-page draw) + repaint/visibility/pixel-snap helpers.
+  - `draw_page.rs`: `draw_page_overlays` (master per-page draw) — takes the per-page `PageView`
+    transform plus a `TypingPageInteractionPolicy` snapshot (mask/focus/eyedropper/auto-type/strict-pixel
+    flags + `TypingCenteringAssistConfig`) built in the canvas hook before `text_overlays` is borrowed; its
+    `ctx` comes from `ui.ctx()`. Plus repaint/visibility/pixel-snap and centering-assist helpers
+    (`draw_centering_assist` takes a `CenteringMarker` + `PageView` + centering config).
   - `vector_transform.rs`: on-canvas VECTOR transform mode for text overlays (Phase 3a + 3b) — seeds a
     transient 13x13 working mesh over the overlay's oriented source-rect footprint, reuses the shared
     deform handles/brushes to edit it, and bakes the result into
@@ -286,6 +290,10 @@ saving, and export.
     the plain baked PNG is hidden for that overlay while the warped preview draws, and it falls back to
     the wireframe-only draw until the base is ready.
   - `mesh_geometry.rs`: deform-mesh/handle math, overlay geometry, hit-tests, unified-Z helpers (pure fns).
+    Owns `PageView` (`Copy` per-page page↔scene transform: `page_idx` + `image_rect` + `zoom`), the
+    argument bundle threaded through the per-page draw/interaction/geometry helpers; its `page_size_px` /
+    `scene_from_page_px` / `page_px_from_scene` methods wrap the same-named free fns (kept as the math
+    source of truth). Re-exported at the typing-module level (`tab::PageView`) so `mask.rs` can name it.
   - `layout_editor.rs`: vector-line layout-editor free fns (frame/line hit-test, draw, conversions).
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
   - `export.rs`: PNG/PSD export jobs + page composition/flatten free fns.

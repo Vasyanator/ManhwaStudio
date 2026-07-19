@@ -25,13 +25,14 @@ Notes:
 use super::helpers::{
     bubble_text_font_id, measure_text_widget_content_height, with_bubble_text_font,
 };
-use super::types::{BubbleTextField, BubbleType, RectCoords};
+use super::types::{
+    BubbleMenuCommand, BubbleMenuContext, BubbleTextField, BubbleType, RectCoords,
+};
 use super::{
     CanvasHooks, CanvasView, ON_TOP_FOCUS_GAP_PX, ON_TOP_FOOTER_RESERVED_HEIGHT_PX, OnTopFocusMode,
 };
 use crate::bubble_status::paint_bubble_status_border;
 use crate::project::{ProjectData, Side};
-use crate::runtime_log;
 use crate::widgets::{SpellcheckedTextEdit, misspelled_word_at_pointer};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke};
@@ -138,14 +139,12 @@ pub(super) fn draw_on_top_for_page(
 
         let mut new_text = snapshot.text.clone();
         let mut new_original = snapshot.original_text.clone();
-        let mut want_paste_original = false;
-        let mut want_paste_translation = false;
-        let mut want_copy_whole_bubble = false;
-        let mut want_duplicate_bubble = false;
-        let mut want_paste_whole_bubble = false;
+        // Single deferred command accumulated across all three context-menu closures below.
+        // Only one menu is ever open at a time and each item closes the menu, so at most one
+        // command is produced per frame; applied after the closures release their borrows.
+        let mut menu_command: Option<BubbleMenuCommand> = None;
         let mut want_translate = false;
         let mut want_delete = false;
-        let mut want_switch_bubble_type = None;
         let mut bubble_has_focus = selected_now && !suppress_on_top_focus_ui;
         let mut text_changed = false;
         let mut hit_rect = rect;
@@ -278,22 +277,20 @@ pub(super) fn draw_on_top_for_page(
                                 text_misspelled_word.clone();
                         }
                         text_resp.response.context_menu(|ui| {
-                            canvas.show_bubble_context_menu(
+                            let outcome = canvas.show_bubble_context_menu(
                                 ui,
-                                project,
-                                bid,
-                                snapshot.bubble_type,
-                                &new_original,
-                                &new_text,
-                                text_misspelled_word.as_deref(),
-                                &mut want_copy_whole_bubble,
-                                &mut want_duplicate_bubble,
-                                &mut want_paste_whole_bubble,
-                                &mut want_paste_original,
-                                &mut want_paste_translation,
-                                &mut want_switch_bubble_type,
-                                &mut interacted_with_bubble,
+                                BubbleMenuContext {
+                                    project,
+                                    bubble_id: bid,
+                                    bubble_type: snapshot.bubble_type,
+                                    original_text: &new_original,
+                                    translated_text: &new_text,
+                                },
                             );
+                            interacted_with_bubble |= outcome.interacted;
+                            if outcome.command.is_some() {
+                                menu_command = outcome.command;
+                            }
                         });
                     });
             } else {
@@ -413,22 +410,20 @@ pub(super) fn draw_on_top_for_page(
                     orig_misspelled_word.clone();
             }
             orig_resp.response.context_menu(|ui| {
-                canvas.show_bubble_context_menu(
+                let outcome = canvas.show_bubble_context_menu(
                     ui,
-                    project,
-                    bid,
-                    snapshot.bubble_type,
-                    &new_original,
-                    &new_text,
-                    orig_misspelled_word.as_deref(),
-                    &mut want_copy_whole_bubble,
-                    &mut want_duplicate_bubble,
-                    &mut want_paste_whole_bubble,
-                    &mut want_paste_original,
-                    &mut want_paste_translation,
-                    &mut want_switch_bubble_type,
-                    &mut interacted_with_bubble,
+                    BubbleMenuContext {
+                        project,
+                        bubble_id: bid,
+                        bubble_type: snapshot.bubble_type,
+                        original_text: &new_original,
+                        translated_text: &new_text,
+                    },
                 );
+                interacted_with_bubble |= outcome.interacted;
+                if outcome.command.is_some() {
+                    menu_command = outcome.command;
+                }
             });
             if original_rect.intersect(scene_clip_rect).is_positive() {
                 hit_rect = hit_rect.union(original_rect.intersect(scene_clip_rect));
@@ -479,22 +474,20 @@ pub(super) fn draw_on_top_for_page(
             }
         }
         response.context_menu(|ui| {
-            canvas.show_bubble_context_menu(
+            let outcome = canvas.show_bubble_context_menu(
                 ui,
-                project,
-                bid,
-                snapshot.bubble_type,
-                &new_original,
-                &new_text,
-                None,
-                &mut want_copy_whole_bubble,
-                &mut want_duplicate_bubble,
-                &mut want_paste_whole_bubble,
-                &mut want_paste_original,
-                &mut want_paste_translation,
-                &mut want_switch_bubble_type,
-                &mut interacted_with_bubble,
+                BubbleMenuContext {
+                    project,
+                    bubble_id: bid,
+                    bubble_type: snapshot.bubble_type,
+                    original_text: &new_original,
+                    translated_text: &new_text,
+                },
             );
+            interacted_with_bubble |= outcome.interacted;
+            if outcome.command.is_some() {
+                menu_command = outcome.command;
+            }
         });
         if response.secondary_clicked() {
             canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
@@ -590,16 +583,7 @@ pub(super) fn draw_on_top_for_page(
             draw_rect_handles(canvas, ui, bid, image_rect, coords);
         }
 
-        if want_paste_original
-            || want_paste_translation
-            || want_copy_whole_bubble
-            || want_duplicate_bubble
-            || want_paste_whole_bubble
-            || want_translate
-            || want_delete
-            || want_switch_bubble_type.is_some()
-            || interacted_with_bubble
-        {
+        if menu_command.is_some() || want_translate || want_delete || interacted_with_bubble {
             canvas.bubble_runtime.selected_bubble = Some(bid);
         }
         selected_now = canvas.bubble_runtime.selected_bubble == Some(bid);
@@ -609,39 +593,13 @@ pub(super) fn draw_on_top_for_page(
         if bubble_has_focus {
             canvas.bubble_runtime.focused_bubbles.insert(bid);
         }
-        if want_paste_original {
-            canvas.request_paste_from_clipboard(ui.ctx(), bid, BubbleTextField::Original);
-        }
-        if want_paste_translation {
-            canvas.request_paste_from_clipboard(ui.ctx(), bid, BubbleTextField::Translation);
-        }
-        if want_copy_whole_bubble && !canvas.copy_whole_bubble_to_internal_buffer(project, bid) {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_on_top_ui] failed to copy bubble payload; bubble_id={bid}"
-            ));
-        }
-        if want_duplicate_bubble
-            && !canvas.duplicate_bubble_below(project, bid, ui.ctx().input(|i| i.time))
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_on_top_ui] failed to duplicate bubble; bubble_id={bid}"
-            ));
-        }
-        if want_paste_whole_bubble
-            && !canvas.paste_copied_whole_bubble_into_bid(project, bid, ui.ctx().input(|i| i.time))
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_on_top_ui] failed to paste copied bubble payload; bubble_id={bid}"
-            ));
-        }
-        if let Some(next_type) = want_switch_bubble_type
-            && !canvas.set_bubble_type_for_bid(bid, next_type)
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_on_top_ui] failed to switch bubble type; bubble_id={bid}; next_type={}",
-                next_type.as_str()
-            ));
-        }
+        canvas.apply_bubble_menu_command(
+            project,
+            ui.ctx(),
+            bid,
+            menu_command,
+            "canvas::bubble_on_top_ui",
+        );
         if want_translate {
             canvas.bubble_runtime.pending_translate.insert(bid);
         }

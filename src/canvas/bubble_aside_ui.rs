@@ -13,6 +13,12 @@ Main responsibilities:
 - manage aside drag lifecycle for bubble-body, rect-area, and image red-rect/area/anchor moves;
 - keep runtime bubble geometry in sync with scene interactions.
 
+Key structures:
+- AsidePageContext: per-page shared bundle (ui, project, hooks, page geometry, link sink) threaded
+  as `&mut` through the whole layout chain; `CanvasView` stays a SEPARATE `&mut` param.
+- AsideColumnLayout: per-column sizing/style bundle shared by the measure and draw passes.
+- AsideBodyMeasure: grouped inputs for the card body-height estimator.
+
 Key functions:
 - draw_aside_for_page()
 - draw_aside_side()  -> single- vs two-column dispatch per side
@@ -57,13 +63,13 @@ use super::helpers::{
 };
 use super::types::{
     AsideBubbleCompactMode, AsideBubbleSideMode, AsideDragTarget, AsideItem, BubbleClass,
-    BubbleLink, BubbleTextField, BubbleType, ImageTextArea, RectCoords, image_area_palette,
+    BubbleLink, BubbleMenuCommand, BubbleMenuContext, BubbleTextField, BubbleType,
+    CanvasScenePageFrame, ImageTextArea, RectCoords, image_area_palette,
     image_bubble_side_from_areas,
 };
 use super::{CanvasHooks, CanvasView};
 use crate::bubble_status::paint_bubble_status_border;
 use crate::project::{Bubble, ProjectData, Side};
-use crate::runtime_log;
 use crate::widgets::{SpellcheckedTextEdit, misspelled_word_at_pointer};
 use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke};
@@ -304,18 +310,24 @@ fn displayed_aside_side(canvas: &CanvasView, bubble_side: Side) -> Side {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Lays out and draws both aside columns for one page, then paints the collected anchor links.
+///
+/// Takes the shared per-page geometry as a `CanvasScenePageFrame` (already built by the scene pass)
+/// and threads a single `AsidePageContext` through the layout chain; `canvas` stays a separate
+/// `&mut` so the snapshot-then-mutate pattern inside keeps its split borrows.
 pub(super) fn draw_aside_for_page(
     canvas: &mut CanvasView,
     ui: &mut egui::Ui,
     project: &ProjectData,
-    page_idx: usize,
-    row_rect: Rect,
-    image_rect: Rect,
+    page_frame: CanvasScenePageFrame,
     left_items: Vec<AsideItem>,
     right_items: Vec<AsideItem>,
     hooks: &mut dyn CanvasHooks,
 ) {
+    let page_idx = page_frame.page_idx;
+    let row_rect = page_frame.row_rect;
+    let image_rect = page_frame.image_rect;
+
     let [left_w, right_w] = canvas
         .scene
         .page_aside_widths
@@ -349,32 +361,19 @@ pub(super) fn draw_aside_for_page(
     // Each side decides single- vs two-column layout independently from its own free horizontal
     // span. `left_w`/`right_w` size the single-column fallback (clamped aside width for the side).
     let mut links = Vec::new();
-    draw_aside_side(
-        canvas,
-        ui,
+    let mut pctx = AsidePageContext {
+        // Reborrow `ui`: it is reused below to paint the collected anchor links after layout.
+        ui: &mut *ui,
         project,
-        Side::Left,
-        left_items,
-        image_rect,
-        row_rect,
-        viewport_rect,
-        left_w,
-        &mut links,
+        // `hooks` is not used again in this function, so move it into the context.
         hooks,
-    );
-    draw_aside_side(
-        canvas,
-        ui,
-        project,
-        Side::Right,
-        right_items,
-        image_rect,
         row_rect,
+        image_rect,
         viewport_rect,
-        right_w,
-        &mut links,
-        hooks,
-    );
+        links: &mut links,
+    };
+    draw_aside_side(canvas, &mut pctx, Side::Left, left_items, left_w);
+    draw_aside_side(canvas, &mut pctx, Side::Right, right_items, right_w);
 
     for link in links {
         draw_anchor_link(
@@ -512,19 +511,19 @@ fn aside_visible_groups(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn estimate_aside_body_height(
-    ui: &egui::Ui,
-    original_text: &str,
-    translation_text: &str,
-    display_text: &str,
-    base_width_px: f32,
-    body_mode: AsideBubbleBodyMode,
-    editable: bool,
-    scale_factor: f32,
-    frame_inner_margin_px: f32,
-    has_header: bool,
-) -> f32 {
+/// Estimates one aside card's total body height for pre-pack layout. Pure geometry over the
+/// measured text metrics in `m`; see `AsideBodyMeasure` for the inputs.
+fn estimate_aside_body_height(m: &AsideBodyMeasure<'_>) -> f32 {
+    let ui = m.ui;
+    let original_text = m.original_text;
+    let translation_text = m.translation_text;
+    let display_text = m.display_text;
+    let base_width_px = m.base_width_px;
+    let body_mode = m.body_mode;
+    let editable = m.editable;
+    let scale_factor = m.scale_factor;
+    let frame_inner_margin_px = m.frame_inner_margin_px;
+    let has_header = m.has_header;
     let margin_unscaled = frame_inner_margin_px / scale_factor.max(f32::EPSILON);
     let content_width_px = (base_width_px - margin_unscaled * 2.0).max(40.0);
     let original_height =
@@ -584,6 +583,78 @@ struct AsideDesiredSlot {
     source_scene_y: f32,
     angle_key: f32,
     is_spacer: bool,
+}
+
+/// Per-page shared context threaded through the whole aside layout/draw call chain.
+///
+/// Bundles the egui `Ui`, project, hook object, page geometry, and the shared anchor-link sink so
+/// the aside functions take one `&mut AsidePageContext` plus a separate `&mut CanvasView`, instead
+/// of a 9-12 argument parameter list per level. `CanvasView` is deliberately NOT a field: the draw
+/// pass clones runtime snapshots before mutating canvas state, and embedding the canvas here would
+/// collide with those split borrows. Borrowed, never consumed.
+struct AsidePageContext<'a> {
+    /// Scene-space egui `Ui` the aside cards are drawn into.
+    ui: &'a mut egui::Ui,
+    /// Project used for hook-bubble resolution and spellcheck lookups; never mutated here.
+    project: &'a ProjectData,
+    /// Tab hook object for per-bubble header/footer/status customization.
+    hooks: &'a mut dyn CanvasHooks,
+    /// Full page row rect (unscaled page-height band) in scene space.
+    row_rect: Rect,
+    /// Page image rect in scene space; anchor origins and side edges derive from it.
+    image_rect: Rect,
+    /// Viewport rect used to spread columns into available height and gate two-column mode.
+    viewport_rect: Rect,
+    /// Shared sink for anchor links, drained and painted once after both sides are laid out.
+    links: &'a mut Vec<BubbleLink>,
+}
+
+/// Column-layout parameters for one aside column (single, near, or far).
+///
+/// Bundles the sizing/style values computed once per column so the measure pass
+/// (`build_aside_desired_slots`) and the draw pass (`draw_aside_slots`) read the same numbers.
+struct AsideColumnLayout {
+    /// Page side this column belongs to.
+    side: Side,
+    /// Column rect in scene space.
+    column_rect: Rect,
+    /// Unscaled column width (px), used for read-only compact-width measuring.
+    base_width: f32,
+    /// Scaled column width (px), used for editable card width and clamping.
+    scaled_width: f32,
+    /// Card scale factor (>= 1.0) applied to fonts/spacing/heights.
+    scale_factor: f32,
+    /// Inner frame margin (px) for cards at this scale.
+    frame_inner_margin: i8,
+    /// Per-scale egui style for cards, or `None` at scale 1.0 (keep ambient style).
+    scaled_style: Option<egui::Style>,
+}
+
+/// Inputs for estimating one aside card's body height before packing.
+///
+/// Groups the text buffers and per-card scalars `estimate_aside_body_height` needs so that measure
+/// helper takes a single reference instead of ten positional arguments.
+struct AsideBodyMeasure<'a> {
+    /// Ui used only for font/spacing metrics (read-only).
+    ui: &'a egui::Ui,
+    /// Original-text buffer measured for the original row.
+    original_text: &'a str,
+    /// Translation-text buffer measured for the translation row.
+    translation_text: &'a str,
+    /// Read-only display text measured in read-only / compact-single modes.
+    display_text: &'a str,
+    /// Card content width (px) the text is wrapped to.
+    base_width_px: f32,
+    /// Which body groups are visible, driving which rows contribute height.
+    body_mode: AsideBubbleBodyMode,
+    /// Whether the canvas is editable (adds editor chrome height).
+    editable: bool,
+    /// Card scale factor applied to measured heights and chrome.
+    scale_factor: f32,
+    /// Inner frame margin (px) at this scale.
+    frame_inner_margin_px: f32,
+    /// Whether a header row is present (read-only path only).
+    has_header: bool,
 }
 
 /// A slot after vertical packing: final center Y and height within one column.
@@ -691,23 +762,19 @@ fn aside_two_column_rects(
 /// both columns plus gaps to stay inside the viewport (evaluated independently per side, so
 /// left/right can differ under horizontal ribbon scroll). Otherwise the classic single column is
 /// drawn, sized to `single_col_width`.
-#[allow(clippy::too_many_arguments)]
 fn draw_aside_side(
     canvas: &mut CanvasView,
-    ui: &mut egui::Ui,
-    project: &ProjectData,
+    pctx: &mut AsidePageContext<'_>,
     side: Side,
     items: Vec<AsideItem>,
-    image_rect: Rect,
-    row_rect: Rect,
-    viewport_rect: Rect,
     single_col_width: f32,
-    out_links: &mut Vec<BubbleLink>,
-    hooks: &mut dyn CanvasHooks,
 ) {
     if items.is_empty() {
         return;
     }
+    let image_rect = pctx.image_rect;
+    let row_rect = pctx.row_rect;
+    let viewport_rect = pctx.viewport_rect;
     let side_margin = canvas.state.side_margin;
     let min_width = canvas.state.bubble_min_width.max(1.0);
     let span = match side {
@@ -726,19 +793,7 @@ fn draw_aside_side(
         );
         let (near_rect, far_rect) =
             aside_two_column_rects(side, image_rect, row_rect, col_w, spacing);
-        draw_aside_two_columns(
-            canvas,
-            ui,
-            project,
-            side,
-            items,
-            near_rect,
-            far_rect,
-            image_rect,
-            viewport_rect,
-            out_links,
-            hooks,
-        );
+        draw_aside_two_columns(canvas, pctx, side, items, near_rect, far_rect);
     } else {
         let col_rect = match side {
             Side::Left => Rect::from_min_size(
@@ -753,33 +808,16 @@ fn draw_aside_side(
                 egui::vec2(single_col_width.max(1.0), image_rect.height()),
             ),
         };
-        draw_aside_column(
-            canvas,
-            ui,
-            project,
-            side,
-            items,
-            col_rect,
-            image_rect,
-            viewport_rect,
-            out_links,
-            hooks,
-        );
+        draw_aside_column(canvas, pctx, side, items, col_rect);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_aside_column(
     canvas: &mut CanvasView,
-    ui: &mut egui::Ui,
-    project: &ProjectData,
+    pctx: &mut AsidePageContext<'_>,
     side: Side,
     items: Vec<AsideItem>,
     column_rect: Rect,
-    image_rect: Rect,
-    viewport_rect: Rect,
-    out_links: &mut Vec<BubbleLink>,
-    hooks: &mut dyn CanvasHooks,
 ) {
     if items.is_empty() || !column_rect.is_positive() {
         return;
@@ -788,42 +826,27 @@ fn draw_aside_column(
     let base_column_width = column_rect.width().max(1.0);
     let scaled_column_width = (base_column_width * scale_factor).max(1.0);
     let frame_inner_margin = aside_frame_inner_margin(scale_factor);
-    let scaled_bubble_style = aside_scaled_style(ui, scale_factor);
-    let desired = build_aside_desired_slots(
-        canvas,
-        ui,
-        project,
+    let scaled_bubble_style = aside_scaled_style(pctx.ui, scale_factor);
+    let layout = AsideColumnLayout {
         side,
-        &items,
-        base_column_width,
-        scaled_column_width,
-        frame_inner_margin,
-        image_rect,
+        column_rect,
+        base_width: base_column_width,
+        scaled_width: scaled_column_width,
         scale_factor,
-        hooks,
-    );
-    let perm_cache = aside_pack_perm_cache_handle(ui);
+        frame_inner_margin,
+        scaled_style: scaled_bubble_style,
+    };
+    let desired = build_aside_desired_slots(canvas, pctx, &layout, &items);
+    let perm_cache = aside_pack_perm_cache_handle(pctx.ui);
     let packed = pack_aside_slots(
         desired,
         side,
         column_rect,
-        viewport_rect,
+        pctx.viewport_rect,
         0.0,
         Some(&perm_cache),
     );
-    draw_aside_slots(
-        canvas,
-        ui,
-        project,
-        side,
-        column_rect,
-        image_rect,
-        packed,
-        frame_inner_margin,
-        scaled_bubble_style,
-        out_links,
-        hooks,
-    );
+    draw_aside_slots(canvas, pctx, &layout, packed);
 }
 
 /// Lays out one side's aside bubbles in two side-by-side columns (near = hugging the ribbon,
@@ -837,26 +860,21 @@ fn draw_aside_column(
 /// column is packed together with one invisible spacer per far bubble (at the far anchor height) so
 /// near cards spread apart and each far link threads the gap between near cards instead of crossing
 /// over/under one.
-#[allow(clippy::too_many_arguments)]
 fn draw_aside_two_columns(
     canvas: &mut CanvasView,
-    ui: &mut egui::Ui,
-    project: &ProjectData,
+    pctx: &mut AsidePageContext<'_>,
     side: Side,
     items: Vec<AsideItem>,
     near_rect: Rect,
     far_rect: Rect,
-    image_rect: Rect,
-    viewport_rect: Rect,
-    out_links: &mut Vec<BubbleLink>,
-    hooks: &mut dyn CanvasHooks,
 ) {
     if items.is_empty() || !near_rect.is_positive() {
         return;
     }
+    let viewport_rect = pctx.viewport_rect;
     let scale_factor = canvas.aside_scale_factor();
     let frame_inner_margin = aside_frame_inner_margin(scale_factor);
-    let scaled_bubble_style = aside_scaled_style(ui, scale_factor);
+    let scaled_bubble_style = aside_scaled_style(pctx.ui, scale_factor);
     // Small mandatory gap so near cards keep a little distance and far links have room between them.
     let gap = (10.0 * scale_factor).max(2.0);
     // Vertical clearance reserved in the near column for one far link to pass between cards.
@@ -865,19 +883,17 @@ fn draw_aside_two_columns(
     // Both columns share the same width; build every desired slot once at that width.
     let base_w = near_rect.width().max(1.0);
     let scaled_w = (base_w * scale_factor).max(1.0);
-    let mut all = build_aside_desired_slots(
-        canvas,
-        ui,
-        project,
+    // Near-column layout also drives the shared measure pass (its width matches the far column).
+    let near_layout = AsideColumnLayout {
         side,
-        &items,
-        base_w,
-        scaled_w,
-        frame_inner_margin,
-        image_rect,
+        column_rect: near_rect,
+        base_width: base_w,
+        scaled_width: scaled_w,
         scale_factor,
-        hooks,
-    );
+        frame_inner_margin,
+        scaled_style: scaled_bubble_style.clone(),
+    };
+    let mut all = build_aside_desired_slots(canvas, pctx, &near_layout, &items);
     if all.is_empty() {
         return;
     }
@@ -897,7 +913,7 @@ fn draw_aside_two_columns(
     for far in &far_desired {
         near_input.push(spacer_from_slot(far, clearance));
     }
-    let perm_cache = aside_pack_perm_cache_handle(ui);
+    let perm_cache = aside_pack_perm_cache_handle(pctx.ui);
     let near_packed = pack_aside_slots(
         near_input,
         side,
@@ -908,19 +924,7 @@ fn draw_aside_two_columns(
     );
     let near_real: Vec<PackedAsideSlot> =
         near_packed.into_iter().filter(|s| !s.is_spacer).collect();
-    draw_aside_slots(
-        canvas,
-        ui,
-        project,
-        side,
-        near_rect,
-        image_rect,
-        near_real,
-        frame_inner_margin,
-        scaled_bubble_style.clone(),
-        out_links,
-        hooks,
-    );
+    draw_aside_slots(canvas, pctx, &near_layout, near_real);
 
     // Far column: packed independently so links stay close to their anchors (straight).
     if !far_desired.is_empty() && far_rect.is_positive() {
@@ -932,19 +936,16 @@ fn draw_aside_two_columns(
             gap,
             Some(&perm_cache),
         );
-        draw_aside_slots(
-            canvas,
-            ui,
-            project,
+        let far_layout = AsideColumnLayout {
             side,
-            far_rect,
-            image_rect,
-            far_packed,
+            column_rect: far_rect,
+            base_width: base_w,
+            scaled_width: scaled_w,
+            scale_factor,
             frame_inner_margin,
-            scaled_bubble_style,
-            out_links,
-            hooks,
-        );
+            scaled_style: scaled_bubble_style,
+        };
+        draw_aside_slots(canvas, pctx, &far_layout, far_packed);
     }
 }
 
@@ -1002,20 +1003,22 @@ fn spacer_from_slot(far: &AsideDesiredSlot, clearance: f32) -> AsideDesiredSlot 
 }
 
 /// Builds the unsorted desired slots (height, width, anchor positions) for one column's items.
-#[allow(clippy::too_many_arguments)]
 fn build_aside_desired_slots(
     canvas: &mut CanvasView,
-    ui: &mut egui::Ui,
-    project: &ProjectData,
-    side: Side,
+    pctx: &mut AsidePageContext<'_>,
+    layout: &AsideColumnLayout,
     items: &[AsideItem],
-    base_column_width: f32,
-    scaled_column_width: f32,
-    frame_inner_margin: i8,
-    image_rect: Rect,
-    scale_factor: f32,
-    hooks: &mut dyn CanvasHooks,
 ) -> Vec<AsideDesiredSlot> {
+    // Rebind context/layout fields to locals so the measure logic below reads them as before.
+    let project = pctx.project;
+    let image_rect = pctx.image_rect;
+    let ui = &mut *pctx.ui;
+    let hooks = &mut *pctx.hooks;
+    let side = layout.side;
+    let base_column_width = layout.base_width;
+    let scaled_column_width = layout.scaled_width;
+    let frame_inner_margin = layout.frame_inner_margin;
+    let scale_factor = layout.scale_factor;
     let mut desired_slots: Vec<AsideDesiredSlot> = Vec::new();
 
     // O(1) id -> persisted bubble lookup for this measure pass, replacing the former per-item
@@ -1101,18 +1104,18 @@ fn build_aside_desired_slots(
             (text_width.max(header_width) + frame_inner_margin_px * 2.0)
                 .clamp(1.0, scaled_column_width)
         };
-        let mut estimated_h = estimate_aside_body_height(
+        let mut estimated_h = estimate_aside_body_height(&AsideBodyMeasure {
             ui,
-            &b.original_text,
-            &b.text,
-            &item_readonly_text,
-            bubble_width,
+            original_text: &b.original_text,
+            translation_text: &b.text,
+            display_text: &item_readonly_text,
+            base_width_px: bubble_width,
             body_mode,
-            canvas.editable,
+            editable: canvas.editable,
             scale_factor,
-            f32::from(frame_inner_margin),
+            frame_inner_margin_px: f32::from(frame_inner_margin),
             has_header,
-        );
+        });
         if canvas.editable && is_image {
             // Editable image bubbles render a preview plus one row block per text area.
             let preview_content_width =
@@ -1438,21 +1441,23 @@ fn pack_aside_slots(
     slots
 }
 
-/// Draws already-packed aside cards in one column and appends their anchor links to `out_links`.
-#[allow(clippy::too_many_arguments)]
+/// Draws already-packed aside cards in one column and appends their anchor links to the shared sink.
 fn draw_aside_slots(
     canvas: &mut CanvasView,
-    ui: &mut egui::Ui,
-    project: &ProjectData,
-    side: Side,
-    column_rect: Rect,
-    image_rect: Rect,
+    pctx: &mut AsidePageContext<'_>,
+    layout: &AsideColumnLayout,
     slots: Vec<PackedAsideSlot>,
-    frame_inner_margin: i8,
-    scaled_bubble_style: Option<egui::Style>,
-    out_links: &mut Vec<BubbleLink>,
-    hooks: &mut dyn CanvasHooks,
 ) {
+    // Rebind context/layout fields to locals so the draw logic below reads them as before.
+    let project = pctx.project;
+    let image_rect = pctx.image_rect;
+    let ui = &mut *pctx.ui;
+    let hooks = &mut *pctx.hooks;
+    let out_links = &mut *pctx.links;
+    let side = layout.side;
+    let column_rect = layout.column_rect;
+    let frame_inner_margin = layout.frame_inner_margin;
+    let scaled_bubble_style = &layout.scaled_style;
     // O(1) id -> persisted bubble lookup for this draw pass, replacing the former per-slot linear
     // `project.bubbles.iter().find()`. Built once per call; borrows `project` immutably for the loop
     // below, which never mutates `project`. (Same small map is rebuilt independently in
@@ -1545,14 +1550,12 @@ fn draw_aside_slots(
         let mut block_rects: Vec<Rect> = Vec::new();
         // Unique egui id discriminator: read-only image areas share a bubble id across cards.
         let item_key = (bid, area_idx.unwrap_or(usize::MAX));
-        let mut want_paste_original = false;
-        let mut want_paste_translation = false;
-        let mut want_copy_whole_bubble = false;
-        let mut want_duplicate_bubble = false;
-        let mut want_paste_whole_bubble = false;
+        // Single deferred command accumulated across all three context-menu closures below.
+        // Only one menu is ever open at a time and each item closes the menu, so at most one
+        // command is produced per frame; applied after the closures release their borrows.
+        let mut menu_command: Option<BubbleMenuCommand> = None;
         let mut want_translate = false;
         let mut want_delete = false;
-        let mut want_switch_bubble_type = None;
         let mut text_changed = false;
         let mut interacted_with_bubble = false;
         let mut bubble_has_focus = selected;
@@ -1662,22 +1665,20 @@ fn draw_aside_slots(
                                 orig_misspelled_word.clone();
                         }
                         orig_resp.response.context_menu(|ui| {
-                            canvas.show_bubble_context_menu(
+                            let outcome = canvas.show_bubble_context_menu(
                                 ui,
-                                project,
-                                bid,
-                                snapshot.bubble_type,
-                                &new_original,
-                                &new_text,
-                                orig_misspelled_word.as_deref(),
-                                &mut want_copy_whole_bubble,
-                                &mut want_duplicate_bubble,
-                                &mut want_paste_whole_bubble,
-                                &mut want_paste_original,
-                                &mut want_paste_translation,
-                                &mut want_switch_bubble_type,
-                                &mut interacted_with_bubble,
+                                BubbleMenuContext {
+                                    project,
+                                    bubble_id: bid,
+                                    bubble_type: snapshot.bubble_type,
+                                    original_text: &new_original,
+                                    translated_text: &new_text,
+                                },
                             );
+                            interacted_with_bubble |= outcome.interacted;
+                            if outcome.command.is_some() {
+                                menu_command = outcome.command;
+                            }
                         });
                     }
                     if visible_groups.show_translation {
@@ -1726,22 +1727,20 @@ fn draw_aside_slots(
                                 tr_misspelled_word.clone();
                         }
                         tr_resp.response.context_menu(|ui| {
-                            canvas.show_bubble_context_menu(
+                            let outcome = canvas.show_bubble_context_menu(
                                 ui,
-                                project,
-                                bid,
-                                snapshot.bubble_type,
-                                &new_original,
-                                &new_text,
-                                tr_misspelled_word.as_deref(),
-                                &mut want_copy_whole_bubble,
-                                &mut want_duplicate_bubble,
-                                &mut want_paste_whole_bubble,
-                                &mut want_paste_original,
-                                &mut want_paste_translation,
-                                &mut want_switch_bubble_type,
-                                &mut interacted_with_bubble,
+                                BubbleMenuContext {
+                                    project,
+                                    bubble_id: bid,
+                                    bubble_type: snapshot.bubble_type,
+                                    original_text: &new_original,
+                                    translated_text: &new_text,
+                                },
                             );
+                            interacted_with_bubble |= outcome.interacted;
+                            if outcome.command.is_some() {
+                                menu_command = outcome.command;
+                            }
                         });
                     }
                 } else if visible_groups.show_readonly_text {
@@ -1799,22 +1798,20 @@ fn draw_aside_slots(
             paint_bubble_status_border(ui.painter(), response.rect, CornerRadius::same(6), style);
         }
         bubble_hit_response.context_menu(|ui| {
-            canvas.show_bubble_context_menu(
+            let outcome = canvas.show_bubble_context_menu(
                 ui,
-                project,
-                bid,
-                snapshot.bubble_type,
-                &new_original,
-                &new_text,
-                None,
-                &mut want_copy_whole_bubble,
-                &mut want_duplicate_bubble,
-                &mut want_paste_whole_bubble,
-                &mut want_paste_original,
-                &mut want_paste_translation,
-                &mut want_switch_bubble_type,
-                &mut interacted_with_bubble,
+                BubbleMenuContext {
+                    project,
+                    bubble_id: bid,
+                    bubble_type: snapshot.bubble_type,
+                    original_text: &new_original,
+                    translated_text: &new_text,
+                },
             );
+            interacted_with_bubble |= outcome.interacted;
+            if outcome.command.is_some() {
+                menu_command = outcome.command;
+            }
         });
         if bubble_hit_response.secondary_clicked() {
             canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
@@ -1830,16 +1827,7 @@ fn draw_aside_slots(
             canvas.bubble_runtime.selected_bubble = Some(bid);
             interacted_with_bubble = true;
         }
-        if want_paste_original
-            || want_paste_translation
-            || want_copy_whole_bubble
-            || want_duplicate_bubble
-            || want_paste_whole_bubble
-            || want_translate
-            || want_delete
-            || want_switch_bubble_type.is_some()
-            || interacted_with_bubble
-        {
+        if menu_command.is_some() || want_translate || want_delete || interacted_with_bubble {
             canvas.bubble_runtime.selected_bubble = Some(bid);
         }
         let selected_now = canvas.bubble_runtime.selected_bubble == Some(bid);
@@ -1850,39 +1838,13 @@ fn draw_aside_slots(
             canvas.bubble_runtime.focused_bubbles.insert(bid);
         }
 
-        if want_paste_original {
-            canvas.request_paste_from_clipboard(ui.ctx(), bid, BubbleTextField::Original);
-        }
-        if want_paste_translation {
-            canvas.request_paste_from_clipboard(ui.ctx(), bid, BubbleTextField::Translation);
-        }
-        if want_copy_whole_bubble && !canvas.copy_whole_bubble_to_internal_buffer(project, bid) {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_aside_ui] failed to copy bubble payload; bubble_id={bid}"
-            ));
-        }
-        if want_duplicate_bubble
-            && !canvas.duplicate_bubble_below(project, bid, ui.ctx().input(|i| i.time))
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_aside_ui] failed to duplicate bubble; bubble_id={bid}"
-            ));
-        }
-        if want_paste_whole_bubble
-            && !canvas.paste_copied_whole_bubble_into_bid(project, bid, ui.ctx().input(|i| i.time))
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_aside_ui] failed to paste copied bubble payload; bubble_id={bid}"
-            ));
-        }
-        if let Some(next_type) = want_switch_bubble_type
-            && !canvas.set_bubble_type_for_bid(bid, next_type)
-        {
-            runtime_log::log_warn(format!(
-                "[canvas::bubble_aside_ui] failed to switch bubble type; bubble_id={bid}; next_type={}",
-                next_type.as_str()
-            ));
-        }
+        canvas.apply_bubble_menu_command(
+            project,
+            ui.ctx(),
+            bid,
+            menu_command,
+            "canvas::bubble_aside_ui",
+        );
         if want_translate {
             canvas.bubble_runtime.pending_translate.insert(bid);
         }

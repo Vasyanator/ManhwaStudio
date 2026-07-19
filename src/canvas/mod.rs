@@ -18,6 +18,8 @@ Main types:
   through canvas editable/readonly settings before rendering.
 - `BubbleMode`: legacy persisted canvas mode retained for settings migration/compatibility.
 - `BubbleCopyPasteTarget`: bubble context-menu paste targets (`Original`, `Translation`, `WholeBubble`).
+- `BubbleMenuContext` / `BubbleMenuCommand` / `BubbleMenuOutcome`: input/return contract of
+  `show_bubble_context_menu` — identity+live-text input and the single deferred command it emits.
 - `RectCoords`: normalized UV rectangle used for bubble placement and resize logic.
 - `RuntimeBubble`: mutable runtime bubble state used by canvas editing/render.
 - `CopiedBubbleData`: internal clipboard payload for whole-bubble copy/paste (all non-positional data).
@@ -263,7 +265,8 @@ pub(crate) use self::types::ImageTextArea;
 
 pub use self::types::{
     AsideBubbleCompactMode, AsideBubbleSideMode, BubbleAction, BubbleClass, BubbleCopyPasteTarget,
-    BubbleMode, BubbleTextField, BubbleType, CanvasBottomHint, CanvasHintHelp, CanvasHintRow,
+    BubbleMenuCommand, BubbleMenuContext, BubbleMenuOutcome, BubbleMode, BubbleTextField,
+    BubbleType, CanvasBottomHint, CanvasHintHelp, CanvasHintRow,
     CanvasState, CanvasUiStatus, OnTopFocusMode, OverlayRectPx, RectCoords,
     SourceTextureUploadBudget, TranslationStatusDisplay,
 };
@@ -1392,35 +1395,37 @@ impl CanvasView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Renders the right-click context menu for a bubble and returns the deferred outcome.
+    ///
+    /// `ui` is the menu's own `Ui` (from `Response::context_menu`); `ctx` carries the bubble
+    /// identity and live text buffers. Borrow-free actions (clipboard copies, spellcheck toggles,
+    /// exclusion-word queuing) run inline; every state-mutating action is returned via
+    /// `BubbleMenuOutcome::command` so the caller can apply it after the menu closure releases its
+    /// borrows. `interacted` is set for any menu interaction, mirroring the old out-flag.
     fn show_bubble_context_menu(
         &mut self,
         ui: &mut egui::Ui,
-        project: &ProjectData,
-        bid: i64,
-        bubble_type: BubbleType,
-        original_text: &str,
-        translated_text: &str,
-        _misspelled_word: Option<&str>,
-        want_copy_whole_bubble: &mut bool,
-        want_duplicate_bubble: &mut bool,
-        want_paste_whole_bubble: &mut bool,
-        want_paste_original: &mut bool,
-        want_paste_translation: &mut bool,
-        want_switch_bubble_type: &mut Option<BubbleType>,
-        interacted_with_bubble: &mut bool,
-    ) {
+        ctx: BubbleMenuContext<'_>,
+    ) -> BubbleMenuOutcome {
+        let BubbleMenuContext {
+            project,
+            bubble_id: bid,
+            bubble_type,
+            original_text,
+            translated_text,
+        } = ctx;
+        let mut outcome = BubbleMenuOutcome::default();
         if ui.button(t!("canvas.bubble_menu.copy_bubble")).clicked() {
-            *want_copy_whole_bubble = true;
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::CopyWhole);
+            outcome.interacted = true;
             ui.close();
         }
         if ui
             .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.duplicate_bubble")))
             .clicked()
         {
-            *want_duplicate_bubble = true;
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::Duplicate);
+            outcome.interacted = true;
             ui.close();
         }
         if ui
@@ -1430,19 +1435,19 @@ impl CanvasView {
             )
             .clicked()
         {
-            *want_paste_whole_bubble = true;
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::PasteWhole);
+            outcome.interacted = true;
             ui.close();
         }
         ui.separator();
         if ui.button(t!("canvas.bubble_menu.copy_original")).clicked() {
             ui.ctx().copy_text(original_text.to_owned());
-            *interacted_with_bubble = true;
+            outcome.interacted = true;
             ui.close();
         }
         if ui.button(t!("canvas.bubble_menu.copy_translation")).clicked() {
             ui.ctx().copy_text(translated_text.to_owned());
-            *interacted_with_bubble = true;
+            outcome.interacted = true;
             ui.close();
         }
         ui.separator();
@@ -1453,8 +1458,8 @@ impl CanvasView {
             )
             .clicked()
         {
-            *want_switch_bubble_type = Some(BubbleType::Default);
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::SwitchType(BubbleType::Default));
+            outcome.interacted = true;
             ui.close();
         }
         if ui
@@ -1464,8 +1469,8 @@ impl CanvasView {
             )
             .clicked()
         {
-            *want_switch_bubble_type = Some(BubbleType::Aside);
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::SwitchType(BubbleType::Aside));
+            outcome.interacted = true;
             ui.close();
         }
         if ui
@@ -1475,8 +1480,8 @@ impl CanvasView {
             )
             .clicked()
         {
-            *want_switch_bubble_type = Some(BubbleType::OnTop);
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::SwitchType(BubbleType::OnTop));
+            outcome.interacted = true;
             ui.close();
         }
         ui.separator();
@@ -1484,16 +1489,16 @@ impl CanvasView {
             .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.paste_into_original")))
             .clicked()
         {
-            *want_paste_original = true;
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::PasteText(BubbleTextField::Original));
+            outcome.interacted = true;
             ui.close();
         }
         if ui
             .add_enabled(self.editable, egui::Button::new(t!("canvas.bubble_menu.paste_into_translation")))
             .clicked()
         {
-            *want_paste_translation = true;
-            *interacted_with_bubble = true;
+            outcome.command = Some(BubbleMenuCommand::PasteText(BubbleTextField::Translation));
+            outcome.interacted = true;
             ui.close();
         }
         if self.editable {
@@ -1514,7 +1519,7 @@ impl CanvasView {
                     BubbleTextField::Original,
                     disabled,
                 ) {
-                    *interacted_with_bubble = true;
+                    outcome.interacted = true;
                 }
             }
             let mut translation_spellcheck_enabled =
@@ -1533,7 +1538,7 @@ impl CanvasView {
                     BubbleTextField::Translation,
                     disabled,
                 ) {
-                    *interacted_with_bubble = true;
+                    outcome.interacted = true;
                 }
             }
         }
@@ -1546,13 +1551,65 @@ impl CanvasView {
             ui.label(tf!("canvas.bubble_menu.spellcheck_word", word = word));
             if ui.button(t!("canvas.bubble_menu.add_shared_exclusion")).clicked() {
                 queue_word_to_global_exceptions(word);
-                *interacted_with_bubble = true;
+                outcome.interacted = true;
                 ui.close();
             }
             if ui.button(t!("canvas.bubble_menu.add_project_exclusion")).clicked() {
                 queue_word_to_project_exceptions(word);
-                *interacted_with_bubble = true;
+                outcome.interacted = true;
                 ui.close();
+            }
+        }
+        outcome
+    }
+
+    /// Applies a deferred `BubbleMenuCommand` after its menu closure has released its borrows.
+    ///
+    /// `log_module` is the caller's module tag used in failure warnings so log lines stay
+    /// attributable to the originating UI layer. No-op when `command` is `None`.
+    fn apply_bubble_menu_command(
+        &mut self,
+        project: &ProjectData,
+        ctx: &egui::Context,
+        bid: i64,
+        command: Option<BubbleMenuCommand>,
+        log_module: &str,
+    ) {
+        let Some(command) = command else {
+            return;
+        };
+        match command {
+            BubbleMenuCommand::PasteText(field) => {
+                self.request_paste_from_clipboard(ctx, bid, field);
+            }
+            BubbleMenuCommand::CopyWhole => {
+                if !self.copy_whole_bubble_to_internal_buffer(project, bid) {
+                    runtime_log::log_warn(format!(
+                        "[{log_module}] failed to copy bubble payload; bubble_id={bid}"
+                    ));
+                }
+            }
+            BubbleMenuCommand::Duplicate => {
+                if !self.duplicate_bubble_below(project, bid, ctx.input(|i| i.time)) {
+                    runtime_log::log_warn(format!(
+                        "[{log_module}] failed to duplicate bubble; bubble_id={bid}"
+                    ));
+                }
+            }
+            BubbleMenuCommand::PasteWhole => {
+                if !self.paste_copied_whole_bubble_into_bid(project, bid, ctx.input(|i| i.time)) {
+                    runtime_log::log_warn(format!(
+                        "[{log_module}] failed to paste copied bubble payload; bubble_id={bid}"
+                    ));
+                }
+            }
+            BubbleMenuCommand::SwitchType(next_type) => {
+                if !self.set_bubble_type_for_bid(bid, next_type) {
+                    runtime_log::log_warn(format!(
+                        "[{log_module}] failed to switch bubble type; bubble_id={bid}; next_type={}",
+                        next_type.as_str()
+                    ));
+                }
             }
         }
     }

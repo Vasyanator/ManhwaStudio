@@ -14,6 +14,7 @@ Key structures:
 - CanvasHintHelp / CanvasHintRow / CanvasBottomHint
 - SourceTextureUploadBudget
 - BubbleAction / BubbleClass / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
+- BubbleMenuContext / BubbleMenuCommand / BubbleMenuOutcome
 - RectCoords
 - RuntimeBubble
 - OverlayPreparedTile / OverlayPreparedPage
@@ -25,7 +26,7 @@ Notes:
 */
 
 use crate::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
-use crate::project::Side;
+use crate::project::{ProjectData, Side};
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
 use serde_json::{Map, Value};
@@ -537,6 +538,62 @@ pub(crate) struct OnTopDragState {
 pub enum BubbleTextField {
     Original,
     Translation,
+}
+
+/// Identity and text content a bubble context menu needs to render and act.
+///
+/// Borrowed, per-frame input built at each call site right before the menu closure runs;
+/// it is never stored. `original_text`/`translated_text` are the live edit-buffer contents
+/// (not the persisted bubble fields) so "Copy original"/"Copy translation" reflect in-progress
+/// edits. The word-under-pointer used by the spellcheck exclusion items is NOT carried here:
+/// the menu reads it from `bubble_context_menu_misspelled_word`, which each call site sets on
+/// the right-click before opening the menu.
+#[derive(Debug, Clone, Copy)]
+pub struct BubbleMenuContext<'a> {
+    /// Project used for spellcheck-disable lookups on this bubble's fields.
+    pub project: &'a ProjectData,
+    /// Target bubble id.
+    pub bubble_id: i64,
+    /// Current display type of the bubble; gates the "make default/aside/on-top" items.
+    pub bubble_type: BubbleType,
+    /// Live original-text buffer; copied verbatim by "Copy original".
+    pub original_text: &'a str,
+    /// Live translation-text buffer; copied verbatim by "Copy translation".
+    pub translated_text: &'a str,
+}
+
+/// A single deferred mutation requested by a bubble context menu.
+///
+/// The menu itself performs only borrow-free side effects inline (clipboard copies, spellcheck
+/// toggles, exclusion-word queuing). Everything that mutates bubble/runtime state is returned as
+/// one of these variants and applied by the caller after the menu closure releases its borrows.
+/// At most one command can be produced per menu invocation (every item calls `ui.close()`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BubbleMenuCommand {
+    /// Copy the whole bubble into the internal buffer.
+    CopyWhole,
+    /// Duplicate this bubble below itself.
+    Duplicate,
+    /// Paste the copied whole-bubble payload into this bubble.
+    PasteWhole,
+    /// Paste clipboard text into the given bubble field.
+    PasteText(BubbleTextField),
+    /// Switch this bubble to the given display type.
+    SwitchType(BubbleType),
+}
+
+/// Result of rendering a bubble context menu.
+///
+/// `interacted` is load-bearing: it mirrors the previous `interacted_with_bubble` out-flag and is
+/// set by every menu item (including the borrow-free ones that produce no `command`), so callers
+/// still re-select the bubble on any interaction. `command`, when present, is applied after the
+/// menu closure returns.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BubbleMenuOutcome {
+    /// Deferred mutation to apply after the menu closure releases its borrows, if any.
+    pub command: Option<BubbleMenuCommand>,
+    /// Whether the user interacted with any menu item this frame.
+    pub interacted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

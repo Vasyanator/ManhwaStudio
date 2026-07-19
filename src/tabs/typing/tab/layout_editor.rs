@@ -392,18 +392,10 @@ pub(super) fn frame_rect_from_center_and_size(center: Pos2, size: Vec2, page_siz
     Rect::from_min_size(Pos2::new(min_x, min_y), Vec2::new(width, height))
 }
 
-pub(super) fn layout_editor_frame_scene_rect(frame_page_rect: Rect, image_rect: Rect, zoom: f32) -> Rect {
+pub(super) fn layout_editor_frame_scene_rect(frame_page_rect: Rect, view: PageView) -> Rect {
     Rect::from_min_max(
-        scene_from_page_px(
-            image_rect,
-            zoom,
-            [frame_page_rect.min.x, frame_page_rect.min.y],
-        ),
-        scene_from_page_px(
-            image_rect,
-            zoom,
-            [frame_page_rect.max.x, frame_page_rect.max.y],
-        ),
+        view.scene_from_page_px([frame_page_rect.min.x, frame_page_rect.min.y]),
+        view.scene_from_page_px([frame_page_rect.max.x, frame_page_rect.max.y]),
     )
 }
 
@@ -518,11 +510,11 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
     editor: &mut TypingLayoutEditorState,
     line_idx: usize,
     frame_scene: Rect,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
     response: &egui::Response,
     ctx: &egui::Context,
 ) -> bool {
+    let zoom = view.zoom;
     let mut completed_change = false;
     if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
         && let Some(line) = editor.lines.get_mut(line_idx)
@@ -537,7 +529,7 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
     let Some(pointer_scene) = response.interact_pointer_pos() else {
         return completed_change;
     };
-    let pointer_page = page_px_from_scene(image_rect, zoom, pointer_scene);
+    let pointer_page = view.page_px_from_scene(pointer_scene);
     let local = egui::pos2(
         (pointer_page[0] - editor.frame_page_rect.left())
             .clamp(0.0, editor.frame_page_rect.width().max(1.0)),

@@ -737,11 +737,10 @@ impl TypingTextOverlayLayer {
         &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
-        page_idx: usize,
+        view: PageView,
         raster_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
     ) {
+        let page_idx = view.page_idx;
         let Some(layer) = self
             .raster_layers_by_page
             .get_mut(&page_idx)
@@ -782,7 +781,7 @@ impl TypingTextOverlayLayer {
             let mesh_scene: Vec<Pos2> = grid
                 .points_px
                 .iter()
-                .map(|p| scene_from_page_px(image_rect, zoom, *p))
+                .map(|p| view.scene_from_page_px(*p))
                 .collect();
             draw_textured_deform_mesh(
                 painter,
@@ -808,7 +807,7 @@ impl TypingTextOverlayLayer {
         for (i, (dx, dy)) in corners.iter().enumerate() {
             let rx = dx * cos_a - dy * sin_a;
             let ry = dx * sin_a + dy * cos_a;
-            quad[i] = scene_from_page_px(image_rect, zoom, [cx + rx, cy + ry]);
+            quad[i] = view.scene_from_page_px([cx + rx, cy + ry]);
         }
         let tint = Color32::from_white_alpha((layer.opacity.clamp(0.0, 1.0) * 255.0) as u8);
         let mut mesh = Mesh::with_texture(texture.id());
@@ -880,18 +879,17 @@ impl TypingTextOverlayLayer {
     /// once text can sit below a raster). Mirrors `merged_fills`' overlay band-Z lookup.
     pub(super) fn topmost_overlay_at(
         &self,
-        page_idx: usize,
+        view: PageView,
         pointer: Option<Pos2>,
-        image_rect: Rect,
-        zoom: f32,
     ) -> Option<(usize, u32)> {
+        let page_idx = view.page_idx;
         let p = pointer?;
         let mut best: Option<(usize, u32)> = None;
         for (idx, overlay) in self.overlays.iter().enumerate() {
             if overlay.page_idx != page_idx || overlay.texture.is_none() {
                 continue;
             }
-            let quad = overlay_quad_scene(overlay, image_rect, zoom);
+            let quad = overlay_quad_scene(overlay, view);
             if !point_in_quad(p, &quad) {
                 continue;
             }

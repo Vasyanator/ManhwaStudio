@@ -31,6 +31,7 @@ use crate::memory_manager::{
 };
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::ProjectData;
+use crate::tabs::typing::tab::PageView;
 use crate::tools::MaskBrush;
 use crate::widgets::WheelSlider;
 use eframe::egui;
@@ -490,13 +491,9 @@ impl TypingMaskLayer {
             });
     }
 
-    pub fn draw_page_mask_overlay_and_handle_input(
-        &mut self,
-        ui: &mut egui::Ui,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) -> bool {
+    pub fn draw_page_mask_overlay_and_handle_input(&mut self, ui: &mut egui::Ui, view: PageView) -> bool {
+        let page_idx = view.page_idx;
+        let image_rect = view.image_rect;
         if !self.panel_open {
             self.active_stroke = None;
             return false;
@@ -529,7 +526,7 @@ impl TypingMaskLayer {
                 && self.fill_job_rx.is_none()
                 && pointer_pos.is_some_and(|pos| image_rect.contains(pos))
                 && let Some(pos) = pointer_pos
-                && let Err(err) = self.start_fill_job(ui.ctx(), page_idx, image_rect, zoom, pos)
+                && let Err(err) = self.start_fill_job(ui.ctx(), view, pos)
             {
                 self.set_error(ui.ctx(), err);
             }
@@ -547,7 +544,7 @@ impl TypingMaskLayer {
             }
 
             if response.hovered() {
-                let _ = self.handle_brush_wheel(ui, page_idx, image_rect, zoom);
+                let _ = self.handle_brush_wheel(ui);
                 let _ = self.handle_brush_size_shortcuts(ui);
             }
 
@@ -575,7 +572,7 @@ impl TypingMaskLayer {
                 };
                 let mask_brush = self.mask_brush.clone();
                 let brush_radius = mask_brush.radius_px();
-                let page_mask = self.ensure_mask_for_paint(page_idx, image_rect, zoom);
+                let page_mask = self.ensure_mask_for_paint(view);
                 if let Some(mask) = page_mask {
                     let dirty_rect =
                         stroke_bounds_mask_rect(mask, image_rect, start_pos, pos, brush_radius);
@@ -615,7 +612,7 @@ impl TypingMaskLayer {
             && let Some(pointer) = hover_pos
             && image_rect.contains(pointer)
         {
-            let [mask_w, mask_h] = self.effective_mask_size_for_page(page_idx, image_rect, zoom);
+            let [mask_w, mask_h] = self.effective_mask_size_for_page(view);
             self.mask_brush
                 .draw_circle_cursor_on_image(ui, image_rect, [mask_w, mask_h], pointer);
         }
@@ -722,21 +719,12 @@ impl TypingMaskLayer {
             .collect()
     }
 
-    fn ensure_mask_for_paint(
-        &mut self,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) -> Option<&mut TypingPageMask> {
+    fn ensure_mask_for_paint(&mut self, view: PageView) -> Option<&mut TypingPageMask> {
+        let page_idx = view.page_idx;
         if self.masks.contains_key(&page_idx) {
             return self.masks.get_mut(&page_idx);
         }
-        let source_w = (image_rect.width() / zoom.max(f32::EPSILON))
-            .round()
-            .max(1.0) as usize;
-        let source_h = (image_rect.height() / zoom.max(f32::EPSILON))
-            .round()
-            .max(1.0) as usize;
+        let [source_w, source_h] = view.page_size_px();
         self.masks.insert(
             page_idx,
             TypingPageMask {
@@ -796,31 +784,15 @@ impl TypingMaskLayer {
         self.status_error = Some((message.into(), now_s + MASK_STATUS_ERROR_SECONDS));
     }
 
-    fn effective_mask_size_for_page(
-        &self,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) -> [usize; 2] {
-        if let Some(mask) = self.masks.get(&page_idx) {
+    fn effective_mask_size_for_page(&self, view: PageView) -> [usize; 2] {
+        if let Some(mask) = self.masks.get(&view.page_idx) {
             return [mask.width.max(1), mask.height.max(1)];
         }
-        let source_w = (image_rect.width() / zoom.max(f32::EPSILON))
-            .round()
-            .max(1.0) as usize;
-        let source_h = (image_rect.height() / zoom.max(f32::EPSILON))
-            .round()
-            .max(1.0) as usize;
+        let [source_w, source_h] = view.page_size_px();
         [source_w.max(1), source_h.max(1)]
     }
 
-    fn handle_brush_wheel(
-        &mut self,
-        ui: &mut egui::Ui,
-        _page_idx: usize,
-        _image_rect: Rect,
-        _zoom: f32,
-    ) -> bool {
+    fn handle_brush_wheel(&mut self, ui: &mut egui::Ui) -> bool {
         let (mods, smooth_scroll, primary_down) = ui.ctx().input(|input| {
             (
                 input.modifiers,
@@ -867,16 +839,15 @@ impl TypingMaskLayer {
     fn start_fill_job(
         &mut self,
         ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         scene_pos: Pos2,
     ) -> Result<(), String> {
-        let Some(mask) = self.ensure_mask_for_paint(page_idx, image_rect, zoom) else {
+        let page_idx = view.page_idx;
+        let Some(mask) = self.ensure_mask_for_paint(view) else {
             return Err(t!("typing.mask.prepare_page_error").to_string());
         };
         let Some((seed_xf, seed_yf)) =
-            scene_to_mask_px(image_rect, mask.width, mask.height, scene_pos)
+            scene_to_mask_px(view.image_rect, mask.width, mask.height, scene_pos)
         else {
             return Err(t!("typing.mask.fill_point_outside_error").to_string());
         };

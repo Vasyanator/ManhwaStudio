@@ -753,18 +753,13 @@ impl TypingTextOverlayLayer {
         uploaded_any
     }
 
-    pub(super) fn ensure_overlay_deform_mesh(
-        &mut self,
-        overlay_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) -> bool {
+    pub(super) fn ensure_overlay_deform_mesh(&mut self, overlay_idx: usize, view: PageView) -> bool {
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
             return false;
         };
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_size = view.page_size_px();
         if overlay.deform_mesh.is_none() {
-            overlay.deform_mesh = Some(default_overlay_deform_mesh(overlay, image_rect, zoom));
+            overlay.deform_mesh = Some(default_overlay_deform_mesh(overlay, view));
         } else if let Some(mesh) = overlay.deform_mesh.as_ref() {
             let normalized = normalize_deform_mesh_resolution(mesh, page_size);
             if &normalized != mesh {

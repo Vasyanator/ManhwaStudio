@@ -418,12 +418,12 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    pub(super) fn begin_layout_editor_for_overlay(&mut self, overlay_idx: usize, image_rect: Rect, zoom: f32) {
+    pub(super) fn begin_layout_editor_for_overlay(&mut self, overlay_idx: usize, view: PageView) {
         let Some(overlay) = self.overlays.get(overlay_idx) else {
             return;
         };
-        let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let geometry = overlay_scene_geometry(overlay, view);
+        let page_size = view.page_size_px();
         let saved_vector_layout = overlay.render_data_json.as_ref().and_then(|render_data| {
             text_render_params_from_render_data(render_data)
                 .map(|params| params.vector_lines_layout)
@@ -435,7 +435,7 @@ impl TypingTextOverlayLayer {
             })
             .map(|layout| {
                 let center = geometry.bounds_rect.center();
-                let center_page = page_px_from_scene(image_rect, zoom, center);
+                let center_page = view.page_px_from_scene(center);
                 frame_rect_from_center_and_size(
                     Pos2::new(center_page[0], center_page[1]),
                     Vec2::new(
@@ -446,8 +446,8 @@ impl TypingTextOverlayLayer {
                 )
             })
             .unwrap_or_else(|| {
-                let min_page = page_px_from_scene(image_rect, zoom, geometry.bounds_rect.min);
-                let max_page = page_px_from_scene(image_rect, zoom, geometry.bounds_rect.max);
+                let min_page = view.page_px_from_scene(geometry.bounds_rect.min);
+                let max_page = view.page_px_from_scene(geometry.bounds_rect.max);
                 Rect::from_min_max(
                     Pos2::new(
                         min_page[0].clamp(0.0, page_size[0].max(1) as f32),
@@ -611,11 +611,11 @@ impl TypingTextOverlayLayer {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         clip_rect: Rect,
     ) {
+        let page_idx = view.page_idx;
+        let zoom = view.zoom;
         let Some(editor) = self.layout_editor.as_mut() else {
             return;
         };
@@ -630,8 +630,8 @@ impl TypingTextOverlayLayer {
             return;
         }
         ensure_layout_editor_has_line(editor);
-        let page_size = page_size_from_image_rect(image_rect, zoom);
-        let frame_scene = layout_editor_frame_scene_rect(editor.frame_page_rect, image_rect, zoom);
+        let page_size = view.page_size_px();
+        let frame_scene = layout_editor_frame_scene_rect(editor.frame_page_rect, view);
         let line_rect_response = ui.interact(
             frame_scene,
             Id::new(("typing_layout_editor_lines", editor.overlay_idx)),
@@ -647,13 +647,12 @@ impl TypingTextOverlayLayer {
             editor,
             active_line_idx,
             frame_scene,
-            image_rect,
-            zoom,
+            view,
             &line_rect_response,
             ctx,
         );
 
-        let frame_scene = layout_editor_frame_scene_rect(editor.frame_page_rect, image_rect, zoom);
+        let frame_scene = layout_editor_frame_scene_rect(editor.frame_page_rect, view);
         for (handle, handle_pos) in layout_frame_handle_points(frame_scene) {
             let handle_rect = Rect::from_center_size(
                 handle_pos,
@@ -669,7 +668,7 @@ impl TypingTextOverlayLayer {
                 Sense::drag(),
             );
             let pointer_page = response.interact_pointer_pos().map(|pos| {
-                let page = page_px_from_scene(image_rect, zoom, pos);
+                let page = view.page_px_from_scene(pos);
                 Pos2::new(page[0], page[1])
             });
             if response.drag_started()
@@ -715,7 +714,7 @@ impl TypingTextOverlayLayer {
             && let Some(overlay) = self.overlays.get(overlay_idx)
             && let Some(texture) = overlay.texture.as_ref()
         {
-            let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
+            let geometry = overlay_scene_geometry(overlay, view);
             draw_textured_deform_mesh(
                 &painter,
                 texture.id(),

@@ -118,13 +118,8 @@ impl TypingTextOverlayLayer {
     /// Seed the transient vector working mesh on ENTER of vector transform mode for `overlay_idx`.
     /// Captures the source-rect dims, then seeds the 13x13 mesh from a stored warp (resampled onto the
     /// lattice) or an identity grid. Returns `false` (leaving state untouched) if the overlay is gone.
-    pub(super) fn seed_vector_transform_mesh(
-        &mut self,
-        overlay_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) -> bool {
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+    pub(super) fn seed_vector_transform_mesh(&mut self, overlay_idx: usize, view: PageView) -> bool {
+        let page_size = view.page_size_px();
         let Some(overlay) = self.overlays.get(overlay_idx) else {
             return false;
         };
@@ -505,8 +500,7 @@ impl TypingTextOverlayLayer {
     pub(super) fn reset_vector_transform(
         &mut self,
         overlay_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         ctx: &egui::Context,
     ) {
         let Some(overlay) = self.overlays.get(overlay_idx) else {
@@ -524,7 +518,7 @@ impl TypingTextOverlayLayer {
         crate::trace_log!(cat::TYPING, "vector_transform reset overlay_idx={overlay_idx}");
         if self.dispatch_vector_rerender(overlay_idx, render_data, ctx) {
             // Reseed an identity working mesh so the handles snap back to the un-warped footprint.
-            self.seed_vector_transform_mesh(overlay_idx, image_rect, zoom);
+            self.seed_vector_transform_mesh(overlay_idx, view);
         }
     }
 
@@ -537,11 +531,11 @@ impl TypingTextOverlayLayer {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         painter: &egui::Painter,
     ) {
+        let page_idx = view.page_idx;
+        let zoom = view.zoom;
         let Some(overlay_idx) = self.transform_mode_overlay_idx else {
             return;
         };
@@ -558,7 +552,7 @@ impl TypingTextOverlayLayer {
         }
         // Defensive: seed if the working mesh was lost.
         if self.vector_transform_mesh.is_none() {
-            self.seed_vector_transform_mesh(overlay_idx, image_rect, zoom);
+            self.seed_vector_transform_mesh(overlay_idx, view);
         }
         // Ensure the un-warped base for the live preview (lazy: this also covers ENTER). Request it
         // when it is missing / belongs to another overlay and no render is already in flight; while a
@@ -573,7 +567,7 @@ impl TypingTextOverlayLayer {
         let Some(mesh) = self.vector_transform_mesh.clone() else {
             return;
         };
-        let mesh_scene = scene_mesh_points(&mesh, image_rect, zoom);
+        let mesh_scene = scene_mesh_points(&mesh, view);
         let bounds = deform_mesh_bounds(&mesh_scene);
         if !bounds.is_positive() {
             return;
@@ -701,7 +695,7 @@ impl TypingTextOverlayLayer {
                 .is_some_and(|state| state.overlay_idx == overlay_idx && state.page_idx == page_idx)
             && let Some(mut state) = self.vector_transform_drag.take()
         {
-            let page_size = page_size_from_image_rect(image_rect, zoom);
+            let page_size = view.page_size_px();
             let delta_page_px = [
                 (pointer.x - state.pointer_start_scene.x) / zoom.max(f32::EPSILON),
                 (pointer.y - state.pointer_start_scene.y) / zoom.max(f32::EPSILON),
@@ -752,8 +746,7 @@ impl TypingTextOverlayLayer {
                         &default_mesh,
                         state.pointer_start_scene,
                         pointer,
-                        image_rect,
-                        zoom,
+                        view,
                         &self.deform_tool_settings,
                     ),
                     None => state.start_mesh.clone(),
@@ -806,7 +799,7 @@ impl TypingTextOverlayLayer {
         let mesh_scene = self
             .vector_transform_mesh
             .as_ref()
-            .map(|m| scene_mesh_points(m, image_rect, zoom))
+            .map(|m| scene_mesh_points(m, view))
             .unwrap_or(mesh_scene);
         if drag_active {
             if let Some(base_tex_id) = self.ensure_vector_base_texture_uploaded(ctx, overlay_idx) {
@@ -867,7 +860,7 @@ impl TypingTextOverlayLayer {
             self.transform_mode_overlay_idx = None;
             self.exit_vector_transform_mode();
         } else if pending_reset {
-            self.reset_vector_transform(overlay_idx, image_rect, zoom, ctx);
+            self.reset_vector_transform(overlay_idx, view, ctx);
         }
     }
 }

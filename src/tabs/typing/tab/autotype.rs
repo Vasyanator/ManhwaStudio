@@ -20,12 +20,11 @@ impl TypingTextOverlayLayer {
     pub(super) fn try_trigger_selected_overlay_auto_typing_by_hotkey(
         &mut self,
         ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         panel_text_input_focused: bool,
         settings: TypingAutoTypingSettings,
     ) {
+        let page_idx = view.page_idx;
         if panel_text_input_focused || ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -69,9 +68,9 @@ impl TypingTextOverlayLayer {
             (local_center_px[1] / overlay.size_px[1].max(1) as f32).clamp(0.0, 1.0),
         ];
         let overlay_file_name = overlay.file_name.clone();
-        let quad_scene = overlay_quad_scene(overlay, image_rect, zoom);
+        let quad_scene = overlay_quad_scene(overlay, view);
         let click_scene = bilinear_quad_point(quad_scene, overlay_tuv[0], overlay_tuv[1]);
-        let mut click_uv = uv_from_scene(image_rect, click_scene);
+        let mut click_uv = uv_from_scene(view.image_rect, click_scene);
         click_uv[0] = click_uv[0].clamp(0.0, 1.0);
         click_uv[1] = click_uv[1].clamp(0.0, 1.0);
         ctx.input_mut(|input| {

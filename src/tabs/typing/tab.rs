@@ -155,6 +155,10 @@ use helpers::*;
 // parent typing module (`mod.rs`) as `tab::text_preview_label`; a glob import
 // only re-imports it privately, so re-export it explicitly at `pub(crate)`.
 pub(crate) use mesh_geometry::text_preview_label;
+// `PageView` lives in the (tab-private) `mesh_geometry` module. Re-export it at the
+// typing-module level so the sibling `mask.rs` (which cannot name `tab::mesh_geometry`)
+// can reach the per-page view transform as `crate::tabs::typing::tab::PageView`.
+pub(in crate::tabs::typing) use mesh_geometry::PageView;
 
 const TEXT_INFO_FILE_NAME: &str = "text_info.json";
 const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
@@ -1147,6 +1151,43 @@ impl TypingTabState {
     }
 }
 
+/// Centering-assist ("Помочь с центровкой") snapshot for one per-page draw pass.
+///
+/// Groups the three transient centering-assist flags that the panel owns and mirrors onto the layer
+/// each frame: whether the feature is on, which bound-center metric is drawn, and whether the marker
+/// itself is shown. `Copy` so it threads through the draw/interaction helpers by value.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::tabs::typing) struct TypingCenteringAssistConfig {
+    /// Master toggle for the centering-assist guide frame + binding.
+    pub enabled: bool,
+    /// Which overlay center the guide frame is bound to (image / mean / median).
+    pub kind: CenteringAssistCenterKind,
+    /// Whether the bound-center marker (cross + circle) is painted; frame + handles draw regardless.
+    pub show_center: bool,
+}
+
+/// Per-page interaction policy snapshot passed into `draw_page_overlays`.
+///
+/// An owned `Copy` bundle of the read-only flags and settings the per-page draw/interaction pass
+/// needs. Built ONCE in `TypingHooks::draw_canvas_overlay_on_page` from the top panel BEFORE
+/// `text_overlays` is mutably borrowed, so the panel and the overlay layer keep their disjoint
+/// borrows; the draw code reads the snapshot instead of re-borrowing the panel.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::tabs::typing) struct TypingPageInteractionPolicy {
+    /// True while the clipping-mask panel is open (suppresses overlay selection/interaction).
+    pub mask_panel_open: bool,
+    /// True while a panel text input has keyboard focus (suppresses canvas hotkeys).
+    pub panel_text_input_focused: bool,
+    /// True while the eyedropper should retain the primary click (blocks focus-clear on empty click).
+    pub eyedropper_blocks_focus_clear: bool,
+    /// Auto-typing hotkey settings snapshot (`C` centers the selected overlay over a bubble).
+    pub auto_typing: TypingAutoTypingSettings,
+    /// True when overlay moves snap to whole page pixels.
+    pub strict_pixel_movement: bool,
+    /// Centering-assist snapshot for this pass.
+    pub centering: TypingCenteringAssistConfig,
+}
+
 struct TypingHooks<'a> {
     text_overlays: &'a mut TypingTextOverlayLayer,
     top_panel: &'a mut TypingTopPanelState,
@@ -1172,9 +1213,14 @@ impl CanvasHooks for TypingHooks<'_> {
         image_rect: Rect,
         zoom: f32,
     ) {
+        let view = PageView {
+            page_idx,
+            image_rect,
+            zoom,
+        };
         if self
             .mask_layer
-            .draw_page_mask_overlay_and_handle_input(ui, page_idx, image_rect, zoom)
+            .draw_page_mask_overlay_and_handle_input(ui, view)
         {
             self.text_overlays.mark_page_texture_dirty(page_idx);
             ctx.request_repaint();
@@ -1189,27 +1235,29 @@ impl CanvasHooks for TypingHooks<'_> {
         image_rect: Rect,
         zoom: f32,
     ) {
-        let panel_text_input_focused = self.top_panel.has_focused_text_input(ctx);
-        let auto_typing_settings = self.top_panel.auto_typing_settings();
-        let eyedropper_blocks_focus_clear = self.top_panel.eyedropper_active()
-            || self
-                .top_panel
-                .eyedropper_consumed_primary_click_this_frame();
-        let occluders = self.text_overlays.draw_page_overlays(
-            ui,
-            ctx,
+        // Build the interaction-policy snapshot from the top panel BEFORE borrowing `text_overlays`
+        // mutably, preserving the disjoint borrows (the panel is not touched inside the draw).
+        let policy = TypingPageInteractionPolicy {
+            mask_panel_open: self.mask_layer.is_panel_open(),
+            panel_text_input_focused: self.top_panel.has_focused_text_input(ctx),
+            eyedropper_blocks_focus_clear: self.top_panel.eyedropper_active()
+                || self
+                    .top_panel
+                    .eyedropper_consumed_primary_click_this_frame(),
+            auto_typing: self.top_panel.auto_typing_settings(),
+            strict_pixel_movement: self.top_panel.strict_pixel_movement(),
+            centering: TypingCenteringAssistConfig {
+                enabled: self.top_panel.centering_assist_enabled(),
+                kind: self.top_panel.centering_assist_kind(),
+                show_center: self.top_panel.centering_show_center(),
+            },
+        };
+        let view = PageView {
             page_idx,
             image_rect,
             zoom,
-            self.mask_layer.is_panel_open(),
-            panel_text_input_focused,
-            eyedropper_blocks_focus_clear,
-            auto_typing_settings,
-            self.top_panel.strict_pixel_movement(),
-            self.top_panel.centering_assist_enabled(),
-            self.top_panel.centering_assist_kind(),
-            self.top_panel.centering_show_center(),
-        );
+        };
+        let occluders = self.text_overlays.draw_page_overlays(ui, view, &policy);
         self.page_overlay_occluders.insert(page_idx, occluders);
     }
 

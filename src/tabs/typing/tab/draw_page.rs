@@ -8,6 +8,13 @@ text/image overlays and interleaved read-only raster layers on a single page,
 plus the small helpers it relies on for repaint gating, pixel snapping, on-screen
 visibility clamping, and vertical drag page transitions.
 
+`draw_page_overlays` takes the per-page `PageView` transform (from `mesh_geometry`)
+and a `TypingPageInteractionPolicy` snapshot (built in the canvas hook); its `ctx`
+comes from `ui.ctx()`.
+
+Key structures:
+- CenteringMarker (per-overlay geometry + render inputs for `draw_centering_assist`)
+
 Also owns the centering-assist ("Помочь с центровкой") drawing and interaction:
 `draw_centering_assist` paints the page-anchored guide frame + corner handles + the
 bound-center marker, `reconcile_centering_frame` keeps the chosen center bound to the
@@ -28,26 +35,37 @@ that stay there as descendants of module `tab`.
 use super::*;
 
 impl TypingTextOverlayLayer {
-
-
-    // All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
-    #[allow(clippy::too_many_arguments)]
+    /// Master per-page draw for the typing tab: draws every visible text/image
+    /// overlay and raster layer of `view.page_idx`, runs their selection and
+    /// drag/rotate/scale interaction, transform-mode overlays, and the
+    /// centering assist, honoring the per-frame `policy` snapshot built by the
+    /// canvas hook. Returns the scene-space quads of the drawn overlays; the
+    /// hook stores them as per-page occluders that hide on-top bubbles and
+    /// aside connector lines underneath overlays. GUI-thread only; called once
+    /// per visible page per frame.
     pub(super) fn draw_page_overlays(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-        mask_panel_open: bool,
-        panel_text_input_focused: bool,
-        eyedropper_blocks_focus_clear: bool,
-        auto_typing_settings: TypingAutoTypingSettings,
-        strict_pixel_movement: bool,
-        centering_assist_enabled: bool,
-        centering_assist_kind: CenteringAssistCenterKind,
-        centering_show_center: bool,
+        view: PageView,
+        policy: &TypingPageInteractionPolicy,
     ) -> Vec<[Pos2; 4]> {
+        // `ctx` comes from `ui.ctx()`; clone once (Arc-backed, cheap) and reborrow so the rest of the
+        // body keeps its `ctx: &Context` shape while `ui` stays free to be borrowed mutably below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        // Unpack the per-page view transform and the interaction policy into the locals the body uses,
+        // so the (large) body logic below is unchanged by the signature consolidation.
+        let page_idx = view.page_idx;
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
+        let mask_panel_open = policy.mask_panel_open;
+        let panel_text_input_focused = policy.panel_text_input_focused;
+        let eyedropper_blocks_focus_clear = policy.eyedropper_blocks_focus_clear;
+        let auto_typing_settings = policy.auto_typing;
+        let strict_pixel_movement = policy.strict_pixel_movement;
+        let centering_assist_enabled = policy.centering.enabled;
+        let centering_assist_kind = policy.centering.kind;
+        let centering_show_center = policy.centering.show_center;
         // Keep the layer's mirror of the centering-assist state fresh for the re-render dispatch sites
         // reached from within this draw (Ctrl+wheel rotation, width drag, vector-transform, shape
         // variant) and for the reconciliation below.
@@ -111,12 +129,7 @@ impl TypingTextOverlayLayer {
                     .get(selected_idx)
                     .is_some_and(|overlay| overlay.page_idx == page_idx);
                 if should_validate
-                    && self.enforce_overlay_visibility_limit(
-                        selected_idx,
-                        image_rect,
-                        zoom,
-                        strict_pixel_movement,
-                    )
+                    && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
                 {
                     self.mark_overlay_geometry_changed(selected_idx, false);
                     // EDIT (visibility-limit clamp): deferred.
@@ -168,36 +181,30 @@ impl TypingTextOverlayLayer {
         if !mask_panel_open && !layout_editor_active {
             self.try_trigger_selected_overlay_auto_typing_by_hotkey(
                 ctx,
-                page_idx,
-                image_rect,
-                zoom,
+                view,
                 panel_text_input_focused,
                 auto_typing_settings,
             );
-            self.try_rotate_selected_overlay_by_ctrl_wheel(ui, page_idx, image_rect, zoom);
+            self.try_rotate_selected_overlay_by_ctrl_wheel(ui, view);
             self.try_rotate_selected_raster_by_ctrl_wheel(ui, page_idx);
             self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
             self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
             self.try_move_selected_overlay_by_arrow_shortcuts(
                 ui,
-                page_idx,
-                image_rect,
-                zoom,
+                view,
                 panel_text_input_focused,
                 strict_pixel_movement,
             );
             self.try_move_selected_raster_by_arrow_shortcuts(
                 ui,
-                page_idx,
-                image_rect,
-                zoom,
+                view,
                 panel_text_input_focused,
                 strict_pixel_movement,
             );
             // Centering assist: after input handling, keep the bound center on the frame center (create
             // the frame lazily; move the LAYER back for anchored changes; let the frame follow a
             // layer move-drag). Runs before `draw_entries` so an anchored re-render recenters lag-free.
-            self.reconcile_centering_frame(ctx, page_idx, image_rect, zoom, strict_pixel_movement);
+            self.reconcile_centering_frame(ctx, view, strict_pixel_movement);
         }
         let mut adjusted_by_visibility_limit = false;
         for idx in 0..self.overlays.len() {
@@ -214,7 +221,7 @@ impl TypingTextOverlayLayer {
             {
                 continue;
             }
-            if self.enforce_overlay_visibility_limit(idx, image_rect, zoom, strict_pixel_movement) {
+            if self.enforce_overlay_visibility_limit(idx, view, strict_pixel_movement) {
                 self.mark_overlay_geometry_changed(idx, false);
                 adjusted_by_visibility_limit = true;
             }
@@ -270,7 +277,7 @@ impl TypingTextOverlayLayer {
             }) {
                 continue;
             }
-            let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
+            let geometry = overlay_scene_geometry(overlay, view);
             if geometry.bounds_rect.width() <= 0.5 || geometry.bounds_rect.height() <= 0.5 {
                 continue;
             }
@@ -437,7 +444,7 @@ impl TypingTextOverlayLayer {
                     if is_transform_mode {
                         None
                     } else {
-                        self.centering_corner_handles_scene(entry.idx, image_rect, zoom)
+                        self.centering_corner_handles_scene(entry.idx, view)
                     };
                 // The rotation handle YIELDS to the centering-frame corner handles: it is pushed
                 // further out along its own corner->outward direction so the two handle sets never
@@ -669,7 +676,7 @@ impl TypingTextOverlayLayer {
                             .button(t!("typing.context_menu.enter_transform_mode_raster"))
                             .clicked()
                         {
-                            if self.ensure_overlay_deform_mesh(entry.idx, image_rect, zoom) {
+                            if self.ensure_overlay_deform_mesh(entry.idx, view) {
                                 crate::trace_log!(
                                     cat::TYPING,
                                     "overlay_transform_mode enter idx={} kind=raster",
@@ -703,7 +710,7 @@ impl TypingTextOverlayLayer {
                                     self.transform_mode_kind = TypingTransformModeKind::Vector;
                                     self.deform_mode = TypingDeformMode::Perspective;
                                     self.drag_state = None;
-                                    self.seed_vector_transform_mesh(entry.idx, image_rect, zoom);
+                                    self.seed_vector_transform_mesh(entry.idx, view);
                                     menu_ui.close();
                                 }
                             }
@@ -859,7 +866,7 @@ impl TypingTextOverlayLayer {
                                 overlay.angle_deg,
                                 overlay.deform_mesh.is_some(),
                                 overlay.deform_mesh.clone().unwrap_or_else(|| {
-                                    default_overlay_quad_mesh(overlay, image_rect, zoom)
+                                    default_overlay_quad_mesh(overlay, view)
                                 }),
                             )
                         })
@@ -886,13 +893,13 @@ impl TypingTextOverlayLayer {
                         } else {
                             TypingOverlayDragMode::MoveCenter
                         };
-                        let start_mesh_scene = scene_mesh_points(&start_mesh, image_rect, zoom);
+                        let start_mesh_scene = scene_mesh_points(&start_mesh, view);
                         let start_center_scene = deform_mesh_center_scene(&start_mesh_scene);
                         let start_pointer_angle_rad =
                             pointer_angle_rad(start_center_scene, pointer_pos);
 
                         if self.transform_mode_overlay_idx == Some(entry.idx) {
-                            let _ = self.ensure_overlay_deform_mesh(entry.idx, image_rect, zoom);
+                            let _ = self.ensure_overlay_deform_mesh(entry.idx, view);
                             if let Some(current_mesh) = self
                                 .overlays
                                 .get(entry.idx)
@@ -978,7 +985,7 @@ impl TypingTextOverlayLayer {
                         {
                             start_center_page_px = overlay.center_page_px;
                             start_mesh = overlay.deform_mesh.clone().unwrap_or_else(|| {
-                                default_overlay_quad_mesh(overlay, image_rect, zoom)
+                                default_overlay_quad_mesh(overlay, view)
                             });
                         }
                         crate::trace_log!(
@@ -1228,22 +1235,21 @@ impl TypingTextOverlayLayer {
                             }
                             TypingOverlayDragMode::BrushStroke(mode) => {
                                 let default_mesh =
-                                    default_overlay_deform_mesh(overlay, image_rect, zoom);
+                                    default_overlay_deform_mesh(overlay, view);
                                 overlay.deform_mesh = Some(apply_brush_deform_drag(
                                     mode,
                                     &state.start_mesh,
                                     &default_mesh,
                                     state.pointer_start_scene,
                                     pointer_pos,
-                                    image_rect,
-                                    zoom,
+                                    view,
                                     &self.deform_tool_settings,
                                 ));
                                 sync_overlay_center_from_deform_mesh(overlay, page_size);
                             }
                             TypingOverlayDragMode::Rotate => {
                                 let start_mesh_scene =
-                                    scene_mesh_points(&state.start_mesh, image_rect, zoom);
+                                    scene_mesh_points(&state.start_mesh, view);
                                 let center_scene = deform_mesh_center_scene(&start_mesh_scene);
                                 let current_angle = pointer_angle_rad(center_scene, pointer_pos);
                                 let delta_angle = normalize_angle_rad(
@@ -1283,12 +1289,7 @@ impl TypingTextOverlayLayer {
                         }
                     }
                     if !page_changed
-                        && self.enforce_overlay_visibility_limit(
-                            entry.idx,
-                            image_rect,
-                            zoom,
-                            strict_pixel_movement,
-                        )
+                        && self.enforce_overlay_visibility_limit(entry.idx, view, strict_pixel_movement)
                     {
                         self.drag_has_changes = true;
                         overlay_changed = true;
@@ -1366,7 +1367,7 @@ impl TypingTextOverlayLayer {
                 return Vec::new();
             }
             if let Some(editor_idx) = pending_enter_layout_editor_idx {
-                self.begin_layout_editor_for_overlay(editor_idx, image_rect, zoom);
+                self.begin_layout_editor_for_overlay(editor_idx, view);
                 ctx.request_repaint();
             }
             let popup_open_after = ui.ctx().any_popup_open();
@@ -1400,12 +1401,7 @@ impl TypingTextOverlayLayer {
                     .is_some_and(|overlay| overlay.page_idx == page_idx)
                 {
                     if let Some(selected_idx) = self.selected_overlay_idx
-                        && self.enforce_overlay_visibility_limit(
-                            selected_idx,
-                            image_rect,
-                            zoom,
-                            strict_pixel_movement,
-                        )
+                        && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
                     {
                         snap_overlay_center_to_pixels_if_enabled(
                             self.overlays
@@ -1482,14 +1478,7 @@ impl TypingTextOverlayLayer {
         for (_, _, item) in &merged_fills {
             match item {
                 MergedFillItem::Raster(raster_idx) => {
-                    self.draw_one_raster_layer(
-                        ui.ctx(),
-                        &painter,
-                        page_idx,
-                        *raster_idx,
-                        image_rect,
-                        zoom,
-                    );
+                    self.draw_one_raster_layer(ui.ctx(), &painter, view, *raster_idx);
                 }
                 MergedFillItem::Overlay(entry_pos) => {
                     let entry = &draw_entries[*entry_pos];
@@ -1532,15 +1521,15 @@ impl TypingTextOverlayLayer {
                         + overlay_render_data_global_rotation_deg(overlay.render_data_json.as_ref());
                     draw_centering_assist(
                         &painter,
-                        image_rect,
-                        zoom,
-                        &entry.quad_scene,
-                        overlay.size_px,
-                        &overlay.extra,
-                        self.centering_assist_kind,
-                        self.centering_show_center,
-                        &frame,
-                        total_angle_deg,
+                        view,
+                        &CenteringMarker {
+                            quad_scene: entry.quad_scene,
+                            size_px: overlay.size_px,
+                            extra: &overlay.extra,
+                            frame,
+                            total_angle_deg,
+                        },
+                        policy.centering,
                     );
                 }
                 if let Some(render_width_px) = entry.render_width_px {
@@ -1598,7 +1587,7 @@ impl TypingTextOverlayLayer {
                     let (corner, handle) =
                         rotation_handle_scene_with_corner(&entry.quad_scene, image_rect);
                     let handle = if let Some(corners) =
-                        self.centering_corner_handles_scene(entry.idx, image_rect, zoom)
+                        self.centering_corner_handles_scene(entry.idx, view)
                     {
                         let obstacles: [Pos2; 4] = std::array::from_fn(|i| corners[i].1);
                         push_rotation_handle_clear(
@@ -1618,10 +1607,10 @@ impl TypingTextOverlayLayer {
         // dedicated pass (drawn after the baked-PNG fill so it sits on top). Gated off while the mask
         // panel or the layout editor is active, matching the normal overlay interaction gate.
         if !mask_panel_open && !layout_editor_active {
-            self.draw_vector_transform_overlay(ui, ctx, page_idx, image_rect, zoom, &painter);
+            self.draw_vector_transform_overlay(ui, ctx, view, &painter);
         }
         if self.layout_editor.is_some() && !mask_panel_open {
-            self.draw_layout_editor_on_page(ui, ctx, page_idx, image_rect, zoom, clip_rect);
+            self.draw_layout_editor_on_page(ui, ctx, view, clip_rect);
         }
         if let Some(selected_idx) = self.transform_mode_overlay_idx
             && self.transform_mode_kind == TypingTransformModeKind::Raster
@@ -1645,7 +1634,7 @@ impl TypingTextOverlayLayer {
         }
         self.draw_auto_typing_debug_visuals(&painter, page_idx, image_rect, auto_typing_settings);
         if !mask_panel_open && !layout_editor_active {
-            self.interact_page_rasters(ui, page_idx, image_rect, zoom, &painter);
+            self.interact_page_rasters(ui, view, &painter);
         }
         draw_entries
             .into_iter()
@@ -1699,10 +1688,11 @@ impl TypingTextOverlayLayer {
     pub(super) fn enforce_overlay_visibility_limit(
         &mut self,
         overlay_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         strict_pixel_movement: bool,
     ) -> bool {
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
         let Some(overlay) = self.overlays.get(overlay_idx) else {
             return false;
         };
@@ -1711,8 +1701,8 @@ impl TypingTextOverlayLayer {
         }
 
         let bounds = if overlay.deform_mesh.is_some() {
-            let deform_mesh = overlay_deform_mesh(overlay, image_rect, zoom);
-            let page_size = page_size_from_image_rect(image_rect, zoom);
+            let deform_mesh = overlay_deform_mesh(overlay, view);
+            let page_size = view.page_size_px();
             let bounds_uv = deform_mesh_bounds_uv(&deform_mesh, page_size);
             if !bounds_uv.is_positive() {
                 return false;
@@ -1722,7 +1712,7 @@ impl TypingTextOverlayLayer {
                 scene_from_uv(image_rect, bounds_uv.max.x, bounds_uv.max.y),
             )
         } else {
-            quad_bounds(&default_overlay_quad_scene(overlay, image_rect, zoom))
+            quad_bounds(&default_overlay_quad_scene(overlay, view))
         };
 
         // Pull an off-page box back so at least TEXT_OVERLAY_MIN_VISIBLE_FRACTION stays visible. The
@@ -1742,7 +1732,7 @@ impl TypingTextOverlayLayer {
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
             return false;
         };
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_size = view.page_size_px();
         if let Some(deform_mesh) = overlay.deform_mesh.as_mut() {
             let dx_px = dx / zoom.max(f32::EPSILON);
             let dy_px = dy / zoom.max(f32::EPSILON);
@@ -1788,40 +1778,49 @@ impl TypingTextOverlayLayer {
     }
 }
 
+/// The per-overlay geometry + render inputs `draw_centering_assist` needs to place the guide FRAME
+/// and the bound-center MARKER for one selected text layer.
+struct CenteringMarker<'a> {
+    /// The overlay's on-screen quad (top-left, top-right, bottom-right, bottom-left); the marker is
+    /// mapped through it so it tracks the layer's on-screen position.
+    quad_scene: [Pos2; 4],
+    /// The overlay's rendered image size in pixels (marker UV denominator).
+    size_px: [usize; 2],
+    /// Renderer extra-info carrying the mean/median centers in final-image pixels.
+    extra: &'a RenderedTextExtraInfo,
+    /// The transient page-anchored guide frame.
+    frame: CenteringFrame,
+    /// The frame's VISUAL rotation in degrees (raster `angle_deg` + vector `global_rotation_deg`).
+    total_angle_deg: f32,
+}
+
 /// Paints the centering-assist overlay for a selected text layer: the page-anchored guide FRAME
 /// (cyan/purple dashed rectangle + four hollow corner handles) and the single bound-center MARKER.
 ///
-/// `quad_scene` is the overlay's on-screen quad (top-left, top-right, bottom-right, bottom-left);
-/// `size_px` is its rendered image size; `extra` carries the renderer's mean/median centers in
-/// final-image pixels; `kind` selects which of them (with a plain-image-center fallback) the marker
-/// shows. `frame` is the transient page-anchored frame; `total_angle_deg` is its VISUAL rotation
-/// (raster `angle_deg` + vector `global_rotation_deg`).
+/// `view` supplies the page↔scene transform; `marker` carries the per-overlay geometry (quad, size,
+/// renderer extra-info, frame, total angle); `centering` selects the marker metric (`kind`) and
+/// whether the marker is shown (`show_center`).
 ///
 /// Frame points are mapped page-px -> scene DIRECTLY (unclamped): the frame may extend off-page and
 /// the painter's clip rect already bounds it (`scene_from_page_px` would wrongly clamp to page bounds).
 /// The marker is mapped through the overlay's drawn quad so it tracks the layer's on-screen position
 /// (an approximation under multi-cell mesh deformation — it interpolates over the four OUTER quad
 /// corners only, the same approximation the visual-center logic accepts).
-#[allow(clippy::too_many_arguments)]
 fn draw_centering_assist(
     painter: &egui::Painter,
-    image_rect: Rect,
-    zoom: f32,
-    quad_scene: &[Pos2; 4],
-    size_px: [usize; 2],
-    extra: &RenderedTextExtraInfo,
-    kind: CenteringAssistCenterKind,
-    show_center: bool,
-    frame: &CenteringFrame,
-    total_angle_deg: f32,
+    view: PageView,
+    marker: &CenteringMarker<'_>,
+    centering: TypingCenteringAssistConfig,
 ) {
+    let image_rect = view.image_rect;
+    let zoom = view.zoom;
     // Unclamped page-px -> scene mapping (see the doc note above).
     let to_scene =
         |p: [f32; 2]| Pos2::new(image_rect.left() + p[0] * zoom, image_rect.top() + p[1] * zoom);
 
     // Frame: closed cyan/purple dashed rectangle over the four rotated corners (its own color
     // pair so it never reads as the black-white selection outline).
-    let corners = centering_frame_corners_page_px(frame, total_angle_deg);
+    let corners = centering_frame_corners_page_px(&marker.frame, marker.total_angle_deg);
     let mut path: Vec<Pos2> = corners.iter().map(|p| to_scene(*p)).collect();
     if let Some(first) = path.first().copied() {
         path.push(first);
@@ -1851,25 +1850,25 @@ fn draw_centering_assist(
     // The single bound-center marker (cross + circle), mapped through the overlay's drawn quad. Gated
     // by "Показывать центр": the frame + handles above always draw while assist is on, only the marker
     // is optional.
-    if show_center {
-        let chosen_img = centering_chosen_img_px(size_px, extra, kind);
-        let width = size_px[0].max(1) as f32;
-        let height = size_px[1].max(1) as f32;
-        let marker = bilinear_quad_point(
-            *quad_scene,
+    if centering.show_center {
+        let chosen_img = centering_chosen_img_px(marker.size_px, marker.extra, centering.kind);
+        let width = marker.size_px[0].max(1) as f32;
+        let height = marker.size_px[1].max(1) as f32;
+        let marker_pos = bilinear_quad_point(
+            marker.quad_scene,
             (chosen_img[0] / width).clamp(0.0, 1.0),
             (chosen_img[1] / height).clamp(0.0, 1.0),
         );
         let color = Color32::RED;
         painter.line_segment(
-            [marker + Vec2::new(-7.0, 0.0), marker + Vec2::new(7.0, 0.0)],
+            [marker_pos + Vec2::new(-7.0, 0.0), marker_pos + Vec2::new(7.0, 0.0)],
             Stroke::new(1.5, color),
         );
         painter.line_segment(
-            [marker + Vec2::new(0.0, -7.0), marker + Vec2::new(0.0, 7.0)],
+            [marker_pos + Vec2::new(0.0, -7.0), marker_pos + Vec2::new(0.0, 7.0)],
             Stroke::new(1.5, color),
         );
-        painter.circle_stroke(marker, 10.0, Stroke::new(1.5, color));
+        painter.circle_stroke(marker_pos, 10.0, Stroke::new(1.5, color));
     }
 }
 
@@ -1881,9 +1880,10 @@ impl TypingTextOverlayLayer {
     fn centering_corner_handles_scene(
         &self,
         idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
     ) -> Option<[(CenteringFrameCorner, Pos2); 4]> {
+        let image_rect = view.image_rect;
+        let zoom = view.zoom;
         if !self.centering_assist_enabled || self.selected_overlay_idx != Some(idx) {
             return None;
         }
@@ -1925,11 +1925,10 @@ impl TypingTextOverlayLayer {
     pub(super) fn reconcile_centering_frame(
         &mut self,
         ctx: &egui::Context,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         strict_pixel_movement: bool,
     ) {
+        let page_idx = view.page_idx;
         if !self.centering_assist_enabled {
             return;
         }
@@ -1942,7 +1941,7 @@ impl TypingTextOverlayLayer {
             return;
         }
         let kind = self.centering_assist_kind;
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_size = view.page_size_px();
         let Some(overlay) = self.overlays.get(idx) else {
             return;
         };
@@ -1992,7 +1991,7 @@ impl TypingTextOverlayLayer {
         // ping-pong with `enforce_overlay_visibility_limit`, no strict-pixel alternation, and (for a
         // deform mesh) rigid-only translation that cannot cumulatively squash the mesh at a page edge.
         let is_deform = overlay.deform_mesh.is_some();
-        let bounds = centering_overlay_page_bounds(overlay, image_rect, zoom, page_size);
+        let bounds = centering_overlay_page_bounds(overlay, view, page_size);
         let current_center = overlay.center_page_px;
         let target = centering_reconcile_target_center(
             current_center,

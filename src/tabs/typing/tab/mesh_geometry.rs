@@ -19,6 +19,11 @@ Main responsibilities:
   (`centering_frame_corners_page_px`), and the opposite-corner-fixed corner-drag
   resize (`centering_frame_corner_drag`). Interaction/drawing live in `draw_page.rs`.
 
+Key structures:
+- PageView (Copy per-page page<->scene transform: page_idx + image_rect + zoom;
+  methods wrap the free page_size_from_image_rect / scene_from_page_px /
+  page_px_from_scene conversions)
+
 Key enums:
 - SampledHandleMode
 - TypingPointerTarget
@@ -26,8 +31,9 @@ Key enums:
 
 Notes:
 Extracted verbatim from `tab.rs`. Free fns and enums are `pub(super)` so `tab.rs`
-and sibling submodules of `tab` can use them. `use super::*;` pulls in the parent
-module's types and imports.
+and sibling submodules of `tab` can use them. `PageView` is
+`pub(in crate::tabs::typing)` and re-exported by `tab.rs` so the sibling `mask.rs`
+can name it. `use super::*;` pulls in the parent module's types and imports.
 */
 
 use super::*;
@@ -381,8 +387,7 @@ pub(super) fn draw_grid_handles(
 pub(super) fn raster_quad_scene(
     transform: &crate::models::layer_model::manifest::TransformRec,
     size: [usize; 2],
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> [Pos2; 4] {
     let (sin_a, cos_a) = transform.rotation.sin_cos();
     let hw = size[0] as f32 * 0.5 * transform.scale;
@@ -392,7 +397,7 @@ pub(super) fn raster_quad_scene(
     for (i, (dx, dy)) in corners.iter().enumerate() {
         let rx = dx * cos_a - dy * sin_a;
         let ry = dx * sin_a + dy * cos_a;
-        quad[i] = scene_from_page_px(image_rect, zoom, [transform.cx + rx, transform.cy + ry]);
+        quad[i] = view.scene_from_page_px([transform.cx + rx, transform.cy + ry]);
     }
     quad
 }
@@ -400,29 +405,25 @@ pub(super) fn raster_quad_scene(
 /// The 4 corner scene points of a deform mesh grid (TL, TR, BR, BL), for perspective-handle drag.
 pub(super) fn deform_mesh_corners_scene(
     deform: &crate::models::layer_model::manifest::DeformRec,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> Option<[Pos2; 4]> {
     let (c, r) = (deform.cols, deform.rows);
     if c < 2 || r < 2 || deform.points_px.len() != c * r {
         return None;
     }
-    let at = |col: usize, row: usize| {
-        scene_from_page_px(image_rect, zoom, deform.points_px[row * c + col])
-    };
+    let at = |col: usize, row: usize| view.scene_from_page_px(deform.points_px[row * c + col]);
     Some([at(0, 0), at(c - 1, 0), at(c - 1, r - 1), at(0, r - 1)])
 }
 
 /// All scene points of a deform mesh grid (row-major), for drawing the wireframe.
 pub(super) fn deform_mesh_scene_points(
     deform: &crate::models::layer_model::manifest::DeformRec,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> Vec<Pos2> {
     deform
         .points_px
         .iter()
-        .map(|p| scene_from_page_px(image_rect, zoom, *p))
+        .map(|p| view.scene_from_page_px(*p))
         .collect()
 }
 
@@ -1186,26 +1187,25 @@ pub(super) fn pointer_angle_rad(center: Pos2, pointer: Pos2) -> f32 {
     (pointer.y - center.y).atan2(pointer.x - center.x)
 }
 
-pub(super) fn overlay_quad_scene(overlay: &TypingOverlayRuntime, image_rect: Rect, zoom: f32) -> [Pos2; 4] {
+pub(super) fn overlay_quad_scene(overlay: &TypingOverlayRuntime, view: PageView) -> [Pos2; 4] {
     if overlay.deform_mesh.is_none() {
-        return default_overlay_quad_scene(overlay, image_rect, zoom);
+        return default_overlay_quad_scene(overlay, view);
     }
-    let mesh = overlay_deform_mesh(overlay, image_rect, zoom);
+    let mesh = overlay_deform_mesh(overlay, view);
     [
-        scene_from_page_px(image_rect, zoom, mesh.point(0, 0)),
-        scene_from_page_px(image_rect, zoom, mesh.point(mesh.cols - 1, 0)),
-        scene_from_page_px(image_rect, zoom, mesh.point(mesh.cols - 1, mesh.rows - 1)),
-        scene_from_page_px(image_rect, zoom, mesh.point(0, mesh.rows - 1)),
+        view.scene_from_page_px(mesh.point(0, 0)),
+        view.scene_from_page_px(mesh.point(mesh.cols - 1, 0)),
+        view.scene_from_page_px(mesh.point(mesh.cols - 1, mesh.rows - 1)),
+        view.scene_from_page_px(mesh.point(0, mesh.rows - 1)),
     ]
 }
 
 pub(super) fn overlay_scene_geometry(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> TypingOverlaySceneGeometry {
     if overlay.deform_mesh.is_none() {
-        let quad_scene = default_overlay_quad_scene(overlay, image_rect, zoom);
+        let quad_scene = default_overlay_quad_scene(overlay, view);
         return TypingOverlaySceneGeometry {
             quad_scene,
             mesh_scene: vec![quad_scene[0], quad_scene[1], quad_scene[3], quad_scene[2]],
@@ -1215,18 +1215,14 @@ pub(super) fn overlay_scene_geometry(
         };
     }
 
-    let deform_mesh = overlay_deform_mesh(overlay, image_rect, zoom);
+    let deform_mesh = overlay_deform_mesh(overlay, view);
     let quad_scene = [
-        scene_from_page_px(image_rect, zoom, deform_mesh.point(0, 0)),
-        scene_from_page_px(image_rect, zoom, deform_mesh.point(deform_mesh.cols - 1, 0)),
-        scene_from_page_px(
-            image_rect,
-            zoom,
-            deform_mesh.point(deform_mesh.cols - 1, deform_mesh.rows - 1),
-        ),
-        scene_from_page_px(image_rect, zoom, deform_mesh.point(0, deform_mesh.rows - 1)),
+        view.scene_from_page_px(deform_mesh.point(0, 0)),
+        view.scene_from_page_px(deform_mesh.point(deform_mesh.cols - 1, 0)),
+        view.scene_from_page_px(deform_mesh.point(deform_mesh.cols - 1, deform_mesh.rows - 1)),
+        view.scene_from_page_px(deform_mesh.point(0, deform_mesh.rows - 1)),
     ];
-    let mesh_scene = scene_mesh_points(&deform_mesh, image_rect, zoom);
+    let mesh_scene = scene_mesh_points(&deform_mesh, view);
     let bounds_rect = deform_mesh_bounds(&mesh_scene);
     TypingOverlaySceneGeometry {
         quad_scene,
@@ -1527,16 +1523,16 @@ pub(super) fn centering_reconcile_target_center(
 /// extents the visibility limiter / rigid translate reason about.
 pub(super) fn centering_overlay_page_bounds(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
     page_size: [usize; 2],
 ) -> Rect {
     if overlay.deform_mesh.is_some() {
         let mesh = overlay_deform_mesh_for_page(overlay, page_size);
         deform_mesh_bounds_px(&mesh)
     } else {
-        let z = zoom.max(f32::EPSILON);
-        let bounds = quad_bounds(&default_overlay_quad_scene(overlay, image_rect, zoom));
+        let image_rect = view.image_rect;
+        let z = view.zoom.max(f32::EPSILON);
+        let bounds = quad_bounds(&default_overlay_quad_scene(overlay, view));
         let to_page = |x: f32, origin: f32| (x - origin) / z;
         Rect::from_min_max(
             Pos2::new(
@@ -1565,15 +1561,12 @@ pub(super) fn shift_index_after_remove(index: &mut Option<usize>, removed_idx: u
 
 pub(super) fn default_overlay_quad_scene(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> [Pos2; 4] {
-    let center_page_px = clamp_page_point(
-        overlay.center_page_px,
-        page_size_from_image_rect(image_rect, zoom),
-    );
+    let zoom = view.zoom;
+    let center_page_px = clamp_page_point(overlay.center_page_px, view.page_size_px());
     let scale = overlay.user_scale.max(0.01);
-    let center = scene_from_page_px(image_rect, zoom, center_page_px);
+    let center = view.scene_from_page_px(center_page_px);
     let size = Vec2::new(
         overlay.size_px[0] as f32 * zoom * scale,
         overlay.size_px[1] as f32 * zoom * scale,
@@ -1600,24 +1593,19 @@ pub(super) fn default_overlay_quad_scene(
 
 pub(super) fn default_overlay_quad_uv(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> [[f32; 2]; 4] {
-    default_overlay_quad_scene(overlay, image_rect, zoom).map(|point| {
-        page_px_to_uv(
-            page_px_from_scene(image_rect, zoom, point),
-            page_size_from_image_rect(image_rect, zoom),
-        )
+    default_overlay_quad_scene(overlay, view).map(|point| {
+        page_px_to_uv(view.page_px_from_scene(point), view.page_size_px())
     })
 }
 
 pub(super) fn default_overlay_quad_mesh(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> TypingOverlayDeformMesh {
-    let quad_uv = default_overlay_quad_uv(overlay, image_rect, zoom);
-    let page_size = page_size_from_image_rect(image_rect, zoom);
+    let quad_uv = default_overlay_quad_uv(overlay, view);
+    let page_size = view.page_size_px();
     let quad_px = quad_uv.map(|point| uv_to_page_px(point, page_size));
     TypingOverlayDeformMesh::new(
         2,
@@ -1632,11 +1620,10 @@ pub(super) fn default_overlay_quad_mesh(
 
 pub(super) fn overlay_deform_mesh(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> Cow<'_, TypingOverlayDeformMesh> {
     overlay.deform_mesh.as_ref().map_or_else(
-        || Cow::Owned(default_overlay_deform_mesh(overlay, image_rect, zoom)),
+        || Cow::Owned(default_overlay_deform_mesh(overlay, view)),
         Cow::Borrowed,
     )
 }
@@ -1682,6 +1669,51 @@ pub(super) fn page_px_from_scene(image_rect: Rect, zoom: f32, point: Pos2) -> [f
         (point.x - image_rect.left()) / zoom,
         (point.y - image_rect.top()) / zoom,
     ]
+}
+
+/// Per-frame page↔scene view transform for one visible page.
+///
+/// Bundles the three values that together define how a single page maps between its
+/// own page-pixel space and the canvas scene space for the current frame: which page
+/// (`page_idx`), the page's on-screen rectangle in scene coordinates (`image_rect`),
+/// and the scene-pixels-per-page-pixel scale (`zoom`). Constructed ONCE at each canvas
+/// hook boundary and threaded through the per-page draw/interaction/geometry helpers so
+/// the transform arguments can no longer be swapped or paired with the wrong zoom.
+///
+/// The conversion methods delegate to the free functions `page_size_from_image_rect`,
+/// `scene_from_page_px`, and `page_px_from_scene`, which remain the single source of
+/// truth for the math (and stay usable directly for callers that hold a raw rect/zoom).
+#[derive(Debug, Clone, Copy)]
+pub(in crate::tabs::typing) struct PageView {
+    /// Zero-based index of the page this view transform belongs to.
+    pub page_idx: usize,
+    /// The page's rectangle in scene coordinates for the current frame.
+    pub image_rect: Rect,
+    /// Scene pixels per page pixel (must be > 0; callers pass the canvas zoom).
+    pub zoom: f32,
+}
+
+impl PageView {
+    /// The page's source size in page pixels `[width, height]`, derived from the
+    /// on-screen rect and zoom. Delegates to `page_size_from_image_rect`.
+    #[must_use]
+    pub(in crate::tabs::typing) fn page_size_px(&self) -> [usize; 2] {
+        page_size_from_image_rect(self.image_rect, self.zoom)
+    }
+
+    /// Maps a page-pixel point to its scene-space position (clamped to the page).
+    /// Delegates to `scene_from_page_px`.
+    #[must_use]
+    pub(in crate::tabs::typing) fn scene_from_page_px(&self, page_px: [f32; 2]) -> Pos2 {
+        scene_from_page_px(self.image_rect, self.zoom, page_px)
+    }
+
+    /// Maps a scene-space position back to page-pixel coordinates.
+    /// Delegates to `page_px_from_scene`.
+    #[must_use]
+    pub(in crate::tabs::typing) fn page_px_from_scene(&self, point: Pos2) -> [f32; 2] {
+        page_px_from_scene(self.image_rect, self.zoom, point)
+    }
 }
 
 pub(super) fn scene_from_uv(image_rect: Rect, u: f32, v: f32) -> Pos2 {
@@ -1758,14 +1790,13 @@ pub(super) fn quantize_drag_page_delta_axis(delta_page_px: f32) -> f32 {
 
 pub(super) fn default_overlay_deform_mesh(
     overlay: &TypingOverlayRuntime,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
 ) -> TypingOverlayDeformMesh {
     deform_mesh_from_quad(
-        default_overlay_quad_uv(overlay, image_rect, zoom),
+        default_overlay_quad_uv(overlay, view),
         TEXT_OVERLAY_DEFORM_SURFACE_COLS,
         TEXT_OVERLAY_DEFORM_SURFACE_ROWS,
-        page_size_from_image_rect(image_rect, zoom),
+        view.page_size_px(),
     )
 }
 
@@ -1849,10 +1880,10 @@ pub(super) fn normalize_deform_mesh_resolution(
     .unwrap_or_else(|| default_deform_mesh_for_page([0.5, 0.5], [1, 1], 1.0, 0.0, [1, 1]))
 }
 
-pub(super) fn scene_mesh_points(mesh: &TypingOverlayDeformMesh, image_rect: Rect, zoom: f32) -> Vec<Pos2> {
+pub(super) fn scene_mesh_points(mesh: &TypingOverlayDeformMesh, view: PageView) -> Vec<Pos2> {
     mesh.points_px
         .iter()
-        .map(|&point| scene_from_page_px(image_rect, zoom, point))
+        .map(|&point| view.scene_from_page_px(point))
         .collect()
 }
 
@@ -2170,23 +2201,22 @@ pub(super) fn apply_perspective_corner_drag(
         .unwrap_or_else(|| mesh.clone())
 }
 
-// Brush deformation depends on distinct input spaces (scene pointer, mesh state, page rect, zoom, tool settings).
-#[allow(clippy::too_many_arguments)]
+/// Applies a brush-mode deform drag to `mesh`, returning the deformed copy (unchanged for a
+/// non-brush mode or a degenerate mesh). `view` maps between the scene pointer and page px.
 pub(super) fn apply_brush_deform_drag(
     mode: TypingDeformMode,
     mesh: &TypingOverlayDeformMesh,
     default_mesh: &TypingOverlayDeformMesh,
     brush_center_scene: Pos2,
     pointer_scene: Pos2,
-    image_rect: Rect,
-    zoom: f32,
+    view: PageView,
     settings: &TypingDeformToolSettings,
 ) -> TypingOverlayDeformMesh {
     if !mode.is_brush_mode() || mesh.cols < 2 || mesh.rows < 2 {
         return mesh.clone();
     }
 
-    let page_size = page_size_from_image_rect(image_rect, zoom);
+    let page_size = view.page_size_px();
     let delta_page_px = [
         pointer_scene.x - brush_center_scene.x,
         pointer_scene.y - brush_center_scene.y,
@@ -2194,7 +2224,7 @@ pub(super) fn apply_brush_deform_drag(
     let delta_scene = pointer_scene - brush_center_scene;
     let radius_px = settings.brush_radius_px.max(4.0);
     let strength = settings.brush_strength.max(0.01);
-    let center_page_px = page_px_from_scene(image_rect, zoom, brush_center_scene);
+    let center_page_px = view.page_px_from_scene(brush_center_scene);
     let radial_drag = (delta_scene.length() / radius_px).min(1.0);
     let mut next_points = mesh.points_px.clone();
 
@@ -2202,7 +2232,7 @@ pub(super) fn apply_brush_deform_drag(
         for col in 0..mesh.cols {
             let idx = row * mesh.cols + col;
             let point_page_px = mesh.point(col, row);
-            let point_scene = scene_from_page_px(image_rect, zoom, point_page_px);
+            let point_scene = view.scene_from_page_px(point_page_px);
             let to_center = point_scene - brush_center_scene;
             let dist_px = to_center.length();
             if dist_px > radius_px {

@@ -333,13 +333,8 @@ impl TypingTextOverlayLayer {
     /// only valid for an eligible text overlay (allowed layout mode, no raster deform mesh); when it is
     /// not, this quietly falls back to the raster rotation so the wheel still visibly rotates. No-op
     /// unless a text overlay on `page_idx` is selected, not in transform mode, and Ctrl/Cmd is held.
-    pub(super) fn try_rotate_selected_overlay_by_ctrl_wheel(
-        &mut self,
-        ui: &mut egui::Ui,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
-    ) {
+    pub(super) fn try_rotate_selected_overlay_by_ctrl_wheel(&mut self, ui: &mut egui::Ui, view: PageView) {
+        let page_idx = view.page_idx;
         let Some(selected_idx) = self.selected_overlay_idx else {
             return;
         };
@@ -373,7 +368,7 @@ impl TypingTextOverlayLayer {
         // Snapshot the overlay's rotation inputs AND its vector eligibility in one borrow.
         let (start_angle_deg, start_mesh_scene, start_mesh_dims, had_mesh, is_text, layout_allows_vector) = {
             let overlay = &self.overlays[selected_idx];
-            let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
+            let geometry = overlay_scene_geometry(overlay, view);
             let is_text = overlay.kind == TypingOverlayKind::Text;
             let layout_allows_vector = vector_transform_allowed_for_layout_mode(
                 overlay_text_layout_mode(overlay.render_data_json.as_ref()),
@@ -434,10 +429,10 @@ impl TypingTextOverlayLayer {
             if had_mesh {
                 let center_scene = deform_mesh_center_scene(&start_mesh_scene);
                 let rotated_scene = rotate_mesh_scene(&start_mesh_scene, center_scene, delta_rad);
-                let page_size = page_size_from_image_rect(image_rect, zoom);
+                let page_size = view.page_size_px();
                 let rotated_page_px = rotated_scene
                     .into_iter()
-                    .map(|scene| page_px_from_scene(image_rect, zoom, scene))
+                    .map(|scene| view.page_px_from_scene(scene))
                     .collect::<Vec<_>>();
                 overlay.deform_mesh = TypingOverlayDeformMesh::new(
                     start_mesh_dims.0,
@@ -725,12 +720,11 @@ impl TypingTextOverlayLayer {
     /// `ensure_overlay_deform_mesh`. Pure in-memory on the cached layer; persisted on drag-end.
     pub(super) fn ensure_raster_deform_mesh(
         &mut self,
-        page_idx: usize,
+        view: PageView,
         raster_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
     ) -> Option<TypingOverlayDeformMesh> {
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_idx = view.page_idx;
+        let page_size = view.page_size_px();
         let layer = self
             .raster_layers_by_page
             .get_mut(&page_idx)
@@ -910,11 +904,11 @@ impl TypingTextOverlayLayer {
     pub(super) fn interact_page_rasters(
         &mut self,
         ui: &mut egui::Ui,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         painter: &egui::Painter,
     ) {
+        let page_idx = view.page_idx;
+        let image_rect = view.image_rect;
         let count = self
             .raster_layers_by_page
             .get(&page_idx)
@@ -975,14 +969,14 @@ impl TypingTextOverlayLayer {
 
         // === Perspective transform mode: edit the selected raster's deform mesh corners. ===
         if let Some(sel) = self.transform_mode_raster_idx {
-            let mesh = self.ensure_raster_deform_mesh(page_idx, sel, image_rect, zoom);
+            let mesh = self.ensure_raster_deform_mesh(view, sel);
             let deform = self
                 .raster_layers_by_page
                 .get(&page_idx)
                 .and_then(|v| v.get(sel))
                 .and_then(|l| l.deform.clone());
             if let (Some(_), Some(deform)) = (mesh, deform)
-                && let Some(corners) = deform_mesh_corners_scene(&deform, image_rect, zoom)
+                && let Some(corners) = deform_mesh_corners_scene(&deform, view)
             {
                 let pointer = ui.ctx().pointer_latest_pos();
                 let interact_rect = egui::Rect::from_points(&corners).expand(
@@ -999,7 +993,7 @@ impl TypingTextOverlayLayer {
                     && let Some(p) = pointer
                     && let Some(handle_idx) = hit_test_transform_handle(p, &corners)
                 {
-                    let page_size = page_size_from_image_rect(image_rect, zoom);
+                    let page_size = view.page_size_px();
                     let start_mesh =
                         TypingOverlayDeformMesh::from_deform_rec(&deform, page_size);
                     let start_transform = self
@@ -1032,7 +1026,7 @@ impl TypingTextOverlayLayer {
                     && (resp.dragged() || primary_down)
                     && let Some(p) = pointer
                 {
-                    self.apply_raster_drag(&state, p, image_rect, zoom);
+                    self.apply_raster_drag(&state, p, view);
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
                 self.raster_context_menu(
@@ -1049,14 +1043,12 @@ impl TypingTextOverlayLayer {
                 );
 
                 // Decoration: deformed mesh wireframe outline + corner handles.
-                let scene_pts = deform_mesh_scene_points(&deform, image_rect, zoom);
+                let scene_pts = deform_mesh_scene_points(&deform, view);
                 draw_textured_deform_mesh_wire(painter, &scene_pts, deform.cols, deform.rows);
                 draw_perspective_handles(painter, &corners);
             }
             self.apply_raster_menu_actions(
-                page_idx,
-                image_rect,
-                zoom,
+                view,
                 menu_enter_transform,
                 menu_exit_transform,
                 menu_reset_transform,
@@ -1072,8 +1064,8 @@ impl TypingTextOverlayLayer {
         let entries: Vec<(usize, [Pos2; 4], Pos2)> = (0..count)
             .filter_map(|i| {
                 let l = self.raster_layers_by_page.get(&page_idx)?.get(i)?;
-                let quad = raster_quad_scene(&l.transform, l.image.size, image_rect, zoom);
-                let center = scene_from_page_px(image_rect, zoom, [l.transform.cx, l.transform.cy]);
+                let quad = raster_quad_scene(&l.transform, l.image.size, view);
+                let center = view.scene_from_page_px([l.transform.cx, l.transform.cy]);
                 Some((i, quad, center))
             })
             .collect();
@@ -1095,7 +1087,7 @@ impl TypingTextOverlayLayer {
                         .and_then(|v| v.get(idx))
                         .map(|l| self.raster_band_z(page_idx, &l.uid))
                 });
-            let topmost_overlay = self.topmost_overlay_at(page_idx, pointer, image_rect, zoom);
+            let topmost_overlay = self.topmost_overlay_at(view, pointer);
             if unified_topmost_pointer_target(topmost_overlay.map(|(_, z)| z), topmost_raster_z)
                 == TypingPointerTarget::Overlay
             {
@@ -1130,7 +1122,7 @@ impl TypingTextOverlayLayer {
                 if (resp.dragged() || primary_down)
                     && let Some(p) = pointer
                 {
-                    self.apply_raster_drag(&state, p, image_rect, zoom);
+                    self.apply_raster_drag(&state, p, view);
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
                 // Keep the menu attached to the selected raster's resp even mid-drag, so it persists.
@@ -1340,9 +1332,7 @@ impl TypingTextOverlayLayer {
         }
 
         self.apply_raster_menu_actions(
-            page_idx,
-            image_rect,
-            zoom,
+            view,
             menu_enter_transform,
             menu_exit_transform,
             menu_reset_transform,
@@ -1424,12 +1414,12 @@ impl TypingTextOverlayLayer {
     }
 
     /// Applies the deferred raster context-menu actions captured by `raster_context_menu`.
+    // The six deferred menu-action slots are independent outcomes of one menu; bundling them would only
+    // obscure that each is a distinct, optional action.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_raster_menu_actions(
         &mut self,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         enter_transform: Option<usize>,
         exit_transform: bool,
         reset_transform: Option<usize>,
@@ -1437,9 +1427,10 @@ impl TypingTextOverlayLayer {
         move_z: Option<(usize, bool)>,
         delete: Option<usize>,
     ) {
+        let page_idx = view.page_idx;
         if let Some(idx) = enter_transform {
             // Seed the mesh (if absent) and enter perspective transform mode.
-            if self.ensure_raster_deform_mesh(page_idx, idx, image_rect, zoom).is_some() {
+            if self.ensure_raster_deform_mesh(view, idx).is_some() {
                 self.transform_mode_raster_idx = Some(idx);
                 self.deform_mode = TypingDeformMode::Perspective;
                 self.raster_drag_state = None;
@@ -1511,9 +1502,9 @@ impl TypingTextOverlayLayer {
         &mut self,
         state: &TypingRasterDragState,
         pointer: Pos2,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
     ) {
+        let zoom = view.zoom;
         let Some(layer) = self
             .raster_layers_by_page
             .get_mut(&state.page_idx)
@@ -1530,11 +1521,8 @@ impl TypingTextOverlayLayer {
                     state.start_transform.cy + (pointer.y - state.pointer_start_scene.y) / z;
             }
             TypingRasterDragMode::Rotate => {
-                let center = scene_from_page_px(
-                    image_rect,
-                    zoom,
-                    [state.start_transform.cx, state.start_transform.cy],
-                );
+                let center =
+                    view.scene_from_page_px([state.start_transform.cx, state.start_transform.cy]);
                 let cur = pointer_angle_rad(center, pointer);
                 layer.transform.rotation =
                     state.start_transform.rotation + (cur - state.start_pointer_angle_rad);
@@ -1543,7 +1531,7 @@ impl TypingTextOverlayLayer {
                 let Some(start_mesh) = &state.start_mesh else {
                     return;
                 };
-                let page_size = page_size_from_image_rect(image_rect, zoom);
+                let page_size = view.page_size_px();
                 let z = zoom.max(f32::EPSILON);
                 // Pointer delta in page px (scene → page).
                 let delta_page_px = [
@@ -1569,12 +1557,11 @@ impl TypingTextOverlayLayer {
     pub(super) fn try_move_selected_overlay_by_arrow_shortcuts(
         &mut self,
         ui: &mut egui::Ui,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         panel_text_input_focused: bool,
         strict_pixel_movement: bool,
     ) {
+        let page_idx = view.page_idx;
         if panel_text_input_focused {
             return;
         }
@@ -1610,7 +1597,7 @@ impl TypingTextOverlayLayer {
         }
 
         let page_delta = [delta_x_px as f32, delta_y_px as f32];
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_size = view.page_size_px();
         if let Some(overlay) = self.overlays.get_mut(selected_idx) {
             if let Some(mesh) = overlay.deform_mesh.as_mut() {
                 mesh.translate(page_delta[0], page_delta[1], page_size);
@@ -1627,12 +1614,7 @@ impl TypingTextOverlayLayer {
             snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, page_size);
         }
 
-        let _ = self.enforce_overlay_visibility_limit(
-            selected_idx,
-            image_rect,
-            zoom,
-            strict_pixel_movement,
-        );
+        let _ = self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement);
         // An arrow nudge is an EXPLICIT layer move: the centering frame FOLLOWS the layer, so re-bind
         // the frame center to the moved chosen center before the reconciliation can yank it back.
         self.sync_centering_frame_to_layer(selected_idx, page_size);
@@ -1655,12 +1637,11 @@ impl TypingTextOverlayLayer {
     pub(super) fn try_move_selected_raster_by_arrow_shortcuts(
         &mut self,
         ui: &mut egui::Ui,
-        page_idx: usize,
-        image_rect: Rect,
-        zoom: f32,
+        view: PageView,
         panel_text_input_focused: bool,
         strict_pixel_movement: bool,
     ) {
+        let page_idx = view.page_idx;
         if panel_text_input_focused {
             return;
         }
@@ -1701,7 +1682,7 @@ impl TypingTextOverlayLayer {
         }
 
         let page_delta = [delta_x_px as f32, delta_y_px as f32];
-        let page_size = page_size_from_image_rect(image_rect, zoom);
+        let page_size = view.page_size_px();
         let Some(layer) = self
             .raster_layers_by_page
             .get_mut(&page_idx)
