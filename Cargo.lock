@@ -3314,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "manhwastudio_rs"
-version = "3.5.1"
+version = "3.6.0"
 dependencies = [
  "ag-psd",
  "anyhow",
