@@ -10,6 +10,7 @@ Rust application code lives under `src/` and is the current implementation; it o
 - `Cargo.toml`: Rust package manifest and authoritative application version.
 - `config.py`: shared Python-side runtime constants and JSON-backed user configuration helpers.
 - `build_zip.py`: builds `ManhwaStudio.zip`; synchronizes `config.py VERSION` from `Cargo.toml` before archiving.
+- `build-all.py`: release orchestrator; builds the desktop target matrix, signs Windows exes, invokes `build_zip.py`, and assembles `target/final/` under updater-expected asset names.
 - `modules/`: Python helper modules used by launcher/backend flows.
 - `src/`: Rust application source.
 
@@ -19,6 +20,7 @@ Rust application code lives under `src/` and is the current implementation; it o
 - Packaging scripts should fail clearly when required manifests or assignments are missing instead of producing an archive with stale metadata.
 
 ## Editing map
+- To change the release matrix, signing, or `target/final/` assembly, edit `build-all.py`.
 - To change ZIP contents or version synchronization, edit `build_zip.py`.
 - To change Python runtime constants, edit `config.py`.
 - To change current application behavior, prefer `src/` unless the task explicitly targets legacy Python/runtime packaging.

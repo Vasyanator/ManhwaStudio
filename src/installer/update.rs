@@ -28,17 +28,12 @@ use crate::config;
 use super::install::TorchInstallSelection;
 use super::utils::{
     ExternalUpdateTarget, UpdateWorkerEvent, github_api_get, load_embedded_icon_data,
-    run_external_update_binary_stage, run_update_binary_stage, run_update_continuation_stage,
+    platform_binary_asset_name, run_external_update_binary_stage, run_update_binary_stage,
+    run_update_continuation_stage,
 };
 
 const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
 const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
-const LINUX_BINARY_ASSET_NAME: &str = "manhwastudio_rs";
-const WINDOWS_BINARY_ASSET_NAME: &str = "manhwastudio_rs.exe";
-// The macOS build (`build-macos.sh`) produces a bare `manhwastudio_rs` binary, which
-// would collide with the Linux release asset. Publish it under a distinct suffixed name
-// so the updater can pick the correct per-platform asset from the same GitHub release.
-const MACOS_BINARY_ASSET_NAME: &str = "manhwastudio_rs_macos";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateWindowOutcome {
@@ -581,21 +576,6 @@ fn fetch_latest_app_release_tag() -> Result<String, String> {
     Err(tf!("installer.update.no_release_with_assets_error", app_zip_asset_name = APP_ZIP_ASSET_NAME, platform_binary_asset_name = platform_binary_asset_name()))
 }
 
-/// Returns the GitHub release asset name for the current platform's executable.
-///
-/// Windows uses `manhwastudio_rs.exe`, macOS uses the suffixed
-/// `manhwastudio_rs_macos` (to avoid colliding with the Linux asset), and every
-/// other target (Linux) uses the bare `manhwastudio_rs`.
-fn platform_binary_asset_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        WINDOWS_BINARY_ASSET_NAME
-    } else if cfg!(target_os = "macos") {
-        MACOS_BINARY_ASSET_NAME
-    } else {
-        LINUX_BINARY_ASSET_NAME
-    }
-}
-
 fn is_remote_newer(local: &str, remote: &str) -> bool {
     compare_versions(remote, local).is_gt()
 }
@@ -650,29 +630,8 @@ enum VersionPart {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LINUX_BINARY_ASSET_NAME, MACOS_BINARY_ASSET_NAME, WINDOWS_BINARY_ASSET_NAME,
-        compare_versions, is_remote_newer,
-    };
+    use super::{compare_versions, is_remote_newer};
     use std::cmp::Ordering;
-
-    #[test]
-    fn platform_binary_asset_names_are_distinct_and_non_empty() {
-        // `platform_binary_asset_name()` selects between these at compile time via
-        // `cfg!`, so verify the underlying constants directly: each must be a distinct,
-        // non-empty asset name so the updater never downloads the wrong platform build.
-        let names = [
-            LINUX_BINARY_ASSET_NAME,
-            MACOS_BINARY_ASSET_NAME,
-            WINDOWS_BINARY_ASSET_NAME,
-        ];
-        assert!(names.iter().all(|name| !name.is_empty()));
-        for (i, left) in names.iter().enumerate() {
-            for right in &names[i + 1..] {
-                assert_ne!(left, right);
-            }
-        }
-    }
 
     #[test]
     fn compares_numeric_release_versions() {

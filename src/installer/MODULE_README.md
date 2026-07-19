@@ -64,10 +64,17 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   dependency-list packages, and unpack `ManhwaStudio.zip` over the install root.
 - Windows Program Files ACL changes happen at root directory creation time, not as a recursive
   post-install permission rewrite.
-- Per-platform release binary assets are distinct: Windows `manhwastudio_rs.exe`, macOS
-  `manhwastudio_rs_macos`, Linux bare `manhwastudio_rs`. `platform_binary_asset_name()` (present in
-  both `update.rs` and `utils.rs`) selects among them via `cfg!(target_os = ...)`; both copies must
-  stay in sync so the release check and the download stage agree on the asset.
+- Release binary assets are per-platform × per-arch and distinct: Windows x86_64
+  `manhwastudio_rs.exe` / aarch64 `manhwastudio_rs_arm64.exe`; macOS x86_64 `manhwastudio_rs_macos`
+  / aarch64 `manhwastudio_rs_macos_arm64`; Linux x86_64 bare `manhwastudio_rs` / aarch64
+  `manhwastudio_rs_linux_arm64`. A single `pub(crate) fn platform_binary_asset_name()` in `utils.rs`
+  selects among them via `cfg!(target_os = ...)` × `cfg!(target_arch = "aarch64")` and is the one
+  source used by both the release availability check (`update.rs`) and the download stage. On-disk
+  executable names stay arch-agnostic (`platform_executable_file_name()`), so `_macos`/`_arm64`
+  suffixes never leak into install-path or archive-strip logic.
+- Known limitation: external-target updates (existing-install / custom-folder entry points) pick the
+  asset by the RUNNING process's os/arch and assume the target executable matches it; the target is
+  only version-queried (`--version`), never arch-probed.
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.

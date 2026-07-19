@@ -58,6 +58,15 @@ use super::install::{UninstallEvent, run_windows_uninstall_window, send_uninstal
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
 const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
 const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
+// Per-platform × per-arch GitHub *release asset* names of the main executable,
+// as produced by `build-all.py`. These name the file uploaded to the release,
+// NOT the on-disk executable (see `platform_executable_file_name`).
+const WINDOWS_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs.exe";
+const WINDOWS_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_arm64.exe";
+const MACOS_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs_macos";
+const MACOS_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_macos_arm64";
+const LINUX_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs";
+const LINUX_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_linux_arm64";
 const PYTHON_VERSION_REQUEST: &str = "3.11";
 const TORCH_VERSION: &str = "2.9.1";
 const TORCHVISION_VERSION: &str = "0.24.1";
@@ -735,26 +744,50 @@ fn run_update_continuation_stage_inner(
 }
 
 /// Returns the GitHub *release asset* download file name of the main executable
-/// for the current platform. This is the name of the file uploaded to the
-/// release, NOT the executable's on-disk name — see `platform_executable_file_name`.
+/// for the current build's OS and architecture. This is the name of the file
+/// uploaded to the release, NOT the executable's on-disk name — see
+/// `platform_executable_file_name`.
 ///
-/// Must stay in sync with `platform_binary_asset_name` in `update.rs`:
-/// Windows → `manhwastudio_rs.exe`, macOS → `manhwastudio_rs_macos` (suffixed so
-/// it does not collide with the bare Linux asset), Linux and other Unix →
-/// `manhwastudio_rs`.
+/// The single source of truth for the six release-asset names: both the release
+/// availability check (`update.rs`) and the download stage
+/// (`run_update_binary_stage_inner`) call it, so they always agree on the asset.
+///
+/// Selection is by OS × architecture at compile time:
+///
+/// | OS      | x86_64                  | aarch64                        |
+/// |---------|-------------------------|--------------------------------|
+/// | Windows | `manhwastudio_rs.exe`   | `manhwastudio_rs_arm64.exe`    |
+/// | macOS   | `manhwastudio_rs_macos` | `manhwastudio_rs_macos_arm64`  |
+/// | Linux   | `manhwastudio_rs`       | `manhwastudio_rs_linux_arm64`  |
+///
+/// Only `x86_64` and `aarch64` are shipped. Because selection is a compile-time
+/// `cfg!` chain, `aarch64` is matched explicitly and `x86_64` is the residual
+/// arm — any other target arch would silently resolve to the x86_64 asset, but no
+/// such build is produced or published.
 ///
 /// On macOS the asset name intentionally differs from the on-disk executable
-/// name: the release ships the binary renamed to `manhwastudio_rs_macos`, but on
-/// disk (and inside `ManhwaStudio.zip`) the executable is the bare
-/// `manhwastudio_rs`. Use this function ONLY for the release download; use
+/// name: the release ships the binary renamed with a `_macos` suffix, but on disk
+/// (and inside `ManhwaStudio.zip`) the executable is the bare `manhwastudio_rs`.
+/// Use this function ONLY for the release download; use
 /// `platform_executable_file_name` for anything that names the file on disk.
-fn platform_binary_asset_name() -> &'static str {
+pub(crate) fn platform_binary_asset_name() -> &'static str {
+    let is_aarch64 = cfg!(target_arch = "aarch64");
     if cfg!(target_os = "windows") {
-        "manhwastudio_rs.exe"
+        if is_aarch64 {
+            WINDOWS_BINARY_ASSET_NAME_AARCH64
+        } else {
+            WINDOWS_BINARY_ASSET_NAME_X86_64
+        }
     } else if cfg!(target_os = "macos") {
-        "manhwastudio_rs_macos"
+        if is_aarch64 {
+            MACOS_BINARY_ASSET_NAME_AARCH64
+        } else {
+            MACOS_BINARY_ASSET_NAME_X86_64
+        }
+    } else if is_aarch64 {
+        LINUX_BINARY_ASSET_NAME_AARCH64
     } else {
-        "manhwastudio_rs"
+        LINUX_BINARY_ASSET_NAME_X86_64
     }
 }
 
@@ -764,10 +797,11 @@ fn platform_binary_asset_name() -> &'static str {
 ///
 /// This is the name the executable carries on disk and inside the extracted
 /// `ManhwaStudio.zip` payload, which is deliberately different from the release
-/// download name on macOS (see `platform_binary_asset_name`). On Windows/Linux
-/// the two coincide; on macOS they differ, so any code that strips or locates the
-/// executable within the install tree or an extracted archive must use this
-/// function, not the release-asset name.
+/// download name (see `platform_binary_asset_name`). The two coincide only on
+/// x86_64 Windows/Linux: macOS assets carry a `_macos` suffix on both arches,
+/// and every aarch64 asset carries an arch suffix that never appears on disk.
+/// Any code that strips or locates the executable within the install tree or an
+/// extracted archive must use this function, not the release-asset name.
 fn platform_executable_file_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "manhwastudio_rs.exe"
@@ -4183,6 +4217,9 @@ impl Display for Platform {
 #[cfg(test)]
 mod tests {
     use super::{
+        LINUX_BINARY_ASSET_NAME_AARCH64, LINUX_BINARY_ASSET_NAME_X86_64,
+        MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
+        WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
         compare_version_strings, dependency_package_name, is_retryable_http_status,
         normalize_package_name, parse_content_range_total, parse_executable_version_output,
         parse_pip_freeze_packages, platform_binary_asset_name, platform_executable_file_name,
@@ -4354,11 +4391,47 @@ mod tests {
     }
 
     #[test]
+    fn platform_binary_asset_names_match_release_contract() {
+        // The release pipeline (`build-all.py`) publishes assets under exactly
+        // these names; a typo or swapped pairing here means shipped installs can
+        // never update again. Pin every OS × arch constant to its exact literal
+        // so any drift fails loudly (exactness also keeps the six names pairwise
+        // distinct within one release).
+        assert_eq!(WINDOWS_BINARY_ASSET_NAME_X86_64, "manhwastudio_rs.exe");
+        assert_eq!(WINDOWS_BINARY_ASSET_NAME_AARCH64, "manhwastudio_rs_arm64.exe");
+        assert_eq!(MACOS_BINARY_ASSET_NAME_X86_64, "manhwastudio_rs_macos");
+        assert_eq!(MACOS_BINARY_ASSET_NAME_AARCH64, "manhwastudio_rs_macos_arm64");
+        assert_eq!(LINUX_BINARY_ASSET_NAME_X86_64, "manhwastudio_rs");
+        assert_eq!(LINUX_BINARY_ASSET_NAME_AARCH64, "manhwastudio_rs_linux_arm64");
+
+        // The selector must hand back the exact literal for the compiling
+        // OS × arch pair, guarding against miswired constants in its branches.
+        let expected = if cfg!(target_os = "windows") {
+            if cfg!(target_arch = "aarch64") {
+                "manhwastudio_rs_arm64.exe"
+            } else {
+                "manhwastudio_rs.exe"
+            }
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "manhwastudio_rs_macos_arm64"
+            } else {
+                "manhwastudio_rs_macos"
+            }
+        } else if cfg!(target_arch = "aarch64") {
+            "manhwastudio_rs_linux_arm64"
+        } else {
+            "manhwastudio_rs"
+        };
+        assert_eq!(platform_binary_asset_name(), expected);
+    }
+
+    #[test]
     fn on_disk_executable_name_never_carries_macos_asset_suffix() {
         // The on-disk / in-archive executable name must not carry the `_macos`
         // suffix that only the release download name uses, otherwise the update
         // strip step would miss the staged binary on macOS. On non-Windows the
-        // on-disk name is the bare `manhwastudio_rs`.
+        // on-disk name is the bare `manhwastudio_rs`, regardless of arch.
         let on_disk = platform_executable_file_name();
         assert!(
             !on_disk.contains("_macos"),
@@ -4366,16 +4439,29 @@ mod tests {
         );
 
         let asset = platform_binary_asset_name();
+        let is_aarch64 = cfg!(target_arch = "aarch64");
         if cfg!(target_os = "windows") {
             assert_eq!(on_disk, "manhwastudio_rs.exe");
-            assert_eq!(asset, "manhwastudio_rs.exe");
         } else {
             assert_eq!(on_disk, "manhwastudio_rs");
         }
+
+        // Backward-compat guard: on x86_64 the asset names must equal the historical
+        // values so existing x86_64 installs and older releases keep updating.
+        if !is_aarch64 {
+            if cfg!(target_os = "windows") {
+                assert_eq!(asset, "manhwastudio_rs.exe");
+            } else if cfg!(target_os = "macos") {
+                assert_eq!(asset, "manhwastudio_rs_macos");
+            } else {
+                assert_eq!(asset, "manhwastudio_rs");
+            }
+        }
+
         if cfg!(target_os = "macos") {
             // The two names intentionally differ on macOS: bare on disk, suffixed
-            // as the release download.
-            assert_eq!(asset, "manhwastudio_rs_macos");
+            // as the release download (with an extra `_arm64` on aarch64).
+            assert!(asset.starts_with("manhwastudio_rs_macos"));
             assert_ne!(on_disk, asset);
         }
     }
