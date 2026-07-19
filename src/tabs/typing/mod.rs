@@ -15,6 +15,11 @@ FILE HEADER (tabs/typing/mod.rs)
     (Vector/Raster); пишется из Settings «Тайп», читается в Ctrl+wheel-хендлере.
 */
 mod auto_typing;
+// The ONLY sanctioned entry point for non-typing code into font administration
+// (loaders, imported-fonts store, display-name overrides, the `FontEntry` type). The
+// settings font-settings UI (`src/tabs/settings/typesetting/`) imports this and nothing
+// else from typing. See `font_admin.rs` for the contract.
+pub(crate) mod font_admin;
 mod mask;
 mod panel;
 mod psd_export;
@@ -32,8 +37,6 @@ mod tab;
 pub use panel::{TypingPanelLayout, TypingTopPanelState};
 // Editor widget for per-effect-kind default parameters, rendered by the settings pane.
 pub(crate) use panel::EffectDefaultsEditorState;
-// Editor widget for the settings "Настройки шрифтов" block (font categories + import).
-pub(crate) use panel::FontSettingsEditorState;
 // Startup seeding of the runtime-global effect-defaults store from user config.
 pub(crate) use panel::seed_effect_defaults_from_config;
 // Startup seeding of the runtime-global imported-system-fonts store from user config.

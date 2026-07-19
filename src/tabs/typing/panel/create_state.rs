@@ -327,16 +327,23 @@ impl TypingCreatePanelState {
             .map(|font| font.path.to_string_lossy().to_string())
     }
 
-    pub(super) fn font_label_by_idx(&self, idx: usize) -> Option<String> {
-        self.fonts.get(idx).map(|font| font.label.clone())
+    /// Canonical render/inline-tag IDENTITY name of the font at `idx`
+    /// (`render_identity_name`: the family name when unique in the list, the file-stem
+    /// label on a shared family). This is the value that reaches the renderer and is
+    /// emitted in `<font=...>` tags — NOT a display string (use `font_display_label`
+    /// for the UI).
+    pub(super) fn font_identity_name_by_idx(&self, idx: usize) -> Option<String> {
+        self.fonts.get(idx).map(FontEntry::render_identity_name)
     }
 
     /// Имя шрифта для показа в списке: с уточнением в скобках, только когда
     /// выбраны «Все группы» и имя неоднозначно; при конкретной группе — без скобок.
     pub(super) fn font_display_label(&self, font: &FontEntry) -> String {
+        // Use the display name (user override or `label`); `label` alone stays the
+        // render/inline-tag key — this affects only what the combo SHOWS.
         match (self.selected_font_group.is_none(), font.disambig.as_deref()) {
-            (true, Some(suffix)) => format!("{} ({})", font.label, suffix),
-            _ => font.label.clone(),
+            (true, Some(suffix)) => format!("{} ({})", font.display_label(), suffix),
+            _ => font.display_label().to_string(),
         }
     }
 
@@ -394,30 +401,61 @@ impl TypingCreatePanelState {
         }
     }
 
+    /// Resolves a font by its persisted `font_path` (tried first) or a persisted
+    /// `font_name`/`font_label`, using the SAME precedence as `TabFontProvider` so the
+    /// combo's highlighted font is the one the renderer actually resolves for that name.
+    ///
+    /// Path lookup wins when it matches. Otherwise the name is matched in ordered,
+    /// whole-list passes: exact `identity_name` → original family name → file-stem label
+    /// → path stem, each pass scanning the full list before the next form is tried (the
+    /// provider keys identity first, then family, then label, then stem). This makes a
+    /// name that is one font's identity and another's alias resolve to the same font in
+    /// the panel and the provider. Returns `None` when neither form matches.
     pub(super) fn find_font_idx_by_path_or_label(
         &self,
         font_path: Option<&str>,
         font_label: Option<&str>,
     ) -> Option<usize> {
-        let mut selected_idx = None;
-        if let Some(path_raw) = font_path {
-            selected_idx = self
+        if let Some(path_raw) = font_path
+            && let Some(idx) = self
                 .fonts
                 .iter()
-                .position(|font| font_matches_path(font, path_raw));
-        }
-        if selected_idx.is_none()
-            && let Some(label_raw) = font_label
+                .position(|font| font_matches_path(font, path_raw))
         {
+            return Some(idx);
+        }
+        if let Some(label_raw) = font_label {
             let label_norm = label_raw.trim().to_ascii_lowercase();
             if !label_norm.is_empty() {
-                selected_idx = self
-                    .fonts
-                    .iter()
-                    .position(|font| font_matches_label(font, &label_norm));
+                return self.find_font_idx_by_label_norm(&label_norm);
             }
         }
-        selected_idx
+        None
+    }
+
+    /// Resolves an already-normalized (trimmed, lowercased) font name to a font index
+    /// via ordered whole-list passes matching the provider's key precedence: exact
+    /// `identity_name`, then original family name, then file-stem label, then path stem.
+    /// `label_norm` must be non-empty. Returns the FIRST match in the earliest form.
+    pub(super) fn find_font_idx_by_label_norm(&self, label_norm: &str) -> Option<usize> {
+        self.fonts
+            .iter()
+            .position(|font| font_matches_identity_name(font, label_norm))
+            .or_else(|| {
+                self.fonts
+                    .iter()
+                    .position(|font| font_matches_original_name(font, label_norm))
+            })
+            .or_else(|| {
+                self.fonts
+                    .iter()
+                    .position(|font| font_label_matches(font, label_norm))
+            })
+            .or_else(|| {
+                self.fonts
+                    .iter()
+                    .position(|font| font_matches_stem(font, label_norm))
+            })
     }
 
     /// Resolves a font by its display label, PREFERRING a match among
@@ -450,8 +488,8 @@ impl TypingCreatePanelState {
         {
             return Some(idx);
         }
-        self.fonts
-            .iter()
-            .position(|font| font_matches_label(font, &label_norm))
+        // Whole-list fallback uses the provider-aligned ordered precedence so an
+        // out-of-group name resolves to the same font the renderer would pick.
+        self.find_font_idx_by_label_norm(&label_norm)
     }
 }

@@ -41,6 +41,12 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   would flag nearly all of them. The per-word cache key carries the typesetting language, and the
   whole cache is cleared whenever the loaded dictionary set changes, so a verdict from one language
   never survives a switch. On wasm the download layer is unavailable; the word is left unmarked.
+- `font_preview.rs`: shared egui font-registration helpers for own-typeface font previews
+  (`combo_font_family_name`, `is_font_family_bound`, `ensure_font_family`). Deterministic
+  `(path, face_index)` → family naming plus the one-time GUI-thread file read that registers
+  a font into egui. Used by the typing create/edit panels and the settings font-settings
+  widget. Registration is ADD-ONLY (egui never evicts a font), so a caller scrolling a large
+  catalog must bound how many distinct families it registers.
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
   list.
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.

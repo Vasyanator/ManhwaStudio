@@ -1841,6 +1841,71 @@ fn normalize_preserves_raster_transform() {
     );
 }
 
+/// The font identity now reaches the renderer BY ORIGINAL FAMILY NAME. The codec's
+/// name-resolution chain must prefer `font_original_name`, then fall back through
+/// `font_label` -> `font_family` -> `font` -> the `font_path` file stem, so legacy
+/// projects (which lack `font_original_name`) still open.
+#[test]
+fn render_params_font_name_prefers_original_name_then_falls_back() {
+    let params = |tp: Value| {
+        text_render_params_from_render_data(&json!({ "text_params": tp, "effects": [] }))
+            .expect("params should parse")
+            .font_name
+    };
+    // Original name wins over every other key.
+    assert_eq!(
+        params(json!({
+            "text": "x",
+            "font_original_name": "Anime Ace v05",
+            "font_label": "основной",
+            "font_family": "Ignored",
+            "font": "Ignored2",
+            "font_path": "/fonts/основной.ttf",
+        })),
+        "Anime Ace v05"
+    );
+    // No original name -> font_label (which on truly old data is a stem/label).
+    assert_eq!(
+        params(json!({ "text": "x", "font_label": "основной", "font_family": "Fam" })),
+        "основной"
+    );
+    // Then font_family, then font, then the path stem.
+    assert_eq!(params(json!({ "text": "x", "font_family": "Fam" })), "Fam");
+    assert_eq!(params(json!({ "text": "x", "font": "Solo" })), "Solo");
+    assert_eq!(
+        params(json!({ "text": "x", "font_path": "/a/b/MyFont.ttf" })),
+        "MyFont"
+    );
+    // Blank/whitespace-only names are skipped, not selected.
+    assert_eq!(
+        params(json!({ "text": "x", "font_original_name": "   ", "font_label": "Real" })),
+        "Real"
+    );
+}
+
+/// Bug-in-waiting fixed: the whitelist rebuilder must preserve `font_original_name`.
+/// Dropping it would erase family-name resolution on every project re-normalize
+/// (e.g. re-reading a legacy `text_info.json`).
+#[test]
+fn normalize_preserves_font_original_name() {
+    // Present -> carried through verbatim.
+    let obj = json!({ "text": "hi", "font_label": "стем", "font_original_name": "Real Family" });
+    let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+    assert_eq!(
+        normalized.get("font_original_name").and_then(Value::as_str),
+        Some("Real Family")
+    );
+    // Absent -> Null (the reader then falls back to font_label). Must not crash or fabricate.
+    let legacy = json!({ "text": "hi", "font_label": "стем" });
+    let normalized_legacy = normalize_text_params_object(legacy.as_object().unwrap(), 512);
+    assert!(
+        normalized_legacy
+            .get("font_original_name")
+            .is_some_and(Value::is_null),
+        "absent original name normalizes to Null"
+    );
+}
+
 /// Finding 10 (d): the codec leg keeps the seven faux keys through `normalize`
 /// (with clamping) and applies the same `force_*` gate when building params.
 #[test]

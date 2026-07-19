@@ -3359,6 +3359,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "translators",
+ "ttf-parser 0.25.1",
  "tungstenite",
  "uds_windows",
  "ureq",

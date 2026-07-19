@@ -52,10 +52,15 @@ impl TypingCreatePanelState {
             .get(font_idx)
             .map(|font| font.path.to_string_lossy().to_string())
             .unwrap_or_default();
+        // `font_label` carries the render/inline IDENTITY (`render_identity_name`: the
+        // family name when unique in the list, the file-stem label on a shared family).
+        // `font_original_name` carries the raw family name separately; both are kept so
+        // old app versions resolving `font_label` still land the right font via the
+        // provider's family-name alias.
         let font_label = self
             .fonts
             .get(font_idx)
-            .map(|font| font.label.clone())
+            .map(FontEntry::render_identity_name)
             .unwrap_or_default();
         let font_original_name = self
             .fonts
@@ -77,7 +82,9 @@ impl TypingCreatePanelState {
             text,
             width_px.max(1),
             Some(font.path.to_string_lossy().to_string()),
-            Some(font.label.clone()),
+            // Identity = `render_identity_name` (family name when unique, else stem
+            // label); see `build_font_profile_json_for_idx`.
+            Some(font.render_identity_name()),
             Some(font.original_name.clone()),
         ))
     }
@@ -164,10 +171,14 @@ impl TypingCreatePanelState {
                 "shape_min_width_percent": self.shape_min_width_percent,
                 "shape_variant": self.shape_variant,
                 "font_path": font_path,
+                // Canonical render IDENTITY (the caller passes `render_identity_name`:
+                // family name when unique, else file-stem label). Kept under the
+                // historical `font_label` key so older app versions still resolve it
+                // via the provider alias.
                 "font_label": font_label,
-                // Real font family/name from the file. Preferred by PSD export and
-                // future virtual fonts; kept alongside `font_path`/`font_label` for
-                // back-compat with older projects.
+                // Real font family/name from the file. Read FIRST by the codec and
+                // preferred by PSD export / future virtual fonts; carries the same
+                // canonical name as `font_label` for current data.
                 "font_original_name": font_original_name,
                 // Сформированный (разбитый на строки) текст «продвинутой формы».
                 // Если не пуст — именно он идёт в рендер; `text` остаётся исходным.

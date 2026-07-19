@@ -24,10 +24,15 @@ use super::*;
 pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRenderParams> {
     let render_obj = render_data.as_object()?;
     let text_params = render_obj.get("text_params")?.as_object()?;
-    // The renderer now references fonts by NAME (resolved through the provider).
-    // Derive the working name from the persisted keys, newest first, and fall back
-    // to the legacy `font_path` file stem so old projects keep opening. Bail only
-    // when NONE of these yields a non-empty name.
+    // The renderer now references fonts by NAME (resolved through the provider),
+    // and the canonical identity is the font's ORIGINAL FAMILY NAME. Derive the
+    // working name from the persisted keys, newest/most-canonical first:
+    // `font_original_name` (the family name; present on both current data and older
+    // in-progress projects, so legacy blobs auto-upgrade to family-name resolution),
+    // then `font_label` (now also the family name; a stem/label on truly old data),
+    // then `font_family`/`font`, then the legacy `font_path` file stem. Bail only
+    // when NONE of these yields a non-empty name. The provider keeps label/stem
+    // aliases, so every one of these forms still resolves to a font.
     let read_name = |key: &str| {
         text_params
             .get(key)
@@ -36,7 +41,8 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     };
-    let font_name = read_name("font_label")
+    let font_name = read_name("font_original_name")
+        .or_else(|| read_name("font_label"))
         .or_else(|| read_name("font_family"))
         .or_else(|| read_name("font"))
         .or_else(|| {
@@ -839,6 +845,16 @@ pub(super) fn normalize_text_params_object(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         });
+    // The font's original FAMILY name — the canonical render identity. The whitelist
+    // rebuilder must carry it through, or re-normalizing a project (e.g. a legacy
+    // `text_info.json`) would DROP it and lose family-name resolution. Absent on truly
+    // old data -> Null (the reader then falls back to `font_label`/stem).
+    let font_original_name = obj
+        .get("font_original_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let width_px = obj
         .get("width_px")
         .and_then(value_as_f32)
@@ -887,6 +903,7 @@ pub(super) fn normalize_text_params_object(
         "text_color": text_color,
         "font_path": font_path,
         "font_label": font_label,
+        "font_original_name": font_original_name,
         "font_size_px": obj.get("font_size_px").and_then(value_as_f32).or_else(|| obj.get("font_size").and_then(value_as_f32)).or_else(|| obj.get("size").and_then(value_as_f32)).unwrap_or(24.0).max(1.0),
         "line_spacing": read_render_param_px_or_percent(obj, "line_spacing", "line_spacing_px", "line_spacing_percent", PxOrPercent::percent(50.0)).to_token(),
         "kerning": read_render_param_px_or_percent(obj, "kerning", "kerning_px", "kerning_percent", PxOrPercent::percent(0.0)).to_token(),

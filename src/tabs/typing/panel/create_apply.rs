@@ -393,11 +393,22 @@ impl TypingCreatePanelState {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
+            // Name fallback mirrors the codec's read order: `font_label`, then the
+            // canonical `font_original_name` (family name). A blob carrying only the
+            // original name (e.g. a legacy in-progress project) must not spuriously
+            // flag `missing_font` — the ordered label lookup matches it.
             let font_label = text_params_obj
                 .get("font_label")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    text_params_obj
+                        .get("font_original_name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
             self.select_font_by_path_or_label(font_path, font_label);
         }
 
@@ -592,8 +603,10 @@ impl TypingCreatePanelState {
             ],
             // The renderer resolves the main font by name through the provider
             // handed to `render_text_to_image`; inline `<font=...>` tags resolve
-            // against the same provider. The name is the font label.
-            font_name: font.label.clone(),
+            // against the same provider. The name is the font's canonical render
+            // IDENTITY — its original family name (fallback file-stem label) — which
+            // the provider keys as its primary lookup (label/stem kept as aliases).
+            font_name: font.render_identity_name(),
             font_size_px: self.font_size_px.max(1.0),
             line_spacing_px: self.line_spacing.as_px_percent().0,
             line_spacing_percent: self.line_spacing.as_px_percent().1,

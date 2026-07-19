@@ -107,42 +107,56 @@ pub(super) fn draw_faux_style_controls(
     }
 }
 
-pub(super) fn is_font_family_bound(ctx: &egui::Context, family: &egui::FontFamily) -> bool {
-    ctx.fonts(|fonts| fonts.definitions().families.contains_key(family))
-}
-
-/// Детерминированное имя egui-семейства для UI-превью шрифта в комбобоксе.
-/// Зависит только от (путь, индекс начертания), поэтому один и тот же файл всегда
-/// регистрируется под одним именем (безопасно разделяется между панелями `create`
-/// и `edit`, у которых общий egui-`Context`), а разные файлы получают разные имена.
-pub(super) fn combo_font_family_name(font_path: &Path, face_index: usize) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    font_path.hash(&mut hasher);
-    face_index.hash(&mut hasher);
-    format!("typing-panel-combo-font-{:016x}", hasher.finish())
-}
-
 /// Принадлежит ли шрифт группе `group` (учитывает объединённые копии).
 pub(super) fn font_in_group(font: &FontEntry, group: &str) -> bool {
     font.groups.iter().any(|g| g.as_deref() == Some(group))
 }
 
-/// Matches a font by its display label OR file-stem, case-insensitively.
+/// Matches a font by ANY resolution form — collision-aware identity, original family
+/// name, display-independent file-stem label, OR path stem — case-insensitively.
 ///
 /// `label_norm` MUST already be trimmed and lowercased by the caller (so the
-/// comparison stays allocation-light across the whole font list). Inline
-/// `<font=…>` tags identify a font only by this display label, which is
-/// intentionally ambiguous (a file stem can repeat inside and outside a group),
-/// so callers that must disambiguate should prefer a scoped lookup.
+/// comparison stays allocation-light across the whole font list). A persisted
+/// `font_name` / inline `<font=…>` tag now carries the render identity, but legacy
+/// data used the family name / label / stem — all must map back to a font index so a
+/// persisted name never spuriously reports `missing_font`. This union predicate is
+/// intentionally form-agnostic (order-insensitive); callers that must match the
+/// PROVIDER's precedence use `find_font_idx_by_label_norm`, which runs the per-form
+/// predicates below as ordered whole-list passes. The identity is always one of the
+/// family name or the label, so it is covered by this union without a separate arm.
 pub(super) fn font_matches_label(font: &FontEntry, label_norm: &str) -> bool {
-    font.label.to_ascii_lowercase() == label_norm
-        || font
-            .path
-            .file_stem()
-            .and_then(|v| v.to_str())
-            .map(|stem| stem.to_ascii_lowercase() == label_norm)
-            .unwrap_or(false)
+    font_matches_identity_name(font, label_norm)
+        || font_matches_original_name(font, label_norm)
+        || font_label_matches(font, label_norm)
+        || font_matches_stem(font, label_norm)
+}
+
+/// Matches a font by its COLLISION-AWARE render identity (`identity_name`), which the
+/// provider keys FIRST. `identity_norm` must be pre-trimmed and lowercased.
+pub(super) fn font_matches_identity_name(font: &FontEntry, identity_norm: &str) -> bool {
+    font.identity_name.trim().to_ascii_lowercase() == identity_norm
+}
+
+/// Matches a font by its original FAMILY name (the provider's second-precedence
+/// alias). `name_norm` must be pre-trimmed and lowercased.
+pub(super) fn font_matches_original_name(font: &FontEntry, name_norm: &str) -> bool {
+    !name_norm.is_empty() && font.original_name.trim().to_ascii_lowercase() == name_norm
+}
+
+/// Matches a font by its display-independent file-stem `label` (the provider's
+/// third-precedence alias). `label_norm` must be pre-trimmed and lowercased.
+pub(super) fn font_label_matches(font: &FontEntry, label_norm: &str) -> bool {
+    font.label.trim().to_ascii_lowercase() == label_norm
+}
+
+/// Matches a font by its PATH file stem (the provider's last-precedence alias).
+/// `stem_norm` must be pre-trimmed and lowercased.
+pub(super) fn font_matches_stem(font: &FontEntry, stem_norm: &str) -> bool {
+    font.path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .map(|stem| stem.to_ascii_lowercase() == stem_norm)
+        .unwrap_or(false)
 }
 
 /// Совпадает ли `raw`-путь с представительным или альтернативным путём шрифта.

@@ -21,7 +21,98 @@ them. use super::*; pulls in the parent module's types and imports.
 
 use super::*;
 
-pub(super) fn resolve_fonts_dir() -> PathBuf {
+/// Looks up the user display-name override for `path` using its stable per-font key
+/// relative to `fonts_dir` (`fonts_data::font_settings_key`). DISPLAY ONLY: the result
+/// feeds `FontEntry.display_name`, never the render/inline-tag identity.
+fn display_name_override_for(fonts_dir: &Path, path: &Path) -> Option<String> {
+    let key = fonts_data::font_settings_key(fonts_dir, path);
+    font_settings_store::font_display_name_override(&key)
+}
+
+/// Per-ENTRY default render identity, used at `FontEntry` construction before the
+/// collision-aware pass runs (and as the fallback for non-panel lists that never run
+/// it): the trimmed original family name, or the file-stem `label` when the file
+/// carried no usable family name. `assign_font_identity_names` overrides this on the
+/// finalized panel list for fonts whose family name is shared.
+#[must_use]
+pub(super) fn default_font_identity_name(original_name: &str, label: &str) -> String {
+    let original = original_name.trim();
+    if original.is_empty() {
+        label.to_string()
+    } else {
+        original.to_string()
+    }
+}
+
+/// Computes the COLLISION-AWARE render/inline-tag identity of every font in a
+/// FINALIZED panel list and writes it into `FontEntry.identity_name`.
+///
+/// Rule: a font whose normalized family name (case-insensitive, trimmed) is UNIQUE in
+/// the list gets that family name as its identity; when two or more loaded FILES share
+/// one family name (e.g. a Regular and a Bold shipped as separate files that both
+/// declare `families[0] = "MyFont"`), the family name is NOT a safe persisted identity
+/// — each colliding font falls back to its (unique-ish) file-stem `label`, so no two
+/// files share a persisted identity and neither silently renders as the other. A font
+/// with no usable family name always uses its `label`.
+///
+/// If two colliding-family fonts ALSO share a label, the label is kept anyway (a
+/// stable persisted identity must never be synthesized) and a warning is logged so the
+/// residual ambiguity is diagnosable. Idempotent: recomputes purely from
+/// `original_name`/`label`, so calling it again on an already-assigned list is a no-op.
+pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
+    // Count fonts per normalized family name to detect shared families.
+    let mut family_counts: HashMap<String, usize> = HashMap::new();
+    for font in fonts.iter() {
+        let family = font.original_name.trim().to_lowercase();
+        if !family.is_empty() {
+            *family_counts.entry(family).or_insert(0) += 1;
+        }
+    }
+
+    // Within each SHARED family, count normalized labels so a residual label collision
+    // (two files sharing both family and label) can be warned about exactly once.
+    let mut labels_by_shared_family: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for font in fonts.iter() {
+        let family = font.original_name.trim().to_lowercase();
+        if family.is_empty() || family_counts.get(&family).copied().unwrap_or(0) <= 1 {
+            continue;
+        }
+        let label = font.label.trim().to_lowercase();
+        *labels_by_shared_family
+            .entry(family)
+            .or_default()
+            .entry(label)
+            .or_insert(0) += 1;
+    }
+    for (family, labels) in &labels_by_shared_family {
+        for (label, count) in labels {
+            if *count > 1 {
+                crate::runtime_log::log_warn(format!(
+                    "typing fonts: family '{family}' is shared by multiple files that also share \
+                     the label '{label}'; their persisted render identity stays ambiguous \
+                     (label kept, no synthetic suffix). Rename one file to disambiguate."
+                ));
+            }
+        }
+    }
+
+    for font in fonts.iter_mut() {
+        let family = font.original_name.trim().to_lowercase();
+        font.identity_name = if family.is_empty() {
+            // No usable family name: the file-stem label is the only identity.
+            font.label.clone()
+        } else if family_counts.get(&family).copied().unwrap_or(0) <= 1 {
+            // Unique family name: the family name IS the identity (user contract).
+            font.original_name.trim().to_string()
+        } else {
+            // Shared family name: fall back to the unique-ish file-stem label so each
+            // file keeps a distinct persisted identity.
+            font.label.clone()
+        };
+    }
+}
+
+pub(in crate::tabs::typing) fn resolve_fonts_dir() -> PathBuf {
     if let Ok(cwd) = env::current_dir() {
         let candidate = cwd.join("fonts");
         if candidate.is_dir() {
@@ -65,6 +156,10 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
         }
     }
     entries.sort_by_key(|font| font.label.to_lowercase());
+    // Assign the collision-aware render identity on the COMBINED list: a folder font's
+    // family name may collide with an imported system font's, so identity must be
+    // resolved after the merge, not on the folder-only subset.
+    assign_font_identity_names(&mut entries);
     entries
 }
 
@@ -75,7 +170,10 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
 /// file bytes, an empty `alt_paths`, `groups = [None]`, and no `disambig`. A missing,
 /// unreadable, or unparseable path is skipped with a logged warning instead of producing a
 /// fake entry, so a stale/corrupt imported path never appears as a usable font.
-pub(super) fn load_imported_system_fonts(paths: &[PathBuf]) -> Vec<FontEntry> {
+pub(in crate::tabs::typing) fn load_imported_system_fonts(paths: &[PathBuf]) -> Vec<FontEntry> {
+    // Imported fonts live outside the fonts dir, so their key is their absolute path;
+    // resolve the fonts dir once for the display-name override lookup.
+    let fonts_dir = resolve_fonts_dir();
     let mut used_labels: HashMap<String, usize> = HashMap::new();
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
@@ -121,6 +219,8 @@ pub(super) fn load_imported_system_fonts(paths: &[PathBuf]) -> Vec<FontEntry> {
         let coverage = super::font_coverage::classify_font_bytes(&bytes, rep_face_index);
         let original_name =
             font_original_name_from_bytes(&bytes, rep_face_index).unwrap_or_else(|| stem.clone());
+        let display_name = display_name_override_for(&fonts_dir, path);
+        let identity_name = default_font_identity_name(&original_name, &label);
         entries.push(FontEntry {
             label,
             path: path.clone(),
@@ -130,12 +230,14 @@ pub(super) fn load_imported_system_fonts(paths: &[PathBuf]) -> Vec<FontEntry> {
             faces,
             coverage,
             original_name,
+            display_name,
+            identity_name,
         });
     }
     entries
 }
 
-pub(super) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
+pub(in crate::tabs::typing) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
     let mut files = Vec::<PathBuf>::new();
     collect_font_files_recursive(fonts_dir, fonts_dir, &mut files);
     files.sort_by_key(|path| path.to_string_lossy().to_lowercase());
@@ -180,6 +282,13 @@ pub(super) fn load_fonts_from_dir(fonts_dir: &Path) -> Vec<FontEntry> {
 
     let mut entries = merge_duplicate_fonts(raws);
     assign_font_disambiguators(&mut entries);
+    // Apply per-font display-name overrides (display only; never a resolution key).
+    for entry in &mut entries {
+        entry.display_name = display_name_override_for(fonts_dir, &entry.path);
+    }
+    // Resolve the collision-aware render identity for this folder-only list; the
+    // combined `load_fonts` re-runs it once the imported fonts are merged in.
+    assign_font_identity_names(&mut entries);
     entries
 }
 
@@ -209,6 +318,7 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
         let path = rep.path.clone();
         let coverage = rep.coverage.clone();
         let original_name = rep.original_name.clone();
+        let identity_name = default_font_identity_name(&original_name, &label);
         let alt_paths = cluster[1..].iter().map(|raw| raw.path.clone()).collect();
         // Объединение групп копий (без повторов, в стабильном порядке).
         let mut groups: Vec<Option<String>> = Vec::new();
@@ -226,6 +336,10 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             faces,
             coverage,
             original_name,
+            // Filled by `load_fonts_from_dir` after disambiguation, once the fonts dir
+            // (needed for the per-font key) is known.
+            display_name: None,
+            identity_name,
         });
     }
     entries
@@ -331,7 +445,7 @@ pub(super) fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
 /// HEAVY (hundreds of faces via `fontdb::load_system_fonts`): callers must run it off
 /// the GUI thread. Regular font loading is config-driven (folder + imported paths); this
 /// bulk enumerator is only the picker's catalog source.
-pub(super) fn load_system_fonts() -> Vec<FontEntry> {
+pub(in crate::tabs::typing) fn load_system_fonts() -> Vec<FontEntry> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
 
@@ -378,6 +492,8 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
     let mut files: Vec<PathBuf> = by_path.keys().cloned().collect();
     files.sort_by_key(|path| path.to_string_lossy().to_lowercase());
 
+    // System fonts live outside the fonts dir; resolve it once for the override key.
+    let fonts_dir = resolve_fonts_dir();
     let mut used_labels = HashMap::<String, usize>::new();
     let mut entries = Vec::<FontEntry>::with_capacity(files.len());
     for path in files {
@@ -426,6 +542,8 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             })
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| stem.to_string());
+        let display_name = display_name_override_for(&fonts_dir, &path);
+        let identity_name = default_font_identity_name(&original_name, &label);
         entries.push(FontEntry {
             label,
             path,
@@ -435,6 +553,8 @@ pub(super) fn load_system_fonts() -> Vec<FontEntry> {
             faces,
             coverage,
             original_name,
+            display_name,
+            identity_name,
         });
     }
 

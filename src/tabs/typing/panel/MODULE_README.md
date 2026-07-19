@@ -18,8 +18,75 @@ records the directory role and the coverage/cache contract, to avoid duplication
 ## Files and submodules
 See the parent `MODULE_README.md` for the full per-file catalog
 (`facade.rs`, `create_state.rs`, `create_*`, `fonts.rs`, `font_provider.rs`,
-`font_coverage.rs`, `presets_io.rs`, `font_settings*.rs`, ...). Edit here for
-panel state/UI, font loading, and coverage; edit `render_next/` for the renderer.
+`font_coverage.rs`, `presets_io.rs`, `font_settings_store.rs`, `fonts_data.rs`, ...). Edit
+here for panel state/UI, font loading, and coverage; edit `render_next/` for the renderer.
+
+## Per-font settings persistence (`fonts_data.rs` + `font_settings_store.rs`)
+- App-level per-font settings live in `fonts/fonts_data.json` (`resolve_fonts_dir()`),
+  a versioned document (`version: 1`) holding the user-imported system font FILE paths
+  and per-font settings (currently a `display_name` override). `fonts_data.rs` owns its
+  serde schema; `load_outcome` returns a typed `LoadOutcome` (`Missing` / `Loaded` /
+  `Invalid`) so a corrupt file is NEVER silently degraded to empty (which the next mutation
+  would then overwrite, destroying imported fonts + overrides); an unknown version still
+  parses best-effort as `Loaded`. `save` is atomic AND crash-durable (temp sibling written
+  via explicit `File` + `write_all` + `sync_all`, then rename; no directory fsync — the
+  file is not crash-critical). `quarantine_bad_file` moves a corrupt document to
+  `fonts_data.json.bad`. The stable per-font KEY (`font_settings_key`) is the fonts-dir-
+  relative forward-slash path when under the fonts dir, else the absolute path.
+- `font_settings_store.rs` is the single process-global runtime store backed by that file:
+  imported paths + display-name overrides behind one `RwLock`, sharing ONE revision
+  counter. Any mutation bumps the revision (so settings lists and typing panels reload)
+  and persists the whole snapshot off the GUI thread. Persistence is SERIALIZED via a
+  process-global `save_lock` and the writer thread snapshots the store AFRESH inside that
+  lock, so concurrent mutations coalesce to the newest state and never race on the shared
+  per-process temp file (previously ~21% of saves were lost / a stale snapshot could win).
+  Startup seeding uses `load_outcome`: `Loaded` uses the file; `Missing` runs the one-time
+  legacy `TextTab.imported_system_fonts` migration; `Invalid` quarantines the file then runs
+  the migration (legacy key left in place, no longer written).
+- Display-name overrides are DISPLAY ONLY: `FontEntry.display_name` (populated by the
+  `fonts.rs` loaders) feeds `FontEntry::display_label()` used at presentation sites
+  (`create_state::font_display_label`, and the settings font-settings rows). It never
+  reaches persistence or the renderer.
+
+## Font render IDENTITY (collision-aware: family name when unique, else file-stem label)
+- The canonical name persisted in `render_data.text_params` / `TextRenderParams.font_name`
+  and emitted in inline `<font=...>` tags is the font's COLLISION-AWARE identity
+  (`FontEntry::render_identity_name()` = `identity_name`). `fonts::assign_font_identity_names`
+  computes it for the FINALIZED panel list: the ORIGINAL FAMILY NAME when that family is
+  unique in the list, else the (unique-ish) file-stem `label` when two loaded FILES share a
+  family (a Regular + Bold pair shipped as separate files) — so each file keeps a distinct
+  persisted identity and neither renders as the other. A residual label collision keeps the
+  label and logs a warning (no synthetic suffix — persisted identity must be stable). Call it
+  wherever a combined panel list is finalized: `fonts::load_fonts` (combined) and
+  `load_fonts_from_dir` (folder-only initial list); non-panel lists (system-font picker) keep
+  the per-entry `default_font_identity_name` fallback. The file-stem `label` and any user
+  display-name are for SHOWING the font (combos, lists) ONLY. Write sites: `create_render_data`
+  (JSON `font_label`+`font_original_name`), `create_apply::build_render_params_for` (`font_name`),
+  `create_state::font_identity_name_by_idx` (inline tags + preset `primary_font_label`).
+- Resolution accepts the identity AND legacy forms with the SAME precedence on both sides:
+  `TabFontProvider` keys `identity_name` PRIMARY, then family-name / label / stem aliases
+  (first-wins; display-name is never a key); `create_state::find_font_idx_by_label_norm` runs the
+  matching ordered whole-list passes (identity → family → label → stem) so a name that is one
+  font's identity and another's alias resolves to the SAME font in the panel and the provider;
+  `codec::text_render_params_from_render_data` reads `font_original_name` → `font_label` →
+  `font_family` → `font` → path stem; `create_apply` panel-restore also falls back to
+  `font_original_name`; `normalize_text_params_object` preserves `font_original_name`;
+  `ui_helpers::font_matches_label` is the form-agnostic union (identity/family/label/stem).
+  Editing legacy text: `create_edit::normalize_desired_inline_tag_style` compares RESOLVED font
+  identity (not raw strings) so a legacy `<font=stem>` on the base font is stripped, not duplicated.
+
+## Font model exposure (`crate::tabs::typing::font_admin`)
+- The font ADMINISTRATION UI (categories, system-font import, per-font properties window)
+  moved OUT of this directory to `src/tabs/settings/typesetting/`. The MODEL stays here:
+  `fonts.rs` loaders, `font_settings_store.rs`, `fonts_data.rs`, `FontEntry`/`FontFaceEntry`.
+- Non-typing code reaches that model ONLY through the sibling `font_admin` facade
+  (`src/tabs/typing/font_admin.rs`), which wraps the loaders + store + display-name keying and
+  re-exports `FontEntry` as an opaque type (fields/constructors private; `pub(crate)`
+  accessors). Everything the facade wraps stays `pub(in crate::tabs::typing)`; do not widen a
+  loader/store item to `pub(crate)` — add a facade wrapper instead.
+- egui own-typeface registration for font previews lives in `crate::widgets::font_preview`
+  (`combo_font_family_name` / `is_font_family_bound` / `ensure_font_family`), shared by
+  `create_presets::ensure_combo_font_family` and the settings font UI.
 
 ## Font-coverage contract (`font_coverage.rs`)
 - Coverage follows the selected TYPESETTING language

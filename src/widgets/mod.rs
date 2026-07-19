@@ -32,6 +32,7 @@ FILE HEADER (widgets/mod.rs)
 mod ai_button;
 mod autocomplete_line;
 mod editable_combo_box;
+mod font_preview;
 mod help_hint;
 mod marked_scroll;
 mod seed_spin_box;
@@ -49,6 +50,8 @@ pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement};
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
+#[allow(unused_imports)]
+pub use font_preview::{combo_font_family_name, ensure_font_family, is_font_family_bound};
 #[allow(unused_imports)]
 pub use help_hint::HelpHint;
 #[allow(unused_imports)]

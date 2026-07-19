@@ -112,6 +112,13 @@ paths change.
     }
 
     fn raw_font(path: &str, group: Option<&str>, hash: u64) -> RawFontFile {
+        raw_font_named(path, group, hash, "")
+    }
+
+    /// Like `raw_font` but with an explicit ORIGINAL family name, so identity/provider
+    /// tests can exercise the label≠family case (a system font whose stem differs from
+    /// the real family name).
+    fn raw_font_named(path: &str, group: Option<&str>, hash: u64, original_name: &str) -> RawFontFile {
         RawFontFile {
             path: PathBuf::from(path),
             stem: PathBuf::from(path)
@@ -123,8 +130,193 @@ paths change.
             content_hash: hash,
             faces: default_single_face(),
             coverage: FontLanguageCoverage::default(),
-            original_name: String::new(),
+            original_name: original_name.to_string(),
         }
+    }
+
+    #[test]
+    fn font_matches_label_matches_family_name_label_and_stem() {
+        // Stem/label "основной", real family "Anime Ace v05".
+        let fonts =
+            merge_duplicate_fonts(vec![raw_font_named("/fonts/основной.ttf", None, 1, "Anime Ace v05")]);
+        let font = &fonts[0];
+        // A persisted family name must map back to this font (no spurious missing_font).
+        assert!(font_matches_label(font, "anime ace v05"));
+        // Legacy label/stem forms still match.
+        assert!(font_matches_label(font, "основной"));
+        // An unrelated name does not match.
+        assert!(!font_matches_label(font, "helvetica"));
+    }
+
+    #[test]
+    fn inline_font_tag_uses_family_name_and_legacy_stem_still_resolves() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts =
+            merge_duplicate_fonts(vec![raw_font_named("/fonts/основной.ttf", None, 1, "Anime Ace v05")]);
+        state.selected_font_idx = 0;
+
+        // Identity used for tags/render is the ORIGINAL FAMILY NAME, not the stem.
+        assert_eq!(
+            state.font_identity_name_by_idx(0).as_deref(),
+            Some("Anime Ace v05")
+        );
+        let tag = build_inline_opening_tags(&TypingInlineTagStyle {
+            font_label: state.font_identity_name_by_idx(0),
+            ..TypingInlineTagStyle::default()
+        });
+        assert!(
+            tag.contains("<font=Anime Ace v05>"),
+            "a newly emitted tag names the family, got: {tag}"
+        );
+
+        // Both the new family name AND a legacy stem tag resolve to the same font index.
+        assert_eq!(
+            state.find_font_idx_by_path_or_label(None, Some("Anime Ace v05")),
+            Some(0)
+        );
+        assert_eq!(
+            state.find_font_idx_by_path_or_label(None, Some("основной")),
+            Some(0)
+        );
+
+        // A legacy `<font=основной>` span on the base font is redundant (resolves to the
+        // same font as the base identity) and must be STRIPPED — no duplicate tag.
+        let legacy_span = state.normalize_desired_inline_tag_style(TypingInlineTagStyle {
+            font_label: Some("основной".to_string()),
+            ..TypingInlineTagStyle::default()
+        });
+        assert!(
+            legacy_span.font_label.is_none(),
+            "a legacy stem tag naming the base font must be stripped"
+        );
+
+        // A genuinely different (unresolvable here) name is PRESERVED, never silently dropped.
+        let other_span = state.normalize_desired_inline_tag_style(TypingInlineTagStyle {
+            font_label: Some("Some Other Family".to_string()),
+            ..TypingInlineTagStyle::default()
+        });
+        assert_eq!(other_span.font_label.as_deref(), Some("Some Other Family"));
+    }
+
+    /// Builds a panel font list from raw files and runs the collision-aware identity
+    /// assignment, so identity/provider tests see the SAME identities the panel uses.
+    fn fonts_with_identities(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
+        let mut fonts = merge_duplicate_fonts(raws);
+        assign_font_identity_names(&mut fonts);
+        fonts
+    }
+
+    // Collision-aware identity: a UNIQUE family name is the identity; a family SHARED by
+    // two distinct files (Regular+Bold) falls back to each file's own stem label.
+    #[test]
+    fn assign_identity_unique_family_uses_family_shared_uses_label() {
+        let fonts = fonts_with_identities(vec![
+            raw_font_named("/fonts/myfont-regular.ttf", None, 1, "MyFont"),
+            raw_font_named("/fonts/myfont-bold.ttf", None, 2, "MyFont"),
+            raw_font_named("/fonts/solo.ttf", None, 3, "Solo Family"),
+        ]);
+        let reg = fonts.iter().find(|f| f.label == "myfont-regular").unwrap();
+        let bold = fonts.iter().find(|f| f.label == "myfont-bold").unwrap();
+        let solo = fonts.iter().find(|f| f.label == "solo").unwrap();
+        // Shared family "MyFont" -> each keeps its own file-stem identity (no swap).
+        assert_eq!(reg.render_identity_name(), "myfont-regular");
+        assert_eq!(bold.render_identity_name(), "myfont-bold");
+        // (d) Unique family -> the family name itself is the identity (user contract).
+        assert_eq!(solo.render_identity_name(), "Solo Family");
+    }
+
+    // Residual label collision inside a shared family (same family AND same label, from
+    // two distinct files): the label is KEPT as identity — no synthetic suffix.
+    #[test]
+    fn assign_identity_label_collision_within_family_keeps_label() {
+        let fonts = fonts_with_identities(vec![
+            raw_font_named("/fonts/groups/A/dup.ttf", Some("A"), 1, "Fam"),
+            raw_font_named("/fonts/groups/B/dup.ttf", Some("B"), 2, "Fam"),
+        ]);
+        assert_eq!(fonts.len(), 2, "same label + different content stay separate");
+        for font in &fonts {
+            assert_eq!(
+                font.render_identity_name(),
+                "dup",
+                "a label collision keeps the label as identity, no synthetic suffix"
+            );
+        }
+    }
+
+    // Write-site identity under a shared family: editing a legacy blob that named the
+    // Regular file re-persists the LABEL identity (not the family), and a Bold span over
+    // a Regular base emits its own font tag (identities differ -> no more no-op).
+    #[test]
+    fn colliding_pair_write_identity_is_label_and_span_emits_tag() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_identities(vec![
+            raw_font_named("/fonts/myfont-regular.ttf", None, 1, "MyFont"),
+            raw_font_named("/fonts/myfont-bold.ttf", None, 2, "MyFont"),
+        ]);
+        let reg = state
+            .fonts
+            .iter()
+            .position(|f| f.label == "myfont-regular")
+            .unwrap();
+        let bold = state
+            .fonts
+            .iter()
+            .position(|f| f.label == "myfont-bold")
+            .unwrap();
+
+        // (b) A legacy blob font_label:"MyFont-Regular" resolves to the Regular file and
+        // its persisted identity is the LABEL "myfont-regular", NOT the family "MyFont".
+        state.select_font_by_path_or_label(None, Some("MyFont-Regular"));
+        assert_eq!(state.selected_font_idx, reg);
+        assert!(state.missing_font.is_none());
+        assert_eq!(
+            state.font_identity_name_by_idx(reg).as_deref(),
+            Some("myfont-regular")
+        );
+
+        // (c) base = Regular, span = Bold -> identities differ -> a font tag is emitted.
+        state.selected_font_idx = reg;
+        let span = state.normalize_desired_inline_tag_style(TypingInlineTagStyle {
+            font_label: state.font_identity_name_by_idx(bold),
+            ..TypingInlineTagStyle::default()
+        });
+        assert_eq!(
+            span.font_label.as_deref(),
+            Some("myfont-bold"),
+            "a Bold span over a Regular base must keep its own font tag"
+        );
+    }
+
+    // Precedence alignment: a name that is one font's LABEL and another's FAMILY
+    // resolves to the SAME font in the panel lookup and the provider.
+    #[test]
+    fn label_and_family_collision_resolves_to_same_font_in_panel_and_provider() {
+        let mut state = TypingCreatePanelState::new(false);
+        // Font A: file stem/label "beta", unique family "Alpha Family".
+        // Font B: file stem/label "gamma", family (and identity) "beta".
+        state.fonts = fonts_with_identities(vec![
+            raw_font_named("/fonts/beta.ttf", None, 1, "Alpha Family"),
+            raw_font_named("/fonts/gamma.ttf", None, 2, "beta"),
+        ]);
+        let b = state
+            .fonts
+            .iter()
+            .position(|f| f.original_name == "beta")
+            .expect("fixture defines a font whose family is 'beta'");
+
+        // Panel: the provider-aligned ordered lookup picks B by its identity.
+        assert_eq!(
+            state.find_font_idx_by_path_or_label(None, Some("beta")),
+            Some(b),
+            "panel must resolve 'beta' to the font whose IDENTITY is 'beta'"
+        );
+        // Provider: the same name resolves to the same font.
+        let provider = TabFontProvider::from_fonts(&state.fonts);
+        assert_eq!(
+            provider.resolved_path_for("beta"),
+            Some(state.fonts[b].path.as_path()),
+            "provider must resolve 'beta' to the SAME font the panel picks"
+        );
     }
 
     #[test]
@@ -596,8 +788,8 @@ paths change.
     fn redundant_adjacent_font_wrapper_is_stripped_not_suppressed() {
         let mut state = state_with_font(); // one font "Test", selected_font_idx = 0
         let base = state
-            .font_label_by_idx(0)
-            .expect("the single fixture font has a label");
+            .font_identity_name_by_idx(0)
+            .expect("the single fixture font has a render identity");
         let open = build_inline_machine_tag(&TypingInlineTagStyle {
             font_label: Some(base),
             ..TypingInlineTagStyle::default()
@@ -671,7 +863,7 @@ paths change.
             .inline_selection_context()
             .expect("plain selection over 'abc' yields a context");
         let mut desired = state.effective_inline_tag_style(&selection);
-        desired.font_label = state.font_label_by_idx(beta);
+        desired.font_label = state.font_identity_name_by_idx(beta);
         let changed = state.apply_inline_style_to_selection(selection, desired);
         assert!(changed, "picking a different font inserts a font tag once");
         assert!(

@@ -473,7 +473,19 @@ impl TypingCreatePanelState {
         } else {
             inline_style
                 .as_deref()
-                .and_then(|style| style.font_label.clone())
+                .and_then(|style| style.font_label.as_deref())
+                .map(|label| {
+                    // DISPLAY ONLY: resolve the raw render label to its display label (a user
+                    // rename override) when a font matches, so the CLOSED combo shows the same
+                    // name as the popup rows. The span style's render key is never touched.
+                    self.find_font_idx_by_label_preferring_indices(
+                        Some(label),
+                        &filtered_font_indices,
+                    )
+                    .and_then(|idx| self.fonts.get(idx))
+                    .map(|font| self.font_display_label(font))
+                    .unwrap_or_else(|| label.to_string())
+                })
                 .or_else(|| {
                     self.fonts
                         .get(self.selected_font_idx)
@@ -557,7 +569,7 @@ impl TypingCreatePanelState {
             // writes the span font label, so selecting text can never insert a
             // `<font>` tag on its own.
             if let Some(picked) = user_picked_font_idx
-                && let Some(label) = self.font_label_by_idx(picked)
+                && let Some(label) = self.font_identity_name_by_idx(picked)
             {
                 style.font_label = Some(label);
             }

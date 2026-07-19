@@ -683,41 +683,12 @@ fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Persists the user-imported system font FILE paths to `TextTab.imported_system_fonts`
-/// (read-modify-write of `user_config.json`, mirroring `save_text_tab_effect_defaults`
-/// so sibling keys survive). Paths are stored as an array of strings via
-/// `path.to_string_lossy()`. Returns a human-readable error on I/O or serialization
-/// failure. Callers must invoke this off the GUI thread. Wired off-thread by
-/// `font_settings_store::persist_off_thread` (the store's add/remove mutators, driven by
-/// the settings font-settings UI).
-///
-/// Always compiled (including the test profile) so the real save API type-checks under
-/// tests. Under test its sole caller `persist_off_thread` early-returns before invoking it,
-/// so it is unreached there — hence `#[cfg_attr(test, allow(dead_code))]`. The
-/// read-modify-write recipe is unit-tested through `save_imported_system_fonts_to`.
-#[cfg_attr(test, allow(dead_code))]
-pub(in crate::tabs::typing) fn save_text_tab_imported_system_fonts(
-    paths: &[PathBuf],
-) -> Result<(), String> {
-    save_imported_system_fonts_to(&config::user_config_path(), paths)
-}
-
-/// Path-parameterized core of `save_text_tab_imported_system_fonts`, split out so the
-/// read-modify-write recipe can be unit-tested against a temp file.
-fn save_imported_system_fonts_to(
-    user_settings_file: &Path,
-    paths: &[PathBuf],
-) -> Result<(), String> {
-    let array = paths
-        .iter()
-        .map(|path| Value::String(path.to_string_lossy().to_string()))
-        .collect::<Vec<_>>();
-    update_text_tab_value(
-        user_settings_file,
-        crate::config::TEXT_TAB_IMPORTED_SYSTEM_FONTS_KEY,
-        Value::Array(array),
-    )
-}
+// NOTE: The imported-system-fonts WRITE path moved to `panel/fonts_data.rs` +
+// `font_settings_store`, which persist the whole per-font settings snapshot to
+// `fonts/fonts_data.json`. Only the READ helper above survives here, used once by
+// `font_settings_store::seed_imported_system_fonts_from_config` to migrate the legacy
+// `TextTab.imported_system_fonts` list into `fonts_data.json`. The legacy key is left in
+// place but is no longer written.
 
 pub(super) fn save_text_tab_create_presets(
     presets: &HashMap<String, TypingCreatePreset>,
@@ -792,49 +763,10 @@ mod tests {
     }
 
     #[test]
-    fn imported_system_fonts_round_trip_through_temp_config() {
-        let path = unique_temp_config_path("imported_fonts_roundtrip");
-        let fonts = vec![
-            PathBuf::from("/fonts/Roboto-Regular.ttf"),
-            PathBuf::from("/usr/share/fonts/NotoSans.otf"),
-        ];
-        save_imported_system_fonts_to(&path, &fonts).expect("save must succeed");
-        let loaded = load_imported_system_fonts_from(&path);
-        assert_eq!(loaded, fonts);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
     fn imported_system_fonts_missing_file_is_empty() {
         let path = unique_temp_config_path("imported_fonts_missing");
         // The file was never created, so loading must yield an empty list, not panic.
         assert!(load_imported_system_fonts_from(&path).is_empty());
-    }
-
-    #[test]
-    fn imported_system_fonts_save_preserves_sibling_keys() {
-        let path = unique_temp_config_path("imported_fonts_siblings");
-        // Seed a config that already carries an unrelated TextTab key.
-        let seed = json!({ "TextTab": { "use_system_fonts": true } });
-        fs::write(&path, serde_json::to_string(&seed).expect("serialize seed"))
-            .expect("write seed");
-        save_imported_system_fonts_to(&path, &[PathBuf::from("/fonts/A.ttf")])
-            .expect("save must succeed");
-        let raw = fs::read_to_string(&path).expect("read back");
-        let value: Value = serde_json::from_str(&raw).expect("parse back");
-        assert_eq!(
-            value
-                .get("TextTab")
-                .and_then(|t| t.get("use_system_fonts"))
-                .and_then(Value::as_bool),
-            Some(true),
-            "sibling key must survive the imported-fonts write"
-        );
-        assert_eq!(
-            load_imported_system_fonts_from(&path),
-            vec![PathBuf::from("/fonts/A.ttf")]
-        );
-        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -178,10 +178,18 @@ The main data flow is:
    `ensure_page_staged` finds the page present and does not seed stale committed text.
 4. Create/edit panel changes are converted to `TextRenderParams` and rendered by
    `render_next::render_text_to_image` in background workers. Fonts reach the renderer
-   BY NAME, not by path: `TextRenderParams.font_name` (the font label) and inline
-   `<font=...>` tags are resolved through a caller-supplied `render_next::FontProvider`.
-   The typing tab OWNS font loading and builds that provider (`panel::TabFontProvider`,
-   keyed by normalized label, lazy file read + content-id cache). The create/edit panels
+   BY NAME, not by path: `TextRenderParams.font_name` and inline `<font=...>` tags are
+   resolved through a caller-supplied `render_next::FontProvider`. That identity name is the
+   font's COLLISION-AWARE identity (`FontEntry.identity_name`): the ORIGINAL FAMILY NAME when
+   the family is unique in the panel list, else the file-stem label when two loaded files
+   share a family (a Regular+Bold pair), so each file keeps a distinct persisted identity.
+   The user display-name is for SHOWING the font in combos/lists only, never persisted or sent
+   to the renderer. Persisted `render_data.text_params` carries the identity in `font_label`
+   (kept under that historical key) AND the raw family name in `font_original_name` (the codec
+   reads it FIRST); legacy blobs that only had a stem/label still resolve via the provider's
+   aliases. The typing tab OWNS font loading and builds that provider
+   (`panel::TabFontProvider`, keyed PRIMARILY by the normalized identity with family
+   name/label/stem kept as legacy aliases, lazy file read + content-id cache). The create/edit panels
    each hold an `Arc<dyn FontProvider>` (rebuilt whenever the font list is (re)assigned);
    the tab layer refreshes its own copy each frame from the panel and captures an `Arc`
    into every render REQUEST struct so background threads resolve fonts without touching
@@ -231,6 +239,12 @@ saving, and export.
 ## Files and submodules
 - `mod.rs`: module wiring and public re-exports for `TypingTabState`,
   `TypingTopPanelState`, and `TypingPanelLayout`.
+- `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
+  font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
+  `pub(in crate::tabs::typing)`) as a narrow facade — font loaders, imported-fonts add/remove +
+  revision, and `&Path`-keyed display-name overrides — and re-exports `FontEntry` as an opaque
+  type. Used by the settings font-settings UI (`src/tabs/settings/typesetting/`); nothing else
+  in typing is `pub(crate)` for it. Add a wrapper here rather than widening a panel internal.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
   definitions incl. `TypingTabState`, `TypingTextOverlayLayer`, `TypingOverlayRuntime`,
   `TypingRasterLayer`, deform/export/create/edit/layout structs), the public
@@ -306,7 +320,8 @@ saving, and export.
   - `fonts.rs`: font discovery/loading — folder fonts PLUS imported system-font paths
     (`load_fonts`/`load_imported_system_fonts`), duplicate merge/disambiguation, group listing
     (free fns). `load_system_fonts` (whole-OS enumeration) is the catalog source for the
-    settings font-import picker (`font_settings.rs`), run off the GUI thread.
+    settings font-import picker (`src/tabs/settings/typesetting/font_settings.rs`, reached via
+    the `font_admin` facade), run off the GUI thread.
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
     representative face's bytes against the current TYPESETTING language and cached on
     `FontEntry.coverage`; the dropdown never recomputes it. A runtime language change makes the cache
@@ -315,7 +330,9 @@ saving, and export.
     Discovery also records each font's `original_name` (real family/name of the representative face,
     fallback post_script_name then file stem) for PSD export and future virtual fonts.
   - `font_provider.rs`: `TabFontProvider`, the app-side `render_next::FontProvider`. Maps a normalized
-    working name (font label) to a font, reads bytes lazily OUTSIDE its lock and caches
+    working name to a font — PRIMARY key is the font's original FAMILY NAME, with file-stem and
+    display-label kept as legacy aliases (deterministic FIRST-wins when two files share a family name;
+    a display-name override is never a key). Reads bytes lazily OUTSIDE its lock and caches
     `Arc<Vec<u8>>` + content id, and carries each font's `original_name` to the renderer. Built from the
     panel's font list; shared (`Arc`) with background render threads.
   - `font_coverage.rs`: pure classification of a font's support for the selected TYPESETTING language
@@ -325,24 +342,28 @@ saving, and export.
     Drives the red/yellow font-dropdown highlight + hover tooltip in
     `create_presets::draw_font_combo_option`. See `panel/MODULE_README.md` for the coverage/cache contract.
   - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
-    Also owns load/save of the `TextTab.imported_system_fonts` path list (read-modify-write of
-    `user_config.json`, preserving sibling keys).
-  - `font_settings_store.rs`: process-global store of the user-imported system font FILE paths
-    (`OnceLock<RwLock<Vec<PathBuf>>>` + a revision `AtomicU64`). Seeded at startup from
-    `TextTab.imported_system_fonts` (`seed_imported_system_fonts_from_config`); `add_/remove_`
-    mutators dedup by exact path (first-seen order), bump the revision, and persist off the GUI
-    thread via `presets_io::save_text_tab_imported_system_fonts`. Seeding does not bump the revision.
-    The create/edit panels watch the revision to reload their font list; the settings
-    font-settings widget drives the add/remove mutators.
-  - `font_settings.rs`: `FontSettingsEditorState`, the self-contained "Настройки шрифтов" widget
-    rendered by the settings "Тайп" pane (double-interface pattern, like `effect_defaults.rs`). Loads
-    the three font categories (folder / imported system / custom) off the GUI thread, reloading live
-    when the `font_settings_store` revision changes; draws each font's name in its own typeface
-    (registered into egui via the shared `combo_font_family_name` naming, one-time GUI-thread file read
-    per visible font like `create_presets::ensure_combo_font_family`); and hosts an in-app searchable,
-    row-virtualized picker over `load_system_fonts` to import a system font by path (add/remove route
-    through the store). Talks only to runtime globals + the font loaders, never to the live typing panel.
-  - `ui_helpers.rs`: font-family binding/matching, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns).
+    Retains only the READ helper `load_text_tab_imported_system_fonts` for the one-time legacy
+    migration (see `font_settings_store`); the imported-fonts WRITE path moved to `fonts_data.rs`.
+  - `fonts_data.rs`: serde schema + disk I/O for the app-level per-font settings document
+    `fonts/fonts_data.json` (`version: 1`; imported system font paths + per-font `display_name`
+    override). Load degrades to empty on a missing/malformed file and best-effort parses an unknown
+    version; save writes a full snapshot atomically (temp sibling + rename, mirroring
+    `locale_store::write_atomic`) and creates the fonts dir if missing. `font_settings_key` derives
+    the stable per-font KEY (fonts-dir-relative forward-slash path under the fonts dir, else the
+    absolute path). Independent of `FontEntry.label` — a display override never touches rendering.
+  - `font_settings_store.rs`: single process-global runtime store backed by `fonts_data.json`
+    (`OnceLock<RwLock<StoreState>>` = imported paths + display-name overrides, plus ONE shared
+    revision `AtomicU64`). Seeded at startup from `fonts_data.json`
+    (`seed_imported_system_fonts_from_config`), or on first run migrates the legacy
+    `TextTab.imported_system_fonts` list once (legacy key left in place, no longer written).
+    `add_/remove_imported_system_font` and `set_font_display_name_override` mutate state, bump the
+    SAME revision, and persist the whole snapshot off the GUI thread via `fonts_data::save`;
+    `font_display_name_override` reads an override. Seeding does not bump the revision. The
+    create/edit panels watch the revision to reload their font lists; the settings font UI
+    (via `font_admin`) drives the mutators. The font-administration UI itself
+    (`FontSettingsEditorState`, the per-font properties window) lives OUTSIDE this module, in
+    `src/tabs/settings/typesetting/`; only the MODEL is here.
+  - `ui_helpers.rs`: font matching/grouping, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns). The generic egui font-family binding/registration helpers moved to `crate::widgets::font_preview`.
   - `effect_parse.rs`: `parse_effect_cards` (free fn).
   - `effect_defaults.rs`: user-configurable DEFAULT parameters per effect kind. Owns a
     runtime-global `OnceLock<RwLock<HashMap<discriminator, Value>>>` store (seeded at

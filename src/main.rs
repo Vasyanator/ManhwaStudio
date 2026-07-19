@@ -251,7 +251,9 @@ fn run_main() -> anyhow::Result<()> {
     // Seed the typing tab's per-effect-kind default overrides so newly added effect
     // cards pick up the user's stored defaults from the first frame.
     tabs::typing::seed_effect_defaults_from_config();
-    // Seed the typing tab's user-imported system font list from user config.
+    // Seed the typing tab's per-font settings (imported system fonts + display-name
+    // overrides) from `fonts/fonts_data.json`. On first run it migrates the legacy
+    // `user_config.json` imported-fonts list into that file once.
     tabs::typing::seed_imported_system_fonts_from_config();
     // Unpack/reconcile the editable on-disk locale catalog before settings load.
     // Best-effort and pre-window: an unwritable `locale/` folder degrades to the

@@ -79,6 +79,10 @@ libc = "0.2"
 # language modal to preselect the interface/typesetting language; already present
 # transitively (cosmic-text / zspell), pinned here as a direct dependency.
 sys-locale = "0.3"
+# Font table parser used by the font-properties window (glyph inventory + kerning
+# extraction). Already present transitively (owned_ttf_parser -> epaint) and pinned
+# to the same 0.25 line here as a direct dependency (precedent: sys-locale above).
+ttf-parser = "0.25"
 texture-synthesis = "0.8.2"
 rayon = "1"
 ag-psd = "0.1.0"

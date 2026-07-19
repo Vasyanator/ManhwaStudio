@@ -1,31 +1,41 @@
 /*
-FILE OVERVIEW: src/tabs/settings/typesetting.rs
-"Тайп" settings pane: typesetting-related options that affect text rendering and
-form iteration across the app.
+FILE OVERVIEW: src/tabs/settings/typesetting/mod.rs
+"Тайп" settings pane orchestrator: typesetting-related options that affect text
+rendering and form iteration across the app.
 
 Main responsibilities:
+- Render the "Поворот Ctrl+колесо" chooser and persist `TextTab.rotation_ctrl_wheel_mode`.
+- Render the shared typesetting-language selector.
 - Render and persist the app-wide hanging-punctuation list, applied live via
   `crate::text_punctuation`.
-- Host two collapsed self-contained typing-panel blocks: the per-effect-kind default
-  parameters editor (`EffectDefaultsEditorState`) and the font-settings block
-  (`FontSettingsEditorState`: font categories + system-font import/removal).
+- Host two collapsed self-contained blocks: the per-effect-kind default parameters editor
+  (`EffectDefaultsEditorState`, a typing-panel widget) and the font-settings block
+  (`FontSettingsEditorState`, owned by this submodule's `font_settings`).
+
+Submodules:
+- `font_settings`: the "Настройки шрифтов" widget (categories + system-font import picker).
+- `font_properties_window`: the per-font properties window opened from the font rows.
 
 Key types:
-- `SettingsTabState`
-
-Key functions:
-- `SettingsTabState::draw_typesetting`
+- `SettingsTabState` (methods only; the type lives in the parent `settings` module)
 
 Notes:
-- Persistence is delegated to a background thread to avoid blocking the GUI thread;
+- Persistence is delegated to background threads to avoid blocking the GUI thread;
   the live set is updated synchronously so new renders pick up the change immediately.
+- The font MODEL stays in `crate::tabs::typing`; this submodule reaches it ONLY through
+  the `crate::tabs::typing::font_admin` facade (UI here, model there).
 */
 
+mod font_properties_window;
+mod font_settings;
+
+pub(super) use font_settings::FontSettingsEditorState;
+
 use super::{SettingsTabState, save_hanging_punctuation, save_rotation_ctrl_wheel_mode};
+use crate::runtime_log;
 use crate::tabs::typing::rotation_ctrl_wheel::{
     RotationCtrlWheelMode, rotation_ctrl_wheel_mode, set_rotation_ctrl_wheel_mode,
 };
-use crate::runtime_log;
 use crate::text_punctuation;
 use ms_thread as thread;
 
@@ -130,9 +140,9 @@ impl SettingsTabState {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
-        // Font-settings block, collapsed by default. Self-contained typing-panel widget;
-        // it loads the font category lists off-thread and drives the runtime-global
-        // imported-fonts store for system-font import/removal.
+        // Font-settings block, collapsed by default. Self-contained widget; it loads the
+        // font category lists off-thread and drives the runtime-global imported-fonts store
+        // for system-font import/removal — all through `crate::tabs::typing::font_admin`.
         egui::CollapsingHeader::new(t!("settings.typesetting.font_settings_header")).id_salt("settings.typesetting.font_settings_header")
             .default_open(false)
             .show(ui, |ui| {

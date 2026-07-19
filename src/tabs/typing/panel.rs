@@ -210,7 +210,10 @@ mod inline_tags;
 use inline_tags::*;
 mod effect_cards;
 use effect_cards::*;
-mod fonts;
+// Font discovery/loading + the per-font settings store/data. Exposed to the typing
+// subtree (`pub(in crate::tabs::typing)`) so the `font_admin` facade can wrap them for
+// the settings font-settings UI, which lives OUTSIDE typing; nothing here is `pub(crate)`.
+pub(in crate::tabs::typing) mod fonts;
 use fonts::*;
 mod font_provider;
 use font_provider::TabFontProvider;
@@ -221,17 +224,14 @@ use ui_helpers::*;
 mod effect_parse;
 use effect_parse::*;
 mod effect_defaults;
-mod font_settings;
-mod font_settings_store;
+pub(in crate::tabs::typing) mod font_settings_store;
+pub(in crate::tabs::typing) mod fonts_data;
 mod font_coverage;
 use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
 use ms_text_util::language::{TextLanguage, text_language};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
 pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults_from_config};
-// Public editor widget for the settings "Настройки шрифтов" block (font categories +
-// system-font import), rendered from the settings pane.
-pub(crate) use font_settings::FontSettingsEditorState;
 // Startup seeding of the runtime-global imported-system-fonts store. The store's
 // `pub(in crate::tabs::typing)` mutators are reached by panel descendants via
 // `font_settings_store::…`.
@@ -687,8 +687,12 @@ impl TypingActionsPanelTab {
     }
 }
 
+// Re-exported (type only) crate-wide via `crate::tabs::typing::font_admin`, so the
+// settings font-settings UI can hold it. The type is `pub(crate)` but its FIELDS stay
+// private to the typing subtree (external code cannot construct or mutate it); external
+// readers go through the `pub(crate)` accessors below.
 #[derive(Clone)]
-struct FontEntry {
+pub(crate) struct FontEntry {
     /// Базовое отображаемое имя (имя файла без расширения), без скобок-уточнения.
     label: String,
     /// Представительный файл шрифта.
@@ -711,6 +715,86 @@ struct FontEntry {
     /// virtual fonts synthesize it as `VirtualFont_a_b_c`. Persisted so PSD export
     /// and future virtual fonts can recover the real font identity by name.
     original_name: String,
+    /// Optional user display-name override from `fonts_data.json`, resolved at load
+    /// time via `font_settings_store::font_display_name_override`. DISPLAY ONLY: it
+    /// changes the name shown in the UI, never the render/inline-tag identity.
+    display_name: Option<String>,
+    /// Canonical, COLLISION-AWARE render/inline-tag identity, computed for the
+    /// FINALIZED panel font list by `fonts::assign_font_identity_names`. It is the
+    /// original family name when that family is unique in the list, and falls back to
+    /// the (unique-ish) file-stem `label` when two loaded files share one family name
+    /// (e.g. a Regular + Bold pair shipped as separate files), so each file keeps a
+    /// distinct persisted identity and never silently swaps for the other. Set to the
+    /// per-entry family-or-label default at construction; overwritten by
+    /// `assign_font_identity_names` once the full list is known.
+    identity_name: String,
+}
+
+impl FontEntry {
+    /// Name to SHOW in the UI: the user display-name override when set, else `label`.
+    ///
+    /// This is DISPLAY ONLY. The render/inline-tag identity is `render_identity_name()`
+    /// (family name when unique, file-stem `label` on a family collision), with the
+    /// label and file-stem kept as legacy resolution aliases; a display override must
+    /// never reach any of those resolution paths. `pub(crate)` so the settings
+    /// font-settings UI (via `font_admin`) can present it.
+    pub(crate) fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.label)
+    }
+
+    /// Representative font FILE path. `pub(crate)` accessor for the settings font UI.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Base render/inline-tag label (file stem, no disambiguation). `pub(crate)` for the
+    /// settings font UI's search predicate; never a display override.
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Real family/name read from the representative face. `pub(crate)` for the settings
+    /// font UI (identity header + search).
+    pub(crate) fn original_name(&self) -> &str {
+        &self.original_name
+    }
+
+    /// Canonical render/inline-tag IDENTITY name — the value persisted in
+    /// `render_data`/`TextRenderParams.font_name` and emitted in `<font=...>` tags.
+    ///
+    /// Returns the COLLISION-AWARE `identity_name` computed for the panel list by
+    /// `fonts::assign_font_identity_names`: the original family name when that family
+    /// is unique in the list, else the file-stem `label` (so a Regular + Bold pair
+    /// shipped as two files keeps two distinct identities and neither renders the
+    /// other). It is NOT a display string — user-facing combos/lists use
+    /// `display_label()`. `TabFontProvider` keys this identity as its primary lookup
+    /// and keeps the family name / label / stem as aliases, so legacy projects that
+    /// persisted any of those forms still resolve. Falls back to the family-or-label
+    /// default if the identity was never assigned (a non-panel list).
+    pub(in crate::tabs::typing) fn render_identity_name(&self) -> String {
+        let identity = self.identity_name.trim();
+        if identity.is_empty() {
+            fonts::default_font_identity_name(&self.original_name, &self.label)
+        } else {
+            identity.to_string()
+        }
+    }
+
+    /// Face index of the representative face (0 for single-face files). `pub(crate)` for
+    /// the settings font UI's own-typeface preview.
+    pub(crate) fn representative_face_index(&self) -> usize {
+        self.faces.first().map(|face| face.face_index).unwrap_or(0)
+    }
+
+    /// Representative face label, but only for MULTI-face files (`None` otherwise), for
+    /// the settings font-properties identity header. `pub(crate)` accessor.
+    pub(crate) fn representative_face_label(&self) -> Option<String> {
+        if self.faces.len() > 1 {
+            self.faces.first().map(|face| face.label.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone)]

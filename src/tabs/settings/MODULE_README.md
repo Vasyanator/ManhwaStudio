@@ -78,7 +78,9 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   and persist through the same `save_text_language`, so they cannot drift apart.
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
   spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
-- `typesetting.rs`: "Тайп" pane for text-typesetting options: the app-wide
+- `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
+  orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
+  font-administration UI. The pane hosts the app-wide
   hanging-punctuation list editor (`TextTab.hanging_punctuation`, applied live via
   `crate::text_punctuation` and persisted through `save_hanging_punctuation` in `mod.rs`)
   the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
@@ -92,16 +94,22 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   observes `text_language()` each frame and re-runs font-coverage classification off-thread) and
   persists `TextTab.text_language` (the `lang.tag()`) through `save_text_language` in `mod.rs` on a
   background thread; the process-global atomic is the single source of truth, so no selection state is
-  stored on `SettingsTabState`. `typesetting.rs` passes the id-salt prefix
+  stored on `SettingsTabState`. `mod.rs` passes the id-salt prefix
   `"settings.typesetting.text_language"` so its egui ids stay distinct from the general widget's,
   the per-effect-kind default-parameter editor (`crate::tabs::typing::EffectDefaultsEditorState`
   held on `SettingsTabState`, rendered via its `ui()`; a self-contained typing-panel widget that
   owns its own persistence to `TextTab.effect_defaults`, so settings needs no access to the private
   effect model), and the "Настройки шрифтов" block
-  (`crate::tabs::typing::FontSettingsEditorState`, same double-interface pattern): it lists the app's
-  fonts in three categories rendered in their own typefaces and imports/removes system fonts via the
-  runtime-global imported-fonts store, loading font lists off the GUI thread. Both blocks are wrapped
-  in collapsed `CollapsingHeader`s.
+  (`typesetting::FontSettingsEditorState`, same double-interface pattern): it lists the app's
+  fonts in three categories rendered in their own typefaces and imports/removes system fonts, loading
+  font lists off the GUI thread. Each folder/imported font
+  row is a button that opens a per-font PROPERTIES window (identity, display-name override editor,
+  own-typeface preview, off-thread glyph/kerning inspection via `ttf-parser`). The font UI is UI only:
+  it reaches the font MODEL exclusively through the `crate::tabs::typing::font_admin` facade (loaders,
+  imported-fonts store, display-name overrides, the opaque `FontEntry` type); the store persists the
+  app-level per-font settings (imported system font paths + per-font `display_name` overrides) to
+  `fonts/fonts_data.json` inside the typing subtree, NOT to `user_config.json`. All
+  blocks are wrapped in collapsed `CollapsingHeader`s.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
   `user_config.json` override persistence.
 
@@ -155,14 +163,16 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   memory-profile runtime effect. The UI-language list is scanned from `locale/` once at construction;
   installation goes through `crate::locale_store::install_ui_locale`.
 - To change text-typesetting options (hanging punctuation, Ctrl+wheel rotation mode, typesetting
-  language), edit `typesetting.rs` and the matching persistence helper in `mod.rs`
+  language), edit `typesetting/mod.rs` and the matching persistence helper in `mod.rs`
   (`save_text_language` for the language). Runtime globals for these live outside settings
   (`crate::text_punctuation`, `crate::tabs::typing::rotation_ctrl_wheel`,
   `ms_text_util::language`). The typesetting-language selector is duplicated in
   `crate::general_settings_panel`; a change to its behavior must be mirrored there (both share the
   catalog keys, the process-global, and `save_text_language` — only the egui `id_salt`s differ).
-- To change the collapsed effect-defaults / font-settings blocks in the "Тайп" pane, edit their
-  widgets in `src/tabs/typing/panel/` (`effect_defaults.rs` / `font_settings.rs`); `typesetting.rs`
-  only wraps each `ui()` in a `CollapsingHeader`.
+- To change the collapsed effect-defaults block, edit `src/tabs/typing/panel/effect_defaults.rs`;
+  `typesetting/mod.rs` only wraps its `ui()` in a `CollapsingHeader`. To change the font-settings
+  block or the per-font properties window, edit `typesetting/font_settings.rs` /
+  `typesetting/font_properties_window.rs` (settings-local UI); any new font MODEL access must go
+  through the `crate::tabs::typing::font_admin` facade, never a fresh typing internal.
 - To change configurable shortcut UI or persistence, edit `hotkeys.rs` and coordinate with
   `src/input_manager_v2.rs`.

@@ -203,15 +203,27 @@ impl TypingCreatePanelState {
                                         ui.label(egui::RichText::new(t!("typing.params.font_label")).strong());
                                         ui.horizontal(|ui| {
                                             let prev_font_idx = self.selected_font_idx;
-                                            let selected_font_text = inline_style
+                                            let selected_font_text: String = inline_style
                                                 .as_ref()
                                                 .and_then(|style| style.font_label.as_deref())
+                                                .map(|label| {
+                                                    // DISPLAY ONLY: resolve the raw render
+                                                    // label to its display label so the
+                                                    // CLOSED combo shows the same name as the
+                                                    // popup rows. The render key is untouched.
+                                                    self.find_font_idx_by_path_or_label(None, Some(label))
+                                                        .and_then(|idx| self.fonts.get(idx))
+                                                        .map(|font| self.font_display_label(font))
+                                                        .unwrap_or_else(|| label.to_string())
+                                                })
                                                 .or_else(|| {
                                                     self.fonts
                                                         .get(self.selected_font_idx)
-                                                        .map(|font| font.label.as_str())
+                                                        .map(|font| self.font_display_label(font))
                                                 })
-                                                .unwrap_or(t!("typing.params.font_placeholder"));
+                                                .unwrap_or_else(|| {
+                                                    t!("typing.params.font_placeholder").to_string()
+                                                });
                                             let mut font_idx = inline_style
                                                 .as_ref()
                                                 .and_then(|style| {
@@ -229,7 +241,10 @@ impl TypingCreatePanelState {
                                                         let (label, path, face_index, coverage) = {
                                                             let font = &self.fonts[idx];
                                                             (
-                                                                font.label.clone(),
+                                                                // DISPLAY ONLY: show the
+                                                                // display label (user rename),
+                                                                // not the raw render key.
+                                                                self.font_display_label(font),
                                                                 font.path.clone(),
                                                                 font.faces
                                                                     .first()
@@ -259,7 +274,7 @@ impl TypingCreatePanelState {
                                                 cycle_wrapped_index(&mut font_idx, font_count, steps);
                                             }
                                             if let Some(style) = inline_style.as_mut() {
-                                                if let Some(label) = self.font_label_by_idx(font_idx) {
+                                                if let Some(label) = self.font_identity_name_by_idx(font_idx) {
                                                     style.font_label = Some(label);
                                                 }
                                             } else {
@@ -1208,7 +1223,7 @@ impl TypingCreatePanelState {
         selection: &TypingInlineSelectionContext,
     ) -> TypingInlineTagStyle {
         let base_font_label = self
-            .font_label_by_idx(self.selected_font_idx)
+            .font_identity_name_by_idx(self.selected_font_idx)
             .unwrap_or_else(|| t!("typing.params.font_placeholder").to_string());
         TypingInlineTagStyle {
             bold: selection.style.bold || self.force_bold,
@@ -1351,16 +1366,28 @@ impl TypingCreatePanelState {
         &self,
         desired_effective_style: TypingInlineTagStyle,
     ) -> TypingInlineTagStyle {
-        let base_font_label = self.font_label_by_idx(self.selected_font_idx);
+        let base_font_label = self.font_identity_name_by_idx(self.selected_font_idx);
         let desired_font_label = desired_effective_style
             .font_label
             .map(|label| label.trim().to_string())
             .filter(|label| !label.is_empty());
         let font_label = desired_font_label.and_then(|label| {
-            if base_font_label
+            // Strip the span's font tag when it names the SAME font as the base.
+            // The cheap raw-string test catches a span already using the base
+            // identity (family name). The resolved-identity test additionally
+            // strips a LEGACY `<font=stem>` span whose stem resolves to the same
+            // font as the base now that the base identity is the family name — so
+            // editing legacy text does not sprout a redundant `<font>` tag.
+            let same_by_string = base_font_label
                 .as_deref()
-                .is_some_and(|base| base.eq_ignore_ascii_case(label.as_str()))
-            {
+                .is_some_and(|base| base.eq_ignore_ascii_case(label.as_str()));
+            let same_by_font = {
+                let base_idx =
+                    self.find_font_idx_by_path_or_label(None, base_font_label.as_deref());
+                let label_idx = self.find_font_idx_by_path_or_label(None, Some(label.as_str()));
+                base_idx.is_some() && base_idx == label_idx
+            };
+            if same_by_string || same_by_font {
                 None
             } else {
                 Some(label)

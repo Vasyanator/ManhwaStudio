@@ -165,7 +165,9 @@ impl TypingCreatePanelState {
             .fonts
             .get(self.selected_font_idx)
             .map(|font| font.path.to_string_lossy().to_string());
-        let primary_font_label = self.font_label_by_idx(self.selected_font_idx);
+        // Persist the font's canonical render IDENTITY (original family name), matching
+        // the render_data flip; `primary_font_key`/`primary_font_path` stay path-based.
+        let primary_font_label = self.font_identity_name_by_idx(self.selected_font_idx);
         self.presets_by_name.insert(
             preset_name.clone(),
             TypingCreatePreset {
@@ -242,37 +244,17 @@ impl TypingCreatePanelState {
         face_index: usize,
     ) -> Option<egui::FontFamily> {
         let cache_key = (font_path.to_path_buf(), face_index);
-        // Имя egui-семейства детерминированно выводится из (путь, индекс начертания):
-        // один и тот же файл всегда даёт одно имя, разные файлы — разные имена. Это
-        // критично, потому что `create_panel` и `edit_panel` — две независимые панели
-        // с общим egui-`Context`. При последовательной нумерации обе генерировали
-        // совпадающие имена (`typing-panel-combo-font-1` …) для РАЗНЫХ файлов, а egui
-        // хранит данные шрифта по имени — поздняя регистрация затирала раннюю, и одна
-        // панель начинала рисовать чужой шрифт (в т.ч. в окне продвинутой формы).
-        let font_name = combo_font_family_name(font_path, face_index);
-        let family = egui::FontFamily::Name(font_name.clone().into());
-        if is_font_family_bound(ctx, &family) {
-            self.combo_font_family_cache.insert(cache_key, font_name);
-            return Some(family);
-        }
-
-        let font_bytes = fs::read(font_path).ok()?;
-        let mut font_data = egui::FontData::from_owned(font_bytes);
-        font_data.index = face_index as u32;
-        ctx.add_font(egui::epaint::text::FontInsert::new(
-            font_name.as_str(),
-            font_data,
-            vec![egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Name(font_name.clone().into()),
-                priority: egui::epaint::text::FontPriority::Highest,
-            }],
-        ));
-        self.combo_font_family_cache.insert(cache_key, font_name);
-        if is_font_family_bound(ctx, &family) {
-            Some(family)
-        } else {
-            None
-        }
+        // Регистрация и детерминированное имя семейства (по путь+индекс начертания)
+        // живут в общем виджете `widgets::font_preview`: критично, что `create_panel` и
+        // `edit_panel` — две независимые панели с общим egui-`Context`, и один и тот же
+        // файл всегда даёт одно имя, а egui хранит данные шрифта по имени (иначе поздняя
+        // регистрация затирала бы раннюю, и панель рисовала бы чужой шрифт).
+        let family = crate::widgets::ensure_font_family(ctx, font_path, face_index)?;
+        self.combo_font_family_cache.insert(
+            cache_key,
+            crate::widgets::combo_font_family_name(font_path, face_index),
+        );
+        Some(family)
     }
 
     pub(super) fn draw_font_combo_option(
