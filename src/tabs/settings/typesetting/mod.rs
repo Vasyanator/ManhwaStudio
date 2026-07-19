@@ -15,6 +15,7 @@ Main responsibilities:
 Submodules:
 - `font_settings`: the "Настройки шрифтов" widget (categories + system-font import picker).
 - `font_properties_window`: the per-font properties window opened from the font rows.
+- `font_groups`: the "Группы" section (virtual font groups) + its group-editor window.
 
 Key types:
 - `SettingsTabState` (methods only; the type lives in the parent `settings` module)
@@ -26,6 +27,7 @@ Notes:
   the `crate::tabs::typing::font_admin` facade (UI here, model there).
 */
 
+mod font_groups;
 mod font_properties_window;
 mod font_settings;
 

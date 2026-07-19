@@ -4,9 +4,10 @@ File: panel/font_settings_store.rs
 Purpose:
 Process-global runtime store for the app-level per-font settings persisted in
 `fonts/fonts_data.json` (via `super::fonts_data`). It owns the authoritative runtime
-copy of two things: the user-imported system font FILE paths, and the per-font
-display-name overrides. A single monotonic revision counter lets a GUI poller detect
-any change and reload; every mutation snapshots the whole state and saves off-thread.
+copy of three things: the user-imported system font FILE paths, the per-font
+display-name overrides, and the user-defined VIRTUAL font groups. A single monotonic
+revision counter lets a GUI poller detect any change and reload; every mutation
+snapshots the whole state and saves off-thread.
 
 Main responsibilities:
 - own a thread-safe runtime-global state (imported paths + display-name overrides);
@@ -23,6 +24,8 @@ Key functions:
 - `imported_system_fonts` / `imported_fonts_revision`
 - `add_imported_system_font` / `remove_imported_system_font`
 - `font_display_name_override` / `set_font_display_name_override`
+- `virtual_groups` / `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group`
+- `add_virtual_group_member` / `remove_virtual_group_member` / `set_virtual_group_member_alias`
 - `seed_imported_system_fonts_from_config`
 
 Notes:
@@ -50,6 +53,11 @@ struct StoreState {
     /// Display-name overrides keyed by `fonts_data::font_settings_key`. Blank values are
     /// never stored (a blank set removes the entry).
     overrides: BTreeMap<String, String>,
+    /// User-defined virtual font groups, in user order. Group names are unique
+    /// case-insensitively; members are unique by font key within a group (enforced by
+    /// the mutators). The store cannot see folder groups (filesystem) — a collision of a
+    /// virtual name with a real folder-group name is handled at the UI / panel-merge level.
+    virtual_groups: Vec<fonts_data::VirtualFontGroup>,
 }
 
 /// Runtime-global per-font settings state. Lazily created; not on a hot path.
@@ -93,6 +101,7 @@ fn snapshot_data() -> fonts_data::FontsData {
     fonts_data::FontsData {
         imported_system_fonts: guard.imported.clone(),
         display_name_overrides: guard.overrides.clone(),
+        virtual_groups: guard.virtual_groups.clone(),
     }
 }
 
@@ -250,6 +259,237 @@ pub(in crate::tabs::typing) fn set_font_display_name_override(
     changed
 }
 
+/// Case-insensitive name equality (Unicode-aware, so Cyrillic group names fold correctly).
+fn names_equal_ci(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Returns a snapshot clone of the virtual font groups, in user order. Consumed by the
+/// typing create/edit panels (`create_state`), which inject these into the combobox group
+/// list via `fonts::apply_virtual_groups` on every font (re)load.
+#[must_use]
+pub(in crate::tabs::typing) fn virtual_groups() -> Vec<fonts_data::VirtualFontGroup> {
+    let guard = match store().read() {
+        Ok(guard) => guard,
+        // A poisoned lock still holds valid data; recover it rather than panicking.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.virtual_groups.clone()
+}
+
+/// Creates an empty virtual font group named `name` (trimmed). Returns `true` on creation;
+/// bumps the shared revision and persists off-thread only then. Returns `false` (no change)
+/// when `name` is blank or case-insensitively duplicates an existing VIRTUAL group name.
+///
+/// NOTE: the store cannot see folder groups (they live on the filesystem under
+/// `fonts/groups/`), so a collision of a virtual name with a real FOLDER-group name is NOT
+/// rejected here. That is validated at the UI level and handled defensively when the panel
+/// merges virtual and folder groups (other tasks).
+pub(in crate::tabs::typing) fn create_virtual_group(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let created = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard
+            .virtual_groups
+            .iter()
+            .any(|group| names_equal_ci(&group.name, name))
+        {
+            false
+        } else {
+            guard.virtual_groups.push(fonts_data::VirtualFontGroup {
+                name: name.to_string(),
+                members: Vec::new(),
+            });
+            true
+        }
+    };
+    if created {
+        bump_revision();
+        persist_off_thread();
+    }
+    created
+}
+
+/// Deletes the virtual group whose name EXACTLY equals `name`. Returns `true` when a group
+/// was removed (then bumps the revision and persists off-thread); `false` when none matched.
+pub(in crate::tabs::typing) fn delete_virtual_group(name: &str) -> bool {
+    let removed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = guard.virtual_groups.len();
+        guard.virtual_groups.retain(|group| group.name != name);
+        guard.virtual_groups.len() != before
+    };
+    if removed {
+        bump_revision();
+        persist_off_thread();
+    }
+    removed
+}
+
+/// Renames the virtual group named EXACTLY `old` to `new` (trimmed). Returns `true` on a real
+/// rename (then bumps the revision and persists off-thread). Returns `false` when `new` is
+/// blank, `old` does not exist, `new` equals the current name (no-op), or `new` collides
+/// case-insensitively with a DIFFERENT existing group.
+pub(in crate::tabs::typing) fn rename_virtual_group(old: &str, new: &str) -> bool {
+    let new = new.trim();
+    if new.is_empty() {
+        return false;
+    }
+    let renamed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.virtual_groups.iter().position(|group| group.name == old) {
+            None => false,
+            Some(idx) => {
+                if guard.virtual_groups[idx].name == new {
+                    // Unchanged (an exact case-only change is still allowed below).
+                    false
+                } else if guard
+                    .virtual_groups
+                    .iter()
+                    .enumerate()
+                    .any(|(other, group)| other != idx && names_equal_ci(&group.name, new))
+                {
+                    // A different group already owns this name (case-insensitively).
+                    false
+                } else {
+                    guard.virtual_groups[idx].name = new.to_string();
+                    true
+                }
+            }
+        }
+    };
+    if renamed {
+        bump_revision();
+        persist_off_thread();
+    }
+    renamed
+}
+
+/// Adds font `key` (a `fonts_data::font_settings_key`) to the virtual group named EXACTLY
+/// `group`. Returns `true` on a real add (then bumps the revision and persists off-thread).
+/// Returns `false` when the group is unknown, `key` is blank, or the font is already a member.
+pub(in crate::tabs::typing) fn add_virtual_group_member(group: &str, key: &str) -> bool {
+    let key = key.trim();
+    if key.is_empty() {
+        return false;
+    }
+    let added = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard
+            .virtual_groups
+            .iter_mut()
+            .find(|candidate| candidate.name == group)
+        {
+            None => false,
+            Some(candidate) => {
+                if candidate.members.iter().any(|member| member.font == key) {
+                    false
+                } else {
+                    candidate.members.push(fonts_data::VirtualFontGroupMember {
+                        font: key.to_string(),
+                        alias: None,
+                    });
+                    true
+                }
+            }
+        }
+    };
+    if added {
+        bump_revision();
+        persist_off_thread();
+    }
+    added
+}
+
+/// Removes font `key` from the virtual group named EXACTLY `group`. Returns `true` when a
+/// member was removed (then bumps the revision and persists off-thread); `false` when the
+/// group is unknown or the font was not a member.
+pub(in crate::tabs::typing) fn remove_virtual_group_member(group: &str, key: &str) -> bool {
+    let removed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard
+            .virtual_groups
+            .iter_mut()
+            .find(|candidate| candidate.name == group)
+        {
+            None => false,
+            Some(candidate) => {
+                let before = candidate.members.len();
+                candidate.members.retain(|member| member.font != key);
+                candidate.members.len() != before
+            }
+        }
+    };
+    if removed {
+        bump_revision();
+        persist_off_thread();
+    }
+    removed
+}
+
+/// Sets or clears the per-group display alias of font `key` in the virtual group named
+/// EXACTLY `group`. `alias = None` or a blank/whitespace-only string CLEARS the alias.
+/// Returns `true` when the stored alias actually changed (then bumps the revision and
+/// persists off-thread); `false` when the group/member is missing or the alias is unchanged.
+pub(in crate::tabs::typing) fn set_virtual_group_member_alias(
+    group: &str,
+    key: &str,
+    alias: Option<&str>,
+) -> bool {
+    // A blank alias behaves identically to "no alias", so normalize it to a clear.
+    let normalized = alias
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let changed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard
+            .virtual_groups
+            .iter_mut()
+            .find(|candidate| candidate.name == group)
+        {
+            None => false,
+            Some(candidate) => match candidate.members.iter_mut().find(|member| member.font == key) {
+                None => false,
+                Some(member) => {
+                    if member.alias == normalized {
+                        false
+                    } else {
+                        member.alias = normalized;
+                        true
+                    }
+                }
+            },
+        }
+    };
+    if changed {
+        bump_revision();
+        persist_off_thread();
+    }
+    changed
+}
+
 /// Seeds the runtime-global store at startup from `fonts/fonts_data.json`, migrating the
 /// legacy `TextTab.imported_system_fonts` list on first run.
 ///
@@ -281,6 +521,7 @@ pub fn seed_imported_system_fonts_from_config() {
     };
     guard.imported = dedup_preserve_order(loaded.imported_system_fonts);
     guard.overrides = loaded.display_name_overrides;
+    guard.virtual_groups = loaded.virtual_groups;
 }
 
 /// One-time migration of the legacy `user_config.json` imported-fonts list into a fresh
@@ -292,6 +533,7 @@ fn migrate_legacy_imported_fonts(fonts_dir: &Path) -> fonts_data::FontsData {
     let migrated = fonts_data::FontsData {
         imported_system_fonts: legacy,
         display_name_overrides: BTreeMap::new(),
+        virtual_groups: Vec::new(),
     };
     if !migrated.imported_system_fonts.is_empty()
         && let Err(err) = fonts_data::save(fonts_dir, &migrated)
@@ -322,6 +564,7 @@ mod tests {
         };
         guard.imported.clear();
         guard.overrides.clear();
+        guard.virtual_groups.clear();
     }
 
     fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
@@ -418,5 +661,99 @@ mod tests {
             imported_fonts_revision() > before,
             "a display-name change must bump the same revision imported-fonts uses"
         );
+    }
+
+    #[test]
+    fn create_virtual_group_rejects_blank_and_ci_duplicate() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("  Экшн  "), "first create trims and succeeds");
+        assert!(!create_virtual_group("   "), "blank name rejected");
+        assert!(
+            !create_virtual_group("ЭКШН"),
+            "case-insensitive duplicate rejected"
+        );
+        let groups = virtual_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Экшн", "stored name is trimmed");
+    }
+
+    #[test]
+    fn rename_virtual_group_rejects_collision_and_no_op() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("A"));
+        assert!(create_virtual_group("B"));
+        assert!(!rename_virtual_group("A", "  b  "), "CI collision with B rejected");
+        assert!(!rename_virtual_group("A", "A"), "unchanged rename is a no-op");
+        assert!(!rename_virtual_group("missing", "X"), "unknown source rejected");
+        assert!(rename_virtual_group("A", "Alpha"), "distinct rename succeeds");
+        let names: Vec<String> = virtual_groups().into_iter().map(|group| group.name).collect();
+        assert_eq!(names, vec!["Alpha".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn add_and_remove_virtual_group_member() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("G"));
+        assert!(!add_virtual_group_member("missing", "A.ttf"), "unknown group rejected");
+        assert!(!add_virtual_group_member("G", "   "), "blank key rejected");
+        assert!(add_virtual_group_member("G", "A.ttf"), "first add succeeds");
+        assert!(!add_virtual_group_member("G", "A.ttf"), "duplicate member rejected");
+        assert!(add_virtual_group_member("G", "B.ttf"), "second member succeeds");
+        let members: Vec<String> = virtual_groups()
+            .into_iter()
+            .flat_map(|group| group.members)
+            .map(|member| member.font)
+            .collect();
+        assert_eq!(members, vec!["A.ttf".to_string(), "B.ttf".to_string()]);
+        assert!(remove_virtual_group_member("G", "A.ttf"), "present member removed");
+        assert!(!remove_virtual_group_member("G", "A.ttf"), "absent member -> false");
+        assert!(!remove_virtual_group_member("missing", "B.ttf"), "unknown group -> false");
+    }
+
+    #[test]
+    fn set_virtual_group_member_alias_set_clear_and_no_op() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("G"));
+        assert!(add_virtual_group_member("G", "A.ttf"));
+        assert!(!set_virtual_group_member_alias("G", "missing.ttf", Some("X")), "unknown member");
+        assert!(!set_virtual_group_member_alias("missing", "A.ttf", Some("X")), "unknown group");
+        assert!(set_virtual_group_member_alias("G", "A.ttf", Some("  Псевдоним  ")), "set trims");
+        assert_eq!(
+            virtual_groups()[0].members[0].alias.as_deref(),
+            Some("Псевдоним")
+        );
+        assert!(
+            !set_virtual_group_member_alias("G", "A.ttf", Some("Псевдоним")),
+            "setting the same alias is a no-op"
+        );
+        assert!(
+            set_virtual_group_member_alias("G", "A.ttf", Some("   ")),
+            "a blank alias clears it"
+        );
+        assert_eq!(virtual_groups()[0].members[0].alias, None);
+        assert!(
+            !set_virtual_group_member_alias("G", "A.ttf", None),
+            "clearing an absent alias is a no-op"
+        );
+    }
+
+    #[test]
+    fn virtual_group_mutations_bump_revision_only_on_real_change() {
+        let _lock = lock_tests();
+        reset_store();
+        let before = imported_fonts_revision();
+        assert!(create_virtual_group("G"));
+        let after_create = imported_fonts_revision();
+        assert!(after_create > before, "create must bump the revision");
+        // A rejected duplicate create must NOT bump.
+        assert!(!create_virtual_group("g"));
+        assert_eq!(imported_fonts_revision(), after_create, "rejected create must not bump");
+        // A no-op alias set on a non-existent member must NOT bump.
+        assert!(!set_virtual_group_member_alias("G", "absent.ttf", Some("X")));
+        assert_eq!(imported_fonts_revision(), after_create, "no-op alias must not bump");
     }
 }

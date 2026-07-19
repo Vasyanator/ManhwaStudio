@@ -726,6 +726,49 @@ paths change.
         assert!(build_inline_machine_tag(&normalized).is_empty());
     }
 
+    // Item 6 (edit panel): a legacy `<font=Comic>` tag with an active virtual group
+    // whose member is an imported ~/Comic.ttf, while a folder Comic.ttf also exists,
+    // must resolve group-preferring to the IN-GROUP (imported) copy — the same
+    // discipline the create panel already follows. Merely selecting text must never
+    // rewrite the span to the folder twin; only an explicit user pick may (guarded by
+    // the edge-triggered `font_combo_user_pick`, tested separately).
+    #[test]
+    fn edit_panel_font_label_resolves_group_preferring() {
+        let mut state = TypingCreatePanelState::new(false);
+        // Two distinct "Comic" files: an imported system font inside group "A" and a
+        // folder copy at the root (distinct content → two entries sharing the stem).
+        state.fonts = merge_duplicate_fonts(vec![
+            raw_font("/home/user/Comic.ttf", Some("A"), 1),
+            raw_font("/fonts/Comic.ttf", None, 2),
+        ]);
+        let in_group_idx = state
+            .fonts
+            .iter()
+            .position(|f| font_in_group(f, "A"))
+            .expect("fixture defines a group-A Comic");
+
+        // Group "A" active → the filtered list holds only the in-group copy.
+        state.selected_font_group = Some("A".to_string());
+        let filtered = state.filtered_font_indices();
+        assert_eq!(filtered, vec![in_group_idx]);
+
+        // The ambiguous legacy label resolves to the in-group copy, not the folder twin.
+        assert_eq!(
+            state.find_font_idx_by_label_preferring_indices(Some("Comic"), &filtered),
+            Some(in_group_idx),
+        );
+        // And staying on that copy emits no font token (nothing to write back), so a
+        // mere selection cannot rewrite the span to the folder font.
+        state.selected_font_idx = in_group_idx;
+        let selection = selection_with_style(TypingInlineTagStyle {
+            font_label: Some("Comic".to_string()),
+            ..TypingInlineTagStyle::default()
+        });
+        let effective = state.effective_inline_tag_style(&selection);
+        let normalized = state.normalize_desired_inline_tag_style(effective);
+        assert_eq!(normalized.font_label, None);
+    }
+
     // Edge-trigger contract (Sol finding 3): the pure decision that gates the
     // inline font-label writeback. Only a popup click or a wheel step that MOVED
     // the index counts; a bare per-frame resolve (no input) never does.
@@ -897,4 +940,198 @@ paths change.
         assert!(via_load_fonts.is_empty());
         assert_eq!(via_load_fonts.len(), via_dir.len());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- Virtual font group injection (`fonts::apply_virtual_groups`) -----------------
+
+    /// Fonts dir the raw-font fixtures below are rooted under, so their
+    /// `font_settings_key`s are the fonts-dir-relative slash paths the members use.
+    fn vgroups_fonts_dir() -> &'static Path {
+        Path::new("/fonts")
+    }
+
+    /// Finalizes a raw-font list exactly like `load_fonts_from_dir` does up to the point
+    /// `apply_virtual_groups` expects: merge duplicates, assign disambiguators, assign the
+    /// collision-aware identity. (No display-name overrides — irrelevant to these tests.)
+    fn finalize_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
+        let mut fonts = merge_duplicate_fonts(raws);
+        assign_font_disambiguators(&mut fonts);
+        assign_font_identity_names(&mut fonts);
+        fonts
+    }
+
+    /// Convenience constructor for a virtual group with the given members.
+    fn vgroup(name: &str, members: Vec<fonts_data::VirtualFontGroupMember>) -> fonts_data::VirtualFontGroup {
+        fonts_data::VirtualFontGroup {
+            name: name.to_string(),
+            members,
+        }
+    }
+
+    /// Convenience constructor for a virtual-group member (font key + optional alias).
+    fn vmember(font: &str, alias: Option<&str>) -> fonts_data::VirtualFontGroupMember {
+        fonts_data::VirtualFontGroupMember {
+            font: font.to_string(),
+            alias: alias.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn apply_virtual_groups_matches_by_primary_path_and_attaches_alias() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![vgroup(
+            "Экшн",
+            vec![vmember("Comic.ttf", Some("Экшн-жирный"))],
+        )];
+        let merged = apply_virtual_groups(&mut fonts, &[], &virtual_groups, dir);
+
+        assert_eq!(merged, vec!["Экшн".to_string()], "merged list gains the virtual group");
+        let font = &fonts[0];
+        assert!(font_in_group(font, "Экшн"), "the font is now a member of the virtual group");
+        assert_eq!(
+            font.display_label_in_group(Some("Экшн")),
+            "Экшн-жирный",
+            "the per-group alias is shown while the group is active"
+        );
+        assert_eq!(
+            font.display_label_in_group(None),
+            "Comic",
+            "with no active group the plain display label is shown"
+        );
+    }
+
+    #[test]
+    fn apply_virtual_groups_matches_by_alt_path_of_merged_duplicate() {
+        let dir = vgroups_fonts_dir();
+        // Two byte-identical same-stem copies fold into one entry: "/fonts/Comic.ttf" is
+        // the representative (sorts first), "/fonts/groups/X/Comic.ttf" becomes an alt path.
+        let mut fonts = finalize_fonts(vec![
+            raw_font("/fonts/Comic.ttf", None, 7),
+            raw_font("/fonts/groups/X/Comic.ttf", Some("X"), 7),
+        ]);
+        assert_eq!(fonts.len(), 1, "the byte-identical copies merged into one entry");
+        // The member references the ALT copy's key, which the primary entry folded in.
+        let virtual_groups = vec![vgroup("Диалоги", vec![vmember("groups/X/Comic.ttf", None)])];
+        let _merged = apply_virtual_groups(&mut fonts, &["X".to_string()], &virtual_groups, dir);
+        assert!(
+            font_in_group(&fonts[0], "Диалоги"),
+            "a member keyed by an alt path still matches the merged entry"
+        );
+    }
+
+    #[test]
+    fn apply_virtual_groups_skips_missing_member_but_keeps_group() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![vgroup("Пусто", vec![vmember("Absent.ttf", Some("N/A"))])];
+        let merged = apply_virtual_groups(&mut fonts, &[], &virtual_groups, dir);
+        // The group name survives (a virtual group may have zero loaded members) but the
+        // unrelated font gains neither membership nor an alias.
+        assert_eq!(merged, vec!["Пусто".to_string()]);
+        assert!(!font_in_group(&fonts[0], "Пусто"));
+        assert_eq!(fonts[0].display_label_in_group(Some("Пусто")), "Comic");
+    }
+
+    #[test]
+    fn apply_virtual_groups_skips_collision_with_real_folder_group() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        // Virtual name "a" collides case-insensitively with the real folder group "A".
+        let virtual_groups = vec![vgroup("a", vec![vmember("Comic.ttf", None)])];
+        let merged = apply_virtual_groups(&mut fonts, &["A".to_string()], &virtual_groups, dir);
+        assert_eq!(merged, vec!["A".to_string()], "the colliding virtual group is excluded");
+        assert!(
+            !font_in_group(&fonts[0], "a"),
+            "a skipped virtual group must not add membership"
+        );
+    }
+
+    #[test]
+    fn apply_virtual_groups_merged_list_is_case_insensitively_sorted() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![vgroup("apple", vec![]), vgroup("Mango", vec![])];
+        let merged = apply_virtual_groups(&mut fonts, &["Zebra".to_string()], &virtual_groups, dir);
+        assert_eq!(
+            merged,
+            vec!["apple".to_string(), "Mango".to_string(), "Zebra".to_string()],
+            "real + virtual groups sort case-insensitively"
+        );
+    }
+
+    #[test]
+    fn apply_virtual_groups_font_in_multiple_virtual_groups() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![
+            vgroup("G1", vec![vmember("Comic.ttf", Some("Один"))]),
+            vgroup("G2", vec![vmember("Comic.ttf", Some("Два"))]),
+        ];
+        let _merged = apply_virtual_groups(&mut fonts, &[], &virtual_groups, dir);
+        let font = &fonts[0];
+        assert!(font_in_group(font, "G1") && font_in_group(font, "G2"));
+        assert_eq!(font.display_label_in_group(Some("G1")), "Один");
+        assert_eq!(font.display_label_in_group(Some("G2")), "Два");
+    }
+
+    #[test]
+    fn apply_virtual_groups_does_not_disturb_disambiguators() {
+        let dir = vgroups_fonts_dir();
+        // Two distinct files sharing the stem "Comic" get bracketed disambiguators computed
+        // from their REAL folder locations (root vs. group "A").
+        let mut fonts = finalize_fonts(vec![
+            raw_font("/fonts/Comic.ttf", None, 1),
+            raw_font("/fonts/groups/A/Comic.ttf", Some("A"), 2),
+        ]);
+        let before: Vec<Option<String>> = fonts.iter().map(|f| f.disambig.clone()).collect();
+        assert!(
+            before.iter().all(Option::is_some),
+            "the shared-stem fixture must produce disambiguators to test against"
+        );
+        // Add the ROOT copy to a virtual group; its folder-derived disambiguator must not move.
+        let root_key = "Comic.ttf";
+        let virtual_groups = vec![vgroup("V", vec![vmember(root_key, None)])];
+        let _merged = apply_virtual_groups(&mut fonts, &["A".to_string()], &virtual_groups, dir);
+        let after: Vec<Option<String>> = fonts.iter().map(|f| f.disambig.clone()).collect();
+        assert_eq!(before, after, "virtual membership must not change disambiguators");
+    }
+
+    #[test]
+    fn display_label_in_group_prefers_alias_only_for_that_group() {
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![vgroup("Aliased", vec![vmember("Comic.ttf", Some("Псевдо"))])];
+        let _merged = apply_virtual_groups(&mut fonts, &[], &virtual_groups, dir);
+        let font = &fonts[0];
+        // Alias only applies for the exact active group; any other/absent group -> plain label.
+        assert_eq!(font.display_label_in_group(Some("Aliased")), "Псевдо");
+        assert_eq!(font.display_label_in_group(Some("Other")), "Comic");
+        assert_eq!(font.display_label_in_group(None), "Comic");
+    }
+
+    #[test]
+    fn empty_virtual_group_selection_is_safe_and_leaves_index() {
+        // An active virtual group with no loaded members must not corrupt the selection or
+        // panic: `filtered_font_indices` is empty and `ensure_selected_font_in_group` leaves
+        // `selected_font_idx` untouched.
+        let mut state = TypingCreatePanelState::new(false);
+        let dir = vgroups_fonts_dir();
+        let mut fonts = finalize_fonts(vec![raw_font("/fonts/Comic.ttf", None, 1)]);
+        let virtual_groups = vec![vgroup("Empty", vec![vmember("Absent.ttf", None)])];
+        let merged = apply_virtual_groups(&mut fonts, &[], &virtual_groups, dir);
+        state.fonts = fonts;
+        state.font_groups = merged;
+        state.selected_font_group = Some("Empty".to_string());
+        state.selected_font_idx = 0;
+
+        assert!(
+            state.filtered_font_indices().is_empty(),
+            "an empty virtual group filters out every font"
+        );
+        state.ensure_selected_font_in_group();
+        assert_eq!(
+            state.selected_font_idx, 0,
+            "an empty group must not move the selection to an invalid index"
+        );
     }

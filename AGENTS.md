@@ -722,6 +722,16 @@ Before finishing, ensure:
 * unsupported features are explicitly rejected;
 * helper scripts or external tools have not entered the runtime path unless explicitly allowed.
 
+### Manual UI Verification (egui-mcp)
+
+Do **not** use egui-mcp (launching and driving the live app over the inspection
+protocol) unless the user explicitly asks for it. It is slow, awkward for an agent,
+and consumes a large amount of tokens.
+
+Instead of testing the real launch yourself, finish the task by asking the user a
+question that states exactly what to test manually (steps and expected result), and
+always allow a free-form answer so the user can describe what they observed.
+
 ---
 
 ## 17. Clippy-Clean Rust

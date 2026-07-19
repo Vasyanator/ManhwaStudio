@@ -11,6 +11,10 @@ Main responsibilities:
 - merge duplicate font files and assign disambiguating group labels;
 - list font groups, compute font-file content hashes, and recurse font-file
   directories.
+- inject the user-defined VIRTUAL font groups into a finalized panel list
+  (`apply_virtual_groups`): append each membership into a font's `groups` and its
+  optional per-group alias into `virtual_group_aliases`, returning the merged
+  (real + virtual) combobox group list. MUST run after merge/disambiguation/identity.
 - `load_system_fonts` enumerates ALL OS-installed fonts; it is the catalog source
   for the settings font-import picker (`panel/font_settings.rs`), run off-thread.
 
@@ -232,6 +236,7 @@ pub(in crate::tabs::typing) fn load_imported_system_fonts(paths: &[PathBuf]) -> 
             original_name,
             display_name,
             identity_name,
+            virtual_group_aliases: BTreeMap::new(),
         });
     }
     entries
@@ -340,6 +345,8 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             // (needed for the per-font key) is known.
             display_name: None,
             identity_name,
+            // Filled by `apply_virtual_groups` after the finalized list is built.
+            virtual_group_aliases: BTreeMap::new(),
         });
     }
     entries
@@ -418,7 +425,12 @@ pub(super) fn default_single_face() -> Vec<FontFaceEntry> {
     }]
 }
 
-pub(super) fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
+/// Lists the real FOLDER-group names: the immediate subdirectory names of
+/// `fonts_dir/groups/`, sorted case-insensitively. Performs one `read_dir`; returns an empty
+/// list when the `groups/` directory is absent or unreadable. Widened to
+/// `pub(in crate::tabs::typing)` so the `font_admin` facade can expose folder-group names
+/// alongside virtual groups.
+pub(in crate::tabs::typing) fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
     let groups_dir = fonts_dir.join("groups");
     let Ok(read_dir) = fs::read_dir(groups_dir) else {
         return Vec::new();
@@ -438,6 +450,110 @@ pub(super) fn load_font_groups(fonts_dir: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     groups.sort_by_key(|group_name| group_name.to_lowercase());
     groups
+}
+
+/// Injects the user-defined VIRTUAL font groups into an already-finalized panel font
+/// list and returns the merged combobox group list (real FOLDER groups + surviving
+/// virtual group names, case-insensitively sorted, stable on ties so the folder groups
+/// keep priority within a tie).
+///
+/// For each virtual group whose name does NOT collide case-insensitively with a real
+/// folder-group name, every member is matched against a loaded font by
+/// `fonts_data::font_settings_key` — the font's PRIMARY path OR any of its merged
+/// `alt_paths` (a byte-identical duplicate the referenced copy may have folded into).
+/// A match records the virtual group in the font's `groups` (so the existing
+/// `font_in_group` / `filtered_font_indices` membership machinery treats it exactly
+/// like a folder group) and, when the member carries an alias, stores it in the font's
+/// `virtual_group_aliases` for group-aware display. A member key with no loaded font is
+/// silently skipped — the config is preserved elsewhere; the font simply does not appear
+/// (a virtual group may legitimately have zero loaded members).
+///
+/// ALIAS MERGE RULE: two distinct member keys in the SAME virtual group can resolve to one
+/// merged font entry (e.g. a byte-identical duplicate folded into another entry's alt path).
+/// Aliases are inserted in member order and only when `Some`, so the LAST `Some` alias wins
+/// and a later `None` member does NOT clear an alias an earlier member already set.
+///
+/// A virtual group whose name collides case-insensitively with a real folder group is
+/// SKIPPED ENTIRELY with a warning (defensive; the settings UI also validates this), so
+/// the folder group's real membership is never diluted by virtual references.
+///
+/// ORDERING CONTRACT: this MUST run AFTER `merge_duplicate_fonts`,
+/// `assign_font_disambiguators`, and `assign_font_identity_names`, because (a) the
+/// disambiguators «(корень)/(group)» must keep reflecting only the REAL folder locations
+/// (virtual membership must not change the "All groups" disambiguation view) and (b) the
+/// collision-aware render identity must already be assigned — virtual membership never
+/// touches it. Adding a virtual membership only APPENDS to `groups`, so the folder-derived
+/// disambiguator (computed earlier from the folder-only `groups`) is left intact.
+#[must_use]
+pub(in crate::tabs::typing) fn apply_virtual_groups(
+    fonts: &mut [FontEntry],
+    real_groups: &[String],
+    virtual_groups: &[fonts_data::VirtualFontGroup],
+    fonts_dir: &Path,
+) -> Vec<String> {
+    // Real folder-group names lowercased, for case-insensitive collision detection.
+    // Unicode-lowercased (not ASCII) so Cyrillic group names fold correctly.
+    let real_lower: HashSet<String> = real_groups.iter().map(|name| name.to_lowercase()).collect();
+
+    // Precompute each font entry's key set once (primary path + every merged alt path). The
+    // membership test below then reduces to a cheap slice lookup instead of recomputing
+    // `font_settings_key` for every (member × entry × alt_path) triple.
+    let entry_keys: Vec<Vec<String>> = fonts
+        .iter()
+        .map(|entry| {
+            std::iter::once(&entry.path)
+                .chain(entry.alt_paths.iter())
+                .map(|path| fonts_data::font_settings_key(fonts_dir, path))
+                .collect()
+        })
+        .collect();
+
+    let mut surviving: Vec<String> = Vec::new();
+    for group in virtual_groups {
+        // Defensive: the settings UI forbids a virtual name colliding with a real folder
+        // group, but validate here too so a stale/edited config can never dilute a real
+        // group's membership.
+        if real_lower.contains(&group.name.to_lowercase()) {
+            crate::runtime_log::log_warn(format!(
+                "typing fonts: virtual font group '{}' collides with a real folder group of the \
+                 same name (case-insensitive); skipping the virtual group.",
+                group.name
+            ));
+            continue;
+        }
+        surviving.push(group.name.clone());
+
+        for member in &group.members {
+            let key = member.font.as_str();
+            for (entry, keys) in fonts.iter_mut().zip(entry_keys.iter()) {
+                // A font key uniquely identifies one file, which belongs to exactly one
+                // entry (as its primary path or a merged alt path), so at most one entry
+                // matches; scanning all is harmless and keeps the match total.
+                if !keys.iter().any(|entry_key| entry_key == key) {
+                    continue;
+                }
+                // Dedup: a font may already carry this virtual group from an earlier member
+                // pass (e.g. two member keys resolving to the same merged entry).
+                let group_key = Some(group.name.clone());
+                if !entry.groups.contains(&group_key) {
+                    entry.groups.push(group_key);
+                }
+                if let Some(alias) = &member.alias {
+                    entry
+                        .virtual_group_aliases
+                        .insert(group.name.clone(), alias.clone());
+                }
+            }
+        }
+    }
+
+    // Merged list: real groups + surviving virtual names, case-insensitively sorted.
+    // `sort_by` is STABLE, so a case-insensitive tie keeps insertion order (real groups
+    // were pushed first), matching the "ties: stable" contract.
+    let mut merged: Vec<String> = real_groups.to_vec();
+    merged.extend(surviving);
+    merged.sort_by_key(|name| name.to_lowercase());
+    merged
 }
 
 /// Enumerates ALL OS-installed fonts (one `FontEntry` per file) for the settings
@@ -555,6 +671,7 @@ pub(in crate::tabs::typing) fn load_system_fonts() -> Vec<FontEntry> {
             original_name,
             display_name,
             identity_name,
+            virtual_group_aliases: BTreeMap::new(),
         });
     }
 

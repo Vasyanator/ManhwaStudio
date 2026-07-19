@@ -18,7 +18,10 @@ Main responsibilities:
 - provide an in-app searchable picker of ALL installed OS fonts (also loaded off-thread,
   virtualized so only visible rows register into egui, and capped so a full-catalog scroll
   registers at most `PICKER_PREVIEW_FONT_CAP` own-typeface previews) to import a font by
-  file path.
+  file path;
+- host the "Группы" (virtual font groups) sub-editor as a fourth category, delegating to
+  `font_groups::FontGroupsEditorState`. The real folder-group names it needs for create-time
+  validation are enumerated in the same off-thread category pass (`FontCategories`).
 
 Key types:
 - `FontSettingsEditorState`
@@ -50,12 +53,15 @@ use std::sync::mpsc::{self, TryRecvError};
 /// font-atlas rebuild, so scrolling the whole OS catalog would otherwise register hundreds
 /// of fonts (hundreds of MB, never reclaimed). Rows beyond the cap render in the default
 /// font; the searched/small case still previews every row in its own typeface.
-const PICKER_PREVIEW_FONT_CAP: usize = 128;
+/// `pub(super)` so the group-editor picker (`font_groups.rs`) shares one cap constant instead
+/// of duplicating it — both register into the SAME non-evicting egui atlas.
+pub(super) const PICKER_PREVIEW_FONT_CAP: usize = 128;
 
 /// Vertical headroom factor for own-typeface preview rows. Rows are drawn in each font's
 /// intrinsic face, whose line height can exceed `body_size`; multiply by this so `show_rows`
-/// positions rows without clipping or overlap.
-const PREVIEW_ROW_HEIGHT_FACTOR: f32 = 1.6;
+/// positions rows without clipping or overlap. `pub(super)` so `font_groups.rs` sizes its
+/// own-typeface picker/member rows with the same headroom.
+pub(super) const PREVIEW_ROW_HEIGHT_FACTOR: f32 = 1.6;
 
 /// Number of preview rows kept visible in a virtualized category list before it scrolls.
 const CATEGORY_VISIBLE_ROWS: f32 = 10.0;
@@ -70,6 +76,9 @@ struct FontCategories {
     imported: Vec<FontEntry>,
     /// Custom (virtual) fonts. Not supported yet; always empty.
     custom: Vec<FontEntry>,
+    /// Real folder-group names under `fonts/groups/`, enumerated in this same off-thread pass
+    /// (filesystem I/O). Used only by the "Группы" section to reject name collisions on create.
+    folder_group_names: Vec<String>,
     /// Imported-fonts store revision at the moment this snapshot was built.
     loaded_revision: u64,
 }
@@ -99,6 +108,8 @@ pub(crate) struct FontSettingsEditorState {
     picker_preview_families: HashSet<String>,
     /// The open per-font properties window, if any (at most one at a time).
     properties: Option<super::font_properties_window::FontPropertiesState>,
+    /// The "Группы" (virtual font groups) sub-editor rendered as the fourth category.
+    groups_editor: super::font_groups::FontGroupsEditorState,
 }
 
 // `FontEntry` is not `Debug`, so the buffered lists cannot derive it; report structural
@@ -111,6 +122,7 @@ impl std::fmt::Debug for FontSettingsEditorState {
             .field("picker_open", &self.picker_open)
             .field("picker_catalog_loaded", &self.picker_catalog.is_some())
             .field("properties_open", &self.properties.is_some())
+            .field("groups_editor", &self.groups_editor)
             .finish()
     }
 }
@@ -247,6 +259,17 @@ impl FontSettingsEditorState {
         if let Some(font) = to_open {
             self.open_properties(&font);
         }
+
+        // Fourth category: virtual font groups. It owns its own collapsing header and the
+        // floating group-editor window; the folder-group names and the loaded font lists come
+        // from this off-thread snapshot (no GUI-thread filesystem work).
+        self.groups_editor.ui(
+            ui,
+            &cats.folder_group_names,
+            &cats.folder,
+            &cats.imported,
+            cats.loaded_revision,
+        );
     }
 
     /// Draws a virtualized list of own-typeface font-name rows for a category. Only the rows
@@ -326,10 +349,13 @@ impl FontSettingsEditorState {
             .spawn(move || {
                 let folder = font_admin::load_folder_fonts();
                 let imported = font_admin::load_imported_fonts();
+                // Enumerated here (filesystem I/O) so the GUI thread never scans the groups dir.
+                let folder_group_names = font_admin::list_folder_group_names();
                 let snapshot = FontCategories {
                     folder,
                     imported,
                     custom: Vec::new(),
+                    folder_group_names,
                     loaded_revision: current_revision,
                 };
                 // A disconnected receiver only means the widget was dropped; ignore.
@@ -341,11 +367,20 @@ impl FontSettingsEditorState {
                     "[settings] failed to start font-categories load thread; error={err}"
                 ));
                 // Stop retrying every frame until the store revision changes: cache an
-                // empty snapshot at the current revision as a best-effort fallback.
+                // empty snapshot at the current revision as a best-effort fallback. Retain the
+                // previously loaded folder-group names, though: an empty list would weaken the
+                // group create/rename collision validation (a virtual group could then be named
+                // to match a real folder group, which the panel later silently drops).
+                let folder_group_names = self
+                    .categories
+                    .as_ref()
+                    .map(|cats| cats.folder_group_names.clone())
+                    .unwrap_or_default();
                 self.categories = Some(FontCategories {
                     folder: Vec::new(),
                     imported: Vec::new(),
                     custom: Vec::new(),
+                    folder_group_names,
                     loaded_revision: current_revision,
                 });
             }
@@ -598,7 +633,12 @@ fn draw_picker_body(
 /// query matches everything. Matches the render `label`, the `original_name`, OR the
 /// `display_label` — the rows SHOW the display label (a user rename override), so a renamed
 /// font must be findable by its shown name, not only by its underlying render key.
-fn font_row_matches(label: &str, original_name: &str, display_label: &str, query: &str) -> bool {
+pub(super) fn font_row_matches(
+    label: &str,
+    original_name: &str,
+    display_label: &str,
+    query: &str,
+) -> bool {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return true;

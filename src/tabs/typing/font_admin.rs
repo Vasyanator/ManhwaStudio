@@ -25,6 +25,16 @@ Key functions:
 - `load_folder_fonts` / `load_imported_fonts` / `load_system_catalog`
 - `fonts_revision` / `add_imported_font` / `remove_imported_font` / `is_font_imported`
 - `display_name_override` / `set_display_name_override`
+- virtual font groups (config-only named font sets): `list_virtual_groups` /
+  `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group` /
+  `add_virtual_group_member` / `remove_virtual_group_member` /
+  `set_virtual_group_member_alias` / `virtual_groups_for_font`
+- `list_folder_group_names` (real folder groups under `fonts/groups/`; HEAVY, off-thread)
+
+Key mapping:
+- Virtual-group members are stored by `font_settings_key`; the facade converts `&Path` ->
+  key (`key_for`) inbound and key -> `PathBuf` (`path_for_key`) outbound, so the keying
+  scheme never leaks to external callers.
 */
 
 use std::path::{Path, PathBuf};
@@ -101,4 +111,126 @@ pub(crate) fn set_display_name_override(path: &Path, value: Option<String>) -> b
 /// fonts dir, else absolute). Keeps `resolve_fonts_dir` + the keying scheme private to typing.
 fn key_for(path: &Path) -> String {
     fonts_data::font_settings_key(&fonts::resolve_fonts_dir(), path)
+}
+
+/// Resolves a `font_settings_key` back to a filesystem path: an absolute key is used
+/// verbatim, otherwise it is joined onto the fonts directory (the inverse of `key_for`).
+/// Keeps the keying scheme + `resolve_fonts_dir` private to typing.
+fn path_for_key(key: &str) -> PathBuf {
+    let candidate = Path::new(key);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        fonts::resolve_fonts_dir().join(candidate)
+    }
+}
+
+/// A virtual font group exposed to non-typing code: its name and members, with each member
+/// referenced by a real filesystem `path` (keys are resolved internally, never leaked).
+#[derive(Debug, Clone)]
+pub(crate) struct VirtualFontGroupInfo {
+    /// Group display name.
+    pub(crate) name: String,
+    /// Ordered members (user order preserved).
+    pub(crate) members: Vec<VirtualFontGroupMemberInfo>,
+}
+
+/// One member of a [`VirtualFontGroupInfo`]: the referenced font's filesystem path plus its
+/// optional per-group display alias.
+#[derive(Debug, Clone)]
+pub(crate) struct VirtualFontGroupMemberInfo {
+    /// Filesystem path of the referenced real font (resolved from its stable key).
+    pub(crate) path: PathBuf,
+    /// Optional per-group display alias; `None` means "use the font's own label".
+    pub(crate) alias: Option<String>,
+}
+
+/// Lists all virtual font groups, with each member's stable key resolved to a filesystem
+/// `path`. Cheap (in-memory snapshot); GUI-thread safe.
+#[must_use]
+pub(crate) fn list_virtual_groups() -> Vec<VirtualFontGroupInfo> {
+    font_settings_store::virtual_groups()
+        .into_iter()
+        .map(|group| VirtualFontGroupInfo {
+            name: group.name,
+            members: group
+                .members
+                .into_iter()
+                .map(|member| VirtualFontGroupMemberInfo {
+                    path: path_for_key(&member.font),
+                    alias: member.alias,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Creates an empty virtual font group. Returns `false` when the name is blank or a
+/// case-insensitive duplicate of an existing VIRTUAL group. Persists off the GUI thread and
+/// bumps the store revision. Does NOT reject a collision with a real FOLDER-group name — the
+/// UI validates that (the store cannot see the filesystem).
+pub(crate) fn create_virtual_group(name: &str) -> bool {
+    font_settings_store::create_virtual_group(name)
+}
+
+/// Deletes the virtual group named exactly `name`. Returns `false` when none matched.
+/// Persists off the GUI thread and bumps the store revision.
+pub(crate) fn delete_virtual_group(name: &str) -> bool {
+    font_settings_store::delete_virtual_group(name)
+}
+
+/// Renames virtual group `old` to `new`. Returns `false` when `new` is blank, `old` is
+/// missing, the name is unchanged, or `new` collides case-insensitively with another group.
+/// Persists off the GUI thread and bumps the store revision.
+pub(crate) fn rename_virtual_group(old: &str, new: &str) -> bool {
+    font_settings_store::rename_virtual_group(old, new)
+}
+
+/// Adds the font at `path` to virtual group `group`. Returns `false` when the group is
+/// unknown or the font is already a member. Keys are derived internally so the keying scheme
+/// stays private. Persists off the GUI thread and bumps the store revision.
+pub(crate) fn add_virtual_group_member(group: &str, path: &Path) -> bool {
+    font_settings_store::add_virtual_group_member(group, &key_for(path))
+}
+
+/// Removes the font at `path` from virtual group `group`. Returns `false` when the group is
+/// unknown or the font was not a member. Persists off the GUI thread and bumps the store revision.
+pub(crate) fn remove_virtual_group_member(group: &str, path: &Path) -> bool {
+    font_settings_store::remove_virtual_group_member(group, &key_for(path))
+}
+
+/// Sets (or, with `None`/blank, clears) the per-group display alias of the font at `path`
+/// in virtual group `group`. Returns `false` when the group/member is missing or the alias
+/// is unchanged. Persists off the GUI thread and bumps the store revision.
+pub(crate) fn set_virtual_group_member_alias(
+    group: &str,
+    path: &Path,
+    alias: Option<&str>,
+) -> bool {
+    font_settings_store::set_virtual_group_member_alias(group, &key_for(path), alias)
+}
+
+/// Returns, for the font at `path`, every virtual group that contains it as `(group name,
+/// per-group alias)`. For the font properties window. Cheap (in-memory scan); GUI-thread safe.
+#[must_use]
+pub(crate) fn virtual_groups_for_font(path: &Path) -> Vec<(String, Option<String>)> {
+    let key = key_for(path);
+    font_settings_store::virtual_groups()
+        .into_iter()
+        .filter_map(|group| {
+            group
+                .members
+                .into_iter()
+                .find(|member| member.font == key)
+                .map(|member| (group.name, member.alias))
+        })
+        .collect()
+}
+
+/// Lists the real FOLDER-group names discovered under `fonts/groups/`. HEAVY: performs
+/// filesystem I/O (one `read_dir` of the groups directory) — callers should invoke it from
+/// their existing off-thread font loads, not per frame on the GUI thread.
+#[must_use]
+pub(crate) fn list_folder_group_names() -> Vec<String> {
+    fonts::load_font_groups(&fonts::resolve_fonts_dir())
 }

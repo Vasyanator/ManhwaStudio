@@ -30,8 +30,16 @@ impl TypingCreatePanelState {
         // imported paths an initial `spawn_font_reload` at the end merges them in off-thread.
         let imported_system_fonts = super::font_settings_store::imported_system_fonts();
         let imported_fonts_revision = super::font_settings_store::imported_fonts_revision();
-        let fonts = load_fonts_from_dir(&fonts_dir);
-        let font_groups = load_font_groups(&fonts_dir);
+        let mut fonts = load_fonts_from_dir(&fonts_dir);
+        // Inject the user-defined virtual font groups into the finalized (folder-only)
+        // list. Members referencing an imported system font do not resolve yet — the
+        // initial list holds only folder fonts — so they are skipped here; the group name
+        // still appears, and the trailing `spawn_font_reload` re-injects against the full
+        // combined list once the imported fonts are merged in.
+        let real_font_groups = load_font_groups(&fonts_dir);
+        let virtual_groups = super::font_settings_store::virtual_groups();
+        let font_groups =
+            apply_virtual_groups(&mut fonts, &real_font_groups, &virtual_groups, &fonts_dir);
         let presets_by_name = if preview_enabled {
             load_text_tab_create_presets()
         } else {
@@ -222,12 +230,21 @@ impl TypingCreatePanelState {
 
     /// Применяет выбранную группу шрифтов (для синхронизации между панелями).
     /// Возвращает `true`, если группа изменилась.
+    ///
+    /// The requested group name is stored VERBATIM and is NOT validated against this
+    /// panel's current `font_groups` here: the two create/edit panels reload their font
+    /// lists independently, so a group just created in the other panel may not yet be in
+    /// this panel's list. Immediately dropping it (via `sync_selected_font_group`) would
+    /// silently reset the selection to "All groups" until re-picked. Validation happens on
+    /// every reload result (`poll_font_reload_results` calls `sync_selected_font_group`),
+    /// which clears a truly nonexistent name once the fresh list lands.
+    /// `ensure_selected_font_in_group` still runs against the current list so the font
+    /// selection stays valid for whatever group members are already loaded.
     pub(super) fn set_font_group(&mut self, group: Option<String>) -> bool {
         if self.selected_font_group == group {
             return false;
         }
         self.selected_font_group = group;
-        self.sync_selected_font_group();
         self.ensure_selected_font_in_group();
         if self.preview_enabled {
             self.queue_preview_render();
@@ -247,8 +264,17 @@ impl TypingCreatePanelState {
         let _ = thread::Builder::new()
             .name("typing-font-reload-worker".to_string())
             .spawn(move || {
-                let fonts = load_fonts(fonts_dir.as_path(), &imported);
-                let font_groups = load_font_groups(fonts_dir.as_path());
+                let mut fonts = load_fonts(fonts_dir.as_path(), &imported);
+                let real_font_groups = load_font_groups(fonts_dir.as_path());
+                // Read the process-global virtual groups off the GUI thread (cheap) and
+                // inject them into the freshly-loaded combined list.
+                let virtual_groups = super::font_settings_store::virtual_groups();
+                let font_groups = apply_virtual_groups(
+                    &mut fonts,
+                    &real_font_groups,
+                    &virtual_groups,
+                    fonts_dir.as_path(),
+                );
                 let _ = tx.send(FontReloadResult {
                     token,
                     fonts,
@@ -336,14 +362,22 @@ impl TypingCreatePanelState {
         self.fonts.get(idx).map(FontEntry::render_identity_name)
     }
 
-    /// Имя шрифта для показа в списке: с уточнением в скобках, только когда
-    /// выбраны «Все группы» и имя неоднозначно; при конкретной группе — без скобок.
+    /// Имя шрифта для показа в списке шрифтов (комбобокс выбора шрифта): с уточнением
+    /// в скобках только когда выбраны «Все группы» и имя неоднозначно; при конкретной
+    /// группе — без скобок, но с учётом псевдонима шрифта в этой ВИРТУАЛЬНОЙ группе.
+    ///
+    /// The base name comes from `display_label_in_group(active_group)`: while a virtual
+    /// group is active and this font carries a per-group alias, the alias is shown; the
+    /// `(корень)/(группа)` disambiguation suffix is added ONLY when «All groups» is
+    /// selected (no active group), matching the historical behavior. DISPLAY ONLY: the
+    /// `label`/identity stays the render/inline-tag key — this affects only what the
+    /// combo SHOWS.
     pub(super) fn font_display_label(&self, font: &FontEntry) -> String {
-        // Use the display name (user override or `label`); `label` alone stays the
-        // render/inline-tag key — this affects only what the combo SHOWS.
-        match (self.selected_font_group.is_none(), font.disambig.as_deref()) {
-            (true, Some(suffix)) => format!("{} ({})", font.display_label(), suffix),
-            _ => font.display_label().to_string(),
+        let active_group = self.selected_font_group.as_deref();
+        let base = font.display_label_in_group(active_group);
+        match (active_group.is_none(), font.disambig.as_deref()) {
+            (true, Some(suffix)) => format!("{base} ({suffix})"),
+            _ => base.to_string(),
         }
     }
 

@@ -242,9 +242,12 @@ saving, and export.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
   `pub(in crate::tabs::typing)`) as a narrow facade — font loaders, imported-fonts add/remove +
-  revision, and `&Path`-keyed display-name overrides — and re-exports `FontEntry` as an opaque
-  type. Used by the settings font-settings UI (`src/tabs/settings/typesetting/`); nothing else
-  in typing is `pub(crate)` for it. Add a wrapper here rather than widening a panel internal.
+  revision, `&Path`-keyed display-name overrides, VIRTUAL font group CRUD + membership/alias
+  (config-only named font sets; members keyed internally by `font_settings_key`, exposed as
+  `&Path`), and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
+  re-exports `FontEntry` as an opaque type. Used by the settings font-settings UI
+  (`src/tabs/settings/typesetting/`); nothing else in typing is `pub(crate)` for it. Add a
+  wrapper here rather than widening a panel internal.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
   definitions incl. `TypingTabState`, `TypingTextOverlayLayer`, `TypingOverlayRuntime`,
   `TypingRasterLayer`, deform/export/create/edit/layout structs), the public
@@ -319,7 +322,11 @@ saving, and export.
   - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
   - `fonts.rs`: font discovery/loading — folder fonts PLUS imported system-font paths
     (`load_fonts`/`load_imported_system_fonts`), duplicate merge/disambiguation, group listing
-    (free fns). `load_system_fonts` (whole-OS enumeration) is the catalog source for the
+    (free fns), and VIRTUAL-group injection (`apply_virtual_groups`: folds the user-defined
+    `fonts_data` virtual groups into a finalized list — membership into `FontEntry.groups`,
+    per-group aliases into `FontEntry.virtual_group_aliases` — and returns the merged combobox
+    group list; MUST run after merge/disambiguation/identity; see `panel/MODULE_README.md`).
+    `load_system_fonts` (whole-OS enumeration) is the catalog source for the
     settings font-import picker (`src/tabs/settings/typesetting/font_settings.rs`, reached via
     the `font_admin` facade), run off the GUI thread.
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
@@ -346,14 +353,18 @@ saving, and export.
     migration (see `font_settings_store`); the imported-fonts WRITE path moved to `fonts_data.rs`.
   - `fonts_data.rs`: serde schema + disk I/O for the app-level per-font settings document
     `fonts/fonts_data.json` (`version: 1`; imported system font paths + per-font `display_name`
-    override). Load degrades to empty on a missing/malformed file and best-effort parses an unknown
+    override + user-defined `virtual_groups`, an ADDITIVE field an older binary silently drops on
+    save; `sanitize_virtual_groups` cleans them on decode AND encode). Load degrades to empty on a
+    missing/malformed file and best-effort parses an unknown
     version; save writes a full snapshot atomically (temp sibling + rename, mirroring
     `locale_store::write_atomic`) and creates the fonts dir if missing. `font_settings_key` derives
     the stable per-font KEY (fonts-dir-relative forward-slash path under the fonts dir, else the
     absolute path). Independent of `FontEntry.label` — a display override never touches rendering.
   - `font_settings_store.rs`: single process-global runtime store backed by `fonts_data.json`
-    (`OnceLock<RwLock<StoreState>>` = imported paths + display-name overrides, plus ONE shared
-    revision `AtomicU64`). Seeded at startup from `fonts_data.json`
+    (`OnceLock<RwLock<StoreState>>` = imported paths + display-name overrides + virtual groups,
+    plus ONE shared revision `AtomicU64`; the virtual-group mutators bump the same revision and
+    persist only on a real change, exactly like the other mutators). Seeded at startup from
+    `fonts_data.json`
     (`seed_imported_system_fonts_from_config`), or on first run migrates the legacy
     `TextTab.imported_system_fonts` list once (legacy key left in place, no longer written).
     `add_/remove_imported_system_font` and `set_font_display_name_override` mutate state, bump the

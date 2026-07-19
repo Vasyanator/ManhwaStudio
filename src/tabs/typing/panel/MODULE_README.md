@@ -33,20 +33,46 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   file is not crash-critical). `quarantine_bad_file` moves a corrupt document to
   `fonts_data.json.bad`. The stable per-font KEY (`font_settings_key`) is the fonts-dir-
   relative forward-slash path when under the fonts dir, else the absolute path.
+- Virtual font groups (`VirtualFontGroup` / `VirtualFontGroupMember`) are user-defined named,
+  ordered sets of REAL fonts referenced by `font_settings_key`, each with an optional per-group
+  display alias. They live in the SAME document under `virtual_groups` (additive field, schema
+  stays `version: 1`; an older binary that saves the file silently drops them). `fonts_data.rs`
+  sanitizes them on BOTH decode and encode (`sanitize_virtual_groups`): blank names/keys dropped,
+  blank aliases -> `None`, duplicate members-by-key and case-insensitive-duplicate group names
+  collapsed (first wins), user order preserved. Round-trip is lossless for sane data.
 - `font_settings_store.rs` is the single process-global runtime store backed by that file:
-  imported paths + display-name overrides behind one `RwLock`, sharing ONE revision
-  counter. Any mutation bumps the revision (so settings lists and typing panels reload)
+  imported paths + display-name overrides + virtual groups behind one `RwLock`, sharing ONE
+  revision counter. Any mutation bumps the revision (so settings lists and typing panels reload)
   and persists the whole snapshot off the GUI thread. Persistence is SERIALIZED via a
   process-global `save_lock` and the writer thread snapshots the store AFRESH inside that
   lock, so concurrent mutations coalesce to the newest state and never race on the shared
   per-process temp file (previously ~21% of saves were lost / a stale snapshot could win).
   Startup seeding uses `load_outcome`: `Loaded` uses the file; `Missing` runs the one-time
   legacy `TextTab.imported_system_fonts` migration; `Invalid` quarantines the file then runs
-  the migration (legacy key left in place, no longer written).
+  the migration (legacy key left in place, no longer written). The virtual-group mutators
+  (`create_/delete_/rename_virtual_group`, `add_/remove_virtual_group_member`,
+  `set_virtual_group_member_alias`) each return whether they actually changed state and follow
+  the same "bump-revision-and-persist only on real change" contract. The store CANNOT see folder
+  groups (filesystem), so a virtual name colliding with a real folder-group name is validated at
+  the UI level, not here.
 - Display-name overrides are DISPLAY ONLY: `FontEntry.display_name` (populated by the
   `fonts.rs` loaders) feeds `FontEntry::display_label()` used at presentation sites
   (`create_state::font_display_label`, and the settings font-settings rows). It never
   reaches persistence or the renderer.
+- Virtual groups are injected into the panel font list by `fonts::apply_virtual_groups`,
+  called at EVERY panel load site (`create_state::new` on the folder-only list, and the
+  `spawn_font_reload` worker on the combined list) AFTER
+  merge/disambiguation/identity-assignment. It appends each membership into the font's
+  `groups` (so `font_in_group`/`filtered_font_indices` and the a95f082 ambiguous-label
+  precedence govern virtual members automatically) and stores each optional per-group
+  alias in `FontEntry.virtual_group_aliases`, returning the merged (real folder + virtual)
+  combobox group list, case-insensitively sorted. A virtual name colliding
+  case-insensitively with a real folder group is skipped with a warning. Members with no
+  loaded font are silently skipped (a virtual group may have zero loaded members; the
+  combo/selection code already tolerates an empty filtered list). `virtual_group_aliases`
+  is DISPLAY ONLY — surfaced by `FontEntry::display_label_in_group(active_group)` and used
+  only by the font-selection combo via `create_state::font_display_label`; it is never a
+  resolution key, never persisted, and never sent to the renderer.
 
 ## Font render IDENTITY (collision-aware: family name when unique, else file-stem label)
 - The canonical name persisted in `render_data.text_params` / `TextRenderParams.font_name`
@@ -87,6 +113,11 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
 - egui own-typeface registration for font previews lives in `crate::widgets::font_preview`
   (`combo_font_family_name` / `is_font_family_bound` / `ensure_font_family`), shared by
   `create_presets::ensure_combo_font_family` and the settings font UI.
+- **Own-typeface rule (UI contract):** EVERYWHERE a font's name is displayed and/or the font
+  is selectable (combo boxes, font lists, group members, settings rows, properties windows),
+  the name must be rendered IN THAT FONT when the font is available, via the
+  `crate::widgets::font_preview` helpers. Fall back to the default UI font only when the font
+  cannot be registered (missing file, unreadable face). New font-name UI must follow this rule.
 
 ## Font-coverage contract (`font_coverage.rs`)
 - Coverage follows the selected TYPESETTING language

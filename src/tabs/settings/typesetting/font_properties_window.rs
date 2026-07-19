@@ -9,8 +9,9 @@ font's supported glyphs and non-default kerning pairs.
 
 Main responsibilities:
 - own the open-window state (`FontPropertiesState`) for exactly one font at a time;
-- render the floating `egui::Window` (identity header, display-name editor, live preview,
-  virtualized glyph grid, collapsible kerning list) without blocking the GUI thread;
+- render the floating `egui::Window` (identity header, display-name editor, a "Группы"
+  section for this font's virtual-group membership, live preview, virtualized glyph grid,
+  collapsible kerning list) without blocking the GUI thread;
 - analyze the font file OFF the GUI thread (glyph inventory + kerning extraction via
   `ttf-parser`) and deliver the result over an `mpsc` channel the window polls;
 - wire the display-name editor to `crate::tabs::typing::font_admin::set_display_name_override`
@@ -35,9 +36,9 @@ channel and repaints while pending.
 */
 
 use crate::tabs::typing::font_admin::{self, FontEntry};
-use crate::widgets::ensure_font_family;
+use crate::widgets::{WheelComboBox, ensure_font_family};
 use ms_thread as thread;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
@@ -142,6 +143,19 @@ pub(super) struct FontPropertiesState {
     analysis: Option<Result<FontAnalysis, String>>,
     /// In-flight analysis load, if any.
     analysis_rx: Option<mpsc::Receiver<Result<FontAnalysis, String>>>,
+    /// Virtual groups THIS font belongs to, as `(group name, per-group alias)`. Cached and
+    /// refreshed when the shared font-config revision advances.
+    member_of: Vec<(String, Option<String>)>,
+    /// All virtual-group names (to offer the font's non-member groups for adding). Cached
+    /// alongside `member_of`.
+    all_group_names: Vec<String>,
+    /// Store revision at which the group caches were built; `None` until the first refresh.
+    groups_revision: Option<u64>,
+    /// Per-group alias edit buffers, keyed by group name.
+    group_alias_bufs: HashMap<String, String>,
+    /// `WheelComboBox` selection index for the add-to-group control (over the non-member
+    /// group list computed each frame).
+    add_group_index: usize,
 }
 
 impl FontPropertiesState {
@@ -169,6 +183,11 @@ impl FontPropertiesState {
             preview: t!("typing.font_settings.properties_preview_sample").to_string(),
             analysis: None,
             analysis_rx: None,
+            member_of: Vec::new(),
+            all_group_names: Vec::new(),
+            groups_revision: None,
+            group_alias_bufs: HashMap::new(),
+            add_group_index: 0,
         }
     }
 
@@ -269,6 +288,10 @@ impl FontPropertiesState {
         ui.add_space(6.0);
         ui.separator();
 
+        self.draw_groups_section(ui);
+        ui.add_space(6.0);
+        ui.separator();
+
         self.draw_preview(ui);
         ui.add_space(6.0);
         ui.separator();
@@ -318,6 +341,145 @@ impl FontPropertiesState {
             self.apply_display_name();
         }
         ui.small(t!("typing.font_settings.properties_display_name_hint"));
+    }
+
+    /// Reloads the cached virtual-group membership for this font when the shared font-config
+    /// revision advances, seeding any missing alias buffers. Cheap in-memory reads, so this is
+    /// GUI-thread safe.
+    fn refresh_groups(&mut self) {
+        let current = font_admin::fonts_revision();
+        if self.groups_revision == Some(current) {
+            return;
+        }
+        self.member_of = font_admin::virtual_groups_for_font(&self.path);
+        self.all_group_names = font_admin::list_virtual_groups()
+            .into_iter()
+            .map(|group| group.name)
+            .collect();
+        self.groups_revision = Some(current);
+        // Prune buffers for groups this font no longer belongs to (removed/renamed elsewhere),
+        // so a stale alias edit cannot linger and reappear if the font rejoins a group.
+        self.group_alias_bufs
+            .retain(|name, _| self.member_of.iter().any(|(group, _)| group == name));
+        // Seed alias buffers only when missing so in-progress edits survive a refresh.
+        for (name, alias) in &self.member_of {
+            self.group_alias_bufs
+                .entry(name.clone())
+                .or_insert_with(|| alias.clone().unwrap_or_default());
+        }
+    }
+
+    /// Renders the "Группы" section: the groups this font belongs to (with per-group alias
+    /// editing and removal) plus an add-to-group control for its non-member groups.
+    fn draw_groups_section(&mut self, ui: &mut egui::Ui) {
+        self.refresh_groups();
+        egui::CollapsingHeader::new(t!("typing.font_settings.properties_groups_header"))
+            .id_salt("typing.font_settings.properties_groups_header")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.draw_groups_body(ui);
+            });
+    }
+
+    /// Body of the "Группы" section. Membership mutations are collected and applied after the
+    /// row loop so no store mutation happens mid-iteration.
+    fn draw_groups_body(&mut self, ui: &mut egui::Ui) {
+        let path = self.path.clone();
+
+        if self.member_of.is_empty() {
+            ui.small(t!("typing.font_settings.properties_groups_none_hint"));
+        } else {
+            // Clone the membership list so the row closures can mutate the alias buffers.
+            let member_of = self.member_of.clone();
+            let mut alias_to_apply: Option<(String, String)> = None;
+            let mut remove_from: Option<String> = None;
+            for (name, _alias) in &member_of {
+                let buf = self.group_alias_bufs.entry(name.clone()).or_default();
+                ui.horizontal(|ui| {
+                    ui.label(name.as_str());
+                    let response = ui.add(
+                        egui::TextEdit::singleline(buf)
+                            .id_salt((
+                                "typing.font_settings.properties_group_alias_edit",
+                                name.as_str(),
+                            ))
+                            .desired_width(160.0)
+                            .hint_text(t!(
+                                "typing.font_settings.group_member_alias_placeholder"
+                            )),
+                    );
+                    let submitted = response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if ui
+                        .button(t!("typing.font_settings.properties_apply_button"))
+                        .clicked()
+                        || submitted
+                    {
+                        alias_to_apply = Some((name.clone(), buf.clone()));
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text(t!(
+                            "typing.font_settings.group_member_remove_tooltip"
+                        ))
+                        .clicked()
+                    {
+                        remove_from = Some(name.clone());
+                    }
+                });
+            }
+            if let Some((name, alias)) = alias_to_apply {
+                let trimmed = alias.trim();
+                // Blank clears the alias (reset to the font's own label).
+                let value = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                font_admin::set_virtual_group_member_alias(&name, &path, value);
+            }
+            if let Some(name) = remove_from {
+                font_admin::remove_virtual_group_member(&name, &path);
+                self.group_alias_bufs.remove(&name);
+            }
+        }
+
+        // Non-member groups: offer adding this font to one of them.
+        let non_member: Vec<String> = self
+            .all_group_names
+            .iter()
+            .filter(|name| {
+                !self
+                    .member_of
+                    .iter()
+                    .any(|(member_name, _)| member_name == *name)
+            })
+            .cloned()
+            .collect();
+        if !non_member.is_empty() {
+            ui.add_space(4.0);
+            if self.add_group_index >= non_member.len() {
+                self.add_group_index = 0;
+            }
+            ui.horizontal(|ui| {
+                ui.label(t!("typing.font_settings.properties_add_to_group_label"));
+                WheelComboBox::from_id_salt("typing.font_settings.properties_add_to_group_combo")
+                    .width(180.0)
+                    .show_index(
+                        ui,
+                        &mut self.add_group_index,
+                        non_member.len(),
+                        |index| non_member[index].as_str(),
+                    );
+                if ui
+                    .button(t!("typing.font_settings.add_button"))
+                    .clicked()
+                    && let Some(name) = non_member.get(self.add_group_index)
+                {
+                    font_admin::add_virtual_group_member(name, &path);
+                }
+            });
+        }
     }
 
     /// Renders the free-text preview: an editable line plus the same text drawn below in the

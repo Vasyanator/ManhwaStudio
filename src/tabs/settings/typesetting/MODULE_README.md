@@ -25,14 +25,33 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   `draw_rotation_ctrl_wheel_setting`) and the `font_settings` / `font_properties_window`
   submodule declarations. Re-exports `FontSettingsEditorState` to the parent `settings` module.
 - `font_settings.rs`: `FontSettingsEditorState`, the "Настройки шрифтов" widget. Loads the
-  three font categories (folder / imported system / custom) off the GUI thread via
-  `font_admin::{load_folder_fonts, load_imported_fonts}`, reloading live when
-  `font_admin::fonts_revision()` advances; draws each font's name in its own typeface
-  (`crate::widgets::ensure_font_family`); and hosts a searchable, row-virtualized picker over
-  `font_admin::load_system_catalog()` to import a system font
-  (`font_admin::add_imported_font` / `remove_imported_font` / `is_font_imported`). Folder/imported
-  rows are BUTTONS that open the per-font properties window. Pure helpers `font_row_matches` /
-  `clean_font_display_name` are unit-tested.
+  three font categories (folder / imported system / custom) AND the real folder-group names
+  off the GUI thread via `font_admin::{load_folder_fonts, load_imported_fonts,
+  list_folder_group_names}`, reloading live when `font_admin::fonts_revision()` advances; draws
+  each font's name in its own typeface (`crate::widgets::ensure_font_family`); and hosts a
+  searchable, row-virtualized picker over `font_admin::load_system_catalog()` to import a system
+  font (`font_admin::add_imported_font` / `remove_imported_font` / `is_font_imported`).
+  Folder/imported rows are BUTTONS that open the per-font properties window. Owns the
+  `font_groups::FontGroupsEditorState` rendered as the fourth "Группы" category. Pure helpers
+  `font_row_matches` (`pub(super)`, reused by `font_groups`) / `clean_font_display_name` are
+  unit-tested.
+- `font_groups.rs`: `FontGroupsEditorState`, the "Группы" section — create/list/rename/delete
+  VIRTUAL font groups and edit their members. Reaches the model ONLY through the virtual-group
+  facade (`font_admin::{list_virtual_groups, create/delete/rename_virtual_group,
+  add/remove_virtual_group_member, set_virtual_group_member_alias}`), caching the snapshot and
+  refreshing on `fonts_revision()`. BOTH create AND rename validation reject a blank name or a
+  case-insensitive collision with an existing virtual group OR a real folder-group name (the
+  folder names are passed in from `font_settings.rs`'s off-thread pass, and threaded into the
+  editor window for rename); each surfaces a red error near its row. Deletion uses an inline
+  two-step confirm (NOT a child-viewport modal — those have an input-routing bug here); the
+  confirm is guarded against a physical double-click and auto-disarms when the pointer leaves the
+  armed button. Owns the
+  group-editor `egui::Window` (pinned `Id`, follows the group name on rename) with a virtualized
+  member list (per-member alias edit + remove; unresolved paths shown greyed, never
+  auto-removed) and an inline add-member picker mirroring the import-picker body. The member
+  names and the picker candidates render in their OWN typeface via the shared
+  `crate::widgets::font_preview` helpers, VISIBLE rows only, bounded by the shared
+  `PICKER_PREVIEW_FONT_CAP` (reused from `font_settings.rs`).
 - `font_properties_window.rs`: the per-font PROPERTIES window (`FontPropertiesState`, one open
   at a time on `FontSettingsEditorState`). Identity header, an editable display-name override
   (wired to `font_admin::set_display_name_override(&Path, ..)` — the facade computes the key),
@@ -48,6 +67,9 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 - UI ONLY: no font-model logic lives here. The single sanctioned entry point to typing's font
   administration is `crate::tabs::typing::font_admin`; do not add or reach for any other typing
   internal. egui font-preview registration uses `crate::widgets::font_preview`.
+- Own-typeface rule: wherever a font's name is displayed and/or the font is selectable, render
+  the name in that font itself when available (see the contract in
+  `src/tabs/typing/panel/MODULE_README.md`, "Font model exposure").
 - Do not block the GUI thread: font enumeration and font-file analysis run on worker threads,
   results polled over `mpsc`.
 - i18n: the font-settings strings keep the HISTORICAL `typing.font_settings.*` key namespace
@@ -59,7 +81,8 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 ## Editing map
 - To change the pane layout or the non-font blocks, edit `mod.rs`.
 - To change the font list, categories, or import picker, edit `font_settings.rs`.
-- To change the per-font properties window (rename editor, glyph grid, kerning viewer), edit
-  `font_properties_window.rs`.
+- To change the per-font properties window (rename editor, glyph grid, kerning viewer, the
+  per-font "Группы" membership section), edit `font_properties_window.rs`.
+- To change the "Группы" section or the group-editor window, edit `font_groups.rs`.
 - To reach a NEW piece of font-model state, add a wrapper to `crate::tabs::typing::font_admin`
   first, then call it here — never widen a typing internal to `pub(crate)`.

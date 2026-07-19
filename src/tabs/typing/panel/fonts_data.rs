@@ -4,9 +4,13 @@ File: panel/fonts_data.rs
 Purpose:
 Serde schema and disk I/O for the app-level per-font settings document
 `fonts_data.json`, stored inside the app fonts directory (`resolve_fonts_dir()`).
-This file is the single on-disk home for the user-imported system font FILE paths
-and per-font UI settings (currently a display-name override). Font discovery never
-picks it up because it only scans `.ttf/.otf/.ttc`.
+This file is the single on-disk home for the user-imported system font FILE paths,
+per-font UI settings (currently a display-name override), and user-defined VIRTUAL
+font groups. Font discovery never picks it up because it only scans `.ttf/.otf/.ttc`.
+
+Downgrade note: `virtual_groups` is an ADDITIVE field (schema stays `version: 1`). An
+OLDER binary that loads and then saves `fonts_data.json` does not know the field and
+will silently DROP all virtual groups — the accepted cost of an additive-field schema.
 
 Main responsibilities:
 - define the versioned JSON schema (`version: 1`) and its serde mirror;
@@ -25,6 +29,8 @@ Key types:
 - `FontsData` (decoded in-memory form consumed by `font_settings_store`)
 - `LoadOutcome` (Missing / Loaded / Invalid load result)
 - `FontSettingsEntry` (per-font settings block: display-name override)
+- `VirtualFontGroup` / `VirtualFontGroupMember` (user-defined virtual font groups; serde
+  mirror AND decoded form; sanitized by `sanitize_virtual_groups` on load and save)
 
 Key functions:
 - `font_settings_key` (pure key derivation, unit-tested)
@@ -60,6 +66,37 @@ struct FontSettingsEntry {
     display_name: Option<String>,
 }
 
+/// One member of a [`VirtualFontGroup`]: a reference to a real known font (a folder font
+/// or an imported system font) by its stable `font_settings_key`, plus an optional
+/// per-group display alias. The JSON member key is `"font"`.
+///
+/// Used directly as BOTH the serde mirror and the decoded form: the referenced font is
+/// always a plain key string, so no separate disk/runtime split is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::tabs::typing) struct VirtualFontGroupMember {
+    /// `font_settings_key` of the referenced real font (folder-relative or absolute path).
+    pub font: String,
+    /// Optional per-group display alias. Absent/`None` means "use the font's own label".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// A user-defined VIRTUAL font group: a named, ordered set of real fonts referenced by
+/// key. Virtual groups exist purely in config (no real files on disk), unlike folder
+/// groups discovered under `fonts/groups/`. Member order is user-significant (a `Vec`).
+///
+/// Used directly as BOTH the serde mirror and the decoded form (see [`VirtualFontGroupMember`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::tabs::typing) struct VirtualFontGroup {
+    /// Group display name. Non-blank and unique case-insensitively across virtual groups
+    /// (enforced by [`sanitize_virtual_groups`] on load/save and by the runtime store).
+    #[serde(default)]
+    pub name: String,
+    /// Ordered group members; user order preserved.
+    #[serde(default)]
+    pub members: Vec<VirtualFontGroupMember>,
+}
+
 /// Serde mirror of the entire `fonts_data.json` document. Every field has a serde
 /// default so a partial or future-version document still deserializes its known keys.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,6 +111,10 @@ struct FontsDataFile {
     /// Per-font settings keyed by `font_settings_key`.
     #[serde(default)]
     font_settings: BTreeMap<String, FontSettingsEntry>,
+    /// User-defined virtual font groups (additive since `version: 1`; see the file header
+    /// downgrade note). Sanitized on decode AND encode.
+    #[serde(default)]
+    virtual_groups: Vec<VirtualFontGroup>,
 }
 
 /// Decoded in-memory form of `fonts_data.json` consumed by `font_settings_store`.
@@ -86,6 +127,9 @@ pub(in crate::tabs::typing) struct FontsData {
     pub imported_system_fonts: Vec<PathBuf>,
     /// Display-name overrides keyed by `font_settings_key`. Empty values are dropped.
     pub display_name_overrides: BTreeMap<String, String>,
+    /// User-defined virtual font groups, sanitized (blank names/keys dropped, blank aliases
+    /// normalized to `None`, duplicate members/groups removed, user order preserved).
+    pub virtual_groups: Vec<VirtualFontGroup>,
 }
 
 /// Absolute (or fonts-dir-relative) path of the `fonts_data.json` document.
@@ -198,6 +242,50 @@ pub(in crate::tabs::typing) fn quarantine_bad_file(fonts_dir: &Path) {
     }
 }
 
+/// Sanitizes a list of virtual font groups, applied on BOTH decode and encode so the
+/// on-disk and in-memory forms are always well-formed. Rules (order preserved throughout):
+/// - drop groups whose trimmed name is empty;
+/// - deduplicate groups by case-insensitive name (FIRST wins);
+/// - within a group, drop members whose trimmed font key is empty;
+/// - deduplicate members by font key within a group (FIRST wins);
+/// - normalize blank/whitespace-only aliases to `None`.
+///
+/// Names, keys, and aliases are trimmed. Round-trip is lossless for already-sane data.
+#[must_use]
+fn sanitize_virtual_groups(groups: Vec<VirtualFontGroup>) -> Vec<VirtualFontGroup> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut out: Vec<VirtualFontGroup> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let name = group.name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Case-insensitive group-name dedup; first occurrence wins.
+        if !seen_names.insert(name.to_lowercase()) {
+            continue;
+        }
+        let mut seen_keys: HashSet<String> = HashSet::new();
+        let mut members: Vec<VirtualFontGroupMember> = Vec::with_capacity(group.members.len());
+        for member in group.members {
+            let font = member.font.trim().to_string();
+            if font.is_empty() {
+                continue;
+            }
+            // Duplicate member keys within one group collapse to the first entry.
+            if !seen_keys.insert(font.clone()) {
+                continue;
+            }
+            let alias = member
+                .alias
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            members.push(VirtualFontGroupMember { font, alias });
+        }
+        out.push(VirtualFontGroup { name, members });
+    }
+    out
+}
+
 /// Converts the serde mirror into the decoded runtime form: string paths become
 /// `PathBuf`s (empty strings skipped) and only non-empty display-name overrides are kept.
 fn decode(file: FontsDataFile) -> FontsData {
@@ -223,6 +311,7 @@ fn decode(file: FontsDataFile) -> FontsData {
     FontsData {
         imported_system_fonts,
         display_name_overrides,
+        virtual_groups: sanitize_virtual_groups(file.virtual_groups),
     }
 }
 
@@ -279,6 +368,7 @@ fn encode(data: &FontsData) -> FontsDataFile {
         version: FONTS_DATA_VERSION,
         imported_system_fonts,
         font_settings,
+        virtual_groups: sanitize_virtual_groups(data.virtual_groups.clone()),
     }
 }
 
@@ -383,6 +473,7 @@ mod tests {
                 PathBuf::from("/usr/share/fonts/Roboto.otf"),
             ],
             display_name_overrides: overrides,
+            virtual_groups: Vec::new(),
         };
         save_to_file(&path, &data).expect("save must succeed");
         let loaded = expect_loaded(load_outcome_from_file(&path));
@@ -455,6 +546,127 @@ mod tests {
         let loaded = expect_loaded(load_outcome_from_file(&path));
         assert_eq!(loaded.imported_system_fonts, vec![PathBuf::from("/x/A.ttf")]);
         let _ = fs::remove_file(&path);
+    }
+
+    /// Convenience constructor for a member with no alias.
+    fn member(font: &str) -> VirtualFontGroupMember {
+        VirtualFontGroupMember {
+            font: font.to_string(),
+            alias: None,
+        }
+    }
+
+    /// Convenience constructor for a member with an alias.
+    fn member_alias(font: &str, alias: &str) -> VirtualFontGroupMember {
+        VirtualFontGroupMember {
+            font: font.to_string(),
+            alias: Some(alias.to_string()),
+        }
+    }
+
+    #[test]
+    fn virtual_groups_round_trip_with_aliases_and_order() {
+        let path = unique_temp_path("vgroups_roundtrip");
+        let groups = vec![
+            VirtualFontGroup {
+                name: "Экшн".to_string(),
+                members: vec![
+                    member_alias("groups/Manga/Bold.ttf", "Жирный"),
+                    member("Comic.otf"),
+                ],
+            },
+            VirtualFontGroup {
+                name: "Диалоги".to_string(),
+                members: vec![member("/usr/share/fonts/NotoSans.ttf")],
+            },
+        ];
+        let data = FontsData {
+            imported_system_fonts: Vec::new(),
+            display_name_overrides: BTreeMap::new(),
+            virtual_groups: groups.clone(),
+        };
+        save_to_file(&path, &data).expect("save must succeed");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        // Group AND member order must survive the round-trip verbatim.
+        assert_eq!(loaded.virtual_groups, groups);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_document_without_virtual_groups_loads_empty() {
+        let path = unique_temp_path("vgroups_absent");
+        let raw = r#"{
+            "version": 1,
+            "imported_system_fonts": [],
+            "font_settings": {}
+        }"#;
+        fs::write(&path, raw).expect("write doc without virtual_groups");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert!(
+            loaded.virtual_groups.is_empty(),
+            "a document predating virtual groups must load with an empty vec"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_extra_json_fields_in_virtual_groups_still_parse() {
+        let path = unique_temp_path("vgroups_extra_fields");
+        // Unknown keys at the document and group/member level must be ignored, not fail.
+        let raw = r#"{
+            "version": 1,
+            "virtual_groups": [
+                {
+                    "name": "G1",
+                    "members": [ { "font": "A.ttf", "future_flag": true } ],
+                    "future_group_key": 42
+                }
+            ],
+            "unknown_future_key": 123
+        }"#;
+        fs::write(&path, raw).expect("write doc with extra fields");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded.virtual_groups.len(), 1);
+        assert_eq!(loaded.virtual_groups[0].name, "G1");
+        assert_eq!(loaded.virtual_groups[0].members, vec![member("A.ttf")]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sanitize_drops_blank_names_keys_and_dedups() {
+        let input = vec![
+            // Blank name -> dropped entirely.
+            VirtualFontGroup {
+                name: "   ".to_string(),
+                members: vec![member("A.ttf")],
+            },
+            VirtualFontGroup {
+                name: "  Keep  ".to_string(),
+                members: vec![
+                    member(""),                          // blank key -> dropped
+                    member_alias("A.ttf", "   "),        // blank alias -> None
+                    member("A.ttf"),                     // duplicate key -> dropped (first wins)
+                    member_alias("B.ttf", "  Bee  "),    // alias trimmed
+                ],
+            },
+            // Case-insensitive duplicate of "Keep" -> dropped (first wins).
+            VirtualFontGroup {
+                name: "keep".to_string(),
+                members: vec![member("C.ttf")],
+            },
+        ];
+        let out = sanitize_virtual_groups(input);
+        assert_eq!(out.len(), 1, "blank + duplicate groups must be dropped");
+        let group = &out[0];
+        assert_eq!(group.name, "Keep", "the name must be trimmed");
+        assert_eq!(
+            group.members,
+            vec![
+                // First "A.ttf" survives with its blank alias normalized to None.
+                member("A.ttf"),
+                member_alias("B.ttf", "Bee"),
+            ]
+        );
     }
 
     #[test]

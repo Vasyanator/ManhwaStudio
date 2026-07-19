@@ -138,7 +138,7 @@ use egui::{Align, Color32, ColorImage, Id, Rect, TextureHandle, TextureOptions, 
 #[cfg(not(target_arch = "wasm32"))]
 use rfd::FileDialog;
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::ops::Range;
@@ -728,6 +728,14 @@ pub(crate) struct FontEntry {
     /// per-entry family-or-label default at construction; overwritten by
     /// `assign_font_identity_names` once the full list is known.
     identity_name: String,
+    /// Per-VIRTUAL-group display aliases for this font, keyed by the (merged) group
+    /// name → the alias to SHOW while that group is active. Populated by
+    /// `fonts::apply_virtual_groups` from each membership's optional per-group alias.
+    /// DISPLAY ONLY: never a resolution key, never persisted into layers/presets, and
+    /// never sent to the renderer — it only changes what the font-selection combo
+    /// shows while the owning virtual group is the active group. Empty by default and
+    /// for fonts with no aliased virtual membership.
+    virtual_group_aliases: BTreeMap<String, String>,
 }
 
 impl FontEntry {
@@ -740,6 +748,23 @@ impl FontEntry {
     /// font-settings UI (via `font_admin`) can present it.
     pub(crate) fn display_label(&self) -> &str {
         self.display_name.as_deref().unwrap_or(&self.label)
+    }
+
+    /// Name to SHOW for this font WITHIN a given active font group.
+    ///
+    /// When `active_group` is `Some(group)` and this font carries a per-group alias for
+    /// `group` (a VIRTUAL-group membership alias from `fonts_data`), that alias is
+    /// returned; otherwise this falls back to `display_label()`. DISPLAY ONLY — like
+    /// `display_label`, the result is never a resolution key, never persisted, and never
+    /// reaches the renderer; it only changes what the font-selection combo shows.
+    pub(in crate::tabs::typing) fn display_label_in_group(&self, active_group: Option<&str>) -> &str {
+        if let Some(group) = active_group
+            && let Some(alias) = self.virtual_group_aliases.get(group)
+        {
+            alias
+        } else {
+            self.display_label()
+        }
     }
 
     /// Representative font FILE path. `pub(crate)` accessor for the settings font UI.

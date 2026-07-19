@@ -235,6 +235,7 @@ mod tests {
             original_name: original_name.to_string(),
             display_name: None,
             identity_name: super::super::fonts::default_font_identity_name(original_name, label),
+            virtual_group_aliases: std::collections::BTreeMap::new(),
         }
     }
 
