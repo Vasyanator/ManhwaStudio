@@ -16,6 +16,8 @@ Key functions:
 - upsert_rect_coords_into_extra
 - bubbles_stamp
 - page_info_content_size
+- clamp_char_range / char_range_to_byte_range / splice_char_range / hangul_seed_at_caret
+  (pure char<->byte text-splicing helpers used by the Hangul keyboard insert path)
 
 Notes:
 - Функции не держат runtime state `CanvasView`.
@@ -33,6 +35,7 @@ use egui::{Color32, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const BUBBLE_TEXT_FONT_FAMILY_NAME: &str = "canvas-bubble-unicode";
@@ -801,6 +804,87 @@ pub(crate) fn page_info_content_size(page_info: &PageImageInfo) -> Option<Vec2> 
     ))
 }
 
+/// Clamps a CHAR range to `[0, text.chars().count()]` and keeps `start <= end`.
+///
+/// The caret recorded by the Hangul keyboard session can go stale when the field text changes
+/// under the open panel (machine translation, OCR, a remote model update). Clamping here is the
+/// single guard that keeps the splice in bounds instead of panicking or writing at a stale offset.
+pub(crate) fn clamp_char_range(text: &str, range: &Range<usize>) -> Range<usize> {
+    let char_count = text.chars().count();
+    let start = range.start.min(char_count);
+    let end = range.end.min(char_count).max(start);
+    start..end
+}
+
+/// Converts a CHAR index to a byte index in `text`, or `None` when it is past the end.
+///
+/// Local equivalent of the typing panel's private helper: the canvas may not reach into
+/// `src/tabs/typing/panel` internals, and char-index arithmetic on bytes is a correctness trap
+/// with multi-byte text (every Hangul jamo and syllable is 3 bytes in UTF-8).
+fn char_index_to_byte_index(text: &str, char_index: usize) -> Option<usize> {
+    let char_count = text.chars().count();
+    if char_index > char_count {
+        return None;
+    }
+    if char_index == char_count {
+        return Some(text.len());
+    }
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+}
+
+/// Converts a CHAR range to the matching byte range in `text`.
+///
+/// The range is clamped first, so the result is always a valid char-boundary byte range and the
+/// function only returns `None` if `text` is mutated concurrently (impossible here — it is `&str`).
+pub(crate) fn char_range_to_byte_range(text: &str, range: &Range<usize>) -> Option<Range<usize>> {
+    let clamped = clamp_char_range(text, range);
+    let start = char_index_to_byte_index(text, clamped.start)?;
+    let end = char_index_to_byte_index(text, clamped.end)?;
+    Some(start..end)
+}
+
+/// Replaces the CHAR range `range` of `text` with `insert`.
+///
+/// Returns the spliced string and the CHAR index just past the inserted text (the new caret).
+/// `range` is clamped to `text` first, so an out-of-date caret degrades to an append at the end
+/// rather than a panic. Returns `None` only if the char↔byte conversion fails.
+pub(crate) fn splice_char_range(
+    text: &str,
+    range: &Range<usize>,
+    insert: &str,
+) -> Option<(String, usize)> {
+    let clamped = clamp_char_range(text, range);
+    let byte_range = char_range_to_byte_range(text, &clamped)?;
+    let mut spliced = text.to_owned();
+    spliced.replace_range(byte_range, insert);
+    Some((spliced, clamped.start + insert.chars().count()))
+}
+
+/// Finds the Hangul syllable the keyboard should be seeded from for the caret `caret`.
+///
+/// Two cases, in this order:
+/// - exactly one selected char that `hangul::is_syllable` → that selection;
+/// - an empty caret preceded by a syllable → the single char before the caret.
+///
+/// Returns the syllable and its CHAR range, or `None` when neither applies (the keyboard then
+/// starts empty and an insert appends at the caret).
+pub(crate) fn hangul_seed_at_caret(text: &str, caret: &Range<usize>) -> Option<(char, Range<usize>)> {
+    let clamped = clamp_char_range(text, caret);
+    let char_at = |index: usize| text.chars().nth(index);
+    if clamped.end == clamped.start + 1 {
+        let c = char_at(clamped.start)?;
+        return ms_text_util::hangul::is_syllable(c).then_some((c, clamped));
+    }
+    if clamped.start == clamped.end && clamped.start > 0 {
+        let index = clamped.start - 1;
+        let c = char_at(index)?;
+        return ms_text_util::hangul::is_syllable(c).then_some((c, index..clamped.start));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,5 +1105,60 @@ mod tests {
         }
         // Area 0 stayed where it was (not resized to fill the red rect).
         assert!((areas[0].area_rect.p1.x - 0.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clamp_char_range_bounds_a_stale_caret() {
+        // Text shrank under the open panel: both ends clamp to the new length.
+        assert_eq!(clamp_char_range("가나", &(5..9)), 2..2);
+        assert_eq!(clamp_char_range("가나", &(1..9)), 1..2);
+        // Inverted input can never produce a reversed range. Built field-wise because the literal
+        // `2..0` form is (rightly) rejected by clippy::reversed_empty_ranges.
+        let inverted = Range { start: 2, end: 0 };
+        assert_eq!(clamp_char_range("가나", &inverted), 2..2);
+        assert_eq!(clamp_char_range("", &(0..0)), 0..0);
+    }
+
+    #[test]
+    fn char_range_to_byte_range_uses_char_boundaries() {
+        // Every Hangul syllable is 3 bytes: byte arithmetic on char indices would split a glyph.
+        let text = "가나다";
+        assert_eq!(char_range_to_byte_range(text, &(1..2)), Some(3..6));
+        assert_eq!(char_range_to_byte_range(text, &(0..3)), Some(0..9));
+        // Mixed-width text: 'a' is 1 byte, 'ㅋ' is 3.
+        assert_eq!(char_range_to_byte_range("aㅋb", &(1..2)), Some(1..4));
+    }
+
+    #[test]
+    fn splice_char_range_inserts_and_reports_the_new_caret() {
+        // Empty caret => pure insertion.
+        assert_eq!(
+            splice_char_range("가다", &(1..1), "나"),
+            Some(("가나다".to_owned(), 2))
+        );
+        // Non-empty range => replacement of that range.
+        assert_eq!(
+            splice_char_range("가나다", &(1..2), "AB"),
+            Some(("가AB다".to_owned(), 3))
+        );
+        // Stale caret past the end degrades to an append, never a panic.
+        assert_eq!(
+            splice_char_range("가", &(7..9), "나"),
+            Some(("가나".to_owned(), 2))
+        );
+    }
+
+    #[test]
+    fn hangul_seed_at_caret_detects_the_syllable_to_replace() {
+        // Caret right after a syllable seeds from it.
+        assert_eq!(hangul_seed_at_caret("각", &(1..1)), Some(('각', 0..1)));
+        // A single selected syllable seeds from the selection.
+        assert_eq!(hangul_seed_at_caret("가각", &(1..2)), Some(('각', 1..2)));
+        // No syllable before the caret, at the start, or in a wider selection.
+        assert_eq!(hangul_seed_at_caret("ab", &(2..2)), None);
+        assert_eq!(hangul_seed_at_caret("각", &(0..0)), None);
+        assert_eq!(hangul_seed_at_caret("각각", &(0..2)), None);
+        // Compatibility jamo are not precomposed syllables and must not seed.
+        assert_eq!(hangul_seed_at_caret("ㅋ", &(1..1)), None);
     }
 }

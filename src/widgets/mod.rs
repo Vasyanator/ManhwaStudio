@@ -25,6 +25,15 @@ FILE HEADER (widgets/mod.rs)
   - `AiButton`: an AI-tool launch button that gates its own availability on the
     process-global capability signals (backend/torch/onnxruntime) and paints an
     optional corner marker badge with the painter only.
+  - `HangulKeyboard` (`HangulKeyboardState` + `show_hangul_keyboard`): an
+    on-screen Korean jamo keyboard. `Compose` mode latches one key per L/V/T row
+    and emits the assembled syllable on the `Insert` button; an explicit
+    replace-previous toggle (`HangulInsertPlacement`) lets the user choose whether
+    Insert appends a new syllable or overwrites the character before the caret.
+    `Direct` mode emits a single compatibility jamo per click. The widget only
+    draws: it never mutates text and never touches `egui::TextEditState`, it
+    returns a `HangulKeyboardOutcome` (`insert` + `replace_previous`) and the
+    consumer decides where the text goes.
   - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
     localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
     short-lived background worker, or both — text above the animation. An optional
@@ -35,6 +44,7 @@ mod ai_button;
 mod autocomplete_line;
 mod editable_combo_box;
 mod font_preview;
+mod hangul_keyboard;
 mod help_hint;
 mod marked_scroll;
 mod seed_spin_box;
@@ -54,6 +64,11 @@ pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]
 pub use font_preview::{combo_font_family_name, ensure_font_family, is_font_family_bound};
+#[allow(unused_imports)]
+pub use hangul_keyboard::{
+    HangulInsertPlacement, HangulKeyboardMode, HangulKeyboardOutcome, HangulKeyboardState,
+    show_hangul_keyboard,
+};
 #[allow(unused_imports)]
 pub use help_hint::{HelpHint, HelpHintResponse};
 #[allow(unused_imports)]

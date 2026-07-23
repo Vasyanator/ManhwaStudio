@@ -7,8 +7,12 @@ set, and language-aware line segmentation. Extracted from `src/` so the renderer
 can be its own crate without reaching back into the application crate.
 
 ## Architecture
-Three independent modules. None reads config or touches the filesystem.
+Four independent modules. None reads config or touches the filesystem.
 
+- `hangul`: pure modern-Hangul syllable arithmetic (the U+AC00 block) plus the
+  compatibility-jamo caption tables used to label jamo indices in UI. Deliberately
+  unrelated to `language`: Korean is not a typesetting language here, and this
+  module must not touch `TextLanguage` / `ScriptGroup` or the global language.
 - `language`: `TextLanguage` (concrete typesetting language) and `ScriptGroup`
   (the segmentation engine family), plus the process-global selected language
   (`set_text_language` / `text_language`, backed by an `AtomicU8` with an explicit
@@ -23,7 +27,12 @@ Three independent modules. None reads config or touches the filesystem.
   `segmentation/MODULE_README.md`.
 
 ## Files and submodules
-- `src/lib.rs`: crate root; re-exports the three modules.
+- `src/lib.rs`: crate root; re-exports the four modules.
+- `src/hangul.rs`: `SYLLABLE_BASE`, `CHOSEONG_COUNT` / `JUNGSEONG_COUNT` /
+  `JONGSEONG_COUNT`, the `*_COMPAT` caption tables, and `compose` / `decompose` /
+  `is_syllable`. Total functions — out-of-range input returns `None`, never panics.
+  Edit it for jamo tables or syllable math; consumers (the jamo keyboard widget)
+  live in the app crate.
 - `src/language.rs`: `TextLanguage`, `ScriptGroup`, `set_text_language`,
   `text_language`. Also the UI-facing metadata used by the settings selector and the
   font-coverage tooltip: `TextLanguage::name_key`, `ScriptGroup::all` /
@@ -55,3 +64,5 @@ Three independent modules. None reads config or touches the filesystem.
 - To change which characters hang, edit `DEFAULT_HANGING_PUNCTUATION` (and the
   app's config default) — see `text_punctuation.rs`.
 - To change segmentation/hyphenation behavior, see `segmentation/`.
+- To change Hangul jamo captions or syllable arithmetic, see `hangul.rs`; its
+  full 11 172-syllable round-trip test is the correctness gate.

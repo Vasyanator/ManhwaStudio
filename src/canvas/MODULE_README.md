@@ -60,6 +60,81 @@ shows only an up-arrow toggle; expanded slides a popup panel up with the arrow r
 no hint). Per-tab content and config persistence live in the tabs, not here.
 `scene.canvas_bottom_hint_rect` (last-frame rect) occludes canvas zoom/drag input under the hint.
 
+The canvas also owns the floating Hangul jamo keyboard (`widgets::show_hangul_keyboard`), opened
+from the ORIGINAL/TRANSLATION context menu of a text bubble. `BubbleMenuContext::field` carries
+which field was right-clicked (`None` for the bubble-body menu) and gates that item; the item
+returns the deferred `BubbleMenuCommand::OpenHangulKeyboard(BubbleTextField)`, applied in
+`apply_bubble_menu_command` like every other state-mutating menu action.
+
+The panel is DECOUPLED from its insertion field. Two independent pieces of state model this:
+`bubble_runtime.hangul_keyboard: Option<HangulKeyboardState>` is "the panel is open" and holds ONLY
+the widget's latch/mode/placement state; `bubble_runtime.hangul_target: Option<HangulInsertTarget>`
+(bubble id, field, captured `TextEdit` id) is a STICKY pointer to the last bubble text field that
+held keyboard focus. The target is NOT rebuilt every frame like `focused_text_input`: clicking a
+panel button steals focus off the `TextEdit`, so a per-frame target would vanish the moment the
+user acts. It persists until another insert-eligible field is focused, its bubble is removed, or the
+project changes. `open_hangul_keyboard_session` no longer binds: it opens the panel, seeds the
+target from the right-clicked field (resolving the `TextEdit` id from the per-frame
+`bubble_text_edit_ids` registry, falling back to `focused_text_input`; opens with `None` target and
+logs a warning if the field was not drawn this frame), and pre-latches the widget from the syllable
+before the field's caret (`hangul_seed_at_caret`, char only — the range is discarded).
+
+Replace-previous is now computed LIVE, so there is no stored range to go stale under an OCR/MT
+rewrite (the old seed machinery is gone). `apply_hangul_keyboard_insert(target, insert,
+replace_previous, …)` reads the CURRENT caret each time (from `focused_text_input` when it still
+matches the target, else egui's stored cursor for `target.text_edit_id`, else end-of-text; clamped)
+and turns it into the splice range via `hangul_insert_splice_range`: a non-empty selection is
+replaced in both modes, a collapsed caret at `p` with `replace_previous && p > 0` targets the single
+char before it (`(p-1)..p`), otherwise a plain insert at `p`. One `char`, not a grapheme cluster —
+precomposed syllables and compat jamo are single scalars. The splice goes through
+`helpers::splice_char_range` (always char↔byte conversion), then caret + focus are restored through
+`target.text_edit_id`. The runtime write uses the same `schedule_text_upsert` +
+`commit_text_upsert_now` pair as `apply_paste_text`, and additionally stages
+`capture_bubble_history_before_mutation` first — which `apply_paste_text` does NOT do — so one
+insert becomes one bubble-history entry. That entry is not what Ctrl+Z hits right after an insert:
+the insert path deliberately restores focus to the `TextEdit` (the right UX), and `handle_shortcuts`
+gates the bubble history on `!ctx.egui_wants_keyboard_input()`, which in egui 0.35 is
+`memory.focused().is_some()`. So while the field is focused Ctrl+Z is consumed by egui's own
+`TextEdit` undoer; the bubble-history entry is what applies once focus is elsewhere.
+
+`mod.rs::draw_hangul_keyboard_panel` draws the panel after the scene pass as an `egui::Window` with
+a literal id, owns closing through `Window::open`, and publishes its rect into
+`scene.canvas_hangul_keyboard_rect`, which is folded into the same `handle_shortcuts` `inside_canvas`
+occlusion test as `canvas_bottom_hint_rect` — without it the wheel over the panel would zoom the page
+underneath. The rect is published only on the keep-open path: `handle_shortcuts` consumes last
+frame's value, so publishing it on the frame the window is closed would swallow one further frame of
+Ctrl+wheel zoom over dead space. Each frame it resolves the CURRENT valid target: "valid" now means
+DRAWN this frame, i.e. present in `bubble_text_edit_ids` — existence alone is not enough, because an
+on-top ORIGINAL field after deselect or any bubble scrolled off-screen still has runtime text but no
+live widget, and an insert there would splice off-screen at a stale caret whose focus restore no-ops.
+A TRULY-gone target (its bubble/field no longer exists at all) is still evicted, but a target that was
+merely not drawn this frame stays sticky and becomes valid again when the field scrolls back into view.
+The registry also owns the field's current id, so the panel takes `text_edit_id` from it as the single
+source of truth. When there is no valid target it draws a RED warning line
+(`canvas.hangul_keyboard.no_target_warning`) above the keyboard and DROPS any insert — the panel stays
+open (losing a target is not a reason to close; that is the whole point of unbinding). On a successful
+Compose insert the panel clears the widget latches (via `HangulKeyboardState::clear`) — the widget no
+longer self-clears on Insert, so a dropped insert keeps the composition, and a Direct-mode jamo insert
+never clears the surviving latches. The panel has exactly two close paths — the user closing the window, and a project
+switch — and TWO target-eviction points: `remove_runtime_bubble` clears `hangul_target` if it points
+at the removed bubble (the panel stays open and shows the warning), and
+`close_hangul_session_on_project_change` (called at the top of `sync_runtime_from_model_or_project`)
+clears BOTH the panel and the target. The second is required because bubble ids are per-project: a
+resync into another project updates colliding ids in place through `upsert_runtime_from_bubble` and
+never reaches `remove_runtime_bubble`, so an open panel would silently retarget. Its signal is
+`project.paths.bubbles_file`, which changes exactly on a project switch and never on an edit.
+
+`note_focused_bubble_text_input` records THREE things per drawn field: the widget `Id` into the
+per-frame `bubble_text_edit_ids` registry (unconditionally — a right-click does not focus an egui
+`TextEdit`), and, only for the focused field, the caret into `focused_text_input` AND the sticky
+`hangul_target`. The registry and `focused_text_input` are cleared at the top of each `draw`;
+`hangul_target` is not (that is what makes it sticky). The widget id is always CAPTURED from
+`response.id`, never reconstructed from a salt: of the four registered field flavours, three
+(`aside_original`, `aside_translation`, `on_top_original`) derive an absolute `Id::new(salt)` through
+`SpellcheckedTextEdit::id_salt`, while `on_top_text` uses a ui-scoped `make_persistent_id` that
+cannot be reproduced outside its owning `Ui`. One captured id covers both derivations and cannot
+silently drift when a salt is renamed.
+
 The top-left canvas controls panel (`scene.rs::draw_canvas_controls`) is a movable, collapsible
 auto-sized `Area`. Its zoom row also carries the canvas-shortcuts hover chip
 (`canvas.shortcuts_hint.*`), right-aligned via `egui::containers::Sides` in
@@ -212,6 +287,12 @@ X range before the old overflow point.
   `mod.rs`, and the source-page texture owner in `app.rs`.
 - To change bubble editing behavior, start in `bubble_runtime.rs` and the relevant
   bubble UI module.
+- To change the Hangul keyboard wiring (panel open/close, the sticky insert target, live caret
+  capture, the text splice), edit `bubble_runtime.rs` (`open_hangul_keyboard_session`,
+  `apply_hangul_keyboard_insert`, `hangul_insert_splice_range`, the `hangul_target` eviction points);
+  for the window itself, its default position, the no-target warning, or its input occlusion, edit
+  `mod.rs::draw_hangul_keyboard_panel` and `scene.canvas_hangul_keyboard_rect`. The keyboard
+  content is a general-purpose widget and lives in `src/widgets/hangul_keyboard.rs`.
 - To change canvas hook contracts, public runtime DTOs, or persisted canvas settings, start in
   `types.rs`, `mod.rs`, and `settings.rs`.
 - To change background preparation or settings-save threading, edit `workers.rs` and the caller

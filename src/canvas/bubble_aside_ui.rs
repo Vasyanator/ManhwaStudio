@@ -1673,6 +1673,7 @@ fn draw_aside_slots(
                                     bubble_type: snapshot.bubble_type,
                                     original_text: &new_original,
                                     translated_text: &new_text,
+                                    field: Some(BubbleTextField::Original),
                                 },
                             );
                             interacted_with_bubble |= outcome.interacted;
@@ -1735,6 +1736,7 @@ fn draw_aside_slots(
                                     bubble_type: snapshot.bubble_type,
                                     original_text: &new_original,
                                     translated_text: &new_text,
+                                    field: Some(BubbleTextField::Translation),
                                 },
                             );
                             interacted_with_bubble |= outcome.interacted;
@@ -1806,6 +1808,8 @@ fn draw_aside_slots(
                     bubble_type: snapshot.bubble_type,
                     original_text: &new_original,
                     translated_text: &new_text,
+                    // Bubble-body menu: no target field, so no per-field items.
+                    field: None,
                 },
             );
             interacted_with_bubble |= outcome.interacted;

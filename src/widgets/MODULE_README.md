@@ -47,6 +47,22 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   a font into egui. Used by the typing create/edit panels and the settings font-settings
   widget. Registration is ADD-ONLY (egui never evicts a font), so a caller scrolling a large
   catalog must bound how many distinct families it registers.
+- `hangul_keyboard.rs`: on-screen Korean jamo keyboard. `HangulKeyboardState` holds the latched
+  choseong/jungseong/jongseong indices, the mode, and the user-selected insert placement
+  (`HangulInsertPlacement`: `Append` / `ReplacePrevious`);
+  `show_hangul_keyboard(ui, &mut state) -> HangulKeyboardOutcome` draws the CONTENT only — the
+  consumer owns the window/area, the target field, and the caret. The widget never mutates text and
+  never touches `egui::TextEditState`; it reports `insert` / `replace_previous` and at
+  most one insert per frame. `Compose` mode latches exactly one key per row (T index 0 is the
+  explicit "no final consonant" key and is stored as `None`, never `Some(0)`) and inserts the
+  composed syllable on the explicit `Insert` button. An explicit checkbox toggle in the action row
+  chooses the placement: append a new syllable or replace the character before the caret (the
+  consumer computes the replaced range live from the caret; the widget only reports the choice).
+  `load_syllable` pre-latches from a syllable and presets the placement to `ReplacePrevious`.
+  `Direct` mode makes the same keys momentary and inserts a single compatibility jamo per click
+  (always appending), plus a quick row of frequent onomatopoeia jamo.
+  All jamo arithmetic and caption tables come from `ms_text_util::hangul`. The jamo captions and the
+  `∅` marker are Unicode data, deliberately not localized (`dev-docs/i18n_exclusions.md`).
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
   list.
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
@@ -105,3 +121,5 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - To change text styling/highlight layout, edit `text_edit_plus.rs` and verify wrapped lines and
   explicit newlines.
 - To change viewport eyedropper behavior, edit `viewport_color_selector.rs`.
+- To change jamo keyboard layout or latch semantics, edit `hangul_keyboard.rs`; the syllable
+  arithmetic and the compatibility-jamo tables belong to `crates/ms-text-util/src/hangul.rs`.

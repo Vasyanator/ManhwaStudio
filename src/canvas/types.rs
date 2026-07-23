@@ -15,6 +15,7 @@ Key structures:
 - SourceTextureUploadBudget
 - BubbleAction / BubbleClass / BubbleType / BubbleMode / BubbleTextField / BubbleCopyPasteTarget
 - BubbleMenuContext / BubbleMenuCommand / BubbleMenuOutcome
+- FocusedBubbleTextInput / HangulInsertTarget
 - RectCoords
 - RuntimeBubble
 - OverlayPreparedTile / OverlayPreparedPage
@@ -30,6 +31,7 @@ use crate::project::{ProjectData, Side};
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
 use serde_json::{Map, Value};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -534,7 +536,11 @@ pub(crate) struct OnTopDragState {
     pub(crate) moved: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Which of a text bubble's two editable string fields an operation targets.
+///
+/// `Hash` is required because the per-frame text-edit id registry
+/// (`BubbleRuntimeState::bubble_text_edit_ids`) is keyed by `(bubble id, field)`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum BubbleTextField {
     Original,
     Translation,
@@ -560,6 +566,11 @@ pub struct BubbleMenuContext<'a> {
     pub original_text: &'a str,
     /// Live translation-text buffer; copied verbatim by "Copy translation".
     pub translated_text: &'a str,
+    /// The text field whose context menu this is; `None` for the bubble-body menu.
+    ///
+    /// Gates the per-field items (currently the Hangul keyboard entry), which are meaningless
+    /// without a target field and a caret inside it.
+    pub field: Option<BubbleTextField>,
 }
 
 /// A single deferred mutation requested by a bubble context menu.
@@ -580,6 +591,8 @@ pub enum BubbleMenuCommand {
     PasteText(BubbleTextField),
     /// Switch this bubble to the given display type.
     SwitchType(BubbleType),
+    /// Open the floating Hangul jamo keyboard for the given bubble field.
+    OpenHangulKeyboard(BubbleTextField),
 }
 
 /// Result of rendering a bubble context menu.
@@ -628,11 +641,45 @@ pub(crate) struct PendingBubblePaste {
     pub(crate) field: BubbleTextField,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Snapshot of the bubble text field that holds keyboard focus this frame.
+///
+/// Rebuilt every frame by `note_focused_bubble_text_input` from the live widget `Response`;
+/// `None` when no bubble field is focused. Not `Copy`: `char_range` owns a `Range<usize>`.
+#[derive(Debug, Clone)]
 pub(crate) struct FocusedBubbleTextInput {
     pub(crate) bid: i64,
     pub(crate) field: BubbleTextField,
     pub(crate) has_selection: bool,
+    /// Id of the focused `egui::TextEdit`, CAPTURED from its `Response` at draw time.
+    ///
+    /// Never reconstructed from an `id_salt`: the aside wrappers use an absolute
+    /// `Id::new(salt)`, the on-top translation field a ui-scoped `make_persistent_id`, and the
+    /// image-area description field egui's own parent-scoped `TextEdit::id_salt`. The last two
+    /// are not reproducible without the owning `Ui`, and a captured id cannot silently drift
+    /// when a salt is renamed.
+    pub(crate) text_edit_id: egui::Id,
+    /// Caret / selection of that field in CHARS (sorted, `start <= end`), or `None` when egui
+    /// has no stored cursor for it yet.
+    pub(crate) char_range: Option<Range<usize>>,
+}
+
+/// The bubble text field a floating Hangul keyboard insert currently targets.
+///
+/// The open panel (`BubbleRuntimeState::hangul_keyboard`) is unbound from any field: it inserts
+/// into whichever field last held keyboard focus, tracked here as a STICKY target. Unlike
+/// `FocusedBubbleTextInput`, this is not rebuilt or cleared every frame — clicking a panel button
+/// steals focus off the `TextEdit`, so a per-frame target would vanish the moment the user acts.
+/// It persists until a different field is focused, the bubble is removed, or the project changes.
+///
+/// It carries no caret: the insert path reads the live caret from the focus tracker (or egui's
+/// stored cursor for `text_edit_id`) each time, so there is no stored range to go stale.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HangulInsertTarget {
+    pub(crate) bid: i64,
+    pub(crate) field: BubbleTextField,
+    /// Captured id of the field's `TextEdit`, used to read the live caret and restore caret +
+    /// focus after an insert.
+    pub(crate) text_edit_id: egui::Id,
 }
 
 #[derive(Debug, Clone, Copy)]

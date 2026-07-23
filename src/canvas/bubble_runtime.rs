@@ -20,6 +20,9 @@ Key functions:
 - flush_bubble_upserts_to_model()
 - sync_runtime_from_model_or_project()
 - apply_pending_actions()
+- note_focused_bubble_text_input(): per-frame widget-id registry + focused caret capture
+- open_hangul_keyboard_session() / apply_hangul_keyboard_insert(): floating jamo keyboard; the
+  panel is unbound from its field and inserts into the sticky `hangul_target` with a LIVE splice
 
 Notes:
 - This module intentionally excludes aside/on-top widget layout and scene drawing.
@@ -28,16 +31,18 @@ Notes:
 */
 
 use super::helpers::{
-    bubble_fingerprint, bubbles_stamp, default_text_area_box, image_area_rect_from_bubble,
-    normalize_image_text_areas, parse_image_text_areas, sanitize_clipboard_text,
-    serialize_image_text_areas, side_to_string, upsert_rect_coords_into_extra,
+    bubble_fingerprint, bubbles_stamp, clamp_char_range, default_text_area_box,
+    hangul_seed_at_caret, image_area_rect_from_bubble, normalize_image_text_areas,
+    parse_image_text_areas, sanitize_clipboard_text, serialize_image_text_areas, side_to_string,
+    splice_char_range, upsert_rect_coords_into_extra,
 };
 use super::bubble_action::BubbleSnapshotOp;
 use super::types::{
     AsideDragState, AsideItem, BubbleAction, BubbleCopyPasteTarget, BubbleTextField,
-    CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput, ImageTextArea,
-    OnTopDragState, PageBubbleBuckets, PendingBubblePaste, RectCoords, RuntimeBubble,
+    CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput, HangulInsertTarget,
+    ImageTextArea, OnTopDragState, PageBubbleBuckets, PendingBubblePaste, RectCoords, RuntimeBubble,
 };
+use crate::widgets::HangulKeyboardState;
 use super::{
     BUBBLE_HISTORY_LIMIT, BubbleClass, BubbleType, CanvasHooks, CanvasView,
     DUPLICATE_BUBBLE_OFFSET_PX, TEXT_UPSERT_DEBOUNCE_SECS, read_system_clipboard_text,
@@ -118,6 +123,42 @@ fn sort_page_bubble_column(mut entries: Vec<PageBubbleEntry>) -> Vec<AsideItem> 
     entries.into_iter().map(|(item, ..)| item).collect()
 }
 
+/// Reads the stored caret/selection of a `TextEdit` as a sorted CHAR range.
+///
+/// Returns `None` when egui has no cursor stored for `text_edit_id` yet (the field has never been
+/// clicked into). egui 0.35 hands back a `Range<CharIndex>`, so the newtype is unwrapped with `.0`.
+fn text_edit_char_range(ctx: &egui::Context, text_edit_id: egui::Id) -> Option<std::ops::Range<usize>> {
+    let range = egui::TextEdit::load_state(ctx, text_edit_id)?
+        .cursor
+        .char_range()?
+        .as_sorted_char_range();
+    Some(range.start.0..range.end.0)
+}
+
+/// Computes the CHAR range a Hangul keyboard insert splices over, given the live caret/selection.
+///
+/// `sel` is the field's current caret as a sorted char range (already clamped to the text). A
+/// non-empty selection is replaced in BOTH modes — typing over a selection replaces it, the
+/// standard editor behaviour. For a collapsed caret at position `p`, `replace_previous` with
+/// `p > 0` targets exactly the one char before the caret (`(p - 1)..p`); otherwise the range is
+/// the empty `p..p` plain insertion point. It always spans one `char`, never a grapheme cluster:
+/// precomposed Hangul syllables and compatibility jamo are single Unicode scalar values, so one
+/// char is exactly one syllable/jamo.
+fn hangul_insert_splice_range(
+    sel: &std::ops::Range<usize>,
+    replace_previous: bool,
+) -> std::ops::Range<usize> {
+    if sel.start != sel.end {
+        return sel.clone();
+    }
+    let p = sel.start;
+    if replace_previous && p > 0 {
+        (p - 1)..p
+    } else {
+        p..p
+    }
+}
+
 pub(super) struct BubbleRuntimeState {
     pub(super) runtime_bubbles: HashMap<i64, RuntimeBubble>,
     pub(super) selected_bubble: Option<i64>,
@@ -137,6 +178,28 @@ pub(super) struct BubbleRuntimeState {
     pub(super) runtime_fingerprints: HashMap<i64, u64>,
     pub(super) focused_bubbles: HashSet<i64>,
     pub(super) focused_text_input: Option<FocusedBubbleTextInput>,
+    /// Per-frame `(bubble id, field) -> egui TextEdit id` registry, filled at draw time by
+    /// `note_focused_bubble_text_input` for every drawn field (focused or not).
+    ///
+    /// The Hangul keyboard is opened from a RIGHT-click, and egui's `TextEdit` requests focus
+    /// only on a primary click, so `focused_text_input` may well be `None` at that moment. This
+    /// registry is what still yields the field's captured widget id. Cleared each frame together
+    /// with `focused_text_input`.
+    pub(super) bubble_text_edit_ids: HashMap<(i64, BubbleTextField), egui::Id>,
+    /// Open floating Hangul jamo keyboard, or `None` when the panel is closed. Holds ONLY the
+    /// widget's latch/mode state; the field it inserts into is the sticky `hangul_target`, not a
+    /// field captured when the panel opened.
+    pub(super) hangul_keyboard: Option<HangulKeyboardState>,
+    /// Sticky insertion target for the open Hangul keyboard: the last bubble text field that held
+    /// keyboard focus. Persists across panel-button clicks (which steal focus off the `TextEdit`)
+    /// and is re-pointed whenever another insert-eligible field gains focus. Cleared when its
+    /// bubble is removed or the project changes; independent of whether the panel is open.
+    pub(super) hangul_target: Option<HangulInsertTarget>,
+    /// `paths.bubbles_file` of the project the runtime is currently synced against, or `None`
+    /// before the first sync. Bubble ids are per-project, so a change here means every id the
+    /// runtime holds now refers to a different bubble; see
+    /// `close_hangul_session_on_project_change`.
+    pub(super) synced_project_file: Option<std::path::PathBuf>,
     pub(super) deferred_remote_bubbles: HashMap<i64, Bubble>,
     pub(super) deferred_remote_deletes: HashSet<i64>,
     pub(super) canvas_context_menu_target: Option<CanvasContextMenuTarget>,
@@ -173,6 +236,10 @@ impl Default for BubbleRuntimeState {
             runtime_fingerprints: HashMap::new(),
             focused_bubbles: HashSet::new(),
             focused_text_input: None,
+            bubble_text_edit_ids: HashMap::new(),
+            hangul_keyboard: None,
+            hangul_target: None,
+            synced_project_file: None,
             deferred_remote_bubbles: HashMap::new(),
             deferred_remote_deletes: HashSet::new(),
             canvas_context_menu_target: None,
@@ -1094,7 +1161,7 @@ impl CanvasView {
     fn copy_focused_text_input_shortcut(
         &mut self,
         ctx: &egui::Context,
-        focused: FocusedBubbleTextInput,
+        focused: &FocusedBubbleTextInput,
     ) -> bool {
         let Some(bubble) = self.bubble_runtime.runtime_bubbles.get(&focused.bid) else {
             return false;
@@ -1107,6 +1174,16 @@ impl CanvasView {
         true
     }
 
+    /// Records one bubble text field's widget id, and its caret when the field has focus.
+    ///
+    /// Called by the aside/on-top layers once per drawn field, every frame. The widget `Id` is
+    /// taken from `response.id` — the only reliable source, since the three field flavours derive
+    /// their ids differently and two of them are not reproducible outside their owning `Ui`.
+    /// The id registry is filled unconditionally (the Hangul keyboard opens from a right-click,
+    /// which does not focus the field); `focused_text_input` is still written only for the field
+    /// that actually holds focus. The focused field also becomes the sticky Hangul insert target
+    /// (`hangul_target`), which — unlike `focused_text_input` — is NOT cleared each frame, so the
+    /// open panel keeps inserting here after a panel-button click steals focus off the `TextEdit`.
     pub(super) fn note_focused_bubble_text_input(
         &mut self,
         ctx: &egui::Context,
@@ -1114,16 +1191,27 @@ impl CanvasView {
         field: BubbleTextField,
         response: &egui::Response,
     ) {
+        self.bubble_runtime
+            .bubble_text_edit_ids
+            .insert((bid, field), response.id);
         if !response.has_focus() {
             return;
         }
-        let has_selection = egui::TextEdit::load_state(ctx, response.id)
-            .and_then(|state| state.cursor.char_range())
-            .is_some_and(|range| !range.is_empty());
+        let char_range = text_edit_char_range(ctx, response.id);
+        let has_selection = char_range.as_ref().is_some_and(|range| !range.is_empty());
         self.bubble_runtime.focused_text_input = Some(FocusedBubbleTextInput {
             bid,
             field,
             has_selection,
+            text_edit_id: response.id,
+            char_range,
+        });
+        // Re-point the sticky Hangul insert target at whatever field currently holds focus, so an
+        // open panel follows the caret instead of the field it was opened on.
+        self.bubble_runtime.hangul_target = Some(HangulInsertTarget {
+            bid,
+            field,
+            text_edit_id: response.id,
         });
     }
 
@@ -1155,11 +1243,13 @@ impl CanvasView {
         for ev in clipboard_events {
             match ev {
                 ClipboardEvent::Copy => {
-                    if let Some(focused) = self.bubble_runtime.focused_text_input {
+                    // Cloned out of the runtime so the `&mut self` copy call below is free of the
+                    // borrow; the struct is small (two ids, a flag and an optional range).
+                    if let Some(focused) = self.bubble_runtime.focused_text_input.clone() {
                         if focused.has_selection {
                             continue;
                         }
-                        if !self.copy_focused_text_input_shortcut(ctx, focused) {
+                        if !self.copy_focused_text_input_shortcut(ctx, &focused) {
                             runtime_log::log_warn(format!(
                                 "[canvas::bubble_runtime] failed to copy focused bubble text; bubble_id={}",
                                 focused.bid
@@ -1258,7 +1348,208 @@ impl CanvasView {
         self.commit_text_upsert_now(bid);
     }
 
+    /// Returns a copy of one runtime bubble text field, or `None` when the bubble is gone.
+    pub(super) fn runtime_bubble_field_text(
+        &self,
+        bid: i64,
+        field: BubbleTextField,
+    ) -> Option<String> {
+        let bubble = self.bubble_runtime.runtime_bubbles.get(&bid)?;
+        Some(match field {
+            BubbleTextField::Original => bubble.original_text.clone(),
+            BubbleTextField::Translation => bubble.text.clone(),
+        })
+    }
+
+    /// Opens the floating Hangul keyboard and seeds its sticky insert target from `bid` / `field`.
+    ///
+    /// Opening no longer BINDS the panel to a field: it only sets `hangul_keyboard` (widget state)
+    /// and points the sticky `hangul_target` at the right-clicked field so the panel works before
+    /// the user focuses anything. A right-click does not focus an egui `TextEdit`, so the field's
+    /// `TextEdit` id is resolved from the per-frame `bubble_text_edit_ids` registry (falling back
+    /// to `focused_text_input` when it matches). If the field was not drawn this frame, the panel
+    /// still opens with `hangul_target = None` (the red warning explains why) and a warning is
+    /// logged. When a target resolves, the widget is pre-latched from the syllable immediately
+    /// before that field's caret (via [`hangul_seed_at_caret`]), which presets its placement to
+    /// replace-previous.
+    pub(super) fn open_hangul_keyboard_session(
+        &mut self,
+        ctx: &egui::Context,
+        bid: i64,
+        field: BubbleTextField,
+    ) {
+        let mut state = HangulKeyboardState::default();
+        // Resolve the target field's TextEdit id: registry first (covers the right-click-without-
+        // focus case), then the focus tracker when it happens to match.
+        let text_edit_id = self
+            .bubble_runtime
+            .bubble_text_edit_ids
+            .get(&(bid, field))
+            .copied()
+            .or_else(|| {
+                self.bubble_runtime
+                    .focused_text_input
+                    .as_ref()
+                    .filter(|focused| focused.bid == bid && focused.field == field)
+                    .map(|focused| focused.text_edit_id)
+            });
+        match text_edit_id {
+            Some(text_edit_id) => {
+                self.bubble_runtime.hangul_target = Some(HangulInsertTarget {
+                    bid,
+                    field,
+                    text_edit_id,
+                });
+                // Pre-latch the widget from the syllable before the caret, as a convenience. The
+                // caret comes from the focus tracker (if it matches), else egui's stored cursor,
+                // else end-of-text — only used to find that one char; the range is discarded.
+                if let Some(text) = self.runtime_bubble_field_text(bid, field) {
+                    let char_count = text.chars().count();
+                    let caret = self
+                        .bubble_runtime
+                        .focused_text_input
+                        .as_ref()
+                        .filter(|focused| focused.bid == bid && focused.field == field)
+                        .and_then(|focused| focused.char_range.clone())
+                        .or_else(|| text_edit_char_range(ctx, text_edit_id))
+                        .map_or(char_count..char_count, |range| {
+                            clamp_char_range(&text, &range)
+                        });
+                    if let Some((syllable, _range)) = hangul_seed_at_caret(&text, &caret) {
+                        // `load_syllable` returns whether a syllable was pre-latched; opening does
+                        // not depend on that outcome, only on its side effect (placement default).
+                        let _ = state.load_syllable(syllable);
+                    }
+                }
+            }
+            None => {
+                // The field is not on screen this frame (collapsed/read-only layout), so there is
+                // no widget id to insert through yet. Open anyway with no target: the panel shows
+                // the red warning until an insert-eligible field is focused.
+                self.bubble_runtime.hangul_target = None;
+                runtime_log::log_warn(format!(
+                    "[canvas::bubble_runtime] Hangul keyboard opened without a target: text field was not drawn this frame; bubble_id={bid}; field={field:?}"
+                ));
+            }
+        }
+        self.bubble_runtime.hangul_keyboard = Some(state);
+        ctx.request_repaint();
+    }
+
+    /// Splices one Hangul keyboard insert into `target`'s field, computing the range LIVE.
+    ///
+    /// The replace-previous decision is not stored — it is recomputed here from the CURRENT caret,
+    /// so there is no range that can go stale under the panel (an OCR/MT result rewriting the
+    /// field between opening and inserting simply changes where the live caret sits). The live
+    /// caret/selection comes from the focus tracker when it still matches `target`, otherwise from
+    /// egui's stored cursor for `target.text_edit_id`, otherwise end-of-text; it is clamped, and
+    /// [`hangul_insert_splice_range`] turns it into the splice range (see there for the mode rules).
+    ///
+    /// The runtime text is written through the same `schedule_text_upsert` +
+    /// `commit_text_upsert_now` pair as `apply_paste_text`; unlike that path it also stages a
+    /// bubble-history snapshot first (`capture_bubble_history_before_mutation`), so one insert is
+    /// one entry in the canvas bubble history. Afterwards the caret is restored and focus handed
+    /// back through `target.text_edit_id`.
+    ///
+    /// Returns `false`, with the cause logged, when the bubble vanished or the splice could not be
+    /// computed; the caller then drops the stale target (but keeps the panel open).
+    pub(super) fn apply_hangul_keyboard_insert(
+        &mut self,
+        ctx: &egui::Context,
+        target: HangulInsertTarget,
+        insert: &str,
+        replace_previous: bool,
+        now_s: f64,
+    ) -> bool {
+        let Some(text) = self.runtime_bubble_field_text(target.bid, target.field) else {
+            runtime_log::log_warn(format!(
+                "[canvas::bubble_runtime] Hangul keyboard insert dropped: runtime bubble is missing; bubble_id={}",
+                target.bid
+            ));
+            return false;
+        };
+        let char_count = text.chars().count();
+        // Live caret: the focus tracker when it still matches this target, else egui's stored
+        // cursor for the field, else the end of the text. Always clamped to the current text.
+        let sel = self
+            .bubble_runtime
+            .focused_text_input
+            .as_ref()
+            .filter(|focused| focused.bid == target.bid && focused.field == target.field)
+            .and_then(|focused| focused.char_range.clone())
+            .or_else(|| text_edit_char_range(ctx, target.text_edit_id))
+            .map_or(char_count..char_count, |range| {
+                clamp_char_range(&text, &range)
+            });
+        let splice_range = hangul_insert_splice_range(&sel, replace_previous);
+        let Some((spliced, new_caret)) = splice_char_range(&text, &splice_range, insert) else {
+            runtime_log::log_warn(format!(
+                "[canvas::bubble_runtime] Hangul keyboard insert dropped: char/byte conversion failed; bubble_id={}; field={:?}",
+                target.bid, target.field
+            ));
+            return false;
+        };
+        self.capture_bubble_history_before_mutation();
+        let Some(bubble) = self.bubble_runtime.runtime_bubbles.get_mut(&target.bid) else {
+            // Unreachable: `runtime_bubble_field_text` above already proved the bubble exists and
+            // nothing between the two lookups can remove it. Logged rather than silent, so a
+            // future refactor that breaks that invariant is diagnosable. The snapshot staged just
+            // above is harmless here: `finalize_pending_history` deduplicates by model revision,
+            // and no mutation followed, so nothing is recorded.
+            runtime_log::log_error(format!(
+                "[canvas::bubble_runtime] Hangul keyboard insert dropped: runtime bubble disappeared between the read and the write; bubble_id={}; field={:?}",
+                target.bid, target.field
+            ));
+            return false;
+        };
+        match target.field {
+            BubbleTextField::Original => bubble.original_text = spliced,
+            BubbleTextField::Translation => bubble.text = spliced,
+        }
+        bubble.mounted = true;
+        self.schedule_text_upsert(target.bid, now_s);
+        self.commit_text_upsert_now(target.bid);
+        // Restore the caret and hand focus back. The field was drawn earlier this frame, so both
+        // take effect on the next frame — which is why the repaint request below is mandatory.
+        let mut state = egui::TextEdit::load_state(ctx, target.text_edit_id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(new_caret),
+                egui::text::CCursor::new(new_caret),
+            )));
+        state.store(ctx, target.text_edit_id);
+        ctx.memory_mut(|mem| mem.request_focus(target.text_edit_id));
+        ctx.request_repaint();
+        true
+    }
+
+    /// Closes the Hangul keyboard and clears its target when the canvas starts syncing against a
+    /// DIFFERENT project, and records the new project identity.
+    ///
+    /// The insert target is keyed by bubble id, and ids are per-project. A resync into another
+    /// project updates every id present in BOTH projects in place through `upsert_runtime_from_bubble`
+    /// and never reaches `remove_runtime_bubble` (which only evicts the target), so an open panel
+    /// targeting bubble 5 would silently retarget to the new project's bubble 5. A project switch
+    /// invalidates everything, so both the panel and the target are dropped. `paths.bubbles_file`
+    /// is the cheapest signal that covers this: it changes exactly on a project switch and never
+    /// on an edit, and this is the single per-frame entry point of the resync path.
+    fn close_hangul_session_on_project_change(&mut self, project: &ProjectData) {
+        let current = project.paths.bubbles_file.as_path();
+        if self.bubble_runtime.synced_project_file.as_deref() == Some(current) {
+            return;
+        }
+        self.bubble_runtime.synced_project_file = Some(current.to_path_buf());
+        self.bubble_runtime.hangul_target = None;
+        if self.bubble_runtime.hangul_keyboard.take().is_some() {
+            runtime_log::log_info(
+                "[canvas::bubble_runtime] Hangul keyboard closed: the canvas is syncing against a different project",
+            );
+        }
+    }
+
     pub(super) fn sync_runtime_from_model_or_project(&mut self, project: &ProjectData) {
+        self.close_hangul_session_on_project_change(project);
         if let Some(model) = self.bubble_runtime.bubbles_model.clone() {
             let mut model_bubbles: Option<(u64, Vec<Bubble>)> = None;
             let mut model_canvas: Option<(u64, SharedCanvasSettings)> = None;
@@ -1950,6 +2241,17 @@ impl CanvasView {
         {
             self.bubble_runtime.pending_bubble_paste = None;
         }
+        // The sticky Hangul insert target may point at this bubble; a removed bubble leaves it at
+        // a dead id, so it is cleared here alongside the per-bubble caches. The panel itself stays
+        // OPEN (it is unbound from any field) and shows the red warning until another field is
+        // focused — that is the whole point of decoupling the panel from its insertion target.
+        if self
+            .bubble_runtime
+            .hangul_target
+            .is_some_and(|target| target.bid == bid)
+        {
+            self.bubble_runtime.hangul_target = None;
+        }
         if self.bubble_runtime.selected_bubble == Some(bid) {
             self.bubble_runtime.selected_bubble = None;
         }
@@ -1980,10 +2282,14 @@ impl CanvasView {
         if self
             .bubble_runtime
             .focused_text_input
+            .as_ref()
             .is_some_and(|focused| focused.bid == bid)
         {
             self.bubble_runtime.focused_text_input = None;
         }
+        self.bubble_runtime
+            .bubble_text_edit_ids
+            .retain(|(entry_bid, _), _| *entry_bid != bid);
         self.scene.on_top_hit_rects.remove(&bid);
         // Evict per-bubble image caches so deleted ids do not leak across a session and a
         // reused bubble id cannot serve a stale fingerprint/preview from the previous bubble.
@@ -2136,6 +2442,172 @@ mod tests {
         assert!(!canvas.image_bubble_meta_cache.contains_key(&21));
         assert!(!canvas.image_bubble_preview_cache.contains_key(&21));
         assert!(!canvas.bubble_runtime.runtime_bubbles.contains_key(&21));
+    }
+
+    /// Inserts a minimal TEXT runtime bubble whose original field holds `original`.
+    fn insert_text_bubble(canvas: &mut CanvasView, bubble_id: i64, original: &str) {
+        let rect = RectCoords {
+            p1: egui::pos2(0.1, 0.1),
+            p2: egui::pos2(0.5, 0.5),
+        };
+        canvas.bubble_runtime.runtime_bubbles.insert(
+            bubble_id,
+            RuntimeBubble {
+                id: bubble_id,
+                img_idx: 0,
+                img_u: 0.3,
+                img_v: 0.3,
+                side: Side::Left,
+                bubble_class: BubbleClass::Text,
+                bubble_type: BubbleType::Aside,
+                text: String::new(),
+                original_text: original.to_string(),
+                rect_coords: rect,
+                anchor_y: 0.0,
+                max_width_px: 200.0,
+                height_px: 80.0,
+                line_x: 0.0,
+                mounted: false,
+                text_areas: Vec::new(),
+                image_block_rects: Vec::new(),
+            },
+        );
+    }
+
+    /// A fixed `TextEdit` id shared by the Hangul insert tests below.
+    fn hangul_test_field_id() -> egui::Id {
+        egui::Id::new("test_hangul_field")
+    }
+
+    /// Builds an insert target for `bid`'s ORIGINAL field on the fixed test `TextEdit` id.
+    fn hangul_target(bid: i64) -> HangulInsertTarget {
+        HangulInsertTarget {
+            bid,
+            field: BubbleTextField::Original,
+            text_edit_id: hangul_test_field_id(),
+        }
+    }
+
+    /// Points `focused_text_input` at `bid`'s ORIGINAL field with the given live char range, so
+    /// `apply_hangul_keyboard_insert` reads that caret/selection instead of egui's stored cursor.
+    fn set_focused_original_caret(
+        canvas: &mut CanvasView,
+        bid: i64,
+        char_range: std::ops::Range<usize>,
+    ) {
+        let has_selection = !char_range.is_empty();
+        canvas.bubble_runtime.focused_text_input = Some(FocusedBubbleTextInput {
+            bid,
+            field: BubbleTextField::Original,
+            has_selection,
+            text_edit_id: hangul_test_field_id(),
+            char_range: Some(char_range),
+        });
+    }
+
+    #[test]
+    fn hangul_insert_splice_range_covers_append_replace_and_selection() {
+        // Collapsed caret, append mode: the empty insertion point at the caret.
+        assert_eq!(hangul_insert_splice_range(&(2..2), false), 2..2);
+        // Collapsed caret, replace-previous with p > 0: exactly the char before the caret.
+        assert_eq!(hangul_insert_splice_range(&(3..3), true), 2..3);
+        // Collapsed caret at 0, replace-previous: nothing precedes it, so degrade to a plain
+        // insertion at 0 rather than an out-of-range replace.
+        assert_eq!(hangul_insert_splice_range(&(0..0), true), 0..0);
+        // A non-empty selection is replaced in BOTH modes.
+        assert_eq!(hangul_insert_splice_range(&(1..3), false), 1..3);
+        assert_eq!(hangul_insert_splice_range(&(1..3), true), 1..3);
+    }
+
+    #[test]
+    fn hangul_insert_appends_then_replace_previous_overwrites_prior_syllable() {
+        // Multi-byte Hangul (each syllable is 3 UTF-8 bytes): an append lands one char before the
+        // caret's char index, and a replace-previous overwrites exactly the one syllable before it,
+        // proving the char↔byte conversion in the splice does not corrupt neighbours.
+        let ctx = egui::Context::default();
+        let mut canvas = CanvasView::default();
+        insert_text_bubble(&mut canvas, 5, "각나");
+        let target = hangul_target(5);
+
+        // Append at the end (caret 2..2): "각나" -> "각나다".
+        set_focused_original_caret(&mut canvas, 5, 2..2);
+        assert!(canvas.apply_hangul_keyboard_insert(&ctx, target, "다", false, 0.0));
+        assert_eq!(
+            canvas
+                .runtime_bubble_field_text(5, BubbleTextField::Original)
+                .as_deref(),
+            Some("각나다")
+        );
+        assert!(canvas.bubble_runtime.pending_upsert.contains(&5));
+
+        // Replace-previous at the end (caret 3..3): overwrites only '다' -> "각나라".
+        set_focused_original_caret(&mut canvas, 5, 3..3);
+        assert!(canvas.apply_hangul_keyboard_insert(&ctx, target, "라", true, 0.0));
+        assert_eq!(
+            canvas
+                .runtime_bubble_field_text(5, BubbleTextField::Original)
+                .as_deref(),
+            Some("각나라"),
+            "replace-previous must overwrite exactly the preceding multi-byte syllable"
+        );
+    }
+
+    #[test]
+    fn hangul_insert_over_a_selection_replaces_the_selection() {
+        // A non-empty selection is replaced regardless of the replace-previous flag.
+        let ctx = egui::Context::default();
+        let mut canvas = CanvasView::default();
+        insert_text_bubble(&mut canvas, 5, "각나다");
+        let target = hangul_target(5);
+
+        // Select the middle char "나" (1..2) and insert with replace_previous=false.
+        set_focused_original_caret(&mut canvas, 5, 1..2);
+        assert!(canvas.apply_hangul_keyboard_insert(&ctx, target, "X", false, 0.0));
+        assert_eq!(
+            canvas
+                .runtime_bubble_field_text(5, BubbleTextField::Original)
+                .as_deref(),
+            Some("각X다")
+        );
+    }
+
+    #[test]
+    fn removing_the_targeted_bubble_clears_the_target_but_keeps_the_panel_open() {
+        // Unbinding regression: the panel is decoupled from its insertion field, so deleting the
+        // targeted bubble must only clear `hangul_target` (the panel then shows the red warning),
+        // NOT close the whole panel.
+        let mut canvas = CanvasView::default();
+        insert_text_bubble(&mut canvas, 5, "각");
+        canvas.bubble_runtime.hangul_keyboard = Some(HangulKeyboardState::default());
+        canvas.bubble_runtime.hangul_target = Some(hangul_target(5));
+
+        canvas.remove_runtime_bubble(5);
+
+        assert!(
+            canvas.bubble_runtime.hangul_target.is_none(),
+            "the target must be cleared when its bubble is removed"
+        );
+        assert!(
+            canvas.bubble_runtime.hangul_keyboard.is_some(),
+            "the panel must stay open after its target's bubble is removed"
+        );
+    }
+
+    #[test]
+    fn project_change_closes_the_panel_and_clears_the_target() {
+        // A project switch invalidates everything (bubble ids are per-project), so both the panel
+        // and the target are dropped.
+        let mut canvas = CanvasView::default();
+        canvas.bubble_runtime.hangul_keyboard = Some(HangulKeyboardState::default());
+        canvas.bubble_runtime.hangul_target = Some(hangul_target(5));
+        canvas.bubble_runtime.synced_project_file = Some(std::path::PathBuf::from("/old/bubbles"));
+
+        let mut project = empty_project();
+        project.paths.bubbles_file = std::path::PathBuf::from("/new/bubbles");
+        canvas.close_hangul_session_on_project_change(&project);
+
+        assert!(canvas.bubble_runtime.hangul_keyboard.is_none());
+        assert!(canvas.bubble_runtime.hangul_target.is_none());
     }
 
     use crate::project::{CanvasSettings, ProjectPaths};

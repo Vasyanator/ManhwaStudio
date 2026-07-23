@@ -6,6 +6,8 @@ Crate root of `ms-text-util` — config-free text utilities shared between the
 ManhwaStudio binary and the text renderer (`ms-text-render`).
 
 Modules:
+- `hangul`: modern-Hangul syllable arithmetic (compose/decompose) and the
+  compatibility-jamo caption tables. Independent of the language model.
 - `language`: the typesetting-language model (`TextLanguage`/`ScriptGroup`) and
   the process-global selected language (seeded by the app).
 - `text_punctuation`: the global hanging-punctuation set (seeded by the app).
@@ -18,6 +20,7 @@ Contract:
   `text_punctuation::set_hanging_punctuation` and `language::set_text_language`.
 */
 
+pub mod hangul;
 pub mod language;
 pub mod segmentation;
 pub mod text_punctuation;

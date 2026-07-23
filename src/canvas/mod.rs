@@ -19,7 +19,8 @@ Main types:
 - `BubbleMode`: legacy persisted canvas mode retained for settings migration/compatibility.
 - `BubbleCopyPasteTarget`: bubble context-menu paste targets (`Original`, `Translation`, `WholeBubble`).
 - `BubbleMenuContext` / `BubbleMenuCommand` / `BubbleMenuOutcome`: input/return contract of
-  `show_bubble_context_menu` — identity+live-text input and the single deferred command it emits.
+  `show_bubble_context_menu` — identity+live-text input (including the right-clicked field, which
+  gates the per-field items) and the single deferred command it emits.
 - `RectCoords`: normalized UV rectangle used for bubble placement and resize logic.
 - `RuntimeBubble`: mutable runtime bubble state used by canvas editing/render.
 - `CopiedBubbleData`: internal clipboard payload for whole-bubble copy/paste (all non-positional data).
@@ -133,7 +134,8 @@ CanvasView method map:
   `is_bubble_locally_locked`, `bubble_extra_from_model_or_project`, `hook_bubble_for_runtime`,
   `build_copied_bubble_data`, `apply_copied_bubble_data_to_bid`,
   `note_focused_bubble_text_input`, `capture_clipboard_events`, `request_paste_from_clipboard`,
-  `apply_paste_text`, `sync_runtime_from_model_or_project`, `sync_overlays_from_model`,
+  `apply_paste_text`, `open_hangul_keyboard_session`, `apply_hangul_keyboard_insert`,
+  `draw_hangul_keyboard_panel`, `sync_runtime_from_model_or_project`, `sync_overlays_from_model`,
   `sync_runtime_from_bubbles`, `apply_deferred_remote_updates`, `upsert_runtime_from_bubble`,
   `apply_bubbles_history_snapshot`.
 - Settings persistence and visibility windows:
@@ -199,7 +201,7 @@ use self::helpers::*;
 use self::overlay_runtime::OverlayRuntimeState;
 use self::scene::CanvasSceneState;
 use self::settings::CanvasSettingsRuntime;
-use self::types::{OverlayUploadBudget, PendingPageFocus, RuntimeBubble};
+use self::types::{HangulInsertTarget, OverlayUploadBudget, PendingPageFocus, RuntimeBubble};
 use crate::app::{PageImageInfo, PageTexture};
 use crate::bubble_status::BubbleBorderStyle;
 use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest};
@@ -208,8 +210,8 @@ use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{Bubble, ProjectData};
 use crate::runtime_log;
 use crate::widgets::{
-    BarGeometry, ScrollMark, paint_marks_on_bar, queue_word_to_global_exceptions,
-    queue_word_to_project_exceptions,
+    BarGeometry, HangulKeyboardMode, HangulKeyboardOutcome, ScrollMark, paint_marks_on_bar,
+    queue_word_to_global_exceptions, queue_word_to_project_exceptions, show_hangul_keyboard,
 };
 // Native-only clipboard backend; absent on the wasm target.
 #[cfg(not(target_arch = "wasm32"))]
@@ -286,6 +288,15 @@ const BUBBLE_MIN_ANCHOR_MARGIN_PX: f32 = 10.0;
 const BUBBLE_ANCHOR_OUTSIDE_RECT_SPAN_MULT: f32 = 0.0;
 const DUPLICATE_BUBBLE_OFFSET_PX: f32 = 40.0;
 const ON_TOP_FOOTER_RESERVED_HEIGHT_PX: f32 = 220.0;
+/// Gap between the canvas edge and the floating Hangul keyboard's default position.
+const HANGUL_KEYBOARD_MARGIN_PX: f32 = 16.0;
+/// Assumed height of the Hangul keyboard used only to seed its default position near the bottom
+/// of the canvas. The window auto-sizes; this never constrains its real height.
+const HANGUL_KEYBOARD_DEFAULT_HEIGHT_PX: f32 = 360.0;
+/// Color of the "no insert target" warning line in the Hangul keyboard panel. Matches the muted
+/// error red used by the settings/status panels (`src/general_settings_panel.rs`,
+/// `src/ai_backend_panel.rs`) rather than the harsh full `Color32::RED`.
+const HANGUL_KEYBOARD_NO_TARGET_COLOR: egui::Color32 = egui::Color32::from_rgb(208, 84, 62);
 /// Floor for the image-bubble preview zoom factor: when zoomed out, the preview
 /// image never shrinks below 20% of its fit-to-bubble size.
 const IMAGE_BUBBLE_PREVIEW_MIN_ZOOM_SCALE: f32 = 0.2;
@@ -1239,6 +1250,8 @@ impl CanvasView {
         self.sync_runtime_from_model_or_project(project);
         self.bubble_runtime.focused_bubbles.clear();
         self.bubble_runtime.focused_text_input = None;
+        // Per-frame registry: rebuilt by `note_focused_bubble_text_input` during the scene pass.
+        self.bubble_runtime.bubble_text_edit_ids.clear();
         self.scene.on_top_hit_rects.clear();
         self.scene.page_aside_presence.clear();
         if self.state.show_bubbles {
@@ -1271,6 +1284,9 @@ impl CanvasView {
         // Cleared here (after `handle_shortcuts` has consumed last frame's value for occlusion) and
         // re-set by `draw_canvas_bottom_hint`; stays `None` when the tab supplies no hint.
         self.scene.canvas_bottom_hint_rect = None;
+        // Same lifecycle as the bottom hint: consumed for occlusion by `handle_shortcuts` above,
+        // cleared here, and re-set by `draw_hangul_keyboard_panel` when the panel is open.
+        self.scene.canvas_hangul_keyboard_rect = None;
         self.overlay_runtime
             .overlay_textures
             .retain(|idx, _| self.overlay_runtime.overlay_images.contains_key(idx));
@@ -1340,6 +1356,10 @@ impl CanvasView {
         if pointer_up {
             self.commit_lingering_drag_gestures_on_pointer_up();
         }
+        // Drawn after the scene pass (the canvas owns this panel, so no hook is involved) and
+        // before `flush_bubble_upserts_to_model` below, so an insert made this frame reaches the
+        // shared model in the same frame, exactly like the clipboard path.
+        self.draw_hangul_keyboard_panel(ctx, canvas_rect);
 
         self.capture_clipboard_events(project, ctx);
         self.apply_pending_actions(hooks);
@@ -1352,6 +1372,125 @@ impl CanvasView {
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
         }
+    }
+
+    /// Draws the floating Hangul jamo keyboard and applies its insert into the sticky target.
+    ///
+    /// Owned by the canvas (the first and only consumer), drawn after the scene pass as an
+    /// `egui::Window` with a LITERAL id — the localized title must never reach the id, or the
+    /// window would lose its position on a language switch. Closing is owned here through
+    /// `Window::open`; the widget itself has no close button.
+    ///
+    /// The panel is UNBOUND from any field: it inserts into `hangul_target`, the last bubble text
+    /// field that held focus, resolved fresh every frame. A target is VALID only if its field was
+    /// DRAWN this frame (present in `bubble_text_edit_ids`) — mere existence is not enough, or an
+    /// insert would splice off-screen into a field the user cannot see. A truly-gone target (bubble
+    /// or field no longer exists) is evicted; a target that was only not drawn this frame stays
+    /// sticky and can become valid again when the field scrolls back. When there is no valid target,
+    /// a red warning line is drawn above the keyboard and any insert is DROPPED — the panel stays
+    /// open, because losing a target is not a reason to close (that is the whole point of
+    /// unbinding). On a successful Compose insert the consumer clears the widget latches here (the
+    /// widget no longer self-clears), so a dropped insert keeps the composition. The only close paths
+    /// are the user closing the window and a project switch (`close_hangul_session_on_project_change`).
+    ///
+    /// The widget state is taken out of the runtime for the duration so it can be borrowed mutably
+    /// while `self` stays free for the text mutation, then put back (the panel stays open in every
+    /// non-user-close path). Publishes the window rect into `scene.canvas_hangul_keyboard_rect` for
+    /// input occlusion.
+    fn draw_hangul_keyboard_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+        let Some(mut state) = self.bubble_runtime.hangul_keyboard.take() else {
+            return;
+        };
+        // Evict a TRULY-gone target (its bubble/field no longer exists at all): that is permanent,
+        // so the sticky pointer is dropped. A target that merely was not DRAWN this frame is kept
+        // sticky — the field may scroll back into view and become valid again.
+        if let Some(target) = self.bubble_runtime.hangul_target
+            && self
+                .runtime_bubble_field_text(target.bid, target.field)
+                .is_none()
+        {
+            self.bubble_runtime.hangul_target = None;
+        }
+        // A target is USABLE this frame only if its field was DRAWN this frame, which the per-frame
+        // `bubble_text_edit_ids` registry records (rebuilt during the scene pass, before this panel
+        // draws). Existence alone is not enough: an on-top ORIGINAL field after deselect, or any
+        // bubble scrolled off-screen, still has runtime text but no live widget, so an insert would
+        // splice off-screen at a stale caret whose focus restore no-ops. Registry-presence is the
+        // primary gate; the registry also holds the field's CURRENT id, so use it as the single
+        // source of truth for `text_edit_id` (it cannot drift from the live widget).
+        let valid_target = self.bubble_runtime.hangul_target.and_then(|target| {
+            self.bubble_runtime
+                .bubble_text_edit_ids
+                .get(&(target.bid, target.field))
+                .map(|&text_edit_id| HangulInsertTarget {
+                    text_edit_id,
+                    ..target
+                })
+        });
+        let has_target = valid_target.is_some();
+        let default_pos = egui::pos2(
+            canvas_rect.left() + HANGUL_KEYBOARD_MARGIN_PX,
+            (canvas_rect.bottom() - HANGUL_KEYBOARD_DEFAULT_HEIGHT_PX)
+                .max(canvas_rect.top() + HANGUL_KEYBOARD_MARGIN_PX),
+        );
+        let mut keep_open = true;
+        let mut outcome: Option<HangulKeyboardOutcome> = None;
+        let window_response = egui::Window::new(t!("canvas.hangul_keyboard.window_title"))
+            .id(egui::Id::new("canvas_hangul_keyboard"))
+            .default_pos(default_pos)
+            .resizable(false)
+            .collapsible(true)
+            .open(&mut keep_open)
+            .show(ctx, |ui| {
+                // No caret to insert into: warn (in the repo's error-label red) before the keyboard
+                // so the user knows why pressing Insert does nothing.
+                if !has_target {
+                    ui.colored_label(
+                        HANGUL_KEYBOARD_NO_TARGET_COLOR,
+                        t!("canvas.hangul_keyboard.no_target_warning"),
+                    );
+                    ui.separator();
+                }
+                outcome = Some(show_hangul_keyboard(ui, &mut state));
+            });
+        if !keep_open {
+            // The user closed the window; dropping `state` here is the close. The rect is
+            // deliberately NOT published on this path: `handle_shortcuts` reads last frame's
+            // value, so publishing a rect for a panel that is already gone would swallow one
+            // frame of Ctrl+wheel zoom over the area the panel used to occupy.
+            return;
+        }
+        if let Some(window_response) = window_response {
+            self.scene.canvas_hangul_keyboard_rect = Some(window_response.response.rect);
+        }
+        if let Some(insert) = outcome
+            .as_ref()
+            .and_then(|outcome| outcome.insert.as_deref())
+            .filter(|insert| !insert.is_empty())
+        {
+            // With no valid target the insert is DROPPED (the red warning already explained why)
+            // and nothing is mutated; the panel stays open in both cases.
+            if let Some(target) = valid_target {
+                let replace_previous = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.replace_previous);
+                let now_s = ctx.input(|i| i.time);
+                if self.apply_hangul_keyboard_insert(ctx, target, insert, replace_previous, now_s) {
+                    // The text was applied, so it is now safe to reset the composition — the widget
+                    // no longer self-clears, so a dropped insert keeps it. Only Compose mode clears:
+                    // in Direct mode the latches are the user's surviving compose state and must NOT
+                    // be wiped by a jamo insert.
+                    if state.mode() == HangulKeyboardMode::Compose {
+                        state.clear();
+                    }
+                } else {
+                    // The failure is already logged with its cause; drop the now-stale target but
+                    // keep the panel open (a new focus can re-target it).
+                    self.bubble_runtime.hangul_target = None;
+                }
+            }
+        }
+        self.bubble_runtime.hangul_keyboard = Some(state);
     }
 
     /// Commits and clears any positional drag/resize gesture whose state is still set after the
@@ -1413,6 +1552,7 @@ impl CanvasView {
             bubble_type,
             original_text,
             translated_text,
+            field,
         } = ctx;
         let mut outcome = BubbleMenuOutcome::default();
         if ui.button(t!("canvas.bubble_menu.copy_bubble")).clicked() {
@@ -1500,6 +1640,22 @@ impl CanvasView {
             outcome.command = Some(BubbleMenuCommand::PasteText(BubbleTextField::Translation));
             outcome.interacted = true;
             ui.close();
+        }
+        // Per-field item: meaningless on the bubble-body menu, which carries no target field and
+        // therefore no caret to insert at.
+        if let Some(field) = field {
+            ui.separator();
+            if ui
+                .add_enabled(
+                    self.editable,
+                    egui::Button::new(t!("canvas.bubble_menu.open_hangul_keyboard")),
+                )
+                .clicked()
+            {
+                outcome.command = Some(BubbleMenuCommand::OpenHangulKeyboard(field));
+                outcome.interacted = true;
+                ui.close();
+            }
         }
         if self.editable {
             ui.separator();
@@ -1611,6 +1767,9 @@ impl CanvasView {
                     ));
                 }
             }
+            BubbleMenuCommand::OpenHangulKeyboard(field) => {
+                self.open_hangul_keyboard_session(ctx, bid, field);
+            }
         }
     }
 
@@ -1643,10 +1802,19 @@ impl CanvasView {
                 .canvas_bottom_hint_rect
                 .is_some_and(|rect| rect.contains(p))
         });
+        // Same occlusion contract for the floating Hangul keyboard window (also drawn after this
+        // pass, so its rect is last frame's): without this the wheel over the panel would zoom the
+        // page underneath instead of scrolling the panel.
+        let over_hangul_keyboard = pointer_pos.is_some_and(|p| {
+            self.scene
+                .canvas_hangul_keyboard_rect
+                .is_some_and(|rect| rect.contains(p))
+        });
         let inside_canvas = pointer_pos
             .map(|p| canvas_rect.contains(p))
             .unwrap_or(false)
-            && !over_bottom_hint;
+            && !over_bottom_hint
+            && !over_hangul_keyboard;
         if self.editable && !ctx.egui_wants_keyboard_input() {
             let command_shift_mods = egui::Modifiers {
                 command: true,

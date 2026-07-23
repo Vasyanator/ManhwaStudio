@@ -104,6 +104,11 @@ pub(super) struct CanvasSceneState {
     /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
     /// the hint. Reset each frame with the other per-frame scene rects.
     pub(super) canvas_bottom_hint_rect: Option<Rect>,
+    /// Screen rect of the floating Hangul keyboard window drawn last frame, or `None` when the
+    /// panel is closed. Folded into the same `inside_canvas` occlusion test as
+    /// `canvas_bottom_hint_rect`: without it the mouse wheel over the panel would zoom the page
+    /// underneath. Reset each frame with the other per-frame scene rects.
+    pub(super) canvas_hangul_keyboard_rect: Option<Rect>,
     /// Fully-expanded size of the bottom-hint body measured on the last frame it was drawn at full
     /// reveal. Drives the height-clip reveal animation so the panel grows/shrinks from the bottom
     /// with the arrow riding upward. `None` until the body has been measured at least once.
@@ -179,6 +184,7 @@ impl Default for CanvasSceneState {
             canvas_left_top_controls_rect: None,
             controls_content_width: None,
             canvas_bottom_hint_rect: None,
+            canvas_hangul_keyboard_rect: None,
             bottom_hint_body_size: None,
             view: ViewTransform::default(),
             view_established_this_frame: false,
