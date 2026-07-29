@@ -4,8 +4,9 @@ FILE HEADER (widgets/mod.rs)
 - Экспорт:
   - `EditableComboBox`: редактируемый комбобокс, который совмещает строку ввода
     и popup со списком готовых значений.
-  - `SpellcheckedTextEdit`: многострочный `TextEdit` с фоновой проверкой орфографии
-    через pure-Rust Hunspell-совместимый backend и подчёркиванием ошибочных слов.
+  - `SpellcheckedTextEdit`: `TextEdit` с фоновой проверкой орфографии через pure-Rust
+    Hunspell-совместимый backend и подчёркиванием ошибочных слов; конструкторы
+    `multiline` и `singleline` выбирают режим поля (общий layouter).
   - `AutocompleteLine`: однострочное поле ввода с выпадающим списком автодополнения
     и настраиваемым лимитом количества подсказок.
   - `WheelComboBox`: combobox, который переключает элементы колесом мыши и

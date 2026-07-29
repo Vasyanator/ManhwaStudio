@@ -346,6 +346,13 @@ impl SettingsTabState {
                 changed |= ui
                     .checkbox(&mut self.canvas_settings.cache_pages, t!("settings.canvas_ribbon.cache_pages_label"))
                     .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.canvas_settings.hint_show_outside_default,
+                        t!("settings.canvas_ribbon.hint_show_outside_default_label"),
+                    )
+                    .on_hover_text(t!("settings.canvas_ribbon.hint_show_outside_default_hint"))
+                    .changed();
 
                 ui.separator();
 

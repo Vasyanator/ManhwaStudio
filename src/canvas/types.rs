@@ -189,23 +189,42 @@ pub enum BubbleAction {
     Delete,
 }
 
+/// Domain class of a bubble, persisted as the `bubble_class` wire token.
+///
+/// `Text` is an ordinary replica, `Image` is a group of image text areas, and `Hint` is a
+/// one-line author note anchored to a page point that is injected into the composed
+/// translation prompt. Neither `Image` nor `Hint` is a display type: both are pinned to
+/// [`BubbleType::Aside`] by the canvas.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BubbleClass {
     Text,
     Image,
+    Hint,
 }
 
 impl BubbleClass {
+    /// Returns the persisted wire token. This is the one exhaustive `match` over the class.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Image => "image",
+            Self::Hint => "hint",
         }
     }
 
+    /// Parses a persisted `bubble_class` token, case-insensitively.
+    ///
+    /// Total and infallible: an unknown token falls back to [`BubbleClass::Text`]. There is no
+    /// bubble-format version field, so this is also the forward-compatibility contract — a
+    /// project containing `"hint"` bubbles opened in an older build renders them as ordinary
+    /// text bubbles. The class-specific `extra` payload is round-tripped untouched by
+    /// `Bubble`'s flattened `extra` map, so re-opening in a build that knows the token
+    /// restores the class fully.
     pub fn from_str(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("image") {
             Self::Image
+        } else if raw.eq_ignore_ascii_case("hint") {
+            Self::Hint
         } else {
             Self::Text
         }
@@ -494,6 +513,12 @@ pub(crate) struct RuntimeBubble {
     /// last editable layout. Used to route card-body drags and to target each area's link line at
     /// its block center. Index matches `text_areas`; empty until laid out.
     pub(crate) image_block_rects: Vec<Rect>,
+    /// Runtime mirror of `extra["hint_show_outside_translation"]`, meaningful only for
+    /// [`BubbleClass::Hint`]. When false the hint is hidden in the read-only tabs (cleaning,
+    /// typing); see the visibility gate in `bubble_runtime::page_bubbles_bucketed`. Kept in sync
+    /// by `upsert_runtime_from_bubble` and `patch_bubble_extra_fields`, and written back by
+    /// `flush_bubble_upserts_to_model`.
+    pub(crate) hint_show_outside: bool,
 }
 
 impl RuntimeBubble {
@@ -828,6 +853,9 @@ pub struct CanvasState {
     pub tabs_autosync_enabled: bool,
     pub cache_pages: bool,
     pub translation_status_display: TranslationStatusDisplay,
+    /// Initial value of `extra["hint_show_outside_translation"]` for a NEWLY created hint bubble.
+    /// A cross-project user preference; existing hints keep their own per-bubble value.
+    pub hint_show_outside_default: bool,
 }
 
 impl Default for CanvasState {
@@ -860,6 +888,7 @@ impl Default for CanvasState {
             tabs_autosync_enabled: true,
             cache_pages: true,
             translation_status_display: TranslationStatusDisplay::UntilNext,
+            hint_show_outside_default: false,
         }
     }
 }

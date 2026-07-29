@@ -298,7 +298,9 @@ saving, and export.
   - `render_store.rs`: create/edit/raster render-and-store workers, shape-variant grid/preview.
   - `export.rs`: PNG/PSD export jobs + page composition/flatten free fns.
   - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
-  - `helpers.rs`: selection→page resolution, bubble/area seed text, doc-node runtime, page-size/overlay disk loaders.
+  - `helpers.rs`: selection→page resolution, bubble/area seed text (incl. the `BubbleClass::Hint`
+    exclusion predicates `is_hint_bubble` / `bubble_offers_create_text_header`), doc-node runtime,
+    page-size/overlay disk loaders.
   - `geometry.rs`: small scalar/coordinate helpers (angle normalize, lerp).
   - `tests.rs`: `#[cfg(test)]` unit tests for the tab.
 - `panel.rs`: module root of the top panel. Holds the data model (all `struct`/`enum`/`const`
@@ -766,6 +768,16 @@ saving, and export.
   the settings font-import picker.
 - Shared state enters through `set_bubbles_model` and `set_overlays_model`; typing must
   not duplicate ownership of project bubbles or clean overlays.
+- **`BubbleClass::Hint` bubbles are never a text source in this tab.** A hint is an author note,
+  not a replica, and its single line lives in `Bubble.text` — the same field a replica's translation
+  uses — so nothing distinguishes it from an ordinary text bubble unless the class is checked
+  explicitly (`BubbleClass::from_str` falls back to `Text` for unknown tokens). Two guards enforce
+  it, both in `tab/helpers.rs`: `pick_bubble_text_for_selection` filters hints out of the
+  Shift-drag seed-text candidates, and `bubble_offers_create_text_header` (the body of the
+  `CanvasHooks::has_bubble_header` impl) withholds the «Создать текст» button. The second guard is
+  load-bearing because the canvas visibility gate is per-bubble: a hint with
+  `extra["hint_show_outside_translation"] == true` IS rendered here, area rect and all. Any new path
+  that turns a bubble into a text layer must add the same class check.
 
 ## Editing map
 - The tab is `tab.rs` (data model + facade + hooks + wiring) plus behavior submodules under

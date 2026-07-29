@@ -14,7 +14,8 @@ Key functions:
 - rgba_from_overlay_tile
 - rect_coords_from_bubble
 - upsert_rect_coords_into_extra
-- bubbles_stamp
+- bubbles_stamp / bubble_fingerprint_with_hasher
+- hint_show_outside_from_extra (reads the hint bubble's `extra` visibility flag)
 - page_info_content_size
 - clamp_char_range / char_range_to_byte_range / splice_char_range / hangul_seed_at_caret
   (pure char<->byte text-splicing helpers used by the Hangul keyboard insert path)
@@ -292,11 +293,21 @@ pub(crate) fn bubble_fingerprint(bubble: &Bubble) -> u64 {
     hasher.finish()
 }
 
+/// Folds every locally observable field of `bubble` into `hasher`.
+///
+/// The fingerprint drives model→runtime resync and cross-tab autosync: two records with the same
+/// fingerprint are treated as identical and the runtime copy is left untouched. It therefore has
+/// to cover the domain class and every class-specific `extra` key the canvas renders or edits —
+/// `bubble_class` (a pure class change carries no other diff), `text_areas` for image bubbles and
+/// `hint_show_outside_translation` for hint bubbles.
 pub(crate) fn bubble_fingerprint_with_hasher(
     bubble: &Bubble,
     hasher: &mut std::collections::hash_map::DefaultHasher,
 ) {
     bubble.id.hash(hasher);
+    // A class conversion (text <-> image <-> hint) may leave every other field equal, so without
+    // this the change would not propagate to other tabs.
+    bubble.bubble_class.hash(hasher);
     bubble.img_idx.hash(hasher);
     bubble.img_u.to_bits().hash(hasher);
     bubble.img_v.to_bits().hash(hasher);
@@ -317,6 +328,27 @@ pub(crate) fn bubble_fingerprint_with_hasher(
     }
     if let Some(description) = bubble.extra.get("description").and_then(Value::as_str) {
         description.hash(hasher);
+    }
+    // Hint bubbles: the per-bubble "show outside the translation tab" flag is the only thing that
+    // changes when the user toggles the footer checkbox, so it must be part of the fingerprint.
+    hint_show_outside_from_extra(&bubble.extra).hash(hasher);
+}
+
+/// Reads the hint bubble's `extra["hint_show_outside_translation"]` flag, defaulting to `false`.
+///
+/// Meaningful only for [`crate::canvas::BubbleClass::Hint`]; other classes never carry the key.
+/// The lenient JSON handling mirrors `tabs::translation::panels::bubbles::bubble_extra_bool` so a
+/// hand-edited `"true"`/`1` is read identically on both sides; the helper is duplicated rather than
+/// shared because the canvas layer must not depend on the tabs layer.
+pub(crate) fn hint_show_outside_from_extra(extra: &Map<String, Value>) -> bool {
+    match extra.get("hint_show_outside_translation") {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::Number(v)) => v.as_i64().is_some_and(|iv| iv != 0),
+        Some(Value::String(v)) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Some(Value::Null | Value::Array(_) | Value::Object(_)) | None => false,
     }
 }
 
@@ -1160,5 +1192,76 @@ mod tests {
         assert_eq!(hangul_seed_at_caret("각각", &(0..2)), None);
         // Compatibility jamo are not precomposed syllables and must not seed.
         assert_eq!(hangul_seed_at_caret("ㅋ", &(1..1)), None);
+    }
+
+    #[test]
+    fn bubble_class_round_trips_through_its_wire_token() {
+        for class in [BubbleClass::Text, BubbleClass::Image, BubbleClass::Hint] {
+            assert_eq!(BubbleClass::from_str(class.as_str()), class);
+        }
+        // Parsing is case-insensitive.
+        assert_eq!(BubbleClass::from_str("HINT"), BubbleClass::Hint);
+        assert_eq!(BubbleClass::from_str("Image"), BubbleClass::Image);
+        // Forward-compat contract: an unknown token degrades to a plain text bubble.
+        assert_eq!(BubbleClass::from_str("sticker"), BubbleClass::Text);
+        assert_eq!(BubbleClass::from_str(""), BubbleClass::Text);
+    }
+
+    #[test]
+    fn hint_show_outside_from_extra_reads_the_lenient_json_forms() {
+        let cases = [
+            (json!(true), true),
+            (json!(false), false),
+            (json!(1), true),
+            (json!(0), false),
+            (json!("on"), true),
+            (json!("off"), false),
+            // Unparseable shapes fall back to the hidden-outside default.
+            (json!("maybe"), false),
+            (json!(null), false),
+            (json!([true]), false),
+        ];
+        for (raw, expected) in cases {
+            let mut extra = Map::new();
+            extra.insert("hint_show_outside_translation".to_string(), raw.clone());
+            assert_eq!(
+                hint_show_outside_from_extra(&extra),
+                expected,
+                "unexpected reading of {raw}"
+            );
+        }
+        // A missing key means "hidden outside the translation tab".
+        assert!(!hint_show_outside_from_extra(&Map::new()));
+    }
+
+    #[test]
+    fn bubble_fingerprint_covers_class_and_hint_visibility() {
+        let base = image_bubble(Map::new());
+
+        // A pure class change carries no other diff and must still bump the fingerprint.
+        let mut as_hint = base.clone();
+        as_hint.bubble_class = Some("hint".to_string());
+        assert_ne!(bubble_fingerprint(&base), bubble_fingerprint(&as_hint));
+
+        // Toggling the per-bubble hint visibility flag must bump it too, otherwise cross-tab
+        // autosync would not propagate the footer checkbox.
+        let mut shown_outside = as_hint.clone();
+        shown_outside
+            .extra
+            .insert("hint_show_outside_translation".to_string(), json!(true));
+        assert_ne!(
+            bubble_fingerprint(&as_hint),
+            bubble_fingerprint(&shown_outside)
+        );
+
+        // An explicit `false` is the same state as an absent key.
+        let mut hidden_outside = as_hint.clone();
+        hidden_outside
+            .extra
+            .insert("hint_show_outside_translation".to_string(), json!(false));
+        assert_eq!(
+            bubble_fingerprint(&as_hint),
+            bubble_fingerprint(&hidden_outside)
+        );
     }
 }

@@ -1734,6 +1734,101 @@ mod tests {
         }
     }
 
+    /// Inserts one aside runtime bubble of `class` on page 0 (left side) into `view`.
+    fn insert_left_aside_bubble(
+        view: &mut CanvasView,
+        id: i64,
+        class: super::super::BubbleClass,
+        hint_show_outside: bool,
+    ) {
+        view.bubble_runtime.runtime_bubbles.insert(
+            id,
+            super::super::types::RuntimeBubble {
+                id,
+                img_idx: 0,
+                img_u: 0.2,
+                img_v: 0.2,
+                side: crate::project::Side::Left,
+                bubble_class: class,
+                bubble_type: super::super::BubbleType::Aside,
+                text: String::new(),
+                original_text: String::new(),
+                rect_coords: super::super::types::RectCoords {
+                    p1: egui::pos2(0.15, 0.15),
+                    p2: egui::pos2(0.25, 0.25),
+                },
+                anchor_y: 0.0,
+                max_width_px: 200.0,
+                height_px: 80.0,
+                line_x: 0.0,
+                mounted: true,
+                text_areas: Vec::new(),
+                image_block_rects: Vec::new(),
+                hint_show_outside,
+            },
+        );
+    }
+
+    #[test]
+    fn hidden_hint_reserves_no_aside_gutter_outside_the_translation_tab() {
+        // Regression: a hint hidden by its per-bubble flag must not be visible in the page LAYOUT
+        // either. `canvas_row_width_for_page` widens the page row by one aside gutter per side
+        // marked in `page_aside_presence`, so if the presence scan skipped the visibility gate a
+        // page whose only aside bubble is a hidden hint would grow an empty gutter and differ from
+        // the very same page in a project without hints.
+        const IMAGE_WIDTH: f32 = 900.0;
+
+        // Baseline: no bubbles at all -> the row is exactly the page width.
+        let mut view = CanvasView::default();
+        view.editable = false;
+        view.refresh_page_aside_presence();
+        let bare_width = view.canvas_row_width_for_page(0, IMAGE_WIDTH);
+        assert!(
+            (bare_width - IMAGE_WIDTH).abs() <= f32::EPSILON,
+            "an empty page must reserve no gutter: {bare_width}"
+        );
+
+        // Read-only tab (cleaning/typing) + hidden hint: still no gutter, and no presence entry.
+        insert_left_aside_bubble(&mut view, 1, super::super::BubbleClass::Hint, false);
+        view.refresh_page_aside_presence();
+        assert!(
+            view.scene.page_aside_presence.is_empty(),
+            "a hidden hint must not mark its page side"
+        );
+        let hidden_width = view.canvas_row_width_for_page(0, IMAGE_WIDTH);
+        assert!(
+            (hidden_width - IMAGE_WIDTH).abs() <= f32::EPSILON,
+            "a hidden hint must reserve no gutter: {hidden_width}"
+        );
+
+        // Translation tab (editable): the same hint is drawn, so its side is reserved.
+        view.editable = true;
+        view.refresh_page_aside_presence();
+        assert_eq!(view.scene.page_aside_presence.get(&0), Some(&[true, false]));
+        let editable_width = view.canvas_row_width_for_page(0, IMAGE_WIDTH);
+        assert!(
+            editable_width > IMAGE_WIDTH,
+            "a visible hint must reserve its side: {editable_width}"
+        );
+
+        // Read-only tab with the per-bubble flag ON: shown, so the side is reserved again.
+        view.editable = false;
+        insert_left_aside_bubble(&mut view, 1, super::super::BubbleClass::Hint, true);
+        view.refresh_page_aside_presence();
+        assert_eq!(view.scene.page_aside_presence.get(&0), Some(&[true, false]));
+        let opted_in_width = view.canvas_row_width_for_page(0, IMAGE_WIDTH);
+        assert!(
+            (opted_in_width - editable_width).abs() <= f32::EPSILON,
+            "an opted-in hint must reserve the same gutter as in the translation tab: \
+             {opted_in_width} != {editable_width}"
+        );
+
+        // Control: an ordinary text bubble is never gated by the hint flag.
+        insert_left_aside_bubble(&mut view, 1, super::super::BubbleClass::Text, false);
+        view.refresh_page_aside_presence();
+        assert_eq!(view.scene.page_aside_presence.get(&0), Some(&[true, false]));
+    }
+
     #[test]
     fn page_world_rect_is_horizontally_centered_in_content_width() {
         // Contract: `reserve_canvas_page_frame` writes a `page_world_rect` whose

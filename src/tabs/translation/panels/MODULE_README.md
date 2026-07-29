@@ -55,13 +55,23 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
   sending it.
 - `bubbles.rs`: searchable bubble cards, debounced original/translation text syncing, footer field
-  editing, character filters, and card context actions.
+  editing, character filters, and card context actions. The class selector converts a bubble
+  between all three `BubbleClass` values; `BubbleCardBody::for_class` is the one exhaustive
+  class→card-shape decision (single-line text vs translation+original, image controls, character
+  controls, «Перевести» action), so a new class must state what its card shows instead of
+  inheriting the text-bubble layout.
 - `composition.rs`: composed text generation from project bubbles, plain/MiniJinja formatting
   options, and TXT/DOCX export helpers. ImageBubbles are gated by the `include_image_bubbles`
   option: when enabled, each text area contributes one line `{translation}` (plus ` - {description}`
   when `use_character_names` is on and the description is non-empty); area 0 reads the legacy
   fields, later areas read `extra["text_areas"]`. The MiniJinja path simply includes/excludes image
   bubbles by the same option (their serialized `extra` already exposes `text_areas`).
+  Hint bubbles are gated by `include_hint_bubbles` and formatted as
+  `{hint_extra_sep}{hint_wrap}{line}{hint_wrap}{hint_extra_sep}` from `Bubble.text`, bypassing the
+  source mode, `ignore_translated_lines`, the replica prefix and character names entirely.
+  The plain path runs in two passes: a formatting pass turning each bubble into a `ComposedItem`,
+  then the pure `emit_composition_items` applying the limit, character merging and the hint
+  attachment rule (below). Keeping emission pure is what makes those rules unit-testable.
 
 ## Contracts and invariants
 - Panels must not start long-running work directly. They return typed actions for `tab.rs` to
@@ -74,6 +84,37 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   controller actions to the OS credential store, not serialized into project settings.
 - `bubbles.rs` must write bubble text through `CanvasView` APIs and footer fields through the
   parent tab patch queue; it must not mutate `ProjectData` directly.
+- A class switch in `bubbles.rs` seeds the target class's own `extra` keys through the footer patch
+  queue, because `CanvasView::set_bubble_class_for_bid` only swaps the class (and pins the aside
+  display type). `Image` seeds `image_source_type`/`description`; `Hint` seeds
+  `hint_show_outside_translation` from `canvas.state.hint_show_outside_default`, the same
+  user-level default the `H` creation path (`promote_bubble_to_hint`) uses, so a hint made here and
+  a hint made on the canvas start identically. A hint card shows ONE line (`Bubble.text`,
+  `original_text` stays empty), keeps the replica-order spin box, and offers neither the character
+  controls nor «Перевести» — a hint is an author note, never sent to a translator.
+- Hint attachment in `composition.rs` is a contract, not a formatting detail. It rests on the
+  **barrier rule**: an ordinary text bubble that emits nothing — filtered in pass 1 as
+  already-translated or source-less, or normalizing to an empty line — is NOT discarded. It stays
+  in reading order as a `ComposedItem::DroppedReplica`, which emits nothing and never disturbs a
+  merge group, but stops a preceding hint's lookahead. Image bubbles and hints excluded by their
+  own option leave no barrier: a hint legitimately binds across them. The "no replicas" early
+  return is keyed on the count of genuinely emitting entries, not on the stream length.
+  `classify_hint_bindings` then resolves each hint against the next replica-or-barrier:
+  an emitting replica → the hint is forward-bound and emitted immediately before it; a barrier →
+  the commented bubble is not inserted, so the hint is dropped and must never re-target the next
+  surviving replica; neither → the hint is trailing.
+  A forward-bound hint and its target replica are admitted to the character limit atomically, so a
+  hint can never outlive the replica it comments on; when the limit stops composition the queued
+  hints are dropped. The "the very first entry is always admitted" privilege belongs to that whole
+  atomic bundle, not to its first element — otherwise a leading hint would take it and starve the
+  replica it annotates. Trailing hints are never queued: they bind backward to the previous entry
+  and are force-emitted at the very end past the limit, whether or not the loop stopped on the
+  limit elsewhere. With `merge_same_character` on, a hint acts as a group boundary (flush, reset
+  the character, emit, start a fresh group) and the atomic check covers only the target replica's
+  own line, not the group it later joins. A hint is separated like any other entry — by the global
+  `sep_between`; `hint_extra_sep` is extra padding inside the entry and counts toward the limit.
+  Composition with no hints at all must stay byte-identical to the pre-hint composer; that property
+  is what the emission tests around merging, image bubbles and the limit guard.
 - Composition export may perform file writes from panel helpers because it is an explicit user
   action; errors must be returned and shown rather than ignored.
 - Language catalogs in `ocr_langs.rs` are data only. Runtime model availability and downloads are

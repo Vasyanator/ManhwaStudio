@@ -125,6 +125,9 @@ pub struct CanvasSettings {
     pub tabs_autosync_enabled: bool,
     pub cache_pages: bool,
     pub translation_status_display: String,
+    /// Initial `hint_show_outside_translation` value for newly created hint bubbles.
+    /// Loaded user-file-primary with a project-file fallback (a cross-project user preference).
+    pub hint_show_outside_default: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -208,6 +211,7 @@ impl Default for CanvasSettings {
             tabs_autosync_enabled: true,
             cache_pages: true,
             translation_status_display: "until_next".to_string(),
+            hint_show_outside_default: false,
         }
     }
 }
@@ -1939,6 +1943,15 @@ fn canvas_settings_from_config(settings: &Value, user_settings: &Value) -> Canva
         .and_then(Value::as_str)
     {
         out.translation_status_display = v.to_string();
+    }
+    // Cross-project user preference: the user file wins, the project file is only a fallback
+    // (same precedence as `cache_pages` / `translation_status_display`).
+    if let Some(v) = user_canvas
+        .and_then(|c| c.get("hint_show_outside_default"))
+        .or_else(|| canvas.and_then(|c| c.get("hint_show_outside_default")))
+        .and_then(Value::as_bool)
+    {
+        out.hint_show_outside_default = v;
     }
     if out.aside_max_width_px < out.aside_min_width_px {
         out.aside_max_width_px = out.aside_min_width_px;

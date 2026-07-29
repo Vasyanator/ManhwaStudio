@@ -7,6 +7,8 @@ Main types:
 - `BubblesSearchScope`: search target (`All`, `Original`, `Translation`).
 - `BubblesPanelFilters`: draft/applied search filters (query/page/character/scope).
 - `BubblePanelEditorState`: per-bubble editor mirror for text/footer fields and lowercase caches.
+- `BubbleCardBody`: the exhaustive `BubbleClass` -> card-shape decision (single-line hint text vs
+  translation+original, image controls, character controls, «Перевести» action).
 - `BubblesPanelState`: panel runtime state (filters, editor cache, pending flushes, visible list cache).
 - `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags).
 
@@ -233,6 +235,54 @@ pub struct BubblesPanelContext<'a> {
     pub last_clarification: &'a mut String,
     pub last_page_idx: &'a mut i64,
     pub last_bubble_order: &'a mut i32,
+}
+
+/// Which class-dependent rows one bubble card draws.
+///
+/// The shared rows (page/id header, class selector, replica-order spin box, move/delete actions)
+/// are unconditional; this struct covers only the parts that differ per [`BubbleClass`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct BubbleCardBody {
+    /// Draw ONE single-line field bound to `Bubble.text` and no ORIGINAL field.
+    single_line_text: bool,
+    /// Draw the image-source / description controls.
+    image_controls: bool,
+    /// Draw the character (speaker) controls.
+    character_controls: bool,
+    /// Offer the per-bubble «Перевести» action.
+    translate_action: bool,
+}
+
+impl BubbleCardBody {
+    /// Resolves the card shape for `class`.
+    ///
+    /// Exhaustive over [`BubbleClass`] on purpose: a new class must state what its card shows
+    /// instead of silently inheriting the text-bubble layout.
+    #[must_use]
+    fn for_class(class: BubbleClass) -> Self {
+        match class {
+            BubbleClass::Text => Self {
+                single_line_text: false,
+                image_controls: false,
+                character_controls: true,
+                translate_action: true,
+            },
+            BubbleClass::Image => Self {
+                single_line_text: false,
+                image_controls: true,
+                character_controls: false,
+                translate_action: true,
+            },
+            // A hint is a one-line author note: it has no original, no speaker and no image
+            // source, and it is never sent to a translator (it is not a replica).
+            BubbleClass::Hint => Self {
+                single_line_text: true,
+                image_controls: false,
+                character_controls: false,
+                translate_action: false,
+            },
+        }
+    }
 }
 
 pub fn draw_bubbles_panel(
@@ -493,31 +543,60 @@ impl BubblesPanelState {
                             bubble_class = BubbleClass::Image;
                             class_changed = true;
                         }
+                        if ui
+                            .selectable_label(
+                                bubble_class == BubbleClass::Hint,
+                                t!("translation.bubbles.class_hint_label"),
+                            )
+                            .clicked()
+                        {
+                            bubble_class = BubbleClass::Hint;
+                            class_changed = true;
+                        }
                     });
 
-                    ui.add_space(4.0);
-                    let translated_resp = ui.add(
-                        egui::TextEdit::multiline(&mut editor.text)
-                            .desired_rows(3)
-                            .hint_text(t!("translation.common.translation_label")),
-                    );
-                    if translated_resp.changed() {
-                        translation_changed = true;
-                        text_search_dirty = true;
-                        editor.refresh_text_lc();
-                    }
+                    // Resolved AFTER the selector so a class switch reshapes the card in the same
+                    // frame it is clicked (matching the pre-existing ImageBubble behavior).
+                    let card_body = BubbleCardBody::for_class(bubble_class);
 
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(t!("translation.bubbles.original_field_label")).small());
-                    let original_resp = ui.add(
-                        egui::TextEdit::multiline(&mut editor.original_text)
-                            .desired_rows(2)
-                            .hint_text(t!("translation.bubbles.original_placeholder")),
-                    );
-                    if original_resp.changed() {
-                        original_changed = true;
-                        text_search_dirty = true;
-                        editor.refresh_original_text_lc();
+                    if card_body.single_line_text {
+                        // A hint owns exactly ONE canonical line, stored in `Bubble.text`;
+                        // `original_text` stays empty for the class, so the ORIGINAL field is
+                        // dropped and the line is single-line, mirroring the canvas hint card.
+                        let hint_resp = ui.add(
+                            egui::TextEdit::singleline(&mut editor.text)
+                                .hint_text(t!("canvas.bubble.hint_text_placeholder")),
+                        );
+                        if hint_resp.changed() {
+                            translation_changed = true;
+                            text_search_dirty = true;
+                            editor.refresh_text_lc();
+                        }
+                    } else {
+                        let translated_resp = ui.add(
+                            egui::TextEdit::multiline(&mut editor.text)
+                                .desired_rows(3)
+                                .hint_text(t!("translation.common.translation_label")),
+                        );
+                        if translated_resp.changed() {
+                            translation_changed = true;
+                            text_search_dirty = true;
+                            editor.refresh_text_lc();
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(t!("translation.bubbles.original_field_label")).small());
+                        let original_resp = ui.add(
+                            egui::TextEdit::multiline(&mut editor.original_text)
+                                .desired_rows(2)
+                                .hint_text(t!("translation.bubbles.original_placeholder")),
+                        );
+                        if original_resp.changed() {
+                            original_changed = true;
+                            text_search_dirty = true;
+                            editor.refresh_original_text_lc();
+                        }
                     }
 
                     ui.add_space(4.0);
@@ -544,7 +623,9 @@ impl BubblesPanelState {
                         }
                     });
 
-                    if bubble_class == BubbleClass::Image {
+                    // Class dispatch AFTER the order spin box: every class keeps the replica order,
+                    // but the rows below it differ (see `BubbleCardBody`).
+                    if card_body.image_controls {
                         Self::draw_image_bubble_controls(
                             ui,
                             project,
@@ -554,7 +635,7 @@ impl BubblesPanelState {
                             panel_ctx,
                             &mut image_error,
                         );
-                    } else {
+                    } else if card_body.character_controls {
                         ui.horizontal_wrapped(|ui| {
                             let known_resp = ui
                                 .checkbox(&mut editor.is_known_character, t!("translation.bubbles.nominative_case_label"))
@@ -717,7 +798,11 @@ impl BubblesPanelState {
                         if ui.small_button(move_btn).clicked() {
                             move_clicked = true;
                         }
-                        if ui.small_button(t!("translation.common.translate_button")).clicked() {
+                        // A hint is not a replica: translating it would overwrite the author's own
+                        // note with machine output, so the action is not offered for that class.
+                        if card_body.translate_action
+                            && ui.small_button(t!("translation.common.translate_button")).clicked()
+                        {
                             translate_clicked = true;
                         }
                         if ui.small_button(t!("translation.common.delete_button")).clicked() {
@@ -819,7 +904,26 @@ impl BubblesPanelState {
             let _ = canvas.request_delete_bubble(bubble_id);
         }
         if class_changed {
-            let _ = canvas.set_bubble_class_for_bid(bubble_id, bubble_class);
+            let converted = canvas.set_bubble_class_for_bid(bubble_id, bubble_class);
+            if converted && bubble_class == BubbleClass::Hint {
+                // Mirror the canvas-side normalization (`set_bubble_class_for_bid`) into this
+                // panel's editor buffer: a hint owns ONE line in `text`, so a blank `text` takes
+                // over the original. Without the mirror the card would show the stale pair until
+                // the model round-trips back through `sync_editor_from_project`, and a still
+                // pending debounced text flush would write it back.
+                if let Some(editor) = self.editor.get_mut(&bubble_id)
+                    && editor.text.trim().is_empty()
+                {
+                    editor.text = std::mem::take(&mut editor.original_text);
+                    editor.refresh_text_lc();
+                    editor.refresh_original_text_lc();
+                    self.visible_cache_dirty = true;
+                }
+            }
+            // The hint visibility flag is NOT patched here: `set_bubble_class_for_bid` seeds the
+            // runtime mirror from the same user-level default, and the per-frame
+            // `flush_bubble_upserts_to_model` owns writing (and, on the way out, removing)
+            // `extra["hint_show_outside_translation"]`. One writer, one source of truth.
             let mut patch = Map::new();
             if bubble_class == BubbleClass::Image {
                 patch.insert(

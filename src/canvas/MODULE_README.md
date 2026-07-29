@@ -16,9 +16,43 @@ owned by the model/runtime so edits and export payloads remain intact.
 
 Bubble editing is split between runtime state and UI layers. `bubble_runtime.rs` owns pending
 upserts/deletes, shared-model sync, undo/redo snapshots, clipboard flows, and failed-write
-preservation. Bubbles have a domain class (`TextBubble` or `ImageBubble`); text bubbles may render
-as aside/on-top/default, while image bubbles always use the aside layout path. `bubble_aside_ui.rs`
+preservation. Bubbles have a domain class (`BubbleClass::Text` / `Image` / `Hint`, persisted as the
+`bubble_class` wire token); text bubbles may render as aside/on-top/default, while image and hint
+bubbles always use the aside layout path. `bubble_aside_ui.rs`
 and `bubble_on_top_ui.rs` only handle layout, hit rectangles, focus, drag, and resize widgets.
+
+A hint bubble (`BubbleClass::Hint`) is a one-line author note anchored to a page point, meant for
+injection into the composed translation prompt. It reuses the ordinary aside text-bubble geometry
+(anchor, link line, resizable rect) verbatim; its single line lives in `Bubble.text`. It owns one
+`extra` key, `hint_show_outside_translation` (bool, absent == false), mirrored onto
+`RuntimeBubble::hint_show_outside` by `upsert_runtime_from_bubble` and by `patch_bubble_extra_fields`
+(the latter is required: patching advances the model revision, so the model→runtime sync would not
+re-apply it and the next positional flush would write the stale runtime value back). Creation goes
+`create_hint_bubble_at_pointer_shortcut` → `create_bubble_at` → `promote_bubble_to_hint`, which seeds
+the flag from the user-level `CanvasState::hint_show_outside_default`.
+
+CONVERTING an existing bubble goes through `mod.rs::set_bubble_class_for_bid`, which owns the whole
+class-owned normalization (the bubbles side panel only calls it and mirrors the result into its own
+editor buffer). Entering `Hint` pins `bubble_type = Aside`, seeds `hint_show_outside` from the same
+user-level default, and folds the two text fields into the hint's single line: a blank `text` takes
+over `original_text`, while a non-empty `text` deliberately LEAVES the original in place rather than
+destroying user-typed text (no hint code path reads it, and converting back to `Text` restores it).
+Leaving `Hint` clears the runtime flag, and `flush_bubble_upserts_to_model` REMOVES
+`extra["hint_show_outside_translation"]` whenever the class is not `Hint` — the key is class-owned,
+so a hint → text → hint round trip re-seeds from the current default instead of resurrecting a stale
+per-bubble value.
+
+Editable hint card anatomy (`bubble_aside_ui.rs`): no header, no ORIGINAL field, one SINGLE-LINE
+`SpellcheckedTextEdit::singleline` bound to `Bubble.text` (id salt `("aside_hint", bid)`), an action
+row with the delete button only, then the tab-owned footer. It registers in the same per-frame machinery as
+the ordinary fields (`note_focused_bubble_text_input` under `BubbleTextField::Translation`, since the
+hint line lives in the same buffer the translation field edits, plus `schedule_text_upsert` /
+`commit_text_upsert_now`). `AsideBubbleVisibleGroups` therefore carries SEPARATE
+`show_translate_action` / `show_delete_action` flags — a hint keeps delete and drops translate — and a
+`show_hint_text` flag. `aside_body_mode` pins hints (like image bubbles) to `Full`, so the compact
+modes never reshape them, and `estimate_aside_body_height` has a matching hint branch: a shape change
+that is not mirrored there makes the packer reserve a wrong slot height for a frame. A read-only hint
+(shown in cleaning/typing because its checkbox is on) uses the ordinary read-only label path.
 
 An image bubble is a *group* of text areas (`RuntimeBubble.text_areas`, persisted via
 `extra["text_areas"]`; see `parse_image_text_areas` / `serialize_image_text_areas` in `helpers.rs`).
@@ -268,12 +302,31 @@ X range before the old overflow point.
   `(side, type)` aside/on-top columns in a single pass. It is the sole bubble-column scanner;
   consumers read the relevant `(side, type)` column from one bucketed result per page per pass
   instead of re-scanning runtime bubbles once per column.
+- HIDDEN HINTS ARE GATED IN ONE PREDICATE: `bubble_runtime.rs::is_runtime_bubble_hidden(&rt)` is
+  `class == Hint && !editable && !hint_show_outside`. `editable` is the tab discriminator
+  (translation keeps it `true`; cleaning and typing set it `false`). "Hidden" means the bubble does
+  not exist for this canvas: not bucketed, not drawn, not hit-testable, not focusable, and NOT
+  COUNTED FOR LAYOUT. Any new scan over `runtime_bubbles` that feeds drawing, hit-testing, or
+  layout must call the predicate — a scan that forgets it leaks the bubble's existence even without
+  painting it. There are exactly three call sites today: `page_bubbles_bucketed` (covers both aside
+  columns, both on-top columns, and `focus_candidate_at_scene_pos`), `mod.rs::refresh_page_aside_presence`
+  (the aside-gutter reservation read by `scene.rs::canvas_row_width_for_page`; without it a page whose
+  only aside bubble is a hidden hint would reserve an empty gutter), and
+  `bubble_aside_ui.rs::aside_hit_test` (whose `mounted` flag stays `true` with stale card geometry
+  when a shown hint is switched off, so the gate — not `mounted` — is what stops a click from being
+  swallowed by an invisible card).
+- Neither `BubbleClass::Image` nor `BubbleClass::Hint` is a display type. Both must not resolve
+  through on-top display settings: `displayed_bubble_type_for_runtime` forces `BubbleType::Aside`
+  and `set_bubble_class_for_bid` pins `bubble_type = Aside` when converting into either class.
+  Class-specific metadata belongs in bubble `extra`.
+- `bubble_fingerprint_with_hasher` must cover the domain class and every class-specific `extra` key
+  the canvas renders or edits (`bubble_class`, `text_areas`, `description`,
+  `hint_show_outside_translation`). A change invisible to the fingerprint does not propagate to
+  other tabs.
 - Per-bubble image caches on `CanvasView` (`image_bubble_meta_cache`,
   `image_bubble_preview_cache`, keyed by bubble id) must be evicted whenever a bubble is fully
   removed. `remove_runtime_bubble` is the single full-removal path and owns that eviction, so
   deleted ids never leak and a reused id cannot serve a stale fingerprint/preview.
-- `BubbleClass::Image` is not a display type. It must not resolve through on-top display settings;
-  image-specific metadata belongs in bubble `extra`.
 - Source page GPU residency is verified manually for now because `egui::TextureHandle` creation
   and eviction require a live GUI context; pure tests should target memory-manager policy instead.
 - Clean-overlay memory eviction may drop only reconstructable GPU texture pages. It must not drop
@@ -287,6 +340,14 @@ X range before the old overflow point.
   `mod.rs`, and the source-page texture owner in `app.rs`.
 - To change bubble editing behavior, start in `bubble_runtime.rs` and the relevant
   bubble UI module.
+- To change hint-bubble behavior, edit `bubble_runtime.rs` (`create_hint_bubble_at_pointer_shortcut`,
+  `promote_bubble_to_hint`, `is_runtime_bubble_hidden` and its three call sites, the write-back in
+  `flush_bubble_upserts_to_model`), `helpers.rs::hint_show_outside_from_extra`, and
+  `mod.rs::set_bubble_class_for_bid` (forced aside + class-owned normalization). For the CARD, edit `bubble_aside_ui.rs` (`aside_visible_groups`,
+  `estimate_aside_body_height`, and the `show_hint_text` field in the card body) — the estimator and
+  the card body must change together. The footer content is tab-owned
+  (`tabs/translation/tab.rs::build_bubble_footer`). The default for new hints is a canvas setting
+  (`CanvasState::hint_show_outside_default`, edited in `src/tabs/settings/canvas_ribbon.rs`).
 - To change the Hangul keyboard wiring (panel open/close, the sticky insert target, live caret
   capture, the text splice), edit `bubble_runtime.rs` (`open_hangul_keyboard_session`,
   `apply_hangul_keyboard_insert`, `hangul_insert_splice_range`, the `hangul_target` eviction points);

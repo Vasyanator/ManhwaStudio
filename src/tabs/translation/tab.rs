@@ -76,7 +76,10 @@ Characters/footer sync:
 - `queue_footer_patch`: buffers one footer field patch with timestamp.
 - `flush_footer_patches`: debounced flush of footer patches to `CanvasView::patch_bubble_extra_fields`.
 - `footer_state_for`: resolves runtime footer state with overrides.
-- `build_bubble_footer` (CanvasHooks): footer editor UI + patch scheduling.
+- `build_bubble_footer` (CanvasHooks): footer editor UI + patch scheduling; the replica-order spin
+  box is shared, then the bubble class selects the rest of the row.
+- `build_image_bubble_footer_controls`: image-class footer half (source type, paste/choose, crop).
+- `build_hint_bubble_footer_controls`: hint-class footer half (one visibility checkbox).
 - `build_bubble_header` (CanvasHooks): currently no-op hook.
 
 OCR flow:
@@ -207,7 +210,8 @@ use crate::tabs::translation::ocr::{
     OcrRuntimeOptions, TranslationOcrController, is_likely_multimodal_model,
 };
 use crate::tabs::translation::panels::bubbles::{
-    BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
+    BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
+    bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
     footer_no_characters,
     footer_state_for_bubble,
 };
@@ -251,6 +255,9 @@ use std::time::SystemTime;
 type DetectionLoadResult = Result<(Vec<(usize, TextDetectorPageResult)>, usize, usize), String>;
 
 const FOOTER_PATCH_DEBOUNCE_SECS: f64 = 0.25;
+/// Bubble `extra` key holding a hint bubble's "show outside the translation tab" flag.
+/// Wire key, deliberately not localized (`dev-docs/i18n_exclusions.md`).
+const HINT_SHOW_OUTSIDE_EXTRA_KEY: &str = "hint_show_outside_translation";
 const TEXT_DETECTOR_MASK_TILE_SIDE: usize = 1024;
 const TEXT_DETECTOR_MASK_TEXTURE_OPTIONS: egui::TextureOptions = egui::TextureOptions::NEAREST;
 const TEXT_DETECTOR_MASK_VISUAL_ALPHA_MAX: u8 = 96;
@@ -1798,6 +1805,19 @@ impl TranslationTabState {
             let _ = self.apply_recent_character_rank_to_latest_bubble(canvas, project, rank);
         }
         true
+    }
+
+    /// Creates a hint bubble under the pointer; returns whether one was created.
+    ///
+    /// Unlike [`Self::create_bubble_at_pointer_shortcut`] there is no recent-character seeding:
+    /// a hint carries no character. Bound to the rebindable `H` hotkey.
+    pub fn create_hint_bubble_at_pointer_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &mut CanvasView,
+        pointer_pos: Pos2,
+    ) -> bool {
+        canvas.create_hint_bubble_at_pointer_shortcut(ctx, pointer_pos)
     }
 
     fn handle_image_bubble_hotkeys(
@@ -3900,6 +3920,11 @@ impl TranslationTabState {
             if current_page_only && bubble.img_idx != current_page {
                 continue;
             }
+            // A hint is an author note to the translator, never a replica: it must not be sent
+            // for translation, nor offered as context.
+            if is_hint_bubble_record(bubble) {
+                continue;
+            }
             if is_image_bubble_record(bubble) && !include_image_bubbles {
                 continue;
             }
@@ -3960,6 +3985,11 @@ impl TranslationTabState {
         let current_page = canvas.current_page_idx();
         let mut items = Vec::new();
         for bubble in project.bubbles.iter() {
+            // A hint is an author note to the translator, never a replica: it is neither
+            // translated nor used as ordered context.
+            if is_hint_bubble_record(bubble) {
+                continue;
+            }
             let is_image = is_image_bubble_record(bubble);
             let has_translation = !bubble.text.trim().is_empty();
             let in_target_scope = !current_page_only || bubble.img_idx == current_page;
@@ -4014,6 +4044,11 @@ impl TranslationTabState {
             let Some(bubble) = project_bubble else {
                 continue;
             };
+            // A hint is an author note to the translator, never a replica: an explicit per-id
+            // request must not translate it either.
+            if is_hint_bubble_record(bubble) {
+                continue;
+            }
             if is_image_bubble_record(bubble) && !include_image_bubbles {
                 continue;
             }
@@ -5033,6 +5068,36 @@ impl TranslationTabState {
             }
         }
     }
+
+    /// Draws the hint-bubble half of the canvas bubble footer: the single
+    /// `canvas.bubble.hint_show_outside_label` checkbox, right after the shared replica-order
+    /// spin box.
+    ///
+    /// The value is read from `extra["hint_show_outside_translation"]`, but a still-pending footer
+    /// patch wins: writes are debounced (`FOOTER_PATCH_DEBOUNCE_SECS`), so reading the bubble alone
+    /// would visibly bounce the checkbox back for a few frames after a click.
+    fn build_hint_bubble_footer_controls(&mut self, ui: &mut egui::Ui, bubble: &Bubble, now_s: f64) {
+        let bubble_id = bubble.id;
+        let stored = bubble_extra_bool(&bubble.extra, HINT_SHOW_OUTSIDE_EXTRA_KEY, false);
+        let mut show_outside = self
+            .pending_footer_patches
+            .get(&bubble_id)
+            .and_then(|patch| patch.get(HINT_SHOW_OUTSIDE_EXTRA_KEY))
+            .and_then(Value::as_bool)
+            .unwrap_or(stored);
+        if ui
+            .checkbox(&mut show_outside, t!("canvas.bubble.hint_show_outside_label"))
+            .on_hover_text(t!("canvas.bubble.hint_show_outside_tooltip"))
+            .changed()
+        {
+            self.queue_footer_patch(
+                bubble_id,
+                HINT_SHOW_OUTSIDE_EXTRA_KEY,
+                Value::Bool(show_outside),
+                now_s,
+            );
+        }
+    }
 }
 
 impl CanvasHooks for TranslationTabState {
@@ -5063,6 +5128,12 @@ impl CanvasHooks for TranslationTabState {
         let bubbles = ctx.bubbles();
         let mut entries: Vec<(f32, bool)> = bubbles
             .iter()
+            // A hint is not a replica: its single line lives in `text` and is never a translation,
+            // so a status stripe for it would always read "translated". Same exemption as
+            // `bubble_status_style`.
+            .filter(|bubble| {
+                bubble.bubble_class.as_deref().map(BubbleClass::from_str) != Some(BubbleClass::Hint)
+            })
             .filter_map(|bubble| {
                 ctx.content_y(bubble.img_idx, bubble.img_v)
                     .map(|content_y| (content_y, !bubble.text.trim().is_empty()))
@@ -5366,10 +5437,18 @@ impl CanvasHooks for TranslationTabState {
                 );
             }
 
-            if bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image)
-            {
-                self.build_image_bubble_footer_controls(ui, project, bubble, now_s);
-                return;
+            // Class dispatch AFTER the order spin box: every class keeps the replica order, but
+            // only a text bubble gets the character field below it.
+            match bubble.bubble_class.as_deref().map(BubbleClass::from_str) {
+                Some(BubbleClass::Image) => {
+                    self.build_image_bubble_footer_controls(ui, project, bubble, now_s);
+                    return;
+                }
+                Some(BubbleClass::Hint) => {
+                    self.build_hint_bubble_footer_controls(ui, bubble, now_s);
+                    return;
+                }
+                Some(BubbleClass::Text) | None => {}
             }
 
             // Borrow `character_names` as a slice instead of cloning the whole Vec
@@ -5420,6 +5499,11 @@ impl CanvasHooks for TranslationTabState {
         canvas: &CanvasView,
     ) -> Option<BubbleBorderStyle> {
         if !editable {
+            return None;
+        }
+        // A hint is not a replica: it has no original, no translation and no character, so the
+        // incomplete-replica rules would paint a warning border on every hint. Exempt the class.
+        if bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Hint) {
             return None;
         }
         evaluate_bubble_status_rules(
@@ -5798,6 +5882,18 @@ impl TranslationTabState {
                 .and_then(Value::as_bool)
             {
                 self.composition_panel_options.include_image_bubbles = value;
+            }
+            if let Some(value) = comp_obj.get("include_hint_bubbles").and_then(Value::as_bool) {
+                self.composition_panel_options.include_hint_bubbles = value;
+            }
+            if let Some(value) = comp_obj.get("hint_wrap").and_then(Value::as_str) {
+                self.composition_panel_options.hint_wrap = normalize_wrap_with(value);
+            }
+            if let Some(value) = comp_obj.get("hint_wrap_enabled").and_then(Value::as_bool) {
+                self.composition_panel_options.hint_wrap_enabled = value;
+            }
+            if let Some(value) = comp_obj.get("hint_extra_sep").and_then(Value::as_str) {
+                self.composition_panel_options.hint_extra_sep = value.to_string();
             }
             if let Some(value) = comp_obj.get("jinja2_enabled").and_then(Value::as_bool) {
                 self.composition_panel_options.jinja2_enabled = value;
@@ -6843,6 +6939,11 @@ fn is_image_bubble_record(bubble: &Bubble) -> bool {
     bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Image)
 }
 
+/// True when the stored bubble record is a hint bubble (`bubble_class == "hint"`).
+fn is_hint_bubble_record(bubble: &Bubble) -> bool {
+    bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Hint)
+}
+
 fn image_bubbles_dir(project: &ProjectData) -> PathBuf {
     project.paths.unsaved_image_bubbles_dir.clone()
 }
@@ -7379,6 +7480,22 @@ fn save_translation_settings_to_project_file(
     composition_obj.insert(
         "include_image_bubbles".to_string(),
         Value::Bool(composition_options.include_image_bubbles),
+    );
+    composition_obj.insert(
+        "include_hint_bubbles".to_string(),
+        Value::Bool(composition_options.include_hint_bubbles),
+    );
+    composition_obj.insert(
+        "hint_wrap".to_string(),
+        Value::String(normalize_wrap_with(&composition_options.hint_wrap)),
+    );
+    composition_obj.insert(
+        "hint_wrap_enabled".to_string(),
+        Value::Bool(composition_options.hint_wrap_enabled),
+    );
+    composition_obj.insert(
+        "hint_extra_sep".to_string(),
+        Value::String(composition_options.hint_extra_sep.clone()),
     );
     composition_obj.insert(
         "jinja2_enabled".to_string(),

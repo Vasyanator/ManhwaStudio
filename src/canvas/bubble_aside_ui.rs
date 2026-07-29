@@ -10,6 +10,8 @@ Main responsibilities:
 - optionally split a side into two side-by-side columns (near/far) when room allows;
 - render bubble cards and per-area anchor links without pulling persistence into UI code;
 - render the editable multi-area image bubble card (preview, framed row blocks, add/remove area);
+- render the editable hint card (one single-line field bound to `Bubble.text`, delete-only action
+  row, tab-owned footer);
 - manage aside drag lifecycle for bubble-body, rect-area, and image red-rect/area/anchor moves;
 - keep runtime bubble geometry in sync with scene interactions.
 
@@ -54,6 +56,9 @@ Notes:
   helpers live in `helpers.rs`.
 - A read-only image bubble splits into one `AsideItem` per text area; an editable one stays a single
   card whose blocks each own a colored rect, anchor point, and link.
+- Card shape is decided in one place, `aside_visible_groups`. The two action flags are separate
+  (`show_translate_action` / `show_delete_action`) because a hint card keeps delete but has nothing
+  to translate. `estimate_aside_body_height` must mirror every shape change made there.
 - This module only drives `CanvasView` through existing runtime/edit helpers.
 */
 
@@ -252,12 +257,19 @@ enum AsideBubbleBodyMode {
     CompactSingle(BubbleTextField),
 }
 
+/// Which row groups one aside card renders this frame.
+///
+/// The two action flags are deliberately separate: a hint card keeps the delete button but has
+/// nothing to translate, so the translate button must be droppable on its own.
 #[derive(Clone, Copy)]
 struct AsideBubbleVisibleGroups {
     show_header: bool,
     show_original: bool,
     show_translation: bool,
-    show_actions: bool,
+    /// Single-line field bound to `Bubble.text`, used by hint cards instead of original+translation.
+    show_hint_text: bool,
+    show_translate_action: bool,
+    show_delete_action: bool,
     show_footer: bool,
     show_readonly_text: bool,
 }
@@ -422,12 +434,17 @@ fn aside_item_color(area_idx: Option<usize>, side: Side) -> Color32 {
     }
 }
 
+/// Picks the body mode for one aside card: how much of an editable card collapses when it is not
+/// the selected bubble.
+///
+/// Image and hint cards are pinned to `Full`: their shape is class-defined (image blocks / one hint
+/// line), so the compact original/translation collapsing does not apply to them.
 fn aside_body_mode(canvas: &CanvasView, bid: i64, has_translation: bool) -> AsideBubbleBodyMode {
     if canvas
         .bubble_runtime
         .runtime_bubbles
         .get(&bid)
-        .is_some_and(|bubble| bubble.bubble_class == BubbleClass::Image)
+        .is_some_and(|b| matches!(b.bubble_class, BubbleClass::Image | BubbleClass::Hint))
     {
         return AsideBubbleBodyMode::Full;
     }
@@ -457,20 +474,45 @@ fn image_bubble_readonly_text_runtime(bubble: &super::types::RuntimeBubble) -> S
     bubble.display_text().to_string()
 }
 
+/// Resolves the row groups one aside card shows, from its edit mode, compact body mode, domain
+/// class, and whether the owning tab supplies a header.
+///
+/// A read-only card is always the single read-only label. An editable hint card is a fixed shape
+/// (one single-line field + delete + footer) that ignores `body_mode`, because `aside_body_mode`
+/// already pins hints to `Full`.
 fn aside_visible_groups(
     editable: bool,
     body_mode: AsideBubbleBodyMode,
     has_header: bool,
+    bubble_class: BubbleClass,
 ) -> AsideBubbleVisibleGroups {
     if !editable {
         return AsideBubbleVisibleGroups {
             show_header: has_header,
             show_original: false,
             show_translation: false,
-            show_actions: false,
+            show_hint_text: false,
+            show_translate_action: false,
+            show_delete_action: false,
             show_footer: false,
             show_readonly_text: true,
         };
+    }
+
+    match bubble_class {
+        BubbleClass::Hint => {
+            return AsideBubbleVisibleGroups {
+                show_header: false,
+                show_original: false,
+                show_translation: false,
+                show_hint_text: true,
+                show_translate_action: false,
+                show_delete_action: true,
+                show_footer: true,
+                show_readonly_text: false,
+            };
+        }
+        BubbleClass::Text | BubbleClass::Image => {}
     }
 
     match body_mode {
@@ -478,7 +520,9 @@ fn aside_visible_groups(
             show_header: true,
             show_original: true,
             show_translation: true,
-            show_actions: true,
+            show_hint_text: false,
+            show_translate_action: true,
+            show_delete_action: true,
             show_footer: true,
             show_readonly_text: false,
         },
@@ -486,7 +530,9 @@ fn aside_visible_groups(
             show_header: false,
             show_original: true,
             show_translation: true,
-            show_actions: false,
+            show_hint_text: false,
+            show_translate_action: false,
+            show_delete_action: false,
             show_footer: false,
             show_readonly_text: false,
         },
@@ -494,7 +540,9 @@ fn aside_visible_groups(
             show_header: false,
             show_original: true,
             show_translation: false,
-            show_actions: false,
+            show_hint_text: false,
+            show_translate_action: false,
+            show_delete_action: false,
             show_footer: false,
             show_readonly_text: false,
         },
@@ -503,7 +551,9 @@ fn aside_visible_groups(
                 show_header: false,
                 show_original: false,
                 show_translation: true,
-                show_actions: false,
+                show_hint_text: false,
+                show_translate_action: false,
+                show_delete_action: false,
                 show_footer: false,
                 show_readonly_text: false,
             }
@@ -513,6 +563,10 @@ fn aside_visible_groups(
 
 /// Estimates one aside card's total body height for pre-pack layout. Pure geometry over the
 /// measured text metrics in `m`; see `AsideBodyMeasure` for the inputs.
+///
+/// The estimate must track `aside_visible_groups` / the card body in `draw_aside_slots`: it is what
+/// the packer reserves before the card has ever been laid out, so a shape change that is not
+/// mirrored here misplaces the card for one frame.
 fn estimate_aside_body_height(m: &AsideBodyMeasure<'_>) -> f32 {
     let ui = m.ui;
     let original_text = m.original_text;
@@ -542,6 +596,22 @@ fn estimate_aside_body_height(m: &AsideBodyMeasure<'_>) -> f32 {
             0.0
         };
         return display_height + vertical_padding + header_height;
+    }
+    // An editable hint card has a class-defined shape that does not depend on `body_mode`:
+    // one single-line field, the delete-only action row, and the footer (order spin box plus the
+    // "show outside translation" checkbox, which wraps onto its own row in a narrow column).
+    match m.bubble_class {
+        BubbleClass::Hint => {
+            let action_spacing = (6.0 + 4.0) * scale_factor;
+            let safety_padding = 6.0 * scale_factor;
+            let hint_rows = 4.0; // text field + action row + two wrapped footer rows
+            return chrome_row_height * hint_rows
+                + item_spacing * 3.0
+                + action_spacing
+                + vertical_padding
+                + safety_padding;
+        }
+        BubbleClass::Text | BubbleClass::Image => {}
     }
     match body_mode {
         AsideBubbleBodyMode::Full => {
@@ -647,6 +717,8 @@ struct AsideBodyMeasure<'a> {
     base_width_px: f32,
     /// Which body groups are visible, driving which rows contribute height.
     body_mode: AsideBubbleBodyMode,
+    /// Domain class of the bubble; hint cards have a fixed shape independent of `body_mode`.
+    bubble_class: BubbleClass,
     /// Whether the canvas is editable (adds editor chrome height).
     editable: bool,
     /// Card scale factor applied to measured heights and chrome.
@@ -1067,6 +1139,7 @@ fn build_aside_desired_slots(
             continue;
         };
         let is_image = b.bubble_class == BubbleClass::Image;
+        let bubble_class = b.bubble_class;
         let (anchor_u, anchor_v) = aside_item_anchor_uv(b, item.area_idx);
         // Read-only text shown for this item (used for width and height estimation).
         let item_readonly_text: String = match item.area_idx {
@@ -1111,6 +1184,7 @@ fn build_aside_desired_slots(
             display_text: &item_readonly_text,
             base_width_px: bubble_width,
             body_mode,
+            bubble_class,
             editable: canvas.editable,
             scale_factor,
             frame_inner_margin_px: f32::from(frame_inner_margin),
@@ -1562,7 +1636,8 @@ fn draw_aside_slots(
         let rtl_align_frame = !canvas.editable && side == Side::Left;
         let body_mode = aside_body_mode(canvas, bid, !snapshot.text.trim().is_empty());
         let has_header = hooks.has_bubble_header(hook_bubble, canvas.editable);
-        let visible_groups = aside_visible_groups(canvas.editable, body_mode, has_header);
+        let visible_groups =
+            aside_visible_groups(canvas.editable, body_mode, has_header, snapshot.bubble_class);
 
         let scene_clip_rect = ui.clip_rect();
         let zoom_drag_active = canvas.scene.zoom_drag_active;
@@ -1620,6 +1695,71 @@ fn draw_aside_slots(
                     );
                 } else if canvas.editable {
                     let text_width = ui.available_width().max(40.0);
+                    if visible_groups.show_hint_text {
+                        // A hint owns exactly one line, stored in `Bubble.text` (the same buffer
+                        // the translation field edits for a text bubble), so it reuses the
+                        // translation spellcheck settings and the `Translation` field identity in
+                        // the per-frame text-input registry.
+                        let hint_spellcheck_enabled = !canvas.bubble_spellcheck_disabled(
+                            project,
+                            bid,
+                            BubbleTextField::Translation,
+                        );
+                        let hint_resp = with_bubble_text_font(ui, |ui| {
+                            SpellcheckedTextEdit::singleline(&mut new_text)
+                                .id_salt(("aside_hint", bid))
+                                .hint_text(t!("canvas.bubble.hint_text_placeholder"))
+                                .desired_width(text_width)
+                                .spellcheck_enabled(
+                                    canvas.state.spellcheck_translation && hint_spellcheck_enabled,
+                                )
+                                .show(ui)
+                        });
+                        let hint_misspelled_word =
+                            misspelled_word_at_pointer(ui, &hint_resp, &new_text);
+                        canvas.note_focused_bubble_text_input(
+                            ui.ctx(),
+                            bid,
+                            BubbleTextField::Translation,
+                            &hint_resp.response,
+                        );
+                        if hint_resp.response.clicked() || hint_resp.response.changed() {
+                            interacted_with_bubble = true;
+                        }
+                        if hint_resp.response.has_focus() {
+                            canvas.bubble_runtime.selected_bubble = Some(bid);
+                            interacted_with_bubble = true;
+                        }
+                        bubble_has_focus = bubble_has_focus || hint_resp.response.has_focus();
+                        if hint_resp.response.changed() {
+                            text_changed = true;
+                            canvas.schedule_text_upsert(bid, ui.ctx().input(|i| i.time));
+                        }
+                        if hint_resp.response.lost_focus() {
+                            canvas.commit_text_upsert_now(bid);
+                        }
+                        if hint_resp.response.secondary_clicked() {
+                            canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                                hint_misspelled_word.clone();
+                        }
+                        hint_resp.response.context_menu(|ui| {
+                            let outcome = canvas.show_bubble_context_menu(
+                                ui,
+                                BubbleMenuContext {
+                                    project,
+                                    bubble_id: bid,
+                                    bubble_type: snapshot.bubble_type,
+                                    original_text: &new_original,
+                                    translated_text: &new_text,
+                                    field: Some(BubbleTextField::Translation),
+                                },
+                            );
+                            interacted_with_bubble |= outcome.interacted;
+                            if outcome.command.is_some() {
+                                menu_command = outcome.command;
+                            }
+                        });
+                    }
                     if visible_groups.show_original {
                         let original_spellcheck_enabled = !canvas.bubble_spellcheck_disabled(
                             project,
@@ -1752,13 +1892,17 @@ fn draw_aside_slots(
                 }
             }
 
-            if visible_groups.show_actions {
+            if visible_groups.show_translate_action || visible_groups.show_delete_action {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button(t!("canvas.bubble.translate_button")).clicked() {
+                    if visible_groups.show_translate_action
+                        && ui.small_button(t!("canvas.bubble.translate_button")).clicked()
+                    {
                         want_translate = true;
                     }
-                    if ui.small_button(t!("canvas.bubble.delete_button")).clicked() {
+                    if visible_groups.show_delete_action
+                        && ui.small_button(t!("canvas.bubble.delete_button")).clicked()
+                    {
                         want_delete = true;
                     }
                 });
@@ -2107,6 +2251,13 @@ pub(super) fn aside_hit_test(canvas: &CanvasView, page_idx: usize, scene_pos: Po
             || canvas.displayed_bubble_type_for_runtime(bubble) != BubbleType::Aside
             || !bubble.mounted
         {
+            continue;
+        }
+        // Same visibility gate as `page_bubbles_bucketed`. `mounted` alone is not enough: a hint
+        // that WAS drawn here (its checkbox was on) keeps `mounted == true` and its last card
+        // geometry after the flag is unticked in the translation tab, and a click inside that now
+        // invisible rect would otherwise be swallowed as "clicked on a bubble".
+        if canvas.is_runtime_bubble_hidden(bubble) {
             continue;
         }
         let rect = match displayed_aside_side(canvas, bubble.side) {
@@ -2823,9 +2974,10 @@ fn resize_image_area_by_handle(
 #[cfg(test)]
 mod tests {
     use super::{
-        AsideDesiredSlot, AsidePackPermCache, PackedAsideSlot, apply_cached_permutation,
-        aside_column_vertical_bounds, aside_slots_overlap, aside_two_column_active,
-        aside_two_column_card_width, aside_two_column_rects, cluster_crossing_fingerprint,
+        AsideBubbleBodyMode, AsideDesiredSlot, AsidePackPermCache, BubbleClass, BubbleTextField,
+        PackedAsideSlot, apply_cached_permutation, aside_column_vertical_bounds,
+        aside_slots_overlap, aside_two_column_active, aside_two_column_card_width,
+        aside_two_column_rects, aside_visible_groups, cluster_crossing_fingerprint,
         index_bubbles_by_id, pack_aside_slots, split_near_priority,
     };
     use crate::canvas::types::AsideItem;
@@ -2847,6 +2999,66 @@ mod tests {
             text: String::new(),
             original_text: String::new(),
             extra: Map::new(),
+        }
+    }
+
+    // An editable hint card is the fixed one-line shape: no header, no original/translation
+    // fields, the single-line hint field, delete WITHOUT translate, and the footer (which carries
+    // the order spin box and the visibility checkbox).
+    #[test]
+    fn editable_hint_card_shows_one_line_delete_and_footer() {
+        let groups = aside_visible_groups(true, AsideBubbleBodyMode::Full, true, BubbleClass::Hint);
+        assert!(!groups.show_header);
+        assert!(!groups.show_original);
+        assert!(!groups.show_translation);
+        assert!(groups.show_hint_text);
+        assert!(!groups.show_translate_action);
+        assert!(groups.show_delete_action);
+        assert!(groups.show_footer);
+        assert!(!groups.show_readonly_text);
+    }
+
+    // The compact body modes must not reshape a hint card: `aside_body_mode` pins hints to `Full`,
+    // and the class branch must win even if a compact mode ever reached this function.
+    #[test]
+    fn hint_card_shape_ignores_compact_body_modes() {
+        for body_mode in [
+            AsideBubbleBodyMode::Full,
+            AsideBubbleBodyMode::CompactDual,
+            AsideBubbleBodyMode::CompactSingle(BubbleTextField::Original),
+            AsideBubbleBodyMode::CompactSingle(BubbleTextField::Translation),
+        ] {
+            let groups = aside_visible_groups(true, body_mode, false, BubbleClass::Hint);
+            assert!(groups.show_hint_text);
+            assert!(groups.show_delete_action);
+            assert!(!groups.show_translate_action);
+        }
+    }
+
+    // A full text bubble keeps BOTH actions after the `show_actions` split, and a hint field never
+    // appears on a non-hint card.
+    #[test]
+    fn full_text_card_keeps_both_actions_and_no_hint_field() {
+        for class in [BubbleClass::Text, BubbleClass::Image] {
+            let groups = aside_visible_groups(true, AsideBubbleBodyMode::Full, true, class);
+            assert!(groups.show_translate_action);
+            assert!(groups.show_delete_action);
+            assert!(!groups.show_hint_text);
+        }
+    }
+
+    // A read-only card is the single read-only label for every class, including a hint shown in
+    // cleaning/typing because its visibility checkbox is on.
+    #[test]
+    fn readonly_card_is_the_label_path_for_every_class() {
+        for class in [BubbleClass::Text, BubbleClass::Image, BubbleClass::Hint] {
+            let groups = aside_visible_groups(false, AsideBubbleBodyMode::Full, true, class);
+            assert!(groups.show_readonly_text);
+            assert!(groups.show_header);
+            assert!(!groups.show_hint_text);
+            assert!(!groups.show_translate_action);
+            assert!(!groups.show_delete_action);
+            assert!(!groups.show_footer);
         }
     }
 

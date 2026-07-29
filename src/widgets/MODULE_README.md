@@ -22,8 +22,13 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   rect (that would carve a hole in the button hitbox).
 - `text_edit_plus.rs`: multiline text editor with per-range text color and ordered rounded
   background highlights.
-- `spellchecked_line.rs`: multiline text editor with asynchronous Hunspell-compatible
-  spellchecking, misspelling underlines, and global/project custom-word helpers.
+- `spellchecked_line.rs`: text editor with asynchronous Hunspell-compatible
+  spellchecking, misspelling underlines, and global/project custom-word helpers. Two constructors
+  select the underlying `egui::TextEdit`: `multiline` (grows with the text; `desired_rows` only sets
+  the initial height) and `singleline` (exactly one row, `Enter` does not insert a newline,
+  `desired_rows` ignored). Everything else — the spellcheck layouter, the builder methods, and the
+  `TextEditOutput` contract — is shared, so a caller that needs a genuinely one-line value must pick
+  `singleline` rather than `multiline().desired_rows(1)`.
   The active dictionary follows the TYPESETTING language (`ms_text_util::language::text_language`,
   like hyphenation and font coverage), never the UI language. `dictionary_spec(language)` is the
   language→dictionary provenance table (on-disk stem + verified `.aff`/`.dic` URLs); it is pure,

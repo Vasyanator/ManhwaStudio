@@ -1515,6 +1515,83 @@ fn selection_picks_closest_anchor_and_skips_empty_text() {
     );
 }
 
+/// Builds a hint bubble: its single author line lives in `text`, `original_text` stays empty, and
+/// the class token is the persisted `"hint"`.
+fn hint_bubble(id: i64, u: f32, v: f32, line: &str) -> Bubble {
+    Bubble {
+        id,
+        img_idx: 0,
+        img_u: u,
+        img_v: v,
+        side: None,
+        bubble_class: Some("hint".to_string()),
+        bubble_type: None,
+        text: line.to_string(),
+        original_text: String::new(),
+        extra: serde_json::Map::new(),
+    }
+}
+
+#[test]
+fn selection_never_seeds_text_from_a_hint_bubble() {
+    let page_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+    let around =
+        |u: f32, v: f32| Rect::from_center_size(scene_from_uv(page_rect, u, v), Vec2::splat(6.0));
+
+    // A hint alone inside the selection yields nothing: an author note must never seed a text
+    // layer, even though its `text` field is non-empty and its anchor is inside the rectangle.
+    let only_hint = vec![hint_bubble(1, 0.4, 0.4, "не переводить это")];
+    assert_eq!(
+        pick_bubble_text_for_selection(&only_hint, 0, around(0.4, 0.4), page_rect),
+        None
+    );
+
+    // With a text bubble slightly FARTHER from the selection center than the hint, the hint must
+    // still lose — it is not a candidate at all, so distance never comes into play.
+    let mixed = vec![
+        hint_bubble(1, 0.4, 0.4, "не переводить это"),
+        text_bubble(2, 0.44, 0.44, "replica"),
+    ];
+    let selection = Rect::from_min_max(
+        scene_from_uv(page_rect, 0.35, 0.35),
+        scene_from_uv(page_rect, 0.50, 0.50),
+    );
+    assert_eq!(
+        pick_bubble_text_for_selection(&mixed, 0, selection, page_rect),
+        Some("replica".to_string())
+    );
+}
+
+#[test]
+fn hint_bubbles_get_no_create_text_header() {
+    let rect_coords = json!({
+        "p1": {"img_u": 0.1, "img_v": 0.1},
+        "p2": {"img_u": 0.6, "img_v": 0.6},
+    });
+
+    // A hint whose "show outside the translation tab" flag is on IS drawn in this tab, so the
+    // per-bubble «Создать текст» header must be suppressed by CLASS. Give it a valid area rect so
+    // only the class guard can reject it.
+    let mut hint = hint_bubble(1, 0.4, 0.4, "author note");
+    hint.extra
+        .insert("rect_coords".to_string(), rect_coords.clone());
+    assert!(
+        bubble_rect_coords(&hint).is_some(),
+        "the test fixture must carry a parsable area rect"
+    );
+    assert!(!bubble_offers_create_text_header(&hint));
+
+    // The same rect on an ordinary text bubble still offers the header.
+    let mut text = text_bubble(2, 0.4, 0.4, "replica");
+    text.extra.insert("rect_coords".to_string(), rect_coords);
+    assert!(bubble_offers_create_text_header(&text));
+
+    // No area rect at all: no header, regardless of class.
+    assert!(!bubble_offers_create_text_header(&text_bubble(
+        3, 0.4, 0.4, "replica"
+    )));
+}
+
 // Legacy ribbon/page-index migration tests moved to `models::layer_model::text_payload` together
 // with the `migrate_overlay_entries` logic (the single shared codec).
 

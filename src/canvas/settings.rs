@@ -102,6 +102,7 @@ impl CanvasView {
         self.state.cache_pages = snapshot.cache_pages;
         self.state.translation_status_display =
             TranslationStatusDisplay::from_str(&snapshot.translation_status_display);
+        self.state.hint_show_outside_default = snapshot.hint_show_outside_default;
         self.sync_cache_pages_setting_to_model();
     }
 
@@ -155,6 +156,7 @@ impl CanvasView {
             tabs_autosync_enabled: self.state.tabs_autosync_enabled,
             cache_pages: self.state.cache_pages,
             translation_status_display: self.state.translation_status_display.as_str().to_string(),
+            hint_show_outside_default: self.state.hint_show_outside_default,
         }
     }
 
@@ -310,6 +312,10 @@ pub(crate) fn save_canvas_settings_to_project_file(
         "translation_status_display".to_string(),
         Value::String(snapshot.translation_status_display.clone()),
     );
+    canvas_obj.insert(
+        "hint_show_outside_default".to_string(),
+        Value::Bool(snapshot.hint_show_outside_default),
+    );
     canvas_obj.remove("copy_from_field");
     canvas_obj.remove("paste_into_field");
     root_obj.insert("canvas".to_string(), Value::Object(canvas_obj));
@@ -409,6 +415,10 @@ pub(crate) fn save_canvas_settings_to_user_file(
     canvas_obj.insert(
         "translation_status_display".to_string(),
         Value::String(snapshot.translation_status_display.clone()),
+    );
+    canvas_obj.insert(
+        "hint_show_outside_default".to_string(),
+        Value::Bool(snapshot.hint_show_outside_default),
     );
         root_obj.insert("Canvas".to_string(), Value::Object(canvas_obj));
         Ok(())

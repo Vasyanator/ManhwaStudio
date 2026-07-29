@@ -112,6 +112,9 @@ pub struct SharedCanvasSettings {
     pub tabs_autosync_enabled: bool,
     pub cache_pages: bool,
     pub translation_status_display: String,
+    /// Initial value of a newly created hint bubble's `hint_show_outside_translation` flag.
+    /// User-level (cross-project) preference; see `canvas/settings.rs` for its persistence.
+    pub hint_show_outside_default: bool,
 }
 
 impl Default for SharedCanvasSettings {
@@ -142,6 +145,7 @@ impl Default for SharedCanvasSettings {
             tabs_autosync_enabled: true,
             cache_pages: true,
             translation_status_display: "until_next".to_string(),
+            hint_show_outside_default: false,
         }
     }
 }

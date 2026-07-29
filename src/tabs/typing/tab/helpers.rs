@@ -117,13 +117,36 @@ pub(super) fn is_font_family_bound(ctx: &egui::Context, family: &egui::FontFamil
     ctx.fonts(|fonts| fonts.definitions().families.contains_key(family))
 }
 
+/// Reports whether `bubble` is a hint bubble (an author note, not a replica).
+///
+/// A hint's single line lives in `Bubble.text`, so every text-seeding or replica-oriented path in
+/// this tab must exclude it explicitly — the class is otherwise indistinguishable from a plain text
+/// bubble, since [`BubbleClass::from_str`] falls back to `Text` for anything unknown.
+#[must_use]
+pub(super) fn is_hint_bubble(bubble: &Bubble) -> bool {
+    bubble.bubble_class.as_deref().map(BubbleClass::from_str) == Some(BubbleClass::Hint)
+}
+
+/// Decides whether a read-only aside for `bubble` offers the «Создать текст» header button.
+///
+/// The button seeds a text layer from the bubble's own area rect, so it requires an area rect AND a
+/// class whose content is a replica. A hint that opted into being shown outside the translation tab
+/// IS drawn here, so the class guard — not the rect — is what keeps an author note from becoming a
+/// text layer.
+#[must_use]
+pub(super) fn bubble_offers_create_text_header(bubble: &Bubble) -> bool {
+    !is_hint_bubble(bubble) && bubble_rect_coords(bubble).is_some()
+}
+
 /// Picks the seed text for a freshly drawn typing selection from the bubble anchor closest to the
 /// selection center whose anchor falls inside the selection rectangle.
 ///
 /// A multi-area `ImageBubble` is a single `Bubble` in the data model but splits into one read-only
 /// aside per text area, each with its own anchor. To match what the user sees, every image text
 /// area is treated as an independent anchor candidate here; a plain text bubble contributes its one
-/// `img_u`/`img_v` anchor. Returns `None` when no eligible anchor with non-empty text overlaps.
+/// `img_u`/`img_v` anchor. Hint bubbles are never candidates: their line is an author note, not a
+/// replica, so it must never seed a text layer. Returns `None` when no eligible anchor with
+/// non-empty text overlaps.
 pub(super) fn pick_bubble_text_for_selection(
     bubbles: &[Bubble],
     page_idx: usize,
@@ -150,7 +173,12 @@ pub(super) fn pick_bubble_text_for_selection(
         }
     };
 
-    for bubble in bubbles.iter().filter(|bubble| bubble.img_idx == page_idx) {
+    // Hints are filtered out here rather than inside `consider`, so they are rejected on BOTH paths
+    // (whole-bubble anchor and any future area anchor) regardless of what they carry in `extra`.
+    for bubble in bubbles
+        .iter()
+        .filter(|bubble| bubble.img_idx == page_idx && !is_hint_bubble(bubble))
+    {
         // Image bubbles expose one anchor per text area (matching the split read-only asides); text
         // bubbles expose a single anchor at `img_u`/`img_v`.
         let areas = parse_image_text_areas(bubble);

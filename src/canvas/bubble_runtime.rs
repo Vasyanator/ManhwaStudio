@@ -20,6 +20,10 @@ Key functions:
 - flush_bubble_upserts_to_model()
 - sync_runtime_from_model_or_project()
 - apply_pending_actions()
+- is_runtime_bubble_hidden(): the SINGLE hidden-hint visibility gate; every runtime-bubble scan
+  that feeds drawing, hit-testing, or layout must consult it
+- page_bubbles_bucketed(): the sole bubble-column scanner; applies the gate
+- create_hint_bubble_at_pointer_shortcut() / promote_bubble_to_hint(): hint bubble creation
 - note_focused_bubble_text_input(): per-frame widget-id registry + focused caret capture
 - open_hangul_keyboard_session() / apply_hangul_keyboard_insert(): floating jamo keyboard; the
   panel is unbound from its field and inserts into the sticky `hangul_target` with a LIVE splice
@@ -32,9 +36,9 @@ Notes:
 
 use super::helpers::{
     bubble_fingerprint, bubbles_stamp, clamp_char_range, default_text_area_box,
-    hangul_seed_at_caret, image_area_rect_from_bubble, normalize_image_text_areas,
-    parse_image_text_areas, sanitize_clipboard_text, serialize_image_text_areas, side_to_string,
-    splice_char_range, upsert_rect_coords_into_extra,
+    hangul_seed_at_caret, hint_show_outside_from_extra, image_area_rect_from_bubble,
+    normalize_image_text_areas, parse_image_text_areas, sanitize_clipboard_text,
+    serialize_image_text_areas, side_to_string, splice_char_range, upsert_rect_coords_into_extra,
 };
 use super::bubble_action::BubbleSnapshotOp;
 use super::types::{
@@ -506,6 +510,8 @@ impl CanvasView {
                 mounted: false,
                 text_areas: Vec::new(),
                 image_block_rects: Vec::new(),
+                // Only meaningful for hint bubbles; a freshly created bubble is a text bubble.
+                hint_show_outside: false,
             },
         );
         self.bubble_runtime.pending_upsert.insert(id);
@@ -783,6 +789,16 @@ impl CanvasView {
                     }
                     // Height/anchor change with the new rect; re-measure on next layout.
                     rt.mounted = false;
+                }
+                // Same reason as the rect mirror above: this call advanced the model revision, so
+                // the model→runtime sync will not re-apply the patch. The runtime copy is what the
+                // visibility gate reads and what the next flush writes back, so a footer toggle
+                // that is not mirrored here would be silently reverted by the next positional
+                // upsert.
+                if patch.contains_key("hint_show_outside_translation")
+                    && let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble_id)
+                {
+                    rt.hint_show_outside = hint_show_outside_from_extra(patch);
                 }
                 true
             }
@@ -1700,6 +1716,9 @@ impl CanvasView {
         };
         // Image bubbles carry their own text areas; text bubbles keep this empty.
         let text_areas = parse_image_text_areas(bubble);
+        // Hint bubbles carry their visibility flag in `extra`; other classes read `false` here and
+        // never persist the key back (see `flush_bubble_upserts_to_model`).
+        let hint_show_outside = hint_show_outside_from_extra(&bubble.extra);
         if let Some(existing) = self.bubble_runtime.runtime_bubbles.get_mut(&bubble.id) {
             let du = new_u - existing.img_u;
             let dv = new_v - existing.img_v;
@@ -1735,6 +1754,7 @@ impl CanvasView {
             existing.img_u = anchor.x;
             existing.img_v = anchor.y;
             existing.text_areas = text_areas;
+            existing.hint_show_outside = hint_show_outside;
         } else {
             let rect_coords = coords_from_record.unwrap_or_else(|| {
                 self.default_rect_coords_for_page_idx(bubble.img_idx, new_u, new_v)
@@ -1762,12 +1782,27 @@ impl CanvasView {
                     mounted: false,
                     text_areas,
                     image_block_rects: Vec::new(),
+                    hint_show_outside,
                 },
             );
         }
         self.bubble_runtime
             .runtime_fingerprints
             .insert(bubble.id, fingerprint);
+    }
+
+    /// True when `bubble` must not appear on THIS canvas at all.
+    ///
+    /// This is the single hidden-hint gate: a [`BubbleClass::Hint`] whose per-bubble
+    /// `hint_show_outside` flag is off is invisible outside the translation tab (`editable ==
+    /// false`, i.e. cleaning and typing). "Invisible" means more than "not painted": such a bubble
+    /// must not be bucketed, hit-tested, focusable, or counted for layout, otherwise it betrays its
+    /// own existence (e.g. by reserving an aside gutter on an otherwise bubble-free page).
+    ///
+    /// EVERY scan of `runtime_bubbles` that feeds drawing, hit-testing, or layout must consult this
+    /// predicate — see the contract note in `src/canvas/MODULE_README.md`.
+    pub(super) fn is_runtime_bubble_hidden(&self, bubble: &RuntimeBubble) -> bool {
+        bubble.bubble_class == BubbleClass::Hint && !self.editable && !bubble.hint_show_outside
     }
 
     /// Buckets every runtime bubble on `page_idx` into the four aside/on-top columns in one pass.
@@ -1782,6 +1817,12 @@ impl CanvasView {
         let mut acc = PageBubbleBucketAccumulator::default();
         for b in self.bubble_runtime.runtime_bubbles.values() {
             if b.img_idx != page_idx {
+                continue;
+            }
+            // Hint visibility gate (shared predicate). This function is the SOLE bubble-column
+            // scanner (see `MODULE_README.md`), so one skip removes the bubble from both aside
+            // columns, from both on-top columns, and from focus hit-testing.
+            if self.is_runtime_bubble_hidden(b) {
                 continue;
             }
             let displayed_type = self.displayed_bubble_type_for_runtime(b);
@@ -1994,6 +2035,20 @@ impl CanvasView {
                 } else {
                     (rt.text.clone(), rt.original_text.clone())
                 };
+            // Hint bubbles own one extra key. Written into the EXISTING map (never a fresh one) so
+            // unknown keys of the record survive, exactly like the image branch above. The key is
+            // CLASS-OWNED, so it is dropped again as soon as the bubble stops being a hint: that
+            // keeps a hint -> text -> hint round trip deterministic (the second conversion re-seeds
+            // from the current default instead of resurrecting a stale per-bubble value) and stops
+            // a plain text bubble from carrying a meaningless flag through save/load.
+            if rt.bubble_class == BubbleClass::Hint {
+                extra.insert(
+                    "hint_show_outside_translation".to_string(),
+                    Value::Bool(rt.hint_show_outside),
+                );
+            } else {
+                extra.remove("hint_show_outside_translation");
+            }
             let rec = runtime_bubble_to_record(
                 rt.id,
                 rt.img_idx,
@@ -2166,6 +2221,53 @@ impl CanvasView {
         ctx.request_repaint();
     }
 
+    /// Creates a hint bubble at `pointer_pos` and selects it; returns whether one was created.
+    ///
+    /// A no-op returning `false` when the canvas is read-only or when the pointer is not over a
+    /// page. Bound to the rebindable `H` hotkey of the translation tab.
+    pub fn create_hint_bubble_at_pointer_shortcut(
+        &mut self,
+        ctx: &egui::Context,
+        pointer_pos: Pos2,
+    ) -> bool {
+        if !self.editable {
+            return false;
+        }
+        let Some((page_idx, page_rect)) = self
+            .scene
+            .page_rects
+            .iter()
+            .enumerate()
+            .find_map(|(idx, rect)| rect.contains(pointer_pos).then_some((idx, *rect)))
+        else {
+            return false;
+        };
+        let new_bid = self.create_bubble_at(page_idx, page_rect, pointer_pos);
+        self.promote_bubble_to_hint(ctx, new_bid);
+        true
+    }
+
+    /// Turns the runtime bubble `bid` into a [`BubbleClass::Hint`] and seeds its visibility flag.
+    ///
+    /// Pins `bubble_type` to [`BubbleType::Aside`] (a hint is never an on-top bubble) and seeds
+    /// `hint_show_outside` from the user-level `CanvasState::hint_show_outside_default`. The text
+    /// fields are left untouched: `Bubble.text` is the hint's single canonical line. Persistence
+    /// goes through the ordinary `pending_upsert` -> `flush_bubble_upserts_to_model` path, which
+    /// owns writing `extra["hint_show_outside_translation"]`.
+    fn promote_bubble_to_hint(&mut self, ctx: &egui::Context, bid: i64) {
+        let show_outside = self.state.hint_show_outside_default;
+        if let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) {
+            rt.bubble_class = BubbleClass::Hint;
+            rt.bubble_type = BubbleType::Aside;
+            rt.hint_show_outside = show_outside;
+            rt.mounted = false;
+        }
+        self.bubble_runtime.pending_upsert.insert(bid);
+        self.bubble_runtime.selected_bubble = Some(bid);
+        self.bubble_runtime.canvas_context_menu_target = None;
+        ctx.request_repaint();
+    }
+
     fn create_bubble_at(&mut self, page_idx: usize, page_rect: Rect, scene_pos: Pos2) -> i64 {
         let side = if scene_pos.x < page_rect.center().x {
             Side::Left
@@ -2196,6 +2298,8 @@ impl CanvasView {
                 mounted: false,
                 text_areas: Vec::new(),
                 image_block_rects: Vec::new(),
+                // Only meaningful for hint bubbles; a freshly created bubble is a text bubble.
+                hint_show_outside: false,
             },
         );
         self.bubble_runtime.pending_upsert.insert(id);
@@ -2340,6 +2444,7 @@ mod tests {
                 mounted: false,
                 text_areas,
                 image_block_rects: Vec::new(),
+                hint_show_outside: false,
             },
         );
     }
@@ -2470,6 +2575,7 @@ mod tests {
                 mounted: false,
                 text_areas: Vec::new(),
                 image_block_rects: Vec::new(),
+                hint_show_outside: false,
             },
         );
     }
@@ -2718,6 +2824,7 @@ mod tests {
                 mounted: true,
                 text_areas: Vec::new(),
                 image_block_rects: Vec::new(),
+                hint_show_outside: false,
             },
         );
     }
@@ -3140,5 +3247,141 @@ mod tests {
             .map(|item| item.bid)
             .collect();
         assert_eq!(order, vec![10, 20]);
+    }
+
+    #[test]
+    fn page_bubbles_bucketed_hides_hints_outside_the_translation_tab() {
+        // The gate: a hint whose per-bubble flag is off must disappear from every column of a
+        // read-only canvas (cleaning/typing) while text bubbles and opted-in hints stay.
+        let mut canvas = CanvasView::default();
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.20, 0.10, Side::Left, BubbleType::Aside);
+        insert_text_runtime_bubble(&mut canvas, 2, 0, 0.20, 0.20, Side::Left, BubbleType::Aside);
+        insert_text_runtime_bubble(&mut canvas, 3, 0, 0.20, 0.30, Side::Left, BubbleType::OnTop);
+        for (bid, show_outside) in [(2, false), (3, true)] {
+            let rt = canvas
+                .bubble_runtime
+                .runtime_bubbles
+                .get_mut(&bid)
+                .expect("test bubble was just inserted");
+            rt.bubble_class = BubbleClass::Hint;
+            rt.hint_show_outside = show_outside;
+        }
+        let aside_ids = |canvas: &CanvasView| {
+            canvas
+                .page_bubbles_bucketed(0)
+                .bucket(Side::Left, BubbleType::Aside)
+                .iter()
+                .map(|item| item.bid)
+                .collect::<Vec<i64>>()
+        };
+
+        // Editable (translation tab): every hint is visible, and hints are forced into the aside
+        // column even though bubble 3 asked for the on-top display type.
+        assert_eq!(aside_ids(&canvas), vec![1, 2, 3]);
+
+        // Read-only (cleaning/typing): only the opted-in hint survives.
+        canvas.editable = false;
+        assert_eq!(aside_ids(&canvas), vec![1, 3]);
+    }
+
+    #[test]
+    fn converting_to_hint_folds_a_lone_original_into_the_single_line() {
+        // A hint owns exactly ONE line, in `text`. Converting a bubble that carried only an
+        // ORIGINAL (an OCR'd, not yet translated replica) must move that text into `text` instead
+        // of producing a blank hint whose content is invisible to every hint code path.
+        let mut canvas = CanvasView::default();
+        canvas.state.hint_show_outside_default = true;
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.20, 0.20, Side::Left, BubbleType::OnTop);
+        canvas
+            .bubble_runtime
+            .runtime_bubbles
+            .get_mut(&1)
+            .expect("test bubble was just inserted")
+            .original_text = "ОРИГИНАЛ".to_string();
+
+        assert!(canvas.set_bubble_class_for_bid(1, BubbleClass::Hint));
+
+        let rt = &canvas.bubble_runtime.runtime_bubbles[&1];
+        assert_eq!(rt.text, "ОРИГИНАЛ");
+        assert!(rt.original_text.is_empty());
+        // A hint is never an on-top bubble, and its flag is seeded from the user-level default.
+        assert_eq!(rt.bubble_type, BubbleType::Aside);
+        assert!(rt.hint_show_outside);
+        assert!(canvas.bubble_runtime.pending_upsert.contains(&1));
+    }
+
+    #[test]
+    fn converting_to_hint_never_destroys_an_original_that_has_no_home() {
+        // Deliberate exception to "a hint's `original_text` is empty": when `text` already holds
+        // the line, dropping the original would silently destroy user-typed text. It is kept (no
+        // hint code path reads it) and returns when the bubble is converted back to a text bubble.
+        let mut canvas = CanvasView::default();
+        insert_text_runtime_bubble(&mut canvas, 1, 0, 0.20, 0.20, Side::Left, BubbleType::Aside);
+        {
+            let rt = canvas
+                .bubble_runtime
+                .runtime_bubbles
+                .get_mut(&1)
+                .expect("test bubble was just inserted");
+            rt.text = "ПЕРЕВОД".to_string();
+            rt.original_text = "ОРИГИНАЛ".to_string();
+        }
+
+        assert!(canvas.set_bubble_class_for_bid(1, BubbleClass::Hint));
+
+        let rt = &canvas.bubble_runtime.runtime_bubbles[&1];
+        assert_eq!(rt.text, "ПЕРЕВОД");
+        assert_eq!(rt.original_text, "ОРИГИНАЛ");
+    }
+
+    #[test]
+    fn class_round_trip_drops_and_reseeds_the_hint_extra_key() {
+        // `hint_show_outside_translation` is CLASS-OWNED: it must vanish from the persisted record
+        // as soon as the bubble stops being a hint, so that hint -> text -> hint re-seeds from the
+        // current user default instead of resurrecting the stale per-bubble value.
+        let project = empty_project();
+        let mut extra = Map::new();
+        extra.insert(
+            "hint_show_outside_translation".to_string(),
+            Value::Bool(true),
+        );
+        let record = runtime_bubble_to_record(
+            1,
+            0,
+            0.30,
+            0.30,
+            Some(side_to_string(Side::Left)),
+            Some("hint".to_string()),
+            Some("aside".to_string()),
+            "подсказка".to_string(),
+            String::new(),
+            Some(extra),
+        );
+        let model = test_model(vec![record]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        assert!(canvas.bubble_runtime.runtime_bubbles[&1].hint_show_outside);
+
+        let stored_flag = |model: &Arc<Mutex<BubblesModel>>| -> Option<Value> {
+            model
+                .lock()
+                .expect("lock model")
+                .extra_of(1)
+                .and_then(|extra| extra.get("hint_show_outside_translation").cloned())
+        };
+
+        // hint -> text: the key is removed from `extra`, and the runtime mirror is reset.
+        assert!(canvas.set_bubble_class_for_bid(1, BubbleClass::Text));
+        assert!(!canvas.bubble_runtime.runtime_bubbles[&1].hint_show_outside);
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert_eq!(stored_flag(&model), None);
+
+        // text -> hint: re-seeded from the CURRENT default (false here), not from the true that
+        // the bubble carried before the first conversion.
+        canvas.state.hint_show_outside_default = false;
+        assert!(canvas.set_bubble_class_for_bid(1, BubbleClass::Hint));
+        canvas.flush_bubble_upserts_to_model(&project);
+        assert_eq!(stored_flag(&model), Some(Value::Bool(false)));
     }
 }

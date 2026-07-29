@@ -142,7 +142,8 @@ CanvasView method map:
   `apply_canvas_snapshot`, `publish_canvas_settings`, `canvas_snapshot`,
   `queue_canvas_settings_save`.
 - Bubble layout/edit helpers:
-  `calc_bubble_width`, `aside_scale_factor`, `page_bubbles`, `page_bubbles_bucketed`,
+  `calc_bubble_width`, `aside_scale_factor`, `page_bubbles_bucketed`,
+  `is_runtime_bubble_hidden` (the single hidden-hint gate), `refresh_page_aside_presence`,
   `hook_bubbles_snapshot`, `hook_bubbles_revision`,
   `commit_lingering_drag_gestures_on_pointer_up`, `apply_pending_actions`,
   `schedule_text_upsert`, `commit_text_upsert_now`, `promote_debounced_text_upserts`,
@@ -1233,6 +1234,39 @@ impl CanvasView {
         self.overlay_runtime.mark_dirty_full(page_idx);
     }
 
+    /// Rebuilds `scene.page_aside_presence`: per page, whether its left/right side holds at least
+    /// one aside bubble that this canvas will actually draw.
+    ///
+    /// Read by `scene::canvas_row_width_for_page`, which widens the page row by one aside gutter
+    /// per marked side. It therefore MUST apply the same per-bubble visibility gate as
+    /// `page_bubbles_bucketed` (`is_runtime_bubble_hidden`): a hidden hint that still marked its
+    /// side would reserve an empty gutter and make the page layout differ from a project without
+    /// hints — the bubble betraying itself without being drawn.
+    ///
+    /// Cleared and left empty when bubbles are hidden globally (`state.show_bubbles == false`).
+    fn refresh_page_aside_presence(&mut self) {
+        self.scene.page_aside_presence.clear();
+        if !self.state.show_bubbles {
+            return;
+        }
+        for bubble in self.bubble_runtime.runtime_bubbles.values() {
+            if self.is_runtime_bubble_hidden(bubble)
+                || self.displayed_bubble_type_for_runtime(bubble) != BubbleType::Aside
+            {
+                continue;
+            }
+            let presence = self
+                .scene
+                .page_aside_presence
+                .entry(bubble.img_idx)
+                .or_insert([false, false]);
+            match bubble.side {
+                crate::project::Side::Left => presence[0] = true,
+                crate::project::Side::Right => presence[1] = true,
+            }
+        }
+    }
+
     pub fn draw(&mut self, params: CanvasDrawParams<'_>) {
         let CanvasDrawParams {
             ctx,
@@ -1253,23 +1287,7 @@ impl CanvasView {
         // Per-frame registry: rebuilt by `note_focused_bubble_text_input` during the scene pass.
         self.bubble_runtime.bubble_text_edit_ids.clear();
         self.scene.on_top_hit_rects.clear();
-        self.scene.page_aside_presence.clear();
-        if self.state.show_bubbles {
-            for bubble in self.bubble_runtime.runtime_bubbles.values() {
-                if self.displayed_bubble_type_for_runtime(bubble) != BubbleType::Aside {
-                    continue;
-                }
-                let presence = self
-                    .scene
-                    .page_aside_presence
-                    .entry(bubble.img_idx)
-                    .or_insert([false, false]);
-                match bubble.side {
-                    crate::project::Side::Left => presence[0] = true,
-                    crate::project::Side::Right => presence[1] = true,
-                }
-            }
-        }
+        self.refresh_page_aside_presence();
         let canvas_rect = ui.max_rect();
         let (suppress_wheel_scroll, zoom_drag_active) =
             self.handle_shortcuts(ctx, project, canvas_rect);
@@ -2089,7 +2107,9 @@ impl CanvasView {
     }
 
     fn displayed_bubble_type_for_runtime(&self, bubble: &RuntimeBubble) -> BubbleType {
-        if bubble.bubble_class == BubbleClass::Image {
+        // Neither image bubbles nor hint bubbles are display types: both always use the aside
+        // layout path and must not resolve through the on-top display settings.
+        if bubble.bubble_class == BubbleClass::Image || bubble.bubble_class == BubbleClass::Hint {
             return BubbleType::Aside;
         }
         let display_type = if self.editable {
@@ -2141,7 +2161,23 @@ impl CanvasView {
         true
     }
 
+    /// Converts the runtime bubble `bid` to `bubble_class`, normalizing the class-owned state.
+    ///
+    /// Returns `false` when the bubble is unknown or already has that class (no mutation, no
+    /// pending write). On a real change it queues a model upsert, so the class-owned parts of the
+    /// record — including the removal of `extra["hint_show_outside_translation"]` when the bubble
+    /// stops being a hint — are persisted by `flush_bubble_upserts_to_model`.
+    ///
+    /// Class-owned normalization:
+    /// - `Image`/`Hint` pin `bubble_type` to [`BubbleType::Aside`] (neither is a display type), so
+    ///   a previously chosen on-top/default type is dropped.
+    /// - Entering `Hint` seeds `hint_show_outside` from `CanvasState::hint_show_outside_default`,
+    ///   exactly like the `H` creation path (`promote_bubble_to_hint`), and folds the two text
+    ///   fields into the hint's single canonical line (see below).
+    /// - Leaving `Hint` clears the runtime `hint_show_outside` mirror; it is meaningless for the
+    ///   other classes and the key is dropped from `extra` on the next flush.
     pub fn set_bubble_class_for_bid(&mut self, bid: i64, bubble_class: BubbleClass) -> bool {
+        let hint_show_outside_default = self.state.hint_show_outside_default;
         let Some(rt) = self.bubble_runtime.runtime_bubbles.get_mut(&bid) else {
             return false;
         };
@@ -2149,8 +2185,28 @@ impl CanvasView {
             return false;
         }
         rt.bubble_class = bubble_class;
-        if bubble_class == BubbleClass::Image {
-            rt.bubble_type = BubbleType::Aside;
+        match bubble_class {
+            BubbleClass::Text => {
+                rt.hint_show_outside = false;
+            }
+            BubbleClass::Image => {
+                rt.bubble_type = BubbleType::Aside;
+                rt.hint_show_outside = false;
+            }
+            BubbleClass::Hint => {
+                rt.bubble_type = BubbleType::Aside;
+                rt.hint_show_outside = hint_show_outside_default;
+                // A hint owns exactly ONE line and it lives in `text`. When `text` is blank the
+                // ORIGINAL is moved into it, so converting a bubble that only carried an original
+                // (e.g. an OCR'd, untranslated replica) does not silently produce an empty hint.
+                // When `text` already holds something the original is deliberately LEFT IN PLACE
+                // rather than destroyed: no hint code path reads or renders it, and converting the
+                // bubble back to a text bubble restores it. Dropping user-typed text to satisfy
+                // the "original stays empty" convention would be the worse trade.
+                if rt.text.trim().is_empty() {
+                    rt.text = std::mem::take(&mut rt.original_text);
+                }
+            }
         }
         rt.mounted = false;
         self.bubble_runtime.pending_upsert.insert(bid);

@@ -99,7 +99,7 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
 use crate::canvas::{
-    CanvasBottomHint, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
+    BubbleClass, CanvasBottomHint, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
     CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget, parse_image_text_areas,
 };
 use crate::memory_manager::{
@@ -1438,11 +1438,17 @@ impl CanvasHooks for TypingHooks<'_> {
         }
     }
 
+    /// Delegates to [`bubble_offers_create_text_header`]: an area rect plus a replica class.
     fn has_bubble_header(&mut self, bubble: &Bubble, _editable: bool) -> bool {
-        bubble_rect_coords(bubble).is_some()
+        bubble_offers_create_text_header(bubble)
     }
 
+    /// Draws the «Создать текст» header button. Guarded on the same conditions as
+    /// [`Self::has_bubble_header`] so the hint exclusion holds even if a caller skips the query.
     fn build_bubble_header(&mut self, ui: &mut egui::Ui, bubble: &Bubble, _editable: bool) {
+        if is_hint_bubble(bubble) {
+            return;
+        }
         let Some(rect_coords) = bubble_rect_coords(bubble) else {
             return;
         };

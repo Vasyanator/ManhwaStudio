@@ -2,8 +2,10 @@
 File: src/widgets/spellchecked_line.rs
 
 Purpose:
-Многострочный `egui::TextEdit` с фоновой проверкой орфографии по Hunspell-
-совместимым словарям и подчёркиванием некорректных слов.
+`egui::TextEdit` с фоновой проверкой орфографии по Hunspell-совместимым
+словарям и подчёркиванием некорректных слов. Доступен в двух режимах:
+`multiline` (растёт по тексту) и `singleline` (ровно одна строка, `Enter`
+не вставляет перевод строки) — layouter у них общий.
 
 Main responsibilities:
 - оборачивать стандартный `TextEdit` без блокировки GUI-потока;
@@ -308,9 +310,16 @@ pub struct SpellcheckedTextEdit<'a> {
     horizontal_align: Align,
     vertical_align: Align,
     spellcheck_enabled: bool,
+    /// `true` -> `egui::TextEdit::multiline`, `false` -> `egui::TextEdit::singleline`.
+    /// Chosen by the constructor and never changed afterwards.
+    multiline: bool,
 }
 
 impl<'a> SpellcheckedTextEdit<'a> {
+    /// Multiline spellchecked editor: `Enter` inserts a newline and the field grows with the text.
+    ///
+    /// `desired_rows` only sets the INITIAL height here; it does not cap growth. Use `singleline`
+    /// when the value must stay exactly one line.
     #[must_use]
     pub fn multiline(text: &'a mut String) -> Self {
         Self {
@@ -322,6 +331,27 @@ impl<'a> SpellcheckedTextEdit<'a> {
             horizontal_align: Align::LEFT,
             vertical_align: Align::TOP,
             spellcheck_enabled: true,
+            multiline: true,
+        }
+    }
+
+    /// Single-line spellchecked editor: the field is exactly one row high, `Enter` does not insert
+    /// a newline (it reports `lost_focus`), and the text scrolls horizontally instead of wrapping.
+    ///
+    /// Uses the same spellcheck layouter as `multiline`, so misspellings are underlined identically.
+    /// `desired_rows` is ignored in this mode; every other builder method behaves the same.
+    #[must_use]
+    pub fn singleline(text: &'a mut String) -> Self {
+        Self {
+            text,
+            hint_text: String::new(),
+            id: None,
+            desired_width: None,
+            desired_rows: 1,
+            horizontal_align: Align::LEFT,
+            vertical_align: Align::TOP,
+            spellcheck_enabled: true,
+            multiline: false,
         }
     }
 
@@ -349,6 +379,7 @@ impl<'a> SpellcheckedTextEdit<'a> {
         self
     }
 
+    /// Initial height in rows. Multiline only; ignored by a `singleline` editor.
     #[must_use]
     pub fn desired_rows(mut self, desired_rows: usize) -> Self {
         self.desired_rows = desired_rows;
@@ -373,15 +404,25 @@ impl<'a> SpellcheckedTextEdit<'a> {
         self
     }
 
+    /// Draws the editor and returns the full `TextEditOutput` (response, galley, cursor state).
+    ///
+    /// The spellcheck layouter is identical in both modes; only the underlying `TextEdit`
+    /// constructor differs (`multiline` vs `singleline`).
     pub fn show(self, ui: &mut Ui) -> TextEditOutput {
         let spellcheck_enabled = self.spellcheck_enabled;
         let mut layouter = move |ui: &Ui, buffer: &dyn TextBuffer, wrap_width: f32| {
             build_spellcheck_galley(ui, buffer.as_str(), wrap_width, spellcheck_enabled)
         };
 
-        let mut edit = TextEdit::multiline(self.text)
+        // `desired_rows` is a multiline-only knob (it sets the initial row count); a single-line
+        // `TextEdit` is always exactly one row high, so it is not forwarded there.
+        let base = if self.multiline {
+            TextEdit::multiline(self.text).desired_rows(self.desired_rows)
+        } else {
+            TextEdit::singleline(self.text)
+        };
+        let mut edit = base
             .hint_text(self.hint_text)
-            .desired_rows(self.desired_rows)
             .horizontal_align(self.horizontal_align)
             .vertical_align(self.vertical_align);
         if let Some(id) = self.id {
@@ -1325,6 +1366,28 @@ mod tests {
             | TextScriptGroup::Romance
             | TextScriptGroup::English => ScriptGroup::Latin,
         }
+    }
+
+    /// The two constructors must differ ONLY in the `multiline` flag (which `show` turns into
+    /// `TextEdit::multiline` vs `TextEdit::singleline`); every other default stays shared, and the
+    /// builder methods must keep working after either one.
+    #[test]
+    fn singleline_and_multiline_constructors_differ_only_in_mode() {
+        let mut text = String::new();
+        let single = SpellcheckedTextEdit::singleline(&mut text);
+        assert!(!single.multiline);
+        assert!(single.spellcheck_enabled);
+        assert!(single.id.is_none());
+
+        let mut other = String::new();
+        let multi = SpellcheckedTextEdit::multiline(&mut other)
+            .id_salt("test_salt")
+            .desired_rows(4)
+            .spellcheck_enabled(false);
+        assert!(multi.multiline);
+        assert_eq!(multi.desired_rows, 4);
+        assert!(!multi.spellcheck_enabled);
+        assert!(multi.id.is_some());
     }
 
     #[test]

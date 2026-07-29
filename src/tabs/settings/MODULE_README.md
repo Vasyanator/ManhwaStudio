@@ -77,7 +77,12 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   reachable from the launcher). Both surfaces read/write the `ms_text_util::language` process-global
   and persist through the same `save_text_language`, so they cannot drift apart.
 - `canvas_ribbon.rs`: shared ribbon/canvas pane for bubble type defaults, aside/on-top layout,
-  spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields.
+  spellcheck word lists, bubble status rules, and related `SharedCanvasSettings` fields. It also
+  hosts `hint_show_outside_default` — the initial value of a NEW hint bubble's
+  `hint_show_outside_translation` flag (existing hints keep their own per-bubble value). Like
+  `cache_pages` it is a cross-project USER preference: written to both the user and project canvas
+  files by `canvas/settings.rs`, but loaded user-file-primary with a project fallback in
+  `project.rs::canvas_settings_from_config`.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
   orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
   font-administration UI. The pane hosts the app-wide
@@ -165,7 +170,14 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   (exhaustive, no `_ =>`), and add a focused renderer if it grows beyond trivial UI. The tab bar and
   order come from `sections_for(Studio)`; do not hand-list sections in `mod.rs`.
 - To change shared canvas/ribbon settings, edit `canvas_ribbon.rs` and the save/apply helpers in
-  `mod.rs`.
+  `mod.rs`. `SharedCanvasSettings` has NO serde derives, so ADDING a field means threading it by
+  hand through: `models/bubbles_model.rs` (struct + `Default`), `project.rs::CanvasSettings`
+  (struct + `Default`) and its loader `canvas_settings_from_config`, the two bridges in `app.rs`,
+  the two writers in `canvas/settings.rs`
+  (`save_canvas_settings_to_project_file` / `save_canvas_settings_to_user_file`),
+  `CanvasView::apply_canvas_snapshot` / `canvas_snapshot` plus the `CanvasState` field in
+  `canvas/types.rs`, and finally the widget here. The struct literals carry no
+  `..Default::default()`, so the compiler flags every construction site.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit the
   shared `crate::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
   renders it inline in `mod.rs::draw` (scroll area + `shared.draw(AiBackend, ..)`).

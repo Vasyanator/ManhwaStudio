@@ -1115,6 +1115,10 @@ pub fn project_config_defaults() -> Value {
             "limit": 700,
             "limit_enabled": true,
             "use_character_names": true,
+            "include_hint_bubbles": true,
+            "hint_wrap": "()",
+            "hint_wrap_enabled": true,
+            "hint_extra_sep": "",
             "jinja2_enabled": false,
             "jinja2_template": ""
         },

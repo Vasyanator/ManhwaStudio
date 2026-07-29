@@ -96,6 +96,9 @@ between batches and prunes old user/assistant turns when the configured context-
 exceeded. Progress events expose translated/error counts, approximate context usage, and the number
 of replicas removed during context pruning; batches may include existing bubble translations when
 the user enables that context option.
+`BubbleClass::Hint` never enters an MT batch — not as a translatable item and not as context — in
+any of the three collection paths (scope run, per-ImageBubble mode, explicit per-id request): a hint
+is an author note addressed to the translator, not a replica.
 
 ## Files and submodules
 - `mod.rs`: module wiring and public re-exports for `TranslationTabState`, hotkey IDs, and hotkey
@@ -148,6 +151,15 @@ the user enables that context option.
   page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
   files are written to the chapter unsaved staging `image_bubbles/` directory and stored as
   chapter-relative paths so the saved chapter can resolve them after commit.
+- `build_bubble_footer` is a class dispatch placed AFTER the shared replica-order spin box, so every
+  bubble class inherits the order control: `Image` gets the image source/crop controls, `Hint` gets
+  only the `hint_show_outside_translation` checkbox, and `Text` gets the character autocomplete.
+  A checkbox/combo in the footer must read a still-pending `pending_footer_patches` entry before
+  falling back to `Bubble.extra`, because the patch is debounced and the model lags a few frames.
+  `bubble_status_style` exempts `BubbleClass::Hint`: a hint has no original, translation, or
+  character, so the incomplete-replica rules would border every hint. `canvas_scrollbar_marks`
+  carries the same exemption for the same reason — a hint's single line lives in `text`, so a
+  translation-status stripe for it would always read "translated".
 - App-managed OCR/detector model downloads must go through `src/ai_models.rs`. Missing models,
   backend failures, unavailable credential stores, AI API request failures, and unsupported engines
   must surface clear errors.

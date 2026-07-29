@@ -125,6 +125,7 @@ const HOTKEY_TRANSLATION_ZOOM_OUT: &str = "translation.canvas.zoom_out";
 const HOTKEY_TRANSLATION_ZOOM_RESET: &str = "translation.canvas.zoom_reset";
 const HOTKEY_TRANSLATION_DELETE_BUBBLE: &str = "translation.bubble.delete_selected";
 const HOTKEY_TRANSLATION_CREATE_BUBBLE: &str = "translation.bubble.create_at_cursor";
+const HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE: &str = "translation.bubble.create_hint_at_cursor";
 const HOTKEY_CLEANING_ZOOM_IN: &str = "cleaning.canvas.zoom_in";
 const HOTKEY_CLEANING_ZOOM_OUT: &str = "cleaning.canvas.zoom_out";
 const HOTKEY_CLEANING_ZOOM_RESET: &str = "cleaning.canvas.zoom_reset";
@@ -603,6 +604,8 @@ impl MangaApp {
         canvas.state.cache_pages = cache_pages;
         canvas.state.translation_status_display =
             TranslationStatusDisplay::from_str(&project.canvas_settings.translation_status_display);
+        canvas.state.hint_show_outside_default =
+            project.canvas_settings.hint_show_outside_default;
         canvas.set_bottom_hint_collapsed(translation_hint_collapsed);
         let shared_canvas_settings = SharedCanvasSettings {
             bubble_type: BubbleMode::Hybrid.as_str().to_string(),
@@ -642,6 +645,7 @@ impl MangaApp {
                 .translation_status_display
                 .as_str()
                 .to_string(),
+            hint_show_outside_default: canvas.state.hint_show_outside_default,
         };
         let bubbles_model = Arc::new(Mutex::new(BubblesModel::new(
             project.bubbles.as_ref().clone(),
@@ -1755,6 +1759,7 @@ impl MangaApp {
                 .translation_status_display
                 .as_str()
                 .to_string(),
+            hint_show_outside_default: self.canvas.state.hint_show_outside_default,
         };
 
         if let Ok(mut bubbles_model) = self.bubbles_model.lock() {
@@ -2247,6 +2252,17 @@ impl MangaApp {
                         ctx,
                         &mut self.canvas,
                         &self.project,
+                        pointer_pos,
+                    );
+                }
+            }
+            HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE => {
+                if !self.translation_tab.blocks_canvas_bubble_hotkeys()
+                    && let Some(pointer_pos) = ctx.pointer_latest_pos()
+                {
+                    self.translation_tab.create_hint_bubble_at_pointer_shortcut(
+                        ctx,
+                        &mut self.canvas,
                         pointer_pos,
                     );
                 }
@@ -3853,6 +3869,18 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
         default_shortcut: Some(egui::KeyboardShortcut::new(
             egui::Modifiers::NONE,
             egui::Key::T,
+        )),
+        default_modifier_only: None,
+        scope: HotkeyScopeV2::Tab(AppTab::Translation),
+        active_when_input: false,
+    });
+    manager.register(HotkeySpecV2 {
+        id: HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE,
+        title: t!("app.hotkey.create_hint_bubble"),
+        section: t!("app.hotkey.bubbles_category"),
+        default_shortcut: Some(egui::KeyboardShortcut::new(
+            egui::Modifiers::NONE,
+            egui::Key::H,
         )),
         default_modifier_only: None,
         scope: HotkeyScopeV2::Tab(AppTab::Translation),
