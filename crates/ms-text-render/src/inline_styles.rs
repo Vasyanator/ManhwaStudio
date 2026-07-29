@@ -14,13 +14,14 @@ Notes:
 - текущий pipeline шага 5 использует здесь только rich-text shaping через `Attrs`;
 - color/kerning/stretch/offset/line-spacing пока лишь сохраняются в span-модели для следующих этапов;
 - parameterized `<b=...>`/`<i=...>` (and machine `b=`/`i=`) request FAUX
-  bold/italic: the span is marked bold/italic but deliberately does NOT get
-  Weight/Style in attrs — the style is synthesized geometrically at the glyph
-  seam (`pipeline.rs`, `FauxGlyphStyle`); bare `<b>`/`<i>` keep the legacy
-  real-Bold/Italic-face behavior.
+  bold/italic: the span is marked bold/italic but deliberately does NOT get a
+  Bold/Italic weight or style in attrs — it keeps the SELECTED face's own
+  weight/style (`FauxFaceBaseline`) and the style is synthesized geometrically
+  at the glyph seam (`pipeline.rs`, `FauxGlyphStyle`); bare `<b>`/`<i>` keep
+  the legacy real-Bold/Italic-face behavior.
 */
 
-use super::font_registry::{InlineFontRegistry, normalize_inline_font_label};
+use super::font_registry::{InlineFontRegistry, RegisteredFontFace, normalize_inline_font_label};
 use super::types::{FauxBoldParams, HorizontalAlign, PxOrPercent, parse_machine_tag};
 use cosmic_text::{Attrs, AttrsOwned, Family, Metrics, Style, Weight};
 
@@ -35,13 +36,16 @@ pub(crate) struct InlineStyleSpan {
     pub(crate) italic: bool,
     /// Faux-bold parameters when the innermost bold tag is a parameterized
     /// `<b=...>` (or machine `b=...`). `Some` implies `bold == true` and means
-    /// the span must KEEP the Regular face (no `Weight::BOLD` in attrs) and be
-    /// thickened geometrically instead. `None` with `bold == true` = real bold.
+    /// the span must KEEP its baseline face — the inline `<font=...>`'s own face
+    /// when the span sets one, otherwise the SELECTED face (no `Weight::BOLD` in
+    /// attrs) — and be thickened geometrically instead. `None` with
+    /// `bold == true` = real bold.
     pub(crate) faux_bold: Option<FauxBoldParams>,
     /// Faux-italic slant (degrees, −45..45, positive = top leans right) when
     /// the innermost italic tag is a parameterized `<i=slant>`. `Some` implies
-    /// `italic == true` and means the span keeps the upright face (no
-    /// `Style::Italic`) and is sheared instead. `None` + `italic` = real italic.
+    /// `italic == true` and means the span keeps its baseline face (the inline
+    /// font's own face, else the SELECTED face; no `Style::Italic` in attrs) and
+    /// is sheared instead. `None` + `italic` = real italic.
     pub(crate) faux_italic_slant_deg: Option<f32>,
     pub(crate) align: Option<HorizontalAlign>,
     pub(crate) font_label: Option<String>,
@@ -467,46 +471,123 @@ pub(crate) fn spans_have_attrs_overrides(spans: &[InlineStyleSpan]) -> bool {
     spans.iter().any(InlineStyleSpan::has_attrs_override)
 }
 
+/// The face a FAUX inline span falls back to: the weight/style of the SELECTED
+/// registered face.
+///
+/// Invariant — FAUX NEVER CHANGES FONT MATCHING. A faux `<b=...>`/`<i=...>` span
+/// synthesizes its style geometrically, so it must resolve to exactly the same
+/// face as the surrounding non-forced text. cosmic-text matches weight EXACTLY
+/// and abandons a family when nothing matches, and the pooled `FontSystem`
+/// carries the whole system font database, so pinning anything other than the
+/// selected face's attrs can silently select a foreign font. Only a REAL
+/// bold/italic request may deviate from this baseline.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FauxFaceBaseline {
+    /// Weight of the selected face (`Weight::NORMAL` when it declares none).
+    pub(crate) weight: Weight,
+    /// Style of the selected face (`Style::Normal` when it declares none).
+    pub(crate) style: Style,
+}
+
+impl Default for FauxFaceBaseline {
+    /// The Regular/upright baseline (weight 400, upright) used when no face
+    /// metadata is available.
+    fn default() -> Self {
+        Self {
+            weight: Weight::NORMAL,
+            style: Style::Normal,
+        }
+    }
+}
+
+impl FauxFaceBaseline {
+    /// Baseline derived from a registered face — the single place mapping face
+    /// metadata to the faux fallback attrs.
+    ///
+    /// `RegisteredFontFace::weight`/`style` are optional; an absent value falls
+    /// back to `Weight::NORMAL`/`Style::Normal`, which reproduces the historical
+    /// hardcoded reset for a face that declares no weight/style.
+    #[must_use]
+    pub(crate) fn from_registered_face(face: &RegisteredFontFace) -> Self {
+        let default = Self::default();
+        Self {
+            weight: face.weight.unwrap_or(default.weight),
+            style: face.style.unwrap_or(default.style),
+        }
+    }
+}
+
+/// Merges the attrs-compatible part of an inline style span into `attrs`.
+///
+/// Resolution order is BASELINE FIRST, then the bold/italic decision ON TOP of
+/// it:
+/// 1. An inline `<font=...>` establishes the span's baseline — its family and
+///    stretch always win, and its own `(weight, style)` become the span's
+///    effective baseline.
+/// 2. Without an inline font the effective baseline is `faux_baseline`, the
+///    SELECTED face's own weight/style.
+/// 3. `bold` then requests `Weight::BOLD` when it is a REAL bold (bare `<b>`,
+///    i.e. `faux_bold.is_none()`) and the effective baseline's weight when it is
+///    a faux `<b=...>`; `italic` does the same on the style axis. A span that
+///    sets neither keeps the effective baseline as-is.
+///
+/// So a faux span never changes font matching (it resolves to the inline font's
+/// own face, or to the selected face), while a real `<b>`/`<i>` still asks for
+/// the Bold/Italic face of whatever family the span ended up on.
 pub(crate) fn apply_inline_style_to_attrs<'a>(
     attrs: &Attrs<'a>,
     style: &InlineStyleSpan,
     inline_font_registry: &InlineFontRegistry,
+    faux_baseline: FauxFaceBaseline,
 ) -> AttrsOwned {
     let mut styled_attrs = AttrsOwned::new(attrs);
-    // Faux spans EXPLICITLY reset to the Regular/upright face: the whole point
-    // of the parameterized `<b=...>`/`<i=...>` tags is to synthesize the style
-    // geometrically at the glyph seam. Merely leaving Weight/Style untouched
-    // would let a GLOBAL real bold/italic (force flag without faux) leak into
-    // the span and stack faux geometry on top of the real Bold/Italic face.
-    if style.bold {
-        styled_attrs.weight = if style.faux_bold.is_some() {
-            Weight::NORMAL
-        } else {
-            Weight::BOLD
-        };
-    }
-    if style.italic {
-        styled_attrs.style = if style.faux_italic_slant_deg.is_some() {
-            Style::Normal
-        } else {
-            Style::Italic
-        };
-    }
+    // The inline font is resolved FIRST because it establishes the span's
+    // BASELINE face; the bold/italic decision below then applies on top of it.
+    // Running it last instead (the historical order) unconditionally overwrote
+    // `weight`/`style` and silently swallowed a real `<b>`/`<i>` set on the same
+    // span — `<b><font=X>..</font></b>` rendered with no bold at all.
+    let mut effective_baseline = faux_baseline;
     if let Some(font_label) = style.font_label.as_deref()
         && let Some(font_attrs) = inline_font_registry.get(&normalize_inline_font_label(font_label))
     {
         if let Some(family_name) = font_attrs.family_name.as_deref() {
             styled_attrs.family_owned = cosmic_text::FamilyOwned::new(Family::Name(family_name));
         }
-        if let Some(style) = font_attrs.style {
-            styled_attrs.style = style;
+        // An undeclared weight/style on the inline face leaves both the attrs and
+        // the baseline untouched, so such a font behaves exactly as before.
+        if let Some(font_style) = font_attrs.style {
+            styled_attrs.style = font_style;
+            effective_baseline.style = font_style;
         }
         if let Some(weight) = font_attrs.weight {
             styled_attrs.weight = weight;
+            effective_baseline.weight = weight;
         }
         if let Some(stretch) = font_attrs.stretch {
             styled_attrs.stretch = stretch;
         }
+    }
+    // Faux spans EXPLICITLY pin the effective baseline's weight/style: the whole
+    // point of the parameterized `<b=...>`/`<i=...>` tags is to synthesize the
+    // style geometrically at the glyph seam, so they must not change font
+    // MATCHING at all. Merely leaving Weight/Style untouched would let a GLOBAL
+    // real bold/italic (force flag without faux) leak into the span and stack
+    // faux geometry on top of the real Bold/Italic face; hardcoding 400/upright
+    // instead would push the span OFF its baseline face whenever the user picked
+    // a non-Regular file or an inline font (see `FauxFaceBaseline`).
+    if style.bold {
+        styled_attrs.weight = if style.faux_bold.is_some() {
+            effective_baseline.weight
+        } else {
+            Weight::BOLD
+        };
+    }
+    if style.italic {
+        styled_attrs.style = if style.faux_italic_slant_deg.is_some() {
+            effective_baseline.style
+        } else {
+            Style::Italic
+        };
     }
     if let Some(font_size_px) = style.font_size_px {
         let base_metrics = attrs
@@ -1087,10 +1168,10 @@ fn parse_hex_color_rgba(value: &str) -> Option<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs, parse_inline_style_tags,
-        remap_inline_style_spans,
+        FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
+        parse_inline_style_tags, remap_inline_style_spans,
     };
-    use crate::font_registry::InlineFontRegistry;
+    use crate::font_registry::{InlineFontRegistry, RegisteredFontFace};
     use crate::types::{FauxBoldParams, HorizontalAlign};
     use cosmic_text::{Attrs, Metrics, Style, Weight};
 
@@ -1469,6 +1550,23 @@ mod tests {
         assert_eq!(legacy_span.faux_italic_slant_deg, None);
     }
 
+    /// The faux baseline of a plain Regular file (weight 400, upright) — the
+    /// overwhelmingly common selected face, and the historical hardcoded reset.
+    fn regular_baseline() -> FauxFaceBaseline {
+        FauxFaceBaseline::default()
+    }
+
+    /// A registered face carrying an explicit weight/style, as a non-Regular
+    /// file of a family resolves to.
+    fn registered_face(family: &str, weight: Weight, style: Style) -> RegisteredFontFace {
+        RegisteredFontFace {
+            family_name: Some(family.to_string()),
+            style: Some(style),
+            weight: Some(weight),
+            stretch: None,
+        }
+    }
+
     #[test]
     fn faux_spans_do_not_set_weight_or_style_on_attrs() {
         let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
@@ -1478,16 +1576,23 @@ mod tests {
             .iter()
             .find(|span| span.faux_bold.is_some())
             .expect("faux span");
-        let applied = apply_inline_style_to_attrs(&attrs, span, &InlineFontRegistry::default());
+        let applied = apply_inline_style_to_attrs(
+            &attrs,
+            span,
+            &InlineFontRegistry::default(),
+            regular_baseline(),
+        );
         assert_ne!(applied.weight, Weight::BOLD, "faux bold keeps Regular face");
         assert_ne!(applied.style, Style::Italic, "faux italic keeps upright face");
     }
 
     #[test]
-    fn faux_spans_reset_global_real_bold_italic_to_regular_face() {
+    fn faux_spans_reset_global_real_bold_italic_to_selected_face() {
         // Base attrs carrying a GLOBAL real bold + italic (force flags without
-        // faux): an inline faux span must explicitly reset to the
-        // Regular/upright face, never stack faux geometry on the real faces.
+        // faux): an inline faux span must explicitly reset to the SELECTED
+        // face's own weight/style, never stack faux geometry on the real faces.
+        // With a Regular selected face the reset is the historical
+        // 400/upright — byte-identical to the pre-fix behavior.
         let attrs = Attrs::new()
             .metrics(Metrics::new(20.0, 24.0))
             .weight(Weight::BOLD)
@@ -1499,11 +1604,16 @@ mod tests {
             .iter()
             .find(|span| span.faux_bold.is_some())
             .expect("faux bold span");
-        let applied = apply_inline_style_to_attrs(&attrs, bold_span, &InlineFontRegistry::default());
+        let applied = apply_inline_style_to_attrs(
+            &attrs,
+            bold_span,
+            &InlineFontRegistry::default(),
+            regular_baseline(),
+        );
         assert_eq!(
             applied.weight,
             Weight::NORMAL,
-            "faux bold span must force the Regular weight over a global real bold"
+            "faux bold span must fall back to the Regular selected face over a global real bold"
         );
         // The italic flag is not set on this span, so the global italic stays.
         assert_eq!(applied.style, Style::Italic);
@@ -1514,14 +1624,311 @@ mod tests {
             .iter()
             .find(|span| span.faux_italic_slant_deg.is_some())
             .expect("faux italic span");
-        let applied =
-            apply_inline_style_to_attrs(&attrs, italic_span, &InlineFontRegistry::default());
+        let applied = apply_inline_style_to_attrs(
+            &attrs,
+            italic_span,
+            &InlineFontRegistry::default(),
+            regular_baseline(),
+        );
         assert_eq!(
             applied.style,
             Style::Normal,
-            "faux italic span must force the upright style over a global real italic"
+            "faux italic span must fall back to the upright selected face over a global real italic"
         );
         assert_eq!(applied.weight, Weight::BOLD);
+    }
+
+    #[test]
+    fn faux_bold_span_keeps_the_selected_faces_own_weight() {
+        // Regression: the user selected a Bold FILE of a family (a separate
+        // entry in the font list, weight 700). A faux `<b=...>` span inside it
+        // must keep 700 — hardcoding 400 would push the span off the selected
+        // face, and cosmic-text matches weight EXACTLY, so it could silently
+        // resolve to a different file from the system font database.
+        let attrs = Attrs::new()
+            .metrics(Metrics::new(20.0, 24.0))
+            .weight(Weight(700));
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Faux Test Family",
+            Weight(700),
+            Style::Normal,
+        ));
+
+        let parsed = parse_inline_style_tags("<b=3>x</b>", 24.0);
+        let bold_span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_bold.is_some())
+            .expect("faux bold span");
+        let applied =
+            apply_inline_style_to_attrs(&attrs, bold_span, &InlineFontRegistry::default(), baseline);
+
+        assert_eq!(
+            applied.weight,
+            Weight(700),
+            "a faux bold span must keep the selected face's own weight, not drop to 400"
+        );
+    }
+
+    #[test]
+    fn faux_italic_span_keeps_the_selected_faces_own_style() {
+        // Same defect on the style axis: an Italic FILE selected as the face
+        // must stay Italic under a faux `<i=...>` span.
+        let attrs = Attrs::new()
+            .metrics(Metrics::new(20.0, 24.0))
+            .style(Style::Italic);
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Faux Test Family",
+            Weight::NORMAL,
+            Style::Italic,
+        ));
+
+        let parsed = parse_inline_style_tags("<i=14>x</i>", 24.0);
+        let italic_span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_italic_slant_deg.is_some())
+            .expect("faux italic span");
+        let applied = apply_inline_style_to_attrs(
+            &attrs,
+            italic_span,
+            &InlineFontRegistry::default(),
+            baseline,
+        );
+
+        assert_eq!(
+            applied.style,
+            Style::Italic,
+            "a faux italic span must keep the selected face's own style, not force upright"
+        );
+    }
+
+    #[test]
+    fn bare_bold_span_still_requests_the_real_bold_face() {
+        // The real-face path is unchanged: a bare `<b>` asks for Weight::BOLD
+        // whatever the selected face's own weight is.
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        for baseline_weight in [Weight::NORMAL, Weight(300), Weight(700)] {
+            let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+                "Ms Faux Test Family",
+                baseline_weight,
+                Style::Normal,
+            ));
+            let parsed = parse_inline_style_tags("<b>x</b>", 24.0);
+            let bold_span = parsed
+                .spans
+                .iter()
+                .find(|span| span.bold)
+                .expect("real bold span");
+            assert_eq!(bold_span.faux_bold, None, "bare <b> must stay a real bold");
+            let applied = apply_inline_style_to_attrs(
+                &attrs,
+                bold_span,
+                &InlineFontRegistry::default(),
+                baseline,
+            );
+            assert_eq!(
+                applied.weight,
+                Weight::BOLD,
+                "a bare <b> must request the real Bold face regardless of the baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn faux_span_with_inline_font_takes_that_fonts_face() {
+        // Ordering contract: the inline `<font=...>` is resolved FIRST and
+        // becomes the span's effective baseline, so a faux `<b=...>` on the same
+        // span pins the INLINE font's own weight/style, not the selected face's.
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Selected Family",
+            Weight(700),
+            Style::Normal,
+        ));
+        let mut registry = InlineFontRegistry::default();
+        registry.insert(
+            "inline".to_string(),
+            registered_face("Ms Inline Family", Weight(300), Style::Italic),
+        );
+
+        let parsed = parse_inline_style_tags("<b=3><font=inline>x</font></b>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_bold.is_some() && span.font_label.is_some())
+            .expect("faux span with an inline font");
+        let applied = apply_inline_style_to_attrs(&attrs, span, &registry, baseline);
+
+        assert_eq!(
+            applied.weight,
+            Weight(300),
+            "an inline font's own weight must win over the selected face baseline"
+        );
+        assert_eq!(
+            applied.style,
+            Style::Italic,
+            "an inline font's own style must win over the selected face baseline"
+        );
+    }
+
+    /// Registry holding one inline font under the label `inline`, with an
+    /// explicitly declared non-default weight/style so a pass-through of the
+    /// baseline is distinguishable from a Bold/Italic request.
+    fn inline_font_registry_with(weight: Weight, style: Style) -> InlineFontRegistry {
+        let mut registry = InlineFontRegistry::default();
+        registry.insert(
+            "inline".to_string(),
+            registered_face("Ms Inline Family", weight, style),
+        );
+        registry
+    }
+
+    /// The inline family the fixture registry registers, as it lands in attrs.
+    fn inline_family() -> cosmic_text::FamilyOwned {
+        cosmic_text::FamilyOwned::new(cosmic_text::Family::Name("Ms Inline Family"))
+    }
+
+    #[test]
+    fn inline_font_with_bare_bold_still_requests_the_real_bold_face() {
+        // Regression: the inline `<font=...>` used to be applied LAST and
+        // overwrote the `Weight::BOLD` a bare `<b>` had just set, so
+        // `<b><font=X>..</font></b>` rendered with no bold at all.
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Selected Family",
+            Weight::NORMAL,
+            Style::Normal,
+        ));
+        let registry = inline_font_registry_with(Weight(300), Style::Normal);
+
+        let parsed = parse_inline_style_tags("<b><font=inline>x</font></b>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.bold && span.font_label.is_some())
+            .expect("real bold span with an inline font");
+        assert_eq!(span.faux_bold, None, "bare <b> must stay a real bold");
+        let applied = apply_inline_style_to_attrs(&attrs, span, &registry, baseline);
+
+        assert_eq!(
+            applied.weight,
+            Weight::BOLD,
+            "a real <b> must survive an inline font on the same span"
+        );
+        assert_eq!(
+            applied.family_owned,
+            inline_family(),
+            "the inline font still selects its own family"
+        );
+    }
+
+    #[test]
+    fn inline_font_with_bare_italic_still_requests_the_real_italic_face() {
+        // Same defect on the style axis.
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Selected Family",
+            Weight::NORMAL,
+            Style::Normal,
+        ));
+        let registry = inline_font_registry_with(Weight(300), Style::Normal);
+
+        let parsed = parse_inline_style_tags("<i><font=inline>x</font></i>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.italic && span.font_label.is_some())
+            .expect("real italic span with an inline font");
+        assert_eq!(
+            span.faux_italic_slant_deg, None,
+            "bare <i> must stay a real italic"
+        );
+        let applied = apply_inline_style_to_attrs(&attrs, span, &registry, baseline);
+
+        assert_eq!(
+            applied.style,
+            Style::Italic,
+            "a real <i> must survive an inline font on the same span"
+        );
+        assert_eq!(
+            applied.family_owned,
+            inline_family(),
+            "the inline font still selects its own family"
+        );
+    }
+
+    #[test]
+    fn inline_font_with_faux_bold_keeps_that_fonts_own_weight() {
+        // Guard for the other direction: a FAUX `<b=...>` must NOT request the
+        // Bold face — it pins the inline font's own weight so the geometric
+        // thickening is applied to exactly the face the span already matched.
+        let attrs = Attrs::new().metrics(Metrics::new(20.0, 24.0));
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Selected Family",
+            Weight(700),
+            Style::Normal,
+        ));
+        let registry = inline_font_registry_with(Weight(300), Style::Normal);
+
+        let parsed = parse_inline_style_tags("<b=30><font=inline>x</font></b>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.faux_bold.is_some() && span.font_label.is_some())
+            .expect("faux bold span with an inline font");
+        let applied = apply_inline_style_to_attrs(&attrs, span, &registry, baseline);
+
+        assert_eq!(
+            applied.weight,
+            Weight(300),
+            "a faux bold must keep the inline font's own weight, not request Bold"
+        );
+        assert_eq!(applied.family_owned, inline_family());
+    }
+
+    #[test]
+    fn inline_font_alone_takes_that_fonts_weight_and_style() {
+        // A span that sets neither bold nor italic keeps the effective baseline,
+        // i.e. the inline font's own face — unchanged behavior.
+        let attrs = Attrs::new()
+            .metrics(Metrics::new(20.0, 24.0))
+            .weight(Weight::BOLD)
+            .style(Style::Italic);
+        let baseline = FauxFaceBaseline::from_registered_face(&registered_face(
+            "Ms Selected Family",
+            Weight(700),
+            Style::Italic,
+        ));
+        let registry = inline_font_registry_with(Weight(300), Style::Normal);
+
+        let parsed = parse_inline_style_tags("<font=inline>x</font>", 24.0);
+        let span = parsed
+            .spans
+            .iter()
+            .find(|span| span.font_label.is_some())
+            .expect("inline font span");
+        assert!(!span.bold && !span.italic, "the span sets no bold/italic");
+        let applied = apply_inline_style_to_attrs(&attrs, span, &registry, baseline);
+
+        assert_eq!(applied.weight, Weight(300));
+        assert_eq!(applied.style, Style::Normal);
+        assert_eq!(applied.family_owned, inline_family());
+    }
+
+    #[test]
+    fn faux_face_baseline_falls_back_to_regular_without_face_metadata() {
+        // A face that declares no weight/style reproduces the historical
+        // hardcoded 400/upright reset.
+        let face = RegisteredFontFace {
+            family_name: Some("Ms Faux Test Family".to_string()),
+            style: None,
+            weight: None,
+            stretch: None,
+        };
+        let baseline = FauxFaceBaseline::from_registered_face(&face);
+        assert_eq!(baseline.weight, Weight::NORMAL);
+        assert_eq!(baseline.style, Style::Normal);
     }
 
     #[test]
@@ -1546,7 +1953,12 @@ mod tests {
             glyph_offset: None,
         };
 
-        let applied = apply_inline_style_to_attrs(&attrs, &style, &InlineFontRegistry::default());
+        let applied = apply_inline_style_to_attrs(
+            &attrs,
+            &style,
+            &InlineFontRegistry::default(),
+            regular_baseline(),
+        );
 
         assert_eq!(applied.weight, Weight::BOLD);
         assert_eq!(applied.style, Style::Italic);

@@ -16,6 +16,14 @@ Notes:
 Extracted verbatim from `panel.rs`; methods are `pub(super)` so the module root
 and sibling `panel` submodules can call them. `use super::*;` pulls in the
 parent module's types and imports.
+
+The advanced-form width metric must describe the text the RENDERER draws, so
+`apply_metric_real_bold_italic` mirrors `ms_text_render`'s
+`base_attrs_real_bold_italic` (real Bold/Italic face only when forced WITHOUT
+faux). Its `FontSystem` holds an empty fontdb plus the one selected font FILE, so
+the request is additionally gated by `metric_real_face_availability`: a face that
+file does not contain is never requested (cosmic-text would otherwise find no
+match at all and panic). See `panel/MODULE_README.md` for the fidelity trade-off.
 */
 
 use super::*;
@@ -902,12 +910,47 @@ impl TypingCreatePanelState {
                 .ok()?;
         let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
         attrs = selected_face.apply_to_attrs(attrs);
-        if self.force_bold {
-            attrs = attrs.weight(cosmic_text::Weight::BOLD);
+        // The metric must measure the SAME face the renderer draws, so the
+        // real-face request is gated exactly like the renderer's
+        // `ms_text_render::pipeline::base_attrs_real_bold_italic`, AND by what this
+        // database can actually provide: it holds only the selected font FILE, and
+        // cosmic-text treats style as a hard `Attrs::matches` filter, so requesting a
+        // face the file does not contain would leave the fallback iterator empty and
+        // panic on the GUI thread (`shape.rs`: `expect("no default font found")`).
+        let wants_real_bold = wants_metric_real_face(self.force_bold, self.faux_bold);
+        let wants_real_italic = wants_metric_real_face(self.force_italic, self.faux_italic);
+        let available = metric_real_face_availability(
+            font_system.db(),
+            attrs.style,
+            attrs.stretch,
+            wants_real_italic,
+        );
+        if wants_real_italic && !available.italic {
+            crate::runtime_log::log_warn(format!(
+                "typing advanced forms: real Italic face requested for font '{}', but the font \
+                 file provides no Italic face; measuring the selected face instead (the \
+                 enumerated forms use upright widths). Path: {} Face index: {face_index}",
+                font.display_label(),
+                path.display()
+            ));
         }
-        if self.force_italic {
-            attrs = attrs.style(cosmic_text::Style::Italic);
+        if wants_real_bold && !available.bold {
+            crate::runtime_log::log_warn(format!(
+                "typing advanced forms: real Bold face requested for font '{}', but the font \
+                 file provides no Bold face at the requested style; measuring the selected face \
+                 instead. Path: {} Face index: {face_index}",
+                font.display_label(),
+                path.display()
+            ));
         }
+        attrs = apply_metric_real_bold_italic(
+            attrs,
+            self.force_bold,
+            self.faux_bold,
+            self.force_italic,
+            self.faux_italic,
+            available,
+        );
         Some(forms::GlyphWidths::build(
             &mut font_system,
             &attrs,
@@ -1297,4 +1340,121 @@ impl TypingCreatePanelState {
         self.advanced_form_open = open;
         changed
     }
+}
+
+/// Whether the width metric should request the REAL Bold (resp. Italic) face.
+///
+/// The real face is wanted when the force flag is set WITHOUT its faux companion;
+/// `faux` alone is ignored. Shared by `apply_metric_real_bold_italic` and its caller
+/// (which logs the skipped requests) so the two can never drift apart.
+#[must_use]
+pub(super) const fn wants_metric_real_face(force: bool, faux: bool) -> bool {
+    force && !faux
+}
+
+/// Which REAL faces the advanced-form metric's font database can actually provide.
+///
+/// Produced by `metric_real_face_availability` from the throwaway database that holds
+/// ONLY the selected font FILE, and consumed by `apply_metric_real_bold_italic`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MetricRealFaceAvailability {
+    /// A face at `Weight::BOLD` exists among the faces the resolved style admits.
+    pub(super) bold: bool,
+    /// A face with `Style::Italic` (or an emoji face, which cosmic-text matches
+    /// regardless of style) exists in the database.
+    pub(super) italic: bool,
+}
+
+impl MetricRealFaceAvailability {
+    /// Availability of everything — for tests of the pure flag gate, which must not
+    /// depend on a font database.
+    #[cfg(test)]
+    pub(super) const ALL: Self = Self {
+        bold: true,
+        italic: true,
+    };
+}
+
+/// Mirrors `cosmic_text::Attrs::matches` (cosmic-text 0.14.2, `attrs.rs:323-327`): a face
+/// enters the match set only when its style AND stretch equal the request, except emoji
+/// faces, which are admitted regardless. Weight is NOT a filter here — cosmic-text uses it
+/// only to rank the faces that already passed this test (`font/system.rs:328`).
+fn metric_face_matches_style(
+    face: &fontdb::FaceInfo,
+    style: cosmic_text::Style,
+    stretch: cosmic_text::Stretch,
+) -> bool {
+    face.post_script_name.contains("Emoji") || (face.style == style && face.stretch == stretch)
+}
+
+/// Probes the metric's font database for the REAL Bold/Italic faces it can satisfy.
+///
+/// `db` is the throwaway database holding only the selected font file (possibly a
+/// multi-face collection), which is exactly the set cosmic-text can match. `base_style`
+/// and `stretch` are the selected face's own attributes, i.e. what the request falls back
+/// to. `italic_requested` selects the style the weight probe runs under, because
+/// cosmic-text filters by style/stretch FIRST and only then ranks by weight: a file whose
+/// only Bold face is italic must not report Bold as available for an upright request.
+///
+/// Bold availability requires an EXACT `Weight::BOLD` face; a file whose heaviest face is,
+/// say, Semibold reports `bold: false`, so the metric keeps the selected face rather than
+/// letting cosmic-text silently rank its way onto a different weight.
+#[must_use]
+pub(super) fn metric_real_face_availability(
+    db: &fontdb::Database,
+    base_style: cosmic_text::Style,
+    stretch: cosmic_text::Stretch,
+    italic_requested: bool,
+) -> MetricRealFaceAvailability {
+    let italic = db
+        .faces()
+        .any(|face| metric_face_matches_style(face, cosmic_text::Style::Italic, stretch));
+    // The style the request will actually carry decides which faces the weight search sees.
+    let resolved_style = if italic_requested && italic {
+        cosmic_text::Style::Italic
+    } else {
+        base_style
+    };
+    let bold = db.faces().any(|face| {
+        metric_face_matches_style(face, resolved_style, stretch)
+            && face.weight == cosmic_text::Weight::BOLD
+    });
+    MetricRealFaceAvailability { bold, italic }
+}
+
+/// Applies the advanced-form width metric's REAL Bold/Italic face request to `attrs`.
+///
+/// MIRRORS `ms_text_render::pipeline::base_attrs_real_bold_italic` and must not
+/// drift from it: the real Bold (resp. Italic) face is requested ONLY when the
+/// force flag is set WITHOUT its faux companion. With `force_* && faux_*` the
+/// renderer keeps the selected Regular/upright face and synthesizes the style
+/// geometrically at the glyph seam, so the metric has to measure that same face —
+/// otherwise the enumerated forms would be sized against a face that is never
+/// drawn. `faux_*` without `force_*` is ignored on both sides. Attributes the gate
+/// does not touch (family, stretch, and the face's own weight/style) pass through
+/// unchanged.
+///
+/// The request is ADDITIONALLY conditioned on `available`: a face the metric's font
+/// database does not contain is never requested, and the selected face's attributes are
+/// kept instead. Unlike the renderer's pooled `FontSystem`, this database holds only the
+/// selected font file, and cosmic-text treats style as an exact `Attrs::matches` filter —
+/// an unsatisfiable Italic request would leave the fallback iterator empty and panic
+/// (`shape.rs`: `expect("no default font found")`). Callers report the skipped request;
+/// this function only enforces it.
+#[must_use]
+pub(super) fn apply_metric_real_bold_italic<'a>(
+    mut attrs: Attrs<'a>,
+    force_bold: bool,
+    faux_bold: bool,
+    force_italic: bool,
+    faux_italic: bool,
+    available: MetricRealFaceAvailability,
+) -> Attrs<'a> {
+    if wants_metric_real_face(force_bold, faux_bold) && available.bold {
+        attrs = attrs.weight(cosmic_text::Weight::BOLD);
+    }
+    if wants_metric_real_face(force_italic, faux_italic) && available.italic {
+        attrs = attrs.style(cosmic_text::Style::Italic);
+    }
+    attrs
 }

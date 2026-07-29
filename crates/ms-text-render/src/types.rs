@@ -43,7 +43,7 @@ pub const TEXT_FORMULA_USER_VAR_COUNT: usize = 8;
 /// Ключи (общий контракт панели и рендера):
 /// - `b` — bold: valueless = the real Bold face; with a value
 ///   `b=thicken[,sharp|round][,out|both][,expand]` (or `b=default`) = faux bold
-///   on the Regular face (see [`FauxBoldParams`]); an unreadable value falls
+///   on the SELECTED face (see [`FauxBoldParams`]); an unreadable value falls
 ///   back to plain (real-face) bold
 /// - `i` — italic: valueless = the real Italic face; with a value
 ///   `i=slant_deg` (degrees, −45..45) = faux italic (baseline shear); an
@@ -317,14 +317,14 @@ pub struct TextRenderParams {
     pub force_bold: bool,
     pub force_italic: bool,
     /// Faux (synthetic) bold. Takes effect ONLY when `force_bold` is also
-    /// `true`: the renderer then keeps the Regular face (no
+    /// `true`: the renderer then keeps the SELECTED face (no
     /// `Weight::BOLD` font matching) and thickens glyph outlines geometrically
     /// (see [`FauxBoldParams`]). `force_bold && faux_bold.is_none()` = current
     /// real-Bold-face behavior; `None` + `force_bold == false` = no bold.
     pub faux_bold: Option<FauxBoldParams>,
     /// Faux (synthetic) italic slant in degrees, `-45..=45`; positive = top
     /// leans right. Takes effect ONLY when `force_italic` is also `true`: the
-    /// renderer then keeps the upright face (no `Style::Italic` matching) and
+    /// renderer then keeps the SELECTED face (no `Style::Italic` matching) and
     /// shears glyph outlines about the baseline. Advances are unchanged.
     pub faux_italic_slant_deg: Option<f32>,
     pub uppercase_text: bool,

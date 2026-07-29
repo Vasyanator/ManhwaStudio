@@ -182,6 +182,29 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
 - Bold/italic controls preserve legacy real-face behavior by default. Faux controls
   serialize their seven `text_params` keys on every render-data rebuild; parameterized
   inline tags use the renderer's `<b=...>` / `<i=...>` grammar.
+- The advanced-form width metric (`create_advanced::build_advanced_form_glyph_widths`)
+  must measure the SAME face the renderer draws, so its real-Bold/Italic face request
+  (`apply_metric_real_bold_italic`) MIRRORS `ms_text_render::pipeline::
+  base_attrs_real_bold_italic`: real face only when `force_*` is set WITHOUT its faux
+  companion; `force_* && faux_*` keeps the selected face (the renderer synthesizes the
+  style geometrically). Changing one side without the other silently sizes the enumerated
+  forms against a face that is never rendered. That request is ADDITIONALLY gated by
+  availability (`metric_real_face_availability`): this path's `FontSystem` is a throwaway
+  with an EMPTY fontdb holding only the selected font FILE, so it probes that db (the exact
+  set cosmic-text can match) and SKIPS an override the file cannot satisfy, keeping the
+  selected face and logging a `runtime_log` warning naming the font and the requested
+  style. The metric therefore never requests a face the loaded file does not provide and
+  CANNOT panic — cosmic-text 0.14.2 treats weight as a ranking key but STYLE as an exact
+  `Attrs::matches` filter, so an unsatisfiable Italic request used to leave the fallback
+  iterator empty and abort the GUI thread (`shape.rs` `expect("no default font found")`).
+  The probe mirrors `Attrs::matches` (style + stretch, emoji faces always admitted) and
+  runs the weight check under the style that will actually be requested, since cosmic-text
+  filters by style before ranking by weight. REMAINING divergence from the renderer: the
+  renderer's pooled `FontSystem` carries the whole system font database and can match a
+  same-family Bold/Italic face living in ANOTHER file, which this empty-db metric cannot
+  see; likewise a file whose heaviest face is Semibold reports no Bold. In those cases the
+  metric measures the selected face, so its widths are a lower-fidelity approximation for
+  real-face bold/italic (never a crash, and faux styles stay exact).
 - The built-in formula-preset NAMES in `presets_io.rs::default_text_tab_formula_presets`
   (all eleven: `"Дуга (мягкая)"`, `"Наклонная линия"`, `"Волна"`, `"Спираль"`,
   `"Экспонента"`, `"Парабола"`, `"Пульс"`, `"Лемниската"`, `"Сердце"`, `"Капля"`,

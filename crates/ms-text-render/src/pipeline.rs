@@ -55,7 +55,7 @@ use super::formula::{
     render_text_with_formula_layout, render_text_with_vector_lines_layout,
 };
 use super::inline_styles::{
-    InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
+    FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
     collect_requested_inline_font_labels, parse_inline_style_tags, remap_inline_style_spans,
     spans_have_attrs_overrides,
 };
@@ -427,10 +427,14 @@ pub fn render_text_to_image(
 
     let mut attrs = Attrs::new().metrics(Metrics::new(font_size_px, font_size_px));
     attrs = selected_face.apply_to_attrs(attrs);
+    // Faux inline spans must never change font matching: they fall back to the
+    // SELECTED face's own weight/style, not to a hardcoded 400/upright which
+    // could match a different file of the same family (or nothing at all).
+    let faux_face_baseline = FauxFaceBaseline::from_registered_face(&selected_face);
     // Faux bold/italic bypass: with faux params present the renderer must KEEP
-    // the Regular/upright face (no Bold/Italic font matching) and synthesize
-    // the style geometrically at the glyph seam. Without faux params the
-    // legacy real-face behavior is unchanged.
+    // the SELECTED face (no Bold/Italic font matching) and synthesize the style
+    // geometrically at the glyph seam. Without faux params the legacy real-face
+    // behavior is unchanged.
     let (want_real_bold, want_real_italic) = base_attrs_real_bold_italic(params);
     if want_real_bold {
         attrs = attrs.weight(cosmic_text::Weight::BOLD);
@@ -551,7 +555,12 @@ pub fn render_text_to_image(
             .map(|span| {
                 (
                     span.clone(),
-                    apply_inline_style_to_attrs(&attrs, span, &inline_font_registry_build.registry),
+                    apply_inline_style_to_attrs(
+                        &attrs,
+                        span,
+                        &inline_font_registry_build.registry,
+                        faux_face_baseline,
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -592,6 +601,7 @@ pub fn render_text_to_image(
             font_system: &mut *font_system,
             buffer: &mut buffer,
             attrs: &attrs,
+            faux_face_baseline,
             inline_style_spans: mapped_inline_style_spans.as_deref(),
             inline_font_registry: &inline_font_registry_build.registry,
             layout_text: layout_text.as_str(),
@@ -635,6 +645,7 @@ pub fn render_text_to_image(
             font_system: &mut *font_system,
             buffer: &mut buffer,
             attrs: &attrs,
+            faux_face_baseline,
             inline_style_spans: mapped_inline_style_spans.as_deref(),
             inline_font_registry: &inline_font_registry_build.registry,
             layout_text: layout_text.as_str(),
@@ -709,6 +720,7 @@ pub fn render_text_to_image(
             font_system,
             &buffer,
             &attrs,
+            faux_face_baseline,
             &inline_font_registry_build.registry,
             mapped_inline_style_spans.as_deref(),
             layout_text.as_str(),
@@ -850,6 +862,7 @@ pub fn render_text_to_image(
             && let Some(hyphen_glyph) = build_wrapped_hyphen_glyph(
                 font_system,
                 &attrs,
+                faux_face_baseline,
                 mapped_inline_style_spans.as_deref(),
                 &inline_font_registry_build.registry,
                 layout_line_offsets.as_slice(),
@@ -1432,12 +1445,16 @@ fn apply_global_rotation(placements: &mut [RotatedGlyphPlacement], angle_rad: f3
 /// Горизонтальный рендер обычного текста с inline-поворотами смещений.
 /// Собирает размещения всех глифов, применяет повороты групп, считает повёрнутый
 /// bbox и выводит каждый глиф обратной выборкой с поворотом.
+///
+/// `faux_face_baseline` — weight/style выбранного face: fallback для faux-спанов
+/// в attrs переносимого мягкого переноса (см. `apply_inline_style_to_attrs`).
 #[allow(clippy::too_many_arguments)]
 fn render_horizontal_rotated(
     params: &TextRenderParams,
     font_system: &mut FontSystem,
     buffer: &Buffer,
     attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_font_registry: &super::font_registry::InlineFontRegistry,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     layout_text: &str,
@@ -1573,6 +1590,7 @@ fn render_horizontal_rotated(
             && let Some(hyphen_glyph) = build_wrapped_hyphen_glyph(
                 font_system,
                 attrs,
+                faux_face_baseline,
                 inline_style_spans,
                 inline_font_registry,
                 layout_line_offsets,
@@ -2501,8 +2519,8 @@ impl FauxGlyphStyle {
 ///
 /// The pair is `(bold, italic)`. Real face matching happens only when the
 /// force flag is set WITHOUT faux params; `force_* && faux present` keeps the
-/// Regular/upright face (the faux geometry is synthesized at the glyph seam),
-/// and faux params without the force flag are ignored entirely.
+/// SELECTED face (the faux geometry is synthesized at the glyph seam), and faux
+/// params without the force flag are ignored entirely.
 #[must_use]
 pub(crate) fn base_attrs_real_bold_italic(params: &TextRenderParams) -> (bool, bool) {
     (
@@ -2827,6 +2845,7 @@ fn build_hard_hyphen_glyph(
 fn build_wrapped_hyphen_glyph(
     font_system: &mut FontSystem,
     base_attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &super::font_registry::InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -2837,6 +2856,7 @@ fn build_wrapped_hyphen_glyph(
 ) -> Option<LayoutGlyph> {
     let hyphen_attrs = wrapped_hyphen_attrs(
         base_attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_line_offsets,
@@ -2847,8 +2867,13 @@ fn build_wrapped_hyphen_glyph(
     build_hard_hyphen_glyph(font_system, &hyphen_attrs, font_size_px, line_height_px)
 }
 
+/// Attrs of the synthesized wrap hyphen: `base_attrs` plus the inline style
+/// active at the consumed soft hyphen. `faux_face_baseline` is the selected
+/// face's weight/style a faux span falls back to, so the hyphen matches exactly
+/// the same face as the text around it.
 fn wrapped_hyphen_attrs<'a>(
     base_attrs: &Attrs<'a>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &super::font_registry::InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -2864,7 +2889,7 @@ fn wrapped_hyphen_attrs<'a>(
     let Some(style) = inline_style_at_offset(spans, style_offset) else {
         return AttrsOwned::new(base_attrs);
     };
-    apply_inline_style_to_attrs(base_attrs, style, inline_font_registry)
+    apply_inline_style_to_attrs(base_attrs, style, inline_font_registry, faux_face_baseline)
 }
 
 fn soft_hyphen_style_offset(

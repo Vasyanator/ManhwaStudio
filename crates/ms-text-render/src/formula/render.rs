@@ -72,7 +72,7 @@ use crate::vector::{
     glyph_contour_from_outline, rasterize_outline_into,
 };
 use crate::inline_styles::{
-    InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
+    FauxFaceBaseline, InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
 };
 use crate::optical::optical_base_advance;
 use crate::pipeline::{
@@ -120,6 +120,10 @@ pub(crate) struct FormulaRenderRequest<'a, 'font> {
     pub(crate) font_system: &'font mut FontSystem,
     pub(crate) buffer: &'font mut Buffer,
     pub(crate) attrs: &'a Attrs<'a>,
+    /// Weight/style of the SELECTED face — the fallback a FAUX inline span
+    /// resolves to, so faux never changes font matching (see
+    /// `inline_styles::FauxFaceBaseline`).
+    pub(crate) faux_face_baseline: FauxFaceBaseline,
     pub(crate) inline_style_spans: Option<&'a [InlineStyleSpan]>,
     pub(crate) inline_font_registry: &'a InlineFontRegistry,
     pub(crate) layout_text: &'a str,
@@ -356,6 +360,7 @@ pub(crate) fn render_text_with_formula_layout(
         font_system,
         buffer,
         attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_text,
@@ -383,6 +388,7 @@ pub(crate) fn render_text_with_formula_layout(
             font_system,
             buffer,
             attrs,
+            faux_face_baseline,
             inline_style_spans,
             inline_font_registry,
             layout_line_offsets.as_slice(),
@@ -404,6 +410,7 @@ pub(crate) fn render_text_with_formula_layout(
             font_system,
             buffer,
             attrs,
+            faux_face_baseline,
             inline_style_spans,
             inline_font_registry,
             layout_line_offsets.as_slice(),
@@ -489,6 +496,7 @@ fn render_text_with_drawn_lines_layout_once(
         font_system,
         buffer,
         attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_text,
@@ -523,6 +531,7 @@ fn render_text_with_drawn_lines_layout_once(
         font_system,
         buffer,
         attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_line_offsets.as_slice(),
@@ -1833,6 +1842,7 @@ fn render_text_with_formula_layout_once(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
     attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -1872,6 +1882,7 @@ fn render_text_with_formula_layout_once(
         font_system,
         buffer,
         attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_line_offsets,
@@ -2320,6 +2331,7 @@ fn detect_shape_layout_fallback_reason(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
     attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -2342,6 +2354,7 @@ fn detect_shape_layout_fallback_reason(
         font_system,
         buffer,
         attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_line_offsets,
@@ -2414,6 +2427,7 @@ fn collect_formula_glyph_seeds(
     font_system: &mut FontSystem,
     buffer: &mut Buffer,
     attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -2531,6 +2545,7 @@ fn collect_formula_glyph_seeds(
             && let Some(mut hyphen_glyph) = build_wrapped_hyphen_glyph(
                 font_system,
                 attrs,
+                faux_face_baseline,
                 inline_style_spans,
                 inline_font_registry,
                 layout_line_offsets,
@@ -3011,6 +3026,7 @@ fn build_hard_hyphen_glyph(
 fn build_wrapped_hyphen_glyph(
     font_system: &mut FontSystem,
     base_attrs: &Attrs<'_>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -3021,6 +3037,7 @@ fn build_wrapped_hyphen_glyph(
 ) -> Option<LayoutGlyph> {
     let hyphen_attrs = wrapped_hyphen_attrs(
         base_attrs,
+        faux_face_baseline,
         inline_style_spans,
         inline_font_registry,
         layout_line_offsets,
@@ -3031,8 +3048,13 @@ fn build_wrapped_hyphen_glyph(
     build_hard_hyphen_glyph(font_system, &hyphen_attrs, font_size_px, line_height_px)
 }
 
+/// Attrs of the synthesized wrap hyphen: `base_attrs` plus the inline style
+/// active at the consumed soft hyphen. `faux_face_baseline` is the selected
+/// face's weight/style a faux span falls back to, so the hyphen matches exactly
+/// the same face as the text around it.
 fn wrapped_hyphen_attrs<'a>(
     base_attrs: &Attrs<'a>,
+    faux_face_baseline: FauxFaceBaseline,
     inline_style_spans: Option<&[InlineStyleSpan]>,
     inline_font_registry: &InlineFontRegistry,
     layout_line_offsets: &[usize],
@@ -3048,7 +3070,7 @@ fn wrapped_hyphen_attrs<'a>(
     let Some(style) = inline_style_at_offset(spans, style_offset) else {
         return AttrsOwned::new(base_attrs);
     };
-    apply_inline_style_to_attrs(base_attrs, style, inline_font_registry)
+    apply_inline_style_to_attrs(base_attrs, style, inline_font_registry, faux_face_baseline)
 }
 
 fn soft_hyphen_style_offset(

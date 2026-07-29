@@ -1135,3 +1135,202 @@ paths change.
             "an empty group must not move the selection to an invalid index"
         );
     }
+
+    /// Repo fixture font used by the advanced-form width-metric tests: a single-face
+    /// Regular file, so a real Bold/Italic face request has nothing to match.
+    fn advanced_form_fixture_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+    }
+
+    /// A create panel whose only font is the fixture file, selected face 0.
+    fn advanced_form_fixture_panel() -> TypingCreatePanelState {
+        let path = advanced_form_fixture_font_path();
+        assert!(path.is_file(), "fixture font missing: {}", path.display());
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = finalize_fonts(vec![raw_font(path.to_string_lossy().as_ref(), None, 1)]);
+        state.selected_font_idx = 0;
+        state.selected_face_idx = 0;
+        state
+    }
+
+    #[test]
+    fn advanced_form_metric_gate_mirrors_renderer_faux_face_contract() {
+        // A distinctive incoming weight stands in for the selected face's own metadata
+        // (`RegisteredFontFace::apply_to_attrs`), so a pass-through is distinguishable
+        // from cosmic-text's defaults.
+        let face_weight = cosmic_text::Weight(350);
+        let seed = || {
+            Attrs::new()
+                .weight(face_weight)
+                .style(cosmic_text::Style::Normal)
+        };
+
+        let all = create_advanced::MetricRealFaceAvailability::ALL;
+
+        // force_* WITHOUT faux -> the REAL Bold/Italic faces are requested.
+        let real =
+            create_advanced::apply_metric_real_bold_italic(seed(), true, false, true, false, all);
+        assert_eq!(real.weight, cosmic_text::Weight::BOLD);
+        assert_eq!(real.style, cosmic_text::Style::Italic);
+
+        // force_* WITH faux -> the selected face is kept, exactly like the renderer's
+        // `base_attrs_real_bold_italic`: the style is synthesized geometrically, so the
+        // metric must measure the face that is actually drawn.
+        let faux =
+            create_advanced::apply_metric_real_bold_italic(seed(), true, true, true, true, all);
+        assert_eq!(faux.weight, face_weight);
+        assert_eq!(faux.style, cosmic_text::Style::Normal);
+
+        // faux_* without force_* is ignored on both sides.
+        let unforced =
+            create_advanced::apply_metric_real_bold_italic(seed(), false, true, false, true, all);
+        assert_eq!(unforced.weight, face_weight);
+        assert_eq!(unforced.style, cosmic_text::Style::Normal);
+    }
+
+    #[test]
+    fn advanced_form_metric_gate_skips_faces_the_font_file_lacks() {
+        let face_weight = cosmic_text::Weight(350);
+        let seed = || {
+            Attrs::new()
+                .weight(face_weight)
+                .style(cosmic_text::Style::Normal)
+        };
+
+        // A real request that the metric's font database cannot satisfy must leave the
+        // selected face's attrs untouched: handing cosmic-text an unsatisfiable style
+        // filter empties the fallback iterator and panics.
+        let none = create_advanced::MetricRealFaceAvailability {
+            bold: false,
+            italic: false,
+        };
+        let gated =
+            create_advanced::apply_metric_real_bold_italic(seed(), true, false, true, false, none);
+        assert_eq!(gated.weight, face_weight);
+        assert_eq!(gated.style, cosmic_text::Style::Normal);
+
+        // Availability is per-axis: an italic-capable file still keeps the face weight.
+        let italic_only = create_advanced::MetricRealFaceAvailability {
+            bold: false,
+            italic: true,
+        };
+        let partial = create_advanced::apply_metric_real_bold_italic(
+            seed(),
+            true,
+            false,
+            true,
+            false,
+            italic_only,
+        );
+        assert_eq!(partial.weight, face_weight);
+        assert_eq!(partial.style, cosmic_text::Style::Italic);
+    }
+
+    #[test]
+    fn advanced_form_metric_availability_probe_reads_the_loaded_faces() {
+        let path = advanced_form_fixture_font_path();
+        assert!(path.is_file(), "fixture font missing: {}", path.display());
+        // The metric's database: empty, then the ONE selected file — the exact set
+        // cosmic-text can match in `build_advanced_form_glyph_widths`.
+        let mut db = fontdb::Database::new();
+        db.load_font_file(&path)
+            .expect("the fixture font must parse");
+
+        let available = create_advanced::metric_real_face_availability(
+            &db,
+            cosmic_text::Style::Normal,
+            cosmic_text::Stretch::Normal,
+            true,
+        );
+        assert!(
+            !available.italic,
+            "LiberationSans-Regular ships no Italic face"
+        );
+        assert!(
+            !available.bold,
+            "LiberationSans-Regular ships no Bold-weight face"
+        );
+    }
+
+    #[test]
+    fn advanced_form_glyph_widths_keep_selected_face_under_faux_bold() {
+        use forms::LineWidthMetric;
+        const TEXT: &str = "Hello world";
+        let mut state = advanced_form_fixture_panel();
+
+        let plain = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert!(plain > 0, "the fixture font must produce real advances");
+
+        // Faux bold: the renderer thickens the Regular face geometrically, so the
+        // metric must report the Regular face's widths, not the real Bold face's.
+        state.force_bold = true;
+        state.faux_bold = true;
+        let faux = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert_eq!(
+            faux, plain,
+            "faux bold must measure the same face the renderer draws"
+        );
+
+        // Real bold: the metric FontSystem holds an empty fontdb plus the one selected
+        // FILE, so a Regular-only file has no Bold face to match and cosmic-text falls
+        // back to it (weight is a ranking key, not a `Attrs::matches` filter). The
+        // widths are therefore the Regular ones here too — documented, not asserted as
+        // desirable; see this module's note on the metric FontSystem.
+        state.faux_bold = false;
+        let real = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert_eq!(
+            real, plain,
+            "a Regular-only file has no Bold face in the metric's empty fontdb"
+        );
+    }
+
+    /// Regression: a REAL italic request against an upright-only font FILE used to reach
+    /// cosmic-text with an empty match set (style is an `Attrs::matches` filter, unlike
+    /// weight) and panic on the GUI thread at `shape.rs` `expect("no default font found")`.
+    #[test]
+    fn advanced_form_glyph_widths_survive_real_italic_on_upright_only_font() {
+        use forms::LineWidthMetric;
+        const TEXT: &str = "Hello world";
+        let mut state = advanced_form_fixture_panel();
+
+        let plain = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert!(plain > 0, "the fixture font must produce real advances");
+
+        // Faux italic: the renderer shears the upright face, so the metric must keep it.
+        state.force_italic = true;
+        state.faux_italic = true;
+        let faux = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert_eq!(
+            faux, plain,
+            "faux italic must measure the same face the renderer draws"
+        );
+
+        // Real italic («Курсив» WITHOUT «Принудительно»): the fixture file ships one
+        // upright face, so the request is skipped and the upright face is measured
+        // instead of handing cosmic-text an unsatisfiable style filter.
+        state.faux_italic = false;
+        let real = state
+            .build_advanced_form_glyph_widths(TEXT)
+            .expect("the fixture font must load")
+            .line_width(TEXT);
+        assert_eq!(
+            real, plain,
+            "an upright-only file has no Italic face for the metric to measure"
+        );
+    }

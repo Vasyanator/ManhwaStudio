@@ -268,7 +268,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `faux_italic_slant_deg: Option<f32>`): synthetic styles applied to the VECTOR
   outline instead of switching faces. They take effect ONLY together with the
   matching `force_bold`/`force_italic` flag; `force_* && faux present` keeps the
-  Regular/upright face (no Bold/Italic font matching — `pipeline.rs`
+  SELECTED face (no Bold/Italic font matching — `pipeline.rs`
   `base_attrs_real_bold_italic`), `force_*` without faux keeps the legacy
   real-face behavior byte-identically. Faux bold offsets the flattened outline
   by `d = thicken_percent/100 * glyph em` (`vector::offset_outline`:
@@ -296,9 +296,41 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   Inline grammar: `<b=thicken[,sharp|round][,out|both][,expand]>` /
   `<b=default>` / `<i=slant_deg>` (machine keys `b=`/`i=` take the same value
   payload); bare `<b>`/`<i>`/valueless machine keys keep the real faces. Faux
-  spans EXPLICITLY reset attrs to `Weight::NORMAL`/`Style::Normal`
-  (`inline_styles.rs`), so a global real bold/italic can never leak under the
-  faux geometry.
+  spans EXPLICITLY reset attrs to the SELECTED face's own weight/style
+  (`inline_styles.rs`, `FauxFaceBaseline::from_registered_face`, threaded from
+  `pipeline.rs`'s `selected_face` into every `apply_inline_style_to_attrs` call
+  site — rich-text spans, both `wrapped_hyphen_attrs`, and the
+  `FormulaRenderRequest`), so a global real bold/italic can never leak under the
+  faux geometry. INVARIANT — FAUX NEVER CHANGES FONT MATCHING: a faux span must
+  resolve to exactly the same face as the surrounding non-forced text (or, when
+  the span also sets an inline `<font=...>`, that font's own face). Only a REAL
+  bold/italic request (bare `<b>`/`<i>`, or `force_*` without faux) may deviate.
+  Why it must be the selected face and not a hardcoded 400/upright: the app lists
+  a family's Regular/Bold/Light FILES as separate selectable entries, cosmic-text
+  matches weight EXACTLY (and abandons the family when nothing matches), and the
+  pooled `FontSystem` carries the whole SYSTEM font database while the
+  `FontProvider` registers only the selected file — so any deviation from the
+  selected face's attrs can silently select a foreign font. A face with no
+  declared weight/style falls back to `Weight::NORMAL`/`Style::Normal`, so a
+  Regular selected face is byte-identical to the historical hardcoded reset.
+  RESOLUTION ORDER in `apply_inline_style_to_attrs` is BASELINE FIRST, then the
+  bold/italic decision ON TOP: an inline `<font=...>` is resolved FIRST (its
+  family/stretch always win, and its own `(weight, style)` become the span's
+  EFFECTIVE baseline, replacing `FauxFaceBaseline` for that span); only then does
+  `bold` pick `Weight::BOLD` (real, `faux_bold.is_none()`) or the effective
+  baseline's weight (faux), and `italic` likewise on the style axis. Resolving
+  the inline font LAST — as the code did before — made it overwrite `weight`/
+  `style` unconditionally and SWALLOW a real bold/italic on the same span, so
+  `<b><font=X>..</font></b>` rendered with no bold at all. An inline face that
+  declares no weight/style leaves both attrs and the baseline untouched.
+  KNOWN LIMITATION (same hazard class as that bug, unfixed): a real `<b>`/`<i>`
+  on an inline font whose FILE has no such face still deviates from the invariant
+  by construction. cosmic-text treats weight as a ranking key but `style` as an
+  exact `Attrs::matches` filter, so a real-italic request on an upright-only
+  inline font empties the match set and shaping falls through to a foreign
+  fallback font (a real-bold request degrades more gracefully — it ranks down to
+  the nearest available weight of the same family). Selecting a family whose
+  Bold/Italic files are present in the system db is the current mitigation.
 - `TextRenderParams.extra_info` (`RenderExtraInfoRequest`) selects which optional
   "extra render info" items the renderer computes alongside the pixels — today the
   MEAN center (area centroid of the convex hull of all included glyphs'
