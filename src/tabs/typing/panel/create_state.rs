@@ -175,6 +175,9 @@ impl TypingCreatePanelState {
             advanced_form_uneven_max: 0,
             advanced_form_conservatism_max: Conservatism::Safe,
             advanced_form_centered: false,
+            // Closed and unloaded: the character table reads nothing from disk
+            // until the user first opens its window.
+            char_table: super::char_table::CharTableState::new(),
         };
         state.active_font_key = state.current_font_key();
         state.sync_current_font_profile_memory();

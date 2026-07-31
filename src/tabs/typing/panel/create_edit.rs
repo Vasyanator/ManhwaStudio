@@ -38,6 +38,7 @@ impl TypingCreatePanelState {
         remap_wheel_to_horizontal: bool,
     ) -> bool {
         let mut changed = self.draw_advanced_form_window(ui.ctx());
+        changed |= self.drive_char_table_window(ui.ctx());
         let mut block_hscroll_by_hovered_param = false;
 
         if stacked_columns {
@@ -1089,8 +1090,20 @@ impl TypingCreatePanelState {
         {
             if range.start < range.end {
                 self.text_selection_char_range = Some(range);
-            } else if response.clicked() || response.dragged() {
-                self.text_selection_char_range = None;
+            } else if response.has_focus() || response.clicked() || response.dragged() {
+                // COLLAPSED cursor = the bare caret. It used to be DISCARDED (the
+                // stored range was cleared), which left `insert_text_at_caret` with
+                // no insertion point after a plain click. It is now recorded, which
+                // is safe because every reader already treats an empty range as "no
+                // selection": `inline_selection_context` returns `None`,
+                // `selected_inline_char_count` returns 0, and
+                // `paint_persistent_text_selection_if_needed` early-returns.
+                // The `has_focus()` guard is load-bearing: while the field is NOT
+                // focused egui also reports a collapsed cursor, and overwriting then
+                // would destroy the PERSISTENT selection that survives focus loss
+                // (the very selection `paint_persistent_text_selection_if_needed`
+                // repaints).
+                self.text_selection_char_range = Some(range);
             }
         }
     }
@@ -1142,6 +1155,92 @@ impl TypingCreatePanelState {
             InlineTextTarget::Source => self.text = value,
             InlineTextTarget::Formed => self.formed_text = value,
         }
+    }
+
+    /// Pumps the character-table window once per frame and applies its action.
+    ///
+    /// Everything the table does off the GUI thread (the glyph-coverage job) and
+    /// everything it reads from disk (the persisted settings, both favorite
+    /// lists) is driven ONLY while the window is open, so a user who never opens
+    /// it pays nothing — the contract `CharTableState` was written to.
+    ///
+    /// Returns `true` when an insertion changed the active text buffer.
+    fn drive_char_table_window(&mut self, ctx: &egui::Context) -> bool {
+        if self.char_table.is_open() {
+            self.char_table.ensure_loaded();
+            self.char_table.ensure_coverage(&self.fonts);
+            self.char_table.poll();
+        }
+        // The base font the `<font=…>` decision is made against; see
+        // `char_table::window::insert_action` for the documented limitation.
+        let base_font_identity = self.font_identity_name_by_idx(self.selected_font_idx);
+        // Disjoint field borrows: the window mutates the table state while
+        // reading the font list, which one `&mut self` method could not express.
+        let action = super::char_table::draw_char_table_window(
+            &mut self.char_table,
+            ctx,
+            &self.fonts,
+            base_font_identity.as_deref(),
+        );
+        match action {
+            Some(super::char_table::CharTableAction::Insert(text)) => {
+                self.insert_text_at_caret(&text)
+            }
+            None => false,
+        }
+    }
+
+    /// Inserts `insert` into the ACTIVE inline text buffer at the stored caret.
+    ///
+    /// The target buffer is the one `active_inline_text` /
+    /// `set_active_inline_text` name (`inline_text_target`), i.e. exactly the
+    /// buffer the accordion is showing — there is no second notion of "active
+    /// field". The insertion point is `text_selection_char_range`: a NON-EMPTY
+    /// range is REPLACED by `insert` (ordinary editor behaviour), a collapsed
+    /// range is the caret, and no stored range at all appends at the end of the
+    /// buffer (nothing was ever focused).
+    ///
+    /// Leaves the caret directly AFTER the inserted text, both immediately
+    /// (`text_selection_char_range`, so a second insertion in the same frame
+    /// chain lands after the first) and through `pending_text_selection_restore`,
+    /// which `sync_text_selection_from_text_edit` pushes into the egui `TextEdit`
+    /// on the next frame it draws.
+    ///
+    /// Returns `true` when the buffer changed; an empty `insert` is a no-op.
+    /// Queues a preview re-render on a real change.
+    pub(super) fn insert_text_at_caret(&mut self, insert: &str) -> bool {
+        if insert.is_empty() {
+            return false;
+        }
+        let (new_text, caret_char_index) = {
+            let text = self.active_inline_text();
+            let char_count = text.chars().count();
+            // No recorded caret => append at the end of the buffer.
+            let char_range = self
+                .text_selection_char_range
+                .clone()
+                .map_or(char_count..char_count, |range| {
+                    clamp_char_range(text, range)
+                });
+            // `clamp_char_range` already bounded the range, so the conversion can
+            // only fail on a non-boundary index, which it cannot produce; the
+            // fallback appends rather than panicking.
+            let byte_range = char_range_to_byte_range(text, &char_range)
+                .unwrap_or(text.len()..text.len());
+            let mut new_text = String::with_capacity(
+                text.len() - (byte_range.end - byte_range.start) + insert.len(),
+            );
+            new_text.push_str(&text[..byte_range.start]);
+            new_text.push_str(insert);
+            new_text.push_str(&text[byte_range.end..]);
+            (new_text, char_range.start + insert.chars().count())
+        };
+        self.set_active_inline_text(new_text);
+        let caret = caret_char_index..caret_char_index;
+        self.text_selection_char_range = Some(caret.clone());
+        self.pending_text_selection_restore = Some(caret);
+        self.queue_preview_render();
+        true
     }
 
     /// Сбрасывает сохранённое инлайн-выделение текста. Вызывается при

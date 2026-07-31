@@ -1297,6 +1297,10 @@ impl CanvasHooks for TypingHooks<'_> {
             .sync_clean_overlays_visible_from_canvas(canvas.clean_overlays_visible());
         self.top_panel
             .set_export_default_dir(project.project_dir.clone());
+        // The character table's project favorites are TITLE-scoped, so the path
+        // comes from `ProjectPaths`, not from the chapter dir.
+        self.top_panel
+            .set_project_favorites_path(project.paths.char_favorites_file.clone());
         // While an export is deferred behind the whole-project preload, surface a non-blocking
         // "preparing pages N/M" indicator in the same panel slot the export progress uses. Tracked by
         // `has_pending_export` (NOT `preload_all_pages_active`): the pass can drain — including the

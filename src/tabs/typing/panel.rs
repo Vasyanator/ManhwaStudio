@@ -232,6 +232,7 @@ pub(in crate::tabs::typing) mod font_settings_store;
 pub(in crate::tabs::typing) mod fonts_data;
 mod font_coverage;
 use font_coverage::{FontLanguageCoverage, FontLanguageSupport};
+mod char_table;
 use ms_text_util::language::{TextLanguage, text_language};
 // Public editor widget for per-effect-kind default parameters, rendered from the
 // settings pane; plus the startup seeding of the runtime-global defaults store.
@@ -1431,6 +1432,11 @@ struct TypingCreatePanelState {
     /// Окно уже отцентрировано (узнало итоговый размер). До этого окно скрыто,
     /// чтобы не было дёрганья при позиционировании.
     advanced_form_centered: bool,
+    /// Состояние окна «Таблица символов» (вкладки, размер ячейки, избранное,
+    /// фоновая карта покрытия глифов). Чистые данные: окно рисуется в
+    /// `char_table::draw_char_table_window`, которое вызывается раз за кадр из
+    /// `create_edit::draw_edit_params_section`.
+    char_table: char_table::CharTableState,
 }
 
 /// Сколько карточек форм максимум отрисовываем в окне за раз. Это предел

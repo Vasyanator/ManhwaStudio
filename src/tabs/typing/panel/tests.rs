@@ -929,6 +929,97 @@ paths change.
         assert_eq!(state.text, text_before, "text unchanged on the second frame");
     }
 
+    // --- character-table insertion (`create_edit::insert_text_at_caret`) -------
+    //
+    // The insertion point is the stored `text_selection_char_range` in the ACTIVE
+    // buffer; a non-empty range is REPLACED, a collapsed one is the caret, and no
+    // range at all appends. The caret must land right AFTER the inserted text and
+    // be published through `pending_text_selection_restore` for the next frame's
+    // `sync_text_selection_from_text_edit`.
+
+    #[test]
+    fn insert_at_caret_handles_start_middle_and_end() {
+        for (caret, expected) in [(0usize, "→abc"), (1, "a→bc"), (3, "abc→")] {
+            let mut state = state_with_font();
+            state.text = "abc".to_string();
+            state.text_selection_char_range = Some(caret..caret);
+            assert!(state.insert_text_at_caret("→"), "a real insertion changed the buffer");
+            assert_eq!(state.text, expected, "caret {caret}");
+            assert_eq!(
+                state.pending_text_selection_restore,
+                Some(caret + 1..caret + 1),
+                "the caret lands after the inserted text"
+            );
+            assert_eq!(
+                state.text_selection_char_range,
+                Some(caret + 1..caret + 1),
+                "the live caret is advanced too, so a second insertion follows the first"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_at_caret_replaces_a_non_empty_selection() {
+        let mut state = state_with_font();
+        state.text = "abcdef".to_string();
+        state.text_selection_char_range = Some(char_range_of(&state.text, "bcd"));
+        assert!(state.insert_text_at_caret("★"));
+        assert_eq!(state.text, "a★ef", "the selection is replaced, not wrapped");
+        assert_eq!(state.pending_text_selection_restore, Some(2..2));
+    }
+
+    #[test]
+    fn insert_at_caret_without_a_recorded_caret_appends() {
+        let mut state = state_with_font();
+        state.text = "abc".to_string();
+        state.text_selection_char_range = None;
+        assert!(state.insert_text_at_caret("→"));
+        assert_eq!(state.text, "abc→", "nothing focused yet => append at the end");
+        assert_eq!(state.pending_text_selection_restore, Some(4..4));
+    }
+
+    #[test]
+    fn insert_at_caret_into_an_empty_buffer_and_multichar_insert() {
+        let mut state = state_with_font();
+        state.text = String::new();
+        state.text_selection_char_range = None;
+        // A tagged insertion is what the character table emits for a font that
+        // differs from the base one; the caret must count CHARACTERS, not bytes.
+        let tagged = "<font=Beta>→</font>";
+        assert!(state.insert_text_at_caret(tagged));
+        assert_eq!(state.text, tagged);
+        let chars = tagged.chars().count();
+        assert_eq!(state.pending_text_selection_restore, Some(chars..chars));
+        // An empty insertion is a no-op and must not move the caret.
+        let before = state.text.clone();
+        assert!(!state.insert_text_at_caret(""));
+        assert_eq!(state.text, before);
+    }
+
+    #[test]
+    fn insert_at_caret_targets_the_formed_buffer_when_it_is_active() {
+        let mut state = state_with_font();
+        state.text = "source".to_string();
+        state.formed_text = "formed".to_string();
+        state.inline_text_target = InlineTextTarget::Formed;
+        state.text_selection_char_range = Some(0..0);
+        assert!(state.insert_text_at_caret("→"));
+        assert_eq!(state.formed_text, "→formed");
+        assert_eq!(state.text, "source", "the inactive buffer is untouched");
+    }
+
+    #[test]
+    fn insert_at_caret_clamps_a_stale_out_of_range_caret() {
+        // A caret recorded against a longer buffer (the layer was switched) must
+        // clamp to the end instead of panicking or losing the insertion.
+        let mut state = state_with_font();
+        state.text = "ab".to_string();
+        state.text_selection_char_range = Some(99..99);
+        assert!(state.insert_text_at_caret("→"));
+        assert_eq!(state.text, "ab→");
+        assert_eq!(state.pending_text_selection_restore, Some(3..3));
+    }
+
     #[test]
     fn load_fonts_with_no_imported_paths_matches_dir_only_loading() {
         // On an empty fonts dir, `load_fonts` with no imported paths must invent no user

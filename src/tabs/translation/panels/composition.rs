@@ -1959,6 +1959,7 @@ mod tests {
                 project_dir: dir.clone(),
                 title_dir: dir.clone(),
                 notes_file: dir.clone(),
+                char_favorites_file: dir.clone(),
                 bubbles_file: dir.clone(),
                 src_dir: dir.clone(),
                 clean_layers_dir: dir.clone(),

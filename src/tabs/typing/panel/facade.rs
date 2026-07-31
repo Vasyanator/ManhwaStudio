@@ -804,6 +804,22 @@ impl TypingTopPanelState {
         self.export_default_dir = Some(path);
     }
 
+    /// Binds the character table's PROJECT favorite list to the open title's
+    /// document (`ProjectPaths::char_favorites_file`, TITLE-scoped).
+    ///
+    /// Mirrors [`Self::set_export_default_dir`]: called every frame from
+    /// `TypingTabState::draw`. The store ignores a repeated identical path, so
+    /// only a real title change re-reads the file.
+    ///
+    /// Only the EDIT panel hosts the character-table window (its button lives on
+    /// the edit accordion), so the create panel's table is deliberately left
+    /// unbound — binding it would read a document for a window never opened there.
+    pub(in crate::tabs::typing) fn set_project_favorites_path(&mut self, path: PathBuf) {
+        self.edit_panel
+            .char_table
+            .set_project_favorites_path(Some(path));
+    }
+
     pub(in crate::tabs::typing) fn sync_export_status(&mut self, status: TypingExportUiStatus) {
         self.export_status = status;
     }

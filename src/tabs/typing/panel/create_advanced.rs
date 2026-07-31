@@ -764,16 +764,28 @@ impl TypingCreatePanelState {
         );
 
         // Заголовок «Изначальный текст»: ▼ если развёрнут, ◀ если свёрнут.
+        // Кнопка «Таблица символов» живёт в ЭТОЙ же строке (у заголовка
+        // сформированного текста её нет: вставка всегда идёт в активный буфер и
+        // дублировать точку входа незачем).
         let source_arrow = if show_formed { "◀" } else { "▼" };
-        if ui
-            .selectable_label(!show_formed, tf!("typing.advanced.source_text_accordion", source_arrow = source_arrow))
-            .clicked()
-            && show_formed
-        {
-            // Переключение пана: старое выделение относилось к другому буферу.
-            self.clear_inline_text_selection();
-            self.advanced_text_show_formed = false;
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(!show_formed, tf!("typing.advanced.source_text_accordion", source_arrow = source_arrow))
+                .clicked()
+                && show_formed
+            {
+                // Переключение пана: старое выделение относилось к другому буферу.
+                self.clear_inline_text_selection();
+                self.advanced_text_show_formed = false;
+            }
+            if ui
+                .button(t!("typing.char_table.open_button"))
+                .on_hover_text(t!("typing.char_table.open_button_tooltip"))
+                .clicked()
+            {
+                self.char_table.toggle_open();
+            }
+        });
         if !show_formed {
             self.inline_text_target = InlineTextTarget::Source;
             let text_colors = build_inline_tag_editor_text_colors(&self.text);

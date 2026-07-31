@@ -46,6 +46,9 @@ pub const DEBUG_CONSOLE: bool = false;
 
 pub const BUBBLES_FILE: &str = "translation_bubbles.json";
 pub const NOTES_FILE: &str = "translation_notes.txt";
+/// Title-scoped favorite characters of the typing tab's character table. Lives
+/// next to the title's other shared files, so every chapter sees one list.
+pub const CHAR_FAVORITES_FILE: &str = "char_favorites.json";
 pub const SRC_DIR: &str = "src";
 pub const CLEANED_DIR: &str = "cleaned";
 pub const CLEAN_LAYERS_DIR: &str = "clean_layers";
@@ -974,6 +977,13 @@ pub fn user_config_defaults() -> Value {
                     .as_config_str(),
             "effect_defaults": {},
             "imported_system_fonts": [],
+            // Character table ("Таблица символов"): the global favorite characters
+            // (single-character strings, user order), the character cell size in
+            // points, and the last selected tab (a stable, non-localized group key
+            // from `panel/char_table/charset.rs`).
+            "char_table_global_favorites": [],
+            "char_table_font_size": 30,
+            "char_table_last_group": "arrows",
             "formula_presets": {
                 "Дуга (мягкая)": {
                     "x_expr": "t * w",

@@ -154,6 +154,28 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   Editing legacy text: `create_edit::normalize_desired_inline_tag_style` compares RESOLVED font
   identity (not raw strings) so a legacy `<font=stem>` on the base font is stripped, not duplicated.
 
+## Character table (`char_table/`)
+- A panel-owned symbol picker ("Таблица символов"): a floating window of curated
+  non-language symbols that INSERTS the picked character into the panel's active text
+  buffer. Full contract in `char_table/MODULE_README.md`; spec in
+  `dev-docs/char_table_plan.md`.
+- It belongs to the EDIT panel only: the opening button sits on the "Изначальный текст"
+  header row of `create_advanced::draw_text_accordion`, and the window is pumped once per
+  frame by `create_edit::drive_char_table_window` next to `draw_advanced_form_window`.
+  The create panel's `char_table` field therefore stays unloaded and unbound.
+- The window is a FREE FN returning a `CharTableAction`, not a `&mut self` method: it
+  needs the font list, the table state and a text-buffer edit at once. The edit lands in
+  `create_edit::insert_text_at_caret`, which writes the buffer named by
+  `inline_text_target` at `text_selection_char_range` — the SAME notions the inline-tag
+  styling uses, never a second "active field". `sync_text_selection_from_text_edit` now
+  records a COLLAPSED caret while the field has focus (it used to drop it), which is what
+  gives the insertion a position; an empty range is still "no selection" to every other
+  reader.
+- The inline `<font=...>` tag is emitted only when the picked font's
+  `render_identity_name()` differs from the panel's selected font — see the LIMITATION
+  note in `char_table/MODULE_README.md` (there is no caret-position style resolver, so the
+  comparison is against the BASE font, not the enclosing span).
+
 ## Font model exposure (`crate::tabs::typing::font_admin`)
 - The font ADMINISTRATION UI (categories, system-font import, per-font properties window)
   moved OUT of this directory to `src/tabs/settings/typesetting/`. The MODEL stays here:

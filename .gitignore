@@ -81,6 +81,12 @@ crates/ag-psd/
 tools/egui_docs/__pycache__/
 tools/egui_docs/*.py[cod]
 
+# The character-table charset generator. Its OUTPUT
+# (src/tabs/typing/panel/char_table/charset.rs) is committed and the app never runs
+# the script, but the script is the only way to regenerate that table, so it is
+# published deliberately (one file, per the per-script decision noted above).
+!tools/gen_char_table.py
+
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/
 !modules/**/

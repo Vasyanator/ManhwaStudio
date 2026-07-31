@@ -1116,6 +1116,7 @@ mod tests {
             project_dir: project_dir.clone(),
             title_dir: title.to_path_buf(),
             notes_file: title.join("notes.txt"),
+            char_favorites_file: title.join(crate::config::CHAR_FAVORITES_FILE),
             bubbles_file: project_dir.join(crate::config::BUBBLES_FILE),
             src_dir: project_dir.join(crate::config::SRC_DIR),
             clean_layers_dir: project_dir.join(crate::config::CLEAN_LAYERS_DIR),

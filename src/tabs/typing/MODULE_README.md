@@ -394,6 +394,13 @@ saving, and export.
     rendered by the settings pane. Per-card (de)serialization reuses the shared
     `effect_card_to_value` (`effect_cards.rs`) / `parse_effect_cards` codec; persistence
     reuses `presets_io::{load,save}_text_tab_effect_defaults` (off-GUI-thread saves).
+  - `char_table/`: the «Таблица символов» symbol picker — `CharTableState` (tabs, cell
+    size, expansion, the two favorite lists, the background glyph-coverage job) plus its
+    `egui::Window` in `char_table/window.rs`. Opened from the "Изначальный текст"
+    accordion header of the EDIT panel; a click inserts the character at the stored caret
+    of the active text buffer, inline-tagged with `<font=...>` only when the picked font
+    differs from the base one. Has its own `MODULE_README.md` — read it before touching
+    the coverage job, the favorites documents, or the font-registration throttle.
   - `tests.rs`: `#[cfg(test)]` unit tests for the panel.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
   tiled mask preview textures, brush/fill editing, async loading/saving, and export

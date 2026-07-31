@@ -2794,6 +2794,7 @@ mod tests {
                 project_dir: empty_path(),
                 title_dir: empty_path(),
                 notes_file: empty_path(),
+                char_favorites_file: empty_path(),
                 bubbles_file: empty_path(),
                 src_dir: empty_path(),
                 clean_layers_dir: empty_path(),

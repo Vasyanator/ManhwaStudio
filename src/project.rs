@@ -222,6 +222,10 @@ pub struct ProjectPaths {
     pub project_dir: PathBuf,
     pub title_dir: PathBuf,
     pub notes_file: PathBuf,
+    /// Title-scoped favorite characters of the typing tab's character table
+    /// (`{title_dir}/char_favorites.json`). Title- rather than chapter-scoped on
+    /// purpose: every chapter of one manga shares one list.
+    pub char_favorites_file: PathBuf,
     pub bubbles_file: PathBuf,
     pub src_dir: PathBuf,
     pub clean_layers_dir: PathBuf,
@@ -317,6 +321,7 @@ impl ProjectData {
             .to_string();
 
         let notes_file = title_dir.join(config::NOTES_FILE);
+        let char_favorites_file = title_dir.join(config::CHAR_FAVORITES_FILE);
         let bubbles_file = project_dir.join(config::BUBBLES_FILE);
         let src_dir = ensure_src_dir(&project_dir)?;
         // Migrate the legacy `cleaned` overlay folder to `clean_layers` before any overlay
@@ -356,6 +361,7 @@ impl ProjectData {
             project_dir: project_dir.clone(),
             title_dir: title_dir.clone(),
             notes_file,
+            char_favorites_file,
             bubbles_file: bubbles_file.clone(),
             src_dir: src_dir.clone(),
             clean_layers_dir,

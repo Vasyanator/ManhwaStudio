@@ -398,7 +398,7 @@ mod tests {
         let project_dir = title_dir.join("chapter");
         let unsaved_dir = title_dir.join("chapter_unsaved");
         ProjectPaths {
-            project_dir: project_dir.clone(), title_dir: title_dir.clone(), notes_file: project_dir.join("notes.json"),
+            project_dir: project_dir.clone(), title_dir: title_dir.clone(), notes_file: project_dir.join("notes.json"), char_favorites_file: title_dir.join("char_favorites.json"),
             bubbles_file: project_dir.join("bubbles.json"), src_dir: project_dir.join("src"), clean_layers_dir: project_dir.join("clean_layers"),
             cleaned_dir: project_dir.join("cleaned"), alt_vers_dir: project_dir.join("alt_vers"), saved_dir: project_dir.join("saved"),
             image_bubbles_dir: project_dir.join("image_bubbles"), text_images_dir: project_dir.join("text_images"), layers_dir: project_dir.join("layers"),
