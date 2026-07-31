@@ -747,6 +747,22 @@ impl TypingCreatePanelState {
         }
         let show_formed = self.advanced_text_show_formed;
 
+        // The accordion is ONE surface with two mutually exclusive buffers, so the
+        // extended-tier check goes here, on the buffer that is about to be drawn. The
+        // field is a `TextEditPlus`, i.e. the `Proportional` family, which carries only
+        // the `core` chain until something asks for more: without this a pasted Arabic /
+        // Thai / Hebrew overlay showed tofu in the panel while the rendered page (whose
+        // fallback chain is the renderer's, not egui's) was correct. Cheap and idempotent
+        // — see `ui_fonts::ensure_covers`; the work happens on a worker thread.
+        crate::ui_fonts::ensure_covers(
+            ui.ctx(),
+            if show_formed {
+                &self.formed_text
+            } else {
+                &self.text
+            },
+        );
+
         // Заголовок «Изначальный текст»: ▼ если развёрнут, ◀ если свёрнут.
         let source_arrow = if show_formed { "◀" } else { "▼" };
         if ui
@@ -868,6 +884,7 @@ impl TypingCreatePanelState {
         let font = self.fonts.get(self.selected_font_idx);
         AdvancedFormMetricSignature {
             font_path: font.map(|font| font.path.to_string_lossy().to_string()),
+            bundled_ui_stack: font.is_some_and(|font| font.bundled_stack_font().is_some()),
             face_index: font
                 .and_then(|font| font.faces.get(self.selected_face_idx))
                 .map_or(0, |face| face.face_index),
@@ -942,6 +959,16 @@ impl TypingCreatePanelState {
                 font.display_label(),
                 path.display()
             ));
+        }
+        // The built-in entry stands for the WHOLE bundled chain, not for the one `core`
+        // file it points at, so measuring only that file would size CJK / Arabic forms
+        // against `.notdef` boxes of Noto Sans while the renderer draws them with real
+        // advances. Registered AFTER `metric_real_face_availability`, which must keep
+        // seeing ONLY the selected file: it decides whether a real Bold/Italic face may be
+        // requested, and a chain face must never make an unsatisfiable request look
+        // satisfiable.
+        if font.bundled_stack_font().is_some() {
+            register_bundled_core_fallback(font_system.db_mut(), &path);
         }
         attrs = apply_metric_real_bold_italic(
             attrs,
@@ -1339,6 +1366,59 @@ impl TypingCreatePanelState {
         self.advanced_form_group = new_group;
         self.advanced_form_open = open;
         changed
+    }
+}
+
+/// Adds the rest of the bundled `core` tier to the advanced-form metric's font database.
+///
+/// Only for the built-in interface font (`FontEntryKind::BundledUiStack`). That entry
+/// points at `core[0]` as its selected face and gets everything else from the renderer's
+/// `MsFallback::common_fallback`, which IS the `core` chain
+/// (`dev-docs/unicode_base_font_plan.md`, layers 2 and 3). The metric's throwaway
+/// `FontSystem` has no `MsFallback`, but cosmic-text's last fallback stage tries every
+/// remaining face of the database (`cosmic-text-0.14.2/src/font/fallback/mod.rs:445-457`),
+/// so registering the chain in `NN-` order reproduces the renderer's advances for the
+/// scripts `core` covers.
+///
+/// `selected_path` is the file already registered as the selected face and is skipped, so
+/// no face is duplicated.
+///
+/// Deliberately `core` ONLY. The `ext` tier is ~80 MB across ~44 files, and this database
+/// is rebuilt from scratch on every metric-cache rebuild (a font, style or text change
+/// with the advanced-form window open), on the GUI thread: registering `ext` would open
+/// and memory-map every one of those files each time, just to read a `name` table. The
+/// `core` files, by contrast, cost no I/O at all here — their bytes are the process-
+/// resident `'static` buffers `ms_fonts::bytes` already handed to the egui UI, so this is
+/// four in-memory face parses. Residual, accepted divergence: a script only `ext` covers
+/// is still measured as `.notdef`, exactly as it was before.
+fn register_bundled_core_fallback(db: &mut fontdb::Database, selected_path: &Path) {
+    let Some(stack) = ms_fonts::stack() else {
+        crate::runtime_log::log_warn(
+            "typing advanced forms: the built-in interface font is selected, but the bundled \
+             fonts/ui stack cannot be resolved; the enumerated form widths are measured with \
+             the single selected file and may be wrong for scripts it does not cover",
+        );
+        return;
+    };
+    for font in stack.core() {
+        if font.path == selected_path {
+            continue;
+        }
+        // A file whose bytes are unreadable is reported by `ms_fonts`; dropping it here
+        // only costs the fidelity of the scripts that one file covered.
+        let Some(bytes) = ms_fonts::bytes(font) else {
+            continue;
+        };
+        let ids = db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(bytes)));
+        if ids.is_empty() {
+            crate::runtime_log::log_warn(format!(
+                "typing advanced forms: the bundled core font '{}' yielded no face for the \
+                 width metric; forms containing the scripts it covers are measured without \
+                 it. Path: {}",
+                font.family_name,
+                font.path.display()
+            ));
+        }
     }
 }
 

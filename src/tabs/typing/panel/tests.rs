@@ -931,14 +931,32 @@ paths change.
 
     #[test]
     fn load_fonts_with_no_imported_paths_matches_dir_only_loading() {
-        // On an empty fonts dir, `load_fonts` with no imported paths must equal the plain
-        // folder load (both empty) — the imported-paths merge is purely additive.
+        // On an empty fonts dir, `load_fonts` with no imported paths must invent no user
+        // font — the imported-paths merge is purely additive. The ONLY entry it may add
+        // is the synthetic built-in one, which `load_fonts` prepends for the PANEL list
+        // (`load_fonts_from_dir` also feeds the settings font-administration list and
+        // therefore must not get it).
         let dir = unique_temp_dir("empty");
         fs::create_dir_all(&dir).expect("create temp dir");
         let via_load_fonts = load_fonts(&dir, &[]);
         let via_dir = load_fonts_from_dir(&dir);
-        assert!(via_load_fonts.is_empty());
-        assert_eq!(via_load_fonts.len(), via_dir.len());
+        assert!(via_dir.is_empty(), "an empty fonts dir holds no user fonts");
+        assert!(
+            via_load_fonts
+                .iter()
+                .all(|font| font.bundled_stack_font().is_some()),
+            "no user font may be invented for an empty fonts dir"
+        );
+        assert!(
+            via_load_fonts.len() <= 1,
+            "at most the single built-in entry may be added"
+        );
+        assert!(
+            via_load_fonts
+                .first()
+                .is_none_or(|font| font.bundled_stack_font().is_some()),
+            "when present, the built-in entry heads the list"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1332,5 +1350,278 @@ paths change.
         assert_eq!(
             real, plain,
             "an upright-only file has no Italic face for the metric to measure"
+        );
+    }
+
+    /// The built-in interface font is offered as the FIRST entry of the panel font
+    /// list, is shown under its localized name, and resolves by the reserved,
+    /// non-localized identity that is what actually gets persisted.
+    #[test]
+    fn built_in_font_heads_the_panel_list_and_resolves_by_its_reserved_identity() {
+        let state = TypingCreatePanelState::new(false);
+        let Some(built_in) = state.fonts.first().filter(|font| font.bundled_stack_font().is_some())
+        else {
+            eprintln!(
+                "skipping built_in_font_heads_the_panel_list_and_resolves_by_its_reserved_identity: \
+                 no fonts/ui stack next to this checkout"
+            );
+            return;
+        };
+
+        assert_eq!(
+            built_in.render_identity_name(),
+            BUNDLED_UI_FONT_IDENTITY,
+            "the persisted identity is the reserved, language-independent name"
+        );
+        assert_eq!(
+            built_in.display_label(),
+            t!("typing.fonts.bundled_ui_font_label"),
+            "the SHOWN name comes from the catalog, not from the persisted identity"
+        );
+        assert!(
+            built_in.path.is_file(),
+            "the entry must point at a real font file so previews, the advanced-form \
+             metric and PSD export keep working: {}",
+            built_in.path.display()
+        );
+        assert_eq!(
+            state.find_font_idx_by_path_or_label(None, Some(BUNDLED_UI_FONT_IDENTITY)),
+            Some(0),
+            "the reserved identity must select the built-in entry"
+        );
+    }
+
+    /// Degradation contract: a project saved with the built-in font, opened by a build
+    /// that does NOT offer it, must land in the normal `missing_font` state — never on
+    /// a silently substituted font. Modeled by a font list without the built-in entry
+    /// (which is exactly what an older build produces: `should_skip_font_dir` keeps the
+    /// whole `fonts/ui` subtree out of the panel list).
+    #[test]
+    fn a_build_without_the_built_in_font_reports_it_missing() {
+        let mut state = TypingCreatePanelState::new(false);
+        let bundled_path = state
+            .fonts
+            .first()
+            .filter(|font| font.bundled_stack_font().is_some())
+            .map(|font| font.path.to_string_lossy().to_string());
+        // Only the user's own fonts, as an older build would list them.
+        state.fonts = finalize_fonts(vec![raw_font_named(
+            "/fonts/основной.ttf",
+            None,
+            1,
+            "Anime Ace v05",
+        )]);
+        state.missing_font = None;
+
+        state.select_font_by_path_or_label(
+            bundled_path.as_deref(),
+            Some(BUNDLED_UI_FONT_IDENTITY),
+        );
+        assert_eq!(
+            state.missing_font.as_deref(),
+            Some(BUNDLED_UI_FONT_IDENTITY),
+            "the built-in font must degrade to 'font not found', naming it"
+        );
+    }
+
+    /// The built-in entry must not disturb the identities of the user's own fonts:
+    /// even a user copy of a BUNDLED family keeps the family name as its identity,
+    /// because the synthetic entry is excluded from the collision pass.
+    #[test]
+    fn the_built_in_entry_does_not_change_user_font_identities() {
+        let mut fonts = finalize_fonts(vec![raw_font_named(
+            "/fonts/NotoSans-Regular.ttf",
+            None,
+            1,
+            "Noto Sans",
+        )]);
+        prepend_bundled_ui_font(&mut fonts);
+        let user = fonts
+            .iter()
+            .find(|font| font.bundled_stack_font().is_none())
+            .expect("the user font must stay in the list");
+        assert_eq!(
+            user.render_identity_name(),
+            "Noto Sans",
+            "a user font's persisted identity must not change because of the built-in entry"
+        );
+    }
+
+    /// The advanced-form width metric of the built-in entry must measure the whole
+    /// bundled chain, not just the one `core` FILE the entry points at.
+    ///
+    /// Selecting the built-in font advertises full coverage, and the renderer delivers it
+    /// through `MsFallback::common_fallback`; the metric used to build a throwaway
+    /// `fontdb` holding only `core[0]`, so an ideograph was sized against the `.notdef`
+    /// box of Noto Sans and every enumerated form came out systematically wrong.
+    ///
+    /// Asserted WITHOUT magic advance numbers: the same file selected as a plain user
+    /// font is the "no chain" control. Latin (which the file itself covers) must measure
+    /// identically in both — the chain must not change what the selected face already
+    /// serves — while the ideograph must not.
+    #[test]
+    fn the_built_in_font_measures_form_widths_through_the_bundled_chain() {
+        use forms::LineWidthMetric;
+        const LATIN: &str = "A";
+        const IDEOGRAPH: &str = "漢";
+
+        let mut chained = TypingCreatePanelState::new(false);
+        let Some(core_first) = chained
+            .fonts
+            .first()
+            .and_then(FontEntry::bundled_stack_font)
+        else {
+            eprintln!(
+                "skipping the_built_in_font_measures_form_widths_through_the_bundled_chain: \
+                 no fonts/ui stack next to this checkout"
+            );
+            return;
+        };
+        let core_path = core_first.path.clone();
+        chained.selected_font_idx = 0;
+        chained.selected_face_idx = 0;
+
+        // Control: the very same FILE, but as an ordinary user font, so nothing but that
+        // file is in the metric database — the behavior this test pins as fixed.
+        let mut single = TypingCreatePanelState::new(false);
+        single.fonts = finalize_fonts(vec![raw_font(
+            core_path.to_string_lossy().as_ref(),
+            None,
+            1,
+        )]);
+        single.selected_font_idx = 0;
+        single.selected_face_idx = 0;
+
+        let measure = |state: &TypingCreatePanelState, text: &str| {
+            state
+                .build_advanced_form_glyph_widths(text)
+                .expect("the bundled core file must load")
+                .line_width(text)
+        };
+
+        assert_eq!(
+            measure(&chained, LATIN),
+            measure(&single, LATIN),
+            "the chain must not change the advances the selected face itself provides"
+        );
+        assert_ne!(
+            measure(&chained, IDEOGRAPH),
+            measure(&single, IDEOGRAPH),
+            "an ideograph the selected core FILE lacks must be measured through the \
+             bundled chain, not as its .notdef box"
+        );
+    }
+
+    /// End-to-end promise of the built-in entry: selecting it renders real pixels,
+    /// including for a character the selected core FILE does not itself cover — that
+    /// glyph comes from the rest of the bundled chain via the renderer's
+    /// `common_fallback`, which is the whole reason this entry points at `core[0]`
+    /// instead of inventing a "font chain" type.
+    #[test]
+    fn the_built_in_font_renders_through_the_bundled_fallback_chain() {
+        let mut state = TypingCreatePanelState::new(false);
+        if state
+            .fonts
+            .first()
+            .and_then(FontEntry::bundled_stack_font)
+            .is_none()
+        {
+            eprintln!(
+                "skipping the_built_in_font_renders_through_the_bundled_fallback_chain: \
+                 no fonts/ui stack next to this checkout"
+            );
+            return;
+        }
+        state.selected_font_idx = 0;
+        state.selected_face_idx = 0;
+        // Latin (covered by the core file itself) + a CJK ideograph (covered only by
+        // the next font of the core chain).
+        state.text = "Aa 漢".to_string();
+
+        let params = state
+            .build_render_params()
+            .expect("the built-in font must produce render params");
+        assert_eq!(params.font_name, BUNDLED_UI_FONT_IDENTITY);
+        let provider = state.font_provider();
+        let image = crate::tabs::typing::render_next::render_text_to_image(
+            &params,
+            provider.as_ref(),
+            None,
+        )
+        .expect("the built-in font must render");
+        assert!(
+            image.rgba.iter().skip(3).step_by(4).any(|alpha| *alpha > 0),
+            "the render must contain visible ink"
+        );
+    }
+
+    /// Builds a report with one fallback font and no lost characters.
+    fn fallback_report(family: &str, chars: &[char]) -> FontFallbackReport {
+        FontFallbackReport {
+            fallbacks: vec![ms_text_render::types::FontFallbackUse {
+                family: family.to_string(),
+                chars: chars.to_vec(),
+            }],
+            missing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_clean_render_shows_no_font_diagnostic_rows() {
+        let lines = create_presets::font_fallback_status_lines(&FontFallbackReport::default());
+        assert!(
+            lines.is_empty(),
+            "a text fully served by the selected font must add nothing to the panel"
+        );
+    }
+
+    #[test]
+    fn a_fallback_is_informational_and_a_lost_character_is_not() {
+        // Fallback only: one row, warning color (it rendered, just not in the
+        // selected typeface).
+        let used = create_presets::font_fallback_status_lines(&fallback_report(
+            "Source Han Sans K",
+            &['漢'],
+        ));
+        assert_eq!(used.len(), 1);
+        assert_eq!(
+            used[0].color,
+            create_presets::FONT_DIAGNOSTIC_WARNING_COLOR,
+            "a fallback must not be painted like an error"
+        );
+        assert!(used[0].text.contains('漢'));
+        assert!(used[0].text.contains("Source Han Sans K"));
+
+        // Lost characters only: one row, error color.
+        let lost = create_presets::font_fallback_status_lines(&FontFallbackReport {
+            fallbacks: Vec::new(),
+            missing: vec!['\u{e000}'],
+        });
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].color, create_presets::FONT_DIAGNOSTIC_ERROR_COLOR);
+
+        // Both: the informational row comes first, the alarming one last.
+        let mut both = fallback_report("Noto Sans Arabic", &['ب']);
+        both.missing = vec!['\u{e000}'];
+        let rows = create_presets::font_fallback_status_lines(&both);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].color, create_presets::FONT_DIAGNOSTIC_WARNING_COLOR);
+        assert_eq!(rows[1].color, create_presets::FONT_DIAGNOSTIC_ERROR_COLOR);
+    }
+
+    #[test]
+    fn a_long_character_list_is_truncated_so_it_cannot_blow_up_the_panel() {
+        // 40 distinct characters, well over the shared display cap.
+        let many: Vec<char> = ('\u{4e00}'..).take(40).collect();
+        let rows = create_presets::font_fallback_status_lines(&fallback_report("Some Font", &many));
+        assert_eq!(rows.len(), 1);
+        let shown = many
+            .iter()
+            .filter(|ch| rows[0].text.contains(**ch))
+            .count();
+        assert!(
+            shown < many.len(),
+            "the list must be truncated, but all {} characters are present",
+            many.len()
         );
     }

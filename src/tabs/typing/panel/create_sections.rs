@@ -8,6 +8,11 @@ effects sections plus the right-side actions column (mask toggle, export,
 image insert, clean-overlay visibility), together with the default effect
 card factory and the effects JSON serializer.
 
+The preview section also hosts the per-render font diagnostic rows (which
+characters the renderer's fallback chain drew instead of the selected font,
+and which it could not draw at all) — see `MODULE_README.md`, "Two font
+diagnostics".
+
 Notes:
 Extracted verbatim from panel.rs. Methods are pub(super) because
 TypingCreatePanelState is used only inside panel.rs. use super::* pulls in
@@ -15,6 +20,9 @@ the parent module's types and imports.
 */
 
 use super::*;
+// The per-render font diagnostic is mapped to colors/wording in one place only
+// (`create_presets.rs`, together with the static coverage tooltip).
+use super::create_presets::font_fallback_status_lines;
 
 impl TypingCreatePanelState {
 
@@ -34,6 +42,20 @@ impl TypingCreatePanelState {
                     },
                 );
             });
+
+            // Factual per-render font diagnostic of the image shown below: which
+            // characters the fallback chain drew instead of the selected font, and
+            // which nothing could draw. It lives HERE and not on the font combo
+            // because it is a property of THIS render of THIS text, while the combo's
+            // coloring is a per-font, per-language classification computed once at
+            // font-load time for the whole list. Nothing is drawn when the selected
+            // font served the whole text.
+            for line in font_fallback_status_lines(&self.preview_font_fallbacks) {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line.text).color(line.color)).wrap(),
+                )
+                .on_hover_text(line.tooltip);
+            }
 
             ui.add_space(4.0);
 

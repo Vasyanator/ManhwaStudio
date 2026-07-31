@@ -128,6 +128,7 @@ fn run_launcher_internal(
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             theme::configure_context(&cc.egui_ctx);
             Ok(Box::new(app::LauncherApp::new(
                 projects_root.clone(),

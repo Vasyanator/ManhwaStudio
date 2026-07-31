@@ -252,6 +252,19 @@ X range before the old overflow point.
   inside the specific `CanvasView`.
 - Canvas scroll areas need per-instance egui ids. Cross-tab viewport sync must go through
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
+- The canvas does NOT load fonts. Bubble text is drawn with the egui family named by
+  `helpers::BUBBLE_TEXT_FONT_FAMILY_NAME`, which is an alias of
+  `crate::ui_fonts::BUBBLE_TEXT_FAMILY_NAME`; the chain behind that family is installed once
+  per window by `crate::ui_fonts` from `fonts/ui`. `helpers::bubble_text_font_id` still
+  degrades to the default family when nothing is bound yet, so the canvas stays correct
+  during the frames before the background font loader finishes.
+- It does, however, TRIGGER the extended tier. The studio arms `fonts/ui/ext` instead of
+  loading it, so `bubble_aside_ui.rs` / `bubble_on_top_ui.rs` offer every bubble string they
+  are about to draw to `crate::ui_fonts::ensure_covers` (once per card, where the strings
+  are already in hand); the first character the chain cannot draw starts the background
+  install. The call is idempotent and returns on a single atomic load once the question is
+  settled, so it stays on the per-frame path. Keep these call sites to the places that
+  actually draw chapter text — the point is a real coverage question, not a broadcast.
 - The page strip in `scene.rs` deliberately zeroes the ambient `item_spacing` while
   allocating page rows so screen tops stay linear in world space and the `ViewTransform`
   (`screen = world*scale + translation`) can reproduce them. Inter-page gaps come only from

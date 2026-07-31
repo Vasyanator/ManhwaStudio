@@ -221,7 +221,6 @@ use eframe::egui;
 use egui::{Pos2, Rect, TextureHandle, Vec2};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -567,7 +566,6 @@ pub struct CanvasView {
     // Throttled per-bubble external file fingerprint (`len:mtime`) plus the instant it was
     // last refreshed, so the preview key is not stat-ing the filesystem every frame.
     image_bubble_meta_cache: HashMap<i64, (Instant, String)>,
-    bubble_unicode_fonts_initialized: bool,
     pixel_sampling_nearest: bool,
     pixel_grid_visible: bool,
     /// Per-frame content of the collapsible bottom-center keyboard-shortcut hint. Set by the
@@ -591,7 +589,6 @@ impl Default for CanvasView {
             settings_runtime: CanvasSettingsRuntime::default(),
             image_bubble_preview_cache: HashMap::new(),
             image_bubble_meta_cache: HashMap::new(),
-            bubble_unicode_fonts_initialized: false,
             pixel_sampling_nearest: false,
             pixel_grid_visible: false,
             bottom_hint: None,
@@ -631,69 +628,6 @@ impl Drop for CanvasView {
 }
 
 impl CanvasView {
-    fn ensure_bubble_unicode_fonts(&mut self, ctx: &egui::Context, project: &ProjectData) {
-        if self.bubble_unicode_fonts_initialized {
-            return;
-        }
-        self.bubble_unicode_fonts_initialized = true;
-
-        let Some(fonts_dir) = resolve_canvas_ui_fonts_dir(project) else {
-            runtime_log::log_warn(
-                "[canvas::fonts] fonts/ui directory not found; bubble unicode fallback disabled",
-            );
-            return;
-        };
-
-        let font_paths = collect_canvas_ui_font_paths(&fonts_dir);
-        if font_paths.is_empty() {
-            runtime_log::log_warn(format!(
-                "[canvas::fonts] no font files found in {}; bubble unicode fallback disabled",
-                fonts_dir.display()
-            ));
-            return;
-        }
-
-        let mut loaded_paths = Vec::new();
-        for (idx, font_path) in font_paths.iter().enumerate() {
-            let font_bytes = match fs::read(font_path) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    runtime_log::log_warn(format!(
-                        "[canvas::fonts] failed to read UI font '{}': {err}",
-                        font_path.display()
-                    ));
-                    continue;
-                }
-            };
-
-            let font_name = format!("canvas-bubble-unicode-{idx}");
-            ctx.add_font(egui::epaint::text::FontInsert::new(
-                font_name.as_str(),
-                egui::FontData::from_owned(font_bytes),
-                vec![egui::epaint::text::InsertFontFamily {
-                    family: bubble_text_font_family(),
-                    priority: egui::epaint::text::FontPriority::Highest,
-                }],
-            ));
-            loaded_paths.push(font_path.display().to_string());
-        }
-
-        if loaded_paths.is_empty() {
-            runtime_log::log_warn(format!(
-                "[canvas::fonts] failed to load any UI fonts from {}",
-                fonts_dir.display()
-            ));
-            return;
-        }
-
-        runtime_log::log_info(format!(
-            "[canvas::fonts] loaded {} UI unicode fonts from {}: {}",
-            loaded_paths.len(),
-            fonts_dir.display(),
-            loaded_paths.join(", ")
-        ));
-    }
-
     pub fn set_create_bubble_shortcut_hint(&mut self, shortcut_hint: Option<String>) {
         self.create_bubble_shortcut_hint = shortcut_hint;
     }
@@ -1278,7 +1212,6 @@ impl CanvasView {
             source_upload_budget,
             hooks,
         } = params;
-        self.ensure_bubble_unicode_fonts(ctx, project);
         self.poll_overlay_prepare_results();
         self.sync_overlays_from_model();
         self.sync_runtime_from_model_or_project(project);
@@ -2777,74 +2710,6 @@ fn bubble_spellcheck_disabled_key(field: BubbleTextField) -> &'static str {
         BubbleTextField::Original => BUBBLE_ORIGINAL_SPELLCHECK_DISABLED_KEY,
         BubbleTextField::Translation => BUBBLE_TRANSLATION_SPELLCHECK_DISABLED_KEY,
     }
-}
-
-fn resolve_canvas_ui_fonts_dir(project: &ProjectData) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    candidates.push(project.paths.title_dir.join("fonts").join("ui"));
-    candidates.push(project.project_dir.join("fonts").join("ui"));
-
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join("fonts").join("ui"));
-    }
-    if let Ok(exe_path) = env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        candidates.push(exe_dir.join("fonts").join("ui"));
-    }
-
-    let mut seen = HashSet::<PathBuf>::new();
-    candidates.into_iter().find(|path| {
-        if !seen.insert(path.clone()) {
-            return false;
-        }
-        path.is_dir()
-    })
-}
-
-fn collect_canvas_ui_font_paths(fonts_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(fonts_dir) else {
-        return Vec::new();
-    };
-
-    let mut font_paths = entries
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.is_file() && is_supported_canvas_ui_font(path))
-        .collect::<Vec<_>>();
-    font_paths.sort_by_cached_key(|path| canvas_ui_font_sort_key(path.as_path()));
-    font_paths
-}
-
-fn is_supported_canvas_ui_font(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext) if matches!(ext.as_str(), "otf" | "ttf" | "ttc" | "otc")
-    )
-}
-
-fn canvas_ui_font_sort_key(path: &Path) -> (u8, u32, String) {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let lower_name = file_name.to_lowercase();
-
-    if let Some((priority, rest_name)) = parse_canvas_ui_font_priority(file_name) {
-        return (0, priority, rest_name.to_lowercase());
-    }
-
-    (1, u32::MAX, lower_name)
-}
-
-fn parse_canvas_ui_font_priority(file_name: &str) -> Option<(u32, &str)> {
-    let (priority_raw, rest_name) = file_name.split_once(':')?;
-    if priority_raw.is_empty() || rest_name.is_empty() {
-        return None;
-    }
-    let priority = priority_raw.parse::<u32>().ok()?;
-    Some((priority, rest_name))
 }
 
 /// Reads plain text from the system clipboard, sanitized for canvas use.

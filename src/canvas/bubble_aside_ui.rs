@@ -1618,6 +1618,19 @@ fn draw_aside_slots(
                 )
             })
             .collect();
+        // Chapter text is the one place where a script outside the always-resident font
+        // chain can appear, so this is where the extended tier is pulled in. Every string
+        // this card can draw is offered once: the two editable fields, the read-only text
+        // and, for an image bubble, the per-area drafts. Cheap and idempotent — see
+        // `ui_fonts::ensure_covers`.
+        for text in [&new_original, &new_text, &txt_owned] {
+            crate::ui_fonts::ensure_covers(ui.ctx(), text);
+        }
+        for (original, description, translation) in &area_drafts {
+            crate::ui_fonts::ensure_covers(ui.ctx(), original);
+            crate::ui_fonts::ensure_covers(ui.ctx(), description);
+            crate::ui_fonts::ensure_covers(ui.ctx(), translation);
+        }
         let mut want_add_area = false;
         let mut remove_area: Option<usize> = None;
         let mut area_text_changed = false;

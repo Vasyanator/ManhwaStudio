@@ -31,11 +31,21 @@ into a reused `FontSystem` only once.
 
 use std::sync::Arc;
 
+/// Shared, erased font byte buffer — exactly the type `fontdb::Source::Binary`
+/// takes, so a provider's bytes reach fontdb without a copy.
+///
+/// Erased rather than `Arc<Vec<u8>>` on purpose: it lets a provider hand over the
+/// `&'static` bytes `ms-fonts` already holds for the bundled `fonts/ui` stack
+/// (`Arc::new(&'static [u8])`) instead of reading the same file into a second
+/// buffer (`dev-docs/unicode_base_font_plan.md`, phase 5). An owned `Vec<u8>`
+/// still coerces into it, so file-backed providers are unchanged.
+pub type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// A fully-resolved font available to a render: the working name it is referenced
 /// by, its original name (the real family/name from the file for real fonts; a
 /// synthesized "VirtualFont_a_b_c" for virtual fonts), the raw bytes, the face to
 /// use, and a stable content id used as the per-FontSystem load-cache key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FontContent {
     /// Working/reference name. `TextRenderParams.font_name` and inline `<font=...>`
     /// tags resolve to this.
@@ -45,12 +55,36 @@ pub struct FontContent {
     /// need the real identity, e.g. PSD export).
     pub original_name: String,
     /// Font file bytes (a real .ttf/.otf today; composed/renamed virtual later).
-    pub data: Arc<Vec<u8>>,
+    /// May be an owned buffer or the shared `'static` bytes of a bundled font.
+    pub data: FontBytes,
     /// Face index within `data`.
     pub face_index: usize,
     /// Stable identity of `data` (content hash). Used as the load-cache key so the
     /// same bytes register into a reused FontSystem only once.
     pub content_id: u64,
+}
+
+impl FontContent {
+    /// The font bytes. Cheap (one deref); the slice borrows `self.data`.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        (*self.data).as_ref()
+    }
+}
+
+/// Hand-written because `data` is a trait object (`dyn AsRef<[u8]>`) and cannot
+/// derive `Debug`; the buffer is summarized by its length, never dumped.
+impl std::fmt::Debug for FontContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FontContent")
+            .field("name", &self.name)
+            .field("original_name", &self.original_name)
+            .field("data_len", &self.bytes().len())
+            .field("face_index", &self.face_index)
+            .field("content_id", &self.content_id)
+            .finish()
+    }
 }
 
 /// Read-only source of fonts by working name, shared with background render

@@ -11,6 +11,11 @@ Main responsibilities:
 - bind an egui font family for combo-box option rendering;
 - issue the initial preview render request and clamp the selected face index.
 
+It is also the ONE place that maps font diagnostics to colors and wording: the
+STATIC per-font coverage classification (`font_coverage.rs`, combobox option
+colors + `font_coverage_tooltip`) and the FACTUAL per-render fallback report the
+renderer returns (`font_fallback_status_lines`, shown next to the preview).
+
 Notes:
 Extracted verbatim from `panel.rs`. Methods are `pub(super)` so the `panel`
 module root and its sibling submodules can call them. `use super::*;` pulls in
@@ -18,6 +23,22 @@ the parent module's types and imports.
 */
 
 use super::*;
+
+/// Maximum characters listed in one user-facing character list before it is
+/// truncated with a "+N more" suffix. Shared by the static coverage tooltip and
+/// the per-render fallback status so a long text can never blow up the panel.
+const MAX_SHOWN_CHARS: usize = 15;
+
+/// "Works, but not the way you asked": a font that only partially covers the
+/// typesetting language, or a character drawn by a fallback font instead of the
+/// selected one. Deliberately not red — both cases still render.
+pub(super) const FONT_DIAGNOSTIC_WARNING_COLOR: egui::Color32 =
+    egui::Color32::from_rgb(240, 200, 60);
+
+/// "This will not be readable": a font that lacks the writing system entirely, or
+/// a character no font in the render base could draw (tofu).
+pub(super) const FONT_DIAGNOSTIC_ERROR_COLOR: egui::Color32 =
+    egui::Color32::from_rgb(230, 96, 92);
 
 impl TypingCreatePanelState {
     pub(super) fn draw_create_presets_section(&mut self, ui: &mut egui::Ui) {
@@ -274,10 +295,10 @@ impl TypingCreatePanelState {
         let text = match coverage.support {
             FontLanguageSupport::Full => egui::RichText::new(label),
             FontLanguageSupport::Partial => {
-                egui::RichText::new(label).color(egui::Color32::from_rgb(240, 200, 60))
+                egui::RichText::new(label).color(FONT_DIAGNOSTIC_WARNING_COLOR)
             }
             FontLanguageSupport::Unsupported => {
-                egui::RichText::new(label).color(egui::Color32::from_rgb(230, 96, 92))
+                egui::RichText::new(label).color(FONT_DIAGNOSTIC_ERROR_COLOR)
             }
         };
         let mut response = ui.selectable_label(selected, text);
@@ -327,23 +348,89 @@ fn font_coverage_tooltip(coverage: &FontLanguageCoverage) -> Option<String> {
         FontLanguageSupport::Full => None,
         FontLanguageSupport::Unsupported => Some(tf!("typing.font_coverage.unsupported_tooltip", script_name = script_name, language_name = language_name)),
         FontLanguageSupport::Partial => {
-            const MAX_SHOWN: usize = 15;
-            let shown: String = coverage
-                .missing
-                .iter()
-                .take(MAX_SHOWN)
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|c| c.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let extra = coverage.missing.len().saturating_sub(MAX_SHOWN);
-            let list = if extra > 0 {
-                tf!("typing.font_coverage.more_chars_tooltip", shown = shown, extra = extra)
-            } else {
-                shown
-            };
+            let list = truncated_char_list(coverage.missing.as_slice());
             Some(tf!("typing.font_coverage.partial_tooltip", language_name = language_name, list = list))
         }
     }
+}
+
+/// Renders `chars` as a space-separated list, truncated to [`MAX_SHOWN_CHARS`]
+/// with a "+N more" suffix.
+///
+/// The suffix reuses `typing.font_coverage.more_chars_tooltip`: it is a pure
+/// "{shown} … (and N more)" fragment with exactly this meaning, and duplicating
+/// the literal into a second key would only let the two drift per locale.
+fn truncated_char_list(chars: &[char]) -> String {
+    let shown: String = chars
+        .iter()
+        .take(MAX_SHOWN_CHARS)
+        .map(|ch| ch.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let extra = chars.len().saturating_sub(MAX_SHOWN_CHARS);
+    if extra > 0 {
+        tf!("typing.font_coverage.more_chars_tooltip", shown = shown, extra = extra)
+    } else {
+        shown
+    }
+}
+
+/// One user-facing status row of the per-render font diagnostic: the text, the
+/// color it is painted in, and the tooltip explaining what it means.
+#[derive(Debug)]
+pub(super) struct FontFallbackStatusLine {
+    pub(super) text: String,
+    pub(super) color: egui::Color32,
+    pub(super) tooltip: &'static str,
+}
+
+/// Turns the renderer's factual fallback report into at most two status rows.
+///
+/// Row 1 (warning color) lists the characters the deterministic fallback chain
+/// drew and the font that drew each group — INFORMATION, not an error: the result
+/// is correct and identical on every machine, it just is not the selected
+/// typeface. Row 2 (error color) lists characters nothing could draw, which the
+/// reader really does lose (a tofu box).
+///
+/// Returns an empty vector when the selected font served the whole text, so the
+/// caller draws nothing at all. Both character lists are truncated by
+/// [`truncated_char_list`].
+///
+/// This is the FACTUAL counterpart of [`font_coverage_tooltip`]: that one judges a
+/// FONT against the typesetting LANGUAGE before anything is typed, this one reports
+/// what happened to THIS text. Both are kept; they answer different questions.
+pub(super) fn font_fallback_status_lines(
+    report: &FontFallbackReport,
+) -> Vec<FontFallbackStatusLine> {
+    let mut lines = Vec::new();
+    if !report.fallbacks.is_empty() {
+        let list = report
+            .fallbacks
+            .iter()
+            .map(|used| {
+                tf!(
+                    "typing.font_fallback.entry_label",
+                    chars = truncated_char_list(used.chars.as_slice()),
+                    font = used.family
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(FontFallbackStatusLine {
+            text: tf!("typing.font_fallback.used_status", list = list),
+            color: FONT_DIAGNOSTIC_WARNING_COLOR,
+            tooltip: t!("typing.font_fallback.used_tooltip"),
+        });
+    }
+    if !report.missing.is_empty() {
+        lines.push(FontFallbackStatusLine {
+            text: tf!(
+                "typing.font_fallback.missing_status",
+                chars = truncated_char_list(report.missing.as_slice())
+            ),
+            color: FONT_DIAGNOSTIC_ERROR_COLOR,
+            tooltip: t!("typing.font_fallback.missing_tooltip"),
+        });
+    }
+    lines
 }

@@ -224,9 +224,9 @@ egui repaints on demand. Nothing in `ui()` re-runs by itself.
 
 **You MUST call one of these** whenever state changes outside the frame that produced it: a worker
 thread finishing, a channel receiving, an animation you drive yourself. Cheap and idempotent per
-frame. Repo examples: while background loaders run (src/app.rs:2443-2447), polling a font-load
-channel with a 100 ms delay (src/app.rs:2259), after a viewport command
-(src/launcher/app.rs:643).
+frame. Repo examples: while background loaders run (src/app.rs:2443-2447), from the font loader
+thread once each stage of the stack is registered (`src/ui_fonts.rs`, `install_blocking`), after a
+viewport command (src/launcher/app.rs:643).
 
 ## 7. Theme and style
 
@@ -244,28 +244,47 @@ channel with a 100 ms delay (src/app.rs:2259), after a viewport command
 
 ## 8. Fonts
 
-`ctx.set_fonts(FontDefinitions)` (egui-0.35.0/src/context.rs:2038). Font bytes are `Arc<FontData>`;
-`FontData::from_owned(Vec<u8>)` (epaint-0.35.0/src/text/fonts.rs:139) and `from_static`
-(:131). Families are keyed by `FontFamily::{Proportional, Monospace, Name(..)}`.
+egui has two ways to install fonts, and **only one of them is allowed in this repo**:
+
+* `ctx.set_fonts(FontDefinitions)` (egui-0.35.0/src/context.rs:2038) — **forbidden.** It stores
+  `memory.new_font_definitions`, and applying it does `self.fonts = None; self.font_definitions =
+  font_definitions;` (:535-540), i.e. a FULL REPLACEMENT. Any family another subsystem registered
+  at runtime is gone; the typing tab caches its family names without re-checking, so the next use
+  panics in epaint (`FontFamily::{family:?} is not bound to any fonts`,
+  epaint-0.35.0/src/text/fonts.rs:1030).
+* `ctx.add_font(FontInsert)` (egui-0.35.0/src/context.rs:2061) — **the one to use.** Purely
+  additive: it pushes into `memory.add_fonts` and the next pass folds each entry into
+  `font_definitions` (:543-560). Safe from a worker thread and safe before the first frame.
+
+`FontInsert::new(name, FontData, Vec<InsertFontFamily>)` (epaint-0.35.0/src/text/fonts.rs:487);
+font bytes come from `FontData::from_owned(Vec<u8>)` (:139) or `from_static` (:131). Families are
+keyed by `FontFamily::{Proportional, Monospace, Name(..)}`.
+
+**Priority is an insertion position, so a loop reverses the chain.** `FontPriority::Highest` is
+`fam.insert(0, ..)` and `Lowest` is `fam.push(..)` (egui-0.35.0/src/context.rs:554-555). Iterating
+files in ascending name order with `Highest` therefore yields the *reverse* order in the final
+fallback chain — walk the sorted list backwards instead.
+
+Never call `ctx.fonts(..)` from a loader: it is `.expect("No fonts available until first call to
+Context::run()")` (egui-0.35.0/src/context.rs:1037), and a loader started from a `run_native`
+constructor closure runs before the first frame.
 
 ```rust
-// src/app.rs:2296-2332 (system-font injection), applied at src/app.rs:2250 via ctx.set_fonts(...)
-defs.font_data.insert(
-    regular_font_name.clone(),
-    Arc::new(egui::FontData::from_owned(result.regular_bytes)),
-);
-defs.families
-    .entry(egui::FontFamily::Proportional)
-    .or_default()
-    .insert(0, regular_font_name.clone());          // index 0 = highest priority
-let bold_family = defs
-    .families
-    .entry(egui::FontFamily::Name("system-ui-sans-bold".into()))
-    .or_default();
+// src/ui_fonts.rs — one add_font per file, from a worker thread
+ctx.add_font(egui::epaint::text::FontInsert::new(
+    &format!("ms-ui-{stage}-{file_name}"),
+    egui::FontData::from_owned(bytes),
+    vec![egui::epaint::text::InsertFontFamily {
+        family: egui::FontFamily::Proportional,
+        priority: egui::epaint::text::FontPriority::Highest,
+    }],
+));
 ```
 
-Font loading itself happens on a worker thread and is applied when the channel yields
-(src/app.rs:2240-2262) — see the next section for why.
+Loading is worker-driven: `ui_fonts::install(&cc.egui_ctx, Tier)` clones the `Context`
+(`Arc<RwLock<..>>`, egui-0.35.0/src/context.rs:710 — Send + Sync), spawns a thread, and returns
+immediately; no channel and no GUI-thread polling. Every `run_native` constructor closure in the
+app must make that call — see the next section for why the work cannot stay on the GUI thread.
 
 ## 9. The GUI thread is sacred
 
@@ -282,5 +301,6 @@ the result actually happens. The font loader above is the canonical example.
 * To change process startup, window size/icon/app-id, or which `run_native` runs: `src/main.rs`.
 * To change the launcher shell and its secondary native windows: `src/launcher/app.rs`.
 * To change the launcher look (Style/Visuals/palette): `src/launcher/theme.rs`.
-* To change fonts: `build_system_font_definitions` in `src/app.rs:2296`.
+* To change fonts (which files load, family names, fallback order): `src/ui_fonts.rs` and
+  `fonts/ui/MODULE_README.md`.
 * To change the PS-editor panel layout (top/left/right/central): `src/tabs/ps_editor/mod.rs:1698-1851`.

@@ -489,6 +489,55 @@ impl LinePlacementReference {
     }
 }
 
+/// One aggregated fallback fact: characters that were drawn by a font OTHER than
+/// the one the caller selected, together with the font that actually drew them.
+///
+/// `family` is the human-readable FAMILY name of that font — never a file path and
+/// never a `fontdb` id — because it is what the UI shows and what the user can act
+/// on. `chars` holds the DISTINCT characters that font drew, sorted by codepoint.
+/// Empty `chars` never occurs: an entry exists only because at least one character
+/// produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontFallbackUse {
+    /// Family name of the font that drew `chars`.
+    pub family: String,
+    /// Distinct characters that font drew, sorted by codepoint.
+    pub chars: Vec<char>,
+}
+
+/// Post-shaping font diagnostic of one render ([`RenderedTextImage::font_fallbacks`]).
+///
+/// It answers "what did the reader ACTUALLY see" for THIS text, which is a different
+/// question from the typing panel's static per-font coverage check ("could this font
+/// serve the selected typesetting language at all"). Both remain useful: the static
+/// check ranks fonts before anything is typed, this one reports the finished render.
+///
+/// `fallbacks` is INFORMATION, not an error — the renderer's fallback chain is
+/// deterministic and identical on every machine, so a character served by it is
+/// rendered correctly, just not in the selected typeface. `missing` is the real
+/// problem: nothing in the render base could draw those characters and the reader
+/// sees a tofu box.
+///
+/// The default (every glyph drawn by the selected font) is empty and costs no
+/// allocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FontFallbackReport {
+    /// Characters served by the fallback chain instead of the selected font,
+    /// grouped by the font that drew them, in first-seen order.
+    pub fallbacks: Vec<FontFallbackUse>,
+    /// Distinct characters no font in the render base could draw (`glyph_id == 0`,
+    /// i.e. `.notdef`/tofu), sorted by codepoint.
+    pub missing: Vec<char>,
+}
+
+impl FontFallbackReport {
+    /// `true` when every glyph was drawn by the selected font and nothing was lost.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fallbacks.is_empty() && self.missing.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TextRenderShapeCompareParams {
     pub width_px: u32,
@@ -518,6 +567,11 @@ pub struct RenderedTextImage {
     /// (`RenderedTextExtraInfo::default()`, all `None`) is what a render that did
     /// not request any extra info returns.
     pub extra: RenderedTextExtraInfo,
+    /// Which characters of THIS text the fallback chain drew instead of the
+    /// selected font, and which nothing could draw at all. Always computed (it is
+    /// two integer comparisons per glyph while everything is fine) and empty when
+    /// the selected font served the whole text. See [`FontFallbackReport`].
+    pub font_fallbacks: FontFallbackReport,
 }
 
 impl RenderedTextImage {
@@ -539,6 +593,7 @@ impl RenderedTextImage {
             content_origin_x: 0,
             content_origin_y: 0,
             extra: RenderedTextExtraInfo::default(),
+            font_fallbacks: FontFallbackReport::default(),
         }
     }
 }

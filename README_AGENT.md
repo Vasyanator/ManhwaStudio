@@ -84,8 +84,9 @@ GUI-free крейты под `crates/`. Слой логики извлечён �
   типов. Первый конкретный op — `canvas/bubble_action.rs::BubbleSnapshotOp` (Фаза 1,
   пузыри); растровые diff'ы появятся в поздних фазах.
 - **`ms-text-render`** (`crates/ms-text-render`) — продовый рендер текста вкладки typing
-  (бывший `src/tabs/typing/render_next`). Зависит от `ms-log`, `ms-text-util`; внешне
-  cosmic-text/swash/zeno/image/rayon.
+  (бывший `src/tabs/typing/render_next`). Зависит от `ms-log`, `ms-text-util`, `ms-fonts`
+  (детерминированная база шрифтов рендера, `font_base.rs` — см. раздел Render ниже);
+  внешне cosmic-text/unicode-script/swash/zeno/image/rayon.
 - **`ms-gifs`** (`crates/ms-gifs`) — GUI-free хранилище встроенных анимированных
   WebP-подсказок + их декодер. Ассеты (`assets/*.webp`, ~2.9 МБ) встроены через
   `include_bytes!` и разбиты по модулям-категориям, названным по вкладкам UI
@@ -106,6 +107,25 @@ GUI-free крейты под `crates/`. Слой логики извлечён �
   ⚠️ Корневой `.gitignore` — publication allowlist: новые ассеты обязаны получить в нём
   правило (`!crates/ms-gifs/assets/*.webp`), иначе сборка из git-клона падает на
   `include_bytes!`. Потребитель — виджет `crate::widgets::HelpHint`.
+- **`ms-fonts`** (`crates/ms-fonts`) — single owner of the bundled `fonts/ui` stack: it
+  resolves the directory once per process (launch dir, then exe dir; the first candidate
+  that actually yields core fonts wins, so an empty folder cannot shadow a healthy one),
+  describes every file as a `StackFont` (`NN-` order, tier, family name read from the
+  `name` table) and hands out `&'static [u8]` bytes read at most once per FILE (the store
+  is keyed by canonical path, so two spellings of one file share one copy). Depends on neither
+  egui nor cosmic-text ON PURPOSE: `ms-text-render` must not depend on the binary crate,
+  so the base the UI and the renderer share lives here (`dev-docs/unicode_base_font_plan.md`,
+  layer 0). Family names and bytes are `'static` because the consumers require it — the
+  cosmic-text `Fallback` trait can only name a family through `&'static str`, and neither
+  epaint nor cosmic-text can unload a font — so both "leaks" match the real lifetime.
+  A font whose family name cannot be read is left out of the stack instead of being named
+  after its file. Project/title overrides are deliberately NOT part of this manifest: they
+  apply to the UI only, so an open project can never change how a finished render looks.
+  `ms_fonts::Tier` (`Core`/`Bold`/`Ext` — where a font comes from) is a different type from
+  `ui_fonts::Tier` (`Core`/`Full` — how much a window installs).
+  Consumers: `src/ui_fonts.rs` (egui), `ms-text-render/font_base.rs` (render base) and the
+  typing panel, which offers the whole stack as ONE selectable font — see the Render
+  section and `src/tabs/typing/panel/MODULE_README.md`.
 
 Бинарник держит стабильные пути через реэкспорт-шимы: `crate::runtime_log` / `crate::trace`
 / `crate::text_punctuation` = соответствующие крейты; `crate::tabs::typing::render_next` =
@@ -155,7 +175,7 @@ main.rs → ProjectData → MangaApp
    Undo/redo (фаза 3a, только мазки кисти) — через `ms-actions` `RasterDiff`: `edit_op::PsEditOp`
    (`ReversibleAction<Ctx = PsEditorTabState>`) хранится в per-page `ActionHistory`, очищаемой при
    смене страницы; Ctrl/Cmd+Z / Ctrl+Shift+Z(Ctrl+Y).
-   Во вкладке `typing` продовый рендер идёт через `render_next::render_text_to_image(&params, &dyn FontProvider, cancel)`: шрифты доходят до рендерера ПО ИМЕНИ (`TextRenderParams.font_name` + inline `<font=...>`), которое резолвится через `render_next::FontProvider`, а не через путь. Это имя теперь — КОЛЛИЗИЕ-УСТОЙЧИВАЯ идентичность шрифта (`FontEntry.identity_name`, вычисляется `fonts::assign_font_identity_names` для финального списка панели): имя семейства, если оно уникально в списке, иначе file-stem `label`, когда два ЗАГРУЖЕННЫХ ФАЙЛА делят одно семейство (пара Regular+Bold как раздельные файлы) — так каждый файл сохраняет свою идентичность и не подменяется другим. Имя семейства, label и file-stem остаются легаси-алиасами резолва (старые проекты и старые версии приложения по-прежнему находят шрифт). Отображаемое имя (имя файла / пользовательский override) — только для показа пользователю в комбобоксах/списках, НЕ для персиста и рендера. Вкладка `typing` владеет загрузкой шрифтов и строит провайдер (`panel::TabFontProvider`, ПЕРВИЧНЫЙ ключ — нормализованная `identity_name`, имя семейства/label/stem — алиасы; ленивое чтение байт + кэш content-id), хранит его на панелях и в слое таба и передаёт `Arc<dyn FontProvider>` в каждый фоновый render-запрос. Имя семейства также сохраняется как `font_original_name` (кодек читает его ПЕРВЫМ) и предпочитается PSD-экспортом. Path-based `render_next::load_selected_font_from_path` остаётся тонкой compat-обёрткой для forms-metric пути. `render_next/` держит публичные типы в `types.rs`, изолированные horizontal и vertical `wrap`/`layout` path'ы, `inline_styles` (tag parsing/remap + attrs-level rich-text + glyph-level color/kerning/stretch/offset/line-spacing overrides; parameterized `<b=...>`/`<i=...>` request FAUX bold/italic — geometric outline thickening/baseline shear on the SELECTED face (the inline `<font=...>`'s own face inside such a span) via `TextRenderParams.faux_bold`/`faux_italic_slant_deg`, active only together with `force_bold`/`force_italic`; bare `<b>`/`<i>` keep the real faces — see `crates/ms-text-render/src/MODULE_README.md`), `font_registry` для selected/inline fonts, общий `raster`-слой для swash/RGBA helper'ов и вынесенный `effects/` пакет с отдельным JSON parser'ом, text preprocess stage до inline parsing (`effect_type=preprocess`), image helper-слоем и split-модулями `stroke_shadow` / `blur` / `glow` / `gradients` / `reflect_shake` / `dry_media` / `interference`; отсутствие `effect_type` в effects JSON означает post-effect для совместимости.
+   Во вкладке `typing` продовый рендер идёт через `render_next::render_text_to_image(&params, &dyn FontProvider, cancel)`: шрифты доходят до рендерера ПО ИМЕНИ (`TextRenderParams.font_name` + inline `<font=...>`), которое резолвится через `render_next::FontProvider`, а не через путь. Это имя теперь — КОЛЛИЗИЕ-УСТОЙЧИВАЯ идентичность шрифта (`FontEntry.identity_name`, вычисляется `fonts::assign_font_identity_names` для финального списка панели): имя семейства, если оно уникально в списке, иначе file-stem `label`, когда два ЗАГРУЖЕННЫХ ФАЙЛА делят одно семейство (пара Regular+Bold как раздельные файлы) — так каждый файл сохраняет свою идентичность и не подменяется другим. Имя семейства, label и file-stem остаются легаси-алиасами резолва (старые проекты и старые версии приложения по-прежнему находят шрифт). Отображаемое имя (имя файла / пользовательский override) — только для показа пользователю в комбобоксах/списках, НЕ для персиста и рендера. Вкладка `typing` владеет загрузкой шрифтов и строит провайдер (`panel::TabFontProvider`, ПЕРВИЧНЫЙ ключ — нормализованная `identity_name`, имя семейства/label/stem — алиасы; ленивое чтение байт + кэш content-id), хранит его на панелях и в слое таба и передаёт `Arc<dyn FontProvider>` в каждый фоновый render-запрос. Имя семейства также сохраняется как `font_original_name` (кодек читает его ПЕРВЫМ) и предпочитается PSD-экспортом. Path-based `render_next::load_selected_font_from_path` остаётся тонкой compat-обёрткой для forms-metric пути. Отдельный, ЕДИНСТВЕННЫЙ синтетический пункт списка шрифтов панели — «Встроенный шрифт интерфейса» (фаза 5 `dev-docs/unicode_base_font_plan.md`): он предлагает бандловый стек `fonts/ui` как обычный выбираемый шрифт, указывая на ПЕРВЫЙ файл core-цепочки, а остальная цепочка приезжает из `MsFallback::common_fallback` рендера. Его идентичность (`BUNDLED_UI_FONT_IDENTITY`, `"ManhwaStudio UI"`) зарезервирована и НЕ локализуется (персистится в проект; локализована только подпись — `dev-docs/i18n_exclusions.md` §A7), пункт всегда нулевой в списке, поэтому панель и провайдер разрешают конфликт имён одинаково (FIRST-wins по одному списку). Байты он отдаёт из `ms_fonts::bytes`, а `FontContent.data` имеет тип `FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>` (тип `fontdb::Source::Binary`), поэтому файл не читается второй раз и дубль фейса в базе рендера не появляется (`font_base::resident_face_ids`). `render_next/` держит публичные типы в `types.rs`, изолированные horizontal и vertical `wrap`/`layout` path'ы, `inline_styles` (tag parsing/remap + attrs-level rich-text + glyph-level color/kerning/stretch/offset/line-spacing overrides; parameterized `<b=...>`/`<i=...>` request FAUX bold/italic — geometric outline thickening/baseline shear on the SELECTED face (the inline `<font=...>`'s own face inside such a span) via `TextRenderParams.faux_bold`/`faux_italic_slant_deg`, active only together with `force_bold`/`force_italic`; bare `<b>`/`<i>` keep the real faces — see `crates/ms-text-render/src/MODULE_README.md`), `font_registry` для selected/inline fonts, общий `raster`-слой для swash/RGBA helper'ов и вынесенный `effects/` пакет с отдельным JSON parser'ом, text preprocess stage до inline parsing (`effect_type=preprocess`), image helper-слоем и split-модулями `stroke_shadow` / `blur` / `glow` / `gradients` / `reflect_shake` / `dry_media` / `interference`; отсутствие `effect_type` в effects JSON означает post-effect для совместимости.
    `TextRenderParams.compare_shape_with` — opt-in pre-raster сравнение `layout_text` с другим набором shape/wrap-параметров (`width_px`, `text_wrap_mode`, `shape_min_width_percent`); при совпадении формы рендер может быть пропущен до растра или продолжен с предупреждением.
 
 ---
@@ -174,6 +194,48 @@ main.rs → ProjectData → MangaApp
   - Python env не найден → prompt на установку, при отказе всё равно Rust launcher;
 - `scr → src` нормализуется для legacy-проектов;
 - `--no-ai` отключает Python backend и PaddleOCR.
+
+---
+
+## Шрифты UI (`src/ui_fonts.rs`)
+
+Единственный владелец шрифтового стека интерфейса. **Каждое** замыкание-конструктор
+`eframe::run_native` (студия, лаунчер, инсталлятор, апдейтер, стартовые prompt-окна) обязано
+ровно один раз вызвать `ui_fonts::install*` — иначе окно остаётся на дефолтных шрифтах egui
+и не-латиница рисуется тофу. Шрифты берутся из бандла `fonts/ui`
+(`fonts/ui/MODULE_README.md` — раскладка `core`/`bold`/`ext` и правило префикса `NN-`), а не
+из системы; системный перебор путей остался только аварийным фолбэком.
+
+Владелец каталога и байт — крейт `ms-fonts`: `ui_fonts` берёт манифест (`ms_fonts::stack()`)
+и байты (`ms_fonts::bytes()`) у него и ставит их через `FontData::from_static`. `from_owned`
+хранил бы байты ДВАЖДЫ (копия в `FontDefinitions::font_data` + глубокий клон в `Blob` фейса,
+`epaint-0.35.0/src/text/fonts.rs:397-402`) — на нынешнем наборе это ≈99 МБ лишней резидентной
+памяти. Побочно снимается и повторное чтение с диска: лаунчер и студия — два последовательных
+`run_native` в ОДНОМ процессе, а `ms_fonts::bytes()` читает файл один раз за процесс.
+
+Три уровня контракта:
+
+- `Tier::Core` — `core/` + `bold/` (~19 МБ): все окна кроме студии.
+- `Tier::Full` — то же, но `ext/` (~80 МБ) только ВЗВОДИТСЯ, а не ставится: только окно
+  студии. Уровень догружается фоном при первом символе, который установленная цепочка не
+  умеет нарисовать, — это `ui_fonts::ensure_covers(ctx, text)`, который canvas зовёт на
+  текстах пузырей. Дробить ext глиф-в-глиф нельзя: epaint парсит `font_data` целиком и не
+  умеет ни ленивой загрузки, ни выгрузки, поэтому «по требованию» возможно только уровнем
+  целиком. Вызов идемпотентен и после решения вопроса стоит один атомарный load.
+- Имена семейств объявлены здесь же: `BUBBLE_TEXT_FAMILY_NAME` (текст пузырей canvas) и
+  `UI_BOLD_FAMILY_NAME` (жирное начертание UI). Canvas только читает их.
+
+Тайтловый override `<title>/fonts/ui` резолвится ТОЛЬКО в `ui_fonts` (свой скан каталога,
+байты через `from_owned`) и действует только на UI: манифест `ms-fonts` процесс-глобален и
+обязан оставаться независимым от проекта, иначе проект незаметно менял бы вид готового
+рендера (`dev-docs/unicode_base_font_plan.md`, решение 2).
+
+Жёсткие ограничения: чтение с диска идёт в фоновом потоке (`Context` — `Arc<RwLock<..>>`,
+Send+Sync), установка — ТОЛЬКО через `Context::add_font`. `Context::set_fonts` запрещён: он
+заменяет весь набор определений и сносит семейства, которые вкладка typing регистрирует в
+рантайме (превью/редактор шрифтов), что приводит к панике epaint. `Context::fonts`/`fonts_mut`
+запрещены в загрузчике: они паникуют до первого кадра — `ensure_covers` их использует и
+поэтому зовётся только из UI-кода внутри кадра, никогда из фонового потока.
 
 ---
 
@@ -395,7 +457,8 @@ original, and a bbox relative to the sent image) and the model returns
 
 - `TypingTabState`: read-only canvas, text/image overlays, inline text editor, export.
 - **Text overlay**: PNG-файлы в `text_images/`; для custom raster line layout рядом может лежать `*_layout.png`; placement хранит `deform_mesh` (high-res surface в UV); `text_info.json` — метаданные. При загрузке `migrate_legacy_text_overlays` приводит старые форматы placement к современному center-anchor: абсолютные ленточные `x`/`y` (без `img_idx`/`u`/`v`) конвертируются через `project::LegacyRibbonGeometry`, top-left `u`/`v` сдвигаются в центр; нормализованный `text_info.json` перезаписывается один раз.
-- **Render** (`render_next/`): `types.rs` хранит `TextRenderParams`/`RenderedTextImage` и связанные enum'ы; `pipeline.rs` рендерит `cosmic-text` → RGBA, поддерживает shape (Free/Rect/Oval/Hex), line mode (Horizontal/Vertical), formula layout (x/y/rotation по параметрической кривой), custom raster/vector line layouts через общий `drawn_lines.rs` path-normalizer, effects pipeline (stroke/shadow/blur/glow/gradient/reflect/shake/interference) и hyphenation через `hyphenation` crate; inline `offset` хранится как расширенная span-модель с глобальным смещением, path-смещением и rotation-overrides. Отрисовка глифов теперь vector-first: монохромные глифы растеризуются из векторных outlines через `vector.rs` (zeno coverage-mask) с общим pivot-хелпером `glyph_blit.rs` на всех трёх путях (horizontal, vertical, on-path/formula); shaping/layout/font-matching остаются на `cosmic-text`, а bitmap (`SwashCache::get_image`) сохранён только для цветных/emoji глифов, placement/bounds-бокса и измерения ink. Детали и отложённый Phase 4 — в `render_next/VECTOR_ENGINE_REFACTOR.md`. `render_text_to_image` берёт `FontSystem` из process-global пула (`font_system_pool.rs`, `with_leased_font_system`) вместо создания нового на каждый рендер (создание запускало полный системный скан шрифтов); загрузка шрифтов дедуплицируется через `FontFaceCache`, поэтому переиспользование системы даёт byte-identical результат. Прогрев из фонового потока — `render_next::prewarm_font_system_pool()`.
+- **Render** (`render_next/`): `types.rs` хранит `TextRenderParams`/`RenderedTextImage` и связанные enum'ы; `pipeline.rs` рендерит `cosmic-text` → RGBA, поддерживает shape (Free/Rect/Oval/Hex), line mode (Horizontal/Vertical), formula layout (x/y/rotation по параметрической кривой), custom raster/vector line layouts через общий `drawn_lines.rs` path-normalizer, effects pipeline (stroke/shadow/blur/glow/gradient/reflect/shake/interference) и hyphenation через `hyphenation` crate; inline `offset` хранится как расширенная span-модель с глобальным смещением, path-смещением и rotation-overrides. Отрисовка глифов теперь vector-first: монохромные глифы растеризуются из векторных outlines через `vector.rs` (zeno coverage-mask) с общим pivot-хелпером `glyph_blit.rs` на всех трёх путях (horizontal, vertical, on-path/formula); shaping/layout/font-matching остаются на `cosmic-text`, а bitmap (`SwashCache::get_image`) сохранён только для цветных/emoji глифов, placement/bounds-бокса и измерения ink. Детали и отложённый Phase 4 — в `render_next/VECTOR_ENGINE_REFACTOR.md`. `render_text_to_image` берёт `FontSystem` из process-global пула (`font_system_pool.rs`, `with_leased_font_system`) вместо создания нового на каждый рендер; загрузка шрифтов дедуплицируется через `FontFaceCache`, поэтому переиспользование системы даёт byte-identical результат. Прогрев из фонового потока — `render_next::prewarm_font_system_pool()`.
+  **База шрифтов рендера — своя, а не системная** (`font_base.rs`, `dev-docs/unicode_base_font_plan.md`, решение 1): `FontSystem::new()` (полный скан шрифтов ОС) не используется — каждая система строится над одной процессной `fontdb::Database`, куда попадают ТОЛЬКО бандл `fonts/ui` (через `ms-fonts`) и шрифт, который вызывающий регистрирует через `FontProvider` на конкретный рендер. Мотив: рендер обязан выглядеть одинаково на любой машине, а системная база делала выбор глифа для отсутствующего символа зависимым от того, что установлено у конкретного пользователя. Уровни хранятся по-разному и это и есть контракт «подгрузка по требованию»: `core`/`bold` — `fontdb::Source::Binary` над теми же `&'static` байтами, что у egui (одна копия на процесс), `ext` (~80 МБ) — `fontdb::Source::File`, то есть в базе лежат только метаданные, а байты мапятся при первом `get_font`. Цепочку фолбэка задаёт `MsFallback` (`cosmic_text::Fallback`): `common_fallback` — core-цепочка в порядке `NN-`; `script_fallback` — плотное отображение письменности в ОДИН бандловый шрифт (Han/Hiragana/Katakana → Source Han Sans K → Plangothic P1/P2 → HanaMin B/A, Hangul → Source Han Sans K, Arabic → Noto Sans Arabic и т.д.), благодаря чему мапится именно нужный файл, а не перебор; `forbidden_fallback` — четыре крупных редких CJK-шрифта (~73 МБ), исключённых из финального перебора всей базы и достижимых только через ханьскую цепочку. Локаль ОС заменена фиксированной `en-US` по той же причине воспроизводимости. Осознанная цена: письменность, которой нет в `fonts/ui`, рисуется тофу — лечится расширением `fonts/ui`, а не возвратом системной базы. Имена семейств в таблицах — реальная связка с бандлом; дрейф ловит тест `the_shipped_bundle_backs_every_family_the_fallback_tables_name`. Вторая цена той же природы: `cosmic-text` пускает face в набор кандидатов только при ТОЧНОМ совпадении `style` и `stretch` (`Attrs::matches`), а бандл содержит только прямые начертания — поэтому НИ ОДНА модификация attrs не применяется, пока `font_registry::family_has_matching_face` не подтвердит, что у названного семейства остаётся подходящий face. Иначе выбранный шрифт просто выпадает из набора: с резолвнутым бандлом запрос уходит в `ext/12-NotoEmoji-Regular` (у `matches` есть безусловное исключение для имён с «Emoji») и весь текст рисуется тофу, а без бандла набор пуст и `cosmic-text` паникует. Единственная модификация, которую рендер синтезирует сам, — настоящий курсив; при отсутствии курсивного начертания он ДЕГРАДИРУЕТ в faux-курсив (`SYNTHESIZED_ITALIC_SLANT_DEG`, 12°) с записью в лог и в `RenderedTextImage.warnings` — и для всего оверлея, и отдельно для каждого inline-спана `<i>`. Поскольку цепочка фолбэка детерминирована, «символ не отрисуется» почти не бывает, зато осмысленно «символ отрисован НЕ выбранным шрифтом» — поэтому каждый рендер возвращает ТИПИЗИРОВАННУЮ диагностику `RenderedTextImage.font_fallbacks` (`FontFallbackReport`: символы, ушедшие в фолбэк, сгруппированные по ИМЕНИ СЕМЕЙСТВА, которое их нарисовало, плюс символы с `glyph_id == 0`). Собирается один раз в `pipeline::render_text_to_image` сразу после шейпинга (все режимы раскладки рисуют из того же буфера) и стоит на «чистом» тексте два целочисленных сравнения на глиф без единой аллокации; `warnings` остаётся прозой о деградациях, диагностика — структурой для UI. Панель «Тайп» показывает её строками состояния у превью (`create_presets::font_fallback_status_lines`) — это ФАКТИЧЕСКАЯ проверка по тексту, дополняющая, а не заменяющая СТАТИЧЕСКУЮ проверку покрытия шрифта по языку вёрстки (`panel/font_coverage.rs`).
 - Shape-variant preview рендерит 3x3 варианты формы из фонового job через отдельные worker-потоки для каждой плитки; GUI получает только собранные RGBA-результаты.
 - **Panel** (`panel.rs`): вертикальная основная панель с вкладками `Параметры`/`Эффекты`, отдельная панель `Действия` и preview-окно для Create; режимы Create/Edit; именованные пресеты шрифтов + формульные пресеты; live-render при редактировании (latest-wins cancellation).
 - Layout-editor mode для выделенного text overlay — runtime-состояние `TypingTextOverlayLayer`: в edit-режиме скрывает сам оверлей, рисует resizable frame и панели линий; vector-preview записывает `custom_vector_lines` в `render_data.text_params.vector_lines_layout` и запускает обычный фоновый edit-render; размер vector-области хранится в `vector_lines_layout.width_px/height_px` отдельно от фактического alpha-bounds PNG, а строки несут свои параметры сглаживания, направления текста, режима расстояния и переворота glyph'ов.
@@ -818,6 +881,13 @@ because a screenshot looked plausible.
 ## Что важно не ломать
 
 - **GUI-поток** — никакого I/O, декодирования изображений, сети, длительных вычислений.
+- **Шрифты UI** — ставятся только через `ui_fonts::install*` / `ui_fonts::ensure_covers` и
+  только `Context::add_font`. `Context::set_fonts` заменяет весь набор определений (снесёт
+  рантайм-семейства typing → паника epaint), `Context::fonts`/`fonts_mut` паникуют до первого
+  кадра (из загрузчика — нельзя, из UI внутри кадра — можно). Новое `run_native`-окно без
+  вызова `ui_fonts::install*` — это баг. Байты бандла берутся у `ms-fonts` и ставятся
+  `FontData::from_static`; собственное `fs::read` + `from_owned` для `fonts/ui` — регресс
+  на ≈99 МБ памяти.
 - **Shared state** — только через `Arc<Mutex<…>>` модели с `revision`; не копировать состояние вручную между вкладками.
 - **CanvasView** — общий движок; логика вкладки добавляется через `CanvasHooks` и отдельные runtime-слои, не форком canvas-кода.
 - **CleanOverlaysModel** — держать двойное представление (ColorImage + RgbaImage); одностороннее разрушает export и инструменты.

@@ -62,18 +62,42 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `FontContentSet` in-memory impl, `font_content_id` cache-key hash). The renderer
   NEVER reads a font file itself; the caller (typing tab) owns the provider (lazy
   file read today, virtual fonts later). Groundwork for virtual/composed fonts.
+  `FontContent.data` is `FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>` — exactly
+  what `fontdb::Source::Binary` takes — so a provider may hand over an owned
+  `Vec<u8>` OR the `'static` bytes `ms-fonts` already holds for a bundled font,
+  and neither is copied on the way into fontdb.
 - `font_registry.rs`: selected/inline font loading and inline-font registry
   construction. The core loader `load_font_content` takes a resolved `FontContent`
   (bytes + face + content id) and never touches the filesystem;
   `load_selected_font_from_path` is a thin compat wrapper over it for the
   path-based forms-metric measurement path. Loading is cache-gated through
   `FontFaceCache` (see `font_system_pool.rs`) keyed by `content_id` so a reused
-  `FontSystem` does not accumulate duplicate faces.
+  `FontSystem` does not accumulate duplicate faces. Owns `displace_bundled_faces`,
+  which makes the caller's own font win over a bundled face of the same family, and
+  the two guards every attrs MODIFICATION must pass — `family_has_matching_face`
+  (style/stretch) and `family_has_face_of_requested_weight` (weight), see the
+  UNSERVICEABLE-ATTRS GUARD contract below; both are `pub` so out-of-crate render
+  harnesses can apply the same rules.
+- `font_base.rs`: the renderer's OWN font database and fallback chain, built once
+  per process from the bundled `fonts/ui` stack (`ms-fonts`). Owns
+  `new_render_font_system` (the single `FontSystem` constructor, re-exported from
+  the crate root for out-of-crate render harnesses such as
+  `src/bin/text_render_test`), the base `fontdb::Database` and `MsFallback`
+  (`cosmic_text::Fallback`). Edit it to change which fonts back a render, the
+  script -> font mapping, the forbidden list, or the weight fallback faces are
+  registered under (`FALLBACK_FACE_WEIGHT`). Its test-only `test_bundle` submodule is
+  how any test reaches the SHIPPED bundle (see Testing Guidance).
+- `fallback_diag.rs`: the post-shaping font diagnostic. Turns the shaped
+  `cosmic_text::Buffer` into `RenderedTextImage.font_fallbacks`
+  (`types::FontFallbackReport`): which characters the fallback chain drew instead
+  of the caller's own font (grouped by the FAMILY NAME that drew them) and which
+  characters nothing could draw (`glyph_id == 0`, tofu). Edit it to change what
+  counts as "the caller's font" or how the facts are aggregated.
 - `font_system_pool.rs`: process-global checkout pool of reusable
-  `cosmic_text::FontSystem` instances (+ their `FontFaceCache`). Owns
-  `with_leased_font_system` (used by `pipeline::render_text_to_image`) and
-  `prewarm_font_system_pool` (re-exported for the app to call from a background
-  thread).
+  `cosmic_text::FontSystem` instances (+ their `FontFaceCache`), all built through
+  `font_base::new_render_font_system`. Owns `with_leased_font_system` (used by
+  `pipeline::render_text_to_image`) and `prewarm_font_system_pool` (re-exported for
+  the app to call from a background thread).
 - `inline_styles.rs`: parser/remapper for inline tags, attrs-compatible style spans, and
   line-level inline alignment markers.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
@@ -138,18 +162,207 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   See `effects/MODULE_README.md`.
 
 ## Contracts and invariants
+- FONT BASE AND FALLBACK (`font_base.rs`) — the renderer does NOT use the operating
+  system's fonts. Every `FontSystem` is built by `font_base::new_render_font_system`
+  over one process-wide `fontdb::Database` holding exactly the bundled `fonts/ui`
+  stack (`ms-fonts`) plus, per render, the font the caller registers through the
+  `FontProvider`. `FontSystem::new()` (a full OS font scan) must never come back:
+  a render has to look the same on every machine, and the OS database made the
+  glyph chosen for a missing character depend on what that operator happened to
+  have installed (`dev-docs/unicode_base_font_plan.md`, decision 1).
+  - Tier storage IS the load-on-demand contract. `core`/`bold` are registered as
+    `fontdb::Source::Binary` over the `&'static` bytes `ms-fonts` already holds, so
+    the renderer shares ONE copy with the egui UI. `ext` (~80 MB, 44 files) is
+    registered as `fontdb::Source::File`: fontdb maps such a file only to read its
+    `name` table and drops the mapping at once, and the bytes enter the address
+    space at the first `FontSystem::get_font`. Do not build a custom lazy loader.
+  - RESIDENT REUSE — a caller may SELECT a bundled font as its own font (the typing
+    panel's "built-in interface font", `dev-docs/unicode_base_font_plan.md` phase 5).
+    `build_base_database` therefore indexes every resident buffer by its ADDRESS and
+    length (`resident_face_ids`), and `font_registry::load_font_content` adopts the
+    already-registered face instead of loading the bytes a second time. Registering
+    them again would put a duplicate `(family, weight, style)` face into every pooled
+    system for no benefit. The index is keyed by buffer identity, not by content
+    hash, so an unrelated file that merely happens to be byte-identical is never
+    rerouted; the loader additionally re-validates each id against the system it is
+    loading into, because fontdb ids are database-local (the throwaway metric system
+    in the typing panel has its own empty db). No taint check runs on that path —
+    nothing was added, so no family became newly ambiguous.
+  - SELECTED FONT WINS (`font_registry::displace_bundled_faces`) — when the caller's
+    own font declares a family name the BUNDLED base also declares (a user's own copy
+    of "Noto Sans", or of any of the ~40 bundled families), the bundled faces are
+    REMOVED from that system's database. Without it the user's file is loaded, matched
+    by name and then never used: cosmic-text resolves `Family::Name` to the first
+    `weight_diff == 0` face of the family in face-id order, the base is registered
+    first, so its ids always win — silently, with the wrong metrics. fontdb cannot
+    reorder ids, so removal (`remove_face`) is the only lever. The scope is exactly
+    the faces the system held BEFORE this cache loaded anything
+    (`FontFaceCache::capture_preexisting_faces`), never a face an earlier render
+    added. The system is then tainted and dropped (see the pool contract below):
+    it no longer holds the base it was cloned from.
+  - FALLBACK WEIGHT — every face of the base EXCEPT the `bold` tier is registered at
+    `Weight::NORMAL`, whatever its `OS/2` table declares (`FALLBACK_FACE_WEIGHT`,
+    applied by `load_source_at_fallback_weight`; fontdb cannot edit a registered face,
+    so such a face is removed and pushed back re-weighted, which keeps its position —
+    pinned by `base_face_order_follows_the_registration_order`). This is not
+    cosmetic: cosmic-text admits a candidate into the script and common fallback
+    passes only when `font_weight_diff == 0`, i.e. only at the exact weight the run is
+    shaped at, and `90-HanaMinB`/`91-HanaMinA` declare `usWeightClass = 500`. Left as
+    declared they are unreachable at every normal-weight run AND unreachable through
+    the final pass (they are forbidden), i.e. dead weight in the bundle. Only the
+    `bold` tier keeps its declared weight — telling it from its regular sibling by
+    weight is its entire purpose.
+  - `MsFallback` pins the three cosmic-text fallback lists. `common_fallback` is the
+    `core` chain in `NN-` order. `script_fallback` maps a writing system to the ONE
+    bundled font that serves it (Han/Hiragana/Katakana -> Source Han Sans K, then
+    the rare-plane fonts; Hangul -> Source Han Sans K; Arabic -> Noto Sans Arabic;
+    and so on), which is what keeps the on-demand mapping targeted instead of a
+    scan. `forbidden_fallback` holds the four large rare-CJK fonts (Plangothic
+    P1/P2, HanaMin A/B, ~73 MB together) so cosmic-text's final "try every face in
+    the database" pass can never mmap them; they stay reachable through the script
+    chains only. The chain is LOCALE-BLIND and the system locale is replaced by a
+    fixed `en-US`, for the same reproducibility reason.
+  - The family names in those tables are matched against the bundled files' `name`
+    tables, so they are a real coupling to `fonts/ui`. A name the resolved stack
+    does not ship is dropped with one warning, and the unit test
+    `the_shipped_bundle_backs_every_family_the_fallback_tables_name` fails on drift.
+    A script NOT named in the table still works AS LONG AS a non-forbidden font
+    covers it — it falls through to the core chain and then to the final database
+    pass — so dropping a new `30-NotoSans<Script>` file into `fonts/ui/ext` needs no
+    code change; naming it only makes the choice precise and cheap.
+  - A script whose ONLY coverage sits in a FORBIDDEN font is the exception, and it is
+    unreachable (tofu, no diagnostic) until `SCRIPT_FAMILIES` names it, because the
+    final pass skips forbidden families. Counted off the shipped `cmap` tables, 84 537
+    codepoints in 78 writing systems exist ONLY inside the four forbidden fonts, and
+    every one of those writing systems now has an entry — Han and the kana through the
+    rare-plane chains, the `91-HanaMinA` group (Runic, Old Turkic, Carian, Lisu, Old
+    Italic, Lycian, Lydian, part of Coptic and Linear B), and the Plangothic group
+    (Tangut ~7 000 codepoints, SignWriting, Khitan Small Script, Nushu, Cuneiform,
+    Egyptian Hieroglyphs, Old Hungarian, Glagolitic and ~55 more). Any font added to
+    `FORBIDDEN_FAMILIES` must come with the script entries that keep its exclusive
+    coverage reachable; the exhaustive guard
+    `every_forbidden_only_codepoint_is_reachable_through_a_script_chain` walks the
+    shipped `cmap` tables and fails on the first writing system that loses its chain.
+  - A writing system that ALREADY had a profile face keeps it FIRST when a rare-plane
+    font is appended (Arabic, Balinese, Cyrillic, Devanagari, Ethiopic, Kannada, Lao,
+    Mongolian, Myanmar, Syriac, Tamil, Telugu — recent block extensions the profile
+    Noto Sans has not caught up with). Ordinary text of those scripts is therefore
+    unchanged and only the genuinely missing codepoints reach Plangothic; pinned by
+    `appending_a_rare_plane_font_keeps_the_profile_face_first`.
+  - FOUR SCRIPT CLASSES CANNOT BE ADDRESSED THROUGH `SCRIPT_FAMILIES` AT ALL.
+    cosmic-text derives a run's scripts from its characters and drops `Common`
+    (`Zyyy`), `Inherited` (`Zinh`), `Latin` and `Unknown` while doing so
+    (`cosmic-text-0.14.2/src/shape.rs:249-257`), so `script_fallback` is never called
+    with any of them. Such characters are looked up through the OTHER scripts of the
+    run they sit in — a combining mark or a shared punctuation sign inside an Arabic
+    run goes through the Arabic chain — and in a run that has no other script they go
+    straight to the core chain and then to the final whole-database pass, which cannot
+    reach a forbidden font. The bundle has 1 120 `Common`, 355 `Inherited`, 17 `Latin`
+    and 2 370 `Unknown` (unassigned or newer than `unicode-script` 0.5.8) codepoints
+    that only a forbidden font ships; they render when surrounded by text of a script
+    whose chain reaches that font and stay tofu on their own. This is structural, not
+    an omission — an entry for those four would be dead weight, and the exhaustive
+    guard skips exactly them.
+  - Accepted cost: a writing system `fonts/ui` does not ship renders as tofu where an
+    installed system font used to cover it by accident. The fix is to extend
+    `fonts/ui`. Coverage inside the named scripts is also PARTIAL by nature — the
+    rare-plane fonts ship what they ship, and the rest of each block stays tofu.
+  - UNSERVICEABLE-ATTRS GUARD (`font_registry::family_has_matching_face`) — cosmic-text
+    admits a face into the match set only on EXACT `style` and `stretch` equality
+    (`Attrs::matches`), and the WHOLE fallback iteration runs over that set. The
+    bundle ships only upright, normal-stretch faces, so an attrs modification that
+    asks for a style nobody registered does not degrade — it removes the caller's
+    font from the run. Both outcomes are total losses: with the bundle resolved the
+    request lands on `ext/12-NotoEmoji-Regular` (cosmic-text's `matches` short-
+    circuits to true for ANY face whose PostScript name contains "Emoji") and the
+    run renders as `.notdef` tofu; without a resolvable stack the set is EMPTY and
+    cosmic-text panics (`shape.rs:274 .expect("no default font found")`), which also
+    leaks the leased `FontSystem` (`with_leased_font_system` has no Drop guard).
+    Therefore: NO attrs modification may be applied unless the family it names still
+    has a face passing `Attrs::matches`. Checking "some face in the database matches"
+    is NOT enough — the emoji exemption makes that always true. `stretch` needs no
+    guard in practice because it is only ever copied FROM a registered face, never
+    synthesized. WEIGHT needs a guard of its own kind (`family_has_face_of_requested_weight`,
+    below): it cannot empty the match set, but it can empty the set of USABLE
+    candidates.
+    - Real ITALIC is the one modification the renderer synthesizes out of thin air, so
+      it is the one that has to degrade. When the selected family (or an inline
+      `<font=...>` family) ships no italic face, the request is rewritten into FAUX
+      italic at `pipeline::SYNTHESIZED_ITALIC_SLANT_DEG` (12°, the `italicAngle` the
+      matching real Italic faces declare) — the whole-overlay case by setting
+      `faux_italic_slant_deg` on a params copy before anything reads the flags, the
+      inline case by rewriting the mapped `InlineStyleSpan`s in place before they feed
+      either the attrs or the per-glyph faux resolution. Never silent: one
+      `runtime_log::log_warn` plus one user-visible entry in
+      `RenderedTextImage.warnings`. Loading the family's own Italic FILE, or setting an
+      explicit `<i=slant>`, still wins over the synthesized default.
+    - Real BOLD is guarded too, by the WEIGHT predicate
+      `font_registry::family_has_face_of_requested_weight` (family + `Attrs::matches` +
+      EXACT weight equality). A `force_bold`/bare `<b>` request on a family that ships
+      no face at `Weight::BOLD` costs twice, both silently: cosmic-text's primary pick
+      requires `font_weight_diff == 0` and does NOT rank down inside the family
+      (`font/fallback/mod.rs:275-283`), so the run jumps to whatever family DOES have a
+      700 face — on the bundled base that is `Noto Sans Bold`, a different typeface;
+      and the script/common fallback passes filter candidates the same way
+      (`font_match_keys_iter(false)`, `fallback/mod.rs:410-417`), so at weight 700
+      EVERY bundled fallback font (all `Weight::NORMAL`) drops out of the run and a
+      rare glyph in the same text renders as tofu. The request is therefore rewritten
+      into FAUX bold at `FauxBoldParams::default()` (the `<b=default>` strength, 3 % of
+      the em) — the whole-overlay case in `pipeline::synthesized_bold_params`, the
+      inline case in `pipeline::degrade_unavailable_inline_bold` — with one
+      `runtime_log::log_warn` and one user-visible `RenderedTextImage.warnings` entry.
+      Loading the family's own Bold FILE, or setting explicit faux bold parameters,
+      still wins over the synthesized default. VISIBLE CHANGE this introduced: text
+      that used to be silently restyled into `Noto Sans Bold` now keeps the selected
+      typeface and is thickened synthetically instead.
+    - Residual, by construction: a family that DOES ship a Bold face keeps the real
+      face, and at weight 700 the weight-filtered fallback passes still cannot reach
+      the bundle's 400-weight fallback fonts — a rare-plane CJK character inside such a
+      bold run stays tofu. Pinned by
+      `font_base::the_rare_han_chain_is_reachable_at_the_shaped_weight`. Removing it
+      would need bold companions of the fallback fonts in `fonts/ui`; it cannot be
+      fixed in matching code.
+- FALLBACK DIAGNOSTIC (`fallback_diag.rs` -> `RenderedTextImage.font_fallbacks`) —
+  every render reports, as TYPED data and not as a `warnings` string, which
+  characters of THIS text were drawn by a font other than the caller's own and by
+  which family, plus which characters came out as `.notdef`. It is collected ONCE
+  in `pipeline::render_text_to_image`, immediately after
+  `Buffer::shape_until_scroll` and BEFORE the mode router, because every layout
+  mode (horizontal normal/rotated, vertical, formula/shape, custom raster/vector
+  lines) draws from that same shaped buffer; each mode's own image constructor
+  leaves the field `default()` and the router assigns it on the way out.
+  - The reference point is the set of FAMILY names the caller supplied — the
+    selected face plus every registered inline `<font=...>` face. Family-level, so
+    a real Bold/Italic of the same family in another FILE still counts as the
+    caller's font. A caller face with no family name, or a name no registered face
+    declares, silences the diagnostic entirely: without a reference point every
+    glyph would look like a fallback, and a wrong report is worse than none.
+  - HOT-PATH COST is the reason it is always on: resolving the expected face ids is
+    one pass over the ~50 base faces per render, and the per-glyph test is then one
+    `u16` compare plus a linear scan of 1-5 `fontdb::ID`s. NOTHING is allocated
+    until the first glyph fails it, so a text fully served by the selected font
+    returns two capacity-0 vectors. Do not move this into the per-glyph draw
+    passes and do not turn it into a `warnings` string — the UI needs the
+    structure (character, font), not prose to re-parse.
+  - `warnings` stays what it was: prose about DEGRADATIONS the renderer performed
+    (faux italic/bold substitution, unchanged layout text). A fallback is not a
+    degradation, which is exactly why it got its own typed field.
+  - `raster::trim_rendered_image_to_alpha_bounds` PROPAGATES the report: cropping
+    changes pixels, not which font drew which character.
 - FontSystem pool (`font_system_pool.rs`): `render_text_to_image` wraps its whole
   body in `with_leased_font_system`, which leases a reusable `FontSystem` + its
   `FontFaceCache` from a process-global pool instead of building a fresh
-  `FontSystem` per render (the fresh build ran a full system-font scan every
-  call). The pool must preserve BYTE-IDENTICAL output across reuse: font loads go
+  `FontSystem` per render (the fresh build re-read and re-parsed the whole font
+  base every call). The pool must preserve BYTE-IDENTICAL output across reuse: font loads go
   through `FontFaceCache` (keyed by content id), so a reused system reuses the
   already-loaded faces instead of re-registering duplicates, and default families
   are set every render for deterministic matching. Two determinism guards keep a
   reused system byte-identical to a fresh one:
   - Pristine default restoration: `FontFaceCache::for_system` captures the fresh
     system's five generic default-family names (sans-serif/serif/monospace/
-    cursive/fantasy) once at creation. `font_registry::apply_default_families`
+    cursive/fantasy) once at creation — on the bundled base all five are seeded
+    with the FIRST core face, so they always name a font that exists.
+    `font_registry::apply_default_families`
     installs the selected face's family as all five defaults when it HAS a family
     name, and RESTORES the captured pristine names when it does NOT — so a
     no-family face never inherits a prior render's family from the reused db.
@@ -160,10 +373,13 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
     and `return_to_pool`/`should_requeue` DROP a tainted system so it can never
     serve a future render. Documented residual: the single render that first
     triggers the collision may still mis-match before the system is dropped (rare,
-    self-healing). Stale colliding faces are NOT removed even though fontdb
-    exposes `remove_face`, because both colliding files may be used together as
-    inline fonts in one render, so removing one file's faces could break that
-    file's own text; taint-drop is the safe bound.
+    self-healing). A CALLER-vs-CALLER collision is NOT resolved by removing faces even
+    though fontdb exposes `remove_face`, because both colliding files may be used
+    together as inline fonts in one render, so removing one file's faces could break
+    that file's own text; taint-drop is the safe bound. A CALLER-vs-BUNDLE collision
+    IS resolved by removal (see SELECTED FONT WINS above) — the caller's font must
+    win — and taints the system for the same reason: its database no longer equals the
+    base.
   Growth is bounded — a leased system is dropped instead of requeued once its
   cache exceeds `MAX_CACHED_FILES` or the pool holds `MAX_POOLED_SYSTEMS`. The
   renderer must not panic while a system is leased (a panic leaks that one system;
@@ -308,9 +524,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   Why it must be the selected face and not a hardcoded 400/upright: the app lists
   a family's Regular/Bold/Light FILES as separate selectable entries, cosmic-text
   matches weight EXACTLY (and abandons the family when nothing matches), and the
-  pooled `FontSystem` carries the whole SYSTEM font database while the
+  pooled `FontSystem` carries the whole bundled `fonts/ui` base while the
   `FontProvider` registers only the selected file — so any deviation from the
-  selected face's attrs can silently select a foreign font. A face with no
+  selected face's attrs can silently select a bundled fallback font. A face with no
   declared weight/style falls back to `Weight::NORMAL`/`Style::Normal`, so a
   Regular selected face is byte-identical to the historical hardcoded reset.
   RESOLUTION ORDER in `apply_inline_style_to_attrs` is BASELINE FIRST, then the
@@ -323,14 +539,13 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `style` unconditionally and SWALLOW a real bold/italic on the same span, so
   `<b><font=X>..</font></b>` rendered with no bold at all. An inline face that
   declares no weight/style leaves both attrs and the baseline untouched.
-  KNOWN LIMITATION (same hazard class as that bug, unfixed): a real `<b>`/`<i>`
-  on an inline font whose FILE has no such face still deviates from the invariant
-  by construction. cosmic-text treats weight as a ranking key but `style` as an
-  exact `Attrs::matches` filter, so a real-italic request on an upright-only
-  inline font empties the match set and shaping falls through to a foreign
-  fallback font (a real-bold request degrades more gracefully — it ranks down to
-  the nearest available weight of the same family). Selecting a family whose
-  Bold/Italic files are present in the system db is the current mitigation.
+  A real `<b>`/`<i>` on an inline font whose FILE has no such face would deviate from
+  the invariant by construction, so BOTH halves are degraded before the shaper sees
+  them (see the UNSERVICEABLE-ATTRS GUARD above): the span is rewritten into a faux
+  `<i>` / faux `<b>` span, with a warning, so it renders as the inline font sheared or
+  thickened instead of as tofu, a panic, or a jump into `Noto Sans Bold`. Loading the
+  family's own Bold/Italic FILE, or using the explicit faux `<b=...>`/`<i=...>` forms,
+  still wins over the synthesized defaults.
 - `TextRenderParams.extra_info` (`RenderExtraInfoRequest`) selects which optional
   "extra render info" items the renderer computes alongside the pixels — today the
   MEAN center (area centroid of the convex hull of all included glyphs'
@@ -404,6 +619,11 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 
 ## External Dependencies
 - `cosmic-text` provides font database, shaping, layout runs, and swash cache access.
+- `ms-fonts` owns the bundled `fonts/ui` stack (paths, `NN-` order, family names,
+  `'static` bytes) that `font_base.rs` turns into the render database. The renderer
+  never resolves that directory itself.
+- `unicode-script` supplies the `Script` type of the `cosmic_text::Fallback` trait;
+  cosmic-text does not re-export it, so it is a direct dependency.
 - `hyphenation` provides the embedded per-language hyphenation dictionaries; the
   language is chosen by `ms_text_util::language::text_language`, and break
   boundary rules come from `ms_text_util::segmentation::rules` (group-dispatched).
@@ -413,6 +633,31 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   a JSON string through `TextRenderParams.effects_json`.
 
 ## Editing map
+- To change which fonts back a render, the script -> font chains, or the forbidden
+  list, edit `font_base.rs` only. Adding a font to the bundle is a `fonts/ui`
+  change, not a code change; naming its family in `SCRIPT_FAMILIES` is the optional
+  follow-up that makes the choice precise — optional EXCEPT for a font that is also
+  added to `FORBIDDEN_FAMILIES`, where the entries are the only thing that keeps its
+  exclusive coverage reachable. Run
+  `every_forbidden_only_codepoint_is_reachable_through_a_script_chain` after any such
+  change: it re-derives the answer from the shipped `cmap` tables.
+- To change what the fallback diagnostic reports (what counts as "the caller's
+  font", how facts are aggregated, which characters are skipped), edit
+  `fallback_diag.rs`. To change WHERE it is collected, edit the single call in
+  `pipeline::render_text_to_image` right after `shape_until_scroll` — not the
+  per-mode draw passes. To change how it is SHOWN, edit
+  `src/tabs/typing/panel/create_presets.rs` (`font_fallback_status_lines`).
+- To change WHICH attrs modifications are legal, edit the predicates
+  `font_registry::family_has_matching_face` (style/stretch) and
+  `font_registry::family_has_face_of_requested_weight` (weight). To change how an
+  illegal one degrades (today: real italic -> faux italic at
+  `SYNTHESIZED_ITALIC_SLANT_DEG`, real bold -> faux bold at
+  `FauxBoldParams::default()`), edit `pipeline::synthesized_italic_slant_deg` /
+  `pipeline::synthesized_bold_params` (whole overlay) and
+  `pipeline::degrade_unavailable_inline_italic` /
+  `pipeline::degrade_unavailable_inline_bold` (inline spans). Any NEW code that
+  writes `attrs.style(..)`/`attrs.stretch(..)`/`attrs.weight(..)` with a value it did
+  not read off a registered face must go through the matching predicate first.
 - To change caller-visible render parameters or result shape, start in `types.rs`, then
   update `mod.rs` smoke anchors and parent typing serialization/parsing.
 - To change the mean/median extra-info math (hull centroid, median, degenerate
@@ -507,6 +752,17 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - Keep tests close to the helper or subsystem they protect. This module already has
   local unit tests for wrapping, hyphenation, inline styles, formula parser/evaluator,
   raster helpers, effects math, vertical layout, and render routing.
+- Anything asserting FONT BASE behaviour must go through `font_base::test_bundle`
+  (test-only). A cargo test binary runs with its package root as the working
+  directory, so `ms_fonts::stack()` never resolves the repository bundle and a test
+  built on `new_render_font_system()` silently measures an EMPTY database — that is
+  how "the base holds exactly the bundle" once compared 0 with 0. `test_bundle`
+  addresses `fonts/ui` through `CARGO_MANIFEST_DIR` and feeds it through the very
+  builders production uses (`build_base_database`, `build_fallback_tables`,
+  `MsFallback`), and `test_bundle::shaped_glyphs` reports `(glyph_id, family)` per
+  glyph so a reachability test can tell "drawn by font X" from `.notdef` tofu. Keep
+  the production-constructor assertion next to it where it still proves something
+  (an empty database proves nothing scanned the OS fonts).
 - Add golden or property-style tests for new layout contracts where exact pixels are
   fragile. Use explicit tolerances for floating-point geometry and alpha math.
 - After Rust changes, run `cargo check-all` and

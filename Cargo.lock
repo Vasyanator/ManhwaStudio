@@ -3336,6 +3336,7 @@ dependencies = [
  "libloading 0.8.9",
  "minijinja",
  "ms-actions",
+ "ms-fonts",
  "ms-gifs",
  "ms-i18n",
  "ms-log",
@@ -3506,6 +3507,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-fonts"
+version = "0.1.0"
+dependencies = [
+ "ms-log",
+ "tempfile",
+ "ttf-parser 0.25.1",
+]
+
+[[package]]
 name = "ms-gifs"
 version = "0.1.0"
 dependencies = [
@@ -3556,11 +3566,13 @@ dependencies = [
  "cosmic-text",
  "hyphenation",
  "image 0.25.10",
+ "ms-fonts",
  "ms-log",
  "ms-text-util",
  "rayon",
  "serde_json",
  "swash",
+ "unicode-script",
  "web-time",
  "zeno",
 ]

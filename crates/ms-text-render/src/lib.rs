@@ -22,6 +22,8 @@ Public surface:
 pub mod drawn_lines;
 mod effects;
 mod extra_info;
+mod fallback_diag;
+mod font_base;
 mod font_provider;
 mod font_registry;
 mod font_system_pool;
@@ -47,20 +49,27 @@ pub use wrap::forms;
 // (владелец — pooled `FontSystem`); внешние вызовы с одноразовой `FontSystem`
 // создают одноразовый `FontFaceCache::new()`.
 pub use font_registry::{
-    load_font_content, load_selected_font_from_path, resolve_font_family_name,
-    resolve_font_postscript_name,
+    family_has_face_of_requested_weight, family_has_matching_face, load_font_content,
+    load_selected_font_from_path, resolve_font_family_name, resolve_font_postscript_name,
 };
 pub use font_system_pool::FontFaceCache;
 
 // Caller-supplied font source: fonts reach the render path by working name
 // through a `FontProvider`; the renderer never touches the filesystem itself.
 // The path-based `load_selected_font_from_path` above is a thin compat wrapper.
-pub use font_provider::{FontContent, FontContentSet, FontProvider, font_content_id};
+pub use font_provider::{FontBytes, FontContent, FontContentSet, FontProvider, font_content_id};
 
 // Прогрев пула `FontSystem` из фонового потока: приложение вызывает
 // `ms_text_render::prewarm_font_system_pool()`, чтобы первый пользовательский
-// рендер не платил за системное сканирование шрифтов.
+// рендер не платил за сборку бандловой базы шрифтов (`font_base.rs`: резолв
+// `fonts/ui` + чтение резидентных уровней). Системные шрифты ОС не сканируются.
 pub use font_system_pool::prewarm_font_system_pool;
+
+// Конструктор `FontSystem` над бандловой базой (`font_base.rs`). Публичен только
+// ради внешних render-харнессов (`src/bin/text_render_test`), чтобы они шейпили
+// на той же детерминированной базе, что и продакшен, а не на шрифтах ОС.
+// Продакшен-рендер обязан брать систему из пула (`with_leased_font_system`).
+pub use font_base::new_render_font_system;
 
 type RenderNextCancel<'a> = Option<(&'a std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>;
 
@@ -84,6 +93,8 @@ const _: usize = std::mem::size_of::<types::TextRenderParams>()
     + std::mem::size_of::<types::FauxBoldParams>()
     + std::mem::size_of::<types::RenderExtraInfoRequest>()
     + std::mem::size_of::<types::RenderedTextExtraInfo>()
+    + std::mem::size_of::<types::FontFallbackReport>()
+    + std::mem::size_of::<types::FontFallbackUse>()
     + types::TEXT_FORMULA_USER_VAR_COUNT;
 
 const _: fn(&types::TextRenderParams) -> Result<types::RenderedTextImage, String> =
@@ -266,6 +277,11 @@ pub fn touch_runtime_smoke_contract() {
     ));
     std::hint::black_box((image.width, image.height, &image.rgba, &image.warnings));
     std::hint::black_box((image.extra.mean_center, image.extra.median_center));
+    std::hint::black_box((
+        image.font_fallbacks.is_empty(),
+        image.font_fallbacks.fallbacks.len(),
+        image.font_fallbacks.missing.len(),
+    ));
     std::hint::black_box([
         types::RenderExtraInfoRequest::default(),
         types::RenderExtraInfoRequest {

@@ -231,6 +231,12 @@ impl TypingTextOverlayLayer {
                                         TypingOverlayKind::Image => t!("typing.layers.image_row_label").to_string(),
                                     };
                                     let selected = self.selected_overlay_idx == Some(ov_idx);
+                                    // The row carries a preview of the overlay's own
+                                    // chapter text, drawn with the UI font chain, so it
+                                    // needs the extended tier for the same reason the
+                                    // text field does. One call per assembled row label;
+                                    // cheap and idempotent (`ui_fonts::ensure_covers`).
+                                    crate::ui_fonts::ensure_covers(ui.ctx(), &label);
                                     ui.horizontal(|ui| {
                                         if ui.button("⬆").clicked() {
                                             move_row = Some((*row, true));

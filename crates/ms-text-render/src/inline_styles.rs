@@ -478,9 +478,10 @@ pub(crate) fn spans_have_attrs_overrides(spans: &[InlineStyleSpan]) -> bool {
 /// synthesizes its style geometrically, so it must resolve to exactly the same
 /// face as the surrounding non-forced text. cosmic-text matches weight EXACTLY
 /// and abandons a family when nothing matches, and the pooled `FontSystem`
-/// carries the whole system font database, so pinning anything other than the
-/// selected face's attrs can silently select a foreign font. Only a REAL
-/// bold/italic request may deviate from this baseline.
+/// carries the whole bundled `fonts/ui` base beside the selected file
+/// (`font_base.rs`), so pinning anything other than the selected face's attrs can
+/// silently select one of those fallback fonts. Only a REAL bold/italic request
+/// may deviate from this baseline.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FauxFaceBaseline {
     /// Weight of the selected face (`Weight::NORMAL` when it declares none).
@@ -1644,7 +1645,7 @@ mod tests {
         // entry in the font list, weight 700). A faux `<b=...>` span inside it
         // must keep 700 — hardcoding 400 would push the span off the selected
         // face, and cosmic-text matches weight EXACTLY, so it could silently
-        // resolve to a different file from the system font database.
+        // resolve to a different file of the render font base.
         let attrs = Attrs::new()
             .metrics(Metrics::new(20.0, 24.0))
             .weight(Weight(700));

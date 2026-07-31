@@ -39,7 +39,11 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-pub(crate) const BUBBLE_TEXT_FONT_FAMILY_NAME: &str = "canvas-bubble-unicode";
+/// egui family name of the wide-unicode chain used for bubble text.
+///
+/// The name is owned by `crate::ui_fonts`, which is the only place that registers fonts
+/// into this family; the canvas just reads it so both sides cannot drift apart.
+pub(crate) const BUBBLE_TEXT_FONT_FAMILY_NAME: &str = crate::ui_fonts::BUBBLE_TEXT_FAMILY_NAME;
 
 const TEXT_MEASURE_CACHE_ID: &str = "canvas_text_measure_cache";
 

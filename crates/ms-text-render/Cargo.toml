@@ -10,7 +10,16 @@ edition = "2024"
 web-time = "1"
 ms-log = { path = "../ms-log" }
 ms-text-util = { path = "../ms-text-util" }
+# The bundled `fonts/ui` stack: the renderer builds its own deterministic fontdb
+# base out of it instead of loading the operating system's fonts
+# (see src/font_base.rs and dev-docs/unicode_base_font_plan.md, decision 1).
+ms-fonts = { path = "../ms-fonts" }
 cosmic-text = "0.14"
+# `cosmic_text::Fallback` names writing systems with `unicode_script::Script` and
+# cosmic-text does not re-export the type, so it has to be a direct dependency.
+# Already in the tree at this version as cosmic-text's own dependency, so it adds
+# no build cost and pins nothing new.
+unicode-script = "0.5"
 swash = "0.2"
 zeno = "0.3"
 hyphenation = { version = "0.8", features = ["embed_all"] }

@@ -498,6 +498,7 @@ mod tests {
             content_origin_x: 0,
             content_origin_y: 0,
             extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
         }
     }
 
@@ -919,6 +920,7 @@ mod tests {
             content_origin_x: 0,
             content_origin_y: 0,
             extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
         };
         (img, bx0, bx1, by0, by1)
     }

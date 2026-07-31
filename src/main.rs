@@ -97,6 +97,9 @@ mod storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod studio_bootstrap;
 mod tabs;
+// Single owner of the UI font stack (`fonts/ui`): every `run_native` context installs the
+// same chain through it, so no window is left on the bare egui defaults.
+mod ui_fonts;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
 mod tools;
@@ -683,6 +686,7 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(MissingPythonEnvPromptApp {
                 output: output_for_app,
                 error_text: None,
@@ -1189,6 +1193,7 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(UpdateCheckApp::new(
                 local_version_for_ui.clone(),
                 Arc::clone(&out),
@@ -1390,6 +1395,16 @@ fn run_main_window(
     let return_to_launcher_flag = Arc::new(AtomicBool::new(false));
     let flag_for_app = Arc::clone(&return_to_launcher_flag);
 
+    // A title (and, historically, the chapter folder) may ship its own `fonts/ui` chain, so
+    // both are probed before the app directories. `ProjectPaths::title_dir` is the chapter's
+    // parent, resolved here because `project_dir` is moved into the loader below.
+    let font_roots: Vec<PathBuf> = project_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(std::iter::once(project_dir.clone()))
+        .collect();
+
     // Start the project load before the window opens; the bootstrap shell shows a loading
     // screen until the receiver yields, then constructs `MangaApp` in place.
     let load_rx =
@@ -1400,6 +1415,7 @@ fn run_main_window(
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ui_fonts::install_with_roots(&cc.egui_ctx, ui_fonts::Tier::Full, &font_roots);
             Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
                 load_rx,
                 user_settings.clone(),
@@ -1694,6 +1710,7 @@ fn pick_project_dir_from_basic_launcher_gui(
         chooser_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
             Ok(Box::new(BasicLauncherApp::new(
                 projects_root.clone(),
                 Arc::clone(&out),

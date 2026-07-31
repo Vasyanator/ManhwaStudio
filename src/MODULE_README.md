@@ -165,6 +165,22 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   unwritable `locale/` folder or a corrupt file is a logged, bounded degradation to the embedded/English
   catalog, never fatal (a corrupt file is left byte-for-byte intact). On wasm the module is compiled out
   and `web_entry.rs` installs the embedded catalog directly.
+- `ui_fonts.rs`: the single owner of the UI font stack. Installs the bundled `fonts/ui` chain
+  into an `egui::Context` from a worker thread, taking the manifest and the process-wide
+  `'static` bytes from `ms-fonts` (so epaint borrows one copy instead of keeping a second),
+  and owns the `BUBBLE_TEXT_FAMILY_NAME` / `UI_BOLD_FAMILY_NAME` family names plus the
+  system-font emergency fallback. Called exactly once per `run_native` constructor closure.
+  `Tier::Full` only ARMS the large `ext/` tier; `ensure_covers(ctx, text)` installs it on
+  the first character the chain cannot draw and is called from the canvas while a frame
+  runs (it reads `Context::fonts_mut`, so never from a loader or a worker thread); the
+  canvas bubble cards and the typing tab's user-text surfaces all offer it their strings.
+  The title-local `fonts/ui` override is resolved here and nowhere else — the `ms-fonts`
+  manifest stays project-independent so a project cannot change a finished render.
+  Override files come from an arbitrary opened project and are therefore UNTRUSTED: each
+  one is parsed and must yield a family name before it can be installed
+  (`validate_font_bytes`), because epaint parses every registered file eagerly and PANICS
+  on a failure it cannot recover from. A candidate whose core files all fail that check is
+  treated as an absent override and the bundled stack wins.
 - `bubble_status.rs`: configurable bubble status rules, condition evaluation, and border painting
   helpers.
 - `paste_image.rs`: clipboard/image paste helpers used by UI workflows.
@@ -244,6 +260,10 @@ prompts instead of blocking the GUI thread.
   not duplicated canvas state machines.
 - Errors should have user-facing status and diagnostic logging context without secrets or large data
   dumps.
+- Fonts are installed ONLY through `ui_fonts.rs`, and only with `egui::Context::add_font`.
+  `Context::set_fonts` replaces the whole definition set and would drop the families other
+  subsystems add at runtime (typing font previews/editors), which then panics in epaint;
+  `Context::fonts` panics before the first frame and must not be called from a loader.
 
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
@@ -329,6 +349,9 @@ prompts instead of blocking the GUI thread.
   launcher theme/state: `launcher/`.
 - Installer/update worker behavior, dependency setup, elevation, shortcuts, or uninstall:
   `installer/`.
+- UI fonts (which files a window loads, family names, fallback order, or a new `run_native`
+  entry point that needs fonts): `ui_fonts.rs` and `fonts/ui/MODULE_README.md`. Never
+  `Context::set_fonts` — see the contract note above.
 - Reusable UI controls: `widgets/`; keep them independent of durable project state.
 - Diagnostic binaries: `bin/`; keep production runtime dependencies in library modules instead of
   hiding behavior in test binaries.

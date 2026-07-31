@@ -31,6 +31,10 @@ impl TypingCreatePanelState {
         let imported_system_fonts = super::font_settings_store::imported_system_fonts();
         let imported_fonts_revision = super::font_settings_store::imported_fonts_revision();
         let mut fonts = load_fonts_from_dir(&fonts_dir);
+        // The bundled-stack entry belongs to the PANEL list only, and `load_fonts_from_dir`
+        // also serves the settings font-administration list, so it is injected here (and in
+        // `load_fonts` for the reload worker) rather than inside the loader.
+        prepend_bundled_ui_font(&mut fonts);
         // Inject the user-defined virtual font groups into the finalized (folder-only)
         // list. Members referencing an imported system font do not resolve yet — the
         // initial list holds only folder fonts — so they are skipped here; the group name
@@ -53,6 +57,14 @@ impl TypingCreatePanelState {
             t!("typing.preview.ready_status").to_string()
         };
         let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
+        // The built-in interface font heads the list for discoverability, but it must
+        // not become the DEFAULT font of a fresh panel: keep the historical default
+        // (the first of the user's OWN fonts), and fall back to index 0 — i.e. the
+        // built-in entry — only when the user has no fonts at all.
+        let default_font_idx = fonts
+            .iter()
+            .position(|font| font.bundled_stack_font().is_none())
+            .unwrap_or(0);
         let mut state = Self {
             fonts_dir,
             fonts,
@@ -77,7 +89,7 @@ impl TypingCreatePanelState {
             selected_formula_preset_name: None,
             formula_preset_name_input: String::new(),
             preview_enabled,
-            selected_font_idx: 0,
+            selected_font_idx: default_font_idx,
             selected_face_idx: 0,
             text: default_preview_text().to_string(),
             text_color: Color32::BLACK,
@@ -143,6 +155,7 @@ impl TypingCreatePanelState {
             render_in_flight: false,
             needs_initial_preview: true,
             status_line,
+            preview_font_fallbacks: FontFallbackReport::default(),
             preview_texture: None,
             preview_size: [1, 1],
             tracked_text_input_ids: Vec::new(),

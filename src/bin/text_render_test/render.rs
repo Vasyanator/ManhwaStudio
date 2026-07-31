@@ -9,7 +9,13 @@ FILE OVERVIEW: src/bin/text_render_test/render.rs
 - `TextShape`: профиль переносов (`Free/Rectangle/Oval/Hexagon`).
 
 Ключевые функции:
-- `render_text_to_image`: формирует layout текста и растрирует glyph в RGBA.
+- `render_text_to_image`: формирует layout текста и растрирует glyph в RGBA. `FontSystem`
+  берётся из `ms_text_render::new_render_font_system()` — та же детерминированная база
+  `fonts/ui`, что и в проде; `FontSystem::new()` (шрифты ОС) здесь запрещён. Запрос
+  настоящего курсива или настоящего жирного, который база обслужить не может,
+  возвращает видимую ошибку (`ms_text_render::family_has_matching_face` и
+  `ms_text_render::family_has_face_of_requested_weight` — те же два предиката, что
+  и в проде), а не тихо рисует прямое/чужое начертание.
 - `reshape_text_for_shape`: подготавливает переносы под формы `free/rectangle/oval/hexagon`.
 - `apply_effects_pipeline`: применяет эффекты из JSON по очереди (`stroke`, `shadow`, `glow_v1`, `glow_v2`, `gradient2`, `gradient4`, `reflect`, `shake`).
 - `register_selected_font`: регистрирует выбранный файл шрифта и фиксирует family/style/weight/stretch.
@@ -139,7 +145,13 @@ pub fn render_text_to_image(params: &TextRenderParams) -> Result<RenderedTextIma
             params.font_path.display()
         )
     })?;
-    let mut font_system = FontSystem::new();
+    // Build the SAME deterministic base production renders on (bundled `fonts/ui`
+    // + `MsFallback`), not `FontSystem::new()`. A fresh `FontSystem` loads the
+    // operator's installed fonts, so this diagnostic used to resolve missing
+    // glyphs — and a real `<i>`/bold request the selected file cannot serve —
+    // through faces production does not have, i.e. it showed a picture the app
+    // can never produce (`dev-docs/unicode_base_font_plan.md`, decision 1).
+    let mut font_system = ms_text_render::new_render_font_system();
     let selected_face =
         register_selected_font(&mut font_system, font_bytes, params.selected_face_index)
             .map_err(|err| format!("не удалось загрузить шрифт в fontdb: {err}"))?;
@@ -162,10 +174,53 @@ pub fn render_text_to_image(params: &TextRenderParams) -> Result<RenderedTextIma
     if let Some(stretch) = selected_face.stretch {
         attrs = attrs.stretch(stretch);
     }
+    // `Style::Italic` is a HARD `Attrs::matches` filter in cosmic-text, and the
+    // render base above ships only UPRIGHT faces. Asking for an italic no
+    // registered family can serve therefore does not degrade — it takes the
+    // selected font out of the run entirely (tofu, or an empty match set and the
+    // `shape.rs` "no default font found" panic). This diagnostic has no
+    // faux-italic synthesis of its own (the production renderer degrades to
+    // `faux_italic_slant_deg` instead), so the honest answer here is a visible
+    // error rather than a silently wrong picture.
+    let real_italic_available =
+        ms_text_render::family_has_matching_face(&font_system, &attrs.clone().style(Style::Italic));
+    let italic_unavailable_error = || {
+        format!(
+            "у шрифта {} нет курсивного начертания, а базовый набор рендера его не содержит: \
+             подключите файл Italic этого шрифта или уберите курсив",
+            params.font_path.display()
+        )
+    };
+    // The WEIGHT half of the same guard. Weight never empties the `Attrs::matches`
+    // set, but cosmic-text's primary pick requires `font_weight_diff == 0` and does
+    // not rank down inside the family, so `Weight::BOLD` on a family without a 700
+    // face silently jumps the run into whatever family HAS one (on the bundled base:
+    // `Noto Sans Bold`) and, because the weight-filtered fallback passes drop every
+    // 400-weight bundled font, turns rare glyphs of the same text into tofu. The
+    // production renderer degrades that request to faux bold; this diagnostic has no
+    // faux synthesis of its own, so — as with italic — it reports the problem instead
+    // of drawing a picture the app can never produce.
+    let real_bold_available = ms_text_render::family_has_face_of_requested_weight(
+        &font_system,
+        &attrs.clone().weight(Weight::BOLD),
+    );
+    let bold_unavailable_error = || {
+        format!(
+            "у шрифта {} нет жирного начертания, а базовый набор рендера его не содержит: \
+             подключите файл Bold этого шрифта или уберите жирный",
+            params.font_path.display()
+        )
+    };
     if params.force_bold {
+        if !real_bold_available {
+            return Err(bold_unavailable_error());
+        }
         attrs = attrs.weight(Weight::BOLD);
     }
     if params.force_italic {
+        if !real_italic_available {
+            return Err(italic_unavailable_error());
+        }
         attrs = attrs.style(Style::Italic);
     }
 
@@ -204,6 +259,15 @@ pub fn render_text_to_image(params: &TextRenderParams) -> Result<RenderedTextIma
     let justify_alignment = justify_alignment_option(params.align);
 
     if let Some(parsed) = parsed_inline_styles.as_ref() {
+        // Same guards as the whole-text ones above: a bare inline `<i>`/`<b>` is a
+        // REAL italic/bold request and hits the same empty-match-set and
+        // wrong-family hazards.
+        if !real_italic_available && parsed.spans.iter().any(|span| span.italic) {
+            return Err(italic_unavailable_error());
+        }
+        if !real_bold_available && parsed.spans.iter().any(|span| span.bold) {
+            return Err(bold_unavailable_error());
+        }
         if let Some(mapped_spans) = remap_inline_style_spans(
             parsed.plain_text.as_str(),
             layout_text.as_str(),

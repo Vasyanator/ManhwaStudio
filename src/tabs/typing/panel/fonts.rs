@@ -17,6 +17,9 @@ Main responsibilities:
   (real + virtual) combobox group list. MUST run after merge/disambiguation/identity.
 - `load_system_fonts` enumerates ALL OS-installed fonts; it is the catalog source
   for the settings font-import picker (`panel/font_settings.rs`), run off-thread.
+- offer the bundled `fonts/ui` stack as ONE selectable font of the PANEL list
+  (`BUNDLED_UI_FONT_IDENTITY`, `bundled_ui_font_entry`, `prepend_bundled_ui_font`);
+  see "Built-in interface font" in `MODULE_README.md` for the full contract.
 
 Notes:
 Extracted verbatim from panel.rs. Free fns are pub(super) so panel.rs can use
@@ -48,6 +51,103 @@ pub(super) fn default_font_identity_name(original_name: &str, label: &str) -> St
     }
 }
 
+/// Reserved render/inline-tag IDENTITY of the synthetic bundled `fonts/ui` entry.
+///
+/// It is persisted into projects (`font_label` / `font_original_name` /
+/// `TextRenderParams.font_name`) and emitted in `<font=...>` tags, so it MUST stay a
+/// fixed, non-localized ASCII string: a project saved under a Russian interface has
+/// to open identically under an English one. The human-readable name lives in the
+/// catalog instead (`typing.fonts.bundled_ui_font_label`, resolved by
+/// `FontEntry::display_label`) — see `dev-docs/i18n_exclusions.md`.
+///
+/// Collision policy: the synthetic entry is always the FIRST element of the panel
+/// font list and the FIRST key inserted into `TabFontProvider`, so a user font that
+/// claims this exact name is shadowed by it consistently in the panel AND in the
+/// renderer (never one but not the other). `prepend_bundled_ui_font` logs a warning
+/// when that happens.
+pub(in crate::tabs::typing) const BUNDLED_UI_FONT_IDENTITY: &str = "ManhwaStudio UI";
+
+/// Builds the synthetic panel entry for the bundled `fonts/ui` stack, or `None` when
+/// this process could not resolve the stack at all (then the option is simply not
+/// offered — nothing is faked).
+///
+/// The entry points at the FIRST `core` file of the stack, which is a real, readable
+/// font file. That is deliberate and is what keeps every per-entry consumer working
+/// without a special case: the own-typeface combo preview, the advanced-form width
+/// metric and the PSD export all read `FontEntry::path`. Selecting it makes the
+/// renderer use that file as the selected face, and the REST of the stack follows
+/// automatically through `MsFallback::common_fallback`
+/// (`dev-docs/unicode_base_font_plan.md`, layer 3) — there is no "font chain" type,
+/// because `FontContent` carries the bytes of exactly one file.
+///
+/// `original_name` is the reserved identity rather than the core font's real family
+/// name ("Noto Sans"). If it were the family name, a build WITHOUT this feature would
+/// silently resolve the overlay to whatever "Noto Sans" it finds in the user's own
+/// font folder; with the reserved name it degrades to the normal "font not found"
+/// state instead.
+///
+/// Blocking I/O on first use: `ms_fonts::stack()` reads the `name` table of each
+/// bundled file (kilobytes each). It is normally already resolved by `ui_fonts` at
+/// startup, and the surrounding panel font loading reads whole font files anyway.
+#[must_use]
+pub(super) fn bundled_ui_font_entry() -> Option<FontEntry> {
+    let core = ms_fonts::stack()?.core().first()?;
+    Some(FontEntry {
+        kind: FontEntryKind::BundledUiStack(core),
+        label: BUNDLED_UI_FONT_IDENTITY.to_string(),
+        path: core.path.clone(),
+        alt_paths: Vec::new(),
+        groups: vec![None],
+        disambig: None,
+        faces: default_single_face(),
+        // Reported as FULL on purpose: the classifier can only measure the ONE file
+        // an entry points at, but this entry stands for the whole bundled chain —
+        // core + bold + the ~44 `ext` fonts the renderer reaches through
+        // `MsFallback`, which together cover the overwhelming majority of assigned
+        // Unicode. Classifying the single core file would understate that and paint
+        // the option as `Partial` for languages the chain does serve.
+        coverage: FontLanguageCoverage::default(),
+        original_name: BUNDLED_UI_FONT_IDENTITY.to_string(),
+        display_name: None,
+        identity_name: BUNDLED_UI_FONT_IDENTITY.to_string(),
+        virtual_group_aliases: BTreeMap::new(),
+    })
+}
+
+/// Prepends the synthetic bundled-stack entry to a FINALIZED panel font list.
+///
+/// Must run AFTER `assign_font_identity_names` (the reserved identity is fixed and
+/// must not be recomputed) and AFTER any sorting: position 0 is a contract, not
+/// cosmetics. Both the panel's ordered name lookup
+/// (`create_state::find_font_idx_by_label_norm`) and `TabFontProvider::from_fonts`
+/// are FIRST-wins over the list order, so being first is what guarantees that a user
+/// font claiming the reserved name loses in BOTH places rather than in only one.
+///
+/// A process without a resolvable `fonts/ui` stack simply does not get the entry
+/// (logged once per reload); the panel keeps working with the user's own fonts.
+pub(super) fn prepend_bundled_ui_font(entries: &mut Vec<FontEntry>) {
+    let Some(entry) = bundled_ui_font_entry() else {
+        crate::runtime_log::log_warn(
+            "typing fonts: the bundled fonts/ui stack is unavailable, so the built-in interface \
+             font is not offered in the font list",
+        );
+        return;
+    };
+    let reserved = BUNDLED_UI_FONT_IDENTITY.trim().to_ascii_lowercase();
+    for font in entries.iter() {
+        if font_matches_label(font, &reserved) {
+            crate::runtime_log::log_warn(format!(
+                "typing fonts: '{}' ({}) claims the reserved name of the built-in interface \
+                 font; the built-in entry keeps the name in both the panel and the renderer, \
+                 and that font stays reachable by its other forms only.",
+                font.label,
+                font.path.display()
+            ));
+        }
+    }
+    entries.insert(0, entry);
+}
+
 /// Computes the COLLISION-AWARE render/inline-tag identity of every font in a
 /// FINALIZED panel list and writes it into `FontEntry.identity_name`.
 ///
@@ -63,10 +163,19 @@ pub(super) fn default_font_identity_name(original_name: &str, label: &str) -> St
 /// stable persisted identity must never be synthesized) and a warning is logged so the
 /// residual ambiguity is diagnosable. Idempotent: recomputes purely from
 /// `original_name`/`label`, so calling it again on an already-assigned list is a no-op.
+///
+/// The synthetic bundled-stack entry is skipped ENTIRELY — it neither receives an
+/// identity here (its reserved one is fixed, `BUNDLED_UI_FONT_IDENTITY`) nor counts
+/// towards a family collision (otherwise its presence alone would flip the identity
+/// of a user's own copy of a bundled family from the family name to a file stem,
+/// changing what newly saved overlays persist).
 pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
     // Count fonts per normalized family name to detect shared families.
     let mut family_counts: HashMap<String, usize> = HashMap::new();
     for font in fonts.iter() {
+        if font.bundled_stack_font().is_some() {
+            continue;
+        }
         let family = font.original_name.trim().to_lowercase();
         if !family.is_empty() {
             *family_counts.entry(family).or_insert(0) += 1;
@@ -77,6 +186,9 @@ pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
     // (two files sharing both family and label) can be warned about exactly once.
     let mut labels_by_shared_family: HashMap<String, HashMap<String, usize>> = HashMap::new();
     for font in fonts.iter() {
+        if font.bundled_stack_font().is_some() {
+            continue;
+        }
         let family = font.original_name.trim().to_lowercase();
         if family.is_empty() || family_counts.get(&family).copied().unwrap_or(0) <= 1 {
             continue;
@@ -101,6 +213,10 @@ pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
     }
 
     for font in fonts.iter_mut() {
+        if font.bundled_stack_font().is_some() {
+            // Reserved identity: fixed at construction, never recomputed.
+            continue;
+        }
         let family = font.original_name.trim().to_lowercase();
         font.identity_name = if family.is_empty() {
             // No usable family name: the file-stem label is the only identity.
@@ -145,6 +261,11 @@ pub(in crate::tabs::typing) fn resolve_fonts_dir() -> PathBuf {
 /// imported copy of an already-present font is not listed twice. The merged list is
 /// sorted case-insensitively by label. An empty `imported_system_paths` yields the sorted
 /// folder fonts only.
+///
+/// The synthetic bundled-stack entry is prepended LAST (see
+/// `prepend_bundled_ui_font`), so it stays at index 0 regardless of the sort. This is
+/// a PANEL list; the settings font-administration list (`font_admin`) deliberately
+/// does not get the entry — there is nothing to administer about it.
 pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) -> Vec<FontEntry> {
     let mut entries = load_fonts_from_dir(fonts_dir);
 
@@ -164,6 +285,7 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
     // family name may collide with an imported system font's, so identity must be
     // resolved after the merge, not on the folder-only subset.
     assign_font_identity_names(&mut entries);
+    prepend_bundled_ui_font(&mut entries);
     entries
 }
 
@@ -226,6 +348,7 @@ pub(in crate::tabs::typing) fn load_imported_system_fonts(paths: &[PathBuf]) -> 
         let display_name = display_name_override_for(&fonts_dir, path);
         let identity_name = default_font_identity_name(&original_name, &label);
         entries.push(FontEntry {
+            kind: FontEntryKind::File,
             label,
             path: path.clone(),
             alt_paths: Vec::new(),
@@ -333,6 +456,7 @@ pub(super) fn merge_duplicate_fonts(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
             }
         }
         entries.push(FontEntry {
+            kind: FontEntryKind::File,
             label,
             path,
             alt_paths,
@@ -661,6 +785,7 @@ pub(in crate::tabs::typing) fn load_system_fonts() -> Vec<FontEntry> {
         let display_name = display_name_override_for(&fonts_dir, &path);
         let identity_name = default_font_identity_name(&original_name, &label);
         entries.push(FontEntry {
+            kind: FontEntryKind::File,
             label,
             path,
             alt_paths: Vec::new(),

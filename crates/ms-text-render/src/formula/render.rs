@@ -756,6 +756,7 @@ fn render_text_with_drawn_lines_layout_once(
                 content_origin_x: 0,
                 content_origin_y: 0,
                 extra: crate::types::RenderedTextExtraInfo::default(),
+                font_fallbacks: crate::types::FontFallbackReport::default(),
             });
         }
         return Ok(RenderedTextImage {
@@ -770,6 +771,7 @@ fn render_text_with_drawn_lines_layout_once(
             content_origin_x: 0,
             content_origin_y: 0,
             extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
         });
     }
 
@@ -986,6 +988,9 @@ fn render_text_with_drawn_lines_layout_once(
         content_origin_x: 0,
         content_origin_y: 0,
         extra,
+        // Filled in by `pipeline::render_text_to_image`, which owns the shaped
+        // buffer this layout drew from.
+        font_fallbacks: crate::types::FontFallbackReport::default(),
     })
 }
 
@@ -2321,6 +2326,9 @@ fn render_text_with_formula_layout_once(
         content_origin_x: 0,
         content_origin_y: 0,
         extra,
+        // Filled in by `pipeline::render_text_to_image`, which owns the shaped
+        // buffer this layout drew from.
+        font_fallbacks: crate::types::FontFallbackReport::default(),
     })
 }
 

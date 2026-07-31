@@ -282,6 +282,13 @@ impl TypingTextOverlayLayer {
                             .clone()
                             .filter(|family| is_font_family_bound(ctx, family))
                             .unwrap_or(egui::FontFamily::Proportional);
+                        // The overlay-creation field is where a rare script normally
+                        // enters the app, and when the selected font is not (yet) bound
+                        // it is drawn with `Proportional`, which carries only the `core`
+                        // chain. Arm the extended tier from the assembled buffer so the
+                        // field does not show tofu for text the page renders correctly.
+                        // Cheap and idempotent — see `ui_fonts::ensure_covers`.
+                        crate::ui_fonts::ensure_covers(ctx, &editor.text);
                         let edit = egui::TextEdit::multiline(&mut editor.text)
                             .id(text_edit_id)
                             .font(egui::FontId::new(editor.font_size_px, family))

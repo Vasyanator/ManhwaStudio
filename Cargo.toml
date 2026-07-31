@@ -4,7 +4,7 @@ version = "3.6.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/puffin_egui"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/puffin_egui"]
 
 [features]
 active-logs = []
@@ -99,6 +99,11 @@ puffin_egui = { path = "crates/puffin_egui", optional = true }
 # a usable wasm32-unknown-unknown path with the current API usage; the web build
 # replaces them (fetch, IndexedDB, download) in the web-glue phase.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Owner of the bundled `fonts/ui` stack (manifest + process-wide `'static` bytes).
+# Native-only: it resolves the directory next to the executable and reads files from
+# disk, neither of which exists in a web build — `src/ui_fonts.rs` compiles to a no-op
+# there and the web entry point installs its own fonts.
+ms-fonts = { path = "crates/ms-fonts" }
 arboard = "3"
 libloading = "0.8"
 rfd = "0.15"

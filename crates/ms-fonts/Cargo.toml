@@ -1,0 +1,21 @@
+[package]
+name = "ms-fonts"
+version = "0.1.0"
+edition = "2024"
+
+# Owner of the bundled `fonts/ui` font stack: resolves the directory, describes every
+# file in it (order, tier, family name) and hands out font bytes that live for the whole
+# process. Deliberately free of egui AND cosmic-text: the text renderer (`ms-text-render`)
+# cannot depend on the binary crate, so the base both of them share has to be its own
+# crate. See dev-docs/unicode_base_font_plan.md.
+[dependencies]
+ms-log = { path = "../ms-log" }
+# Reads the family name out of the `name` table. Already in the workspace tree
+# (direct dependency of the binary, transitive through fontdb/epaint) and pinned to the
+# same 0.25 line, so it adds no build cost. Only `std` is needed here: the crate parses
+# one table and never touches outlines, layout or variations.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# On-disk fixtures for the byte store and the `name`-table reader.
+tempfile = "3"

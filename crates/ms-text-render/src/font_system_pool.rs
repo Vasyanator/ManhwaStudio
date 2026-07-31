@@ -3,12 +3,17 @@ File: crates/ms-text-render/src/font_system_pool.rs
 
 Purpose:
 Process-global checkout pool of reusable `cosmic_text::FontSystem` instances so
-that renders do not re-run the expensive system-font scan on every call.
+that renders do not rebuild the font database on every call.
+
+Every pooled system is built by `font_base::new_render_font_system`, i.e. over the
+bundled `fonts/ui` base with the deterministic `MsFallback` chain. The OS font
+database is NOT loaded (see `font_base.rs` and
+`dev-docs/unicode_base_font_plan.md`, decision 1).
 
 Why a pool and not a thread_local:
 Renders run on freshly spawned, short-lived worker threads (live-edit render,
 created overlays, preview tiles). A `thread_local!` `FontSystem` would be
-re-initialized (re-paying the system-font scan) on every new thread and give
+re-initialized (re-paying the database build) on every new thread and give
 almost no benefit on the hot live-edit path. A process-global pool survives
 across threads, so a `FontSystem` built once is leased by whichever thread
 renders next.
@@ -25,14 +30,16 @@ Main responsibilities:
 
 Key structures:
 - `FontFaceCache`: per-`FontSystem` map of already-loaded font content (keyed by
-  content id), plus the pristine default-family names captured at system creation
-  and a determinism taint flag.
+  content id), plus the pristine default-family names captured at system creation,
+  the face ids the system already held before this cache loaded anything (its
+  bundled base) and a determinism taint flag.
 - `PooledFontSystem`: a `FontSystem` bundled with its `FontFaceCache`.
 
 Determinism guards (renderer requires byte-identical output for identical params
 even on a reused pooled system):
-- Pristine default families: a fresh `FontSystem::new()` seeds fontdb generic
-  families (sans-serif/serif/monospace/cursive/fantasy). `FontFaceCache::for_system`
+- Pristine default families: a fresh render system seeds fontdb generic families
+  (sans-serif/serif/monospace/cursive/fantasy) with the FIRST core face of the
+  bundled base (`font_base::build_base_database`). `FontFaceCache::for_system`
   captures those names once so a render whose selected face has NO family name can
   RESTORE them instead of inheriting a prior render's family (see
   `font_registry::apply_default_families`).
@@ -43,6 +50,12 @@ even on a reused pooled system):
   `return_to_pool` DROPS a tainted system so it can never serve a future render.
   Documented residual: the single render that first triggers the collision may
   still mis-match before the system is dropped (rare, self-healing).
+- Displacement-and-drop: when the caller's font declares a family the BUNDLED base
+  also declares, the loader removes the bundled faces from that system's database so
+  the user's own file wins the match (`font_registry::displace_bundled_faces`). The
+  system then no longer holds the base it was built on, so it is tainted for the same
+  reason and dropped. `capture_preexisting_faces` is what tells the base apart from
+  faces earlier renders added.
 
 Notes:
 `FontSystem` is `Send` but not `Sync`; ownership is moved in/out of the pool
@@ -52,16 +65,27 @@ closure leaks that one system, which the pool simply recreates, and the renderer
 must not panic anyway.
 */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use cosmic_text::{FontSystem, fontdb};
 
+use super::font_base;
 use super::font_registry::RegisteredFontFace;
 
-/// Maximum number of distinct font contents a pooled `FontSystem` may accumulate
-/// before it is dropped instead of returned. Keeps a long-lived `FontSystem`
-/// from growing without bound as many different fonts are rendered.
+/// Maximum number of distinct CALLER font contents a pooled `FontSystem` may
+/// accumulate before it is dropped instead of returned. Keeps a long-lived
+/// `FontSystem` from growing without bound as many different fonts are rendered.
+///
+/// Re-verified after the move to the bundled font base (`font_base.rs`), and kept
+/// at 64: the counter measures only fonts registered through `FontFaceCache`, i.e.
+/// caller-supplied `Arc<Vec<u8>>` buffers that are FULLY RESIDENT for the life of
+/// the system — that is the memory this bound exists to cap, and the bundled base
+/// does not contribute to it. The base changed the OTHER two costs in the safe
+/// direction: per-system face metadata dropped from the OS database (thousands of
+/// faces) to ~50, and the bundled `ext` bytes are file MAPPINGS
+/// (`fontdb::Source::File`) whose pages the kernel shares between every pooled
+/// system, so they do not scale with the pool size the way resident buffers do.
 const MAX_CACHED_FILES: usize = 64;
 
 /// Maximum number of `FontSystem` instances kept warm in the free list. Extra
@@ -151,6 +175,10 @@ pub struct FontFaceCache {
     /// Generic default-family names captured at system creation. Empty for
     /// caches built with `new()` (throwaway systems); populated by `for_system`.
     pristine: PristineDefaultFamilies,
+    /// Face ids the owning `FontSystem` already held before this cache loaded
+    /// anything into it, i.e. the bundled base of that system. `None` until the
+    /// first load captures it.
+    preexisting: Option<HashSet<fontdb::ID>>,
     /// Set when a family-name collision between two distinct files is detected.
     /// A tainted system is dropped by `return_to_pool`, never reused.
     tainted: bool,
@@ -183,6 +211,34 @@ impl FontFaceCache {
     /// fresh-system defaults instead of a prior render's family.
     pub(crate) fn restore_pristine_defaults(&self, font_system: &mut FontSystem) {
         self.pristine.restore_into(font_system.db_mut());
+    }
+
+    /// Records, ONCE, which faces the owning system holds before this cache loads
+    /// anything into it — the bundled base that system was built on.
+    ///
+    /// Must be called before the first `load_font_source`, i.e. at the top of
+    /// `font_registry::load_font_content`; afterwards it is a no-op. The set is what
+    /// tells a BUNDLED face (which a caller font of the same family must displace)
+    /// from a face an earlier render of this same system registered (which it must
+    /// not: both files may be needed together as inline fonts, so that case is
+    /// handled by taint alone).
+    ///
+    /// Captured per system rather than read off the process-wide base, because
+    /// fontdb ids are database-local: the same id means different faces in the
+    /// pooled systems and in the typing panel's throwaway metric system.
+    pub(crate) fn capture_preexisting_faces(&mut self, font_system: &FontSystem) {
+        if self.preexisting.is_none() {
+            self.preexisting = Some(font_system.db().faces().map(|face| face.id).collect());
+        }
+    }
+
+    /// Whether `id` is one of the faces captured by `capture_preexisting_faces`.
+    /// Always `false` before the first capture, so nothing can be removed by mistake.
+    #[must_use]
+    pub(crate) fn is_preexisting_face(&self, id: fontdb::ID) -> bool {
+        self.preexisting
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&id))
     }
 
     /// Whether a family-name collision between two distinct files has tainted
@@ -275,15 +331,19 @@ struct PooledFontSystem {
 }
 
 impl PooledFontSystem {
-    /// Builds a fresh pooled system. Constructing `FontSystem::new()` runs the
-    /// system-font scan (the cost this pool exists to amortize) and keeps the
-    /// default-locale behavior identical to the previous per-render creation.
+    /// Builds a fresh pooled system over the deterministic bundled font base
+    /// (`font_base::new_render_font_system`), never over the OS font database.
+    ///
+    /// The first call in a process resolves the `fonts/ui` manifest and reads the
+    /// resident tiers (blocking I/O — see `prewarm_font_system_pool`); later calls
+    /// only clone the shared `fontdb::Database`, which copies `Arc`s and name
+    /// strings but no font bytes (`fontdb-0.16.2/src/lib.rs:151-159`).
     #[must_use]
     fn new() -> Self {
         // Build the system first, then capture its pristine default families so a
         // no-family render can restore fresh-system matching regardless of pool
         // history (see file header, determinism guards).
-        let system = FontSystem::new();
+        let system = font_base::new_render_font_system();
         let cache = FontFaceCache::for_system(&system);
         Self {
             system,
@@ -370,8 +430,10 @@ pub(crate) fn with_leased_font_system<R>(
 }
 
 /// Pre-builds one `FontSystem` and parks it in the pool so the first user render
-/// does not pay the system-font scan on the hot path.
+/// does not pay the bundled-base build on the hot path.
 ///
+/// That first build resolves the `fonts/ui` manifest and reads the resident tiers
+/// (~19 MB of blocking I/O), which is exactly why this must run off the GUI thread.
 /// Intended to be called once from a background thread at startup. Cheap to call
 /// again (it just leases and returns a system).
 pub fn prewarm_font_system_pool() {
@@ -382,7 +444,8 @@ pub fn prewarm_font_system_pool() {
 #[cfg(test)]
 mod tests {
     use super::{
-        FontFaceCache, checkout, return_to_pool, should_requeue, with_leased_font_system,
+        FontFaceCache, checkout, font_base, return_to_pool, should_requeue,
+        with_leased_font_system,
     };
     use crate::font_provider::{FontContent, font_content_id};
     use crate::font_registry::{load_font_content, load_selected_font_from_path};
@@ -403,7 +466,7 @@ mod tests {
         FontContent {
             name: "test-font".to_string(),
             original_name: "test-font".to_string(),
-            data: Arc::clone(bytes),
+            data: Arc::clone(bytes) as crate::font_provider::FontBytes,
             face_index: 0,
             content_id,
         }
@@ -422,7 +485,9 @@ mod tests {
             return;
         }
 
-        let mut system = cosmic_text::FontSystem::new();
+        // Built like production (bundled base, no OS font scan) so the dedup count
+        // is measured against the same database a real render sees.
+        let mut system = font_base::new_render_font_system();
         let mut cache = FontFaceCache::new();
 
         let first = load_selected_font_from_path(&mut system, &mut cache, &font_path, 0)
@@ -462,21 +527,64 @@ mod tests {
     }
 
     #[test]
-    fn leased_system_returns_to_pool() {
-        // Lease a system, mark it, and confirm a subsequent checkout can reuse a
+    fn leased_system_exposes_the_bundled_base_and_returns_to_pool() {
+        // Lease a system, touch it, and confirm a subsequent checkout can reuse a
         // pooled system (the pool is non-empty after the lease returns).
         let face_count = with_leased_font_system(|system, _cache| {
             // Touch the system so the closure genuinely uses the lease.
             system.db().len()
         });
-        assert!(
-            face_count >= 1,
-            "a leased FontSystem should expose its system font database"
+        // The leased database must be EXACTLY the bundled `fonts/ui` stack — never
+        // the operating system's fonts, which is what made renders machine
+        // dependent (`dev-docs/unicode_base_font_plan.md`, decision 1). When no
+        // stack is resolvable (a test binary's working directory is its package
+        // root) the deterministic answer is an empty database, not a system scan.
+        let expected = ms_fonts::stack().map_or(0, |stack| {
+            stack.core().len() + stack.bold().len() + stack.ext().len()
+        });
+        assert_eq!(
+            face_count, expected,
+            "a leased FontSystem must expose the bundled base and nothing else"
         );
         // After the lease, at least one system should be parked. Check out and
         // return it to confirm reuse works without panicking.
         let pooled = checkout();
         return_to_pool(pooled);
+
+        // The assert above is only a proof of the NEGATIVE (nothing scanned the OS),
+        // because a test binary cannot resolve the manifest. Measure the POSITIVE
+        // against the shipped bundle through the same constructor the pool uses,
+        // with the manifest addressed from `CARGO_MANIFEST_DIR`.
+        let Some(shipped) = font_base::test_bundle::stack() else {
+            eprintln!(
+                "skipping the bundle-backed half of \
+                 leased_system_exposes_the_bundled_base_and_returns_to_pool: fonts/ui is not \
+                 present next to this checkout"
+            );
+            return;
+        };
+        let system =
+            font_base::test_bundle::font_system().expect("the shipped stack was just resolved");
+        assert_eq!(
+            system.db().len(),
+            shipped.file_count(),
+            "a pooled system built over the shipped bundle must hold every bundled file"
+        );
+        // A pooled system captures its pristine defaults at creation; on the bundled
+        // base they must name a font that actually exists, not fontdb's "Arial".
+        let cache = FontFaceCache::for_system(&system);
+        let restored_from = cache
+            .pristine
+            .sans_serif
+            .clone()
+            .expect("the bundled base must seed a sans-serif default");
+        assert!(
+            system
+                .db()
+                .faces()
+                .any(|face| face.families.iter().any(|(name, _)| *name == restored_from)),
+            "the pristine default family '{restored_from}' must be a face of the bundle"
+        );
     }
 
     #[test]
@@ -523,7 +631,8 @@ mod tests {
             }
         };
 
-        let mut system = cosmic_text::FontSystem::new();
+        // Built like production (bundled base, no OS font scan).
+        let mut system = font_base::new_render_font_system();
         let mut cache = FontFaceCache::for_system(&system);
 
         // Distinct explicit content ids model two different (e.g. virtual) fonts.

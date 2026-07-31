@@ -139,6 +139,12 @@ pub(super) fn draw_on_top_for_page(
 
         let mut new_text = snapshot.text.clone();
         let mut new_original = snapshot.original_text.clone();
+        // Chapter text is the one place where a script outside the always-resident font
+        // chain can appear, so this is where the extended tier is pulled in. Both fields
+        // are checked: the widget below shows the translation, and the read-only variant
+        // falls back to the original. Cheap and idempotent — see `ui_fonts::ensure_covers`.
+        crate::ui_fonts::ensure_covers(ui.ctx(), &new_text);
+        crate::ui_fonts::ensure_covers(ui.ctx(), &new_original);
         // Single deferred command accumulated across all three context-menu closures below.
         // Only one menu is ever open at a time and each item closes the menu, so at most one
         // command is produced per frame; applied after the closures release their borrows.

@@ -91,6 +91,10 @@ FILE HEADER (tabs/typing/panel.rs)
     `assign_font_disambiguators` добавляет к имени название группы в скобках. Скобки
     показывает только `font_display_label` при выбранных «Все группы»; при конкретной
     группе имя без скобок.
+  - Нулевым пунктом списка идёт синтетический «Встроенный шрифт интерфейса»
+    (`FontEntryKind::BundledUiStack`) — бандловый стек `fonts/ui` как обычный выбираемый
+    шрифт. Единственный пункт с локализуемой ПОДПИСЬЮ и зарезервированной, НЕ
+    локализуемой идентичностью; полный контракт — в `panel/MODULE_README.md`.
 
 Module root note (EN):
 This file is the module root of the top panel. It keeps ALL struct/enum/const
@@ -117,8 +121,8 @@ use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_pa
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
-    AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, LinePlacementReference,
-    PxOrPercent, RenderExtraInfoRequest, RenderedTextImage,
+    AntiAliasingMode, FauxBoldParams, FontFallbackReport, HorizontalAlign, KerningMode,
+    LinePlacementReference, PxOrPercent, RenderExtraInfoRequest, RenderedTextImage,
     TEXT_FORMULA_USER_VAR_COUNT, parse_machine_tag,
     TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
     TextRenderParams, TextShape, TextVectorLine, TextVectorLineDistanceMode,
@@ -692,12 +696,33 @@ impl TypingActionsPanelTab {
     }
 }
 
+/// What a `FontEntry` stands for.
+///
+/// Almost every entry is a real font FILE. The one exception is the synthetic entry
+/// for the bundled `fonts/ui` stack (`dev-docs/unicode_base_font_plan.md`, phase 5):
+/// it is shown in the typing font combo as the "built-in interface font", points at
+/// the FIRST core file of the stack (so previews, the advanced-form metric and PSD
+/// export all have a real file to work with), and gets the rest of the stack behind
+/// it for free through the renderer's `common_fallback` chain.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tabs::typing) enum FontEntryKind {
+    /// A real font file: found in the project fonts dir or imported by the user.
+    File,
+    /// The synthetic bundled-stack entry, carrying the core font whose bytes
+    /// `ms-fonts` already holds resident for the whole process.
+    BundledUiStack(&'static ms_fonts::StackFont),
+}
+
 // Re-exported (type only) crate-wide via `crate::tabs::typing::font_admin`, so the
 // settings font-settings UI can hold it. The type is `pub(crate)` but its FIELDS stay
 // private to the typing subtree (external code cannot construct or mutate it); external
 // readers go through the `pub(crate)` accessors below.
 #[derive(Clone)]
 pub(crate) struct FontEntry {
+    /// Whether this is a real font file or the synthetic bundled-stack entry.
+    /// Governs the DISPLAY name (the bundled entry's is localized) and keeps the
+    /// bundled entry's reserved identity out of the collision-aware identity pass.
+    kind: FontEntryKind,
     /// Базовое отображаемое имя (имя файла без расширения), без скобок-уточнения.
     label: String,
     /// Представительный файл шрифта.
@@ -751,8 +776,26 @@ impl FontEntry {
     /// label and file-stem kept as legacy resolution aliases; a display override must
     /// never reach any of those resolution paths. `pub(crate)` so the settings
     /// font-settings UI (via `font_admin`) can present it.
+    ///
+    /// The bundled-stack entry is the one entry whose shown name is LOCALIZED: its
+    /// stored `label`/identity is a fixed reserved string (it is persisted into
+    /// projects and must never depend on the interface language), so the human name
+    /// is resolved here, at the presentation site, on every call.
     pub(crate) fn display_label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.label)
+        match self.kind {
+            FontEntryKind::BundledUiStack(_) => t!("typing.fonts.bundled_ui_font_label"),
+            FontEntryKind::File => self.display_name.as_deref().unwrap_or(&self.label),
+        }
+    }
+
+    /// The bundled `fonts/ui` stack font this entry stands for, or `None` for a real
+    /// font file. `TabFontProvider` uses it to hand the renderer the process-resident
+    /// `'static` bytes instead of reading the file a second time.
+    pub(in crate::tabs::typing) fn bundled_stack_font(&self) -> Option<&'static ms_fonts::StackFont> {
+        match self.kind {
+            FontEntryKind::BundledUiStack(font) => Some(font),
+            FontEntryKind::File => None,
+        }
     }
 
     /// Name to SHOW for this font WITHIN a given active font group.
@@ -1345,6 +1388,15 @@ struct TypingCreatePanelState {
     render_in_flight: bool,
     needs_initial_preview: bool,
     status_line: String,
+    /// Font diagnostic of the LAST COMPLETED preview render: which characters of
+    /// the current text the renderer's fallback chain drew instead of the selected
+    /// font, and which nothing could draw. Its lifetime mirrors `preview_texture` —
+    /// both describe the same finished render — so it is replaced on a successful
+    /// render and cleared when a render fails. Empty means "the selected font
+    /// served the whole text", which is also the state while no render has
+    /// completed yet. Answers a different question from `FontEntry.coverage`
+    /// (static per-font language support); see `panel/font_coverage.rs`.
+    preview_font_fallbacks: FontFallbackReport,
     preview_texture: Option<TextureHandle>,
     preview_size: [usize; 2],
     tracked_text_input_ids: Vec<Id>,
@@ -1420,6 +1472,12 @@ struct AdvancedFormCache {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct AdvancedFormMetricSignature {
     font_path: Option<String>,
+    /// The selection is the BUILT-IN interface font, whose metric database also carries
+    /// the rest of the bundled `core` chain (`create_advanced::register_bundled_core_fallback`).
+    /// Kept separate from `font_path` because the built-in entry points at a real file
+    /// (`core[0]`): a user who imported that very file would otherwise share this
+    /// signature while being measured with a different database.
+    bundled_ui_stack: bool,
     face_index: usize,
     force_bold: bool,
     force_italic: bool,

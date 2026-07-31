@@ -417,6 +417,17 @@ saving, and export.
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask
   flood fill, export, or auto-typing detection. Use worker threads and poll receivers
   from the frame loop.
+- **Every surface of this tab that shows CHAPTER TEXT with an egui font must offer that
+  string to `ui_fonts::ensure_covers` first.** The UI chain only carries `fonts/ui/core`
+  until something asks for more, so a rare script (Arabic, Thai, Hebrew, …) renders as tofu
+  in the panel while the rendered page — which uses the renderer's own fallback chain — is
+  correct. One call per surface, where the string is already assembled:
+  `tab/create_upload.rs::draw_text_editor` (the overlay-creation field),
+  `panel/create_advanced.rs::draw_text_accordion` (the source/formed editor, on whichever
+  buffer the accordion is showing) and `tab/panels.rs::draw_layers_tab_body` (the per-row
+  text preview). The create-preview panel needs no call: it shows a rendered IMAGE, not
+  egui text. The call is idempotent, must run on the GUI thread inside a frame, and does its
+  work on a worker thread — see `src/ui_fonts.rs`.
 - **Text-layer EDIT writes are DEFERRED; STRUCTURAL writes stay EAGER.** An edit (placement, geometry,
   mask-clip toggle, render-data) only calls `mark_placement_save_dirty` (`tab/persist.rs`), which
   writes nothing. The write happens at a FLUSH POINT. This is what stops a drag from spawning a save

@@ -35,6 +35,16 @@ Notes:
   shared `glyph_blit` helpers; the layout math, bounds/canvas assembly and
   inline-color contract are unchanged, and color glyphs keep the `raster.rs` bitmap
   blit;
+- an attrs modification the registered fonts cannot serve is degraded BEFORE the
+  shaper sees it: `synthesized_italic_slant_deg` / `synthesized_bold_params` rewrite
+  a whole-overlay real italic/bold into the faux form on ONE params copy, and
+  `degrade_unavailable_inline_italic` / `degrade_unavailable_inline_bold` do the same
+  per inline `<i>`/`<b>` span in place. Italic is gated by
+  `font_registry::family_has_matching_face` (style is a hard match filter), bold by
+  `font_registry::family_has_face_of_requested_weight` (an exact weight is what the
+  primary pick and every weight-filtered fallback pass require). All four warn (log +
+  returned `warnings`); see the UNSERVICEABLE-ATTRS GUARD contract in
+  `MODULE_README.md`;
 - `smoke_render_text_to_image` оставлен как бездисковая заглушка для runtime smoke-anchor;
 - основной источник поведения: `render_text_to_image`, `reshape_text_for_shape`,
   `build_vertical_layout_text`, `render_vertical_text`, `render_text_with_formula_layout`,
@@ -43,12 +53,17 @@ Notes:
   `src/tabs/typing/render.rs`.
 */
 
+use ms_log::runtime_log;
 use ms_log::trace::cat;
 
 use super::effects::{apply_effects_pipeline, apply_text_preprocess_effects};
 use super::extra_info::ExtraInfoAccumulator;
+use super::fallback_diag::collect_font_fallback_report;
 use super::font_provider::FontProvider;
-use super::font_registry::{build_inline_font_registry, load_font_content};
+use super::font_registry::{
+    InlineFontRegistry, build_inline_font_registry, family_has_face_of_requested_weight,
+    family_has_matching_face, load_font_content,
+};
 use super::font_system_pool::with_leased_font_system;
 use super::formula::{
     FormulaRenderOutcome, FormulaRenderRequest, render_text_with_drawn_lines_layout,
@@ -80,8 +95,9 @@ use super::vector::{
     faux_key_bits, glyph_contour_from_outline, rasterize_outline_into,
 };
 use super::types::{
-    FauxBoldParams, HorizontalAlign, KerningMode, RenderedTextExtraInfo, RenderedTextImage,
-    TextLayoutMode, TextLineMode, TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
+    FauxBoldParams, FontFallbackReport, HorizontalAlign, KerningMode, RenderedTextExtraInfo,
+    RenderedTextImage, TextLayoutMode, TextLineMode, TextRenderParams,
+    TextRenderShapeCompareParams, TextWrapMode,
 };
 use super::wrap::{
     HyphenationDictionaries, LayoutTextResult, ShapeWrapRequest, VerticalWrapRequest,
@@ -334,6 +350,8 @@ pub fn apply_effects_to_image(
         content_origin_y: 0,
         // Arbitrary-image effects reuse has no glyph layout to sample from.
         extra: RenderedTextExtraInfo::default(),
+        // No text was shaped here, so there is nothing to diagnose.
+        font_fallbacks: FontFallbackReport::default(),
     };
 
     if !effects_json.trim().is_empty() {
@@ -431,6 +449,68 @@ pub fn render_text_to_image(
     // SELECTED face's own weight/style, not to a hardcoded 400/upright which
     // could match a different file of the same family (or nothing at all).
     let faux_face_baseline = FauxFaceBaseline::from_registered_face(&selected_face);
+
+    // A REAL italic request the selected family cannot serve must NOT reach the
+    // shaper: `Style::Italic` is a hard `Attrs::matches` filter, so it would drop
+    // the caller's font out of the run entirely (tofu from the bundled emoji
+    // face, or an empty match set and cosmic-text's `expect` panic). Degrade it
+    // to the faux italic the renderer already implements, ONCE, by rewriting the
+    // params — every downstream consumer (attrs, advances, bounds pads, all
+    // layout modes) then follows the faux path on its own.
+    //
+    // A REAL bold request is degraded on the same principle, for a different reason:
+    // `Weight` is a ranking key, so it cannot empty the match set, but cosmic-text's
+    // primary pick requires an EXACT weight match and does not rank down inside the
+    // family — so a bold request on a family without a Bold file silently jumps to
+    // another typeface AND puts the whole run out of reach of every weight-filtered
+    // fallback pass (see `font_registry::family_has_face_of_requested_weight`).
+    let synthesized_italic = synthesized_italic_slant_deg(font_system, &attrs, params);
+    let synthesized_bold = synthesized_bold_params(font_system, &attrs, params);
+    let degraded_params;
+    let params = if synthesized_italic.is_some() || synthesized_bold.is_some() {
+        let mut degraded = params.clone();
+        if let Some(slant) = synthesized_italic {
+            runtime_log::log_warn(format!(
+                "[ms_text_render] real italic requested for font '{}' (family '{}'), but no italic \
+                 face of that family is registered and the bundled base ships none; synthesizing \
+                 faux italic at {slant:.1} deg instead. Load the family's Italic file, or set an \
+                 explicit faux slant, to control this.",
+                params.font_name,
+                selected_face.family_name.as_deref().unwrap_or("<none>")
+            ));
+            warnings.push(format!(
+                "у шрифта «{}» нет курсивного начертания — курсив нарисован синтетическим наклоном \
+                 {slant:.0}°; подключите файл Italic этого шрифта, чтобы использовать настоящий курсив",
+                params.font_name
+            ));
+            degraded.faux_italic_slant_deg = Some(slant);
+        }
+        if let Some(faux) = synthesized_bold {
+            runtime_log::log_warn(format!(
+                "[ms_text_render] real bold requested for font '{}' (family '{}'), but that family \
+                 has no face at weight {}; synthesizing faux bold ({}% of the em) instead. Keeping \
+                 the real request would draw the text in another typeface and would cut the run \
+                 off from the script fallback chains. Load the family's Bold file, or set explicit \
+                 faux bold parameters, to control this.",
+                params.font_name,
+                selected_face.family_name.as_deref().unwrap_or("<none>"),
+                cosmic_text::Weight::BOLD.0,
+                faux.thicken_percent,
+            ));
+            warnings.push(format!(
+                "у шрифта «{}» нет жирного начертания — жирность нарисована синтетическим \
+                 утолщением; подключите файл Bold этого шрифта, чтобы использовать настоящее \
+                 жирное начертание",
+                params.font_name
+            ));
+            degraded.faux_bold = Some(faux);
+        }
+        degraded_params = degraded;
+        &degraded_params
+    } else {
+        params
+    };
+
     // Faux bold/italic bypass: with faux params present the renderer must KEEP
     // the SELECTED face (no Bold/Italic font matching) and synthesize the style
     // geometrically at the glyph seam. Without faux params the legacy real-face
@@ -510,13 +590,15 @@ pub fn render_text_to_image(
                     content_origin_x: 0,
                     content_origin_y: 0,
                     extra: RenderedTextExtraInfo::default(),
+                    // Cancelled before shaping: no glyphs, nothing to diagnose.
+                    font_fallbacks: FontFallbackReport::default(),
                 });
             }
         }
     }
     let justify_alignment = justify_alignment_option(params.align);
 
-    let mapped_inline_style_spans = parsed_inline_styles.as_ref().and_then(|parsed| {
+    let mut mapped_inline_style_spans = parsed_inline_styles.as_ref().and_then(|parsed| {
         remap_inline_style_spans(
             parsed.plain_text.as_str(),
             layout_text.as_str(),
@@ -545,6 +627,54 @@ pub fn render_text_to_image(
         requested_inline_fonts.as_slice(),
     );
     warnings.extend(inline_font_registry_build.warnings);
+
+    // Same guard as the whole-overlay one above, but per span: an inline `<i>`
+    // resolves against its own `<font=...>` family, so it can be unserviceable
+    // even when the overlay's own font ships an italic face (and vice versa).
+    // Runs on the MAPPED spans, after the inline fonts are registered and before
+    // anything reads them, so attrs and per-glyph faux resolution stay in sync.
+    if let Some(spans) = mapped_inline_style_spans.as_mut() {
+        let degraded_spans = degrade_unavailable_inline_italic(
+            font_system,
+            &attrs,
+            &inline_font_registry_build.registry,
+            faux_face_baseline,
+            spans.as_mut_slice(),
+        );
+        if degraded_spans > 0 {
+            runtime_log::log_warn(format!(
+                "[ms_text_render] {degraded_spans} inline <i> span(s) requested a real italic no \
+                 registered font family can serve; synthesizing faux italic at \
+                 {SYNTHESIZED_ITALIC_SLANT_DEG:.1} deg for them"
+            ));
+            warnings.push(format!(
+                "курсивные вставки <i> нарисованы синтетическим наклоном \
+                 {SYNTHESIZED_ITALIC_SLANT_DEG:.0}°: у выбранного шрифта нет курсивного начертания"
+            ));
+        }
+
+        // Same per span for a real `<b>`: a family with no Bold face would take the
+        // whole span into the bundled bold tier (a different typeface) and out of the
+        // weight-filtered fallback chains.
+        let degraded_bold_spans = degrade_unavailable_inline_bold(
+            font_system,
+            &attrs,
+            &inline_font_registry_build.registry,
+            faux_face_baseline,
+            spans.as_mut_slice(),
+        );
+        if degraded_bold_spans > 0 {
+            runtime_log::log_warn(format!(
+                "[ms_text_render] {degraded_bold_spans} inline <b> span(s) requested a real bold \
+                 no registered font family can serve; synthesizing faux bold for them"
+            ));
+            warnings.push(
+                "жирные вставки <b> нарисованы синтетическим утолщением: у выбранного шрифта нет \
+                 жирного начертания"
+                    .to_string(),
+            );
+        }
+    }
 
     if let Some(mapped_spans) = mapped_inline_style_spans
         .as_deref()
@@ -586,6 +716,28 @@ pub fn render_text_to_image(
     apply_line_aligns_to_buffer(&mut buffer, inline_line_aligns.as_slice());
     buffer.shape_until_scroll(font_system, false);
 
+    // Post-shaping font diagnostic, collected ONCE here because every layout mode
+    // below (custom lines, formula/shape, vertical, horizontal rotated, horizontal
+    // normal) draws from THIS shaped buffer. The reference point is the set of
+    // families the CALLER supplied: the selected font plus every inline
+    // `<font=...>` font — a glyph drawn by any of them is "your font"; anything
+    // else came out of the deterministic fallback chain (`font_base.rs`).
+    let mut expected_families: Vec<&str> = Vec::new();
+    if let Some(family) = selected_face.family_name.as_deref() {
+        expected_families.push(family);
+    }
+    let inline_families = inline_font_registry_build
+        .registry
+        .values()
+        .filter_map(|face| face.family_name.as_deref());
+    for family in inline_families {
+        if !expected_families.contains(&family) {
+            expected_families.push(family);
+        }
+    }
+    let font_fallbacks =
+        collect_font_fallback_report(font_system, &buffer, expected_families.as_slice());
+
     if matches!(
         params.text_layout_mode,
         TextLayoutMode::CustomRasterLines | TextLayoutMode::CustomVectorLines
@@ -622,6 +774,7 @@ pub fn render_text_to_image(
         match custom_lines_result {
             FormulaRenderOutcome::Rendered(mut rendered) => {
                 rendered.warnings.extend(warnings);
+                rendered.font_fallbacks = font_fallbacks;
                 apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
                 return Ok(rendered);
             }
@@ -657,6 +810,7 @@ pub fn render_text_to_image(
         })? {
             FormulaRenderOutcome::Rendered(mut rendered) => {
                 rendered.warnings.extend(warnings);
+                rendered.font_fallbacks = font_fallbacks;
                 apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
                 return Ok(rendered);
             }
@@ -692,6 +846,7 @@ pub fn render_text_to_image(
             direction: params.vertical_line_direction,
         })?;
         rendered.warnings.extend(warnings);
+        rendered.font_fallbacks = font_fallbacks;
         apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
         return Ok(rendered);
     }
@@ -733,6 +888,7 @@ pub fn render_text_to_image(
             cancel,
         )?;
         rendered.warnings.extend(warnings);
+        rendered.font_fallbacks = font_fallbacks;
         apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
         rendered = trim_rendered_image_to_alpha_bounds(rendered, 1);
         return Ok(rendered);
@@ -1042,6 +1198,7 @@ pub fn render_text_to_image(
         content_origin_x: 0,
         content_origin_y: 0,
         extra,
+        font_fallbacks,
     };
     apply_effects_pipeline(&mut rendered, params.effects_json.as_str(), cancel)?;
     rendered = trim_rendered_image_to_alpha_bounds(rendered, 1);
@@ -1837,6 +1994,8 @@ fn render_horizontal_rotated(
         content_origin_x: 0,
         content_origin_y: 0,
         extra,
+        // Filled in by `render_text_to_image`, which owns the shaped buffer.
+        font_fallbacks: FontFallbackReport::default(),
     })
 }
 
@@ -2515,6 +2674,146 @@ impl FauxGlyphStyle {
     }
 }
 
+/// Slant (degrees) of the faux italic the renderer synthesizes when a REAL
+/// italic was asked for but no italic face of the selected family is registered.
+///
+/// 12° is the `post.italicAngle` the Italic companions of the fonts this project
+/// ships and tests against declare (Noto Sans Italic, Liberation Sans Italic), so
+/// the synthesized shear lands where the real face would have. It is a fallback
+/// default only: an explicit `faux_italic_slant_deg` (inline `<i=...>` or the
+/// panel value) always wins and never reaches this path.
+pub(crate) const SYNTHESIZED_ITALIC_SLANT_DEG: f32 = 12.0;
+
+/// The slant to synthesize when the whole-overlay REAL italic request cannot be
+/// served by the selected family, or `None` when nothing must change.
+///
+/// Returns `Some` only for a REAL italic request (`force_italic` WITHOUT an
+/// explicit faux slant) whose `Style::Italic` variant of `base_attrs` no longer
+/// selects the caller's own font — see [`family_has_matching_face`] for why that
+/// is a total-loss render rather than a graceful degradation. The caller applies
+/// the result by setting `faux_italic_slant_deg`, which turns the request into
+/// the faux path everywhere at once (attrs, advances, bounds pads, every layout
+/// mode) instead of patching one seam.
+#[must_use]
+fn synthesized_italic_slant_deg(
+    font_system: &FontSystem,
+    base_attrs: &Attrs<'_>,
+    params: &TextRenderParams,
+) -> Option<f32> {
+    if !params.force_italic || params.faux_italic_slant_deg.is_some() {
+        return None;
+    }
+    let italic_attrs = base_attrs.clone().style(cosmic_text::Style::Italic);
+    if family_has_matching_face(font_system, &italic_attrs) {
+        return None;
+    }
+    Some(SYNTHESIZED_ITALIC_SLANT_DEG)
+}
+
+/// Rewrites every REAL inline `<i>` span the registered fonts cannot serve into a
+/// FAUX italic span, in place, and reports how many spans were degraded.
+///
+/// The span-level analog of [`synthesized_italic_slant_deg`], and it must run on
+/// the MAPPED spans before they are used, because those same spans feed both the
+/// attrs (`apply_inline_style_to_attrs`) and the per-glyph faux resolution
+/// (`faux_italic_slant_at_offset`) on every layout mode — mutating them once here
+/// is what keeps the two consistent. A span carrying an explicit `<i=slant>` is
+/// already faux and is skipped; so is a span whose resolved family DOES ship an
+/// italic face (a real `<i>` on such a font keeps its real face).
+///
+/// The returned count is the degradation signal the caller turns into the log and
+/// user-visible warning; dropping it would make the fallback silent.
+#[must_use]
+fn degrade_unavailable_inline_italic(
+    font_system: &FontSystem,
+    base_attrs: &Attrs<'_>,
+    inline_font_registry: &InlineFontRegistry,
+    faux_face_baseline: FauxFaceBaseline,
+    spans: &mut [InlineStyleSpan],
+) -> usize {
+    let mut degraded = 0usize;
+    for span in spans.iter_mut() {
+        if !span.italic || span.faux_italic_slant_deg.is_some() {
+            continue;
+        }
+        // Resolve the span exactly as the shaper will (inline `<font=...>` family
+        // and stretch included), then ask whether that resolved face can be
+        // italic at all.
+        let span_attrs =
+            apply_inline_style_to_attrs(base_attrs, span, inline_font_registry, faux_face_baseline);
+        if family_has_matching_face(font_system, &span_attrs.as_attrs()) {
+            continue;
+        }
+        span.faux_italic_slant_deg = Some(SYNTHESIZED_ITALIC_SLANT_DEG);
+        degraded += 1;
+    }
+    degraded
+}
+
+/// The faux-bold parameters to synthesize when the whole-overlay REAL bold request
+/// cannot be served by the selected family, or `None` when nothing must change.
+///
+/// The weight analog of [`synthesized_italic_slant_deg`]. Returns `Some` only for a
+/// REAL bold request (`force_bold` WITHOUT explicit faux params) whose family ships no
+/// face at `Weight::BOLD` — see [`family_has_face_of_requested_weight`] for the two
+/// silent losses that request would otherwise cause (the run jumps to the bundled
+/// `Noto Sans Bold`, and every weight-filtered fallback pass becomes unreachable, so
+/// rare-plane CJK in the same run turns into tofu).
+///
+/// The synthesized strength is [`FauxBoldParams::default`], i.e. exactly the
+/// `<b=default>` inline tag, so the fallback has one documented meaning.
+#[must_use]
+fn synthesized_bold_params(
+    font_system: &FontSystem,
+    base_attrs: &Attrs<'_>,
+    params: &TextRenderParams,
+) -> Option<FauxBoldParams> {
+    if !params.force_bold || params.faux_bold.is_some() {
+        return None;
+    }
+    let bold_attrs = base_attrs.clone().weight(cosmic_text::Weight::BOLD);
+    if family_has_face_of_requested_weight(font_system, &bold_attrs) {
+        return None;
+    }
+    Some(FauxBoldParams::default())
+}
+
+/// Rewrites every REAL inline `<b>` span whose resolved family ships no bold face
+/// into a FAUX bold span, in place, and reports how many spans were degraded.
+///
+/// The span-level analog of [`synthesized_bold_params`], and the exact counterpart of
+/// [`degrade_unavailable_inline_italic`]: it must run on the MAPPED
+/// spans before anything reads them, because those spans feed both the attrs
+/// (`apply_inline_style_to_attrs`) and the per-glyph faux resolution
+/// (`faux_bold_params_at_offset`). A span carrying explicit `<b=...>` params is
+/// already faux and is skipped; so is a span whose resolved family DOES ship a bold
+/// face (a real `<b>` on such a font keeps its real face).
+#[must_use]
+fn degrade_unavailable_inline_bold(
+    font_system: &FontSystem,
+    base_attrs: &Attrs<'_>,
+    inline_font_registry: &InlineFontRegistry,
+    faux_face_baseline: FauxFaceBaseline,
+    spans: &mut [InlineStyleSpan],
+) -> usize {
+    let mut degraded = 0usize;
+    for span in spans.iter_mut() {
+        if !span.bold || span.faux_bold.is_some() {
+            continue;
+        }
+        // Resolve the span exactly as the shaper will (inline `<font=...>` family and
+        // its own weight included), then ask whether that family can be bold at all.
+        let span_attrs =
+            apply_inline_style_to_attrs(base_attrs, span, inline_font_registry, faux_face_baseline);
+        if family_has_face_of_requested_weight(font_system, &span_attrs.as_attrs()) {
+            continue;
+        }
+        span.faux_bold = Some(FauxBoldParams::default());
+        degraded += 1;
+    }
+    degraded
+}
+
 /// Whether the whole-overlay base attrs request the REAL Bold/Italic faces.
 ///
 /// The pair is `(bold, italic)`. Real face matching happens only when the
@@ -3191,7 +3490,9 @@ fn rotated_placement_extra_samples(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_effects_to_image, base_attrs_real_bold_italic};
+    use super::{
+        SYNTHESIZED_ITALIC_SLANT_DEG, apply_effects_to_image, base_attrs_real_bold_italic,
+    };
     use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
         AntiAliasingMode, FauxBoldParams, HorizontalAlign, KerningMode, RenderExtraInfoRequest,
@@ -5155,5 +5456,194 @@ mod tests {
         };
         let image = render_text_to_image(&params, None).expect("formula rotated render");
         assert_centers_in_bounds(&image);
+    }
+
+    /// REGRESSION (blocker): a REAL italic request — `force_italic` WITHOUT an
+    /// explicit faux slant — on a font that ships no italic face must render,
+    /// not panic.
+    ///
+    /// Before the guard this reached cosmic-text with `Style::Italic` in the
+    /// attrs. `Style` is a HARD `Attrs::matches` filter
+    /// (`cosmic-text-0.14.2/src/attrs.rs:322-327`) and the whole fallback
+    /// iteration is built from that filtered set, so the upright-only fixture and
+    /// the upright-only bundled base left it EMPTY and
+    /// `shape.rs:274 .expect("no default font found")` panicked. (With the
+    /// shipped `fonts/ui/ext/12-NotoEmoji-Regular.ttf` present the set is not
+    /// empty — the emoji exemption keeps that one face in — and the failure mode
+    /// is a full-run `.notdef` tofu render instead; see
+    /// `font_registry::the_emoji_exemption_makes_a_database_wide_match_check_useless`.)
+    /// A panic here is doubly bad: `with_leased_font_system` has no Drop guard,
+    /// so it also leaks the leased `FontSystem` out of the pool.
+    #[test]
+    fn real_italic_without_an_italic_face_degrades_to_faux_instead_of_panicking() {
+        let mut params = base_params();
+        params.text = "Hi".to_string();
+        params.font_size_px = 64.0;
+        params.force_italic = true;
+        assert!(
+            params.faux_italic_slant_deg.is_none(),
+            "this test only means something for a REAL italic request"
+        );
+
+        let degraded = render_text_to_image(&params, None)
+            .expect("a real italic request must never panic the renderer");
+        assert!(
+            degraded.width > 0 && degraded.height > 0,
+            "the degraded render must still produce pixels"
+        );
+
+        // The degradation is the documented faux italic at the default slant,
+        // not "silently upright" and not some other angle.
+        let mut explicit_faux = params.clone();
+        explicit_faux.faux_italic_slant_deg = Some(SYNTHESIZED_ITALIC_SLANT_DEG);
+        let explicit = render_text_to_image(&explicit_faux, None).expect("explicit faux render");
+        assert_eq!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (explicit.width, explicit.height, &explicit.rgba),
+            "the degraded render must equal an explicit faux italic at the default slant"
+        );
+
+        let mut upright = params.clone();
+        upright.force_italic = false;
+        let upright = render_text_to_image(&upright, None).expect("upright render");
+        assert_ne!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (upright.width, upright.height, &upright.rgba),
+            "the degradation must actually slant the text, not silently drop the italic"
+        );
+
+        // Degradation must not be silent (CLAUDE.md: no silent fallback for an
+        // unsupported request).
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("курсив")),
+            "the degraded render must warn the user, got {:?}",
+            degraded.warnings
+        );
+    }
+
+    /// The same guard per inline span: a bare `<i>` is a REAL italic request and
+    /// must not panic (or silently leave the selected font) when the resolved
+    /// family ships no italic face.
+    #[test]
+    fn real_inline_italic_without_an_italic_face_degrades_to_faux() {
+        let mut params = base_params();
+        params.text = "a<i>b</i>c".to_string();
+        params.font_size_px = 64.0;
+        params.enable_inline_style_tags = true;
+
+        let degraded = render_text_to_image(&params, None)
+            .expect("a real inline italic must never panic the renderer");
+        assert!(degraded.width > 0 && degraded.height > 0);
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("<i>")),
+            "the degraded inline render must warn the user, got {:?}",
+            degraded.warnings
+        );
+
+        // An explicit `<i=12>` span is the faux path the degradation lands on.
+        let mut explicit_faux = params.clone();
+        explicit_faux.text = format!("a<i={SYNTHESIZED_ITALIC_SLANT_DEG}>b</i>c");
+        let explicit = render_text_to_image(&explicit_faux, None).expect("explicit faux render");
+        assert_eq!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (explicit.width, explicit.height, &explicit.rgba),
+            "a degraded <i> span must equal an explicit faux <i=slant> span"
+        );
+    }
+
+    /// A REAL bold request — `force_bold` WITHOUT explicit faux params — on a family
+    /// that ships no Bold file must be degraded to faux bold, not sent to the shaper.
+    ///
+    /// Sending it costs twice, both silently: cosmic-text's primary face pick needs an
+    /// EXACT weight match and does not rank down inside the family, so the whole run
+    /// jumps to whatever family DOES have a 700 face (the bundled `Noto Sans Bold`);
+    /// and the script/common fallback passes admit only `weight_diff == 0` candidates,
+    /// so every bundled fallback font — all of them 400 — becomes unreachable and rare
+    /// glyphs in the same run render as tofu.
+    #[test]
+    fn real_bold_without_a_bold_face_degrades_to_faux() {
+        let mut params = base_params();
+        params.text = "Hi".to_string();
+        params.font_size_px = 64.0;
+        params.force_bold = true;
+        assert!(
+            params.faux_bold.is_none(),
+            "this test only means something for a REAL bold request"
+        );
+
+        let degraded =
+            render_text_to_image(&params, None).expect("a real bold request must still render");
+        assert!(degraded.width > 0 && degraded.height > 0);
+
+        // The degradation is the documented `<b=default>` strength, not "silently
+        // regular" and not some other thickness.
+        let mut explicit_faux = params.clone();
+        explicit_faux.faux_bold = Some(FauxBoldParams::default());
+        let explicit = render_text_to_image(&explicit_faux, None).expect("explicit faux render");
+        assert_eq!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (explicit.width, explicit.height, &explicit.rgba),
+            "the degraded render must equal an explicit faux bold at the default strength"
+        );
+
+        let mut plain = params.clone();
+        plain.force_bold = false;
+        let plain = render_text_to_image(&plain, None).expect("plain render");
+        assert_ne!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (plain.width, plain.height, &plain.rgba),
+            "the degradation must actually thicken the text, not silently drop the bold"
+        );
+
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("жирного начертания")),
+            "the degraded render must warn the user, got {:?}",
+            degraded.warnings
+        );
+    }
+
+    /// The same guard per inline span: a bare `<b>` is a REAL bold request and must
+    /// not leave the selected font when its family ships no bold face.
+    #[test]
+    fn real_inline_bold_without_a_bold_face_degrades_to_faux() {
+        let mut params = base_params();
+        params.text = "a<b>b</b>c".to_string();
+        params.font_size_px = 64.0;
+        params.enable_inline_style_tags = true;
+
+        let degraded =
+            render_text_to_image(&params, None).expect("a real inline bold must still render");
+        assert!(degraded.width > 0 && degraded.height > 0);
+        assert!(
+            degraded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("<b>")),
+            "the degraded inline render must warn the user, got {:?}",
+            degraded.warnings
+        );
+
+        // An explicit `<b=3>` span is the faux path the degradation lands on (3 % is
+        // `FauxBoldParams::default().thicken_percent`).
+        let mut explicit_faux = params.clone();
+        explicit_faux.text = format!(
+            "a<b={}>b</b>c",
+            FauxBoldParams::default().thicken_percent as u32
+        );
+        let explicit = render_text_to_image(&explicit_faux, None).expect("explicit faux render");
+        assert_eq!(
+            (degraded.width, degraded.height, &degraded.rgba),
+            (explicit.width, explicit.height, &explicit.rgba),
+            "a degraded <b> span must equal an explicit faux <b=thicken> span"
+        );
     }
 }

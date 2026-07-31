@@ -32,6 +32,24 @@ RGBA buffer, and sequential application of JSON-described effects.
 ## Contracts and invariants
 - Rendering must use actual font files from the resolved `fonts` directory. Missing or unreadable
   fonts must produce visible errors; do not synthesize placeholder output.
+- The `FontSystem` comes from `ms_text_render::new_render_font_system()`, i.e. the SAME
+  deterministic bundled `fonts/ui` base production renders on. `FontSystem::new()` must not come
+  back: it loads the operator's installed fonts, so this diagnostic would resolve missing glyphs
+  and unserviceable style requests through faces the app can never use, and show a picture
+  production cannot produce (`dev-docs/unicode_base_font_plan.md`, decision 1).
+- A real italic (the `Курсив` flag or a bare inline `<i>`) that no registered family can serve is
+  a visible ERROR here, not a silent upright render — `Style::Italic` is a hard match filter in
+  cosmic-text and would otherwise take the selected font out of the run entirely. The check is
+  `ms_text_render::family_has_matching_face`. This diagnostic deliberately does NOT reimplement
+  the production renderer's faux-italic degradation.
+- A real BOLD (the `Жирный` flag or a bare inline `<b>`) is guarded the same way, by the weight
+  predicate `ms_text_render::family_has_face_of_requested_weight`. Both predicates are the very
+  ones production applies before any attrs modification, so the diagnostic accepts exactly the
+  style requests production can serve with a real face. Missing one of them is not cosmetic: an
+  unserviceable `Weight::BOLD` silently restyles the run into another family that HAS a 700 face
+  (on the bundled base `Noto Sans Bold`) and drops every 400-weight fallback font out of the run,
+  so rare glyphs become tofu. Production degrades such a request to faux bold; this diagnostic has
+  no faux synthesis and reports the error instead.
 - The GUI thread must not run the heavy render path. Keep text layout, glyph rasterization,
   hyphenation, and effect processing on the render worker.
 - `RenderedTextImage.rgba` is unpremultiplied RGBA with length `width * height * 4`; any new image

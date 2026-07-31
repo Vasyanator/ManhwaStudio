@@ -235,6 +235,7 @@ mod tests {
             content_origin_x: 0,
             content_origin_y: 0,
             extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
         }
     }
 

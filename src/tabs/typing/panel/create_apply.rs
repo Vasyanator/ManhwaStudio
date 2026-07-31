@@ -522,6 +522,10 @@ impl TypingCreatePanelState {
                             TextureOptions::LINEAR,
                         ));
                     }
+                    // Replaced together with the texture: both describe this one
+                    // finished render, so the diagnostic can never outlive the
+                    // pixels it explains.
+                    self.preview_font_fallbacks = image.font_fallbacks;
                     self.status_line = if image.warnings.is_empty() {
                         t!("typing.preview.render_done_status").to_string()
                     } else {
@@ -530,6 +534,9 @@ impl TypingCreatePanelState {
                 }
                 Err(err) => {
                     crate::trace_log!(cat::SYNC, "preview_render result=err token={} err={}", result.token, err);
+                    // No render, no diagnostic: keeping the previous one would
+                    // attribute it to a text/font that was never drawn.
+                    self.preview_font_fallbacks = FontFallbackReport::default();
                     self.status_line = tf!("typing.preview.render_error_status", err = err);
                 }
             }

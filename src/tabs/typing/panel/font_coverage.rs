@@ -31,6 +31,21 @@ settings selector exists) changed at runtime; because coverage is cached on
 `FontEntry.coverage` at font-load time, a language change requires reloading the
 font list to recompute it. `TypingTopPanelState` detects the change and triggers
 that reload (see `panel/facade.rs`).
+
+Relation to the renderer's FACTUAL diagnostic (`FontFallbackReport`, shown next to
+the preview): the two answer DIFFERENT questions and both stay.
+- This file is STATIC and PREDICTIVE: "could this FONT serve the selected
+  typesetting LANGUAGE at all?" It measures one font file against a fixed alphabet,
+  knows nothing about the text being typed, and runs for every font in the list
+  off the GUI thread so the combo can rank the options BEFORE anything is typed.
+- `FontFallbackReport` is FACTUAL and RETROSPECTIVE: "in this render of this text,
+  which characters did another font draw, and which drew nothing?" It sees the real
+  text and the real fallback chain, but only after a render and only for the one
+  font that was used.
+Note also that `Unsupported` here no longer means "the text will not appear":
+since `dev-docs/unicode_base_font_plan.md` phase 4 the renderer always has a
+deterministic fallback chain, so a wrong-script font yields text drawn in ANOTHER
+font (which the factual report names), not blank space.
 */
 
 use ms_text_util::language::{ScriptGroup, TextLanguage, text_language};

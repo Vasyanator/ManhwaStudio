@@ -173,9 +173,6 @@ pub struct MangaApp {
     textures: HashMap<usize, PageTexture>,
     failed_pages: HashSet<usize>,
     load_errors: Vec<String>,
-    fonts_initialized: bool,
-    fonts_load_started: bool,
-    fonts_load_rx: Option<Receiver<Option<FontLoadResult>>>,
     loader_rx: Receiver<LoaderEvent>,
     decoded_queue: VecDeque<DecodedPage>,
     decoded_pending_by_idx: HashMap<usize, DecodedPage>,
@@ -324,11 +321,6 @@ enum PendingCloseAction {
 struct PendingExitCleanup {
     action: PendingCloseAction,
     rx: Receiver<Result<(), String>>,
-}
-
-struct FontLoadResult {
-    regular_bytes: Vec<u8>,
-    bold_bytes: Option<Vec<u8>>,
 }
 
 pub struct PageTexture {
@@ -758,9 +750,6 @@ impl MangaApp {
             textures: HashMap::new(),
             failed_pages: HashSet::new(),
             load_errors: Vec::new(),
-            fonts_initialized: false,
-            fonts_load_started: false,
-            fonts_load_rx: None,
             loader_rx: rx,
             decoded_queue: VecDeque::new(),
             decoded_pending_by_idx: HashMap::new(),
@@ -2844,76 +2833,6 @@ impl MangaApp {
         };
     }
 
-    fn ensure_fonts(&mut self, ctx: &egui::Context) {
-        if self.fonts_initialized {
-            return;
-        }
-
-        let system_candidates = [
-            (
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                Some("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
-            ),
-            (
-                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                Some("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
-            ),
-            (
-                "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-                Some("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"),
-            ),
-            (
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                Some("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-            ),
-            ("/System/Library/Fonts/AppleSDGothicNeo.ttc", None),
-            (
-                "C:\\Windows\\Fonts\\malgun.ttf",
-                Some("C:\\Windows\\Fonts\\malgunbd.ttf"),
-            ),
-        ];
-
-        if !self.fonts_load_started {
-            let (tx, rx) = std::sync::mpsc::channel::<Option<FontLoadResult>>();
-            self.fonts_load_started = true;
-            self.fonts_load_rx = Some(rx);
-            thread::spawn(move || {
-                for (regular_path, bold_path) in system_candidates {
-                    let Ok(regular_bytes) = fs::read(regular_path) else {
-                        continue;
-                    };
-                    let bold_bytes = bold_path.and_then(|path| fs::read(path).ok());
-                    let _ = tx.send(Some(FontLoadResult {
-                        regular_bytes,
-                        bold_bytes,
-                    }));
-                    return;
-                }
-                let _ = tx.send(None);
-            });
-            return;
-        }
-
-        let Some(rx) = self.fonts_load_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Some(result)) => {
-                let current_definitions = ctx.fonts(|fonts| fonts.definitions().clone());
-                ctx.set_fonts(build_system_font_definitions(current_definitions, result));
-                self.fonts_initialized = true;
-                self.fonts_load_rx = None;
-            }
-            Ok(None) | Err(TryRecvError::Disconnected) => {
-                self.fonts_initialized = true;
-                self.fonts_load_rx = None;
-            }
-            Err(TryRecvError::Empty) => {
-                ctx.request_repaint_after(web_time::Duration::from_millis(100));
-            }
-        }
-    }
-
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for tab in AppTab::ALL {
@@ -2955,44 +2874,6 @@ impl MangaApp {
             });
         });
     }
-}
-
-fn build_system_font_definitions(
-    mut defs: egui::FontDefinitions,
-    result: FontLoadResult,
-) -> egui::FontDefinitions {
-    let regular_font_name = "system-ui-sans".to_string();
-    let bold_font_name = "system-ui-sans-bold".to_string();
-    defs.font_data.insert(
-        regular_font_name.clone(),
-        Arc::new(egui::FontData::from_owned(result.regular_bytes)),
-    );
-    if let Some(bold_bytes) = result.bold_bytes {
-        defs.font_data.insert(
-            bold_font_name.clone(),
-            Arc::new(egui::FontData::from_owned(bold_bytes)),
-        );
-    }
-
-    defs.families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, regular_font_name.clone());
-    defs.families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .push(regular_font_name.clone());
-
-    let bold_family = defs
-        .families
-        .entry(egui::FontFamily::Name("system-ui-sans-bold".into()))
-        .or_default();
-    bold_family.clear();
-    if defs.font_data.contains_key(&bold_font_name) {
-        bold_family.push(bold_font_name);
-    }
-    bold_family.push(regular_font_name);
-    defs
 }
 
 // The AI backend process + health/device probe outlive the studio window now (owned
@@ -3076,7 +2957,6 @@ impl eframe::App for MangaApp {
             // If no unsaved changes: let eframe handle the close normally.
         }
 
-        self.ensure_fonts(ctx);
         {
             // Coarse marker for the per-frame worker polling + GPU upload phase: decoded page
             // promotion, incremental texture upload, and overlay/page-cache loader draining.

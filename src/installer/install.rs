@@ -117,7 +117,8 @@ pub fn run_python_installer_window(
     eframe::run_native(
         t!("installer.install.window_title"),
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             Ok(Box::new(InstallerApp::new(
                 root_dir.clone(),
                 Arc::clone(&shared_result_for_app),
@@ -166,7 +167,8 @@ fn run_existing_windows_install_window(
     eframe::run_native(
         "ManhwaStudio",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             Ok(Box::new(ExistingInstallApp::new(
                 existing_install.clone(),
                 result_sink_for_app,
@@ -1476,7 +1478,10 @@ pub(super) fn run_windows_uninstall_window(
     eframe::run_native(
         t!("installer.install.uninstall_window_title"),
         native_options,
-        Box::new(move |_cc| Ok(Box::new(UninstallApp::new(rx, result_sink_for_app)))),
+        Box::new(move |cc| {
+            crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
+            Ok(Box::new(UninstallApp::new(rx, result_sink_for_app)))
+        }),
     )
     .map_err(|e| e.to_string())?;
 

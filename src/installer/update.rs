@@ -77,6 +77,7 @@ fn run_update_window_internal(mode: UpdateMode) -> Result<UpdateWindowOutcome, S
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             Ok(Box::new(UpdateApp::new(mode, output_for_app)))
         }),
     )

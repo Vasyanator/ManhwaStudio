@@ -74,6 +74,54 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   only by the font-selection combo via `create_state::font_display_label`; it is never a
   resolution key, never persisted, and never sent to the renderer.
 
+## Built-in interface font (the bundled `fonts/ui` stack as a selectable font)
+- The panel font list carries ONE synthetic entry (`FontEntry.kind =
+  FontEntryKind::BundledUiStack`, built by `fonts::bundled_ui_font_entry`) that offers the
+  bundled `fonts/ui` stack as a normal selectable font
+  (`dev-docs/unicode_base_font_plan.md`, phase 5). It points at the FIRST `core` file of
+  `ms_fonts::stack()` — a real file — so the own-typeface combo preview, the advanced-form
+  width metric and PSD export need no special case; the REST of the stack follows for free
+  because the renderer's `MsFallback::common_fallback` is that same core chain. There is no
+  "font chain" type and must not be one: `FontContent` carries the bytes of exactly one file.
+- IDENTITY: `fonts::BUNDLED_UI_FONT_IDENTITY` (`"ManhwaStudio UI"`) is used as
+  `identity_name`, `original_name` AND `label`. It is persisted and non-localizable
+  (`dev-docs/i18n_exclusions.md` §A7). `original_name` is deliberately NOT the core font's
+  real family ("Noto Sans"): otherwise a build without this entry would silently resolve an
+  overlay to a user's own Noto Sans instead of degrading to `missing_font`.
+- DISPLAY: `FontEntry::display_label` returns `t!("typing.fonts.bundled_ui_font_label")` for
+  this entry only — the one entry whose shown name is localized while its stored name is not.
+- COLLISIONS: the entry is inserted at index 0 by `fonts::prepend_bundled_ui_font` AFTER
+  sorting and AFTER `assign_font_identity_names`. The panel's ordered name lookup
+  (`find_font_idx_by_label_norm`) and `TabFontProvider::from_fonts` are both FIRST-wins over
+  the SAME list, so a user font claiming the reserved name loses in both places (never in
+  only one) and is warned about. `assign_font_identity_names` skips the entry entirely, both
+  as a recipient and as a family-collision COUNT, so its presence cannot flip a user's own
+  copy of a bundled family from a family-name identity to a file-stem one. The entry claims
+  no file-stem alias in the provider.
+- COVERAGE is reported as `Full` (never classified): the classifier can only measure the one
+  file an entry points at, while this entry stands for the whole chain (core + bold + ~44
+  `ext` fonts) the renderer reaches — classifying the core file alone would paint the option
+  as `Partial` for languages the chain does serve.
+- The ADVANCED-FORM WIDTH METRIC honours the chain for this entry:
+  `create_advanced::register_bundled_core_fallback` adds the remaining `core` files to the
+  metric's throwaway `fontdb` (as `Source::Binary` over the `'static` buffers `ms_fonts`
+  already holds, so no I/O), and cosmic-text's last fallback stage reaches them the way the
+  renderer's `MsFallback::common_fallback` does. It runs AFTER
+  `metric_real_face_availability`, which must keep seeing ONLY the selected file — a chain
+  face must never make an unsatisfiable Bold/Italic request look satisfiable. `ext` is
+  deliberately NOT registered: the database is rebuilt on every metric-cache rebuild, on the
+  GUI thread, and ~44 files would be opened and mapped each time; a script only `ext` covers
+  is therefore still measured as `.notdef`.
+- BYTES: `TabFontProvider` serves this entry from `ms_fonts::bytes` (the `'static` buffer
+  already shared with the egui UI and the renderer's font base), so the file is not read
+  twice AND `ms_text_render::font_base::resident_face_ids` recognizes the buffer as already
+  registered — no duplicate face lands in any pooled `FontSystem`.
+- SCOPE: PANEL lists only. `fonts::load_fonts` and `create_state::new` prepend it; the
+  settings font-administration list (`font_admin::load_folder_fonts`) does NOT get it —
+  there is nothing to import, rename or group about it. It is also not the DEFAULT font of a
+  fresh panel: `create_state::new` selects the first of the user's OWN fonts and only falls
+  back to the built-in entry when the user has none.
+
 ## Font render IDENTITY (collision-aware: family name when unique, else file-stem label)
 - The canonical name persisted in `render_data.text_params` / `TextRenderParams.font_name`
   and emitted in inline `<font=...>` tags is the font's COLLISION-AWARE identity
@@ -98,6 +146,11 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `font_family` → `font` → path stem; `create_apply` panel-restore also falls back to
   `font_original_name`; `normalize_text_params_object` preserves `font_original_name`;
   `ui_helpers::font_matches_label` is the form-agnostic union (identity/family/label/stem).
+- A FAILING resolve is distinguishable in the log from an unknown name: `TabFontProvider`
+  reports an unreadable font file with its path and the OS reason (once per path — the
+  renderer retries the resolve for every text image) and reports a poisoned cache mutex
+  once, recovering the map rather than silently re-reading the file on every resolve. An
+  unknown name stays a silent `None`; the renderer turns it into the missing-font error.
   Editing legacy text: `create_edit::normalize_desired_inline_tag_style` compares RESOLVED font
   identity (not raw strings) so a legacy `<font=stem>` on the base font is stripped, not duplicated.
 
@@ -135,6 +188,33 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
 - The `match` on `TextLanguage` (`extra_chars_for_language`) and on `ScriptGroup`
   (`script_chars_for_group`) are exhaustive with no catch-all arm: a new language
   or group must be wired here explicitly (enforced by the compiler).
+
+## Two font diagnostics, two questions (do not merge them)
+- STATIC coverage (`font_coverage.rs`, above): "could this FONT serve the selected
+  typesetting LANGUAGE at all?" — computed per font at load time, off the GUI thread,
+  before any text exists. It is what ranks the options in the font combo (colors +
+  `font_coverage_tooltip`) so the user can pick well BEFORE typing.
+- FACTUAL fallback report (`ms_text_render::types::FontFallbackReport`, returned in
+  `RenderedTextImage.font_fallbacks`): "what happened to THIS text in THIS render?" —
+  which characters the renderer's deterministic fallback chain drew instead of the
+  selected font and in which font, and which characters came out as tofu. It exists
+  because after `dev-docs/unicode_base_font_plan.md` phase 4 "the character will not
+  render" is almost never true any more, while "the character was drawn by a font you
+  did not choose" became the meaningful statement.
+- The panel keeps the report of the LAST COMPLETED preview render in
+  `TypingCreatePanelState::preview_font_fallbacks`, replaced with the preview texture
+  on success and cleared on a render error, so the diagnostic can never outlive the
+  pixels it explains.
+- It is DRAWN in `create_sections::draw_preview_section`, under the preview status
+  row, not on the font combo: it is a property of one render of one text, whereas the
+  combo's coloring is a per-font, per-language classification shared by the whole
+  list. Only the create panel has a preview render (`preview_enabled`), so only it
+  shows the rows.
+- `create_presets.rs` maps BOTH diagnostics to colors/wording and is the only place
+  that may (`font_coverage_tooltip`, `font_fallback_status_lines`, the shared
+  `FONT_DIAGNOSTIC_WARNING_COLOR`/`FONT_DIAGNOSTIC_ERROR_COLOR` and
+  `MAX_SHOWN_CHARS`). Falling back is INFORMATION and uses the warning color; a tofu
+  character uses the error color.
 
 ## Coverage cache invalidation
 - `FontEntry.coverage` is computed ONCE per font at LOAD time (in `fonts.rs`,
@@ -227,3 +307,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   detection) and `create_state.rs::spawn_font_reload`.
 - To change the highlight colors / tooltip, see `create_presets.rs`
   (`draw_font_combo_option`, `font_coverage_tooltip`).
+- To change the per-render fallback rows (wording, colors, truncation), see
+  `create_presets.rs` (`font_fallback_status_lines`, `truncated_char_list`); to
+  change where they are drawn, see `create_sections.rs::draw_preview_section`; to
+  change WHAT the renderer reports, see `crates/ms-text-render/src/fallback_diag.rs`.

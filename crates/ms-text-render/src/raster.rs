@@ -575,6 +575,8 @@ pub(crate) fn trim_rendered_image_to_alpha_bounds(
         content_origin_x: 0,
         content_origin_y: 0,
         extra,
+        // Cropping changes pixels, not which font drew which character.
+        font_fallbacks: image.font_fallbacks,
     }
 }
 
@@ -700,6 +702,7 @@ mod tests {
             content_origin_x: 0,
             content_origin_y: 0,
             extra: crate::types::RenderedTextExtraInfo::default(),
+            font_fallbacks: crate::types::FontFallbackReport::default(),
             width: 4,
             height: 3,
             rgba: vec![
