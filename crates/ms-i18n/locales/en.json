@@ -1285,6 +1285,7 @@
   "launcher.export_page.exporting_status": "Exporting the chapter...",
   "launcher.export_page.finish_tar_error": "could not finalize the tar archive: {err}",
   "launcher.export_page.finish_zstd_error": "could not finalize the zstd archive: {err}",
+  "launcher.export_page.format_warning": "⚠ This exports the editable chapter in the program’s own format. To export the chapter as PNG or PSD, open the chapter and press \"Overlay and save to folder\" on the \"Text\" tab.",
   "launcher.export_page.heading": "Export chapter",
   "launcher.export_page.open_zstd_encoder_error": "could not open the zstd encoder: {err}",
   "launcher.export_page.pack_chapter_error": "could not pack the chapter folder: {err}",

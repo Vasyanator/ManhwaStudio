@@ -1282,6 +1282,7 @@
   "launcher.export_page.exporting_status": "Exportando el capítulo...",
   "launcher.export_page.finish_tar_error": "no se pudo finalizar el archivo tar: {err}",
   "launcher.export_page.finish_zstd_error": "no se pudo finalizar el archivo zstd: {err}",
+  "launcher.export_page.format_warning": "⚠ Esta es la exportación del capítulo editable en el formato propio del programa. Para exportar el capítulo como PNG o PSD, abre el capítulo y pulsa «Superponer y guardar en carpeta» en la pestaña «Texto».",
   "launcher.export_page.heading": "Exportar capítulo",
   "launcher.export_page.open_zstd_encoder_error": "no se pudo abrir el codificador zstd: {err}",
   "launcher.export_page.pack_chapter_error": "no se pudo empaquetar la carpeta del capítulo: {err}",

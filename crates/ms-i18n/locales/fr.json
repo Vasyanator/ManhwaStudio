@@ -1282,6 +1282,7 @@
   "launcher.export_page.exporting_status": "Export du chapitre…",
   "launcher.export_page.finish_tar_error": "impossible de finaliser l'archive tar : {err}",
   "launcher.export_page.finish_zstd_error": "impossible de finaliser l'archive zstd : {err}",
+  "launcher.export_page.format_warning": "⚠ Il s’agit de l’export du chapitre modifiable dans le format propre au programme. Pour exporter le chapitre en PNG ou PSD, ouvrez le chapitre et cliquez sur « Superposer et enregistrer dans un dossier » dans l’onglet « Texte ».",
   "launcher.export_page.heading": "Exporter un chapitre",
   "launcher.export_page.open_zstd_encoder_error": "impossible d'ouvrir l'encodeur zstd : {err}",
   "launcher.export_page.pack_chapter_error": "impossible d'empaqueter le dossier du chapitre : {err}",

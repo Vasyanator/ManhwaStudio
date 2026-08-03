@@ -45,6 +45,10 @@ const COMPRESSION_PRESETS: [(&str, i32); 5] = [
     ("launcher.export_page.compression_max", 15),
 ];
 
+/// Yellow accent for the format warning shown above the export form. Kept local
+/// to this page because the launcher theme exposes only success/error accents.
+const STATUS_WARNING: egui::Color32 = egui::Color32::from_rgb(232, 186, 66);
+
 /// Resolves a compression-preset catalog key to its localized label.
 fn compression_preset_label(key: &'static str) -> &'static str {
     ms_i18n::lookup(key).unwrap_or(key)
@@ -118,6 +122,18 @@ impl ExportPageState {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(t!("launcher.export_page.heading")).size(24.0).strong());
                         ui.add_space(14.0);
+
+                        // The page exports the editable chapter into the app's own
+                        // `.mschapter` container, which users regularly confuse with a
+                        // PNG/PSD render export; the warning points at the real path.
+                        ui.add(
+                            egui::Label::new(theme::status(
+                                t!("launcher.export_page.format_warning"),
+                                STATUS_WARNING,
+                            ))
+                            .wrap(),
+                        );
+                        ui.add_space(10.0);
 
                         ui.label(theme::status(t!("launcher.export_page.title_label"), theme::TEXT_MUTED));
                         let mut title_changed = false;

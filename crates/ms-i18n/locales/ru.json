@@ -1285,6 +1285,7 @@
   "launcher.export_page.exporting_status": "Экспортируем главу...",
   "launcher.export_page.finish_tar_error": "не удалось завершить tar-архив: {err}",
   "launcher.export_page.finish_zstd_error": "не удалось завершить zstd-архив: {err}",
+  "launcher.export_page.format_warning": "⚠ Это экспорт редактируемой главы в собственном формате программы. Чтобы экспортировать главу как png или psd, откройте главу и во вкладке «Текст» нажмите «Наложить и сохранить в папку».",
   "launcher.export_page.heading": "Экспорт главы",
   "launcher.export_page.open_zstd_encoder_error": "не удалось открыть zstd-кодер: {err}",
   "launcher.export_page.pack_chapter_error": "не удалось упаковать папку главы: {err}",
