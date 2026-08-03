@@ -2,6 +2,15 @@
 name = "manhwastudio_rs"
 version = "3.6.0"
 edition = "2024"
+# Minimum supported Rust version. Derived from the dependency graph, not chosen:
+# egui/eframe 0.35 declare `rust-version = "1.92"`, the highest floor here (next
+# are image 0.25.10 at 1.88 and the edition-2024 floor at 1.85). Raise it only
+# when a dependency actually forces it.
+#
+# This is the SINGLE SOURCE OF TRUTH for the toolchain check in
+# `tools/run-dev/` — both run-dev scripts parse this field and refuse to run on
+# an older toolchain. Do not duplicate the number into them.
+rust-version = "1.92"
 
 [workspace]
 members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/puffin_egui"]

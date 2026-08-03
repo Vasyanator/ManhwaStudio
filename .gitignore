@@ -33,6 +33,13 @@
 !ai_backend.py
 !config.py
 
+# run-dev launchers. These are the entry point for running from source, so they
+# must reach anyone who clones or downloads the repository; the actual logic they
+# hand off to lives in tools/run-dev/ (whitelisted below).
+!run-dev.Linux.sh
+!run-dev.MacOS.command
+!run-dev.Windows.bat
+
 # Application icons embedded by Rust code and the Windows resource build.
 !app_icon.ico
 !app_icon_512.png
@@ -86,6 +93,13 @@ tools/egui_docs/*.py[cod]
 # the script, but the script is the only way to regenerate that table, so it is
 # published deliberately (one file, per the per-script decision noted above).
 !tools/gen_char_table.py
+
+# The run-dev source-run scripts. Unlike the rest of tools/, these are user-facing
+# and are useless unless published: run-dev.* in the root only hands off to them.
+!tools/run-dev/
+!tools/run-dev/*.sh
+!tools/run-dev/*.ps1
+!tools/run-dev/MODULE_README.md
 
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/

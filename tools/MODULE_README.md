@@ -2,16 +2,25 @@
 
 ## Purpose
 Offline developer/agent utilities that operate on the repository but are **not**
-part of the shipped runtime. Nothing here is imported by `src/` or the `crates/`;
-these scripts are run by hand during migrations and audits.
+part of the shipped runtime. Nothing here is imported by `src/` or the `crates/`.
 
-Current contents relate to the i18n migration: routing the ~4,800 hardcoded
-Russian UI string literals through the `ms-i18n` `t!` / `tf!` macros.
+Two unrelated concerns live here:
+
+- **i18n migration** (`i18n_extract.py`) — routing the ~4,800 hardcoded Russian UI
+  string literals through the `ms-i18n` `t!` / `tf!` macros. Run by hand during
+  migrations and audits.
+- **`run-dev/`** — the source-run entry point (update from git, provision Rust,
+  `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
+  and is invoked through the launchers in the project root. It has its own
+  `MODULE_README.md`; the algorithm is specified in `dev-docs/run_dev_plan.md`.
 
 ## Architecture
-Pure Python 3 (stdlib only — no third-party deps). The i18n tool is a single-file
-pipeline. Migration is **two-step**: the tool finds and rewrites deterministically;
-a human supplies the semantic key names. The tool never invents a final key.
+The i18n tool is pure Python 3 (stdlib only — no third-party deps) and is a
+single-file pipeline. Migration is **two-step**: the tool finds and rewrites
+deterministically; a human supplies the semantic key names. The tool never
+invents a final key.
+
+`run-dev/` is shell + PowerShell and shares nothing with the Python tooling.
 
 ```
 find_rust_files -> lex_rust (strings + bracket-safe masked source)
@@ -55,6 +64,10 @@ detection cannot be fooled by punctuation inside strings or comments.
 - The transliterated key scheme (`module.fn.slug`) survives only as `suggested_key`.
 
 ## Files and submodules
+- `run-dev/`: the source-run entry point (Linux/macOS shell + Windows PowerShell)
+  plus its contract tests. Boundary: it may read `Cargo.toml` and drive `git`,
+  `rustup` and `cargo`, but must never import or be imported by anything in
+  `src/`. See its own `MODULE_README.md`.
 - `i18n_extract.py`: the extraction tool. Modes: `--dry-run` (default, writes
   nothing except an optional `--report` under `docs/`), `--propose <path> -o FILE`
   (emit a key proposal, no `.rs` writes), `--apply <path> --keys FILE` (rewrite
