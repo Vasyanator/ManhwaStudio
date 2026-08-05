@@ -351,7 +351,16 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                     .and_then(value_as_f32)
                     .unwrap_or(16.0)
                     .clamp(0.0, 300.0),
-                softness_px: 0.0,
+                // Soft-glow-only fields: inert for V1/V2, never serialized by
+                // `effect_card_to_value` for these versions.
+                blur_radius_px: 0.0,
+                blur_bias: 0.0,
+                blur_knee: 100.0,
+                expand_x_plus_px: 0,
+                expand_x_minus_px: 0,
+                expand_y_plus_px: 0,
+                expand_y_minus_px: 0,
+                outline_shape: GlowOutlineShape::Square,
                 color: ColorField::new(
                     obj.get("color")
                         .and_then(parse_color32_value)
@@ -399,15 +408,65 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                     .or_else(|| obj.get("glow_radius"))
                     .and_then(value_as_f32)
                     .unwrap_or(8.0)
-                    .clamp(0.0, 300.0),
-                softness_px: obj
-                    .get("softness")
+                    .clamp(0.0, 512.0),
+                // The current key is `blur_radius`; the rest are legacy spellings kept
+                // so projects and presets written before the parameter was renamed load
+                // unchanged.
+                blur_radius_px: obj
+                    .get("blur_radius")
+                    .or_else(|| obj.get("blur"))
+                    .or_else(|| obj.get("blur_px"))
+                    .or_else(|| obj.get("softness"))
                     .or_else(|| obj.get("softness_px"))
                     .or_else(|| obj.get("glow_softness"))
-                    .or_else(|| obj.get("blur"))
                     .and_then(value_as_f32)
                     .unwrap_or(4.0)
+                    .clamp(0.0, 256.0),
+                blur_bias: obj
+                    .get("bias")
+                    .and_then(value_as_f32)
+                    .unwrap_or(0.0)
+                    .clamp(-100.0, 100.0),
+                blur_knee: obj
+                    .get("knee")
+                    .and_then(value_as_f32)
+                    .unwrap_or(100.0)
                     .clamp(0.0, 100.0),
+                expand_x_plus_px: obj
+                    .get("expand_x_plus")
+                    .and_then(value_as_f32)
+                    .map(|v| v.round() as i32)
+                    .unwrap_or(0)
+                    .clamp(-512, 512),
+                expand_x_minus_px: obj
+                    .get("expand_x_minus")
+                    .and_then(value_as_f32)
+                    .map(|v| v.round() as i32)
+                    .unwrap_or(0)
+                    .clamp(-512, 512),
+                expand_y_plus_px: obj
+                    .get("expand_y_plus")
+                    .and_then(value_as_f32)
+                    .map(|v| v.round() as i32)
+                    .unwrap_or(0)
+                    .clamp(-512, 512),
+                expand_y_minus_px: obj
+                    .get("expand_y_minus")
+                    .and_then(value_as_f32)
+                    .map(|v| v.round() as i32)
+                    .unwrap_or(0)
+                    .clamp(-512, 512),
+                outline_shape: match obj
+                    .get("shape")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "round" => GlowOutlineShape::Round,
+                    _ => GlowOutlineShape::Square,
+                },
                 color: ColorField::new(
                     obj.get("color")
                         .and_then(parse_color32_value)

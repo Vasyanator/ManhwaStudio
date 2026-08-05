@@ -193,11 +193,72 @@ pub(crate) struct GlowEffectParams {
     pub(crate) fade_shift: f32,
 }
 
+/// Outline shape of the `soft_glow` dilation element.
+///
+/// `Square` dilates with the (possibly asymmetric) rectangle spanned by the four side
+/// extents; `Round` dilates with the ellipse whose four quadrants use the corresponding
+/// per-side extents as semi-axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SoftGlowShape {
+    Square,
+    Round,
+}
+
+/// Parameters of the `soft_glow` post-effect.
+///
+/// The glow outline is the source alpha dilated by a per-side element and then blurred:
+/// `radius_px` is the base reach on every side and the four `expand_*` fields add (or,
+/// when negative, remove) reach on one side each — `expand_x_plus` to the right,
+/// `expand_x_minus` to the left, `expand_y_plus` downwards, `expand_y_minus` upwards.
+/// The blurred outline is normalized to `[0, 1]` and remapped through the bias/knee
+/// response curve before it is tinted with `color`.
 #[derive(Debug, Clone)]
 pub(crate) struct SoftGlowEffectParams {
-    pub(crate) radius_steps: u32,
-    pub(crate) softness_px: f32,
+    /// Base dilation radius in px, applied to all four sides before `expand_*`.
+    pub(crate) radius_px: u32,
+    /// Extra reach to the RIGHT, px (may be negative to pull that side in).
+    pub(crate) expand_x_plus: i32,
+    /// Extra reach to the LEFT, px (may be negative to pull that side in).
+    pub(crate) expand_x_minus: i32,
+    /// Extra reach DOWNWARDS, px (may be negative to pull that side in).
+    pub(crate) expand_y_plus: i32,
+    /// Extra reach UPWARDS, px (may be negative to pull that side in).
+    pub(crate) expand_y_minus: i32,
+    /// Shape of the dilation element built from the four side extents.
+    pub(crate) shape: SoftGlowShape,
+    /// Gaussian sigma, in px, of the blur applied to the dilated outline.
+    pub(crate) blur_radius_px: f32,
+    /// Response-curve bias in `-100..=100`; `0` keeps the curve the identity.
+    pub(crate) bias: f32,
+    /// Response-curve knee in `0..=100`: sharp polyline (`0`) to quadratic Bezier (`100`).
+    pub(crate) knee: f32,
     pub(crate) color: [u8; 4],
+}
+
+impl SoftGlowEffectParams {
+    /// Returns the per-side dilation extents `(left, right, up, down)` in px.
+    ///
+    /// Each extent is `radius_px + expand_*` evaluated in `i64` (so neither the sum nor a
+    /// negative expansion can wrap) and clamped to `0..=u32::MAX`; a negative side simply
+    /// contributes no reach. All four zero means the effect has nothing to draw.
+    #[must_use]
+    pub(crate) fn extents(&self) -> (u32, u32, u32, u32) {
+        (
+            soft_glow_side_extent(self.radius_px, self.expand_x_minus),
+            soft_glow_side_extent(self.radius_px, self.expand_x_plus),
+            soft_glow_side_extent(self.radius_px, self.expand_y_minus),
+            soft_glow_side_extent(self.radius_px, self.expand_y_plus),
+        )
+    }
+}
+
+/// Clamped `radius_px + expand` for one soft-glow side, in px.
+///
+/// The sum is evaluated in `i64` and clamped into `0..=u32::MAX`, so the `u32` conversion
+/// below can never fail; the `unwrap_or` is unreachable defensive code, not error swallowing.
+fn soft_glow_side_extent(radius_px: u32, expand: i32) -> u32 {
+    let value = i64::from(radius_px) + i64::from(expand);
+    u32::try_from(value.clamp(0, i64::from(u32::MAX))).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,10 +916,25 @@ fn parse_glow_effect_params(
     })
 }
 
+/// Parses the `soft_glow` post-effect parameters from its JSON object.
+///
+/// Every field is optional and falls back to the documented default: `radius` 8,
+/// all four `expand_*` 0, `shape` square, `blur_radius` 4.0, `bias` 0.0, `knee` 100.0,
+/// `color` opaque black. The legacy `softness*` keys are accepted as aliases of
+/// `blur_radius` and `bias` defaults to the identity curve, so a persisted
+/// `{radius, softness, color}` object keeps rendering as before. Aliases exist ONLY for the
+/// keys that legacy project files actually contain (`radius*`/`glow_radius` and the
+/// blur/softness family); the per-side expansion, shape, bias, and knee keys have exactly one
+/// spelling each — the one the panel writes — so nothing can be read here and then silently
+/// rewritten as something else.
+///
+/// # Errors
+/// Returns a Russian `soft_glow.<field> ...` message when a value has the wrong JSON type,
+/// falls outside its documented range, or names an unknown `shape`.
 fn parse_soft_glow_effect_params(
     obj: &serde_json::Map<String, Value>,
 ) -> Result<SoftGlowEffectParams, String> {
-    let radius_steps_i32 = parse_effect_i32(
+    let radius_i32 = parse_effect_i32(
         obj.get("radius")
             .or_else(|| obj.get("radius_px"))
             .or_else(|| obj.get("glow_radius")),
@@ -869,21 +945,76 @@ fn parse_soft_glow_effect_params(
     )?;
 
     Ok(SoftGlowEffectParams {
-        radius_steps: u32::try_from(radius_steps_i32)
+        radius_px: u32::try_from(radius_i32)
             .map_err(|_| "soft_glow.radius должен быть >= 0".to_string())?,
-        softness_px: parse_effect_f32_range(
-            obj.get("softness")
-                .or_else(|| obj.get("softness_px"))
-                .or_else(|| obj.get("glow_softness"))
+        expand_x_plus: parse_effect_i32(
+            obj.get("expand_x_plus"),
+            "soft_glow.expand_x_plus",
+            0,
+            -512,
+            512,
+        )?,
+        expand_x_minus: parse_effect_i32(
+            obj.get("expand_x_minus"),
+            "soft_glow.expand_x_minus",
+            0,
+            -512,
+            512,
+        )?,
+        expand_y_plus: parse_effect_i32(
+            obj.get("expand_y_plus"),
+            "soft_glow.expand_y_plus",
+            0,
+            -512,
+            512,
+        )?,
+        expand_y_minus: parse_effect_i32(
+            obj.get("expand_y_minus"),
+            "soft_glow.expand_y_minus",
+            0,
+            -512,
+            512,
+        )?,
+        shape: parse_soft_glow_shape(obj)?,
+        blur_radius_px: parse_effect_f32_range(
+            obj.get("blur_radius")
                 .or_else(|| obj.get("blur"))
-                .or_else(|| obj.get("blur_px")),
-            "soft_glow.softness",
+                .or_else(|| obj.get("blur_px"))
+                .or_else(|| obj.get("softness"))
+                .or_else(|| obj.get("softness_px"))
+                .or_else(|| obj.get("glow_softness")),
+            "soft_glow.blur_radius",
             4.0,
             0.0,
             256.0,
         )?,
+        bias: parse_effect_f32_range(obj.get("bias"), "soft_glow.bias", 0.0, -100.0, 100.0)?,
+        knee: parse_effect_f32_range(obj.get("knee"), "soft_glow.knee", 100.0, 0.0, 100.0)?,
         color: parse_effect_color(obj.get("color"))?.unwrap_or([0, 0, 0, 255]),
     })
+}
+
+/// Parses the `soft_glow` outline shape; a missing key means `Square`.
+///
+/// The value is trimmed and lowercased before matching, mirroring the other string-enum
+/// parsers in this file. Only the two spellings the UI writes are accepted: an extra
+/// spelling would round-trip through the panel as the canonical one and silently change
+/// the effect.
+///
+/// # Errors
+/// Returns an error naming the accepted set when the value is a string outside it.
+fn parse_soft_glow_shape(obj: &serde_json::Map<String, Value>) -> Result<SoftGlowShape, String> {
+    let Some(shape) = obj.get("shape").and_then(Value::as_str) else {
+        return Ok(SoftGlowShape::Square);
+    };
+
+    match shape.trim().to_ascii_lowercase().as_str() {
+        "square" => Ok(SoftGlowShape::Square),
+        "round" => Ok(SoftGlowShape::Round),
+        other => Err(format!(
+            "soft_glow.shape: неизвестное значение '{other}', ожидалось square/round"
+        )),
+    }
 }
 
 fn parse_gradient2_effect_params(
@@ -1293,7 +1424,7 @@ fn value_to_u8(value: &Value, label: &str) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EffectSpec, InterferenceKind, parse_effects_json};
+    use super::{EffectSpec, InterferenceKind, SoftGlowShape, parse_effects_json};
 
     /// Extracts the single `Interference` params from a one-effect JSON array.
     ///
@@ -1449,5 +1580,163 @@ mod tests {
         assert!((params.angle_deg - 45.0).abs() < 1e-6);
         assert_eq!(params.gap_px, 4);
         assert!((params.jitter_px - 8.0).abs() < 1e-6);
+    }
+
+    /// Extracts the single `SoftGlow` params from a one-effect JSON array.
+    ///
+    /// Test-only helper: the fixture invariant is "this JSON parses to exactly one SoftGlow
+    /// effect", so any deviation panics with a diagnostic — the panic IS the test failure.
+    fn parse_single_soft_glow(json: &str) -> super::SoftGlowEffectParams {
+        let effects = match parse_effects_json(json) {
+            Ok(effects) => effects,
+            Err(error) => panic!("fixture json must parse: {error}"),
+        };
+        assert_eq!(effects.len(), 1, "fixture must contain exactly one effect");
+        match effects.into_iter().next() {
+            Some(EffectSpec::SoftGlow(params)) => params,
+            other => panic!("fixture must parse to SoftGlow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn soft_glow_defaults_when_only_name_present() {
+        let params = parse_single_soft_glow(r#"[{"effect":"soft_glow"}]"#);
+        assert_eq!(params.radius_px, 8);
+        assert_eq!(params.expand_x_plus, 0);
+        assert_eq!(params.expand_x_minus, 0);
+        assert_eq!(params.expand_y_plus, 0);
+        assert_eq!(params.expand_y_minus, 0);
+        assert_eq!(params.shape, SoftGlowShape::Square);
+        assert!((params.blur_radius_px - 4.0).abs() < 1e-6);
+        assert!((params.bias - 0.0).abs() < 1e-6);
+        assert!((params.knee - 100.0).abs() < 1e-6);
+        assert_eq!(params.color, [0, 0, 0, 255]);
+        assert_eq!(params.extents(), (8, 8, 8, 8));
+    }
+
+    /// The persisted legacy object (`radius` + `softness` + `color` only) must keep its old
+    /// geometry and land on the identity response curve.
+    #[test]
+    fn soft_glow_legacy_object_still_parses() {
+        let params = parse_single_soft_glow(
+            r#"[{"effect":"soft_glow","radius":5,"softness":2.5,"color":[10,20,30,200]}]"#,
+        );
+        assert_eq!(params.radius_px, 5);
+        assert_eq!(params.shape, SoftGlowShape::Square);
+        assert_eq!(params.extents(), (5, 5, 5, 5));
+        assert!((params.blur_radius_px - 2.5).abs() < 1e-6);
+        assert!((params.bias - 0.0).abs() < 1e-6);
+        assert_eq!(params.color, [10, 20, 30, 200]);
+    }
+
+    #[test]
+    fn soft_glow_parses_all_primary_keys() {
+        let json = r#"[{
+            "effect":"soft_glow","radius":12,
+            "expand_x_plus":7,"expand_x_minus":-3,"expand_y_plus":4,"expand_y_minus":-2,
+            "shape":"round","blur_radius":9.5,"bias":-35.0,"knee":20.0,"color":[1,2,3,4]
+        }]"#;
+        let params = parse_single_soft_glow(json);
+        assert_eq!(params.radius_px, 12);
+        assert_eq!(params.expand_x_plus, 7);
+        assert_eq!(params.expand_x_minus, -3);
+        assert_eq!(params.expand_y_plus, 4);
+        assert_eq!(params.expand_y_minus, -2);
+        assert_eq!(params.shape, SoftGlowShape::Round);
+        assert!((params.blur_radius_px - 9.5).abs() < 1e-6);
+        assert!((params.bias + 35.0).abs() < 1e-6);
+        assert!((params.knee - 20.0).abs() < 1e-6);
+        assert_eq!(params.color, [1, 2, 3, 4]);
+        // left = 12 - 3, right = 12 + 7, up = 12 - 2, down = 12 + 4.
+        assert_eq!(params.extents(), (9, 19, 10, 16));
+    }
+
+    /// Every LEGACY alias (the radius and blur/softness families) must still resolve; those
+    /// are the spellings persisted project files contain.
+    #[test]
+    fn soft_glow_accepts_every_legacy_alias() {
+        let params = parse_single_soft_glow(
+            r#"[{"effect":"glow_soft","glow_radius":6,"glow_softness":7.5}]"#,
+        );
+        assert_eq!(params.radius_px, 6);
+        assert!((params.blur_radius_px - 7.5).abs() < 1e-6);
+
+        for key in ["blur_radius", "blur", "blur_px", "softness", "softness_px"] {
+            let json = format!(r#"[{{"effect":"soft_glow","{key}":3.25}}]"#);
+            let params = parse_single_soft_glow(&json);
+            assert!(
+                (params.blur_radius_px - 3.25).abs() < 1e-6,
+                "alias '{key}' did not resolve to blur_radius_px"
+            );
+        }
+        for key in ["radius", "radius_px", "glow_radius"] {
+            let json = format!(r#"[{{"effect":"soft_glow","{key}":2}}]"#);
+            assert_eq!(
+                parse_single_soft_glow(&json).radius_px,
+                2,
+                "alias '{key}' did not resolve to radius_px"
+            );
+        }
+    }
+
+    /// The keys introduced with the per-side/shape/curve geometry have exactly ONE spelling:
+    /// an unrecognized spelling must fall back to the default rather than be honored, since
+    /// the panel would rewrite it as the canonical key and silently change the effect.
+    #[test]
+    fn soft_glow_new_keys_have_a_single_spelling() {
+        let json = r#"[{
+            "effect":"soft_glow",
+            "expand_right":2,"expand_left":3,"expand_bottom":4,"expand_top":5,
+            "blur_bias":10.0,"blur_knee":30.0
+        }]"#;
+        let params = parse_single_soft_glow(json);
+        assert_eq!(params.expand_x_plus, 0);
+        assert_eq!(params.expand_x_minus, 0);
+        assert_eq!(params.expand_y_plus, 0);
+        assert_eq!(params.expand_y_minus, 0);
+        assert!((params.bias - 0.0).abs() < 1e-6);
+        assert!((params.knee - 100.0).abs() < 1e-6);
+        // `outline_shape` is likewise not a key: the shape stays the default.
+        assert_eq!(
+            parse_single_soft_glow(r#"[{"effect":"soft_glow","outline_shape":"round"}]"#).shape,
+            SoftGlowShape::Square
+        );
+    }
+
+    #[test]
+    fn soft_glow_shape_is_trimmed_and_case_insensitive() {
+        assert_eq!(
+            parse_single_soft_glow(r#"[{"effect":"soft_glow","shape":"  ROUND "}]"#).shape,
+            SoftGlowShape::Round
+        );
+        assert_eq!(
+            parse_single_soft_glow(r#"[{"effect":"soft_glow","shape":" Square"}]"#).shape,
+            SoftGlowShape::Square
+        );
+    }
+
+    #[test]
+    fn soft_glow_rejects_unknown_shape_and_out_of_range_values() {
+        let cases = [
+            r#"[{"effect":"soft_glow","shape":"blob"}]"#,
+            // Spellings that are deliberately NOT accepted (they are not what the UI writes).
+            r#"[{"effect":"soft_glow","shape":"ellipse"}]"#,
+            r#"[{"effect":"soft_glow","shape":"rect"}]"#,
+            r#"[{"effect":"soft_glow","radius":-1}]"#,
+            r#"[{"effect":"soft_glow","radius":513}]"#,
+            r#"[{"effect":"soft_glow","expand_x_plus":600}]"#,
+            r#"[{"effect":"soft_glow","expand_y_minus":-600}]"#,
+            r#"[{"effect":"soft_glow","blur_radius":300.0}]"#,
+            r#"[{"effect":"soft_glow","bias":-101.0}]"#,
+            r#"[{"effect":"soft_glow","knee":101.0}]"#,
+            r#"[{"effect":"soft_glow","knee":"loud"}]"#,
+        ];
+        for json in cases {
+            let error = parse_effects_json(json).err();
+            assert!(
+                error.as_ref().is_some_and(|msg| msg.contains("soft_glow.")),
+                "expected a soft_glow.* error for {json}, got {error:?}"
+            );
+        }
     }
 }

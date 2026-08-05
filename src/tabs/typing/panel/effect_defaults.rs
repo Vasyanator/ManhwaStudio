@@ -389,6 +389,69 @@ mod tests {
         }
     }
 
+    /// A fully populated soft-glow card (every expansion distinct and non-zero,
+    /// `Round` shape, non-default blur radius/bias/knee) must survive
+    /// `effect_card_to_value` -> `parse_effect_cards` -> `effect_card_to_value`
+    /// unchanged: the writer emits the current key names and the reader must read
+    /// exactly those, not only the legacy spellings.
+    #[test]
+    fn soft_glow_card_round_trips_all_parameters() {
+        let card = EffectCard::Glow(GlowEffectCard {
+            version: GlowEffectVersion::Soft,
+            radius_px: 37.0,
+            blur_radius_px: 25.5,
+            blur_bias: -42.5,
+            blur_knee: 63.0,
+            expand_x_plus_px: 11,
+            expand_x_minus_px: -7,
+            expand_y_plus_px: 23,
+            expand_y_minus_px: -19,
+            outline_shape: GlowOutlineShape::Round,
+            color: ColorField::new(Color32::from_rgba_unmultiplied(12, 34, 56, 200)),
+            opacity_mode: StrokeOpacityMode::FromContour,
+            transparency_percent: 0.0,
+            fade_strength: 0.0,
+            fade_shift: 0.0,
+        });
+        let value = effect_card_to_value(&card);
+        let reparsed = parse_effect_cards(std::slice::from_ref(&value), NEUTRAL_EDITOR_COLOR)
+            .into_iter()
+            .next();
+        assert!(reparsed.is_some(), "parse must reproduce the soft glow card");
+        if let Some(reparsed) = reparsed {
+            assert_eq!(effect_card_to_value(&reparsed), value);
+        }
+    }
+
+    /// Projects and presets written before the blur parameter was renamed carry
+    /// `softness` instead of `blur_radius` and no shape/expansion keys; they must
+    /// still load, mapping the legacy blur radius and defaulting the rest.
+    #[test]
+    fn soft_glow_accepts_legacy_softness_and_defaults_new_fields() {
+        let legacy = serde_json::json!({
+            "effect": "soft_glow",
+            "enabled": true,
+            "radius": 8.0,
+            "softness": 6.5,
+            "color": [0, 0, 0, 255],
+        });
+        let parsed = parse_effect_cards(std::slice::from_ref(&legacy), NEUTRAL_EDITOR_COLOR)
+            .into_iter()
+            .next();
+        let Some(EffectCard::Glow(glow)) = parsed else {
+            panic!("expected a soft glow card");
+        };
+        assert!(glow.version == GlowEffectVersion::Soft);
+        assert!((glow.blur_radius_px - 6.5).abs() < f32::EPSILON);
+        assert!(glow.blur_bias.abs() < f32::EPSILON);
+        assert!((glow.blur_knee - 100.0).abs() < f32::EPSILON);
+        assert_eq!(glow.expand_x_plus_px, 0);
+        assert_eq!(glow.expand_x_minus_px, 0);
+        assert_eq!(glow.expand_y_plus_px, 0);
+        assert_eq!(glow.expand_y_minus_px, 0);
+        assert!(glow.outline_shape == GlowOutlineShape::Square);
+    }
+
     #[test]
     fn store_set_get_clear_roundtrips() {
         let key = "test_effect_kind_store_roundtrip";

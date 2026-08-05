@@ -8,15 +8,21 @@ Main responsibilities:
 - применять contour glow двух вариантов и soft outline glow;
 - держать glow falloff math рядом с glow-реализациями;
 - переиспользовать EDT/dilate/blur helper'ы из `image_ops`.
+
+Notes:
+Soft glow owns two pieces of math kept here next to its only caller: the per-side
+dilation dispatch (rectangle vs. ellipse element, `image_ops`) and
+`soft_glow_response_curve`, the bias/knee remap applied to the blurred outline. The
+curve is the identity at bias 0, which is what keeps pre-curve projects unchanged.
 */
 
 use super::super::raster::blend_pixel_over;
 use super::super::types::RenderedTextImage;
 use super::image_ops::{
-    EDT_COST_INF, dilate_alpha_max_filter3, euclidean_distance_transform_with_costs,
-    gaussian_blur_alpha_f32_in_place, gaussian_blur_alpha_in_place, gaussian_blur_kernel_radius,
+    EDT_COST_INF, dilate_alpha_ellipse, dilate_alpha_rect, euclidean_distance_transform_with_costs,
+    gaussian_blur_alpha_f32_in_place, gaussian_blur_kernel_radius,
 };
-use super::parse::{GlowEffectParams, SoftGlowEffectParams, StrokeOpacityMode};
+use super::parse::{GlowEffectParams, SoftGlowEffectParams, SoftGlowShape, StrokeOpacityMode};
 use rayon::prelude::*;
 
 /// Applies the legacy disc-splat contour glow (`glow_v1`).
@@ -303,8 +309,33 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
     image.content_origin_y = image.content_origin_y.saturating_add(pad);
 }
 
+/// Applies the soft outline glow (`soft_glow`).
+///
+/// Dilates the source alpha by the four per-side extents (`SoftGlowEffectParams::extents`)
+/// with either the rectangle or the ellipse element, subtracts the source to get the outline
+/// ring, blurs that ring with `blur_radius_px`, remaps it through `soft_glow_response_curve`,
+/// and composites the result under the source text. The outline is held in `f32` from the
+/// subtraction through the blur and the curve, with a single `u8` rounding at composite time,
+/// so the ring does not band (the same pattern `glow_v1`/`glow_v2` use).
+///
+/// The canvas grows PER SIDE — each side by its own extent plus the blur kernel half-width —
+/// so an asymmetric glow is not clipped and does not waste margin on the opposite side;
+/// `content_origin_x/y` therefore advance by the LEFT and TOP padding respectively.
+/// Returns without touching the image when all four extents are zero, when the glow color is
+/// fully transparent, or when the image (or the padded canvas) is empty.
+///
+/// The glow layer is deliberately NOT reduced by the source alpha (no `shaped - source_alpha`
+/// term, unlike the contour variants' `overlap` factor): this is the behavior every persisted
+/// soft-glow effect was authored against, and subtracting would visibly change antialiased
+/// glyph rims (partial coverage there is worth up to ~64/255 alpha). Nothing is lost visually
+/// because `blend_source_text` composites the source on top of the glow afterwards.
+///
+/// Cost note: `Round` dilation is `O(width * height * (up + down + 1))` while `Square` is
+/// `O(width * height)`; a very large round radius therefore runs for seconds and cannot be
+/// interrupted, since cancellation is only checked between effects.
 pub(crate) fn apply_soft_glow_effect(image: &mut RenderedTextImage, glow: &SoftGlowEffectParams) {
-    if glow.radius_steps == 0 {
+    let (left, right, up, down) = glow.extents();
+    if left == 0 && right == 0 && up == 0 && down == 0 {
         return;
     }
     let color_alpha_factor = glow.color[3] as f32 / 255.0;
@@ -318,11 +349,22 @@ pub(crate) fn apply_soft_glow_effect(image: &mut RenderedTextImage, glow: &SoftG
         return;
     }
 
-    let pad = ((glow.radius_steps as f32) + glow.softness_px.max(0.0) * 3.0)
-        .ceil()
-        .max(1.0) as u32;
-    let out_width = image.width.saturating_add(pad.saturating_mul(2));
-    let out_height = image.height.saturating_add(pad.saturating_mul(2));
+    // Per-side padding: the dilation reach on that side plus the blur tail, so neither the
+    // ring nor its blur is clipped at the canvas rim.
+    let blur_sigma = glow.blur_radius_px.max(0.0);
+    let blur_pad = gaussian_blur_kernel_radius(blur_sigma);
+    let pad_left = left.saturating_add(blur_pad);
+    let pad_right = right.saturating_add(blur_pad);
+    let pad_top = up.saturating_add(blur_pad);
+    let pad_bottom = down.saturating_add(blur_pad);
+    let out_width = image
+        .width
+        .saturating_add(pad_left)
+        .saturating_add(pad_right);
+    let out_height = image
+        .height
+        .saturating_add(pad_top)
+        .saturating_add(pad_bottom);
     if out_width == 0 || out_height == 0 {
         return;
     }
@@ -332,8 +374,8 @@ pub(crate) fn apply_soft_glow_effect(image: &mut RenderedTextImage, glow: &SoftG
     let source = image.rgba.clone();
     let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
     let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
-    let origin_x = pad as i32;
-    let origin_y = pad as i32;
+    let origin_x = pad_left as i32;
+    let origin_y = pad_top as i32;
 
     for y in 0..height {
         for x in 0..width {
@@ -350,27 +392,45 @@ pub(crate) fn apply_soft_glow_effect(image: &mut RenderedTextImage, glow: &SoftG
     }
 
     let mut dilated = source_alpha_expanded.clone();
-    dilate_alpha_max_filter3(
-        dilated.as_mut_slice(),
-        out_width_usize,
-        out_height_usize,
-        glow.radius_steps as usize,
-    );
-
-    let mut outline_alpha = vec![0u8; out_width_usize * out_height_usize];
-    for idx in 0..outline_alpha.len() {
-        outline_alpha[idx] = dilated[idx].saturating_sub(source_alpha_expanded[idx]);
+    match glow.shape {
+        SoftGlowShape::Square => dilate_alpha_rect(
+            dilated.as_mut_slice(),
+            out_width_usize,
+            out_height_usize,
+            left as usize,
+            right as usize,
+            up as usize,
+            down as usize,
+        ),
+        SoftGlowShape::Round => dilate_alpha_ellipse(
+            dilated.as_mut_slice(),
+            out_width_usize,
+            out_height_usize,
+            left as usize,
+            right as usize,
+            up as usize,
+            down as usize,
+        ),
     }
-    if glow.softness_px > f32::EPSILON {
-        gaussian_blur_alpha_in_place(&mut outline_alpha, out_width, out_height, glow.softness_px);
+
+    // Outline ring normalized to [0, 1] and kept in f32 through the blur and the curve.
+    let mut outline: Vec<f32> = dilated
+        .iter()
+        .zip(source_alpha_expanded.iter())
+        .map(|(&dilated_a, &source_a)| f32::from(dilated_a.saturating_sub(source_a)) / 255.0)
+        .collect();
+    if blur_sigma > f32::EPSILON {
+        gaussian_blur_alpha_f32_in_place(&mut outline, out_width, out_height, blur_sigma);
     }
 
-    // Each output pixel composites the soft-glow color from its own read-only outline
-    // alpha, so the glow layer is parallelized per pixel.
+    // Each output pixel composites the soft-glow color from its own read-only outline value,
+    // so the glow layer is parallelized per pixel; the curve, the color-alpha factor, and the
+    // single u8 rounding all happen here.
     out.par_chunks_mut(4)
-        .zip(outline_alpha.par_iter())
-        .for_each(|(dst, &alpha_val)| {
-            let glow_a = ((alpha_val as f32) * color_alpha_factor)
+        .zip(outline.par_iter())
+        .for_each(|(dst, &outline_value)| {
+            let shaped = soft_glow_response_curve(outline_value, glow.bias, glow.knee);
+            let glow_a = (shaped * color_alpha_factor * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -392,9 +452,59 @@ pub(crate) fn apply_soft_glow_effect(image: &mut RenderedTextImage, glow: &SoftG
     image.width = out_width;
     image.height = out_height;
     image.rgba = out;
-    // Контент сдвинут на pad по обеим осям внутри увеличенного буфера.
-    image.content_origin_x = image.content_origin_x.saturating_add(pad);
-    image.content_origin_y = image.content_origin_y.saturating_add(pad);
+    // Контент сдвинут на левый/верхний pad внутри увеличенного буфера (padding асимметричен).
+    image.content_origin_x = image.content_origin_x.saturating_add(pad_left);
+    image.content_origin_y = image.content_origin_y.saturating_add(pad_top);
+}
+
+/// Remaps a normalized soft-glow intensity `x` through the bias/knee response curve.
+///
+/// The curve is pinned at `(0, 0)` and `(1, 1)` and bends around a corner point that slides
+/// along the anti-diagonal: `bias` in `-100..=100` places the corner at
+/// `(0.5 - 0.5t, 0.5 + 0.5t)` with `t = bias/100`, so `+100` puts it at `(0, 1)` (the glow
+/// saturates immediately), `0` leaves the corner on the diagonal (the curve is EXACTLY the
+/// identity — this is what keeps legacy projects rendering unchanged), and `-100` puts it at
+/// `(1, 0)` (the glow stays dark until the very end).
+///
+/// `knee` in `0..=100` blends between two ways of passing through that corner: `0` is the
+/// sharp two-segment polyline `(0,0) -> corner -> (1,1)`, `100` is the quadratic Bezier that
+/// uses the corner as its control point. The Bezier is evaluated by inverting
+/// `x(t) = (1 - 2cx)t^2 + 2cx t` analytically; when `1 - 2cx` vanishes the three control
+/// points are collinear and the inversion is linear in `t`, which collapses the curve onto
+/// the identity. Inputs are clamped to `[0, 1]` and so is the result.
+fn soft_glow_response_curve(x: f32, bias: f32, knee: f32) -> f32 {
+    /// Degeneracy threshold for the corner position and the Bezier leading coefficient.
+    const CURVE_EPS: f32 = 1e-6;
+
+    let t = bias.clamp(-100.0, 100.0) / 100.0;
+    let k = knee.clamp(0.0, 100.0) / 100.0;
+    let corner_x = 0.5 - 0.5 * t;
+    let corner_y = 0.5 + 0.5 * t;
+    let x = x.clamp(0.0, 1.0);
+
+    // Sharp polyline through the corner; a degenerate corner collapses it to a step, which
+    // is exactly what bias = +-100 means.
+    let sharp = if corner_x <= CURVE_EPS {
+        if x > 0.0 { 1.0 } else { 0.0 }
+    } else if corner_x >= 1.0 - CURVE_EPS {
+        if x >= 1.0 { 1.0 } else { 0.0 }
+    } else if x < corner_x {
+        x * (corner_y / corner_x)
+    } else {
+        corner_y + (x - corner_x) * ((1.0 - corner_y) / (1.0 - corner_x))
+    };
+
+    // Quadratic Bezier P0=(0,0) P1=(corner) P2=(1,1), inverted for the Bezier parameter.
+    let quad_a = 1.0 - 2.0 * corner_x;
+    let bezier_t = if quad_a.abs() < CURVE_EPS {
+        x / (2.0 * corner_x).max(CURVE_EPS)
+    } else {
+        (-corner_x + (corner_x * corner_x + quad_a * x).max(0.0).sqrt()) / quad_a
+    };
+    let bezier_t = bezier_t.clamp(0.0, 1.0);
+    let bezier = 2.0 * bezier_t * (1.0 - bezier_t) * corner_y + bezier_t * bezier_t;
+
+    ((1.0 - k) * sharp + k * bezier).clamp(0.0, 1.0)
 }
 
 /// Gaussian sigma (in pixels) for the post-glow smoothing blur applied by `glow_v1`/`glow_v2`.
@@ -473,8 +583,13 @@ fn blend_source_text(
 
 #[cfg(test)]
 mod tests {
-    use super::super::parse::{GlowEffectParams, SoftGlowEffectParams, StrokeOpacityMode};
-    use super::{apply_glow_effect_v1, apply_glow_effect_v2, apply_soft_glow_effect};
+    use super::super::parse::{
+        GlowEffectParams, SoftGlowEffectParams, SoftGlowShape, StrokeOpacityMode,
+    };
+    use super::{
+        apply_glow_effect_v1, apply_glow_effect_v2, apply_soft_glow_effect,
+        soft_glow_response_curve,
+    };
     use crate::types::RenderedTextImage;
 
     fn sample_glyph_image() -> RenderedTextImage {
@@ -736,10 +851,15 @@ mod tests {
     /// `out.par_chunks_mut(4).zip(...).for_each(...)` composite replaced by a plain loop.
     fn apply_soft_glow_effect_seq(image: &mut RenderedTextImage, glow: &SoftGlowEffectParams) {
         use super::super::super::raster::blend_pixel_over;
-        use super::super::image_ops::{dilate_alpha_max_filter3, gaussian_blur_alpha_in_place};
-        use super::blend_source_text;
+        use super::super::image_ops::{
+            dilate_alpha_ellipse, dilate_alpha_rect, gaussian_blur_alpha_f32_in_place,
+            gaussian_blur_kernel_radius,
+        };
+        use super::super::parse::SoftGlowShape;
+        use super::{blend_source_text, soft_glow_response_curve};
 
-        if glow.radius_steps == 0 {
+        let (left, right, up, down) = glow.extents();
+        if left == 0 && right == 0 && up == 0 && down == 0 {
             return;
         }
         let color_alpha_factor = glow.color[3] as f32 / 255.0;
@@ -751,11 +871,20 @@ mod tests {
         if width == 0 || height == 0 {
             return;
         }
-        let pad = ((glow.radius_steps as f32) + glow.softness_px.max(0.0) * 3.0)
-            .ceil()
-            .max(1.0) as u32;
-        let out_width = image.width.saturating_add(pad.saturating_mul(2));
-        let out_height = image.height.saturating_add(pad.saturating_mul(2));
+        let blur_sigma = glow.blur_radius_px.max(0.0);
+        let blur_pad = gaussian_blur_kernel_radius(blur_sigma);
+        let pad_left = left.saturating_add(blur_pad);
+        let pad_right = right.saturating_add(blur_pad);
+        let pad_top = up.saturating_add(blur_pad);
+        let pad_bottom = down.saturating_add(blur_pad);
+        let out_width = image
+            .width
+            .saturating_add(pad_left)
+            .saturating_add(pad_right);
+        let out_height = image
+            .height
+            .saturating_add(pad_top)
+            .saturating_add(pad_bottom);
         if out_width == 0 || out_height == 0 {
             return;
         }
@@ -764,8 +893,8 @@ mod tests {
         let source = image.rgba.clone();
         let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
         let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
-        let origin_x = pad as i32;
-        let origin_y = pad as i32;
+        let origin_x = pad_left as i32;
+        let origin_y = pad_top as i32;
         for y in 0..height {
             for x in 0..width {
                 let src_idx = (y * width + x) * 4;
@@ -780,26 +909,37 @@ mod tests {
             }
         }
         let mut dilated = source_alpha_expanded.clone();
-        dilate_alpha_max_filter3(
-            dilated.as_mut_slice(),
-            out_width_usize,
-            out_height_usize,
-            glow.radius_steps as usize,
-        );
-        let mut outline_alpha = vec![0u8; out_width_usize * out_height_usize];
-        for idx in 0..outline_alpha.len() {
-            outline_alpha[idx] = dilated[idx].saturating_sub(source_alpha_expanded[idx]);
+        match glow.shape {
+            SoftGlowShape::Square => dilate_alpha_rect(
+                dilated.as_mut_slice(),
+                out_width_usize,
+                out_height_usize,
+                left as usize,
+                right as usize,
+                up as usize,
+                down as usize,
+            ),
+            SoftGlowShape::Round => dilate_alpha_ellipse(
+                dilated.as_mut_slice(),
+                out_width_usize,
+                out_height_usize,
+                left as usize,
+                right as usize,
+                up as usize,
+                down as usize,
+            ),
         }
-        if glow.softness_px > f32::EPSILON {
-            gaussian_blur_alpha_in_place(
-                &mut outline_alpha,
-                out_width,
-                out_height,
-                glow.softness_px,
-            );
+        let mut outline: Vec<f32> = dilated
+            .iter()
+            .zip(source_alpha_expanded.iter())
+            .map(|(&dilated_a, &source_a)| f32::from(dilated_a.saturating_sub(source_a)) / 255.0)
+            .collect();
+        if blur_sigma > f32::EPSILON {
+            gaussian_blur_alpha_f32_in_place(&mut outline, out_width, out_height, blur_sigma);
         }
-        for (dst, &alpha_val) in out.chunks_mut(4).zip(outline_alpha.iter()) {
-            let glow_a = ((alpha_val as f32) * color_alpha_factor)
+        for (dst, &outline_value) in out.chunks_mut(4).zip(outline.iter()) {
+            let shaped = soft_glow_response_curve(outline_value, glow.bias, glow.knee);
+            let glow_a = (shaped * color_alpha_factor * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -852,11 +992,48 @@ mod tests {
         assert_eq!(parallel.rgba, sequential.rgba);
     }
 
+    /// Baseline soft-glow configuration: legacy-shaped (square, symmetric, identity curve).
+    fn sample_soft_glow_params() -> SoftGlowEffectParams {
+        SoftGlowEffectParams {
+            radius_px: 2,
+            expand_x_plus: 0,
+            expand_x_minus: 0,
+            expand_y_plus: 0,
+            expand_y_minus: 0,
+            shape: SoftGlowShape::Square,
+            blur_radius_px: 1.4,
+            bias: 0.0,
+            knee: 100.0,
+            color: [10, 200, 255, 180],
+        }
+    }
+
     #[test]
     fn soft_glow_parallel_composite_matches_sequential() {
+        let glow = sample_soft_glow_params();
+        let mut parallel = sample_glyph_image();
+        let mut sequential = sample_glyph_image();
+        apply_soft_glow_effect(&mut parallel, &glow);
+        apply_soft_glow_effect_seq(&mut sequential, &glow);
+        assert_eq!(parallel.rgba, sequential.rgba);
+        assert_eq!(parallel.width, sequential.width);
+        assert_eq!(parallel.height, sequential.height);
+    }
+
+    /// Same bit-identity check on the new geometry: round outline, asymmetric per-side
+    /// expansion (including a negative side) and a non-zero bias/knee curve.
+    #[test]
+    fn soft_glow_round_asymmetric_parallel_composite_matches_sequential() {
         let glow = SoftGlowEffectParams {
-            radius_steps: 2,
-            softness_px: 1.4,
+            radius_px: 4,
+            expand_x_plus: 3,
+            expand_x_minus: -2,
+            expand_y_plus: 1,
+            expand_y_minus: 5,
+            shape: SoftGlowShape::Round,
+            blur_radius_px: 2.1,
+            bias: 45.0,
+            knee: 60.0,
             color: [10, 200, 255, 180],
         };
         let mut parallel = sample_glyph_image();
@@ -864,6 +1041,221 @@ mod tests {
         apply_soft_glow_effect(&mut parallel, &glow);
         apply_soft_glow_effect_seq(&mut sequential, &glow);
         assert_eq!(parallel.rgba, sequential.rgba);
+        assert_eq!(parallel.width, sequential.width);
+        assert_eq!(parallel.height, sequential.height);
+    }
+
+    /// Per-side padding must follow the per-side extents: the canvas grows by
+    /// `extent + blur kernel radius` on each side and `content_origin` moves by the LEFT/TOP
+    /// padding only.
+    #[test]
+    fn soft_glow_pads_each_side_by_its_own_extent() {
+        let glow = SoftGlowEffectParams {
+            radius_px: 3,
+            expand_x_plus: 6,
+            expand_x_minus: 0,
+            expand_y_plus: 0,
+            expand_y_minus: 4,
+            shape: SoftGlowShape::Square,
+            blur_radius_px: 0.0,
+            bias: 0.0,
+            knee: 100.0,
+            color: [255, 255, 255, 255],
+        };
+        let base = sample_glyph_image();
+        let (base_width, base_height) = (base.width, base.height);
+        let mut image = base;
+        apply_soft_glow_effect(&mut image, &glow);
+
+        // extents: left 3, right 9, up 7, down 3; blur radius 0 adds nothing.
+        assert_eq!(image.width, base_width + 3 + 9);
+        assert_eq!(image.height, base_height + 7 + 3);
+        assert_eq!(image.content_origin_x, 3);
+        assert_eq!(image.content_origin_y, 7);
+        assert_eq!(
+            image.rgba.len(),
+            image.width as usize * image.height as usize * 4
+        );
+    }
+
+    /// With `bias = 0` the response curve is the identity, so the composited glow must equal
+    /// the plain blurred outline: the reference below reproduces the outline field with the
+    /// shared helpers and compares the alpha of every pixel the source text does not cover.
+    #[test]
+    fn soft_glow_bias_zero_matches_plain_blurred_outline() {
+        use super::super::image_ops::{dilate_alpha_rect, gaussian_blur_alpha_f32_in_place};
+
+        let glow = SoftGlowEffectParams {
+            knee: 55.0,
+            ..sample_soft_glow_params()
+        };
+        let source = sample_glyph_image();
+        let (src_width, src_height) = (source.width as usize, source.height as usize);
+        let src_rgba = source.rgba.clone();
+        let mut image = source;
+        apply_soft_glow_effect(&mut image, &glow);
+
+        let out_width = image.width as usize;
+        let out_height = image.height as usize;
+        let origin_x = image.content_origin_x as usize;
+        let origin_y = image.content_origin_y as usize;
+
+        let mut expanded = vec![0u8; out_width * out_height];
+        for y in 0..src_height {
+            for x in 0..src_width {
+                expanded[(origin_y + y) * out_width + origin_x + x] =
+                    src_rgba[(y * src_width + x) * 4 + 3];
+            }
+        }
+        let mut dilated = expanded.clone();
+        dilate_alpha_rect(dilated.as_mut_slice(), out_width, out_height, 2, 2, 2, 2);
+        let mut outline: Vec<f32> = dilated
+            .iter()
+            .zip(expanded.iter())
+            .map(|(&d, &s)| f32::from(d.saturating_sub(s)) / 255.0)
+            .collect();
+        gaussian_blur_alpha_f32_in_place(
+            &mut outline,
+            image.width,
+            image.height,
+            glow.blur_radius_px,
+        );
+
+        let color_alpha_factor = f32::from(glow.color[3]) / 255.0;
+        for (idx, &outline_value) in outline.iter().enumerate() {
+            if expanded[idx] != 0 {
+                // Covered by the source text, whose own composite dominates the alpha there.
+                continue;
+            }
+            let expected = (outline_value * color_alpha_factor * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            assert_eq!(
+                image.rgba[idx * 4 + 3],
+                expected,
+                "pixel {idx}: curve must be a no-op at bias 0"
+            );
+        }
+    }
+
+    /// The round element is inscribed in the square one, so an equal-radius round glow may
+    /// never exceed the square glow anywhere, and must fall strictly short at the corners.
+    #[test]
+    fn soft_glow_round_is_contained_in_square() {
+        let square = SoftGlowEffectParams {
+            radius_px: 6,
+            blur_radius_px: 0.0,
+            shape: SoftGlowShape::Square,
+            ..sample_soft_glow_params()
+        };
+        let round = SoftGlowEffectParams {
+            shape: SoftGlowShape::Round,
+            ..square.clone()
+        };
+        let mut square_image = sample_glyph_image();
+        let mut round_image = sample_glyph_image();
+        apply_soft_glow_effect(&mut square_image, &square);
+        apply_soft_glow_effect(&mut round_image, &round);
+
+        assert_eq!(square_image.width, round_image.width);
+        assert_eq!(square_image.height, round_image.height);
+        let mut strictly_smaller = 0usize;
+        for (square_px, round_px) in square_image
+            .rgba
+            .chunks_exact(4)
+            .zip(round_image.rgba.chunks_exact(4))
+        {
+            assert!(
+                round_px[3] <= square_px[3],
+                "round glow alpha {} exceeds square glow alpha {}",
+                round_px[3],
+                square_px[3]
+            );
+            if round_px[3] < square_px[3] {
+                strictly_smaller += 1;
+            }
+        }
+        assert!(
+            strictly_smaller > 0,
+            "round glow must be strictly smaller than the square glow at the corners"
+        );
+    }
+
+    /// The response curve must be pinned at both ends for every bias/knee combination.
+    #[test]
+    fn soft_glow_curve_is_pinned_at_both_ends() {
+        for bias in [-100.0f32, -60.0, -1.0, 0.0, 1.0, 60.0, 100.0] {
+            for knee in [0.0f32, 25.0, 50.0, 75.0, 100.0] {
+                let at_zero = soft_glow_response_curve(0.0, bias, knee);
+                let at_one = soft_glow_response_curve(1.0, bias, knee);
+                assert!(
+                    at_zero.abs() <= 1e-6,
+                    "curve(0) = {at_zero} at bias {bias}, knee {knee}"
+                );
+                assert!(
+                    (at_one - 1.0).abs() <= 1e-6,
+                    "curve(1) = {at_one} at bias {bias}, knee {knee}"
+                );
+            }
+        }
+    }
+
+    /// Bias 0 must be the exact identity at every knee — this is what keeps projects saved
+    /// before the curve existed rendering unchanged.
+    #[test]
+    fn soft_glow_curve_is_identity_at_zero_bias() {
+        for knee in [0.0f32, 50.0, 100.0] {
+            for step in 0..=200 {
+                let x = step as f32 / 200.0;
+                let y = soft_glow_response_curve(x, 0.0, knee);
+                assert!(
+                    (y - x).abs() <= 1e-6,
+                    "curve({x}) = {y} at bias 0, knee {knee}"
+                );
+            }
+        }
+    }
+
+    /// The curve must be monotonic non-decreasing everywhere it is used: a dip would make a
+    /// thicker outline produce a fainter glow.
+    #[test]
+    fn soft_glow_curve_is_monotonic() {
+        for bias_step in -20..=20 {
+            let bias = bias_step as f32 * 5.0;
+            for knee in [0.0f32, 50.0, 100.0] {
+                let mut previous = soft_glow_response_curve(0.0, bias, knee);
+                for step in 1..=400 {
+                    let x = step as f32 / 400.0;
+                    let value = soft_glow_response_curve(x, bias, knee);
+                    assert!(
+                        value >= previous - 1e-6,
+                        "curve dips at x = {x} (bias {bias}, knee {knee}): {previous} -> {value}"
+                    );
+                    previous = value;
+                }
+            }
+        }
+    }
+
+    /// The analytically inverted Bezier (knee 100) must agree with a forward evaluation of the
+    /// same quadratic Bezier, sampled by its own parameter.
+    #[test]
+    fn soft_glow_curve_matches_forward_bezier() {
+        for bias in [-80.0f32, -40.0, 40.0, 80.0] {
+            let t = f64::from(bias) / 100.0;
+            let corner_x = 0.5 - 0.5 * t;
+            let corner_y = 0.5 + 0.5 * t;
+            for step in 0..=100 {
+                let param = f64::from(step) / 100.0;
+                let x = (1.0 - 2.0 * corner_x) * param * param + 2.0 * corner_x * param;
+                let y = 2.0 * param * (1.0 - param) * corner_y + param * param;
+                let got = soft_glow_response_curve(x as f32, bias, 100.0);
+                assert!(
+                    (f64::from(got) - y).abs() <= 1e-5,
+                    "bias {bias}, t {param}: curve({x}) = {got}, forward Bezier = {y}"
+                );
+            }
+        }
     }
 
     /// Default-falloff, radius-16 glow used by the smoothness goldens: opaque white so the

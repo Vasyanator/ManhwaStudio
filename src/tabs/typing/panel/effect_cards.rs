@@ -167,7 +167,17 @@ pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
                 "effect": "soft_glow",
                 "enabled": true,
                 "radius": glow.radius_px.round().max(0.0),
-                "softness": glow.softness_px,
+                "expand_x_plus": glow.expand_x_plus_px,
+                "expand_x_minus": glow.expand_x_minus_px,
+                "expand_y_plus": glow.expand_y_plus_px,
+                "expand_y_minus": glow.expand_y_minus_px,
+                "shape": match glow.outline_shape {
+                    GlowOutlineShape::Square => "square",
+                    GlowOutlineShape::Round => "round",
+                },
+                "blur_radius": glow.blur_radius_px,
+                "bias": glow.blur_bias,
+                "knee": glow.blur_knee,
                 "color": glow.color.rgba(),
             }),
         },
@@ -547,12 +557,111 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 .changed();
         }
         EffectCard::Glow(glow) => {
+            // The slider ceiling must track the reader clamp in `effect_parse.rs` and the
+            // renderer's own range for the kind: `WheelSlider` inherits
+            // `SliderClamping::Always`, so a stored radius above the slider maximum would be
+            // silently written back truncated with `changed() == false` (no re-render, no undo
+            // entry) and then persisted. Soft glow accepts 0..=512, V1/V2 accept 0..=300.
+            let radius_max = match glow.version {
+                GlowEffectVersion::V1 | GlowEffectVersion::V2 => 300.0,
+                GlowEffectVersion::Soft => 512.0,
+            };
             changed |= ui
-                .add(WheelSlider::new(&mut glow.radius_px, 0.0..=300.0).text(t!("typing.effects.radius_px_label")))
+                .add(WheelSlider::new(&mut glow.radius_px, 0.0..=radius_max).text(t!("typing.effects.radius_px_label")))
                 .changed();
             if glow.version == GlowEffectVersion::Soft {
+                let mut shape_idx = match glow.outline_shape {
+                    GlowOutlineShape::Square => 0,
+                    GlowOutlineShape::Round => 1,
+                };
+                let glow_shape_prev = shape_idx;
+                let glow_shape_combo = WheelComboBox::from_label(t!("typing.effects.soft_glow_shape_combo_id")).id_salt("typing.effects.soft_glow_shape_combo_id")
+                    .selected_text(match glow.outline_shape {
+                        GlowOutlineShape::Square => t!("typing.effects.soft_glow_shape_square_option"),
+                        GlowOutlineShape::Round => t!("typing.effects.soft_glow_shape_round_option"),
+                    })
+                    .show_ui_with_wheel(ui, |ui| {
+                        if ui
+                            .selectable_label(shape_idx == 0, t!("typing.effects.soft_glow_shape_square_option"))
+                            .clicked()
+                        {
+                            shape_idx = 0;
+                        }
+                        if ui
+                            .selectable_label(shape_idx == 1, t!("typing.effects.soft_glow_shape_round_option"))
+                            .clicked()
+                        {
+                            shape_idx = 1;
+                        }
+                    });
+                if let Some(steps) = glow_shape_combo.wheel_steps {
+                    cycle_wrapped_index(&mut shape_idx, 2, steps);
+                }
+                changed |= shape_idx != glow_shape_prev;
+                glow.outline_shape = if shape_idx == 0 {
+                    GlowOutlineShape::Square
+                } else {
+                    GlowOutlineShape::Round
+                };
+
+                ui.label(t!("typing.effects.soft_glow_expand_label"));
+                // A 2x2 `Grid` (not two `ui.horizontal` rows): the X and Y spin boxes
+                // carry prefix captions of different widths, so only a grid keeps the
+                // second column aligned between the two rows. The salt is fixed because
+                // every call site already wraps a card in its own `push_id`/`id_salt`
+                // scope, so two soft-glow cards never share this grid's id.
+                egui::Grid::new("typing_soft_glow_expand_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut glow.expand_x_plus_px)
+                                    .range(-512..=512)
+                                    .prefix(t!("typing.effects.soft_glow_expand_x_plus_label")),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut glow.expand_x_minus_px)
+                                    .range(-512..=512)
+                                    .prefix(t!("typing.effects.soft_glow_expand_x_minus_label")),
+                            )
+                            .changed();
+                        ui.end_row();
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut glow.expand_y_plus_px)
+                                    .range(-512..=512)
+                                    .prefix(t!("typing.effects.soft_glow_expand_y_plus_label")),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                WheelSpinBox::new(&mut glow.expand_y_minus_px)
+                                    .range(-512..=512)
+                                    .prefix(t!("typing.effects.soft_glow_expand_y_minus_label")),
+                            )
+                            .changed();
+                        ui.end_row();
+                    });
+
                 changed |= ui
-                    .add(WheelSlider::new(&mut glow.softness_px, 0.0..=100.0).text(t!("typing.effects.softness_px_label")))
+                    .add(
+                        WheelSlider::new(&mut glow.blur_radius_px, 0.0..=256.0)
+                            .text(t!("typing.effects.blur_radius_px_label")),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        WheelSlider::new(&mut glow.blur_bias, -100.0..=100.0)
+                            .text(t!("typing.effects.blur_bias_label")),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        WheelSlider::new(&mut glow.blur_knee, 0.0..=100.0)
+                            .text(t!("typing.effects.blur_knee_label")),
+                    )
                     .changed();
                 changed |= glow.color.draw(ui, t!("typing.effects.color_label"));
             } else {

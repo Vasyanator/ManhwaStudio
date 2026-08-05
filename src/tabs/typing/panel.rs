@@ -1021,6 +1021,15 @@ enum GlowEffectVersion {
     Soft,
 }
 
+/// Shape of the structuring element the soft-glow effect dilates the source
+/// contour with. Serialized as the JSON `shape` string (`square` / `round`)
+/// consumed by the renderer's `soft_glow` effect.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlowOutlineShape {
+    Square,
+    Round,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Gradient2FillMode {
     AllOpaque,
@@ -1176,10 +1185,35 @@ struct InterferenceEffectCard {
     jitter_px: f32,
 }
 
+/// UI model shared by the three glow effect cards. `version` selects both the
+/// serialized JSON kind (`glow_v1` / `glow_v2` / `soft_glow`) and the controls
+/// drawn by `draw_effect_card_controls`; the fields that do not belong to the
+/// active version hold inert placeholders and are never serialized.
+///
+/// The soft-glow expansion fields are ADDITIONAL dilation in whole pixels applied
+/// on one side each, on top of `radius_px`: `x_plus` = right, `x_minus` = left,
+/// `y_plus` = down, `y_minus` = up.
 struct GlowEffectCard {
     version: GlowEffectVersion,
     radius_px: f32,
-    softness_px: f32,
+    /// Soft glow only: SIGMA of the gaussian blur applied to the dilated outline, in px
+    /// (the renderer passes this value straight in as the blur sigma, so the visible
+    /// reach is roughly 3x it). The user-visible label calls it a radius on purpose.
+    blur_radius_px: f32,
+    /// Soft glow only: blur response bias, in percent (-100..=100).
+    blur_bias: f32,
+    /// Soft glow only: blur response knee, in percent (0..=100); 100 = no knee.
+    blur_knee: f32,
+    /// Soft glow only: extra dilation on the right side, in px (-512..=512).
+    expand_x_plus_px: i32,
+    /// Soft glow only: extra dilation on the left side, in px (-512..=512).
+    expand_x_minus_px: i32,
+    /// Soft glow only: extra dilation on the bottom side, in px (-512..=512).
+    expand_y_plus_px: i32,
+    /// Soft glow only: extra dilation on the top side, in px (-512..=512).
+    expand_y_minus_px: i32,
+    /// Soft glow only: shape of the dilation structuring element.
+    outline_shape: GlowOutlineShape,
     color: ColorField,
     opacity_mode: StrokeOpacityMode,
     transparency_percent: f32,

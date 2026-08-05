@@ -8,12 +8,20 @@ Main responsibilities:
 - держать blur/dilate/blend/EDT helpers отдельно от конкретных эффектов;
 - переиспользоваться несколькими effect-модулями без копипасты;
 - содержать локальные тесты на безопасные image helper'ы.
+
+Notes:
+Dilation comes in two production forms, both taking four independent per-side extents:
+`dilate_alpha_rect` (separable sliding-window maximum, O(width*height)) and
+`dilate_alpha_ellipse` (per-quadrant semi-axes, O(width*height*(up+down+1))). The legacy
+iterated `dilate_alpha_max_filter3` is test-only now and serves as the reference the
+rectangle equivalence golden compares against.
 */
 
 use super::super::raster::blend_pixel_over;
 #[cfg(test)]
 use super::super::types::RenderedTextImage;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 
 /// Composites a straight-alpha RGBA `src` buffer over `dst` in place, pixel for pixel.
 ///
@@ -284,6 +292,11 @@ fn separable_gaussian_blur_f32(buffer: &mut [f32], width: usize, height: usize, 
 /// (neighbors clamp to the image bounds). Each iteration reads the previous state and
 /// writes a fresh scratch buffer; the output rows of one iteration are independent and
 /// parallelized, so each iteration is bit-identical to the sequential filter.
+///
+/// Test-only: production code dilates through `dilate_alpha_rect` (which is `O(1)` amortized
+/// per pixel and supports asymmetric extents). This iterated filter is kept as the independent
+/// reference the `dilate_alpha_rect` equivalence golden compares against.
+#[cfg(test)]
 pub(crate) fn dilate_alpha_max_filter3(
     alpha: &mut [u8],
     width: usize,
@@ -316,6 +329,247 @@ pub(crate) fn dilate_alpha_max_filter3(
             });
         alpha.copy_from_slice(tmp.as_slice());
     }
+}
+
+/// Dilates `alpha` with an axis-aligned, possibly asymmetric rectangle.
+///
+/// `alpha` is a single-channel `width * height` buffer mutated in place; the four extents are
+/// the reach, in px, that an opaque pixel gains towards each side (`left`/`right` along x,
+/// `up`/`down` along y). Because dilation mirrors its structuring element, the output at `x`
+/// reads the source over `[x - right, x + left]` — a pure right-side extent therefore grows
+/// the shape to the right. Out-of-image indices are dropped, which is identical to the
+/// clamp-to-edge handling of `dilate_alpha_max_filter3` (repeating an edge pixel cannot change
+/// a maximum). Extents beyond the image, zero extents, and zero-sized images are all handled
+/// without panicking; a `width * height` mismatch leaves the buffer untouched.
+///
+/// The filter is separable: a horizontal sliding-window maximum followed by a vertical one
+/// (run on a transposed copy so both use the same row kernel and row-parallel access). Each
+/// pass is `O(1)` amortized per pixel via a monotonic index deque, so the total cost is
+/// `O(width * height)` regardless of the extents. Every output row is written from a read-only
+/// snapshot, so the rayon-parallel result is bit-identical to a sequential pass.
+///
+/// With `left == right == up == down == n` this is exactly `dilate_alpha_max_filter3(.., n)`.
+pub(crate) fn dilate_alpha_rect(
+    alpha: &mut [u8],
+    width: usize,
+    height: usize,
+    left: usize,
+    right: usize,
+    up: usize,
+    down: usize,
+) {
+    if width == 0 || height == 0 || alpha.len() != width * height {
+        return;
+    }
+    // Reach past the image edge adds nothing: every wider window covers the same pixels as
+    // the widest in-bounds one, so clamping keeps the result exact and bounds the work.
+    let left = left.min(width - 1);
+    let right = right.min(width - 1);
+    let up = up.min(height - 1);
+    let down = down.min(height - 1);
+
+    if left != 0 || right != 0 {
+        let source = alpha.to_vec();
+        alpha
+            .par_chunks_mut(width)
+            .zip(source.par_chunks(width))
+            .for_each(|(dst_row, src_row)| {
+                let mut window = VecDeque::with_capacity(left + right + 2);
+                sliding_max_row(src_row, dst_row, right, left, &mut window);
+            });
+    }
+
+    if up != 0 || down != 0 {
+        // Columns become rows: the vertical pass then reuses the same cache-friendly,
+        // row-parallel kernel instead of striding the buffer by `width`.
+        let mut transposed = vec![0u8; alpha.len()];
+        transpose_u8(alpha, &mut transposed, width, height);
+        let mut dilated = vec![0u8; alpha.len()];
+        dilated
+            .par_chunks_mut(height)
+            .zip(transposed.par_chunks(height))
+            .for_each(|(dst_col, src_col)| {
+                let mut window = VecDeque::with_capacity(up + down + 2);
+                sliding_max_row(src_col, dst_col, down, up, &mut window);
+            });
+        transpose_u8(&dilated, alpha, height, width);
+    }
+}
+
+/// Dilates `alpha` with an ellipse whose four quadrants use the four per-side extents.
+///
+/// `alpha` is a single-channel `width * height` buffer mutated in place. An element offset
+/// `(dx, dy)` belongs to the ellipse iff `(dx/rx)^2 + (dy/ry)^2 <= 1`, where `rx` is `right`
+/// for `dx >= 0` and `left` otherwise, and `ry` is `down` for `dy >= 0` and `up` otherwise.
+/// A zero semi-axis degenerates to that side's axis line only, and the centre offset is always
+/// part of the element. Like `dilate_alpha_rect`, the element is mirrored when applied: the
+/// output row `y` reads source row `y - dy`, so `down` grows the shape downwards.
+///
+/// Implemented per output row: for every `dy` the row half-widths come from
+/// `ellipse_row_half_width` (exact integer arithmetic, so lattice points lying exactly on the
+/// ellipse are kept), and the source
+/// row's sliding-window maximum over `[-lx, rx]` is `max`-ed into the output row. Cost is
+/// `O(width * height * (up + down + 1))`. Output rows read only the immutable source snapshot,
+/// so the rayon-parallel result is bit-identical to a sequential pass. Zero-sized images, zero
+/// extents, extents larger than the image, and a `width * height` mismatch are all handled
+/// without panicking.
+pub(crate) fn dilate_alpha_ellipse(
+    alpha: &mut [u8],
+    width: usize,
+    height: usize,
+    left: usize,
+    right: usize,
+    up: usize,
+    down: usize,
+) {
+    if width == 0 || height == 0 || alpha.len() != width * height {
+        return;
+    }
+    if left == 0 && right == 0 && up == 0 && down == 0 {
+        return;
+    }
+
+    // Only the ITERATION range is clamped, never the semi-axes: `ry` shapes the ellipse and
+    // must keep its requested value. Offsets past the image edge would all read the same
+    // clamped edge row through a narrower window than the last in-bounds offset does, so
+    // dropping them leaves the maximum unchanged.
+    let dy_down_max = down.min(height - 1);
+    let dy_up_max = up.min(height - 1);
+    let window_capacity = left.min(width - 1) + right.min(width - 1) + 2;
+
+    let source = alpha.to_vec();
+    alpha
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, out_row)| {
+            let mut window = VecDeque::with_capacity(window_capacity);
+            let mut scratch = vec![0u8; width];
+            out_row.fill(0);
+            for (dy_abs, downwards) in (0..=dy_down_max)
+                .map(|dy| (dy, true))
+                .chain((1..=dy_up_max).map(|dy| (dy, false)))
+            {
+                let semi_axis_y = if downwards { down } else { up };
+                // Degenerate semi-axis: only the `dy == 0` axis line belongs to the element.
+                if semi_axis_y == 0 && dy_abs != 0 {
+                    continue;
+                }
+                // `.min(width - 1)` is what actually bounds the window, so a semi-axis larger
+                // than the image degenerates to a full row.
+                let half_left = ellipse_row_half_width(left, semi_axis_y, dy_abs).min(width - 1);
+                let half_right = ellipse_row_half_width(right, semi_axis_y, dy_abs).min(width - 1);
+
+                let source_y = if downwards {
+                    y.saturating_sub(dy_abs)
+                } else {
+                    y.saturating_add(dy_abs).min(height - 1)
+                };
+                let row_start = source_y * width;
+                sliding_max_row(
+                    &source[row_start..row_start + width],
+                    scratch.as_mut_slice(),
+                    half_right,
+                    half_left,
+                    &mut window,
+                );
+                for (out_px, &value) in out_row.iter_mut().zip(scratch.iter()) {
+                    *out_px = (*out_px).max(value);
+                }
+            }
+        });
+}
+
+/// Half-width of the ellipse row at vertical offset `dy`, in px.
+///
+/// Returns the largest integer `d >= 0` satisfying `(d / semi_x)^2 + (dy / semi_y)^2 <= 1`,
+/// i.e. `floor(semi_x * sqrt(semi_y^2 - dy^2) / semi_y)`. It is evaluated in exact integer
+/// arithmetic (`isqrt` over `u128`) rather than in floating point, because `floor` of a float
+/// product drops the lattice points that sit EXACTLY on the ellipse: every Pythagorean triple
+/// (`semi = 10, dy = 8, d = 6`, `semi = 5, dy = 4, d = 3`, ...) rounds to just below the
+/// integer and loses a pixel, denting the outline at the affected rows.
+///
+/// A zero `semi_x` returns `0` (the element collapses onto the vertical axis) and a zero
+/// `semi_y` degenerates to the horizontal axis line, so it returns `semi_x` at `dy == 0` and
+/// `0` elsewhere. `dy > semi_y` is outside the element and returns `0`.
+///
+/// The `u128` products cannot overflow: both semi-axes originate from `u32` extents, and
+/// `(2^32 - 1)^4 < 2^128`. The widening `usize -> u128` casts are lossless on every supported
+/// target (no `From<usize> for u128` exists in `std`).
+fn ellipse_row_half_width(semi_x: usize, semi_y: usize, dy: usize) -> usize {
+    if semi_x == 0 {
+        return 0;
+    }
+    if semi_y == 0 {
+        return if dy == 0 { semi_x } else { 0 };
+    }
+    if dy >= semi_y {
+        return 0;
+    }
+    let semi_x_sq = (semi_x as u128) * (semi_x as u128);
+    let semi_y_sq = (semi_y as u128) * (semi_y as u128);
+    let dy_sq = (dy as u128) * (dy as u128);
+    // d * semi_y <= sqrt(semi_x^2 * (semi_y^2 - dy^2)) <=> d^2 * semi_y^2 <= semi_x^2 * (...),
+    // and both sides are integers, so flooring the integer square root is exact.
+    let bound = (semi_x_sq * (semi_y_sq - dy_sq)).isqrt() / (semi_y as u128);
+    // `bound <= semi_x <= usize::MAX`, so the conversion cannot fail; `unwrap_or` is
+    // unreachable defensive code, not error swallowing.
+    usize::try_from(bound).unwrap_or(semi_x)
+}
+
+/// Writes the sliding-window maximum of `src` into `dst`: `dst[x] = max(src[x - back ..= x + forward])`.
+///
+/// Indices outside the row are dropped, which equals clamp-to-edge for a maximum. `window` is
+/// caller-owned scratch (cleared on entry) holding source indices whose values are strictly
+/// decreasing, so each element is pushed and popped at most once and the row costs `O(len)`
+/// no matter how wide the window is. Only the first `min(src.len(), dst.len())` slots are
+/// written; a zero-length row is a no-op.
+fn sliding_max_row(
+    src: &[u8],
+    dst: &mut [u8],
+    back: usize,
+    forward: usize,
+    window: &mut VecDeque<usize>,
+) {
+    window.clear();
+    let len = src.len().min(dst.len());
+    if len == 0 {
+        return;
+    }
+    let mut next = 0usize;
+    for x in 0..len {
+        let end = x.saturating_add(forward).min(len - 1);
+        while next <= end {
+            let value = src[next];
+            // Anything not larger than the incoming value can never be a future maximum.
+            while window.back().is_some_and(|&idx| src[idx] <= value) {
+                window.pop_back();
+            }
+            window.push_back(next);
+            next += 1;
+        }
+        let start = x.saturating_sub(back);
+        while window.front().is_some_and(|&idx| idx < start) {
+            window.pop_front();
+        }
+        // The window always contains `x` itself (`start <= x <= end`), so the front exists;
+        // `src[x]` is a correct lower bound and only defensive.
+        dst[x] = window.front().map_or(src[x], |&idx| src[idx]);
+    }
+}
+
+/// Transposes a single-channel `width * height` buffer into `dst` (`height * width`).
+///
+/// `dst[x * height + y] = src[y * width + x]`. Output rows are independent and parallelized;
+/// a length mismatch on either buffer is a no-op.
+fn transpose_u8(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
+    if src.len() != width * height || dst.len() != src.len() || width == 0 || height == 0 {
+        return;
+    }
+    dst.par_chunks_mut(height).enumerate().for_each(|(x, column)| {
+        for (y, out_px) in column.iter_mut().enumerate() {
+            *out_px = src[y * width + x];
+        }
+    });
 }
 
 pub(crate) fn sample_rgba_premultiplied_bilinear(
@@ -720,8 +974,8 @@ pub(crate) fn image_has_alpha_on_edge(image: &RenderedTextImage, inset_px: u32) 
 #[cfg(test)]
 mod tests {
     use super::{
-        EDT_COST_INF, blend_full_image_over, dilate_alpha_max_filter3,
-        euclidean_distance_transform_with_costs, gaussian_blur_alpha_in_place,
+        EDT_COST_INF, blend_full_image_over, dilate_alpha_ellipse, dilate_alpha_max_filter3,
+        dilate_alpha_rect, euclidean_distance_transform_with_costs, gaussian_blur_alpha_in_place,
         gaussian_blur_rgba_in_place, image_has_alpha_on_edge, sample_rgba_premultiplied_bilinear,
     };
     use crate::raster::blend_pixel_over;
@@ -1137,6 +1391,208 @@ mod tests {
         let got = euclidean_distance_transform_with_costs(&[0.0f32; 7], 4, 3);
         assert_eq!(got.len(), 12);
         assert!(got.iter().all(|&v| v >= EDT_COST_INF));
+    }
+
+    /// Deterministic pseudo-random alpha image (splitmix-style LCG, no external RNG).
+    fn pseudo_random_alpha(width: usize, height: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..width * height)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                u8::try_from((state >> 33) & 0xFF).unwrap_or(0)
+            })
+            .collect()
+    }
+
+    /// A single opaque dot on an otherwise empty canvas.
+    fn dot_image(width: usize, height: usize, x: usize, y: usize) -> Vec<u8> {
+        let mut alpha = vec![0u8; width * height];
+        alpha[y * width + x] = 255;
+        alpha
+    }
+
+    /// The symmetric rectangle dilation must reproduce the legacy iterated 3x3 max filter
+    /// byte for byte — this is what proves the persisted square soft-glow is preserved.
+    #[test]
+    fn dilate_rect_symmetric_matches_max_filter3() {
+        let width = 23usize;
+        let height = 17usize;
+        let base = pseudo_random_alpha(width, height, 0x5EED_1234);
+
+        for n in 0..=6usize {
+            let mut rect = base.clone();
+            let mut legacy = base.clone();
+            dilate_alpha_rect(rect.as_mut_slice(), width, height, n, n, n, n);
+            dilate_alpha_max_filter3(legacy.as_mut_slice(), width, height, n);
+            assert_eq!(rect, legacy, "rect dilation differs from max-filter3 at n = {n}");
+        }
+    }
+
+    /// An asymmetric rectangle must grow exactly the requested sides and nothing else.
+    #[test]
+    fn dilate_rect_grows_only_requested_sides() {
+        let (width, height) = (15usize, 13usize);
+        let (cx, cy) = (7usize, 6usize);
+        let mut alpha = dot_image(width, height, cx, cy);
+        dilate_alpha_rect(alpha.as_mut_slice(), width, height, 0, 3, 2, 0);
+
+        for y in 0..height {
+            for x in 0..width {
+                let grown_right = x >= cx && x <= cx + 3;
+                let grown_up = y + 2 >= cy && y <= cy;
+                let expected = if grown_right && grown_up { 255 } else { 0 };
+                assert_eq!(
+                    alpha[y * width + x],
+                    expected,
+                    "pixel ({x},{y}) after right=3 / up=2 dilation"
+                );
+            }
+        }
+    }
+
+    /// The ellipse element must match its analytic definition exactly (verified by dilating a
+    /// single dot, where the output IS the element) and stay inside the rectangle of the same
+    /// extents while still reaching all four axis extremes.
+    #[test]
+    fn dilate_ellipse_matches_quadrant_definition_and_fits_in_rect() {
+        let (width, height) = (41usize, 33usize);
+        let (cx, cy) = (20usize, 16usize);
+        let (left, right, up, down) = (5usize, 8usize, 3usize, 6usize);
+
+        let mut ellipse = dot_image(width, height, cx, cy);
+        dilate_alpha_ellipse(ellipse.as_mut_slice(), width, height, left, right, up, down);
+        let mut rect = dot_image(width, height, cx, cy);
+        dilate_alpha_rect(rect.as_mut_slice(), width, height, left, right, up, down);
+
+        for y in 0..height {
+            for x in 0..width {
+                // The predicate is evaluated in exact integer arithmetic, matching the
+                // implementation's contract: `(dx/rx)^2 + (dy/ry)^2 <= 1` rewritten as
+                // `dx^2 * ry^2 + dy^2 * rx^2 <= rx^2 * ry^2`. A float form would disagree on
+                // the lattice points that lie exactly on the ellipse.
+                let dx = x as i128 - cx as i128;
+                let dy = y as i128 - cy as i128;
+                let semi_x = if dx >= 0 { right } else { left } as i128;
+                let semi_y = if dy >= 0 { down } else { up } as i128;
+                let inside = if semi_x == 0 && semi_y == 0 {
+                    dx == 0 && dy == 0
+                } else if semi_x == 0 {
+                    dx == 0 && dy * dy <= semi_y * semi_y
+                } else if semi_y == 0 {
+                    dy == 0 && dx * dx <= semi_x * semi_x
+                } else {
+                    dx * dx * semi_y * semi_y + dy * dy * semi_x * semi_x
+                        <= semi_x * semi_x * semi_y * semi_y
+                };
+                let expected = if inside { 255 } else { 0 };
+                assert_eq!(
+                    ellipse[y * width + x],
+                    expected,
+                    "ellipse pixel ({x},{y}), offset ({dx},{dy})"
+                );
+                assert!(
+                    ellipse[y * width + x] <= rect[y * width + x],
+                    "ellipse pixel ({x},{y}) escapes the rectangle of the same extents"
+                );
+            }
+        }
+
+        // Axis extremes belong to the ellipse by construction.
+        assert_eq!(ellipse[cy * width + cx + right], 255);
+        assert_eq!(ellipse[cy * width + cx - left], 255);
+        assert_eq!(ellipse[(cy + down) * width + cx], 255);
+        assert_eq!(ellipse[(cy - up) * width + cx], 255);
+        // The rectangle's corner is outside it.
+        assert_eq!(ellipse[(cy + down) * width + cx + right], 0);
+    }
+
+    /// Lattice points lying EXACTLY on the ellipse must belong to the element.
+    ///
+    /// Every Pythagorean triple is such a point (`6^2 + 8^2 = 10^2`), and a float
+    /// `floor(semi * sqrt(1 - (dy/semi)^2))` rounds just below the integer there and dents the
+    /// outline by one pixel on those rows. The radii below are all common UI values.
+    #[test]
+    fn dilate_ellipse_keeps_points_exactly_on_the_ellipse() {
+        for (radius, dy, expected_half) in [(5usize, 4usize, 3usize), (10, 8, 6), (13, 12, 5), (15, 12, 9), (20, 16, 12), (25, 20, 15)] {
+            let width = 4 * radius + 3;
+            let height = 4 * radius + 3;
+            let (cx, cy) = (width / 2, height / 2);
+            let mut alpha = dot_image(width, height, cx, cy);
+            dilate_alpha_ellipse(alpha.as_mut_slice(), width, height, radius, radius, radius, radius);
+
+            for (row, sign) in [(cy + dy, "down"), (cy - dy, "up")] {
+                let half = (0..=radius)
+                    .rev()
+                    .find(|&dx| alpha[row * width + cx + dx] == 255)
+                    .unwrap_or(0);
+                assert_eq!(
+                    half, expected_half,
+                    "radius {radius}, dy {dy} ({sign}): row half-width {half}, expected {expected_half}"
+                );
+                assert_eq!(
+                    alpha[row * width + cx - expected_half],
+                    255,
+                    "radius {radius}, dy {dy} ({sign}): the mirrored lattice point is missing"
+                );
+            }
+        }
+    }
+
+    /// A zero vertical semi-axis degenerates to the horizontal axis line only.
+    #[test]
+    fn dilate_ellipse_zero_semi_axis_is_an_axis_line() {
+        let (width, height) = (13usize, 9usize);
+        let (cx, cy) = (6usize, 4usize);
+        let mut alpha = dot_image(width, height, cx, cy);
+        dilate_alpha_ellipse(alpha.as_mut_slice(), width, height, 2, 2, 0, 0);
+
+        for y in 0..height {
+            for x in 0..width {
+                let expected = if y == cy && x + 2 >= cx && x <= cx + 2 {
+                    255
+                } else {
+                    0
+                };
+                assert_eq!(alpha[y * width + x], expected, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    /// Zero extents are the identity and both helpers must survive degenerate geometry:
+    /// empty buffers, 1x1 / 1xN / Nx1 images, a length mismatch, and extents far larger
+    /// than the image (which saturate to a full-image maximum).
+    #[test]
+    fn dilate_helpers_handle_degenerate_geometry() {
+        let mut empty: Vec<u8> = Vec::new();
+        dilate_alpha_rect(empty.as_mut_slice(), 0, 0, 4, 4, 4, 4);
+        dilate_alpha_ellipse(empty.as_mut_slice(), 0, 0, 4, 4, 4, 4);
+        assert!(empty.is_empty());
+
+        let mut mismatched = vec![7u8; 5];
+        dilate_alpha_rect(mismatched.as_mut_slice(), 4, 3, 1, 1, 1, 1);
+        dilate_alpha_ellipse(mismatched.as_mut_slice(), 4, 3, 1, 1, 1, 1);
+        assert_eq!(mismatched, vec![7u8; 5]);
+
+        let mut identity = pseudo_random_alpha(6, 4, 0xABCD);
+        let expected = identity.clone();
+        dilate_alpha_rect(identity.as_mut_slice(), 6, 4, 0, 0, 0, 0);
+        dilate_alpha_ellipse(identity.as_mut_slice(), 6, 4, 0, 0, 0, 0);
+        assert_eq!(identity, expected);
+
+        let mut single = vec![42u8];
+        dilate_alpha_rect(single.as_mut_slice(), 1, 1, 9, 9, 9, 9);
+        dilate_alpha_ellipse(single.as_mut_slice(), 1, 1, 9, 9, 9, 9);
+        assert_eq!(single, vec![42u8]);
+
+        // 1xN column and Nx1 row: an oversized extent must saturate to the whole line.
+        let mut column = vec![0u8, 5, 0, 9, 0];
+        dilate_alpha_rect(column.as_mut_slice(), 1, 5, 3, 3, 100, 100);
+        assert_eq!(column, vec![9u8; 5]);
+        let mut row = vec![0u8, 5, 0, 9, 0];
+        dilate_alpha_ellipse(row.as_mut_slice(), 5, 1, 100, 100, 3, 3);
+        assert_eq!(row, vec![9u8; 5]);
     }
 
     #[test]

@@ -48,8 +48,21 @@ max 0/255 for both the RGBA and alpha paths).
 - `stroke_shadow.rs`: alpha-contour stroke and shadow layers with optional blur/source
   color behavior.
 - `blur.rs`: Gaussian blur and motion blur post-effects.
-- `glow.rs`: contour glow (`glow_v1`/`glow_v2`), soft glow, and falloff. Both contour
-  variants hold the glow-only alpha in `f32` end to end (no intermediate `u8` rounding) and
+- `glow.rs`: contour glow (`glow_v1`/`glow_v2`), soft glow, and falloff. Soft glow dilates the
+  source alpha by four independent per-side extents (`radius_px` plus a signed `expand_*` per
+  side, clamped at 0) with either the rectangle (`Square`) or the per-quadrant ellipse (`Round`)
+  element, subtracts the source to get the outline ring, then keeps that ring in `f32` through
+  the Gaussian blur (`blur_radius_px`) and the `soft_glow_response_curve` bias/knee remap, with
+  a single `u8` rounding at composite time. The curve is pinned at (0,0)/(1,1) and is EXACTLY
+  the identity at bias 0, so persisted pre-curve effects render unchanged. Padding is per side
+  (side extent + blur kernel half-width), so an asymmetric glow is not clipped and
+  `content_origin_x/y` advance by the LEFT and TOP padding only — not by one symmetric scalar.
+  The glow layer is intentionally not reduced by the source alpha (legacy behavior; the source
+  is composited over it anyway). Cost asymmetry matters here: `Square` is `O(w*h)` while `Round`
+  is `O(w*h*(up+down+1))`, so a 1000x600 source at radius 512 + expand 512 takes ~0.035 s square
+  vs ~3.7 s round (~9.2 s with blur 256) in release, and that run cannot be aborted part-way —
+  `apply_effects_pipeline` checks cancellation only BETWEEN effects.
+  Both contour variants hold the glow-only alpha in `f32` end to end (no intermediate `u8` rounding) and
   post-blur it with a small sigma (`glow_smoothing_sigma`, ~1px, clamped `[0.8, 2.0]`) before
   compositing, so iso-distance plateaus no longer band; overlap and the color-alpha factor are
   applied after the blur with a single final `u8` round, and the canvas is padded by the glow
@@ -67,7 +80,16 @@ max 0/255 for both the RGBA and alpha paths).
 - `image_ops.rs`: shared low-level image helpers used by multiple effects. Also owns the shared
   deterministic noise primitives (`hash_noise_signed` splitmix64 hash, `value_noise_signed`
   bilinear value noise, `smoothstep01`, `lerp_f32`, `i32_to_u64_wrapping`) used by both
-  `dry_media` and `interference` so there is one tested noise implementation. The EDT comes in
+  `dry_media` and `interference` so there is one tested noise implementation.
+  Dilation has two production forms, both taking four per-side extents (`left`, `right`, `up`,
+  `down`) and mirroring the structuring element as dilation requires (a `right` extent grows the
+  shape to the right): `dilate_alpha_rect` is a separable sliding-window maximum (horizontal pass,
+  then a vertical pass over a transposed copy) costing `O(width * height)` regardless of the
+  extents, and `dilate_alpha_ellipse` walks each `dy` of the per-quadrant ellipse with the same
+  row kernel, costing `O(width * height * (up + down + 1))` — seconds, not milliseconds, at
+  radii in the hundreds, so callers must treat a large round dilation as a long uninterruptible
+  pass. With equal extents the rectangle is byte-identical to the legacy iterated
+  `dilate_alpha_max_filter3`, which is now a test-only reference. The EDT comes in
   two forms: `euclidean_distance_transform_to_mask` (binary 0/1 seeding) is a thin wrapper over
   `euclidean_distance_transform_with_costs`, the Felzenszwalb-Huttenlocher transform evaluated
   in `f32` over an arbitrary squared-distance cost field (a valid seed cost is in
@@ -97,6 +119,9 @@ max 0/255 for both the RGBA and alpha paths).
 - To change interference (помехи/glitch) behavior or add a sub-kind, edit `interference.rs`
   (the sub-kind dispatch + `*_fill_row` kernels) and, for a new sub-kind, `InterferenceKind`
   and its parsing in `parse.rs`.
+- To change soft-glow geometry (per-side extents, outline shape) or its blur response, edit
+  `apply_soft_glow_effect` / `soft_glow_response_curve` in `glow.rs`, the dilation helpers in
+  `image_ops.rs`, and `SoftGlowEffectParams` + `parse_soft_glow_effect_params` in `parse.rs`.
 - To change the shared noise (grain/static) math, edit the noise helpers in `image_ops.rs`;
   both `dry_media` and `interference` depend on them.
 - To change legacy JSON compatibility, edit `parse.rs` and update parent typing
