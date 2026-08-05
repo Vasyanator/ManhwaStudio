@@ -1042,6 +1042,19 @@ enum Gradient4FillMode {
     SpecificColor,
 }
 
+/// Rectangle the gradient ramp is stretched over. Serialized as the JSON `area_mode`
+/// string (`full_image` / `affected_area`) consumed by the renderer's gradient effects.
+///
+/// `FullImage` is the legacy behavior and the default for cards restored from projects
+/// saved before this parameter existed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GradientAreaMode {
+    /// Bounding box of everything non-transparent.
+    FullImage,
+    /// Bounding box of only the pixels the fill mode replaces.
+    AffectedArea,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReflectAxis {
     X,
@@ -1229,6 +1242,10 @@ struct Gradient2EffectCard {
     respect_source_alpha: bool,
     fill_mode: Gradient2FillMode,
     target_color: ColorField,
+    /// `SpecificColor` only: allowed deviation from `target_color`, in percent of the
+    /// RGB cube diagonal (0 = byte-exact match).
+    color_tolerance_percent: f32,
+    area_mode: GradientAreaMode,
 }
 
 struct Gradient4EffectCard {
@@ -1240,6 +1257,10 @@ struct Gradient4EffectCard {
     respect_source_alpha: bool,
     fill_mode: Gradient4FillMode,
     target_color: ColorField,
+    /// `SpecificColor` only: allowed deviation from `target_color`, in percent of the
+    /// RGB cube diagonal (0 = byte-exact match).
+    color_tolerance_percent: f32,
+    area_mode: GradientAreaMode,
 }
 
 struct ReflectEffectCard {

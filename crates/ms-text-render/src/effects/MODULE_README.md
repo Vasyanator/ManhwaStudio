@@ -69,7 +69,15 @@ max 0/255 for both the RGBA and alpha paths).
   reach plus the blur kernel half-width. `glow_v2` additionally seeds the EDT sub-pixel:
   partial coverage becomes a `d0*d0` initial cost (`d0 = (0.5 - a/255).max(0.0)`) instead of a
   binary 0/1 mask. `glow_v1` keeps its legacy integer disc-splat seeding (no sub-pixel EDT).
-- `gradients.rs`: two-color and four-corner gradient fills over the text alpha bounds.
+- `gradients.rs`: two-color and four-corner gradient fills. Two orthogonal parameters decide
+  WHAT is repainted and WHERE the ramp is stretched. `fill_mode` (`all_opaque` /
+  `specific_color`) plus `color_tolerance_percent` decide what: the tolerance is a share of
+  the RGB cube diagonal (`sqrt(3)*255`) compared against the RGB distance to `target_color`,
+  alpha excluded, so antialiased glyphs match at any coverage; 0 % is the byte-exact legacy
+  match. `area_mode` decides where: `full_image` uses the bounding box of every
+  non-transparent pixel (legacy), `affected_area` uses the bounding box of only the replaced
+  pixels, so the ramp spans exactly the recolored shape. Both parameters default to the
+  legacy behavior when absent, and under `all_opaque` the two area modes coincide.
 - `reflect_shake.rs`: axis reflection and shake-trail composition.
 - `dry_media.rs`: deterministic pencil/chalk texture erosion and dust/grain effects.
 - `interference.rs`: deterministic interference (помехи/glitch) post-effect with four sub-kinds
@@ -122,6 +130,11 @@ max 0/255 for both the RGBA and alpha paths).
 - To change soft-glow geometry (per-side extents, outline shape) or its blur response, edit
   `apply_soft_glow_effect` / `soft_glow_response_curve` in `glow.rs`, the dilation helpers in
   `image_ops.rs`, and `SoftGlowEffectParams` + `parse_soft_glow_effect_params` in `parse.rs`.
+- To change which pixels a gradient repaints or which rectangle its ramp spans, edit
+  `should_replace_gradient*` / `color_tolerance_threshold_sq` / `bounds_where` in
+  `gradients.rs` and `parse_gradient_color_tolerance` / `parse_gradient_area_mode` +
+  `GradientAreaMode` in `parse.rs`. The panel mirrors both fields in
+  `src/tabs/typing/panel/{effect_parse,effect_cards}.rs`, so the JSON keys must stay in sync.
 - To change the shared noise (grain/static) math, edit the noise helpers in `image_ops.rs`;
   both `dry_media` and `interference` depend on them.
 - To change legacy JSON compatibility, edit `parse.rs` and update parent typing

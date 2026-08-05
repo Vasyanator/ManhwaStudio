@@ -267,6 +267,20 @@ pub(crate) enum Gradient2FillMode {
     SpecificColor,
 }
 
+/// Rectangle the gradient ramp is stretched over. Shared by both gradient effects.
+///
+/// `FullImage` is the legacy behavior and stays the default, so persisted effects
+/// render unchanged. Under `AllOpaque` the two modes are equivalent by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GradientAreaMode {
+    /// Bounding box of every non-transparent pixel (the whole picture for an
+    /// opaque imported image).
+    FullImage,
+    /// Bounding box of only the pixels the fill mode actually replaces, so the ramp
+    /// spans the affected shape instead of the whole picture.
+    AffectedArea,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Gradient2EffectParams {
     pub(crate) color1: [u8; 4],
@@ -276,6 +290,10 @@ pub(crate) struct Gradient2EffectParams {
     pub(crate) respect_source_alpha: bool,
     pub(crate) fill_mode: Gradient2FillMode,
     pub(crate) target_color: [u8; 4],
+    /// `SpecificColor` only: how far a pixel may differ from `target_color` and still
+    /// be replaced, in percent of the RGB cube diagonal (0 = byte-exact match).
+    pub(crate) color_tolerance_percent: f32,
+    pub(crate) area_mode: GradientAreaMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +312,10 @@ pub(crate) struct Gradient4EffectParams {
     pub(crate) respect_source_alpha: bool,
     pub(crate) fill_mode: Gradient4FillMode,
     pub(crate) target_color: [u8; 4],
+    /// `SpecificColor` only: how far a pixel may differ from `target_color` and still
+    /// be replaced, in percent of the RGB cube diagonal (0 = byte-exact match).
+    pub(crate) color_tolerance_percent: f32,
+    pub(crate) area_mode: GradientAreaMode,
 }
 
 pub(crate) fn parse_effects_json(effects_json: &str) -> Result<Vec<EffectSpec>, String> {
@@ -1064,6 +1086,8 @@ fn parse_gradient2_effect_params(
                 .or_else(|| obj.get("mask_color")),
         )?
         .unwrap_or([255, 255, 255, 255]),
+        color_tolerance_percent: parse_gradient_color_tolerance(obj, "gradient2")?,
+        area_mode: parse_gradient_area_mode(obj, "gradient2")?,
     })
 }
 
@@ -1138,6 +1162,8 @@ fn parse_gradient4_effect_params(
                 .or_else(|| obj.get("mask_color")),
         )?
         .unwrap_or([255, 255, 255, 255]),
+        color_tolerance_percent: parse_gradient_color_tolerance(obj, "gradient4")?,
+        area_mode: parse_gradient_area_mode(obj, "gradient4")?,
     })
 }
 
@@ -1158,6 +1184,53 @@ fn parse_gradient4_fill_mode(
         "specific_color" | "color" | "target_color" => Ok(Gradient4FillMode::SpecificColor),
         other => Err(format!(
             "gradient4.fill_mode: неизвестное значение '{other}', ожидалось all_opaque/specific_color"
+        )),
+    }
+}
+
+/// Parses the shared gradient color tolerance, in percent of the RGB cube diagonal.
+///
+/// `effect` names the effect in error messages (`gradient2` / `gradient4`). A missing
+/// value means 0 %, i.e. the byte-exact target-color match of the legacy contract.
+fn parse_gradient_color_tolerance(
+    obj: &serde_json::Map<String, Value>,
+    effect: &str,
+) -> Result<f32, String> {
+    parse_effect_f32_range(
+        obj.get("color_tolerance_percent")
+            .or_else(|| obj.get("color_tolerance"))
+            .or_else(|| obj.get("tolerance_percent"))
+            .or_else(|| obj.get("tolerance")),
+        &format!("{effect}.color_tolerance_percent"),
+        0.0,
+        0.0,
+        100.0,
+    )
+}
+
+/// Parses the shared gradient area mode.
+///
+/// `effect` names the effect in error messages (`gradient2` / `gradient4`). A missing
+/// value means `FullImage`, so effects persisted before this parameter existed keep
+/// their appearance.
+fn parse_gradient_area_mode(
+    obj: &serde_json::Map<String, Value>,
+    effect: &str,
+) -> Result<GradientAreaMode, String> {
+    let Some(mode) = obj
+        .get("area_mode")
+        .or_else(|| obj.get("size_mode"))
+        .or_else(|| obj.get("area"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(GradientAreaMode::FullImage);
+    };
+
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "full_image" | "full" | "image" | "whole" => Ok(GradientAreaMode::FullImage),
+        "affected_area" | "affected" | "target" | "replaced" => Ok(GradientAreaMode::AffectedArea),
+        other => Err(format!(
+            "{effect}.area_mode: неизвестное значение '{other}', ожидалось full_image/affected_area"
         )),
     }
 }
@@ -1424,7 +1497,67 @@ fn value_to_u8(value: &Value, label: &str) -> Result<u8, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EffectSpec, InterferenceKind, SoftGlowShape, parse_effects_json};
+    use super::{
+        EffectSpec, GradientAreaMode, InterferenceKind, SoftGlowShape, parse_effects_json,
+    };
+
+    /// Extracts the single `Gradient2` params from a one-effect JSON array.
+    ///
+    /// Test-only helper with the same fixture contract as `parse_single_interference`.
+    fn parse_single_gradient2(json: &str) -> super::Gradient2EffectParams {
+        let effects = match parse_effects_json(json) {
+            Ok(effects) => effects,
+            Err(error) => panic!("fixture json must parse: {error}"),
+        };
+        assert_eq!(effects.len(), 1, "fixture must contain exactly one effect");
+        match effects.into_iter().next() {
+            Some(EffectSpec::Gradient2(params)) => params,
+            other => panic!("fixture must parse to Gradient2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gradient_area_and_tolerance_default_to_legacy_behavior() {
+        let params = parse_single_gradient2(r#"[{"effect":"gradient2"}]"#);
+        assert_eq!(params.area_mode, GradientAreaMode::FullImage);
+        assert!((params.color_tolerance_percent - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gradient_area_mode_aliases_resolve() {
+        for (alias, expected) in [
+            ("full_image", GradientAreaMode::FullImage),
+            ("full", GradientAreaMode::FullImage),
+            ("whole", GradientAreaMode::FullImage),
+            ("affected_area", GradientAreaMode::AffectedArea),
+            (" Affected ", GradientAreaMode::AffectedArea),
+            ("replaced", GradientAreaMode::AffectedArea),
+        ] {
+            let json = format!(r#"[{{"effect":"gradient2","area_mode":"{alias}"}}]"#);
+            assert_eq!(
+                parse_single_gradient2(&json).area_mode,
+                expected,
+                "alias '{alias}' mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn gradient_area_mode_rejects_unknown_value() {
+        let error = parse_effects_json(r#"[{"effect":"gradient2","area_mode":"bbox"}]"#)
+            .expect_err("unknown area mode must be an error");
+        assert!(error.contains("gradient2.area_mode"), "got: {error}");
+    }
+
+    #[test]
+    fn gradient_color_tolerance_is_read_and_range_checked() {
+        let params = parse_single_gradient2(r#"[{"effect":"gradient2","tolerance":12.5}]"#);
+        assert!((params.color_tolerance_percent - 12.5).abs() < 1e-6);
+
+        let error = parse_effects_json(r#"[{"effect":"gradient2","color_tolerance_percent":900}]"#)
+            .expect_err("out-of-range tolerance must be an error");
+        assert!(error.contains("gradient2.color_tolerance_percent"), "got: {error}");
+    }
 
     /// Extracts the single `Interference` params from a one-effect JSON array.
     ///

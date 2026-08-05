@@ -44,6 +44,59 @@ pub(super) fn effect_card_title(effect: &EffectCard) -> &'static str {
     }
 }
 
+/// Maps the gradient area mode to the stable JSON token the renderer parses.
+fn gradient_area_mode_key(mode: GradientAreaMode) -> &'static str {
+    match mode {
+        GradientAreaMode::FullImage => "full_image",
+        GradientAreaMode::AffectedArea => "affected_area",
+    }
+}
+
+/// Draws the gradient area-mode combo shared by both gradient effects and returns
+/// whether the user changed it.
+///
+/// `label` is the already-translated combo caption and `id_salt` its stable catalog
+/// key, so the stored widget state survives a language switch and the two gradient
+/// cards never share one popup.
+fn draw_gradient_area_mode_combo(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    id_salt: &'static str,
+    mode: &mut GradientAreaMode,
+) -> bool {
+    let mut idx = usize::from(*mode == GradientAreaMode::AffectedArea);
+    let previous = idx;
+    let combo = WheelComboBox::from_label(label)
+        .id_salt(id_salt)
+        .selected_text(match *mode {
+            GradientAreaMode::FullImage => t!("typing.effects.gradient_area_full_image"),
+            GradientAreaMode::AffectedArea => t!("typing.effects.gradient_area_affected"),
+        })
+        .show_ui_with_wheel(ui, |ui| {
+            if ui
+                .selectable_label(idx == 0, t!("typing.effects.gradient_area_full_image"))
+                .clicked()
+            {
+                idx = 0;
+            }
+            if ui
+                .selectable_label(idx == 1, t!("typing.effects.gradient_area_affected"))
+                .clicked()
+            {
+                idx = 1;
+            }
+        });
+    if let Some(steps) = combo.wheel_steps {
+        cycle_wrapped_index(&mut idx, 2, steps);
+    }
+    *mode = if idx == 0 {
+        GradientAreaMode::FullImage
+    } else {
+        GradientAreaMode::AffectedArea
+    };
+    idx != previous
+}
+
 /// Serializes a single `EffectCard` to its stored JSON object (the exact shape one
 /// element of `effects_value_array` produces). This is the single source of truth for
 /// per-card serialization: `effects_value_array` maps it over its cards, and the effect
@@ -191,6 +244,8 @@ pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
             "respect_source_alpha": gradient.respect_source_alpha,
             "fill_mode": if gradient.fill_mode == Gradient2FillMode::AllOpaque { "all_opaque" } else { "specific_color" },
             "target_color": gradient.target_color.rgba(),
+            "color_tolerance_percent": gradient.color_tolerance_percent,
+            "area_mode": gradient_area_mode_key(gradient.area_mode),
         }),
         EffectCard::Gradient4(gradient) => json!({
             "effect": "gradient4",
@@ -203,6 +258,8 @@ pub(super) fn effect_card_to_value(effect: &EffectCard) -> Value {
             "respect_source_alpha": gradient.respect_source_alpha,
             "fill_mode": if gradient.fill_mode == Gradient4FillMode::AllOpaque { "all_opaque" } else { "specific_color" },
             "target_color": gradient.target_color.rgba(),
+            "color_tolerance_percent": gradient.color_tolerance_percent,
+            "area_mode": gradient_area_mode_key(gradient.area_mode),
         }),
         EffectCard::Reflect(reflect) => json!({
             "effect": "reflect",
@@ -775,7 +832,19 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 gradient.fill_mode == Gradient2FillMode::SpecificColor,
                 |ui| {
                     changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
+                    changed |= ui
+                        .add(
+                            WheelSlider::new(&mut gradient.color_tolerance_percent, 0.0..=100.0)
+                                .text(t!("typing.effects.gradient_color_tolerance_label")),
+                        )
+                        .changed();
                 },
+            );
+            changed |= draw_gradient_area_mode_combo(
+                ui,
+                t!("typing.effects.gradient2_area_combo_id"),
+                "typing.effects.gradient2_area_combo_id",
+                &mut gradient.area_mode,
             );
         }
         EffectCard::Gradient4(gradient) => {
@@ -830,7 +899,19 @@ pub(super) fn draw_effect_card_controls(ui: &mut egui::Ui, effect: &mut EffectCa
                 gradient.fill_mode == Gradient4FillMode::SpecificColor,
                 |ui| {
                     changed |= gradient.target_color.draw(ui, t!("typing.effects.fill_replaceable_label"));
+                    changed |= ui
+                        .add(
+                            WheelSlider::new(&mut gradient.color_tolerance_percent, 0.0..=100.0)
+                                .text(t!("typing.effects.gradient_color_tolerance_label")),
+                        )
+                        .changed();
                 },
+            );
+            changed |= draw_gradient_area_mode_combo(
+                ui,
+                t!("typing.effects.gradient4_area_combo_id"),
+                "typing.effects.gradient4_area_combo_id",
+                &mut gradient.area_mode,
             );
         }
         EffectCard::Reflect(reflect) => {

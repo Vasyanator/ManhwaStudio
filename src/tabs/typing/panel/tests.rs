@@ -15,6 +15,47 @@ paths change.
         assert_eq!(color.rgba(), [255, 255, 255, 128]);
     }
 
+    /// Extracts the single gradient2 card a fixture JSON array must parse to.
+    ///
+    /// Test-only helper: the fixture invariant is "this array holds exactly one
+    /// gradient2 card", so any deviation panics — the panic IS the failure.
+    fn single_gradient2_card(effects: &[Value]) -> Gradient2EffectCard {
+        let cards = parse_effect_cards(effects, Color32::WHITE);
+        assert_eq!(cards.len(), 1, "fixture must hold exactly one card");
+        match cards.into_iter().next() {
+            Some(EffectCard::Gradient2(card)) => card,
+            _ => panic!("fixture must parse to a Gradient2 card"),
+        }
+    }
+
+    #[test]
+    fn gradient_area_and_tolerance_round_trip_through_card_json() {
+        let mut card = match TypingCreatePanelState::default_effect_card(
+            AvailableEffectKind::Gradient2,
+            Color32::WHITE,
+        ) {
+            EffectCard::Gradient2(card) => card,
+            _ => panic!("Gradient2 kind must build a Gradient2 card"),
+        };
+        card.fill_mode = Gradient2FillMode::SpecificColor;
+        card.color_tolerance_percent = 17.5;
+        card.area_mode = GradientAreaMode::AffectedArea;
+
+        let value = effect_card_to_value(&EffectCard::Gradient2(card));
+        let restored = single_gradient2_card(&[value]);
+
+        assert!((restored.color_tolerance_percent - 17.5).abs() < 1e-6);
+        assert!(restored.area_mode == GradientAreaMode::AffectedArea);
+    }
+
+    #[test]
+    fn gradient_card_without_new_keys_keeps_legacy_defaults() {
+        let restored = single_gradient2_card(&[json!({"effect": "gradient2"})]);
+
+        assert!((restored.color_tolerance_percent - 0.0).abs() < 1e-6);
+        assert!(restored.area_mode == GradientAreaMode::FullImage);
+    }
+
     #[test]
     fn machine_tag_round_trips_through_build_and_parse() {
         let style = TypingInlineTagStyle {

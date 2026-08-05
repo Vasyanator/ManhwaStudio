@@ -519,6 +519,8 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                         .and_then(parse_color32_value)
                         .unwrap_or(text_color),
                 ),
+                color_tolerance_percent: parse_gradient_color_tolerance(obj),
+                area_mode: parse_gradient_area_mode(obj),
             })),
             "gradient4" => out.push(EffectCard::Gradient4(Gradient4EffectCard {
                 color_top_left: ColorField::new(
@@ -567,6 +569,8 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
                         .and_then(parse_color32_value)
                         .unwrap_or(text_color),
                 ),
+                color_tolerance_percent: parse_gradient_color_tolerance(obj),
+                area_mode: parse_gradient_area_mode(obj),
             })),
             "reflect" => out.push(EffectCard::Reflect(ReflectEffectCard {
                 axis: match obj
@@ -631,4 +635,37 @@ pub(super) fn parse_effect_cards(effects: &[Value], text_color: Color32) -> Vec<
         }
     }
     out
+}
+
+/// Reads the shared gradient color tolerance (percent of the RGB cube diagonal).
+///
+/// Accepts the same aliases the renderer accepts. A missing or unusable value means
+/// 0 %, i.e. the byte-exact target-color match effects saved before this parameter
+/// existed relied on.
+fn parse_gradient_color_tolerance(obj: &serde_json::Map<String, Value>) -> f32 {
+    obj.get("color_tolerance_percent")
+        .or_else(|| obj.get("color_tolerance"))
+        .or_else(|| obj.get("tolerance_percent"))
+        .or_else(|| obj.get("tolerance"))
+        .and_then(value_as_f32)
+        .unwrap_or(0.0)
+        .clamp(0.0, 100.0)
+}
+
+/// Reads the shared gradient area mode; anything unrecognized falls back to the
+/// legacy `FullImage` so old effects keep their appearance.
+fn parse_gradient_area_mode(obj: &serde_json::Map<String, Value>) -> GradientAreaMode {
+    match obj
+        .get("area_mode")
+        .or_else(|| obj.get("size_mode"))
+        .or_else(|| obj.get("area"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "affected_area" | "affected" | "target" | "replaced" => GradientAreaMode::AffectedArea,
+        _ => GradientAreaMode::FullImage,
+    }
 }
