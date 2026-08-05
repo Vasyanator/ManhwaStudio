@@ -27,13 +27,21 @@ languages — interface vs. typeset text — are chosen next to each other here.
 surfaces read and write the process-global `ms_text_util::language`, which is the
 single source of truth, so they cannot drift out of sync.
 
+The interface-scale slider is a THIRD kind of setting here: like the UI language it is
+applied live rather than returned in the outcome, but it applies only to the surface
+that renders it, because `Context::set_zoom_factor` is per-`Context` and launcher and
+studio are separate `run_native` windows. The other surface picks the value up at
+startup through `apply_ui_scale_from_user_settings`.
+
 Key items:
 - `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values.
 - `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing.
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + memory-profile
-  combo + UI-language selector + typesetting-language selector.
+  combo + interface-scale slider + UI-language selector + typesetting-language selector.
+- `apply_ui_scale` / `apply_ui_scale_from_user_settings`: apply `General.ui_scale_percent`
+  to an egui context (called by each `run_native` constructor closure).
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
   language combos), also called by the studio "Тайп" pane; takes a per-call-site
   `id_salt` prefix so the two rendered instances keep distinct egui ids.
@@ -50,10 +58,11 @@ but persists through the same paths.
 use crate::i18n_resolve::resolve_key;
 use crate::memory_manager::MemoryProfile;
 use crate::runtime_log;
-use crate::widgets::WheelComboBox;
+use crate::widgets::{WheelComboBox, WheelSlider};
 use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
 use ms_thread as thread;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Status line shown under the projects-directory editor.
 ///
@@ -87,6 +96,13 @@ pub struct GeneralSettingsPanelState {
     /// Interface-language options, scanned ONCE at construction from the `locale/`
     /// folder (the GUI thread never rescans the filesystem per frame).
     pub locale_options: Vec<LocaleOption>,
+    /// Interface scale in percent as shown by the slider (`100` = native size).
+    /// Persisted to `General.ui_scale_percent`.
+    pub ui_scale_percent: u32,
+    /// The scale currently applied to this surface's egui context. Differs from
+    /// [`Self::ui_scale_percent`] only while the user is still dragging the slider;
+    /// see the apply rule in [`draw_general_settings_panel`].
+    pub applied_ui_scale_percent: u32,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
 }
@@ -159,11 +175,19 @@ impl GeneralSettingsPanelState {
                     )
                 }
             };
+        // The interface scale comes from the process-global value, not from disk: it is
+        // what this surface's context actually renders at, and it stays right even if a
+        // persist failed earlier in the session.
+        let ui_scale_percent = ui_scale_percent();
         Self {
             projects_dir_input: projects_dir.clone(),
             saved_projects_dir: projects_dir,
             memory_profile,
             ui_language_tag,
+            ui_scale_percent,
+            // The surface applied this same value to its egui context when the window
+            // was created (`apply_ui_scale_to_context`), so nothing is pending.
+            applied_ui_scale_percent: ui_scale_percent,
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
@@ -286,6 +310,10 @@ pub fn draw_general_settings_panel(
 
     ui.separator();
 
+    draw_ui_scale_setting(ui, state);
+
+    ui.separator();
+
     // Interface-language selector. Populated once from the on-disk `locale/` folder
     // (see `scan_locale_options`); changing it persists and live-installs the locale.
     ui.label(t!("settings.general.ui_language_label"));
@@ -385,6 +413,107 @@ pub fn draw_text_language_setting(ui: &mut egui::Ui, id_salt: &str) {
         set_text_language(selected_language);
         persist_text_language(selected_language);
     }
+}
+
+/// Renders the global interface-scale slider (percent of native size) and applies a
+/// settled change to the surface's own egui context.
+///
+/// The scale is one `Context::set_zoom_factor` away from `pixels_per_point`, so it
+/// rescales the WHOLE surface at once — fonts, spacing, widget sizes — without
+/// changing the OS window size. Each surface (launcher / studio) owns its own
+/// `Context`, so this applies live only here; the other surface picks the value up
+/// from `General.ui_scale_percent` when its window is created.
+///
+/// Apply rule: a change is applied (and persisted) only once the slider is no longer
+/// being dragged. Applying mid-drag would rescale the slider itself under the cursor
+/// and make the control fight the pointer; wheel, click and keyboard changes are not
+/// drags and therefore apply immediately.
+fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    ui.label(t!("settings.general.ui_scale_label"));
+    ui.small(t!("settings.general.ui_scale_hint"));
+
+    let slider = ui.add(
+        WheelSlider::new(
+            &mut state.ui_scale_percent,
+            crate::config::UI_SCALE_PERCENT_MIN..=crate::config::UI_SCALE_PERCENT_MAX,
+        )
+        .suffix("%")
+        .step_by(f64::from(UI_SCALE_STEP_PERCENT))
+        .wheel_step(f64::from(UI_SCALE_STEP_PERCENT))
+        // Typing into the value field must not apply a half-typed number: "150" would
+        // otherwise pass through 1 -> 15 (both clamped to the 50 % floor), rescaling the
+        // window and writing the config on every keystroke. Applied on Enter/focus loss.
+        .update_while_editing(false),
+    );
+
+    if state.ui_scale_percent != state.applied_ui_scale_percent && !slider.dragged() {
+        let percent = state.ui_scale_percent;
+        apply_ui_scale(ui.ctx(), percent);
+        state.applied_ui_scale_percent = percent;
+        if let Err(err) = persist_general_key(
+            crate::config::GENERAL_UI_SCALE_PERCENT_KEY,
+            serde_json::Value::from(percent),
+        ) {
+            runtime_log::log_error(format!(
+                "[general-settings] failed to persist ui scale '{percent}%'; error={err}"
+            ));
+            state.status =
+                GeneralSettingsStatus::Error(t!("settings.general.ui_scale_save_error").to_string());
+        }
+    }
+}
+
+/// Slider/wheel step of the interface-scale control, in percent.
+const UI_SCALE_STEP_PERCENT: u16 = 5;
+
+/// Process-global interface scale, in percent. The single source of truth while the
+/// process runs, mirroring how the UI language lives in the `ms-i18n` runtime rather
+/// than in a settings snapshot.
+///
+/// It must NOT be re-derived from the startup `user_settings` snapshot per window:
+/// `run_main` reads that snapshot ONCE and reuses it for every launcher/studio window
+/// of the session, so a scale changed in one surface would be invisible to the next
+/// window opened after it.
+static UI_SCALE_PERCENT: AtomicU32 = AtomicU32::new(crate::config::UI_SCALE_PERCENT_DEFAULT);
+
+/// Seeds the process-global interface scale from the startup user settings.
+///
+/// Called ONCE during startup, before any window is created (next to the other
+/// `seed_*_from_config` calls in `run_main`). Out-of-range stored values are clamped
+/// by [`crate::config::ui_scale_percent_from_user_settings`].
+pub fn seed_ui_scale_from_user_settings(user_settings: &serde_json::Value) {
+    UI_SCALE_PERCENT.store(
+        crate::config::ui_scale_percent_from_user_settings(user_settings),
+        Ordering::Relaxed,
+    );
+}
+
+/// The current process-global interface scale, in percent.
+#[must_use]
+pub fn ui_scale_percent() -> u32 {
+    UI_SCALE_PERCENT.load(Ordering::Relaxed)
+}
+
+/// Applies an interface scale (in percent) to `ctx` via `Context::set_zoom_factor` and
+/// records it as the new process-global value.
+///
+/// Out-of-range input is clamped by [`crate::config::ui_scale_factor_from_percent`].
+/// The zoom change becomes active at the start of the next pass (egui defers it to
+/// avoid jitter) and egui requests the repaint itself. Only the passed context is
+/// rescaled — other open windows own separate `Context`s and pick the value up when
+/// they are (re)created.
+pub fn apply_ui_scale(ctx: &egui::Context, percent: u32) {
+    UI_SCALE_PERCENT.store(percent, Ordering::Relaxed);
+    ctx.set_zoom_factor(crate::config::ui_scale_factor_from_percent(percent));
+}
+
+/// Applies the process-global interface scale to a freshly created egui context.
+///
+/// Every `eframe::run_native` constructor closure that should honor the global
+/// interface scale calls this ONCE, next to `ui_fonts::install*`. A surface that does
+/// not call it simply renders at native size.
+pub fn apply_ui_scale_to_context(ctx: &egui::Context) {
+    ctx.set_zoom_factor(crate::config::ui_scale_factor_from_percent(ui_scale_percent()));
 }
 
 /// Persists the chosen typesetting language to `TextTab.text_language` on a
@@ -748,6 +877,20 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(normalize_projects_dir_value("  /tmp/my_projects  "), expected);
+    }
+
+    #[test]
+    fn ui_scale_seed_sets_process_global_and_clamps() {
+        seed_ui_scale_from_user_settings(&serde_json::json!({"General": {"ui_scale_percent": 90}}));
+        assert_eq!(ui_scale_percent(), 90);
+        // A hand-edited absurd value is clamped, never stored as-is.
+        seed_ui_scale_from_user_settings(
+            &serde_json::json!({"General": {"ui_scale_percent": 10_000}}),
+        );
+        assert_eq!(ui_scale_percent(), crate::config::UI_SCALE_PERCENT_MAX);
+        // Restore the default so the shared global does not leak into other tests.
+        seed_ui_scale_from_user_settings(&serde_json::json!({}));
+        assert_eq!(ui_scale_percent(), crate::config::UI_SCALE_PERCENT_DEFAULT);
     }
 
     #[test]

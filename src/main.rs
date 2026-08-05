@@ -266,6 +266,10 @@ fn run_main() -> anyhow::Result<()> {
     // Install the active UI locale from disk (or the embedded catalog on failure),
     // now that `General.ui_language` is available in the loaded settings.
     locale_store::install_ui_locale(&user_settings);
+    // Seed the process-global interface scale before any window is created. Windows read
+    // the global (not this snapshot), so a scale changed in the launcher is honored by the
+    // studio opened afterwards and vice versa.
+    general_settings_panel::seed_ui_scale_from_user_settings(&user_settings);
 
     if cli.continue_update {
         init_runtime_logging();
@@ -1416,6 +1420,9 @@ fn run_main_window(
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             ui_fonts::install_with_roots(&cc.egui_ctx, ui_fonts::Tier::Full, &font_roots);
+            // Global interface scale (`General.ui_scale_percent`): per-`Context`, so the
+            // studio applies it for itself exactly like the launcher does for its window.
+            general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);
             Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
                 load_rx,
                 user_settings.clone(),

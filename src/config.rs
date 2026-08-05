@@ -18,6 +18,8 @@ Main items:
   `read_ort_load_guard`: per-scope ONNX Runtime SIGILL load-guard model and its pure
   decision logic (state persisted under `General.ort_load_state`).
 - `MemoryProfile`: persisted global image-cache memory policy recorded under `General`.
+- `ui_scale_percent_from_user_settings` / `clamp_ui_scale_percent` / `ui_scale_factor_from_percent`:
+  global interface scale (`General.ui_scale_percent`) and its conversion to the egui zoom factor.
 - `load_user_config`: canonical entry-point for `user_config.json` with persistence.
 - `mark_first_run_languages_if_needed` / `user_settings_first_run_languages_pending`:
   fresh-install detection and gate for the launcher's first-run language modal via the
@@ -113,6 +115,19 @@ pub const GENERAL_MEMORY_PROFILE_KEY: &str = "memory_profile";
 /// a custom on-disk locale tag). Read at startup by `locale_store::install_ui_locale`
 /// and written by the shared general-settings widget's UI-language selector.
 pub const GENERAL_UI_LANGUAGE_KEY: &str = "ui_language";
+/// `General.ui_scale_percent`: the global interface scale in PERCENT (`100` = native
+/// size). Applied to an egui context as `Context::set_zoom_factor(percent / 100)`, so
+/// it scales every point-sized element at once (fonts, spacing, widget sizes) without
+/// touching the OS window size. Read by [`ui_scale_percent_from_user_settings`] and
+/// written by the shared general-settings widget's scale slider.
+pub const GENERAL_UI_SCALE_PERCENT_KEY: &str = "ui_scale_percent";
+/// Smallest selectable interface scale, in percent. Below this the UI stops being
+/// legible on a normal-DPI display; egui itself would accept down to 10 %.
+pub const UI_SCALE_PERCENT_MIN: u32 = 50;
+/// Largest selectable interface scale, in percent.
+pub const UI_SCALE_PERCENT_MAX: u32 = 200;
+/// Default interface scale: native size, i.e. `zoom_factor == 1.0`.
+pub const UI_SCALE_PERCENT_DEFAULT: u32 = 100;
 /// `General.first_run_languages_confirmed`: tri-state marker gating the launcher's
 /// first-run language modal.
 ///
@@ -576,6 +591,64 @@ pub fn projects_root_from_user_settings(user_settings: &Value) -> PathBuf {
         .unwrap_or_else(default_projects_root)
 }
 
+/// Reads `General.ui_scale_percent`, clamped to
+/// [`UI_SCALE_PERCENT_MIN`]..=[`UI_SCALE_PERCENT_MAX`].
+///
+/// A missing, non-numeric, or out-of-range value resolves to
+/// [`UI_SCALE_PERCENT_DEFAULT`] / the nearest bound, so a hand-edited config can never
+/// make the interface unusable. Accepts a float too (an older/hand-written `90.0`),
+/// rounding to the nearest percent.
+#[must_use]
+pub fn ui_scale_percent_from_user_settings(user_settings: &Value) -> u32 {
+    let raw = user_settings
+        .get("General")
+        .and_then(Value::as_object)
+        .and_then(|general| general.get(GENERAL_UI_SCALE_PERCENT_KEY))
+        .and_then(Value::as_f64);
+    let Some(raw) = raw else {
+        return UI_SCALE_PERCENT_DEFAULT;
+    };
+    if !raw.is_finite() {
+        return UI_SCALE_PERCENT_DEFAULT;
+    }
+    clamp_ui_scale_percent(raw.round())
+}
+
+/// Clamps a raw percent value into the supported range as a `u32`.
+///
+/// Takes `f64` because the JSON value is read as one; a non-finite input resolves to
+/// [`UI_SCALE_PERCENT_DEFAULT`]. Rust has no `TryFrom<f64> for u32`, so the final
+/// conversion is an `as` cast — it is proven safe here because the value is clamped
+/// into `50..=200` first, where truncation and wrap-around are both impossible.
+#[must_use]
+pub fn clamp_ui_scale_percent(percent: f64) -> u32 {
+    if !percent.is_finite() {
+        return UI_SCALE_PERCENT_DEFAULT;
+    }
+    if percent <= f64::from(UI_SCALE_PERCENT_MIN) {
+        return UI_SCALE_PERCENT_MIN;
+    }
+    if percent >= f64::from(UI_SCALE_PERCENT_MAX) {
+        return UI_SCALE_PERCENT_MAX;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite and strictly inside 50..200 by the guards above"
+    )]
+    let percent = percent.round() as u32;
+    percent
+}
+
+/// Converts an interface-scale percent into the egui zoom factor
+/// (`Context::set_zoom_factor`): `100` → `1.0`. Out-of-range input is clamped first.
+#[must_use]
+pub fn ui_scale_factor_from_percent(percent: u32) -> f32 {
+    let percent = percent.clamp(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX);
+    // Clamped into 50..=200, so `u16` always fits; the fallback only keeps this total.
+    f32::from(u16::try_from(percent).unwrap_or(100)) / 100.0
+}
+
 #[must_use]
 pub fn memory_profile_from_user_settings(user_settings: &Value) -> MemoryProfile {
     user_settings
@@ -897,6 +970,7 @@ pub fn user_config_defaults() -> Value {
             "theme": "dark",
             "style": "default",
             "ui_language": "ru",
+            "ui_scale_percent": UI_SCALE_PERCENT_DEFAULT,
             "projects_dir": default_projects_root.to_string_lossy().to_string(),
             "ai_backend_autostart": true,
             "ai_device": "not-selected",
@@ -1682,6 +1756,66 @@ mod tests {
         assert!(
             !general.contains_key(GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY),
             "General.first_run_languages_confirmed must not be part of the defaults tree"
+        );
+    }
+
+    #[test]
+    fn ui_scale_percent_defaults_and_clamps() {
+        // Missing key / missing section / wrong type -> native size.
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({})),
+            UI_SCALE_PERCENT_DEFAULT
+        );
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {}})),
+            UI_SCALE_PERCENT_DEFAULT
+        );
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": "90"}})),
+            UI_SCALE_PERCENT_DEFAULT
+        );
+        // A stored value is honored, including a hand-written float.
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": 90}})),
+            90
+        );
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": 89.6}})),
+            90
+        );
+        // A hand-edited out-of-range value can never make the UI unusable.
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": 5}})),
+            UI_SCALE_PERCENT_MIN
+        );
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": 5000}})),
+            UI_SCALE_PERCENT_MAX
+        );
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&json!({"General": {"ui_scale_percent": -1}})),
+            UI_SCALE_PERCENT_MIN
+        );
+    }
+
+    #[test]
+    fn ui_scale_factor_maps_percent_to_zoom_factor() {
+        assert!((ui_scale_factor_from_percent(100) - 1.0).abs() < f32::EPSILON);
+        assert!((ui_scale_factor_from_percent(90) - 0.9).abs() < 1e-6);
+        // Out-of-range input is clamped, never turned into an absurd zoom factor.
+        assert!(
+            (ui_scale_factor_from_percent(10_000) - ui_scale_factor_from_percent(UI_SCALE_PERCENT_MAX))
+                .abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn user_config_defaults_carry_native_ui_scale() {
+        let defaults = user_config_defaults();
+        assert_eq!(
+            ui_scale_percent_from_user_settings(&defaults),
+            UI_SCALE_PERCENT_DEFAULT
         );
     }
 

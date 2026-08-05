@@ -130,6 +130,9 @@ fn run_launcher_internal(
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             theme::configure_context(&cc.egui_ctx);
+            // Global interface scale (`General.ui_scale_percent`): applied per-`Context`,
+            // so the launcher window honors it independently of the studio window.
+            crate::general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);
             Ok(Box::new(app::LauncherApp::new(
                 projects_root.clone(),
                 launcher_app_id(test_mode).to_owned(),

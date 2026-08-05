@@ -278,12 +278,21 @@ prompts instead of blocking the GUI thread.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
-- General settings editor (projects directory, global memory profile, UI language, and a duplicate
-  surface for the typesetting-language selector owned by `tabs/settings/typesetting.rs`) shared by
-  the studio settings tab AND the launcher settings page: `general_settings_panel.rs`. Per-UI
+- General settings editor (projects directory, global memory profile, interface scale, UI language,
+  and a duplicate surface for the typesetting-language selector owned by
+  `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:
+  `general_settings_panel.rs`. Per-UI
   `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to
   `user_config.json` serialized on `config::lock_user_config_write()`, except the typesetting
-  language, which is written off-thread through `tabs::settings::save_text_language`. The shared
+  language, which is written off-thread through `tabs::settings::save_text_language`.
+- Global interface scale (`General.ui_scale_percent`, 50-200 %): also `general_settings_panel.rs`.
+  It is a `Context::set_zoom_factor` call, so it rescales a whole window (fonts, spacing, widget
+  sizes) without touching the OS window size. The live value is the process-global
+  `ui_scale_percent()`, seeded once in `run_main` (`seed_ui_scale_from_user_settings`) and updated by
+  the slider — NOT re-read from the startup `user_settings` snapshot, which `run_main` reuses for
+  every window of the session. Each `run_native` constructor closure that should honor it calls
+  `apply_ui_scale_to_context` next to `ui_fonts::install*` (today: studio `run_main_window` +
+  `launcher::run`); a window that does not call it renders at native size. The shared
   typesetting-language selector itself is the public `general_settings_panel::draw_text_language_setting(ui, id_salt)`,
   called by both this widget and the studio "Тайп" pane (`tabs/settings/typesetting.rs`).
 - Menu-level shared layer for the two settings surfaces (launcher settings page + studio settings

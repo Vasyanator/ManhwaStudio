@@ -241,6 +241,27 @@ Send+Sync), установка — ТОЛЬКО через `Context::add_font`. 
 
 ---
 
+## Масштаб интерфейса (`General.ui_scale_percent`)
+
+Глобальный размер UI (50-200 %, дефолт 100) — это `Context::set_zoom_factor(percent/100)`:
+меняется `pixels_per_point`, а не размеры в коде, поэтому масштабируются сразу шрифты,
+отступы и все виджеты, а размер окна ОС не трогается.
+
+Владелец — `src/general_settings_panel.rs`: процесс-глобальный `ui_scale_percent()`,
+засеянный один раз в `run_main` (`seed_ui_scale_from_user_settings`) и обновляемый
+слайдером в общем General-виджете. Читать значение из стартового снимка `user_settings`
+нельзя: `run_main` берёт его ОДИН раз и переиспользует для всех окон сессии, поэтому
+масштаб, изменённый в лаунчере, не дошёл бы до открытой после него студии.
+
+`zoom_factor` живёт в `Context`, а лаунчер и студия — разные `run_native`-окна, поэтому
+каждое замыкание-конструктор, которое обязано уважать масштаб, зовёт
+`general_settings_panel::apply_ui_scale_to_context` рядом с `ui_fonts::install*` (сегодня —
+студия и лаунчер; окно без вызова просто рисуется в натуральную величину). Клавиатурный
+зум egui остаётся выключенным (`opt.zoom_with_keyboard = false` в `MangaApp::ui`), иначе
+Ctrl+/-/0 конфликтуют с зумом холста.
+
+---
+
 ## Что такое проект
 
 `src/project.rs`:
@@ -510,7 +531,7 @@ original, and a bbox relative to the sent image) and the model returns
 
 | Pane | Ответственность |
 |---|---|
-| **General** | projects_dir + memory profile через общий виджет `crate::general_settings_panel` (тот же, что в лаунчере; синхронная запись под `config::lock_user_config_write()`); enforcement вертикального typing-panel layout остаётся studio-only |
+| **General** | projects_dir + memory profile + масштаб интерфейса через общий виджет `crate::general_settings_panel` (тот же, что в лаунчере; синхронная запись под `config::lock_user_config_write()`); enforcement вертикального typing-panel layout остаётся studio-only |
 | **CanvasRibbon** | SharedCanvasSettings (лента), ComicType, BubbleStatus rules |
 | **Typesetting** («Тайп») | text-typesetting options: висящая пунктуация (`TextTab.hanging_punctuation`, live через `crate::text_punctuation`), режим «Поворот Ctrl+колесо» (`TextTab.rotation_ctrl_wheel_mode`, live через `crate::tabs::typing::rotation_ctrl_wheel`) и редактор стандартных параметров карточек эффектов (`TextTab.effect_defaults`, self-contained typing-panel widget `EffectDefaultsEditorState`) |
 | **AiBackend** | запуск/остановка `ai_backend.py`, device, CUDA/ONNX diagnostics |
