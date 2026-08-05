@@ -527,10 +527,14 @@ impl TypingTopPanelState {
                             self.draw_auto_typing_controls(ui);
                             // Centering assist ("Помочь с центровкой"): a page-anchored guide frame the
                             // user drags to a bubble; the selected text layer stays centered in it.
-                            let centering_toggle = ui.checkbox(
-                                &mut self.centering_assist_enabled,
-                                t!("typing.panel.centering_assist_toggle"),
-                            );
+                            let centering_toggle = ui
+                                .checkbox(
+                                    &mut self.centering_assist_enabled,
+                                    t!("typing.panel.centering_assist_toggle"),
+                                )
+                                .on_hover_text(t!(
+                                    "typing.panel.centering_assist_hotkey_hint"
+                                ));
                             if centering_toggle.changed()
                                 && self.centering_assist_enabled
                                 && self.mode == TypingTopPanelMode::EditText
@@ -751,6 +755,18 @@ impl TypingTopPanelState {
         self.centering_assist_enabled
     }
 
+    /// Flips centering assist ("Помочь с центровкой"), exactly as the panel checkbox does.
+    ///
+    /// Used by the `H` hotkey. Turning it ON while editing re-emits the edit request so the
+    /// renderer computes the mean/median centers and the guide frame appears without a further
+    /// text/param edit — the same side effect the checkbox has.
+    pub(in crate::tabs::typing) fn toggle_centering_assist(&mut self) {
+        self.centering_assist_enabled = !self.centering_assist_enabled;
+        if self.centering_assist_enabled && self.mode == TypingTopPanelMode::EditText {
+            self.emit_edit_request();
+        }
+    }
+
     /// Which overlay center the assist frame currently binds to (image / mean / median).
     pub(in crate::tabs::typing) fn centering_assist_kind(&self) -> CenteringAssistCenterKind {
         self.centering_assist_kind
@@ -780,6 +796,17 @@ impl TypingTopPanelState {
         }
         self.clean_overlays_visible = visible;
         self.clean_overlays_initialized = true;
+    }
+
+    /// Flips the «Показывать клин» state and queues the canvas request, exactly as the panel
+    /// checkbox does.
+    ///
+    /// Used by the `C` hotkey so the checkbox and the hotkey share one source of truth: the panel
+    /// field is the authority after the one-shot [`Self::sync_clean_overlays_visible_from_canvas`]
+    /// seed, and the queued request is drained by the tab into the canvas in the same frame.
+    pub(in crate::tabs::typing) fn toggle_clean_overlays_visible(&mut self) {
+        self.clean_overlays_visible = !self.clean_overlays_visible;
+        self.pending_clean_overlays_visible = Some(self.clean_overlays_visible);
     }
 
     pub(in crate::tabs::typing) fn take_clean_overlays_visible_request(&mut self) -> Option<bool> {

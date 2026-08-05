@@ -397,7 +397,8 @@ pub struct RenderExtraInfoRequest {
     /// Compute the MEAN center: the area centroid of the convex hull of all
     /// included glyphs' placement-box corners (`RenderedTextExtraInfo::mean_center`).
     pub mean_center: bool,
-    /// Compute the MEDIAN center: the per-axis median of all included glyphs'
+    /// Compute the MEDIAN center: the per-axis median over LINE samples, where
+    /// each layout line contributes one sample — the mean of its included glyphs'
     /// placement-box centers (`RenderedTextExtraInfo::median_center`).
     pub median_center: bool,
 }
@@ -426,8 +427,11 @@ pub struct RenderedTextExtraInfo {
     /// corners, in final-image pixels. `None` when not requested or when no glyph
     /// contributed (e.g. every glyph excluded as hanging punctuation).
     pub mean_center: Option<[f32; 2]>,
-    /// Per-axis median of all included glyphs' placement-box centers, in
-    /// final-image pixels. `None` when not requested or when no glyph contributed.
+    /// Per-axis median over LINE samples, in final-image pixels: each layout line
+    /// (a COLUMN in vertical mode) is first collapsed to the mean of its included
+    /// glyphs' placement-box centers, and the median is taken over those samples, so
+    /// every line weighs the same regardless of how many glyphs it holds. `None` when
+    /// not requested or when no glyph contributed.
     pub median_center: Option<[f32; 2]>,
 }
 

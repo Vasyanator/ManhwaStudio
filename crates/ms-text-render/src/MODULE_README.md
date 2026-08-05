@@ -137,7 +137,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   `ExtraInfoAccumulator` (collects per-glyph placement-box corner/center samples
   in content space; a true no-op when nothing is requested), the monotone-chain
   convex hull + polygon area centroid (mean center, point-average fallback for
-  degenerate hulls), the per-axis median (median center), `finish` which maps
+  degenerate hulls), the per-LINE median (median center: each layout line collapses
+  to the mean of its glyph centers, then a per-axis median over those line samples,
+  so line length cannot skew the result), `finish` which maps
   the accumulated samples from content space to final-image pixels, and the shared
   `rotated_box_samples` helper (a scaled glyph box's rotated corners/center) used by
   the rotated draw paths. Knows nothing about fonts/layout/raster. Unit-tested in
@@ -549,8 +551,10 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `TextRenderParams.extra_info` (`RenderExtraInfoRequest`) selects which optional
   "extra render info" items the renderer computes alongside the pixels — today the
   MEAN center (area centroid of the convex hull of all included glyphs'
-  placement-box corners) and the MEDIAN center (per-axis median of their box
-  centers), returned in `RenderedTextImage.extra` (`RenderedTextExtraInfo`, two
+  placement-box corners) and the MEDIAN center (per-axis median over LINE samples:
+  each layout line — a COLUMN in vertical mode — contributes one sample, the mean of
+  its included glyphs' box centers, so a long line does not outvote a short one),
+  returned in `RenderedTextImage.extra` (`RenderedTextExtraInfo`, two
   `Option<[f32; 2]>` in FINAL-IMAGE pixels, fractional and possibly outside the
   image). The DEFAULT (nothing requested) is a true no-op with the byte-identical
   fast path and zero per-glyph sampling. Like `anti_aliasing`, it does NOT affect
@@ -569,7 +573,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (`layout/vertical.rs`), and formula/on-path + `Shape` + custom raster/vector
   lines (`formula/render.rs`). The shared accumulator API: build one
   `ExtraInfoAccumulator::new(params.extra_info)` per render, gate work on
-  `is_active()`, call `add_glyph(corners, center, warpable)` per drawn glyph AFTER all
+  `is_active()`, call `add_glyph(corners, center, warpable, line_idx)` per drawn glyph AFTER all
   placement transforms (post block/group/global rotation), apply the mesh warp once
   via `map_points(|p| ctx.warp_world(p))` when a warp is active, then
   `finish(x_offset, y_offset)` with that path's content->canvas offset and store the
@@ -583,8 +587,15 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   formula/on-path + `Shape` + custom-line paths). The rotated draw paths build
   their per-glyph box via the shared `extra_info::rotated_box_samples` (scaled box
   half-extents rotated by the glyph's total rotation). Hanging-punctuation exclusion
-  applies to the HORIZONTAL paths only (vertical/formula never read
-  `hanging_punctuation`). Both formula render functions accumulate INSIDE their
+  applies to every mode whose WRAP actually hangs punctuation: the horizontal paths
+  (`pipeline.rs`, per-glyph inline) and the formula/custom-line paths (`formula/render.rs`,
+  marked once per seed in `collect_formula_glyph_seeds` as `hanging_excluded`). Vertical
+  is deliberately EXCLUDED from the exclusion: `VerticalWrapRequest` carries no
+  `hanging_punctuation` flag, so nothing hangs there and its centers must not react to
+  the setting. The shared predicates (`glyph_is_hanging_punctuation`,
+  `hanging_edge_run_bounds`, `is_edge_run_hanging`) live in `pipeline.rs` next to
+  `hanging_metrics_for_layout` so the exclusion and the visual hang always agree on what
+  hangs. Both formula render functions accumulate INSIDE their
   `_once` body, so the formula retry loop (`render_margin_pad` growth) naturally
   rebuilds a FRESH accumulator every iteration and the stored extras always match
   the accepted image.

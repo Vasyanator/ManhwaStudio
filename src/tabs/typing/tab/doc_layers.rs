@@ -579,6 +579,7 @@ impl TypingTextOverlayLayer {
                 image,
                 is_image,
                 mask_clip,
+                extra_centers,
                 ..
             } = &node.body
             else {
@@ -622,10 +623,13 @@ impl TypingTextOverlayLayer {
                     if pixels_changed {
                         rt.size_px = size_px;
                         rt.source_rgba = color_image_to_rgba(image);
-                        // Centering-assist centers: the doc image carries no text-center info, so stale
-                        // mean/median centers must not survive a pixel change they no longer match. Reset
-                        // to default; a re-render with the centering assist enabled recomputes them.
-                        rt.extra = RenderedTextExtraInfo::default();
+                        // Centering-assist centers: take them from the doc node, which stores them in
+                        // the SAME mutation as the pixels (`set_text_render`). Projecting them here
+                        // rather than resetting is what makes the mean/median centers survive a render:
+                        // every render routes through the doc and re-projects on the same call stack, so
+                        // a reset would wipe the centers the render had just produced. Nodes loaded from
+                        // disk carry all-`None`, which correctly clears stale centers.
+                        rt.extra = extra_centers.clone();
                         rt.display_texture_stale = true;
                         self.raster_texture_generations
                             .insert(cache_key, node.generation);
@@ -634,7 +638,7 @@ impl TypingTextOverlayLayer {
                 }
                 None => {
                     // CREATE: materialize a runtime from the doc node (migrated-chapter case).
-                    let runtime = text_runtime_from_doc_node(
+                    let mut runtime = text_runtime_from_doc_node(
                         &node.uid,
                         page_idx,
                         center,
@@ -648,6 +652,9 @@ impl TypingTextOverlayLayer {
                         size_px,
                         color_image_to_rgba(image),
                     );
+                    // Assigned here rather than threaded through the (already over-long) constructor:
+                    // the centers belong to the node's pixels, which were just projected above.
+                    runtime.extra = extra_centers.clone();
                     self.overlays.push(runtime);
                     let idx = self.overlays.len() - 1;
                     // Mark the texture generation as projected so a subsequent sync doesn't needlessly

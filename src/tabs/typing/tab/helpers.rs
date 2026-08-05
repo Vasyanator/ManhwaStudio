@@ -276,8 +276,9 @@ pub(super) fn text_runtime_from_doc_node(
         render_data_json,
         size_px,
         source_rgba,
-        // A doc-materialized overlay carries no text-center info (the doc image has none by design); it
-        // is recomputed only on a re-render with centering assist enabled.
+        // Centering-assist centers are NOT a constructor parameter (the signature is already
+        // over-long): `sync_from_doc` assigns them from the doc node right after this call, next to
+        // the pixels they belong to. A caller that skips that assignment gets the neutral default.
         extra: RenderedTextExtraInfo::default(),
         // No centering-assist frame until the reconciliation creates one for the selected overlay.
         centering_frame: None,

@@ -563,6 +563,10 @@ impl TypingTextOverlayLayer {
                     payload_uid: uid,
                     // Carry the overlay's mask-clip flag so the v3 inline payload persists it.
                     mask_clip: Some(decoded.mask_clip_enabled),
+                    // The centers measured for THESE pixels. The `route_to_doc` below re-projects
+                    // this node onto the runtime pushed after it, so the doc must already carry them
+                    // or the projection would hand the runtime empty centers.
+                    extra_centers: decoded.extra.clone(),
                 },
             };
             Some((page_idx, node))

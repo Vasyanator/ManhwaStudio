@@ -643,7 +643,11 @@ impl TypingCreatePanelState {
             // редактирование); остальные действия ниже — только при создании.
             ui.separator();
             let mut show_clean = clean_overlays_visible;
-            if ui.checkbox(&mut show_clean, t!("typing.export.show_clean_overlay")).changed() {
+            if ui
+                .checkbox(&mut show_clean, t!("typing.export.show_clean_overlay"))
+                .on_hover_text(t!("typing.export.show_clean_overlay_hotkey_hint"))
+                .changed()
+            {
                 out.changed_clean_overlays = Some(show_clean);
             }
             if self.preview_enabled {

@@ -31,7 +31,9 @@ Both `_once` functions build their OWN `ExtraInfoAccumulator` (so the formula re
 loop rebuilds it fresh each iteration) and feed it the final line-placed, rotated
 glyph box (shared `extra_info::rotated_box_samples`) for both outline and bitmap
 glyphs, warp once via `map_points`, then store `finish`'s centers into the returned
-image before the caller trims/effects. No hanging exclusion. Default = no-op.
+image before the caller trims/effects. Leading/trailing hanging punctuation is
+excluded from that sampling (marked per seed in `collect_formula_glyph_seeds`),
+so it cannot drag the centers. Default request = no-op.
 
 Glyph-ink spacing (MinimumPreviousDistance mode):
 - `seed_ink_geometry`/`CachedGlyphInk` derive a glyph's ink contour from its outline
@@ -77,6 +79,7 @@ use crate::inline_styles::{
 use crate::optical::optical_base_advance;
 use crate::pipeline::{
     FauxGlyphStyle, GlyphScaleSettings, KerningSettings, effective_spacing_percent,
+    hanging_edge_run_bounds, is_edge_run_hanging,
     faux_bounds_pads, faux_style_at_offset, faux_style_for_glyph, horizontal_line_offset,
 };
 use crate::raster::{
@@ -155,6 +158,12 @@ struct FormulaGlyphSeed {
     /// (`resolve_glyph_outline`) and the draw transforms consume it.
     /// `FauxGlyphStyle::NONE` keeps every seam byte-identical to no faux.
     faux: FauxGlyphStyle,
+    /// `true` when this glyph sits in its line's leading/trailing hanging-punctuation
+    /// run, so the draw pass must keep it OUT of the extra-info (mean/median center)
+    /// sampling — it hangs past the text block and would drag the center with it.
+    /// Always `false` unless extra info was requested AND `hanging_punctuation` is on;
+    /// it never affects the drawn pixels.
+    hanging_excluded: bool,
 }
 
 impl FormulaGlyphSeed {
@@ -873,7 +882,8 @@ fn render_text_with_drawn_lines_layout_once(
         // Extra-info sample: the final line-placed, rotated glyph box the composite
         // pass draws. Both kinds contribute, but only the outline sample is warpable;
         // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
-        if extra_active {
+        // Leading/trailing hanging punctuation is skipped so it cannot drag the center.
+        if extra_active && !seed.hanging_excluded {
             let (scaled_w, scaled_h) =
                 seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
             let (corners, center) = rotated_box_samples(
@@ -883,7 +893,7 @@ fn render_text_with_drawn_lines_layout_once(
                 scaled_h,
                 transform.rotation_rad,
             );
-            extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+            extra_acc.add_glyph(corners, center, glyph_outline.is_some(), seed.line_idx);
         }
 
         // Prefer the true font outline: rasterize it directly into the output at
@@ -2211,7 +2221,8 @@ fn render_text_with_formula_layout_once(
         // Extra-info sample: the final line-placed, rotated glyph box the composite
         // pass draws. Both kinds contribute, but only the outline sample is warpable;
         // the bitmap fallback's sample stays unwarped to match its unwarped pixels.
-        if extra_active {
+        // Leading/trailing hanging punctuation is skipped so it cannot drag the center.
+        if extra_active && !seed.hanging_excluded {
             let (scaled_w, scaled_h) =
                 seed.glyph_scale.scaled_size(glyph_w as f32, glyph_h as f32);
             let (corners, center) = rotated_box_samples(
@@ -2221,7 +2232,7 @@ fn render_text_with_formula_layout_once(
                 scaled_h,
                 transform.rotation_rad,
             );
-            extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+            extra_acc.add_glyph(corners, center, glyph_outline.is_some(), seed.line_idx);
         }
 
         // Prefer the true font outline; keep the bitmap blit for outline-less
@@ -2466,7 +2477,16 @@ fn collect_formula_glyph_seeds(
         compute_inline_line_aligns(params.align, layout_line_offsets, inline_style_spans);
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
+    // Leading/trailing hanging-punctuation runs are marked (not dropped): the glyphs still
+    // DRAW, they are only kept out of the extra-info center sampling. Computed only when that
+    // sampling is active and punctuation actually hangs, so the default path pays nothing.
+    let mark_hanging = params.extra_info.is_active() && params.hanging_punctuation;
     while let Some(run) = runs.next() {
+        let hanging_bounds = if mark_hanging {
+            hanging_edge_run_bounds(&run)
+        } else {
+            (0, run.glyphs.len())
+        };
         let line_align = inline_line_aligns
             .get(line_idx)
             .copied()
@@ -2482,7 +2502,7 @@ fn collect_formula_glyph_seeds(
                 has_inline_size_overrides,
             )
         });
-        for glyph in run.glyphs {
+        for (glyph_idx_in_run, glyph) in run.glyphs.iter().enumerate() {
             let glyph_idx_in_line = line_seen
                 .get_mut(line_idx)
                 .map(|value| {
@@ -2546,6 +2566,8 @@ fn collect_formula_glyph_seeds(
                     run.line_i,
                     glyph,
                 ),
+                hanging_excluded: mark_hanging
+                    && is_edge_run_hanging(hanging_bounds, glyph_idx_in_run),
             });
         }
 
@@ -2615,6 +2637,9 @@ fn collect_formula_glyph_seeds(
                 glyphs_in_line: line_counts.get(line_idx).copied().unwrap_or(1),
                 advance_px: 0.0,
                 faux: hyphen_faux,
+                // The wrapped soft hyphen is real ink and never hangs, so it always
+                // contributes to the extra-info samples (matches the horizontal path).
+                hanging_excluded: false,
             });
         }
         line_idx += 1;

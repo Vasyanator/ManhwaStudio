@@ -46,7 +46,8 @@ Extra render info (`TextRenderParams.extra_info`):
 The draw pass feeds one `ExtraInfoAccumulator` a per-glyph placement box (shared
 `extra_info::rotated_box_samples`, center carried through the block rotation) for
 both cell kinds, warps it once via `map_points`, and stores `finish`'s centers into
-the built image. No hanging-punctuation exclusion here. Default request = no-op.
+the built image. No hanging-punctuation exclusion here — see the draw pass note.
+Default request = no-op.
 
 Source:
 - `render_vertical_text`
@@ -377,7 +378,10 @@ pub(crate) fn render_vertical_text(
     // `add_glyph`/`map_points`/`finish` call is a no-op with no per-glyph cost.
     // Samples are collected in raw content space (post block rotation) here; the
     // optional mesh warp is applied once below and the content->canvas offset in
-    // `finish`. Vertical text never reads `hanging_punctuation`, so no exclusion.
+    // `finish`. NO hanging-punctuation exclusion here, deliberately: the vertical wrap
+    // (`VerticalWrapRequest`) carries no `hanging_punctuation` flag at all, so punctuation
+    // never hangs in this mode and there is nothing to exclude. The horizontal and
+    // formula paths DO exclude it because their wrap does hang it.
     let mut extra_acc = ExtraInfoAccumulator::new(params.extra_info);
     let extra_active = extra_acc.is_active();
 
@@ -459,7 +463,9 @@ pub(crate) fn render_vertical_text(
                     scaled_h,
                     global_rotation_rad,
                 );
-                extra_acc.add_glyph(corners, center, glyph_outline.is_some());
+                // A vertical COLUMN is this mode's line unit, so the median weights
+                // every column equally (see `per_line_median`).
+                extra_acc.add_glyph(corners, center, glyph_outline.is_some(), column_idx);
             }
 
             // Prefer the true font outline: rasterize it at the exact world placement

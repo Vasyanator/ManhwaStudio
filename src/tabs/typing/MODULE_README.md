@@ -733,6 +733,19 @@ saving, and export.
   production text renders request BOTH renderer centers (`RenderExtraInfoRequest`) at the five dispatch
   sites landing in the live overlay runtime (create, edit, vector re-render / Ctrl+wheel / width drag,
   layout-editor re-render, shape-variant apply); the result is carried on `TypingOverlayRuntime.extra`.
+  CENTER OWNERSHIP: `TypingOverlayRuntime.extra` is a PROJECTION of the doc node's transient
+  `NodeBody::Text.extra_centers`, not an independent copy. Every text render routes its pixels through
+  `route_to_doc(set_text_render(..., extra))`, and `route_to_doc` re-projects the page on the SAME call
+  stack, so `sync_from_doc` restores `extra` from the node whenever `pixels_changed`. A runtime-only
+  center would therefore be wiped by the projection that immediately follows the render that produced
+  it — which is exactly why all three bound-center kinds used to collapse onto the plain image center.
+  Nodes loaded from disk carry no centers (the metric is never persisted), so the fallback in
+  `mesh_geometry::centering_chosen_img_px` still applies until the first assist-enabled render.
+  The MEDIAN center weights every layout LINE equally (the renderer collapses each line to one sample
+  before taking the median), so it does not snap onto whichever line holds the most glyphs. Leading and
+  trailing hanging punctuation is excluded from both centers whenever the layer has hanging punctuation
+  ON, in the horizontal and formula layouts; the vertical layout never hangs punctuation, so its centers
+  do not react to that setting.
   When OFF the feature keeps a negligible constant per-frame cost (the flag/kind mirror plus an
   early-returning `reconcile_centering_frame` call); renders compute no centers and nothing is drawn.
   STATE HOME: the guide frame is a transient `Option<CenteringFrame>` on `TypingOverlayRuntime`

@@ -11,7 +11,9 @@ Main responsibilities:
 - accumulate per-glyph corner/center samples only for the requested metrics;
 - compute the convex-hull area centroid (mean center) with a point-average
   fallback for degenerate hulls;
-- compute the per-axis median (median center);
+- compute the median center: each layout line collapses to one sample (the mean
+  of its glyph centers) and the per-axis median is taken over those samples, so
+  line length cannot skew it;
 - translate accumulated content-space samples (e.g. through a mesh warp) and map
   the finished centers into canvas pixels via a content->canvas offset.
 
@@ -22,7 +24,7 @@ Key functions:
 - ExtraInfoAccumulator::new / is_active / add_glyph / map_points / finish
 - convex_hull (monotone chain)
 - polygon_area_centroid
-- per_axis_median
+- per_line_median / per_axis_median
 
 Notes:
 Coordinates are the same content-space units the horizontal draw pass uses; the
@@ -51,11 +53,15 @@ pub(crate) struct ExtraInfoAccumulator {
     /// transforms a corner only when its flag is `true`. Color-glyph BITMAP-fallback
     /// glyphs push `false` because their raster pixels are drawn UNWARPED.
     hull_warpable: Vec<bool>,
-    /// Placement-box center samples feeding the per-axis median center. Empty
-    /// unless `request.median_center` is set.
+    /// Placement-box center samples feeding the median center. Empty unless
+    /// `request.median_center` is set.
     center_points: Vec<[f32; 2]>,
     /// Per-center warp flag parallel to `center_points` (see `hull_warpable`).
     center_warpable: Vec<bool>,
+    /// Layout line each center sample belongs to, parallel to `center_points`.
+    /// [`Self::finish`] collapses each line to ONE sample before taking the median,
+    /// so a long line cannot outvote a short one (see [`per_line_median`]).
+    center_lines: Vec<usize>,
 }
 
 impl ExtraInfoAccumulator {
@@ -69,6 +75,7 @@ impl ExtraInfoAccumulator {
             hull_warpable: Vec::new(),
             center_points: Vec::new(),
             center_warpable: Vec::new(),
+            center_lines: Vec::new(),
         }
     }
 
@@ -86,7 +93,18 @@ impl ExtraInfoAccumulator {
     /// pixels are drawn UNWARPED — [`Self::map_points`] then leaves their samples in
     /// place so the samples stay aligned with the pixels. Only the samples the active
     /// metrics need are stored. A no-op when the accumulator is inactive.
-    pub(crate) fn add_glyph(&mut self, corners: [[f32; 2]; 4], center: [f32; 2], warpable: bool) {
+    ///
+    /// `line_idx` identifies the glyph's layout line (a COLUMN in vertical mode) and
+    /// is used only by the median center, which weights every line equally. Callers
+    /// must number lines consistently within one render; the absolute values and their
+    /// order do not matter, only which glyphs share a value.
+    pub(crate) fn add_glyph(
+        &mut self,
+        corners: [[f32; 2]; 4],
+        center: [f32; 2],
+        warpable: bool,
+        line_idx: usize,
+    ) {
         if self.request.mean_center {
             self.hull_points.extend_from_slice(&corners);
             // One flag per corner keeps `hull_warpable` parallel to `hull_points`.
@@ -95,6 +113,7 @@ impl ExtraInfoAccumulator {
         if self.request.median_center {
             self.center_points.push(center);
             self.center_warpable.push(warpable);
+            self.center_lines.push(line_idx);
         }
     }
 
@@ -137,7 +156,8 @@ impl ExtraInfoAccumulator {
             None
         };
         let median_center = if self.request.median_center {
-            per_axis_median(&self.center_points).map(|[cx, cy]| [cx + x_offset, cy + y_offset])
+            per_line_median(&self.center_points, &self.center_lines)
+                .map(|[cx, cy]| [cx + x_offset, cy + y_offset])
         } else {
             None
         };
@@ -242,6 +262,52 @@ fn point_average(points: &[[f32; 2]]) -> Option<[f32; 2]> {
     // Intentional f64->f32 at the contract boundary; magnitudes are image-plane
     // pixels, well within f32 range.
     Some([(sum_x / count) as f32, (sum_y / count) as f32])
+}
+
+/// Per-LINE median of `points`, or `None` when empty.
+///
+/// `lines[i]` is the layout line of `points[i]` (the two slices must be parallel;
+/// a length mismatch is treated as "no line information" and every point falls
+/// into one group). Each distinct line is first collapsed to a single sample —
+/// the arithmetic mean of its points — and the per-axis median is then taken over
+/// those LINE samples.
+///
+/// Grouping first is what makes this a usable center: glyph centers cluster into
+/// rows, so a plain per-glyph median snaps its y onto whichever line happens to
+/// carry the most glyphs (a two-line block would report the first line's y as the
+/// "center", and adding one glyph could flip it to the other line). Weighting every
+/// line equally removes that bimodality; a one-letter line counts as much as a long
+/// one, which is the intended "typical line" reading.
+#[must_use]
+fn per_line_median(points: &[[f32; 2]], lines: &[usize]) -> Option<[f32; 2]> {
+    if points.is_empty() {
+        return None;
+    }
+    // Line counts are tiny (a handful per render), so a linear scan beats a map.
+    let mut sums: Vec<(usize, [f64; 2], usize)> = Vec::new();
+    for (idx, [x, y]) in points.iter().enumerate() {
+        // A missing/short `lines` slice degrades to a single group rather than panicking.
+        let line = lines.get(idx).copied().unwrap_or(0);
+        match sums.iter_mut().find(|(key, _, _)| *key == line) {
+            Some((_, sum, count)) => {
+                sum[0] += f64::from(*x);
+                sum[1] += f64::from(*y);
+                *count += 1;
+            }
+            None => sums.push((line, [f64::from(*x), f64::from(*y)], 1)),
+        }
+    }
+    let line_centers: Vec<[f32; 2]> = sums
+        .iter()
+        .map(|(_, sum, count)| {
+            // `count` is a glyph-sample count, far below f64's 2^53 integer-exact range.
+            let n = *count as f64;
+            // Intentional f64->f32 at the contract boundary; magnitudes are image-plane
+            // pixels, well within f32 range.
+            [(sum[0] / n) as f32, (sum[1] / n) as f32]
+        })
+        .collect();
+    per_axis_median(&line_centers)
 }
 
 /// Per-axis median of `points`, or `None` when empty.
@@ -420,7 +486,7 @@ mod tests {
     fn inactive_accumulator_is_noop() {
         let mut acc = ExtraInfoAccumulator::new(RenderExtraInfoRequest::default());
         assert!(!acc.is_active());
-        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true);
+        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true, 0);
         acc.map_points(|p| [p[0] + 100.0, p[1] + 100.0]);
         assert_eq!(acc.finish(5.0, 5.0), RenderedTextExtraInfo::default());
     }
@@ -433,8 +499,8 @@ mod tests {
         };
         let mut acc = ExtraInfoAccumulator::new(req);
         // Two unit squares centered at (0.5,0.5) and (2.5,0.5).
-        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true);
-        acc.add_glyph([[2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0]], [2.5, 0.5], true);
+        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true, 0);
+        acc.add_glyph([[2.0, 0.0], [3.0, 0.0], [3.0, 1.0], [2.0, 1.0]], [2.5, 0.5], true, 0);
         let out = acc.finish(10.0, 20.0);
         // Hull is the rectangle (0,0)-(3,1); centroid (1.5, 0.5) + offset.
         let mean = out.mean_center.expect("mean requested");
@@ -451,7 +517,7 @@ mod tests {
             median_center: true,
         };
         let mut acc = ExtraInfoAccumulator::new(req);
-        acc.add_glyph([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]], [1.0, 1.0], true);
+        acc.add_glyph([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]], [1.0, 1.0], true, 0);
         acc.map_points(|p| [p[0] + 3.0, p[1] - 1.0]);
         let out = acc.finish(0.0, 0.0);
         let mean = out.mean_center.expect("mean requested");
@@ -470,8 +536,8 @@ mod tests {
             median_center: true,
         };
         let mut acc = ExtraInfoAccumulator::new(req);
-        acc.add_glyph([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]], [1.0, 1.0], true);
-        acc.add_glyph([[4.0, 0.0], [6.0, 0.0], [6.0, 2.0], [4.0, 2.0]], [5.0, 1.0], false);
+        acc.add_glyph([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]], [1.0, 1.0], true, 0);
+        acc.add_glyph([[4.0, 0.0], [6.0, 0.0], [6.0, 2.0], [4.0, 2.0]], [5.0, 1.0], false, 0);
         // Translate every warpable sample by +100 in x; non-warpable stays.
         acc.map_points(|p| [p[0] + 100.0, p[1]]);
         let out = acc.finish(0.0, 0.0);
@@ -482,6 +548,82 @@ mod tests {
         // at x in [4,6]; the hull is the rectangle x:[4,102], y:[0,2], centroid (53,1).
         let mean = out.mean_center.expect("mean requested");
         assert!(approx(mean, [53.0, 1.0]), "got {mean:?}");
+    }
+
+    #[test]
+    fn median_weights_every_line_equally_not_every_glyph() {
+        // Two rows: a LONG line of 5 glyphs at y = 0 and a SHORT line of 1 glyph at
+        // y = 100. A per-GLYPH median would report y = 0 (4 of 6 samples sit there),
+        // naming the long line as the block's center. Per-LINE it must land midway.
+        let req = RenderExtraInfoRequest {
+            mean_center: false,
+            median_center: true,
+        };
+        let mut acc = ExtraInfoAccumulator::new(req);
+        for i in 0..5 {
+            let x = i as f32;
+            acc.add_glyph(
+                [[x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0]],
+                [x + 0.5, 0.0],
+                true,
+                0,
+            );
+        }
+        acc.add_glyph(
+            [[0.0, 100.0], [1.0, 100.0], [1.0, 101.0], [0.0, 101.0]],
+            [2.5, 100.0],
+            true,
+            1,
+        );
+        let median = acc
+            .finish(0.0, 0.0)
+            .median_center
+            .expect("median requested");
+        // Line samples: (2.5, 0) and (2.5, 100) -> even count -> midpoint (2.5, 50).
+        assert!(approx(median, [2.5, 50.0]), "got {median:?}");
+    }
+
+    #[test]
+    fn median_line_sample_is_the_mean_of_that_line() {
+        // One line whose glyphs are lopsided: 3 glyphs bunched at x = 0 and one far
+        // out at x = 12. Collapsing the line uses the MEAN, so the outlier pulls the
+        // line sample; the median only arbitrates BETWEEN lines.
+        let req = RenderExtraInfoRequest {
+            mean_center: false,
+            median_center: true,
+        };
+        let mut acc = ExtraInfoAccumulator::new(req);
+        for x in [0.0f32, 0.0, 0.0, 12.0] {
+            acc.add_glyph(
+                [[x, 0.0], [x, 0.0], [x, 0.0], [x, 0.0]],
+                [x, 4.0],
+                true,
+                7, // an arbitrary, non-zero line id: only equality matters
+            );
+        }
+        let median = acc
+            .finish(0.0, 0.0)
+            .median_center
+            .expect("median requested");
+        assert!(approx(median, [3.0, 4.0]), "got {median:?}");
+    }
+
+    #[test]
+    fn median_odd_line_count_picks_the_middle_line() {
+        let req = RenderExtraInfoRequest {
+            mean_center: false,
+            median_center: true,
+        };
+        let mut acc = ExtraInfoAccumulator::new(req);
+        for (line, y) in [(0usize, 0.0f32), (1, 10.0), (2, 90.0)] {
+            acc.add_glyph([[0.0, y], [1.0, y], [1.0, y], [0.0, y]], [0.0, y], true, line);
+        }
+        let median = acc
+            .finish(0.0, 0.0)
+            .median_center
+            .expect("median requested");
+        // Three line samples at y 0/10/90 -> middle is 10 (NOT the 33.3 average).
+        assert!(approx(median, [0.0, 10.0]), "got {median:?}");
     }
 
     #[test]
@@ -516,7 +658,7 @@ mod tests {
             median_center: false,
         };
         let mut acc = ExtraInfoAccumulator::new(req);
-        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true);
+        acc.add_glyph([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], [0.5, 0.5], true, 0);
         let out = acc.finish(0.0, 0.0);
         assert!(out.mean_center.is_some());
         assert!(out.median_center.is_none());

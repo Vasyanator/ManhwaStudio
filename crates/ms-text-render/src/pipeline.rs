@@ -1008,7 +1008,7 @@ pub fn render_text_to_image(
                 // so its sample must stay unwarped too.
                 if extra_active && !is_edge_run_hanging(hanging_bounds, glyph_idx) {
                     let (corners, center) = horizontal_placement_extra_samples(&placement);
-                    extra_acc.add_glyph(corners, center, placement.outline.is_some());
+                    extra_acc.add_glyph(corners, center, placement.outline.is_some(), line_idx);
                 }
                 placements.push(placement);
             }
@@ -1087,7 +1087,7 @@ pub fn render_text_to_image(
                 // when it draws from its outline (bitmap fallback stays unwarped).
                 if extra_active {
                     let (corners, center) = horizontal_placement_extra_samples(&placement);
-                    extra_acc.add_glyph(corners, center, placement.outline.is_some());
+                    extra_acc.add_glyph(corners, center, placement.outline.is_some(), line_idx);
                 }
                 placements.push(placement);
             }
@@ -1456,6 +1456,10 @@ struct RotatedGlyphPlacement {
     /// run and must be excluded from the extra-info sampling (set by the collection
     /// loop; defaults to `false`, e.g. for the wrapped hyphen).
     hanging_excluded: bool,
+    /// Layout line this glyph belongs to. Carried on the placement because the
+    /// extra-info sampling runs AFTER the run loop here (global rotation is baked in
+    /// first), so the loop's line counter is no longer in scope. Median-only.
+    line_idx: usize,
 }
 
 impl RotatedGlyphPlacement {
@@ -1539,6 +1543,9 @@ fn build_rotated_placement(
         group_rotation_rad,
         // Set by the collection loop when hanging punctuation is enabled.
         hanging_excluded: false,
+        // Overwritten by the collection loop, which knows the run's line. A placement
+        // built outside a run loop (none today) reads as line 0.
+        line_idx: 0,
     })
 }
 
@@ -1739,6 +1746,7 @@ fn render_horizontal_rotated(
                 offset.group_rotation_rad,
             ) {
                 placement.hanging_excluded = is_edge_run_hanging(hanging_bounds, glyph_idx);
+                placement.line_idx = line_idx;
                 placements.push(placement);
             }
         }
@@ -1916,7 +1924,12 @@ fn render_horizontal_rotated(
             let (corners, center) = rotated_placement_extra_samples(placement);
             // Warpable only for outline glyphs; a color-glyph bitmap fallback draws
             // unwarped pixels, so its sample must not be warped either.
-            extra_acc.add_glyph(corners, center, placement.outline.is_some());
+            extra_acc.add_glyph(
+                corners,
+                center,
+                placement.outline.is_some(),
+                placement.line_idx,
+            );
         }
         if let Some(ctx) = warp_ctx.as_ref() {
             extra_acc.map_points(|point| ctx.warp_world(point));
@@ -3392,7 +3405,15 @@ fn hanging_metrics_for_layout(
     }
 }
 
-fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
+/// `true` when the glyph's source text is made up entirely of hanging
+/// punctuation. `text` must be the glyph's OWN run text, since `LayoutGlyph`
+/// byte offsets are run-relative.
+///
+/// Uses this module's [`is_hanging_punctuation`] set, the SAME predicate the
+/// layout-level hang metrics use, so the exclusion and the visual hang can never
+/// disagree about what hangs.
+#[must_use]
+pub(crate) fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
     let end = glyph.end.min(text.len());
     let start = glyph.start.min(end);
     let Some(slice) = text.get(start..end) else {
@@ -3407,7 +3428,11 @@ fn glyph_is_hanging_punctuation(text: &str, glyph: &LayoutGlyph) -> bool {
 /// runs and must be excluded from the extra-info sampling (same edge-run
 /// semantics as [`hanging_metrics_for_layout`]). A run that is entirely hanging
 /// punctuation (or empty) excludes nothing and returns `(0, len)`.
-fn hanging_edge_run_bounds(run: &LayoutRun<'_>) -> (usize, usize) {
+///
+/// Shared with the formula/custom-line draw paths (`formula::render`), which hang
+/// punctuation through the same horizontal wrap. `TextLineMode::Vertical` is NOT
+/// a caller: its wrap never hangs punctuation, so nothing hangs there to exclude.
+pub(crate) fn hanging_edge_run_bounds(run: &LayoutRun<'_>) -> (usize, usize) {
     let len = run.glyphs.len();
     let Some(first_non) = run
         .glyphs
@@ -3427,7 +3452,7 @@ fn hanging_edge_run_bounds(run: &LayoutRun<'_>) -> (usize, usize) {
 /// `true` when the glyph at `index` is in the leading/trailing hanging run given
 /// `(leading_end, trailing_start)` from [`hanging_edge_run_bounds`].
 #[must_use]
-fn is_edge_run_hanging(bounds: (usize, usize), index: usize) -> bool {
+pub(crate) fn is_edge_run_hanging(bounds: (usize, usize), index: usize) -> bool {
     index < bounds.0 || index >= bounds.1
 }
 
@@ -5261,6 +5286,94 @@ mod tests {
                 "center y {center:?} should be near the ink center y {box_cy} (tol {tol})"
             );
         }
+    }
+
+    /// Renders `text` twice — hanging punctuation off, then on — and returns both
+    /// mean centers. Shared by the horizontal and formula exclusion tests.
+    fn mean_centers_without_and_with_hanging(
+        text: &str,
+        layout_mode: TextLayoutMode,
+    ) -> ([f32; 2], [f32; 2], usize) {
+        let mut params = base_params();
+        params.text = text.to_string();
+        params.text_layout_mode = layout_mode;
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: false,
+        };
+
+        params.hanging_punctuation = false;
+        let off = render_text_to_image(&params, None).expect("render should succeed");
+        params.hanging_punctuation = true;
+        let on = render_text_to_image(&params, None).expect("render should succeed");
+
+        assert_eq!(
+            [off.width, off.height],
+            [on.width, on.height],
+            "the fixture must not change the image size between the two renders, \
+             so any center delta is the exclusion and not a different layout"
+        );
+        (
+            off.extra.mean_center.expect("mean requested"),
+            on.extra.mean_center.expect("mean requested"),
+            off.width as usize,
+        )
+    }
+
+    #[test]
+    fn formula_layout_excludes_hanging_punctuation_from_the_centers() {
+        // The formula path hangs punctuation through the same horizontal wrap the
+        // Normal path uses, so it must exclude it from the center sampling too —
+        // it used to sample every glyph, letting a trailing "?!" drag the center
+        // right while the pixels of that punctuation hung outside the block.
+        let (off, on, _) = mean_centers_without_and_with_hanging("Aa?!", TextLayoutMode::Formula);
+        assert!(
+            on[0] < off[0] - 1.0,
+            "excluding the trailing punctuation must pull the mean center LEFT: \
+             off={off:?} on={on:?}"
+        );
+    }
+
+    #[test]
+    fn formula_and_normal_agree_on_what_hangs() {
+        // Same text, same wrap: both layout modes must move their center in the same
+        // direction and by a comparable amount when the exclusion kicks in. This is
+        // the regression guard against one path being fixed and the other forgotten.
+        let (normal_off, normal_on, width) =
+            mean_centers_without_and_with_hanging("Aa?!", TextLayoutMode::Normal);
+        let (formula_off, formula_on, _) =
+            mean_centers_without_and_with_hanging("Aa?!", TextLayoutMode::Formula);
+        let normal_shift = normal_off[0] - normal_on[0];
+        let formula_shift = formula_off[0] - formula_on[0];
+        assert!(normal_shift > 1.0 && formula_shift > 1.0);
+        // Loose: the two paths place glyphs differently, so only the magnitude class
+        // is comparable, not the exact value.
+        let tol = width as f32 * 0.25;
+        assert!(
+            (normal_shift - formula_shift).abs() <= tol,
+            "the two paths must exclude the same glyphs: \
+             normal_shift={normal_shift} formula_shift={formula_shift} tol={tol}"
+        );
+    }
+
+    #[test]
+    fn vertical_layout_keeps_punctuation_in_the_centers() {
+        // Vertical text never hangs punctuation (its wrap has no such flag), so there
+        // is nothing hanging to exclude and the centers must be identical either way.
+        // Guards against "fix it everywhere" symmetry that would silently move the
+        // vertical center for a setting that mode does not implement.
+        let mut params = base_params();
+        params.text = "Aa?!".to_string();
+        params.text_line_mode = TextLineMode::Vertical;
+        params.extra_info = RenderExtraInfoRequest {
+            mean_center: true,
+            median_center: true,
+        };
+        params.hanging_punctuation = false;
+        let off = render_text_to_image(&params, None).expect("render should succeed");
+        params.hanging_punctuation = true;
+        let on = render_text_to_image(&params, None).expect("render should succeed");
+        assert_eq!(off.extra, on.extra, "vertical centers must not react");
     }
 
     #[test]

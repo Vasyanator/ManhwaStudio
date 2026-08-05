@@ -781,6 +781,9 @@ impl TypingTextOverlayLayer {
             // Centering-assist centers: update the mean/median center data IN THE SAME block as `size_px`/
             // `source_rgba` so the centers and the pixels they index never fall out of sync. Image-effects
             // renders return default (all-`None`) extras, which correctly clears any stale text centers.
+            // For a TEXT overlay this local write is only the optimistic half: the `route_to_doc` below
+            // pushes the SAME centers into the doc node, and the projection that follows reads them back
+            // (a doc that did not carry them would project empty centers over this assignment).
             overlay.extra = result.extra.clone();
             if let Some(center) = layout_editor_frame_center {
                 overlay.center_page_px = [center.x, center.y];
@@ -810,8 +813,9 @@ impl TypingTextOverlayLayer {
             // (`request_overlay_placement_save`) cannot cover this: it is suppressed while the render is
             // in flight and would race the reproject even after.
             let transform = overlay.transform_rec();
+            let extra_centers = result.extra.clone();
             self.route_to_doc(page_idx, move |doc| {
-                doc.set_text_render(page_idx, &uid, render_data, image);
+                doc.set_text_render(page_idx, &uid, render_data, image, extra_centers);
                 doc.set_transform(page_idx, &uid, transform);
             });
         }

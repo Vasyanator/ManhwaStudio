@@ -3177,3 +3177,104 @@ fn push_rotation_handle_clear_moves_past_obstacles_on_ray() {
     }
     assert!((cleared.y - 100.0).abs() <= 1e-3, "stays on the outward ray: {cleared:?}");
 }
+
+#[test]
+fn centering_centers_survive_the_render_round_trip_through_the_doc() {
+    // LIVE BUG (variant B fix): a render applied its mean/median centers to the overlay runtime and
+    // then routed the fresh pixels to the doc; `route_to_doc` re-projects on the SAME call stack, and
+    // the projection used to reset `extra`, wiping the centers the render had just produced. With the
+    // centers stored on the doc node, the projection restores them instead — so all three
+    // `CenteringAssistCenterKind` variants stop collapsing onto the plain image center.
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("typ_centers_rt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let img = ColorImage::filled([4, 3], Color32::GREEN);
+    let file = persist::write_text_image(&dir, 0, "ta", &img).unwrap();
+    persist::write_page_text_payload(
+        &dir,
+        None,
+        0,
+        &[persist::TextPayloadOut {
+            uid: "ta".into(),
+            name: "ta".into(),
+            z: 1,
+            layer_idx: 0,
+            pinned: false,
+            visible: true,
+            opacity: 1.0,
+            group_uid: None,
+            pinned_by_group: false,
+            payload_uid: "ta".into(),
+            render_data: json!({ "text": "ta" }),
+            is_image: false,
+            transform: crate::models::layer_model::manifest::TransformRec {
+                cx: 10.0,
+                cy: 20.0,
+                rotation: 0.0,
+                scale: 1.0,
+            },
+            deform: None,
+            rendered_file: Some(file),
+            mask_clip: None,
+        }],
+    )
+    .unwrap();
+
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
+
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc);
+    assert_eq!(layer.overlays.len(), 1, "the doc text node projected");
+    // A node loaded from disk carries no centers: nothing was rendered yet.
+    assert_eq!(layer.overlays[0].extra.mean_center, None);
+
+    layer.layer_doc = Some(Arc::new(Mutex::new(doc)));
+
+    // Exactly what `apply_edit_overlay_render_result` does: apply the render's centers to the
+    // runtime, then push the same pixels AND centers into the doc (which re-projects inline).
+    let rendered_centers = RenderedTextExtraInfo {
+        mean_center: Some([1.5, 2.5]),
+        median_center: Some([3.5, 4.5]),
+    };
+    layer.overlays[0].extra = rendered_centers.clone();
+    let routed = layer.route_to_doc(0, {
+        let centers = rendered_centers.clone();
+        move |doc| {
+            doc.set_text_render(
+                0,
+                "ta",
+                json!({ "text": "ta-rerendered" }),
+                ColorImage::filled([4, 3], Color32::RED),
+                centers,
+            );
+        }
+    });
+    assert!(routed, "the doc handled the render write");
+
+    assert_eq!(
+        layer.overlays[0].extra, rendered_centers,
+        "the projection must restore the render's centers, not wipe them"
+    );
+
+    // A later projection with no intervening render keeps them too (generation unchanged).
+    let doc_handle = layer.layer_doc.clone().expect("doc wired");
+    {
+        let guard = doc_handle.lock().expect("doc lock");
+        layer.sync_from_doc(0, &guard);
+    }
+    assert_eq!(
+        layer.overlays[0].extra, rendered_centers,
+        "a plain re-projection does not disturb the centers"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

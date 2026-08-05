@@ -31,6 +31,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::ColorImage;
+use ms_text_render::types::RenderedTextExtraInfo;
 use serde_json::Value;
 
 use super::manifest::{DeformRec, TransformRec};
@@ -91,6 +92,15 @@ pub enum NodeBody {
         /// Persisted `mask_clip_enabled` (typing tab): whether the text is clipped to its mask. `None`
         /// ⇒ default. Round-trips through the v3 inline payload.
         mask_clip: Option<bool>,
+        /// Renderer-measured centering-assist centers for `image`, in final-image pixels.
+        ///
+        /// TRANSIENT and NEVER persisted: a load from disk starts all-`None` and a render with the
+        /// centering assist enabled fills them in. Held HERE rather than only on the typing tab's
+        /// runtime because `sync_from_doc` rebuilds that runtime from this node — a runtime-only copy
+        /// is wiped by the projection that follows every `set_text_render`. Always written together
+        /// with `image` (see [`LayerDoc::set_text_render`]) so the centers can never describe pixels
+        /// other than the ones stored here.
+        extra_centers: RenderedTextExtraInfo,
     },
 }
 
@@ -522,6 +532,8 @@ impl LayerDoc {
                     is_image: inline.is_image,
                     payload_uid: meta.payload_uid.clone(),
                     mask_clip: inline.mask_clip,
+                    // Disk carries no centers; a render with the centering assist on fills them in.
+                    extra_centers: RenderedTextExtraInfo::default(),
                 },
             });
             built_inline.insert(meta.uid.clone(), ());
@@ -633,6 +645,8 @@ impl LayerDoc {
                     is_image,
                     payload_uid: uid,
                     mask_clip,
+                    // Disk carries no centers; a render with the centering assist on fills them in.
+                    extra_centers: RenderedTextExtraInfo::default(),
                 },
             });
         }
@@ -1123,15 +1137,21 @@ impl LayerDoc {
         }
     }
 
-    /// Replaces a TEXT node's render params and rendered image, sets `pixels_dirty` (so the next flush
-    /// re-encodes the rendered PNG — mirrors `set_raster_pixels`), and bumps its generation. No-op if
-    /// the page/node is absent or the node is not text. Persistence happens on `flush_page`.
+    /// Replaces a TEXT node's render params, rendered image and centering-assist centers, sets
+    /// `pixels_dirty` (so the next flush re-encodes the rendered PNG — mirrors `set_raster_pixels`),
+    /// and bumps its generation. No-op if the page/node is absent or the node is not text.
+    /// Persistence happens on `flush_page`; `extra_centers` is transient and never written.
+    ///
+    /// `extra_centers` MUST be the centers the renderer measured for THIS `image` (all-`None` when
+    /// they were not requested). They are stored in the same mutation as the pixels so a later
+    /// projection can never pair one render's centers with another render's pixels.
     pub fn set_text_render(
         &mut self,
         page_idx: usize,
         uid: &str,
         render_data: Value,
         image: ColorImage,
+        extra_centers: RenderedTextExtraInfo,
     ) {
         crate::trace_log!(
             cat::LAYER_MODEL,
@@ -1146,11 +1166,13 @@ impl LayerDoc {
             && let NodeBody::Text {
                 render_data: r,
                 image: i,
+                extra_centers: c,
                 ..
             } = &mut node.body
         {
             *r = render_data;
             *i = image;
+            *c = extra_centers;
             node.pixels_dirty = true;
             node.bump_generation();
             self.bump_version();
@@ -1513,6 +1535,9 @@ impl LayerDoc {
                 is_image,
                 payload_uid,
                 mask_clip,
+                // Transient: the centering-assist centers are a per-render measurement and are
+                // deliberately not part of the on-disk text payload.
+                extra_centers: _,
             } = &node.body
             else {
                 continue;
@@ -1873,6 +1898,9 @@ impl LayerDoc {
                 is_image,
                 payload_uid,
                 mask_clip,
+                // Transient: the centering-assist centers are a per-render measurement and are
+                // deliberately not part of the on-disk text payload.
+                extra_centers: _,
             } = &node.body
             else {
                 continue;
@@ -2846,6 +2874,7 @@ mod tests {
                 is_image: false,
                 payload_uid: "tnew".into(),
                 mask_clip: None,
+                extra_centers: RenderedTextExtraInfo::default(),
             },
         };
         assert!(doc.add_node(0, new_node));
@@ -3194,6 +3223,7 @@ mod tests {
                 is_image: false,
                 payload_uid: uid.into(),
                 mask_clip: Some(true),
+                extra_centers: RenderedTextExtraInfo::default(),
             },
         }
     }
@@ -3418,6 +3448,7 @@ mod tests {
             "ov1",
             serde_json::json!({"text": "Edited", "size": 40}),
             img([6, 5], Color32::BLUE),
+            RenderedTextExtraInfo::default(),
         );
         doc.flush_page_text(0, &dir, None).unwrap();
 
@@ -3472,6 +3503,7 @@ mod tests {
             "t0",
             serde_json::json!({"text": "New"}),
             img([9, 7], Color32::from_rgb(1, 2, 3)),
+            RenderedTextExtraInfo::default(),
         );
         assert!(
             doc.node(0, "t0").unwrap().pixels_dirty,
@@ -3628,6 +3660,7 @@ mod tests {
                 is_image: false,
                 payload_uid: "payload-123".into(),
                 mask_clip: None,
+                extra_centers: RenderedTextExtraInfo::default(),
             },
         };
 
@@ -3697,6 +3730,7 @@ mod tests {
                 is_image: false,
                 payload_uid: uid.into(),
                 mask_clip: None,
+                extra_centers: RenderedTextExtraInfo::default(),
             },
         }
     }
@@ -3780,6 +3814,7 @@ mod tests {
             "t",
             serde_json::json!({"text": "y"}),
             img([2, 2], Color32::WHITE),
+            RenderedTextExtraInfo::default(),
         );
         assert_bumped(&doc, "set_text_render");
 
@@ -3975,6 +4010,7 @@ mod tests {
             "t",
             serde_json::json!({"text": "Hi", "size": 32}),
             img([7, 8], Color32::BLUE),
+            RenderedTextExtraInfo::default(),
         );
 
         let node = doc.node(0, "t").unwrap();
@@ -4001,6 +4037,7 @@ mod tests {
             "r",
             serde_json::json!({"x": 1}),
             img([9, 9], Color32::RED),
+            RenderedTextExtraInfo::default(),
         );
         assert_eq!(
             doc.node(0, "r").unwrap().generation,
@@ -4157,9 +4194,21 @@ mod tests {
             groups: Vec::new(),
         });
         doc.enable_background_saver();
-        doc.set_text_render(0, "t", serde_json::json!({"text": "first"}), img([2, 2], Color32::RED));
+        doc.set_text_render(
+            0,
+            "t",
+            serde_json::json!({"text": "first"}),
+            img([2, 2], Color32::RED),
+            RenderedTextExtraInfo::default(),
+        );
         doc.enqueue_page_text_save(0, &dir, None).unwrap();
-        doc.set_text_render(0, "t", serde_json::json!({"text": "second"}), img([2, 2], Color32::BLUE));
+        doc.set_text_render(
+            0,
+            "t",
+            serde_json::json!({"text": "second"}),
+            img([2, 2], Color32::BLUE),
+            RenderedTextExtraInfo::default(),
+        );
         let handle = doc.saver_handle().expect("background saver enabled");
         assert!(handle.barrier_blocking().is_empty());
         doc.poll_save_acks();
@@ -4183,7 +4232,13 @@ mod tests {
             groups: Vec::new(),
         });
         doc.enable_background_saver();
-        doc.set_text_render(0, "t", serde_json::json!({"text": "dirty"}), img([2, 2], Color32::RED));
+        doc.set_text_render(
+            0,
+            "t",
+            serde_json::json!({"text": "dirty"}),
+            img([2, 2], Color32::RED),
+            RenderedTextExtraInfo::default(),
+        );
         doc.enqueue_page_text_save(0, &invalid_parent.join("layers"), None).unwrap();
         let handle = doc.saver_handle().expect("background saver enabled");
         assert!(handle.barrier_blocking().contains(&0));

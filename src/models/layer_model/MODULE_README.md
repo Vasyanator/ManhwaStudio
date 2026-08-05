@@ -196,7 +196,12 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     rendered text PNG; `text_image_file_name` is its uid-keyed name. The doc's `flush_page` (whole
     page) and `flush_page_text` (text only, leaving rasters on disk untouched) drive this for every
     `NodeBody::Text`. The doc node carries `text_layer_idx` (the «Группа текста N» axis), authoritative
-    so a flush persists it for NEW overlays too.
+    so a flush persists it for NEW overlays too. It also carries `extra_centers`
+    (`RenderedTextExtraInfo`, the typing tab's centering-assist mean/median centers): TRANSIENT —
+    never persisted, written only by `set_text_render` in the SAME mutation as the pixels, and
+    projected back onto the typing runtime by `sync_from_doc`. It lives on the node rather than on
+    that runtime because every render routes through the doc and re-projects on the same call
+    stack, so a runtime-only copy would be wiped by the projection that follows the render.
   - Unified grouping (PS editor): `save_page_grouping(GroupingEdit)` — one locked manifest RMW (no PNG
     IO) that creates/removes `GroupRec`s, sets `group_uid` on raster + text nodes, toggles collapse /
     group visibility/opacity, applies a complete band `order` (reusing `apply_band_order`), records

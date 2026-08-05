@@ -3545,6 +3545,14 @@ fn build_typing_hint_rows() -> Vec<CanvasHintRow> {
             t!("canvas.bottom_hint.typing.nudge_label"),
             t!("canvas.bottom_hint.typing.nudge_keys"),
         ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.toggle_clean_label"),
+            t!("canvas.bottom_hint.typing.toggle_clean_keys"),
+        ),
+        CanvasHintRow::new(
+            t!("canvas.bottom_hint.typing.toggle_centering_assist_label"),
+            t!("canvas.bottom_hint.typing.toggle_centering_assist_keys"),
+        ),
     ]
 }
 

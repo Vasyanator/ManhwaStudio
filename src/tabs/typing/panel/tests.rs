@@ -475,6 +475,71 @@ paths change.
         assert_eq!(state.edit_panel.text_selection_char_range, None);
     }
 
+    /// The `C` hotkey path (`toggle_clean_overlays_visible`) must behave exactly like the
+    /// «Показывать клин» checkbox: flip the panel state AND queue a canvas request each time.
+    #[test]
+    fn toggle_clean_overlays_visible_flips_state_and_queues_request() {
+        let mut state = TypingTopPanelState::default();
+        // Seed from the canvas once, as the tab does before the hotkey is handled.
+        state.sync_clean_overlays_visible_from_canvas(true);
+
+        state.toggle_clean_overlays_visible();
+        assert_eq!(state.take_clean_overlays_visible_request(), Some(false));
+        // The request is drained once per frame; the panel state itself keeps the new value.
+        assert_eq!(state.take_clean_overlays_visible_request(), None);
+
+        state.toggle_clean_overlays_visible();
+        assert_eq!(state.take_clean_overlays_visible_request(), Some(true));
+    }
+
+    /// The one-shot canvas seed must not clobber a value the `C` hotkey (or the checkbox) already
+    /// set: after the first sync the panel is the source of truth.
+    #[test]
+    fn clean_overlays_canvas_sync_does_not_override_a_toggle() {
+        let mut state = TypingTopPanelState::default();
+        state.sync_clean_overlays_visible_from_canvas(true);
+        state.toggle_clean_overlays_visible();
+
+        state.sync_clean_overlays_visible_from_canvas(true);
+        state.toggle_clean_overlays_visible();
+        assert_eq!(state.take_clean_overlays_visible_request(), Some(true));
+    }
+
+    /// The `H` hotkey path (`toggle_centering_assist`) must flip the same flag the checkbox does,
+    /// in both directions.
+    #[test]
+    fn toggle_centering_assist_flips_the_panel_flag() {
+        let mut state = TypingTopPanelState::default();
+        assert!(!state.centering_assist_enabled());
+
+        state.toggle_centering_assist();
+        assert!(state.centering_assist_enabled());
+
+        state.toggle_centering_assist();
+        assert!(!state.centering_assist_enabled());
+    }
+
+    /// Turning centering assist ON must re-emit the edit request only while a layer is being
+    /// edited (that is the checkbox's side effect); turning it OFF never emits one, and with no
+    /// edit target there is nothing to re-render.
+    #[test]
+    fn toggle_centering_assist_emits_edit_request_only_when_editing() {
+        let mut state = TypingTopPanelState::default();
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        assert_eq!(state.mode, TypingTopPanelMode::EditText);
+        // Drain whatever the selection sync itself queued so the assertions below are unambiguous.
+        let _ = state.take_edit_request();
+
+        state.toggle_centering_assist();
+        assert!(
+            state.take_edit_request().is_some(),
+            "turning the assist on while editing must re-render for the mean/median centers"
+        );
+
+        state.toggle_centering_assist();
+        assert!(state.take_edit_request().is_none());
+    }
+
     /// Unique temp path for an imported-fonts test so parallel tests never collide and the
     /// real user config / fonts folder are never touched.
     fn unique_temp_dir(tag: &str) -> PathBuf {

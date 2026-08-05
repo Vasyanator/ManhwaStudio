@@ -31,9 +31,12 @@ FILE HEADER (tabs/typing/tab.rs)
     с consume wheel-события до `CanvasView`, чтобы не скроллить холст; когда курсор
     поверх любой панели (Foreground-слой над холстом по z-order), обработчик уступает
     событие виджету панели и шрифт холста не меняется),
-    hotkey `C` для выделенного `text`-оверлея запускает фоновый авто-тайп:
+    hotkey `V` для выделенного `text`-оверлея запускает фоновый авто-тайп:
     берётся оптический центр оверлея, от него ищется пузырь на composited-странице
     (`src + clean overlay` из shared cache), после чего оверлей центрируется по пузырю;
+    hotkey `C` переключает видимость клина, hotkey `H` — помощь с центровкой
+    (тот же state, что у чекбоксов `Показывать клин` / `Помочь с центровкой` на панели
+    действий; оба обрабатываются в `draw_canvas_overlay_top_left`);
     при выделении оверлея верхняя панель auto-переключается в режим редактирования,
     изменения текста/параметров рендерятся в тот же PNG в фоне по схеме latest-wins:
     новый запрос сразу вытесняет предыдущий и устаревший результат не применяется,
@@ -1295,6 +1298,32 @@ impl CanvasHooks for TypingHooks<'_> {
         }
         self.top_panel
             .sync_clean_overlays_visible_from_canvas(canvas.clean_overlays_visible());
+        // Keyboard twins of two Actions-panel checkboxes. Both flip the PANEL state rather than the
+        // downstream consumer, so checkbox and hotkey share one source of truth:
+        //   `C` — clean-overlay («клин») visibility. The canvas→panel sync above is one-shot, so the
+        //         panel owns the value afterwards and the queued request reaches the canvas further
+        //         down this same method. Placed AFTER that sync so the initial seed cannot overwrite
+        //         a toggle.
+        //   `H` — centering assist («Помочь с центровкой»), including the checkbox's turn-on side
+        //         effect (re-emitted edit request while editing). Read back into the overlay layer
+        //         on the next frame's policy snapshot, exactly like the checkbox.
+        //
+        // Shared gate: suppressed while a panel text input or any egui widget holds the keyboard,
+        // and while the layout editor owns the canvas. Keys are consumed so no other canvas handler
+        // sees them.
+        let canvas_hotkeys_active = !self.top_panel.has_focused_text_input(ctx)
+            && !ctx.egui_wants_keyboard_input()
+            && !self.text_overlays.layout_editor_active();
+        if canvas_hotkeys_active
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::C))
+        {
+            self.top_panel.toggle_clean_overlays_visible();
+        }
+        if canvas_hotkeys_active
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::H))
+        {
+            self.top_panel.toggle_centering_assist();
+        }
         self.top_panel
             .set_export_default_dir(project.project_dir.clone());
         // The character table's project favorites are TITLE-scoped, so the path
