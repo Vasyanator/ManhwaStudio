@@ -3878,6 +3878,7 @@
   "typing.params.no_break": "Não dividir",
   "typing.params.parse_bi_tags": "Ativar tags em linha",
   "typing.params.pick_available_font_hint": "Escolha outra fonte disponível, caso contrário o render fica bloqueado",
+  "typing.params.replace_ellipsis": "Substituir reticências por 3 pontos",
   "typing.params.scale_label": "Escala",
   "typing.params.shape_free_option": "Livre",
   "typing.params.shape_soft_option": "Suave",

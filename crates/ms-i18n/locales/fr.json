@@ -3878,6 +3878,7 @@
   "typing.params.no_break": "Ne pas couper",
   "typing.params.parse_bi_tags": "Activer les balises en ligne",
   "typing.params.pick_available_font_hint": "Choisissez une autre police disponible, sinon le rendu est bloqué",
+  "typing.params.replace_ellipsis": "Remplacer les points de suspension par 3 points",
   "typing.params.scale_label": "Échelle",
   "typing.params.shape_free_option": "Libre",
   "typing.params.shape_soft_option": "Douce",

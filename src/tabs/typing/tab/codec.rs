@@ -196,6 +196,14 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .get("trim_extra_spaces")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Off when the key is absent, like every other processing flag here: a card
+        // saved before this option existed must keep rendering its `…` untouched.
+        // New cards always carry the key (the panel writes it), so the panel-side
+        // default of `on` is unaffected.
+        replace_ellipsis_with_dots: text_params
+            .get("replace_ellipsis_with_dots")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         hanging_punctuation: text_params
             .get("hanging_punctuation")
             .and_then(Value::as_bool)
@@ -948,6 +956,7 @@ pub(super) fn normalize_text_params_object(
             "hanging_punctuation",
             "new_line_after_sentence",
             "trim_extra_spaces",
+            "replace_ellipsis_with_dots",
             "vertical_line_direction",
             // Точное смещение выравнивания (слайдер лево↔право). Легаси-строка
             // `align` сохраняется отдельно для совместимости/PSD-экспорта, но

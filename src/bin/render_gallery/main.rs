@@ -94,6 +94,7 @@ fn base_params() -> TextRenderParams {
         faux_italic_slant_deg: None,
         uppercase_text: false,
         trim_extra_spaces: true,
+        replace_ellipsis_with_dots: true,
         hanging_punctuation: false,
         new_line_after_sentence: false,
         enable_inline_style_tags: false,

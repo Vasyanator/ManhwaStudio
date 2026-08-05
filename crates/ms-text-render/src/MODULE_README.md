@@ -32,8 +32,10 @@ The public boundary is intentionally small:
 
 The main render flow is:
 
-1. `pipeline.rs` prepares source text (`uppercase_text`, trimming, sentence newlines),
-   applies preprocess effects, parses inline style tags, and loads the selected font.
+1. `pipeline.rs` prepares source text (`replace_ellipsis_with_dots`, `uppercase_text`,
+   trimming, sentence newlines — in that order, so the expanded `...` is visible to
+   sentence detection and wrapping), applies preprocess effects, parses inline style
+   tags, and loads the selected font.
 2. `font_registry.rs` registers the selected face and requested inline fonts in
    `cosmic-text`.
 3. `wrap/` builds layout text for horizontal, vertical, and shape-aware modes, including

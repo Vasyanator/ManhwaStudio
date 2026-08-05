@@ -3878,6 +3878,7 @@
   "typing.params.no_break": "No dividir",
   "typing.params.parse_bi_tags": "Habilitar etiquetas en línea",
   "typing.params.pick_available_font_hint": "Elija otra fuente disponible, de lo contrario el render está bloqueado",
+  "typing.params.replace_ellipsis": "Sustituir puntos suspensivos por 3 puntos",
   "typing.params.scale_label": "Escala",
   "typing.params.shape_free_option": "Libre",
   "typing.params.shape_soft_option": "Suave",

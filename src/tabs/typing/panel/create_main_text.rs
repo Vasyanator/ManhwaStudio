@@ -205,6 +205,7 @@ impl TypingCreatePanelState {
             let shape_summary = format!("{} · {}", shape_label, anti_aliasing_label(self.anti_aliasing));
             let enabled_count = usize::from(self.hanging_punctuation)
                 + usize::from(self.trim_extra_spaces)
+                + usize::from(self.replace_ellipsis_with_dots)
                 + usize::from(self.new_line_after_sentence)
                 + usize::from(self.uppercase_text)
                 + usize::from(self.enable_inline_style_tags);
@@ -1255,9 +1256,10 @@ impl TypingCreatePanelState {
     }
 
     /// Text-processing section (default collapsed, gated on `!font_missing` then
-    /// `!selection_mode`): the five processing checkboxes (hanging punctuation,
-    /// strip extra spaces, newline after sentence, all-uppercase, enable inline
-    /// tags). Moved verbatim from the former right column.
+    /// `!selection_mode`): the six processing checkboxes (hanging punctuation,
+    /// strip extra spaces, replace ellipsis with three dots, newline after
+    /// sentence, all-uppercase, enable inline tags). Moved verbatim from the
+    /// former right column.
     pub(super) fn draw_text_processing_section(
         &mut self,
         ui: &mut egui::Ui,
@@ -1284,6 +1286,12 @@ impl TypingCreatePanelState {
                     ui.checkbox(&mut self.trim_extra_spaces, t!("typing.params.strip_extra_spaces"));
                 mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &trim_spaces_resp);
                 *changed |= trim_spaces_resp.changed();
+                let replace_ellipsis_resp = ui.checkbox(
+                    &mut self.replace_ellipsis_with_dots,
+                    t!("typing.params.replace_ellipsis"),
+                );
+                mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &replace_ellipsis_resp);
+                *changed |= replace_ellipsis_resp.changed();
                 let sentence_nl_resp = ui.checkbox(
                     &mut self.new_line_after_sentence,
                     t!("typing.params.newline_after_sentence"),

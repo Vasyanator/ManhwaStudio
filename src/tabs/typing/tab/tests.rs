@@ -1234,6 +1234,7 @@ fn shape_variant_test_params(text_shape: TextShape) -> TextRenderParams {
         faux_italic_slant_deg: None,
         uppercase_text: false,
         trim_extra_spaces: false,
+        replace_ellipsis_with_dots: false,
         hanging_punctuation: false,
         new_line_after_sentence: false,
         enable_inline_style_tags: false,
@@ -1360,7 +1361,8 @@ fn storage_normalization_preserves_formed_text_and_modern_fields() {
             "formed_text": "Ты\nстанешь выше\nи сильнее",
             "kerning_px": 3.0,
             "hanging_punctuation": true,
-            "new_line_after_sentence": true
+            "new_line_after_sentence": true,
+            "replace_ellipsis_with_dots": false
         },
         "effects": []
     });
@@ -1393,6 +1395,14 @@ fn storage_normalization_preserves_formed_text_and_modern_fields() {
             .get("new_line_after_sentence")
             .and_then(Value::as_bool),
         Some(true)
+    );
+    // An explicit `false` must survive: the whitelist normalizer drops unknown keys,
+    // and losing this one would silently re-enable the option on the next load.
+    assert_eq!(
+        text_params
+            .get("replace_ellipsis_with_dots")
+            .and_then(Value::as_bool),
+        Some(false)
     );
 }
 

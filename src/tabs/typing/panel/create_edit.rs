@@ -998,6 +998,15 @@ impl TypingCreatePanelState {
                                             &trim_spaces_resp,
                                         );
                                         changed |= trim_spaces_resp.changed();
+                                        let replace_ellipsis_resp = ui.checkbox(
+                                            &mut self.replace_ellipsis_with_dots,
+                                            t!("typing.params.replace_ellipsis"),
+                                        );
+                                        mark_hscroll_block_on_hover(
+                                            &mut block_hscroll_by_hovered_param,
+                                            &replace_ellipsis_resp,
+                                        );
+                                        changed |= replace_ellipsis_resp.changed();
                                         let sentence_nl_resp = ui.checkbox(
                                             &mut self.new_line_after_sentence,
                                             t!("typing.params.newline_after_sentence"),

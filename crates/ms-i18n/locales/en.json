@@ -4016,6 +4016,7 @@
   "typing.params.outward_only": "Outward only",
   "typing.params.parse_bi_tags": "Enable inline tags",
   "typing.params.pick_available_font_hint": "Pick another available font, otherwise rendering is blocked",
+  "typing.params.replace_ellipsis": "Replace ellipsis with 3 dots",
   "typing.params.scale_label": "Scale",
   "typing.params.shape_free_option": "Free",
   "typing.params.shape_soft_option": "Soft",

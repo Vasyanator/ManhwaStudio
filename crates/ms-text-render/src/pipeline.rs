@@ -2442,10 +2442,17 @@ fn place_optical_horizontal_contour(
 }
 
 fn prepare_source_text(source_text: &str, params: &TextRenderParams) -> String {
+    // Ellipsis expansion runs FIRST, so every later step (sentence detection,
+    // wrapping, hanging punctuation) sees the same `...` the reader will see.
+    let source_text = if params.replace_ellipsis_with_dots {
+        replace_ellipsis_with_dots(source_text)
+    } else {
+        source_text.to_string()
+    };
     let source_text = if params.uppercase_text {
         source_text.to_uppercase()
     } else {
-        source_text.to_string()
+        source_text
     };
     let source_text = if params.trim_extra_spaces {
         trim_extra_spaces(source_text.as_str())
@@ -2466,6 +2473,20 @@ fn prepare_source_text(source_text: &str, params: &TextRenderParams) -> String {
 
 pub(crate) fn effective_spacing_percent(base_percent: f32, glyph_percent: f32) -> f32 {
     (base_percent + (glyph_percent - 100.0)).clamp(-300.0, 300.0)
+}
+
+/// Expands every `…` (U+2026 HORIZONTAL ELLIPSIS) into three ASCII periods.
+///
+/// Only U+2026 is expanded; other leader/ellipsis characters (`‥`, `⋯`, `︙`) are
+/// left alone because they do not stand for exactly three dots. Returns the text
+/// unchanged when it contains no `…`.
+fn replace_ellipsis_with_dots(text: &str) -> String {
+    // Cheap early-out: the common case is text without a single `…`, and
+    // `replace` would still allocate a full copy.
+    if !text.contains('…') {
+        return text.to_string();
+    }
+    text.replace('…', "...")
 }
 
 fn trim_extra_spaces(text: &str) -> String {
@@ -3517,6 +3538,7 @@ fn rotated_placement_extra_samples(
 mod tests {
     use super::{
         SYNTHESIZED_ITALIC_SLANT_DEG, apply_effects_to_image, base_attrs_real_bold_italic,
+        prepare_source_text, replace_ellipsis_with_dots,
     };
     use crate::font_provider::{FontContent, FontContentSet, font_content_id};
     use crate::types::{
@@ -3583,6 +3605,7 @@ mod tests {
             faux_italic_slant_deg: None,
             uppercase_text: false,
             trim_extra_spaces: true,
+            replace_ellipsis_with_dots: true,
             hanging_punctuation: false,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,
@@ -4774,6 +4797,53 @@ mod tests {
 
         let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
             panic!("render_next should render sentence-newline case: {error}")
+        });
+        assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
+    }
+
+    #[test]
+    fn ellipsis_expansion_replaces_only_u2026() {
+        assert_eq!(replace_ellipsis_with_dots("Что…"), "Что...");
+        assert_eq!(replace_ellipsis_with_dots("а… б…в"), "а... б...в");
+        // Text without `…` must come back byte-identical.
+        assert_eq!(replace_ellipsis_with_dots("Что..."), "Что...");
+        // Sibling leader characters do not stand for three dots and stay put.
+        assert_eq!(replace_ellipsis_with_dots("а‥б⋯в"), "а‥б⋯в");
+    }
+
+    #[test]
+    fn ellipsis_expansion_is_off_when_disabled() {
+        let mut params = base_params();
+        params.text = "Что…".to_string();
+        params.trim_extra_spaces = false;
+        params.replace_ellipsis_with_dots = false;
+        assert_eq!(prepare_source_text(&params.text, &params), "Что…");
+    }
+
+    #[test]
+    fn ellipsis_expansion_feeds_sentence_newlines() {
+        // The expansion runs FIRST, so the produced `...` is a sentence end for
+        // `new_line_after_sentence` — the same as if the author typed three dots.
+        let mut params = base_params();
+        params.text = "Что… Дальше".to_string();
+        params.trim_extra_spaces = false;
+        params.replace_ellipsis_with_dots = true;
+        params.new_line_after_sentence = true;
+        assert_eq!(prepare_source_text(&params.text, &params), "Что...\nДальше");
+
+        params.replace_ellipsis_with_dots = false;
+        assert_eq!(prepare_source_text(&params.text, &params), "Что… Дальше");
+    }
+
+    #[test]
+    fn base_pipeline_renders_expanded_ellipsis() {
+        let mut params = base_params();
+        params.text = "Что… дальше…".to_string();
+        params.replace_ellipsis_with_dots = true;
+        params.width_px = 320;
+
+        let rendered = render_text_to_image(&params, None).unwrap_or_else(|error| {
+            panic!("render_next should render expanded-ellipsis case: {error}")
         });
         assert!(alpha_bounds_from_rgba(rendered.width, rendered.height, &rendered.rgba).is_some());
     }

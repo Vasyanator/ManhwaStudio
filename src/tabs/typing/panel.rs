@@ -1428,6 +1428,7 @@ struct TypingCreatePanelState {
     faux_italic_slant_deg: f32,
     uppercase_text: bool,
     trim_extra_spaces: bool,
+    replace_ellipsis_with_dots: bool,
     hanging_punctuation: bool,
     new_line_after_sentence: bool,
     enable_inline_style_tags: bool,

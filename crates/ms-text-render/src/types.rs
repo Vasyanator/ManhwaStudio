@@ -329,6 +329,12 @@ pub struct TextRenderParams {
     pub faux_italic_slant_deg: Option<f32>,
     pub uppercase_text: bool,
     pub trim_extra_spaces: bool,
+    /// Rewrites every `…` (U+2026 HORIZONTAL ELLIPSIS) into three ASCII periods
+    /// before any other text processing. Purely a source-text normalization: the
+    /// substituted `...` then takes part in sentence detection
+    /// (`new_line_after_sentence`), hanging punctuation and wrapping exactly as
+    /// if the author had typed three periods.
+    pub replace_ellipsis_with_dots: bool,
     pub hanging_punctuation: bool,
     pub new_line_after_sentence: bool,
     pub enable_inline_style_tags: bool,

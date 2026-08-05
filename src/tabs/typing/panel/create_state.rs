@@ -141,6 +141,7 @@ impl TypingCreatePanelState {
             faux_italic_slant_deg: 14.0,
             uppercase_text: false,
             trim_extra_spaces: true,
+            replace_ellipsis_with_dots: true,
             hanging_punctuation: true,
             new_line_after_sentence: false,
             enable_inline_style_tags: false,

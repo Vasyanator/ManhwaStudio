@@ -329,6 +329,10 @@ impl TypingCreatePanelState {
             .get("trim_extra_spaces")
             .and_then(Value::as_bool)
             .unwrap_or(self.trim_extra_spaces);
+        self.replace_ellipsis_with_dots = text_params_obj
+            .get("replace_ellipsis_with_dots")
+            .and_then(Value::as_bool)
+            .unwrap_or(self.replace_ellipsis_with_dots);
         self.new_line_after_sentence = text_params_obj
             .get("new_line_after_sentence")
             .and_then(Value::as_bool)
@@ -652,6 +656,7 @@ impl TypingCreatePanelState {
                 .then_some(self.faux_italic_slant_deg),
             uppercase_text: self.uppercase_text,
             trim_extra_spaces: self.trim_extra_spaces,
+            replace_ellipsis_with_dots: self.replace_ellipsis_with_dots,
             hanging_punctuation: self.hanging_punctuation,
             new_line_after_sentence: self.new_line_after_sentence,
             enable_inline_style_tags: self.enable_inline_style_tags,

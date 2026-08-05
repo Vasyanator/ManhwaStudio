@@ -4016,6 +4016,7 @@
   "typing.params.outward_only": "Только наружу",
   "typing.params.parse_bi_tags": "Включить инлайн-теги",
   "typing.params.pick_available_font_hint": "Выберите другой доступный шрифт, иначе рендер заблокирован",
+  "typing.params.replace_ellipsis": "Заменять троеточие на 3 точки",
   "typing.params.scale_label": "Масштаб",
   "typing.params.shape_free_option": "Свободно",
   "typing.params.shape_soft_option": "Мягкая",
