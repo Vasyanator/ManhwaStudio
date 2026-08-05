@@ -34,6 +34,10 @@ use rayon::prelude::*;
 /// compositing, so the disc-quantized iso-distance plateaus no longer band; a single `u8`
 /// rounding happens at composite time. This is the legacy variant: unlike `glow_v2` it does
 /// NOT use sub-pixel EDT seeding — offsets are quantized to the integer grid by construction.
+///
+/// The glow layer carries its own alpha, unreduced by the source alpha; the source is then
+/// composited over it, which is what accounts for the source coverage. See the alpha contract
+/// on `blend_source_text`.
 pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEffectParams) {
     let radius = glow.radius_px.max(0.0);
     if radius <= f32::EPSILON {
@@ -87,7 +91,6 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
 
     let source = image.rgba.clone();
     let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
-    let mut source_alpha_expanded = vec![0u8; out_width as usize * out_height as usize];
     // Glow-only intensity in [0, 1]; kept in f32 through splat + blur, rounded once at composite.
     let mut glow_alpha = vec![0.0f32; out_width as usize * out_height as usize];
     let origin_x = pad as i32;
@@ -103,8 +106,6 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
 
             let base_x = origin_x + x as i32;
             let base_y = origin_y + y as i32;
-            let base_idx = base_y as usize * out_width as usize + base_x as usize;
-            source_alpha_expanded[base_idx] = src_a;
             let contour_alpha = src_a as f32 / 255.0;
 
             for (ox, oy, falloff) in offsets.iter() {
@@ -130,16 +131,17 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
     // Smooth the plateau-structured glow field before compositing (deterministic, in f32).
     gaussian_blur_alpha_f32_in_place(&mut glow_alpha, out_width, out_height, sigma);
 
-    // Each output pixel composites its own glow color from read-only `glow_alpha` and
-    // `source_alpha_expanded`, so the glow layer is parallelized per pixel. Overlap and the
-    // color-alpha factor are applied here, after the blur, with a single final u8 rounding.
+    // Each output pixel composites its own glow color from the read-only `glow_alpha`, so the
+    // glow layer is parallelized per pixel; the color-alpha factor and the single final u8
+    // rounding happen here, after the blur. The glow alpha is NOT reduced by the source alpha:
+    // `blend_source_text` puts the source over this layer right after, which already accounts
+    // for the source coverage exactly once (see the `overlap` note on `blend_source_text`).
     out.par_chunks_mut(4).enumerate().for_each(|(idx, dst)| {
         let intensity = glow_alpha[idx];
         if intensity <= 0.0 {
             return;
         }
-        let overlap = 1.0 - (source_alpha_expanded[idx] as f32 / 255.0);
-        let glow_a = (intensity * overlap * color_alpha_factor * 255.0)
+        let glow_a = (intensity * color_alpha_factor * 255.0)
             .round()
             .clamp(0.0, 255.0) as u8;
         if glow_a == 0 {
@@ -174,9 +176,12 @@ pub(crate) fn apply_glow_effect_v1(image: &mut RenderedTextImage, glow: &GlowEff
 /// maps the distance
 /// through `glow_falloff_alpha`, then Gaussian-blurs the glow-only alpha with a small sigma
 /// before compositing. Sub-pixel seeding breaks the integer iso-distance plateaus and the blur
-/// removes any residual ~1px banding; overlap and the color-alpha factor are applied after the
-/// blur with a single final `u8` rounding. The hard `dist2 > radius^2` cutoff is kept — the
-/// blur softens its rim.
+/// removes any residual ~1px banding; the color-alpha factor is applied after the blur with a
+/// single final `u8` rounding. The hard `dist2 > radius^2` cutoff is kept — the blur softens
+/// its rim.
+///
+/// As in `glow_v1`, the glow layer is not reduced by the source alpha — see the alpha contract
+/// on `blend_source_text`.
 pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEffectParams) {
     let radius = glow.radius_px.max(0.0);
     if radius <= f32::EPSILON {
@@ -210,7 +215,6 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
     let out_width_usize = out_width as usize;
     let out_height_usize = out_height as usize;
     let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
-    let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
     // Sub-pixel squared-distance cost field: non-seed pixels stay at EDT_COST_INF.
     let mut cost_field = vec![EDT_COST_INF; out_width_usize * out_height_usize];
     let origin_x = pad as i32;
@@ -228,7 +232,6 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
             let base_x = origin_x + x as i32;
             let base_y = origin_y + y as i32;
             let base_idx = base_y as usize * out_width_usize + base_x as usize;
-            source_alpha_expanded[base_idx] = src_a;
             // Approximate the sub-pixel distance from the pixel center to the true glyph edge:
             // fully covered (a=255) sits on the edge (0.0); partial coverage pushes the edge
             // outward by up to half a pixel, so the seed carries a small squared-distance cost.
@@ -273,16 +276,16 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
     // Smooth the (now sub-pixel-seeded) glow field before compositing (deterministic, in f32).
     gaussian_blur_alpha_f32_in_place(&mut glow_alpha, out_width, out_height, sigma);
 
-    // Each output pixel composites its glow color from the read-only glow field and expanded
-    // source alpha, so the glow layer is parallelized per pixel. Overlap and the color-alpha
-    // factor are applied here, after the blur, with a single final u8 rounding.
+    // Each output pixel composites its glow color from the read-only glow field, so the glow
+    // layer is parallelized per pixel; the color-alpha factor and the single final u8 rounding
+    // happen here, after the blur. As in `glow_v1`, the glow alpha is NOT reduced by the source
+    // alpha — `blend_source_text` accounts for the source coverage right after.
     out.par_chunks_mut(4).enumerate().for_each(|(idx, dst)| {
         let intensity = glow_alpha[idx];
         if intensity <= 0.0 {
             return;
         }
-        let overlap = 1.0 - (source_alpha_expanded[idx] as f32 / 255.0);
-        let glow_a = (intensity * overlap * color_alpha_factor * 255.0)
+        let glow_a = (intensity * color_alpha_factor * 255.0)
             .round()
             .clamp(0.0, 255.0) as u8;
         if glow_a == 0 {
@@ -325,10 +328,10 @@ pub(crate) fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEff
 /// fully transparent, or when the image (or the padded canvas) is empty.
 ///
 /// The glow layer is deliberately NOT reduced by the source alpha (no `shaped - source_alpha`
-/// term, unlike the contour variants' `overlap` factor): this is the behavior every persisted
-/// soft-glow effect was authored against, and subtracting would visibly change antialiased
-/// glyph rims (partial coverage there is worth up to ~64/255 alpha). Nothing is lost visually
-/// because `blend_source_text` composites the source on top of the glow afterwards.
+/// term): this is the behavior every persisted soft-glow effect was authored against, and
+/// subtracting would visibly change antialiased glyph rims (partial coverage there is worth up
+/// to ~64/255 alpha). Nothing is lost visually because `blend_source_text` composites the
+/// source on top of the glow afterwards. `glow_v1`/`glow_v2` follow the same rule.
 ///
 /// Cost note: `Round` dilation is `O(width * height * (up + down + 1))` while `Square` is
 /// `O(width * height)`; a very large round radius therefore runs for seconds and cannot be
@@ -551,6 +554,13 @@ fn bias01(t: f32, bias: f32) -> f32 {
     (t / (k * (1.0 - t) + 1.0)).clamp(0.0, 1.0)
 }
 
+/// Composites the source image over the already-drawn glow layer at (`origin_x`, `origin_y`).
+///
+/// Alpha contract: this straight-alpha source-over is the ONLY place the source coverage may
+/// enter the result. A glow layer must therefore carry its own unreduced alpha — multiplying it
+/// by `1 - src_a` beforehand counts the coverage twice and leaves a translucent ring on every
+/// antialiased rim (`out_a = a + g(1-a)²` instead of `a + g(1-a)`, i.e. up to a quarter of the
+/// alpha missing at half coverage), which reads as a light halo hugging the glyphs.
 fn blend_source_text(
     source: &[u8],
     width: usize,
@@ -669,7 +679,6 @@ mod tests {
         }
         let source = image.rgba.clone();
         let mut out = vec![0u8; out_width as usize * out_height as usize * 4];
-        let mut source_alpha_expanded = vec![0u8; out_width as usize * out_height as usize];
         let mut glow_alpha = vec![0.0f32; out_width as usize * out_height as usize];
         let origin_x = pad as i32;
         let origin_y = pad as i32;
@@ -682,8 +691,6 @@ mod tests {
                 }
                 let base_x = origin_x + x as i32;
                 let base_y = origin_y + y as i32;
-                let base_idx = base_y as usize * out_width as usize + base_x as usize;
-                source_alpha_expanded[base_idx] = src_a;
                 let contour_alpha = src_a as f32 / 255.0;
                 for (ox, oy, falloff) in offsets.iter() {
                     let tx = base_x + *ox;
@@ -709,8 +716,7 @@ mod tests {
             if intensity <= 0.0 {
                 continue;
             }
-            let overlap = 1.0 - (source_alpha_expanded[idx] as f32 / 255.0);
-            let glow_a = (intensity * overlap * color_alpha_factor * 255.0)
+            let glow_a = (intensity * color_alpha_factor * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -769,7 +775,6 @@ mod tests {
         let out_width_usize = out_width as usize;
         let out_height_usize = out_height as usize;
         let mut out = vec![0u8; out_width_usize * out_height_usize * 4];
-        let mut source_alpha_expanded = vec![0u8; out_width_usize * out_height_usize];
         let mut cost_field = vec![EDT_COST_INF; out_width_usize * out_height_usize];
         let origin_x = pad as i32;
         let origin_y = pad as i32;
@@ -784,7 +789,6 @@ mod tests {
                 let base_x = origin_x + x as i32;
                 let base_y = origin_y + y as i32;
                 let base_idx = base_y as usize * out_width_usize + base_x as usize;
-                source_alpha_expanded[base_idx] = src_a;
                 let coverage = src_a as f32 / 255.0;
                 let d0 = (0.5 - coverage).max(0.0);
                 cost_field[base_idx] = d0 * d0;
@@ -824,8 +828,7 @@ mod tests {
             if intensity <= 0.0 {
                 continue;
             }
-            let overlap = 1.0 - (source_alpha_expanded[idx] as f32 / 255.0);
-            let glow_a = (intensity * overlap * color_alpha_factor * 255.0)
+            let glow_a = (intensity * color_alpha_factor * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
             if glow_a == 0 {
@@ -1270,6 +1273,64 @@ mod tests {
             fade_strength: 0.0,
             fade_shift: 0.0,
         }
+    }
+
+    /// Asserts the composited alpha never dips as a ray leaves the source through its
+    /// antialiased rim.
+    ///
+    /// The glow layer carries its own alpha and `blend_source_text` puts the source over it,
+    /// which accounts for the rim coverage exactly once. Multiplying the glow by `1 - src_a`
+    /// beforehand counted it twice and punched a translucent notch into the rim pixel (v1
+    /// 186/255, v2 190/255 where the next pixel outward already read 221/233), which shows up
+    /// as a light halo hugging the glyphs over a light background.
+    ///
+    /// Rays run inward-to-outward, so a correct profile is non-increasing; a single alpha level
+    /// of slack absorbs the `u8` rounding, exactly as `assert_profile_smooth` does.
+    fn assert_no_rim_alpha_notch(name: &str, apply: impl Fn(&mut RenderedTextImage)) {
+        let (mut image, bx0, _bx1, by0, _by1) = block_image(true);
+        apply(&mut image);
+
+        let out_width = image.width as usize;
+        // The effect grows the canvas symmetrically and advances the content origin by the
+        // padding, so this maps source coordinates into the padded buffer.
+        let pad_x = image.content_origin_x as usize;
+        let pad_y = image.content_origin_y as usize;
+        let alpha_at = |x: usize, y: usize| image.rgba[(y * out_width + x) * 4 + 3];
+
+        // Leftward from 2px inside the solid core, and upward from the same depth.
+        let horizontal: Vec<u8> = (0..10)
+            .map(|k| alpha_at(pad_x + bx0 + 2 - k, pad_y + by0 + 10))
+            .collect();
+        let vertical: Vec<u8> = (0..10)
+            .map(|k| alpha_at(pad_x + bx0 + 20, pad_y + by0 + 2 - k))
+            .collect();
+
+        for (axis, profile) in [("horizontal", &horizontal), ("vertical", &vertical)] {
+            for pair in profile.windows(2) {
+                assert!(
+                    pair[1] <= pair[0].saturating_add(1),
+                    "{name}/{axis}: alpha dips at the antialiased rim: {profile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn glow_v1_leaves_no_alpha_notch_on_the_antialiased_rim() {
+        let glow = smoothness_glow_params();
+        assert_no_rim_alpha_notch("glow_v1", |image| apply_glow_effect_v1(image, &glow));
+    }
+
+    #[test]
+    fn glow_v2_leaves_no_alpha_notch_on_the_antialiased_rim() {
+        let glow = smoothness_glow_params();
+        assert_no_rim_alpha_notch("glow_v2", |image| apply_glow_effect_v2(image, &glow));
+    }
+
+    #[test]
+    fn soft_glow_leaves_no_alpha_notch_on_the_antialiased_rim() {
+        let glow = sample_soft_glow_params();
+        assert_no_rim_alpha_notch("soft_glow", |image| apply_soft_glow_effect(image, &glow));
     }
 
     /// Builds an 80x60 canvas with a solid opaque 40x20 block; with `aa`, the block gets a

@@ -57,8 +57,12 @@ max 0/255 for both the RGBA and alpha paths).
   the identity at bias 0, so persisted pre-curve effects render unchanged. Padding is per side
   (side extent + blur kernel half-width), so an asymmetric glow is not clipped and
   `content_origin_x/y` advance by the LEFT and TOP padding only — not by one symmetric scalar.
-  The glow layer is intentionally not reduced by the source alpha (legacy behavior; the source
-  is composited over it anyway). Cost asymmetry matters here: `Square` is `O(w*h)` while `Round`
+  No glow variant reduces its layer by the source alpha: `blend_source_text` composites the
+  source over the finished glow, and that source-over is the ONE place the source coverage may
+  enter the result. Pre-multiplying the glow by `1 - src_a` counts the coverage twice
+  (`out_a = a + g(1-a)²` instead of `a + g(1-a)`) and punches a translucent notch into every
+  antialiased rim, which reads as a light halo hugging the glyphs; `glow_v1`/`glow_v2` did that
+  until it was removed, and the rim-notch tests pin the rule for all three variants. Cost asymmetry matters here: `Square` is `O(w*h)` while `Round`
   is `O(w*h*(up+down+1))`, so a 1000x600 source at radius 512 + expand 512 takes ~0.035 s square
   vs ~3.7 s round (~9.2 s with blur 256) in release, and that run cannot be aborted part-way —
   `apply_effects_pipeline` checks cancellation only BETWEEN effects.
@@ -115,6 +119,10 @@ max 0/255 for both the RGBA and alpha paths).
   field that failed.
 - RGBA buffers are unmultiplied and must remain `width * height * 4` bytes after every
   effect, including effects that pad or resize the image.
+- An effect that draws a layer BEHIND the source and then composites the source back over it
+  must give that layer its own alpha, unreduced by the source alpha. The straight-alpha
+  source-over is the only place the source coverage may be applied; applying it twice leaves a
+  translucent ring on every antialiased rim (see the glow bullet above).
 - Empty images and zero-sized intermediate dimensions must be handled without panics.
 - Long or multi-pass effects must honor the cancellation checks performed by
   `apply_effects_pipeline` before each effect.
