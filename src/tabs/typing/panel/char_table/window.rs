@@ -40,30 +40,26 @@ use super::{CharTableState, FAVORITES_TAB_KEY, MAX_CELL_FONT_SIZE, MIN_CELL_FONT
 use crate::tabs::typing::panel::FontEntry;
 use crate::tabs::typing::panel::fonts::BUNDLED_UI_FONT_IDENTITY;
 use crate::widgets::WheelSlider;
-use crate::widgets::{combo_font_family_name, ensure_font_family, is_font_family_bound};
+use crate::widgets::{
+    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
+};
 use eframe::egui;
-use std::collections::HashSet;
 
 /// Stable window identity. A literal persistence key (window position/size), not
 /// a caption — the caption is the localized title (`dev-docs/i18n_exclusions.md`).
 const WINDOW_ID: &str = "typing.char_table.window";
 
-/// How many NEW font preview typefaces may be registered in one frame.
+/// How many not-yet-bound font previews may be advanced in one frame.
 ///
-/// `font_preview::ensure_font_family` reads the font file on the CALLING (GUI)
-/// thread and makes egui rebuild its glyph atlas, and egui's `add_font` never
-/// evicts. A symbol covered by forty loaded fonts would therefore stall the GUI
-/// thread for forty file reads plus forty atlas rebuilds in a single frame. Cells
-/// whose typeface is not bound yet draw the glyph in the UI font meanwhile, and
-/// the window keeps requesting repaints until the backlog is drained.
+/// The font FILE is no longer read here — `widgets::font_preview` reads it on its own
+/// worker threads — but a request still queues a read and, once the bytes arrive,
+/// hands them to egui, which never evicts a registered font and rebuilds its glyph
+/// atlas. A symbol covered by forty loaded fonts would otherwise queue forty reads and
+/// forty registrations at once. Cells whose typeface is not bound yet draw the glyph in
+/// the UI font meanwhile, and the window keeps requesting repaints until the backlog is
+/// drained. A font that FAILED to load is remembered by `widgets::font_preview`, so it
+/// never costs a slot again.
 const MAX_FONT_REGISTRATIONS_PER_FRAME: usize = 2;
-
-/// `Context::data` key of the set of preview families that FAILED to register.
-///
-/// Without it an unreadable font file would be re-read on the GUI thread on every
-/// frame the variants block is open, since `ensure_font_family` caches only
-/// successes.
-const FAILED_FAMILIES_DATA_KEY: &str = "typing.char_table.failed_font_families";
 
 /// Extra room around the glyph inside a cell, in points.
 const CELL_PADDING_PX: f32 = 12.0;
@@ -671,30 +667,29 @@ impl FontRegistrationBudget {
 
 /// Resolves the egui family that draws `font`'s own typeface, honouring `budget`.
 ///
-/// Returns `FontFamily::Proportional` (the UI font) when the family is not bound
-/// yet and the frame's registration budget is exhausted — the cell then shows the
-/// glyph in the UI font and `budget.outstanding` asks for another frame. A file
-/// that cannot be registered is remembered in `Context::data`, so an unreadable
-/// font is read once, not once per frame.
+/// Returns `FontFamily::Proportional` (the UI font) whenever the family is not usable
+/// in THIS frame — the budget is exhausted, the file is still being read off the GUI
+/// thread, or the registration has not taken effect yet — and sets
+/// `budget.outstanding`, which is what asks for another frame. A font that cannot be
+/// previewed at all (unreadable file, data egui refuses) is remembered by
+/// `widgets::font_preview` itself and costs nothing on later frames.
 fn variant_font_family(
     ctx: &egui::Context,
     font: &FontEntry,
     budget: &mut FontRegistrationBudget,
 ) -> egui::FontFamily {
+    // The identity names the font (and keys the egui family); the content hash pins WHICH
+    // bytes that name stood for, so a replaced file is not drawn from the stale
+    // registration; the path is only where the bytes are read from on first registration.
     let path = font.path();
+    let identity = font.render_identity_name();
+    let content_hash = font.content_hash();
     let face_index = font.representative_face_index();
-    let family_name = combo_font_family_name(path, face_index);
-    let family = egui::FontFamily::Name(family_name.clone().into());
+    let family_name = combo_font_family_name(&identity, content_hash, face_index);
+    let family = egui::FontFamily::Name(family_name.into());
+    // A font already bound costs nothing and never touches the budget.
     if is_font_family_bound(ctx, &family) {
         return family;
-    }
-
-    let failed_id = egui::Id::new(FAILED_FAMILIES_DATA_KEY);
-    let already_failed = ctx
-        .data(|data| data.get_temp::<HashSet<String>>(failed_id))
-        .is_some_and(|failed| failed.contains(&family_name));
-    if already_failed {
-        return egui::FontFamily::Proportional;
     }
     if budget.remaining == 0 {
         budget.outstanding = true;
@@ -702,21 +697,15 @@ fn variant_font_family(
     }
     budget.remaining -= 1;
 
-    match ensure_font_family(ctx, path, face_index) {
-        Some(family) => family,
-        None => {
-            crate::runtime_log::log_warn(format!(
-                "typing: char table: cannot show a symbol in its own typeface; the font file \
-                 could not be registered and the cell falls back to the interface font. \
-                 Path: {} Face index: {face_index}",
-                path.display()
-            ));
-            ctx.data_mut(|data| {
-                data.get_temp_mut_or_default::<HashSet<String>>(failed_id)
-                    .insert(family_name);
-            });
+    match request_font_family(ctx, &identity, content_hash, path, face_index) {
+        PreviewFontFamily::Ready(family) => family,
+        PreviewFontFamily::Pending => {
+            budget.outstanding = true;
             egui::FontFamily::Proportional
         }
+        // `font_preview` has already logged the reason once; repeating it here would
+        // write a line per frame for as long as the block stays open.
+        PreviewFontFamily::Unavailable => egui::FontFamily::Proportional,
     }
 }
 

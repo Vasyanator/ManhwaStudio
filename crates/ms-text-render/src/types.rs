@@ -183,6 +183,33 @@ impl PxOrPercent {
         }
     }
 
+    /// Token that ALWAYS round-trips through [`Self::parse`], for values that are being
+    /// re-serialized rather than authored.
+    ///
+    /// [`Self::to_token`] is the canonical, human-facing spelling and is fixed at two
+    /// decimals, so it silently rounds `1.2345` to `"1.23"`. That is fine while the exact
+    /// value still lives elsewhere, but destructive when the token BECOMES the storage —
+    /// as in the schema-1 → schema-2 conversion, which folds the legacy `*_px`/`*_percent`
+    /// pair into this token and then drops the pair.
+    ///
+    /// Returns the canonical two-decimal form whenever it parses back to exactly this
+    /// value (the overwhelmingly common case, so persisted payloads keep their canonical
+    /// spelling and stay comparable to the frozen schema defaults), and the shortest
+    /// exact `f32` representation otherwise.
+    #[must_use]
+    pub fn to_token_lossless(self) -> String {
+        let canonical = self.to_token();
+        if Self::parse(&canonical).is_some_and(|back| back == self) {
+            return canonical;
+        }
+        // `{}` on `f32` prints the shortest decimal that reads back as the same bits.
+        if self.is_percent {
+            format!("{}%", self.value)
+        } else {
+            format!("{}", self.value)
+        }
+    }
+
     /// Разложить на устаревшую пару (px, percent): активна ровно одна компонента.
     #[must_use]
     pub fn as_px_percent(self) -> (f32, f32) {
@@ -882,5 +909,44 @@ impl Default for TextVectorLinesLayoutParams {
             letter_spacing_px: 0.0,
             lines: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod px_or_percent_tests {
+    use super::PxOrPercent;
+
+    /// `to_token` is fixed at two decimals and therefore LOSES a value that needs more —
+    /// which is destructive when the token replaces the value's only other storage. The
+    /// lossless form always parses back to the same value.
+    #[test]
+    fn lossless_token_round_trips_where_the_canonical_one_rounds() {
+        for value in [
+            PxOrPercent::px(1.2345),
+            PxOrPercent::percent(0.006),
+            PxOrPercent::percent(100.125),
+            PxOrPercent::px(-0.001),
+        ] {
+            assert_ne!(
+                PxOrPercent::parse(&value.to_token()),
+                Some(value),
+                "the canonical token is expected to round {value:?}"
+            );
+            assert_eq!(
+                PxOrPercent::parse(&value.to_token_lossless()),
+                Some(value),
+                "the lossless token must round-trip {value:?}"
+            );
+        }
+    }
+
+    /// It keeps the CANONICAL spelling whenever that already round-trips, so persisted
+    /// payloads stay byte-comparable with the frozen schema defaults (`"0.00%"`).
+    #[test]
+    fn lossless_token_keeps_the_canonical_spelling_when_it_is_exact() {
+        assert_eq!(PxOrPercent::percent(0.0).to_token_lossless(), "0.00%");
+        assert_eq!(PxOrPercent::percent(50.0).to_token_lossless(), "50.00%");
+        assert_eq!(PxOrPercent::percent(100.0).to_token_lossless(), "100.00%");
+        assert_eq!(PxOrPercent::px(7.5).to_token_lossless(), "7.50");
     }
 }

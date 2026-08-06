@@ -24,19 +24,18 @@ face + content id) and never touches the filesystem. Loading is cache-gated by
 `content_id`: on a cache hit the bytes are NOT re-hashed and NOT re-loaded into
 fontdb; the previously loaded face IDs and metadata are reused. Default font
 families are still set every render (cheap, deterministic matching).
-`load_selected_font_from_path` is a THIN COMPAT WRAPPER over `load_font_content`
-for the app's forms-metric measurement path, which still holds a path and its own
-throwaway `FontSystem`. The throwaway-DB helpers `resolve_font_postscript_name` /
-`resolve_font_family_name` are export-only and stay uncached.
+There is NO path-keyed loader any more: every caller — including the app's
+forms-metric measurement path, which builds its own throwaway `FontSystem` — resolves
+the font through a `FontProvider` and hands `load_font_content` the resulting
+`FontContent`. Do not reintroduce one: a path is where bytes come from, never what a
+font IS, and a second loader would key the face cache by something other than the
+content id.
 */
 
-use super::font_provider::{FontContent, FontProvider, font_content_id};
+use super::font_provider::{FontContent, FontProvider};
 use super::font_system_pool::FontFaceCache;
 use cosmic_text::{Attrs, Family, FontSystem, Stretch, Style, Weight, fontdb};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct RegisteredFontFace {
@@ -183,44 +182,6 @@ pub fn load_font_content(
     font_cache.store_meta(content_id, face_index, selected.clone());
     apply_default_families(font_system, font_cache, &selected);
     Ok(selected)
-}
-
-/// Thin compat wrapper over `load_font_content` for the app's forms-metric
-/// measurement path, which still holds a file path and its own throwaway
-/// `FontSystem`. Reads the file, hashes it into a `content_id` via
-/// `font_content_id`, and delegates to `load_font_content`.
-///
-/// The synthesized `name`/`original_name` (the file stem) are irrelevant to the
-/// renderer here — metric measurement only needs the resolved face metadata.
-///
-/// # Errors
-/// Returns an error string if the file cannot be read or fontdb cannot parse it.
-pub fn load_selected_font_from_path(
-    font_system: &mut FontSystem,
-    font_cache: &mut FontFaceCache,
-    font_path: &Path,
-    selected_face_index: usize,
-) -> Result<RegisteredFontFace, String> {
-    let bytes = fs::read(font_path).map_err(|error| {
-        format!(
-            "не удалось прочитать шрифт {}: {error}",
-            font_path.display()
-        )
-    })?;
-    let content_id = font_content_id(&bytes);
-    let stem = font_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("")
-        .to_string();
-    let content = FontContent {
-        name: stem.clone(),
-        original_name: stem,
-        data: Arc::new(bytes),
-        face_index: selected_face_index,
-        content_id,
-    };
-    load_font_content(font_system, font_cache, &content, selected_face_index)
 }
 
 /// Face ids under which `bytes` are ALREADY registered in `font_system`, or `None`
@@ -474,52 +435,6 @@ fn apply_default_families(
         // so identical params render identically regardless of pool history.
         font_cache.restore_pristine_defaults(font_system);
     }
-}
-
-/// Загружает файл шрифта в свежую `fontdb::Database` и возвращает реальное
-/// PostScript-имя (OpenType name table id 6) выбранного face.
-///
-/// Зачем: Photoshop сопоставляет шрифт текстового слоя именно по PostScript-имени
-/// (например `MaybugMSRegular`), а не по имени файла или UI-метке. Функция читает
-/// это имя напрямую из данных шрифта, как бы файл ни назывался.
-///
-/// Robustness: при отсутствии/нечитаемости файла, непарсируемом шрифте или
-/// выходе `face_index` за границы возвращает `None` (без паники) — экспорт идёт
-/// в фоновом потоке и не должен падать.
-#[must_use]
-pub fn resolve_font_postscript_name(font_path: &str, face_index: usize) -> Option<String> {
-    if font_path.is_empty() {
-        return None;
-    }
-    let mut db = fontdb::Database::new();
-    // load_font_file сам читает файл; ошибка чтения/парсинга -> None.
-    db.load_font_file(font_path).ok()?;
-    // Face'ы перечисляем так же, как `register_selected_font`: выбираем по
-    // позиции среди загруженных, с откатом на первый при выходе за границы.
-    let faces: Vec<_> = db.faces().collect();
-    let face = faces.get(face_index).or_else(|| faces.first())?;
-    if face.post_script_name.is_empty() {
-        None
-    } else {
-        Some(face.post_script_name.clone())
-    }
-}
-
-/// Имя семейства (OpenType name table id 1) выбранного face — фолбэк для PSD,
-/// когда PostScript-имя недоступно. Та же robustness, что и у резолвера выше.
-#[must_use]
-pub fn resolve_font_family_name(font_path: &str, face_index: usize) -> Option<String> {
-    if font_path.is_empty() {
-        return None;
-    }
-    let mut db = fontdb::Database::new();
-    db.load_font_file(font_path).ok()?;
-    let faces: Vec<_> = db.faces().collect();
-    let face = faces.get(face_index).or_else(|| faces.first())?;
-    face.families
-        .first()
-        .map(|(name, _)| name.clone())
-        .filter(|name| !name.is_empty())
 }
 
 #[must_use]

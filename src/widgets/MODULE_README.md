@@ -47,11 +47,22 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   whole cache is cleared whenever the loaded dictionary set changes, so a verdict from one language
   never survives a switch. On wasm the download layer is unavailable; the word is left unmarked.
 - `font_preview.rs`: shared egui font-registration helpers for own-typeface font previews
-  (`combo_font_family_name`, `is_font_family_bound`, `ensure_font_family`). Deterministic
-  `(path, face_index)` → family naming plus the one-time GUI-thread file read that registers
-  a font into egui. Used by the typing create/edit panels and the settings font-settings
-  widget. Registration is ADD-ONLY (egui never evicts a font), so a caller scrolling a large
-  catalog must bound how many distinct families it registers.
+  (`combo_font_family_name`, `is_font_family_bound`, `request_font_family`). Deterministic
+  `(font identity, content hash, face_index)` → family naming plus the one-time registration
+  of a font into egui. `request_font_family` returns a `PreviewFontFamily`
+  (`Ready` / `Pending` / `Unavailable`): the file READ is queued on worker threads and only
+  the `add_font` call happens on the GUI thread, so a caller draws its fallback and is
+  repainted when the family binds. The path is only the byte source: two entries
+  can share a FILE and still be different fonts (the bundled `fonts/ui` entry and a user
+  import of it), and moving a file must not re-register it. The CONTENT HASH
+  (`FontEntry::content_hash`) is in the key because egui never re-reads a registered font:
+  without it, replacing the file behind one PostScript name would keep the UI drawing the
+  old typeface while the renderer drew the new one. `0` is the documented "content unknown"
+  sentinel (bundled stack, unreadable file, the system-font picker catalog), and those
+  entries share one family per `(identity, face)` as before. Used by the typing create/edit
+  panels and the settings font-settings widget. Registration is ADD-ONLY (egui never evicts
+  a font), so a caller scrolling a large catalog must bound how many distinct families it
+  registers.
 - `hangul_keyboard.rs`: on-screen Korean jamo keyboard. `HangulKeyboardState` holds the latched
   choseong/jungseong/jongseong indices, the mode, and the user-selected insert placement
   (`HangulInsertPlacement`: `Append` / `ReplacePrevious`);

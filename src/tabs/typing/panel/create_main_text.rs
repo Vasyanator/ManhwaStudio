@@ -554,10 +554,15 @@ impl TypingCreatePanelState {
             .selected_text(selected_font_text)
             .show_ui_with_wheel(ui, |ui| {
                 for idx in filtered_font_indices.iter().copied() {
-                    let (label, path, face_index, coverage) = {
+                    // DISPLAY vs IDENTITY: `label` is what the user reads (override →
+                    // group alias → stem), `identity` keys the own-typeface registration,
+                    // and `path` is only where its bytes are read from.
+                    let (label, identity, content_hash, path, face_index, coverage) = {
                         let font = &self.fonts[idx];
                         (
                             self.font_display_label(font),
+                            font.render_identity_name(),
+                            font.content_hash(),
                             font.path.clone(),
                             font.faces.first().map(|face| face.face_index).unwrap_or(0),
                             font.coverage.clone(),
@@ -566,11 +571,15 @@ impl TypingCreatePanelState {
                     let selected = font_idx == idx;
                     if self.draw_font_combo_option(
                         ui,
-                        &label,
-                        path.as_path(),
-                        face_index,
-                        selected,
-                        &coverage,
+                        &create_presets::FontComboOption {
+                            label: &label,
+                            identity: &identity,
+                            content_hash,
+                            path: path.as_path(),
+                            face_index,
+                            selected,
+                            coverage: &coverage,
+                        },
                     ) {
                         font_idx = idx;
                         popup_pick = Some(idx);

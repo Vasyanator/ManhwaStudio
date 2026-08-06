@@ -2,14 +2,20 @@
 File: panel/presets_io.rs
 
 Purpose:
-Free-function helpers extracted verbatim from panel.rs for TextTab preset
-persistence and text layout serde conversions.
+Free-function helpers extracted verbatim from panel.rs for the `user_config.json`
+`TextTab` members the panel still owns, plus the text-layout serde conversions.
 
 Main responsibilities:
 - load the TextTab legacy inline-tags flag;
-- load and save the TextTab imported-system-fonts path list;
-- load, default, and save the create presets and formula presets;
+- load the LEGACY TextTab imported-system-fonts path list (read-only migration input);
+- load, default, and save the formula presets;
+- load and save the per-effect-kind defaults;
 - convert formula, drawn-lines, and vector-lines layouts to and from serde_json Value.
+
+Scope note:
+CREATE PRESETS LEFT THIS FILE. They live in `fonts/presets.json`, owned by
+`panel/presets_store.rs` (`dev-docs/font_identity_postscript_plan.md` phase 5); what
+remains here is only what still belongs to `user_config.json`.
 
 Notes:
 Uses `use super::*;` to pull in the parent module's types and imports. Moved
@@ -34,67 +40,6 @@ pub(super) fn load_text_tab_use_legacy_inline_tags() -> bool {
         .and_then(|text_tab| text_tab.get(TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-pub(super) fn load_text_tab_create_presets() -> HashMap<String, TypingCreatePreset> {
-    let user_settings_file = config::user_config_path();
-    let Ok(raw) = fs::read_to_string(user_settings_file) else {
-        return HashMap::new();
-    };
-    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
-        return HashMap::new();
-    };
-    let Some(presets_obj) = payload
-        .get("TextTab")
-        .and_then(Value::as_object)
-        .and_then(|text_tab| text_tab.get(TEXT_TAB_CREATE_PRESETS_KEY))
-        .and_then(Value::as_object)
-    else {
-        return HashMap::new();
-    };
-
-    let mut out = HashMap::new();
-    for (name, raw_preset) in presets_obj {
-        let Some(obj) = raw_preset.as_object() else {
-            continue;
-        };
-        let primary_font_key = obj
-            .get("primary_font_key")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if primary_font_key.is_empty() {
-            continue;
-        }
-        let primary_font_path = obj
-            .get("primary_font_path")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let primary_font_label = obj
-            .get("primary_font_label")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let font_profiles = obj
-            .get("font_profiles")
-            .and_then(Value::as_object)
-            .map(|profiles| {
-                profiles
-                    .iter()
-                    .map(|(font_key, profile)| (font_key.clone(), profile.clone()))
-                    .collect::<HashMap<String, Value>>()
-            })
-            .unwrap_or_default();
-        out.insert(
-            name.clone(),
-            TypingCreatePreset {
-                primary_font_key,
-                primary_font_path,
-                primary_font_label,
-                font_profiles,
-            },
-        );
-    }
-    out
 }
 
 pub(super) fn default_text_tab_formula_presets() -> HashMap<String, TypingFormulaPreset> {
@@ -660,7 +605,11 @@ pub(in crate::tabs::typing) fn load_text_tab_imported_system_fonts() -> Vec<Path
 
 /// Path-parameterized core of `load_text_tab_imported_system_fonts`, split out so the
 /// read logic can be unit-tested against a temp file instead of the real user config.
-fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
+///
+/// Also used by `presets_store::legacy_imports_are_taken_over`, which must compare the
+/// legacy list against `fonts_data.json` before that key may be deleted — the same read
+/// rule, so it deliberately does not get a second implementation.
+pub(super) fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
     let Ok(raw) = fs::read_to_string(user_settings_file) else {
         return Vec::new();
     };
@@ -687,46 +636,10 @@ fn load_imported_system_fonts_from(user_settings_file: &Path) -> Vec<PathBuf> {
 // `font_settings_store`, which persist the whole per-font settings snapshot to
 // `fonts/fonts_data.json`. Only the READ helper above survives here, used once by
 // `font_settings_store::seed_imported_system_fonts_from_config` to migrate the legacy
-// `TextTab.imported_system_fonts` list into `fonts_data.json`. The legacy key is left in
-// place but is no longer written.
-
-pub(super) fn save_text_tab_create_presets(
-    presets: &HashMap<String, TypingCreatePreset>,
-) -> Result<(), String> {
-    let mut presets_obj = Map::new();
-    let mut names: Vec<&String> = presets.keys().collect();
-    names.sort();
-    for name in names {
-        let Some(preset) = presets.get(name) else {
-            continue;
-        };
-        if preset.primary_font_key.trim().is_empty() {
-            continue;
-        }
-        let mut font_profiles_obj = Map::new();
-        let mut font_keys: Vec<&String> = preset.font_profiles.keys().collect();
-        font_keys.sort();
-        for font_key in font_keys {
-            if let Some(profile) = preset.font_profiles.get(font_key) {
-                font_profiles_obj.insert(font_key.clone(), profile.clone());
-            }
-        }
-        presets_obj.insert(
-            name.clone(),
-            json!({
-                "primary_font_key": preset.primary_font_key,
-                "primary_font_path": preset.primary_font_path,
-                "primary_font_label": preset.primary_font_label,
-                "font_profiles": font_profiles_obj,
-            }),
-        );
-    }
-    update_text_tab_value(
-        &config::user_config_path(),
-        TEXT_TAB_CREATE_PRESETS_KEY,
-        Value::Object(presets_obj),
-    )
-}
+// `TextTab.imported_system_fonts` list into `fonts_data.json`. The legacy key is never
+// written any more, and `presets_store::drop_migrated_user_config_keys` DELETES it once
+// `fonts_data.json` exists (which is what stops a removed imported font from coming back);
+// this reader therefore only ever sees a config that has not been migrated yet.
 
 pub(super) fn save_text_tab_formula_presets(
     presets: &HashMap<String, TypingFormulaPreset>,

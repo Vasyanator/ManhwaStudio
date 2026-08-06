@@ -36,6 +36,7 @@ pub(super) fn export_typing_pages_to_folder(
             exported: 0,
             total,
             output_dir,
+            warnings: Vec::new(),
         });
     }
     prepare_export_clean_overlay_snapshots(&mut jobs, clean_overlays_model)?;
@@ -47,7 +48,7 @@ pub(super) fn export_typing_pages_to_folder(
         .max(1)
         .min(jobs.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = mpsc::channel::<Result<Vec<String>, String>>();
     let mut worker_handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let tx = tx.clone();
@@ -72,10 +73,20 @@ pub(super) fn export_typing_pages_to_folder(
     let mut exported = 0usize;
     let mut processed = 0usize;
     let mut first_error: Option<String> = None;
+    // Deduplicated across pages: the same ambiguous font is normally used on every page,
+    // and the status line must state the problem once, not once per page.
+    let mut warnings: Vec<String> = Vec::new();
     for result in rx {
         processed = processed.saturating_add(1);
         match result {
-            Ok(()) => exported = exported.saturating_add(1),
+            Ok(page_warnings) => {
+                exported = exported.saturating_add(1);
+                for warning in page_warnings {
+                    if !warnings.contains(&warning) {
+                        warnings.push(warning);
+                    }
+                }
+            }
             Err(err) => {
                 if first_error.is_none() {
                     first_error = Some(err);
@@ -93,14 +104,22 @@ pub(super) fn export_typing_pages_to_folder(
     if let Some(err) = first_error {
         return Err(err);
     }
+    // Worker completion order is not deterministic, so sort for a stable status line.
+    warnings.sort();
     Ok(TypingExportResult {
         exported,
         total,
         output_dir,
+        warnings,
     })
 }
 
-pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), String> {
+/// Exports ONE page and returns the localized warnings its assembly produced (empty in the
+/// normal case; PNG never produces any).
+///
+/// A warning is NOT an error: the page is written either way. Today the only source is the
+/// PSD font-name ambiguity — see `psd_export::AmbiguousExportFont`.
+pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<Vec<String>, String> {
     match job.export_format {
         TypingExportFormat::Png => {
             let (base_rgba, base_w, base_h) = flatten_typing_export_page_rgba(&job)?;
@@ -121,15 +140,17 @@ pub(super) fn export_typing_single_page(job: TypingExportPageJob) -> Result<(), 
                 .write(job.output_path.to_string_lossy().as_ref(), &buf)
                 .map_err(|err| {
                     tf!("typing.errors.save_page_error", job = job.output_path.display(), err = err)
-                })
+                })?;
+            Ok(Vec::new())
         }
         TypingExportFormat::Psd => {
-            let bytes = super::super::psd_export::export_typing_single_page_psd(&job)?;
+            let built = super::super::psd_export::export_typing_single_page_psd(&job)?;
             crate::storage::storage()
-                .write(job.output_path.to_string_lossy().as_ref(), &bytes)
+                .write(job.output_path.to_string_lossy().as_ref(), &built.bytes)
                 .map_err(|err| {
                     tf!("typing.errors.save_page_error", job = job.output_path.display(), err = err)
-                })
+                })?;
+            Ok(built.warnings)
         }
     }
 }
@@ -470,10 +491,14 @@ impl TypingTextOverlayLayer {
                                 result.exported,
                                 result.total
                             );
+                            for warning in &result.warnings {
+                                crate::trace_log!(cat::PERSIST, "export warning={}", warning);
+                            }
                             self.create_status_error = None;
                             self.export_status = TypingExportUiStatus::Success {
                                 done: result.exported,
                                 total: result.total,
+                                warnings: result.warnings,
                             };
                             let _ = result.output_dir;
                         }
@@ -549,6 +574,11 @@ impl TypingTextOverlayLayer {
         overlays_by_page
     }
 
+    /// Dispatches the whole-project export.
+    ///
+    /// `font_post_script_names` is the panel's `identity -> PostScript name per face`
+    /// snapshot, taken on the GUI thread at dispatch (the worker has no font list) and
+    /// used only by the PSD writer; a PNG export ignores it.
     pub(super) fn request_export_to_folder(
         &mut self,
         ctx: &egui::Context,
@@ -556,6 +586,7 @@ impl TypingTextOverlayLayer {
         masks_snapshot: HashMap<usize, TypingMaskExportPage>,
         output_dir: PathBuf,
         export_format: TypingExportFormat,
+        font_post_script_names: crate::tabs::typing::psd_export::FontPostScriptNames,
     ) {
         if self.export_rx.is_some() {
             self.set_create_error(ctx, t!("typing.export.already_running_error"));
@@ -675,6 +706,7 @@ impl TypingTextOverlayLayer {
                     export_format,
                     layers_primary_dir: self.layers_primary_dir.clone(),
                     layers_fallback_dir: self.layers_fallback_dir.clone(),
+                    font_post_script_names: font_post_script_names.clone(),
                 }
             })
             .collect::<Vec<_>>();

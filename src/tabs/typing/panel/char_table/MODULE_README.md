@@ -17,11 +17,13 @@ the window is first opened (`ensure_loaded`), so a user who never opens it pays 
 Data flow per frame (once the window is wired up):
 `ensure_coverage(&panel.fonts)` → spawns a worker only when the font-list fingerprint
 changed → `poll()` picks up the finished `char -> Vec<font index>` map → the window reads
-it through `fonts_for_char`. Every WRITE (favorites, cell size, last tab) goes through
-`spawn_persist`, never on the GUI thread.
+it through `fonts_for_char`. Every WRITE (favorites, cell size, last tab) goes through the
+per-store COALESCING writer (`mod.rs::SnapshotWriter`, reached via `persist_user_config`
+and the favorites stores), never on the GUI thread.
 
 ## Files and submodules
-- `mod.rs`: `CharTableState` + the shared `spawn_persist` helper + the two `TextTab`
+- `mod.rs`: `CharTableState` + the shared `SnapshotWriter` (and `persist_user_config`, the
+  config-side snapshot) + the two `TextTab`
   settings (`char_table_font_size`, `char_table_last_group`). Edit here for window state.
 - `window.rs`: the `egui::Window` — size control, tab strip, wrapping grid, expanded
   variants block, favorites star + popup. The only egui code in this directory.
@@ -139,11 +141,14 @@ it through `fonts_for_char`. Every WRITE (favorites, cell size, last tab) goes t
 - Per font the swash charmap is built ONCE and every character is tested against it
   (`charmap.map(ch) != 0`), exactly like `font_coverage::classify_font_bytes_for`.
 - Recomputed only when the font-list FINGERPRINT changes, not on every window open. The
-  fingerprint is length + per entry the render identity, the FILE PATH and the
-  representative face index. The path and face index are load-bearing: a re-imported font
-  can keep its identity while pointing at different bytes, and a different face of one
-  `.ttc` has a different cmap — with identity alone the cached map would silently keep glyph
-  indices computed from the previous file.
+  fingerprint is length + per entry the render identity, the CONTENT HASH and the
+  representative face index. The content hash and the face index are load-bearing: an
+  UNCONTESTED font keeps its PostScript name when its file is replaced by another build
+  (the identity carries a `%hash` suffix only while two files contest one name), and a
+  different face of one `.ttc` has a different cmap — with identity alone the cached map
+  would silently keep offering a character the font no longer draws. The FILE PATH is
+  deliberately NOT part of it: moving a font must not throw the whole map away and re-read
+  every font.
 - **The `FontEntryKind::BundledUiStack` entry is excluded from the map.** It stands for the
   whole bundled `fonts/ui` fallback chain (core + bold + ~44 `ext` files), not for the one
   file it points at, so a per-file cmap test would understate it — the same reason its
@@ -190,14 +195,16 @@ it through `fonts_for_char`. Every WRITE (favorites, cell size, last tab) goes t
   what the tier exists for, and the load runs on a worker thread — but the CALL must be on
   the GUI thread inside a frame (it panics before the first frame).
 - **Registration throttle: `MAX_FONT_REGISTRATIONS_PER_FRAME = 2`.**
-  `widgets::font_preview::ensure_font_family` reads the font file on the CALLING (GUI)
-  thread and makes egui rebuild its glyph atlas, and egui's `add_font` never evicts — a
-  symbol covered by forty loaded fonts would otherwise mean forty file reads plus forty
-  atlas rebuilds in ONE frame. `is_font_family_bound` decides without paying for a
+  `widgets::font_preview::request_font_family` makes egui rebuild its glyph atlas, and
+  egui's `add_font` never evicts — a symbol covered by forty loaded fonts would otherwise
+  mean forty queued file reads plus forty atlas rebuilds around ONE frame. `is_font_family_bound` decides without paying for a
   registration; cells not yet bound draw the glyph in the UI font meanwhile and the window
-  calls `ctx.request_repaint()` while any registration is outstanding. A font that FAILS
-  to register is remembered in `Context::data`, so an unreadable file is read once, not
-  once per frame.
+  calls `ctx.request_repaint()` while any registration is outstanding. A slot buys a QUEUED
+  read plus a deferred `add_font`, never a blocking read — `request_font_family` hands the
+  `fs::read` to a background loader and only the registration happens on the GUI thread.
+  Remembering a font that cannot be used is `widgets::font_preview`'s job, not this
+  window's: it keeps an egui refusal per `Context` and a read error process-wide, and logs
+  each once, so an unreadable file is neither re-read nor re-logged per frame.
 - **Tag emission**: a variant click inserts `<font={identity}>{ch}</font>` ONLY when
   `identity` differs from the font in effect at the caret, else the bare character. The
   identity comes from `FontEntry::render_identity_name()` (or

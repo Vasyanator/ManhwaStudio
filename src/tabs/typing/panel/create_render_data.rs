@@ -18,6 +18,7 @@ Notes:
 */
 
 use super::*;
+use crate::tabs::typing::psd_export::FontPostScriptNames;
 
 impl TypingCreatePanelState {
     /// render-data для image-оверлея: только список эффектов (без text_params).
@@ -42,63 +43,44 @@ impl TypingCreatePanelState {
         self.effects.iter().map(effect_card_to_value).collect()
     }
 
-    pub(super) fn build_current_font_profile_json(&self) -> Value {
-        self.build_font_profile_json_for_idx(self.selected_font_idx)
-    }
-
+    /// Profile JSON of the font at `font_idx` in the CURRENT schema, carrying that font's
+    /// IDENTITY (`FontEntry::render_identity_name`) under `font`. An out-of-range index
+    /// yields a payload with no font key — the profile is still usable for parameters.
     pub(super) fn build_font_profile_json_for_idx(&self, font_idx: usize) -> Value {
-        let font_path = self
-            .fonts
-            .get(font_idx)
-            .map(|font| font.path.to_string_lossy().to_string())
-            .unwrap_or_default();
-        // `font_label` carries the render/inline IDENTITY (`render_identity_name`: the
-        // family name when unique in the list, the file-stem label on a shared family).
-        // `font_original_name` carries the raw family name separately; both are kept so
-        // old app versions resolving `font_label` still land the right font via the
-        // provider's family-name alias.
-        let font_label = self
-            .fonts
-            .get(font_idx)
-            .map(FontEntry::render_identity_name)
-            .unwrap_or_default();
-        let font_original_name = self
-            .fonts
-            .get(font_idx)
-            .map(|font| font.original_name.clone())
-            .unwrap_or_default();
-        self.build_render_data_json_with_font(
-            self.text.clone(),
-            self.width_px.max(1),
-            Some(font_path),
-            Some(font_label),
-            Some(font_original_name),
-        )
+        // Schema 2 stores ONE font key: the identity (the representative face's
+        // PostScript name, `%hash`-suffixed only on a same-name/different-bytes
+        // contest). Path, label, family name are neither written nor read here any
+        // more; they survive only as the codec's legacy READ chain for schema-1
+        // documents (`dev-docs/font_identity_postscript_plan.md` phase 3).
+        let font_identity = self.fonts.get(font_idx).map(FontEntry::render_identity_name);
+        self.build_render_data_json_with_font(self.text.clone(), self.width_px.max(1), font_identity)
     }
 
+    /// Full render-data JSON for the CURRENTLY selected font, or `None` when the panel
+    /// has no font selected (an empty font list).
     pub(super) fn build_render_data_json_for(&self, text: String, width_px: u32) -> Option<Value> {
         let font = self.fonts.get(self.selected_font_idx)?;
         Some(self.build_render_data_json_with_font(
             text,
             width_px.max(1),
-            Some(font.path.to_string_lossy().to_string()),
-            // Identity = `render_identity_name` (family name when unique, else stem
-            // label); see `build_font_profile_json_for_idx`.
             Some(font.render_identity_name()),
-            Some(font.original_name.clone()),
         ))
     }
 
+    /// Builds the overlay's `render_data` in the CURRENT `text_params` schema.
+    ///
+    /// `font_identity` is the font's render identity (`FontEntry::render_identity_name`)
+    /// or `None` when no font is selected. The parameter object is assembled in full and
+    /// then handed to [`text_params_schema::write_text_params`], which stamps the schema
+    /// version and drops every value equal to its frozen default — so this function must
+    /// keep listing EVERY key, defaults included. An empty effect list is omitted.
     pub(super) fn build_render_data_json_with_font(
         &self,
         text: String,
         width_px: u32,
-        font_path: Option<String>,
-        font_label: Option<String>,
-        font_original_name: Option<String>,
+        font_identity: Option<String>,
     ) -> Value {
-        let mut render_data = json!({
-            "text_params": {
+        let mut text_params = json!({
                 "text": text,
                 "text_color": [self.text_color.r(), self.text_color.g(), self.text_color.b(), self.text_color.a()],
                 "font_size_px": self.font_size_px,
@@ -171,42 +153,84 @@ impl TypingCreatePanelState {
                 },
                 "shape_min_width_percent": self.shape_min_width_percent,
                 "shape_variant": self.shape_variant,
-                "font_path": font_path,
-                // Canonical render IDENTITY (the caller passes `render_identity_name`:
-                // family name when unique, else file-stem label). Kept under the
-                // historical `font_label` key so older app versions still resolve it
-                // via the provider alias.
-                "font_label": font_label,
-                // Real font family/name from the file. Read FIRST by the codec and
-                // preferred by PSD export / future virtual fonts; carries the same
-                // canonical name as `font_label` for current data.
-                "font_original_name": font_original_name,
                 // Сформированный (разбитый на строки) текст «продвинутой формы».
                 // Если не пуст — именно он идёт в рендер; `text` остаётся исходным.
                 // Переживает перезапуск.
                 "formed_text": self.formed_text,
-            },
-            "effects": self.effects_value_array(),
         });
-        if let Some(text_params) = render_data.get_mut("text_params").and_then(Value::as_object_mut) {
-            text_params.insert("faux_bold".to_string(), json!(self.faux_bold));
-            text_params.insert("faux_bold_thicken_percent".to_string(), json!(self.faux_bold_thicken_percent));
-            text_params.insert("faux_bold_expand_percent".to_string(), json!(self.faux_bold_expand_percent));
-            text_params.insert("faux_bold_sharp_corners".to_string(), json!(self.faux_bold_sharp_corners));
-            text_params.insert("faux_bold_outward_only".to_string(), json!(self.faux_bold_outward_only));
-            text_params.insert("faux_italic".to_string(), json!(self.faux_italic));
-            text_params.insert("faux_italic_slant_deg".to_string(), json!(self.faux_italic_slant_deg));
+        let Some(text_params_obj) = text_params.as_object_mut() else {
+            // Unreachable: the literal above IS an object. Returning an empty payload
+            // instead of panicking keeps the GUI thread alive on an impossible edit.
+            return json!({});
+        };
+        // The ONLY font key of schema 2. Absent when the panel has no font selected.
+        if let Some(identity) = font_identity {
+            text_params_obj.insert("font".to_string(), Value::String(identity));
         }
+        text_params_obj.insert("faux_bold".to_string(), json!(self.faux_bold));
+        text_params_obj.insert("faux_bold_thicken_percent".to_string(), json!(self.faux_bold_thicken_percent));
+        text_params_obj.insert("faux_bold_expand_percent".to_string(), json!(self.faux_bold_expand_percent));
+        text_params_obj.insert("faux_bold_sharp_corners".to_string(), json!(self.faux_bold_sharp_corners));
+        text_params_obj.insert("faux_bold_outward_only".to_string(), json!(self.faux_bold_outward_only));
+        text_params_obj.insert("faux_italic".to_string(), json!(self.faux_italic));
+        text_params_obj.insert("faux_italic_slant_deg".to_string(), json!(self.faux_italic_slant_deg));
         // Carry the canvas-authored vector mesh warp verbatim (Phase 3). Only
         // emit the key when present so old overlays stay byte-stable/clean.
-        if let Some(raster_transform) = self.pending_raster_transform.clone()
-            && let Some(text_params) = render_data
-                .get_mut("text_params")
-                .and_then(Value::as_object_mut)
-        {
-            text_params.insert("raster_transform".to_string(), raster_transform);
+        if let Some(raster_transform) = self.pending_raster_transform.clone() {
+            text_params_obj.insert("raster_transform".to_string(), raster_transform);
         }
-        render_data
+        let text_params = text_params_schema::write_text_params(std::mem::take(text_params_obj));
+
+        let mut render_data = serde_json::Map::new();
+        render_data.insert("text_params".to_string(), text_params);
+        // An empty effect list carries no information: every reader treats an absent
+        // `effects` exactly like `[]` (`effects_json_from_render_data`, the panel's own
+        // `parse_effect_cards` call, and the renderer's `parse_effects_json`).
+        let effects = self.effects_value_array();
+        if !effects.is_empty() {
+            render_data.insert("effects".to_string(), Value::Array(effects));
+        }
+        Value::Object(render_data)
+    }
+
+    /// Snapshot of `identity -> per-face PostScript names` for the panel's CURRENT font
+    /// list, for consumers that need a real PostScript name but hold no font list — today
+    /// the PSD export, whose job carries neither the fonts nor the provider.
+    ///
+    /// Faces are indexed by their POSITION in the font's face list, which is what
+    /// `text_params.selected_face_index` stores. Cheap (one small string per face) and
+    /// built off any font file access.
+    pub(in crate::tabs::typing) fn font_post_script_names(&self) -> FontPostScriptNames {
+        let mut index = FontPostScriptNames::default();
+        for font in &self.fonts {
+            index.insert_font(
+                &font.render_identity_name(),
+                font.faces
+                    .iter()
+                    .map(|face| face.post_script_name.clone())
+                    .collect(),
+                font.post_script_name(),
+            );
+        }
+        index
+    }
+
+    /// Resolves a font reference written by an OLDER build (a `font_path` and/or a name
+    /// in any historical form) to the current render IDENTITY, or `None` when no
+    /// installed font matches.
+    ///
+    /// The single entry point of the legacy READ path for callers outside the panel (the
+    /// tab's schema-1 -> schema-2 conversion). It delegates to the same
+    /// `find_font_idx_by_legacy_reference` the panel's own overlay-selection path uses,
+    /// so a converted document selects exactly the font the panel would have selected.
+    pub(in crate::tabs::typing) fn resolve_legacy_font_identity(
+        &self,
+        font_path: Option<&str>,
+        font_name: Option<&str>,
+    ) -> Option<String> {
+        self.find_font_idx_by_legacy_reference(font_path, font_name)
+            .and_then(|idx| self.fonts.get(idx))
+            .map(FontEntry::render_identity_name)
     }
 
     pub(super) fn shape_layout_to_value(&self) -> Value {
@@ -487,16 +511,33 @@ impl TypingCreatePanelState {
         layout
     }
 
+    /// Stores the panel's current parameters as the profile of the font at `idx`, keyed by
+    /// that font's IDENTITY, and makes it the active profile anchor. No-op without the
+    /// per-font memory (edit panel) or for an out-of-range index.
+    ///
+    /// WHICH LAYER IS WRITTEN follows the ownership split of "variant A"
+    /// (`dev-docs/font_identity_postscript_plan.md`): with a preset applied the edit belongs
+    /// to that preset's working set and the font's PERSISTED DEFAULT is left alone; without
+    /// one, the parameters on screen are what this font should remember by itself. See
+    /// [`DefaultProfileWrite`].
     pub(super) fn store_current_font_profile_by_idx(&mut self, idx: usize) {
         if !self.preview_enabled {
             return;
         }
-        let Some(font_key) = self.font_key_by_idx(idx) else {
+        let Some(identity) = self.font_identity_name_by_idx(idx) else {
             return;
         };
-        self.font_profiles_by_key
-            .insert(font_key.clone(), self.build_font_profile_json_for_idx(idx));
-        self.active_font_key = Some(font_key);
+        let write = if self.selected_preset_name.is_some() {
+            DefaultProfileWrite::PresetOnly
+        } else {
+            DefaultProfileWrite::UpdateFontDefault
+        };
+        self.font_profiles_by_identity.insert(
+            identity.clone(),
+            self.build_font_profile_json_for_idx(idx),
+            write,
+        );
+        self.active_font_identity = Some(identity);
     }
 
     pub(super) fn sync_current_font_profile_memory(&mut self) {
@@ -511,11 +552,11 @@ impl TypingCreatePanelState {
             return false;
         }
         self.store_current_font_profile_by_idx(prev_font_idx);
-        let Some(new_font_key) = self.current_font_key() else {
+        let Some(new_identity) = self.current_font_identity() else {
             return false;
         };
-        self.active_font_key = Some(new_font_key.clone());
-        if let Some(profile) = self.font_profiles_by_key.get(&new_font_key).cloned() {
+        self.active_font_identity = Some(new_identity.clone());
+        if let Some(profile) = self.font_profiles_by_identity.get(&new_identity).cloned() {
             self.apply_render_data_json_with_options(&profile, false);
             self.clamp_face_index();
             return true;

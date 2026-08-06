@@ -29,6 +29,27 @@ use super::*;
 /// the per-render fallback status so a long text can never blow up the panel.
 const MAX_SHOWN_CHARS: usize = 15;
 
+/// Everything one row of the font combo popup needs (`draw_font_combo_option`).
+///
+/// Bundled into a struct so the draw fn stays under the argument-count lint, and — more
+/// importantly — so the three different notions of a "font name" cannot be swapped at a
+/// call site: `label` is DISPLAY ONLY (override → virtual-group alias → file stem),
+/// `identity` is the resolution/registration key (`FontEntry::render_identity_name`), and
+/// `path` is only where the bytes are read from for the own-typeface preview.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FontComboOption<'a> {
+    pub(super) label: &'a str,
+    pub(super) identity: &'a str,
+    /// `FontEntry::content_hash` of the font behind `identity` — the byte discriminant of
+    /// the egui preview registration (`widgets::font_preview`), so a replaced file is not
+    /// previewed from stale bytes. `0` = content unknown.
+    pub(super) content_hash: u64,
+    pub(super) path: &'a Path,
+    pub(super) face_index: usize,
+    pub(super) selected: bool,
+    pub(super) coverage: &'a FontLanguageCoverage,
+}
+
 /// "Works, but not the way you asked": a font that only partially covers the
 /// typesetting language, or a character drawn by a fallback font instead of the
 /// selected one. Deliberately not red — both cases still render.
@@ -131,26 +152,73 @@ impl TypingCreatePanelState {
         });
     }
 
+    /// Applies a saved create preset: its per-font profile memory and its primary font.
+    ///
+    /// The preset names its font ONCE, by identity (`TypingCreatePreset.font`). A value the
+    /// migration could not resolve survives there in its legacy spelling, so this stays a
+    /// READ path: the profile map is re-keyed to IDENTITIES in memory and the primary font
+    /// is resolved through the one legacy door
+    /// (`dev-docs/font_identity_postscript_plan.md`, fixed decision 5). A key that resolves
+    /// to no loaded font is kept VERBATIM rather than dropped — it is the only remaining
+    /// clue about which font it meant, and the user may install that font later.
+    ///
+    /// MISSING PRIMARY FONT. When the preset NAMES a primary font that no loaded font
+    /// matches BY NAME, the panel enters the same `missing_font` state an overlay load
+    /// produces (`create_apply::select_font_by_identity`): the selection is left where it
+    /// was and no profile is applied to it, so the preset is never silently applied to a
+    /// DIFFERENT font than the one it was saved for. A legacy value that only matches a
+    /// loaded font by PATH counts as missing too — the file at a remembered path is not
+    /// proof of identity. A preset that names no font at all (an empty `font`, only
+    /// reachable for a preset saved with an empty font list) keeps the current selection
+    /// and is not a missing font.
     pub(super) fn apply_preset_by_name(&mut self, name: String) {
         let Some(preset) = self.presets_by_name.get(&name).cloned() else {
             return;
         };
-        self.font_profiles_by_key = preset.font_profiles;
+        // Marked applied BEFORE any profile is stored: from here on every parameter write
+        // belongs to THIS preset's working set, not to the font's persisted default
+        // (`create_render_data::store_current_font_profile_by_idx`, variant A).
+        self.selected_preset_name = Some(name);
+        // Applying a preset replaces the SESSION memory only; each font's persisted default
+        // profile is left alone (a preset is an independent overlay, not a rewrite of what
+        // every font remembers on disk).
+        self.font_profiles_by_identity =
+            FontProfileMemory::from_map(self.font_profiles_keyed_by_identity(preset.font_profiles));
 
-        let target_idx = self
-            .find_font_idx_by_key(&preset.primary_font_key)
-            .or_else(|| {
-                self.find_font_idx_by_path_or_label(
-                    preset.primary_font_path.as_deref(),
-                    preset.primary_font_label.as_deref(),
-                )
-            });
-        if let Some(idx) = target_idx {
-            self.selected_font_idx = idx;
+        let primary = preset.font.trim();
+        let names_a_font = !primary.is_empty();
+        // The stored value is an identity; a leftover legacy value may be a name form or a
+        // path, so it goes through the legacy door — where only NAME evidence may select.
+        let target_idx = self.find_font_idx_by_identity(primary).or_else(|| {
+            match self.match_font_by_legacy_reference(Some(primary), &[primary]) {
+                Some(LegacyFontMatch::ByName(idx)) => Some(idx),
+                Some(LegacyFontMatch::PathOnly(_)) | None => None,
+            }
+        });
+        match target_idx {
+            Some(idx) => {
+                self.selected_font_idx = idx;
+                self.missing_font = None;
+            }
+            None if names_a_font => {
+                // The preset's own font is not loaded. Record it and stop: applying its
+                // parameters to whatever font happens to be selected would show the user a
+                // preset "applied" to a font it was never saved for.
+                self.missing_font = Some(
+                    Path::new(primary)
+                        .file_name()
+                        .and_then(|file| file.to_str())
+                        .filter(|_| primary.contains(std::path::is_separator))
+                        .unwrap_or(primary)
+                        .to_string(),
+                );
+                return;
+            }
+            None => {}
         }
-        self.active_font_key = self.current_font_key();
-        if let Some(font_key) = self.current_font_key() {
-            if let Some(profile) = self.font_profiles_by_key.get(&font_key).cloned() {
+        self.active_font_identity = self.current_font_identity();
+        if let Some(identity) = self.current_font_identity() {
+            if let Some(profile) = self.font_profiles_by_identity.get(&identity).cloned() {
                 self.apply_render_data_json_with_options(&profile, false);
             } else {
                 self.selected_face_idx = 0;
@@ -158,9 +226,108 @@ impl TypingCreatePanelState {
             }
         }
         self.clamp_face_index();
-        self.selected_preset_name = Some(name);
     }
 
+    /// Re-keys a stored profile map to font IDENTITIES.
+    ///
+    /// Every key that resolves to a loaded font is replaced by that font's identity
+    /// STRING (so a key differing only in case stops shadowing the profile it means);
+    /// a key that resolves to nothing survives unchanged, so no user data is lost — it is
+    /// the only remaining clue about which font it meant, and the font may be installed
+    /// later. Such a key can never collide with a converted one, since a key that matches
+    /// a loaded identity in any casing resolves by definition.
+    ///
+    /// COLLISION PRIORITY (deterministic, and NOT the `HashMap` iteration order — that is
+    /// randomized per process, so the surviving profile used to be a coin toss). Several
+    /// legacy keys can name one font (`/old/fonts/Regular.ttf` and `Regular`); the winner
+    /// is the key with the strongest claim, and ties are broken lexicographically:
+    ///
+    /// 1. the key IS the identity, byte for byte — the current form;
+    /// 2. the key is the identity up to case;
+    /// 3. a legacy NAME (family / label / stem) — still a name for the font;
+    /// 4. a legacy PATH — the weakest form, and the one the plan is removing.
+    ///
+    /// A PATH is deliberately still accepted HERE, unlike in font SELECTION: the stored key
+    /// is the only reference a legacy preset ever had for a profile (it was literally
+    /// `path.to_string_lossy()`), so refusing it would strand every profile the user has,
+    /// while the worst case is remembered PARAMETERS attached to a font whose file was
+    /// replaced — not a layer re-rendered in the wrong typeface. Ranking it last is what
+    /// keeps a name from ever losing to a path.
+    ///
+    /// Every displaced profile is logged with the key that won, so a merge is visible
+    /// rather than silent.
+    fn font_profiles_keyed_by_identity(
+        &self,
+        profiles: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        // (winning rank, winning key, profile) per target key.
+        let mut out: HashMap<String, (u8, String, Value)> = HashMap::with_capacity(profiles.len());
+        // Sorting makes both the rank comparison and its lexicographic tie-break
+        // independent of the map's randomized iteration order.
+        let mut incoming: Vec<(String, Value)> = profiles.into_iter().collect();
+        incoming.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, profile) in incoming {
+            // One lookup decides both the target and the rank: the legacy door reports
+            // WHICH kind of evidence matched, so a name can no longer lose to a path (it
+            // used to, because the key was handed in as a path AND as a name, and the path
+            // was tried first).
+            let matched = self
+                .find_font_idx_by_identity(&key)
+                .map(LegacyFontMatch::ByName)
+                .or_else(|| self.match_font_by_legacy_reference(Some(&key), &[&key]));
+            let resolved = matched
+                .map(LegacyFontMatch::font_idx)
+                .and_then(|idx| self.font_identity_name_by_idx(idx));
+            let (target, rank) = match resolved {
+                Some(identity) => {
+                    let rank = if identity == key {
+                        0
+                    } else if identity.eq_ignore_ascii_case(&key) {
+                        1
+                    } else if matches!(matched, Some(LegacyFontMatch::ByName(_))) {
+                        2
+                    } else {
+                        3
+                    };
+                    (identity, rank)
+                }
+                // Unresolvable: kept verbatim, and alone under that key.
+                None => (key.clone(), 0),
+            };
+            match out.entry(target) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((rank, key, profile));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let (loser_key, winner_key) = if rank < slot.get().0 {
+                        let previous = slot.insert((rank, key.clone(), profile));
+                        (previous.1, key)
+                    } else {
+                        (key, slot.get().1.clone())
+                    };
+                    crate::runtime_log::log_info(format!(
+                        "typing presets: profile keys '{loser_key}' and '{winner_key}' both name \
+                         the font '{}'; keeping the profile stored under '{winner_key}' (the \
+                         stronger key form) and dropping the other.",
+                        slot.key(),
+                    ));
+                }
+            }
+        }
+        out.into_iter()
+            .map(|(identity, (_, _, profile))| (identity, profile))
+            .collect()
+    }
+
+    /// Saves the panel's current parameters as the named create preset and persists the
+    /// whole preset document off the GUI thread.
+    ///
+    /// The preset carries the SESSION profile memory ONLY — the fonts the user actually
+    /// touched here. It used to additionally copy the CURRENT font's profile into every
+    /// other loaded font's key, which is what turned 67 real profiles into 162 stored ones
+    /// (87 % of `user_config.json`) and, worse, made a preset claim parameters for fonts it
+    /// was never configured for. Each font's own remembered parameters live in
+    /// `fonts_data.fonts.<identity>.profile` and need no copy.
     pub(super) fn save_current_preset(&mut self) {
         if !self.preview_enabled {
             return;
@@ -172,41 +339,288 @@ impl TypingCreatePanelState {
 
         self.sync_current_font_profile_memory();
 
-        let mut font_profiles = self.font_profiles_by_key.clone();
-        let current_profile = self.build_current_font_profile_json();
-        for idx in 0..self.fonts.len() {
-            if let Some(key) = self.font_key_by_idx(idx) {
-                font_profiles
-                    .entry(key)
-                    .or_insert_with(|| current_profile.clone());
-            }
-        }
-        let primary_font_key = self.current_font_key().unwrap_or_default();
-        let primary_font_path = self
-            .fonts
-            .get(self.selected_font_idx)
-            .map(|font| font.path.to_string_lossy().to_string());
-        // Persist the font's canonical render IDENTITY (original family name), matching
-        // the render_data flip; `primary_font_key`/`primary_font_path` stay path-based.
-        let primary_font_label = self.font_identity_name_by_idx(self.selected_font_idx);
         self.presets_by_name.insert(
             preset_name.clone(),
             TypingCreatePreset {
-                primary_font_key,
-                primary_font_path,
-                primary_font_label,
-                font_profiles,
+                font: self.current_font_identity().unwrap_or_default(),
+                font_profiles: self.font_profiles_by_identity.to_map(),
             },
         );
-        self.selected_preset_name = Some(preset_name.clone());
+        self.selected_preset_name = Some(preset_name);
+        self.spawn_presets_save(false);
+    }
 
+    /// Persists the whole preset document to `fonts/presets.json` off the GUI thread.
+    ///
+    /// `then_clean_user_config` additionally deletes the migrated legacy `TextTab` keys —
+    /// only ever passed by the migration, and only AFTER the new document is safely on
+    /// disk, so a failed write can never lose the presets it was supposed to replace.
+    ///
+    /// A failed save (or a failed thread spawn) is logged AND pushed to `preset_store_tx`,
+    /// which the GUI thread turns into a visible status line: a preset the user just saved
+    /// must never disappear silently, which is exactly what the two `let _ =` this replaced
+    /// allowed.
+    ///
+    /// Under `#[cfg(test)]` the body early-returns before spawning, so unit tests never
+    /// touch the real fonts directory; the write itself is covered by `presets_store`'s own
+    /// tests and by `run_presets_save`, which a test drives synchronously (same precedent as
+    /// `font_settings_store::persist_off_thread`).
+    fn spawn_presets_save(&self, then_clean_user_config: bool) {
+        if cfg!(test) {
+            return;
+        }
         let presets = self.presets_by_name.clone();
-        let _ = thread::Builder::new()
+        let fonts_dir = self.fonts_dir.clone();
+        let events = self.preset_store_tx.clone();
+        // Ticket taken HERE, where the snapshot is: it is what keeps a slow writer from
+        // putting an older state of the document back over a newer one.
+        let ticket = presets_store::next_save_ticket();
+        let spawn_result = thread::Builder::new()
             .name("typing-save-create-presets".to_string())
             .spawn(move || {
-                let _ = save_text_tab_create_presets(&presets);
+                // The config path is resolved HERE, off the GUI thread, and handed down
+                // explicitly so the whole chain can be tested against a temp file.
+                let clean_config = then_clean_user_config.then(config::user_config_path);
+                run_presets_save(&fonts_dir, &presets, ticket, clean_config.as_deref(), &events);
             });
+        if let Err(err) = spawn_result {
+            report_preset_save_failure(
+                &self.preset_store_tx,
+                &format!("cannot spawn the presets.json writer thread: {err}"),
+            );
+        }
     }
+
+    /// Drains everything the background `fonts/presets.json` workers have to say, once per
+    /// frame: the off-thread seed, the one-shot `user_config` migration, presets another app
+    /// instance wrote, and save failures. A no-op when the channel is empty.
+    ///
+    /// The migration is finished HERE, on the GUI thread, because re-keying the legacy font
+    /// references needs this panel's font list — the same reason `fonts_data`'s v1 migration
+    /// is deferred to the end of a font-list build.
+    ///
+    /// And it waits for the AUTHORITATIVE (combined) list. The preset read and the font load
+    /// are two independent background jobs, so "the fonts are usually there by now" is a
+    /// race, not an ordering: when the reader wins, a migration run here would resolve no
+    /// IMPORTED system font, keep those references verbatim, delete the legacy
+    /// `user_config` key and never retry — `presets.json` and `fonts_data.json` would
+    /// disagree about the same font forever. The payload is therefore PARKED until
+    /// `poll_font_reload_results` reports the combined list.
+    pub(super) fn poll_preset_store_events(&mut self) {
+        loop {
+            match self.preset_store_rx.try_recv() {
+                Ok(PresetStoreEvent::Seeded { presets, legacy }) => {
+                    self.install_seeded_presets(presets);
+                    if let Some(legacy) = legacy {
+                        if self.font_list_is_authoritative {
+                            self.finish_legacy_presets_migration(legacy);
+                        } else {
+                            self.pending_legacy_presets_migration = Some(legacy);
+                        }
+                    }
+                }
+                Ok(PresetStoreEvent::MergedFromDisk(presets)) => {
+                    // Written by another app instance and already part of the document on
+                    // disk; adopting them keeps the next snapshot from dropping them again.
+                    // Ours wins a name clash — it is what is on screen.
+                    for (name, preset) in presets {
+                        self.presets_by_name.entry(name).or_insert(preset);
+                    }
+                }
+                Ok(PresetStoreEvent::SaveFailed(reason)) => {
+                    self.status_line = tf!("typing.presets.save_error_status", err = reason);
+                }
+                // The senders live in the panel itself, so the channel cannot be
+                // disconnected while the panel exists; both idle cases end the drain.
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Installs the presets the startup read found. A preset the user saved BEFORE the read
+    /// landed wins over its stored namesake: it is the fresher one, and the save that wrote
+    /// it already merged the document it did not know about (`presets_store::save`).
+    fn install_seeded_presets(&mut self, presets: HashMap<String, TypingCreatePreset>) {
+        for (name, preset) in presets {
+            self.presets_by_name.entry(name).or_insert(preset);
+        }
+    }
+
+    /// Completes the one-shot migration out of `user_config.TextTab.create_presets`
+    /// (`dev-docs/font_identity_postscript_plan.md` phase 5) with the payload the seed read
+    /// off the GUI thread, then persists the result and cleans the legacy keys.
+    ///
+    /// A migrated preset whose name is ALREADY taken is kept under a suffixed name instead
+    /// of being dropped: two presets are the user's data twice over, and "the newer one
+    /// wins" would silently delete years-old parameters the user never asked to lose.
+    pub(super) fn finish_legacy_presets_migration(
+        &mut self,
+        legacy: Vec<presets_store::LegacyPresetEntry>,
+    ) {
+        if legacy.is_empty() {
+            // Nothing to migrate. The dead keys may still be lying around, so the cleanup
+            // pass runs anyway (it rewrites nothing when they are absent).
+            spawn_user_config_cleanup(&self.fonts_dir);
+            return;
+        }
+        let migrated = self.migrate_legacy_presets(legacy);
+        let migrated_count = migrated.len();
+        for (name, preset) in migrated {
+            let free_name = self.free_preset_name(name);
+            self.presets_by_name.insert(free_name, preset);
+        }
+        crate::runtime_log::log_info(format!(
+            "typing: migrated {migrated_count} create preset(s) from user_config.json into \
+             fonts/presets.json"
+        ));
+        self.spawn_presets_save(true);
+    }
+
+    /// `name` itself when no preset holds it, otherwise the first free `"{name} (N)"`
+    /// (N from 2). A rename is logged, since the user will see a name they did not type.
+    fn free_preset_name(&self, name: String) -> String {
+        if !self.presets_by_name.contains_key(&name) {
+            return name;
+        }
+        // Bounded by the number of presets plus one, so a free slot always exists.
+        let taken = self.presets_by_name.len() + 2;
+        for suffix in 2..=taken {
+            let candidate = format!("{name} ({suffix})");
+            if !self.presets_by_name.contains_key(&candidate) {
+                crate::runtime_log::log_warn(format!(
+                    "typing presets: a preset named '{name}' already exists, so the migrated \
+                     one was kept as '{candidate}' rather than dropped."
+                ));
+                return candidate;
+            }
+        }
+        // Unreachable by the bound above; keeping the original name would overwrite, so the
+        // fallback appends the count instead of losing the preset.
+        format!("{name} ({taken})")
+    }
+
+    /// Converts legacy presets into the current form, resolving every stored font
+    /// reference against THIS panel's font list. Pure with respect to `self` (nothing is
+    /// stored here), so the whole migration rule is unit-testable.
+    ///
+    /// Per preset:
+    /// - the three competing primary references collapse into one `font`. Resolution is by
+    ///   NAME (`primary_font_key` as an identity first, then the label, then the key, then
+    ///   the path's own name forms); a match that exists ONLY as a file path is refused,
+    ///   because a file sitting at a remembered location is not proof of identity.
+    /// - the profile map is re-keyed by [`Self::font_profiles_keyed_by_identity`], where a
+    ///   path key IS accepted (it is the only reference a legacy profile ever had) but
+    ///   ranks below every name.
+    /// - every profile body is upgraded to the current `text_params` schema.
+    ///
+    /// Anything that resolves to nothing is KEPT VERBATIM under its legacy string and
+    /// logged — never dropped: it is the only surviving clue about the font it meant, and
+    /// it resolves again once the user reinstalls that font.
+    pub(super) fn migrate_legacy_presets(
+        &self,
+        legacy: Vec<presets_store::LegacyPresetEntry>,
+    ) -> Vec<(String, TypingCreatePreset)> {
+        legacy
+            .into_iter()
+            .map(|(name, preset)| {
+                let font = self.migrate_legacy_primary_font(&name, &preset);
+                let profiles = self.font_profiles_keyed_by_identity(preset.font_profiles);
+                let font_profiles = profiles
+                    .into_iter()
+                    .map(|(key, profile)| (key, self.upgrade_profile_to_current_schema(profile)))
+                    .collect();
+                (name, TypingCreatePreset { font, font_profiles })
+            })
+            .collect()
+    }
+
+    /// Resolves the three legacy primary-font references of one preset into a single
+    /// identity, or returns the strongest legacy string VERBATIM when nothing resolves by
+    /// name. See [`Self::migrate_legacy_presets`] for the rule; this logs what it kept.
+    fn migrate_legacy_primary_font(
+        &self,
+        preset_name: &str,
+        preset: &presets_store::LegacyCreatePreset,
+    ) -> String {
+        let key = preset.primary_font_key.trim();
+        let label = preset.primary_font_label.as_deref().unwrap_or_default().trim();
+        let path = preset.primary_font_path.as_deref().unwrap_or_default().trim();
+        if key.is_empty() && label.is_empty() && path.is_empty() {
+            // The preset names no font at all; it selects nothing and reports nothing.
+            return String::new();
+        }
+        // Identity first (what a late build wrote), then every remaining NAME form: the
+        // stored key and label as written, then the FILE STEM of each stored path — the
+        // last name candidate of the historical chain
+        // (`text_params_schema::legacy_font_name_candidates`), so a preset and a layer
+        // written by the same build resolve the same way. The paths themselves are only
+        // offered to the path pass, whose match is refused below.
+        let stem_of = |value: &str| {
+            Path::new(value)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty() && *stem != value)
+                .map(ToOwned::to_owned)
+        };
+        let stems: Vec<String> = [key, path].into_iter().filter_map(stem_of).collect();
+        let names: Vec<&str> = [key, label]
+            .into_iter()
+            .chain(stems.iter().map(String::as_str))
+            .filter(|value| !value.is_empty())
+            .collect();
+        let matched = self
+            .find_font_idx_by_identity(key)
+            .map(LegacyFontMatch::ByName)
+            .or_else(|| self.match_font_by_legacy_reference(Some(path), &names));
+        if let Some(LegacyFontMatch::ByName(idx)) = matched
+            && let Some(identity) = self.font_identity_name_by_idx(idx)
+        {
+            return identity;
+        }
+        // Keep the strongest legacy spelling so the user can still see (and repair) what
+        // the preset meant; `apply_preset_by_name` reports it as a missing font.
+        let kept = names.first().copied().unwrap_or_default().to_string();
+        crate::runtime_log::log_warn(format!(
+            "typing presets: the primary font of preset '{preset_name}' ('{kept}') matches no \
+             loaded font by name; it is KEPT VERBATIM and will resolve again if that font is \
+             reinstalled."
+        ));
+        kept
+    }
+
+    /// Upgrades one stored profile body (`{ "effects": [...], "text_params": {...} }`) to
+    /// the current `text_params` schema, reusing the ONE conversion the tab-side codec owns
+    /// so a preset and a layer can never disagree about what a legacy key meant.
+    ///
+    /// A body whose font does not resolve is returned UNCHANGED (schema 1) — the conversion
+    /// refuses to drop legacy keys it cannot replace, and so does this.
+    fn upgrade_profile_to_current_schema(&self, profile: Value) -> Value {
+        let Some(text_params) = profile
+            .get("text_params")
+            .and_then(Value::as_object)
+            .cloned()
+        else {
+            return profile;
+        };
+        let upgraded = crate::tabs::typing::tab::codec::upgrade_text_params_to_v2(
+            &text_params,
+            &|path, name| self.resolve_legacy_font_identity(path, name),
+        );
+        match upgraded {
+            crate::tabs::typing::tab::codec::TextParamsUpgrade::Converted(value) => {
+                let mut profile = profile;
+                if let Some(obj) = profile.as_object_mut() {
+                    obj.insert("text_params".to_string(), value);
+                }
+                profile
+            }
+            // Already current, or a font this build cannot resolve: leave the body alone.
+            crate::tabs::typing::tab::codec::TextParamsUpgrade::AlreadyCurrent
+            | crate::tabs::typing::tab::codec::TextParamsUpgrade::UnresolvedFont { .. }
+            | crate::tabs::typing::tab::codec::TextParamsUpgrade::PathOnlyFont { .. } => profile,
+        }
+    }
+
 
     pub(super) fn apply_formula_preset_by_name(&mut self, name: String) -> bool {
         let Some(preset) = self.formula_presets_by_name.get(&name).cloned() else {
@@ -258,37 +672,41 @@ impl TypingCreatePanelState {
                 });
     }
 
-    pub(super) fn ensure_combo_font_family(
-        &mut self,
-        ctx: &egui::Context,
-        font_path: &Path,
-        face_index: usize,
-    ) -> Option<egui::FontFamily> {
-        let cache_key = (font_path.to_path_buf(), face_index);
-        // Регистрация и детерминированное имя семейства (по путь+индекс начертания)
-        // живут в общем виджете `widgets::font_preview`: критично, что `create_panel` и
-        // `edit_panel` — две независимые панели с общим egui-`Context`, и один и тот же
-        // файл всегда даёт одно имя, а egui хранит данные шрифта по имени (иначе поздняя
-        // регистрация затирала бы раннюю, и панель рисовала бы чужой шрифт).
-        let family = crate::widgets::ensure_font_family(ctx, font_path, face_index)?;
-        self.combo_font_family_cache.insert(
-            cache_key,
-            crate::widgets::combo_font_family_name(font_path, face_index),
-        );
-        Some(family)
-    }
-
+    /// Рисует один пункт комбобокса шрифтов: подпись `option.label` (ТОЛЬКО отображаемое
+    /// имя) собственным начертанием шрифта `option.identity` (байты берутся из
+    /// `option.path`), с подсветкой/подсказкой по покрытию языка. Возвращает `true` при
+    /// клике.
+    ///
+    /// Регистрация начертания идёт через общий `widgets::font_preview`: имя семейства
+    /// детерминировано по `(идентичность, хеш содержимого, индекс начертания)`, поэтому
+    /// `create_panel` и `edit_panel` с общим egui-`Context` делят одну регистрацию (иначе
+    /// поздняя затирала бы раннюю, и панель рисовала бы чужой шрифт). Первые кадры пункт
+    /// рисуется интерфейсным шрифтом: файл читается ФОНОМ, на GUI-потоке остаётся только
+    /// `Context::add_font`.
     pub(super) fn draw_font_combo_option(
         &mut self,
         ui: &mut egui::Ui,
-        label: &str,
-        font_path: &Path,
-        face_index: usize,
-        selected: bool,
-        coverage: &FontLanguageCoverage,
+        option: &FontComboOption<'_>,
     ) -> bool {
+        let FontComboOption {
+            label,
+            identity,
+            content_hash,
+            path,
+            face_index,
+            selected,
+            coverage,
+        } = *option;
         let prev_override = ui.style().override_font_id.clone();
-        if let Some(family) = self.ensure_combo_font_family(ui.ctx(), font_path, face_index) {
+        if let crate::widgets::PreviewFontFamily::Ready(family) =
+            crate::widgets::request_font_family(
+                ui.ctx(),
+                identity,
+                content_hash,
+                path,
+                face_index,
+            )
+        {
             ui.style_mut().override_font_id = Some(egui::FontId::new(14.0, family));
         }
         // Highlight fonts that do not fully support the program language.
@@ -329,6 +747,190 @@ impl TypingCreatePanelState {
             self.selected_face_idx = 0;
         }
     }
+}
+
+/// Starts the OFF-GUI-THREAD seeding of a create panel's preset state.
+///
+/// Reading `fonts/presets.json` (and, when a migration is owed, the up-to-half-a-megabyte
+/// `user_config.json`) is file I/O and must not happen while a panel is being constructed on
+/// the GUI thread (CLAUDE.md §5). The worker sends exactly one
+/// [`PresetStoreEvent::Seeded`], which `poll_preset_store_events` installs.
+///
+/// The panel starts with NO presets and the writer's baseline set to "the document is
+/// absent", so a save issued before the seed lands cannot blindly overwrite the document it
+/// has not read yet: `presets_store::save` sees the mismatch, merges the file in and
+/// retries.
+///
+/// Under `#[cfg(test)]` nothing is spawned and no disk is touched: the store is covered by
+/// `presets_store`'s tests and the migration RULE by `migrate_legacy_presets`' own tests,
+/// while a unit test must never read the developer's real `fonts/` or `user_config.json`.
+pub(super) fn spawn_presets_seed(fonts_dir: &Path, events: &Sender<PresetStoreEvent>) {
+    if cfg!(test) {
+        return;
+    }
+    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Absent);
+    let fonts_dir = fonts_dir.to_path_buf();
+    let events = events.clone();
+    let spawn_result = thread::Builder::new()
+        .name("typing-read-create-presets".to_string())
+        .spawn(move || {
+            let (event, clean_config_now) = read_presets_seed(&fonts_dir);
+            // A closed channel means the panel is already gone; there is nobody left to
+            // hand the payload to and nothing has been modified, so the send result is
+            // deliberately ignored.
+            let _ = events.send(event);
+            if clean_config_now {
+                clean_migrated_user_config_keys(&fonts_dir, &config::user_config_path());
+            }
+        });
+    if let Err(err) = spawn_result {
+        crate::runtime_log::log_warn(format!(
+            "typing: could not spawn the create-preset reader; presets stay unloaded for this \
+             session and the read is retried on the next launch: {err}"
+        ));
+    }
+}
+
+/// Reads the preset document and, when one is owed, the legacy payload the migration needs.
+/// Returns the event to hand to the GUI thread plus whether the legacy `user_config` keys
+/// may be cleaned right away.
+///
+/// - `Loaded`: use the document and remember its bytes as the writer's baseline. The legacy
+///   keys are obsolete, but an earlier run may have died between writing the document and
+///   rewriting the config, so that half is retried NOW (nothing is rewritten when the keys
+///   are already gone).
+/// - `Missing` / `Invalid` (the corrupt file is quarantined first, so the next save cannot
+///   destroy a recoverable document): read the legacy `user_config.TextTab.create_presets`
+///   payload for the one-shot migration, which is finished on the GUI thread, where the font
+///   list exists. The config keys may only be dropped once the new document is written.
+pub(super) fn read_presets_seed(fonts_dir: &Path) -> (PresetStoreEvent, bool) {
+    match presets_store::load_outcome(fonts_dir) {
+        presets_store::LoadOutcome::Loaded {
+            presets,
+            fingerprint,
+        } => {
+            presets_store::set_baseline(
+                fonts_dir,
+                doc_store::SaveBaseline::Matching(fingerprint),
+            );
+            (
+                PresetStoreEvent::Seeded {
+                    presets,
+                    legacy: None,
+                },
+                true,
+            )
+        }
+        presets_store::LoadOutcome::Missing => (
+            PresetStoreEvent::Seeded {
+                presets: HashMap::new(),
+                legacy: Some(presets_store::load_legacy_presets()),
+            },
+            false,
+        ),
+        presets_store::LoadOutcome::Invalid => {
+            // The baseline follows what the quarantine achieved. `Failed` needs no baseline
+            // at all: `quarantine_bad_file` has already disabled persistence for this file,
+            // because the corrupt document is then the only copy of the user's presets.
+            match presets_store::quarantine_bad_file(fonts_dir) {
+                // The corrupt file is gone; the next save creates a fresh document.
+                presets_store::QuarantineOutcome::Moved => {
+                    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Absent);
+                }
+                // The corrupt file is still in place but its content is preserved in the
+                // `.bad` copy, so replacing it is safe — and its bytes are not our baseline.
+                presets_store::QuarantineOutcome::Copied
+                | presets_store::QuarantineOutcome::Failed => {
+                    presets_store::set_baseline(fonts_dir, doc_store::SaveBaseline::Unchecked);
+                }
+            }
+            (
+                PresetStoreEvent::Seeded {
+                    presets: HashMap::new(),
+                    legacy: Some(presets_store::load_legacy_presets()),
+                },
+                false,
+            )
+        }
+    }
+}
+
+/// Writes one preset snapshot and reports the outcome to the GUI thread. The body of the
+/// background writer, split out so a test can drive a REAL save (and a real failure) without
+/// a thread.
+///
+/// ORDERING CONTRACT: the legacy `user_config` keys are deleted only after `save` returned
+/// `Ok`, and `save` returns only once the document AND its directory entry are durable
+/// (`doc_store::Durability::ContentsAndDirectory`). Without that a power loss between the
+/// two could leave the presets in neither file.
+pub(super) fn run_presets_save(
+    fonts_dir: &Path,
+    presets: &HashMap<String, TypingCreatePreset>,
+    ticket: u64,
+    clean_user_config: Option<&Path>,
+    events: &Sender<PresetStoreEvent>,
+) {
+    match presets_store::save(fonts_dir, presets, ticket) {
+        Ok(report) => {
+            if !report.merged_from_disk.is_empty() {
+                // Same reasoning as above: a closed channel means the panel is gone.
+                let _ = events.send(PresetStoreEvent::MergedFromDisk(report.merged_from_disk));
+            }
+            if let Some(user_settings_file) = clean_user_config {
+                clean_migrated_user_config_keys(fonts_dir, user_settings_file);
+            }
+        }
+        Err(err) => report_preset_save_failure(events, &err.to_string()),
+    }
+}
+
+/// Deletes the migrated (and dead) legacy `TextTab` keys off the GUI thread, without writing
+/// `presets.json` first. Used when the document is already there (an earlier run wrote it but
+/// could not rewrite the config) or when there was nothing to migrate at all; the pass
+/// rewrites nothing when no legacy key is present, so it is a cheap no-op from the second
+/// launch on. Test-gated like `spawn_presets_save`: a unit test must not touch the real
+/// `user_config.json`.
+fn spawn_user_config_cleanup(fonts_dir: &Path) {
+    if cfg!(test) {
+        return;
+    }
+    let fonts_dir = fonts_dir.to_path_buf();
+    let spawn_result = thread::Builder::new()
+        .name("typing-clean-legacy-presets-config".to_string())
+        .spawn(move || clean_migrated_user_config_keys(&fonts_dir, &config::user_config_path()));
+    if let Err(err) = spawn_result {
+        crate::runtime_log::log_warn(format!(
+            "typing: could not spawn the user_config cleanup thread; the legacy preset keys \
+             stay in place and the cleanup retries next launch: {err}"
+        ));
+    }
+}
+
+/// Deletes the legacy `TextTab` keys the preset migration made obsolete and logs the
+/// outcome. Which keys those are — in particular whether the imported-system-fonts list may
+/// go — is decided by `presets_store::drop_migrated_user_config_keys` from the CONTENT of
+/// `fonts_data.json`, never from its mere existence (see that function).
+fn clean_migrated_user_config_keys(fonts_dir: &Path, user_settings_file: &Path) {
+    match presets_store::drop_migrated_user_config_keys(fonts_dir, user_settings_file) {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => crate::runtime_log::log_info(format!(
+            "typing: removed migrated legacy keys from user_config.json TextTab: {removed:?}"
+        )),
+        Err(err) => crate::runtime_log::log_warn(format!(
+            "typing: could not remove the migrated legacy preset keys from user_config.json; \
+             they stay in place and the cleanup retries next launch: {err}"
+        )),
+    }
+}
+
+/// Logs a preset-save failure and hands the technical reason to the GUI thread, which turns
+/// it into a visible status line. The localization happens THERE, not here: `tf!` is a
+/// catalog lookup and the message belongs to the frame that shows it.
+pub(super) fn report_preset_save_failure(events: &Sender<PresetStoreEvent>, reason: &str) {
+    crate::runtime_log::log_error(format!("typing: failed to save fonts/presets.json: {reason}"));
+    // A closed channel means the panel that would show the message is gone; the log line
+    // above is then the whole record, so the send result is deliberately ignored.
+    let _ = events.send(PresetStoreEvent::SaveFailed(reason.to_string()));
 }
 
 /// Build the hover tooltip for a font dropdown item, or `None` when the font

@@ -715,9 +715,34 @@ impl TypingTextOverlayLayer {
     /// must already be loaded via `ensure_raster_layers_for_page`), then rebuilds the per-page
     /// projections from the doc with `sync_from_doc`. No-op (returns false) if no doc is wired; the
     /// caller then keeps its legacy local-cache + disk path. Returns true when the doc handled it.
+    ///
+    /// The edit is ASSUMED to have changed something — the document is marked changed and
+    /// re-projected unconditionally. A caller whose closure can legitimately do nothing (e.g. the
+    /// node it targets is absent) must use [`Self::route_to_doc_reporting`] instead, so a no-op does
+    /// not bump the version and does not mark the layer dirty for a write that has nothing to write.
     pub(super) fn route_to_doc<F>(&mut self, page_idx: usize, edit: F) -> bool
     where
         F: FnOnce(&mut crate::models::layer_model::layer_doc::LayerDoc),
+    {
+        self.route_to_doc_reporting(page_idx, |doc| {
+            edit(doc);
+            true
+        })
+    }
+
+    /// [`Self::route_to_doc`] for an edit that reports whether it CHANGED anything.
+    ///
+    /// `edit` returns `false` when it left the document exactly as it found it (typically: the node
+    /// it targets is not on the page, or its value already equals the new one). The document is then
+    /// neither marked changed nor re-projected, and this returns `false` — indistinguishable, by
+    /// design, from "no doc wired": in both cases the caller owes the doc no write. Marking a
+    /// no-op edit as changed costs a whole-page re-projection plus a redundant rewrite of
+    /// `layers.json` on the next flush.
+    ///
+    /// Returns `true` only when the doc was wired, the page resident, AND `edit` reported a change.
+    pub(super) fn route_to_doc_reporting<F>(&mut self, page_idx: usize, edit: F) -> bool
+    where
+        F: FnOnce(&mut crate::models::layer_model::layer_doc::LayerDoc) -> bool,
     {
         let Some(doc) = self.layer_doc.clone() else {
             return false;
@@ -729,7 +754,9 @@ impl TypingTextOverlayLayer {
             // The page is not resident in the doc; let the caller fall back to its legacy path.
             return false;
         }
-        edit(&mut guard);
+        if !edit(&mut guard) {
+            return false;
+        }
         // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
         // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
         guard.mark_changed();

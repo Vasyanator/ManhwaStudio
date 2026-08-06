@@ -14,6 +14,13 @@ submodules of `tab` can use them. `use super::*;` pulls in the parent module's
 types and imports. Struct/enum definitions and the rest of the big
 `impl TypingTextOverlayLayer` block remain in `tab.rs`; these methods reach the
 private items that stay there as descendants of module `tab`.
+
+The on-canvas editor's own-typeface font is obtained in TWO steps on purpose:
+`request_editor_font` spawns the `FontProvider::resolve` (a provider cache miss is an
+`fs::read`, which must never run on the GUI thread) and `poll_editor_font_request` —
+driven once per frame from `draw_text_editor`, before its "no editor open" early
+return — registers the arrived bytes with egui, which does need the GUI thread. The
+field draws in the default UI font meanwhile.
 */
 
 use super::*;
@@ -189,11 +196,10 @@ impl TypingTextOverlayLayer {
             pick_bubble_text_for_selection(&project.bubbles, page_idx, scene_rect, page_rect)
                 .unwrap_or_default();
 
-        let mut font_family = None;
         let mut font_size_px = 24.0;
         if let Some(spec) = top_panel.create_editor_font_spec() {
-            font_family = self.ensure_editor_font(ctx, &spec);
             font_size_px = spec.ui_font_size_px.clamp(8.0, 128.0);
+            self.request_editor_font(&spec, top_panel.font_provider());
         }
 
         self.create_editor = Some(TypingCreateTextEditor {
@@ -202,7 +208,9 @@ impl TypingTextOverlayLayer {
             center_page_px,
             width_px,
             text: seed_text,
-            font_family,
+            // Filled in by `poll_editor_font_request` as soon as the background resolve
+            // lands; until then the field draws in the default UI font.
+            font_family: None,
             font_size_px,
             needs_focus: true,
             window_focused_last_frame: ctx.input(|input| input.viewport().focused.unwrap_or(true)),
@@ -210,31 +218,116 @@ impl TypingTextOverlayLayer {
         self.create_status_error = None;
     }
 
-    pub(super) fn ensure_editor_font(
+    /// Starts a BACKGROUND resolve of the font the on-canvas create editor should draw in.
+    ///
+    /// The bytes come from `fonts` — the panel's `FontProvider`, i.e. the SAME resolution
+    /// the renderer performs for that identity — so the editor cannot preview a different
+    /// file than the one the render will use, and nothing about it is keyed by a path.
+    /// A provider cache MISS reads the font file, which is why this never happens inline:
+    /// the GUI thread must not do file I/O (`CLAUDE.md` §5). The editor draws in the
+    /// default UI font until [`Self::poll_editor_font_request`] picks the result up; a
+    /// previous in-flight request is dropped, so the newest selection wins.
+    pub(super) fn request_editor_font(
         &mut self,
-        ctx: &egui::Context,
         spec: &TypingEditorFontSpec,
-    ) -> Option<egui::FontFamily> {
-        let cache_key = (spec.font_path.clone(), spec.face_index);
-        if let Some(name) = self.editor_font_cache.get(&cache_key) {
-            return Some(egui::FontFamily::Name(name.clone().into()));
+        fonts: Arc<dyn FontProvider>,
+    ) {
+        let font_identity = spec.font_identity.clone();
+        let face_index = spec.face_index;
+        let (tx, rx) = mpsc::channel::<Option<FontContent>>();
+        let worker_identity = font_identity.clone();
+        let spawn_result = thread::Builder::new()
+            .name("typing-editor-font-resolve".to_string())
+            .spawn(move || {
+                // A failed send just means the editor was closed or superseded before the
+                // bytes arrived; the provider keeps them cached either way.
+                let _ = tx.send(fonts.resolve(&worker_identity));
+            });
+        match spawn_result {
+            Ok(_handle) => {
+                self.editor_font_request = Some(TypingEditorFontRequest {
+                    font_identity,
+                    face_index,
+                    rx,
+                });
+            }
+            Err(err) => {
+                // The editor still works — it simply shows the default UI font — but the
+                // reason must be diagnosable rather than silent.
+                self.editor_font_request = None;
+                crate::runtime_log::log_error(format!(
+                    "typing: failed to spawn the on-canvas editor font resolver; the text \
+                     field falls back to the interface font. Font: {} Error: {err}",
+                    spec.font_identity
+                ));
+            }
         }
+    }
 
-        let font_bytes = fs::read(&spec.font_path).ok()?;
-        self.editor_font_next_id = self.editor_font_next_id.saturating_add(1);
-        let font_name = format!("typing-editor-font-{}", self.editor_font_next_id);
-        let mut font_data = egui::FontData::from_owned(font_bytes);
-        font_data.index = spec.face_index as u32;
-        ctx.add_font(egui::epaint::text::FontInsert::new(
-            font_name.as_str(),
-            font_data,
-            vec![egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Name(font_name.clone().into()),
-                priority: egui::epaint::text::FontPriority::Highest,
-            }],
-        ));
-        self.editor_font_cache.insert(cache_key, font_name.clone());
-        Some(egui::FontFamily::Name(font_name.into()))
+    /// Picks up a finished [`Self::request_editor_font`] without blocking and registers the
+    /// bytes with egui (which must happen on the GUI thread, where the `Context` lives).
+    ///
+    /// Registration is done at most once per `(identity, content id, face index)`: the
+    /// content id is what the provider reported for the bytes it actually served, so a font
+    /// file replaced under the same PostScript name is registered again instead of being
+    /// drawn forever from the snapshot egui already holds. An identity that did not resolve
+    /// leaves the editor on the default UI font. Call once per frame, including on frames
+    /// with no open editor, so a late result is not stranded in the channel.
+    pub(super) fn poll_editor_font_request(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.editor_font_request.as_ref() else {
+            return;
+        };
+        let content = match request.rx.try_recv() {
+            Ok(content) => content,
+            Err(TryRecvError::Empty) => {
+                // The result arrives on a worker thread, which schedules no frame of its
+                // own: without this the editor would keep the fallback font until the user
+                // happened to move the mouse or type.
+                ctx.request_repaint();
+                return;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.editor_font_request = None;
+                return;
+            }
+        };
+        let Some(request) = self.editor_font_request.take() else {
+            return;
+        };
+        let Some(content) = content else {
+            return;
+        };
+
+        let cache_key = (
+            request.font_identity,
+            content.content_id,
+            request.face_index,
+        );
+        let font_name = match self.editor_font_cache.get(&cache_key) {
+            Some(name) => name.clone(),
+            None => {
+                // egui owns the bytes it renders from, so the shared buffer is copied once
+                // per registration (never per frame).
+                let font_bytes = content.data.as_ref().as_ref().to_vec();
+                self.editor_font_next_id = self.editor_font_next_id.saturating_add(1);
+                let font_name = format!("typing-editor-font-{}", self.editor_font_next_id);
+                let mut font_data = egui::FontData::from_owned(font_bytes);
+                font_data.index = u32::try_from(request.face_index).unwrap_or(0);
+                ctx.add_font(egui::epaint::text::FontInsert::new(
+                    font_name.as_str(),
+                    font_data,
+                    vec![egui::epaint::text::InsertFontFamily {
+                        family: egui::FontFamily::Name(font_name.clone().into()),
+                        priority: egui::epaint::text::FontPriority::Highest,
+                    }],
+                ));
+                self.editor_font_cache.insert(cache_key, font_name.clone());
+                font_name
+            }
+        };
+        if let Some(editor) = self.create_editor.as_mut() {
+            editor.font_family = Some(egui::FontFamily::Name(font_name.into()));
+        }
     }
 
     pub(super) fn draw_text_editor(
@@ -243,6 +336,9 @@ impl TypingTextOverlayLayer {
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
     ) {
+        // Runs before the early return: the resolve must be able to finish (and its family
+        // to be cached) even on a frame where the editor has already been closed.
+        self.poll_editor_font_request(ctx);
         if self.create_editor.is_none() {
             return;
         }
@@ -831,5 +927,172 @@ impl TypingTextOverlayLayer {
                 self.mark_overlay_pixels_dirty(idx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Test `FontProvider` that can be made to BLOCK inside `resolve`, so a test can prove
+    /// the call does not happen on the calling (GUI) thread.
+    ///
+    /// `finished` flips only after `resolve` returns, and `gate` is what holds it: while
+    /// nothing has been sent on the gate's sender, `resolve` cannot complete.
+    struct GatedFontProvider {
+        gate: Mutex<Receiver<()>>,
+        finished: Arc<AtomicBool>,
+        content_id: u64,
+    }
+
+    impl FontProvider for GatedFontProvider {
+        fn resolve(&self, name: &str) -> Option<FontContent> {
+            // A poisoned lock cannot happen here (the test never panics while holding it),
+            // and recovering keeps the test failure readable instead of a second panic.
+            let gate = match self.gate.lock() {
+                Ok(gate) => gate,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = gate.recv();
+            self.finished.store(true, Ordering::SeqCst);
+            Some(FontContent {
+                name: name.to_string(),
+                original_name: name.to_string(),
+                data: Arc::new(Vec::new()),
+                face_index: 0,
+                content_id: self.content_id,
+            })
+        }
+    }
+
+    /// Provider that answers immediately with a fixed content id, for the cache-key tests.
+    struct FixedFontProvider {
+        content_id: u64,
+    }
+
+    impl FontProvider for FixedFontProvider {
+        fn resolve(&self, name: &str) -> Option<FontContent> {
+            Some(FontContent {
+                name: name.to_string(),
+                original_name: name.to_string(),
+                data: Arc::new(Vec::new()),
+                face_index: 0,
+                content_id: self.content_id,
+            })
+        }
+    }
+
+    fn spec(identity: &str) -> TypingEditorFontSpec {
+        TypingEditorFontSpec {
+            font_identity: identity.to_string(),
+            face_index: 0,
+            ui_font_size_px: 24.0,
+        }
+    }
+
+    /// Polls until the request has been consumed, without blocking forever if it never is.
+    fn poll_until_settled(layer: &mut TypingTextOverlayLayer, ctx: &egui::Context) -> bool {
+        for _ in 0..2000 {
+            layer.poll_editor_font_request(ctx);
+            if layer.editor_font_request.is_none() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Obtaining the editor font's BYTES is `fs::read` on a provider cache miss, so it must
+    /// never run on the GUI thread (`CLAUDE.md` §5). `request_editor_font` therefore only
+    /// dispatches: with the provider held inside `resolve`, the call still returns and the
+    /// poll reports nothing yet — proof the read is not inline.
+    #[test]
+    fn requesting_the_editor_font_does_not_resolve_on_the_calling_thread() {
+        let ctx = egui::Context::default();
+        let (release, gate) = mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(GatedFontProvider {
+            gate: Mutex::new(gate),
+            finished: Arc::clone(&finished),
+            content_id: 7,
+        });
+
+        let mut layer = TypingTextOverlayLayer::default();
+        layer.request_editor_font(&spec("Alpha-Regular"), provider);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the resolve must not have run on the calling thread"
+        );
+        layer.poll_editor_font_request(&ctx);
+        assert!(
+            layer.editor_font_request.is_some(),
+            "an unfinished resolve must leave the request in flight, not block the caller"
+        );
+        assert!(
+            layer.editor_font_cache.is_empty(),
+            "nothing may be registered before the bytes arrive"
+        );
+
+        release.send(()).expect("the worker holds the receiver");
+        assert!(poll_until_settled(&mut layer, &ctx), "the result must land");
+        assert_eq!(
+            layer.editor_font_cache.len(),
+            1,
+            "the resolved font is registered once, on the GUI thread"
+        );
+    }
+
+    /// The editor's egui registration is keyed by the CONTENT the provider served, not by
+    /// `(identity, face)` alone: a font file replaced under the same PostScript name used to
+    /// keep the first registration forever, so the editor drew the old typeface while the
+    /// renderer drew the new one.
+    #[test]
+    fn the_editor_font_cache_is_keyed_by_the_resolved_content() {
+        let ctx = egui::Context::default();
+        let mut layer = TypingTextOverlayLayer::default();
+
+        layer.request_editor_font(&spec("Alpha-Regular"), Arc::new(FixedFontProvider { content_id: 1 }));
+        assert!(poll_until_settled(&mut layer, &ctx));
+        let after_first = layer.editor_font_next_id;
+        assert_eq!(layer.editor_font_cache.len(), 1);
+
+        // Same identity, same bytes: the existing family is reused (egui `add_font` never
+        // evicts, so a re-registration per open would leak atlases).
+        layer.request_editor_font(&spec("Alpha-Regular"), Arc::new(FixedFontProvider { content_id: 1 }));
+        assert!(poll_until_settled(&mut layer, &ctx));
+        assert_eq!(layer.editor_font_cache.len(), 1);
+        assert_eq!(
+            layer.editor_font_next_id, after_first,
+            "unchanged bytes must not register a second family"
+        );
+
+        // Same identity, DIFFERENT bytes: a fresh family, so the editor shows the new file.
+        layer.request_editor_font(&spec("Alpha-Regular"), Arc::new(FixedFontProvider { content_id: 2 }));
+        assert!(poll_until_settled(&mut layer, &ctx));
+        assert_eq!(
+            layer.editor_font_cache.len(),
+            2,
+            "replaced bytes behind one identity must register a new family"
+        );
+        assert_ne!(layer.editor_font_next_id, after_first);
+    }
+
+    /// An identity the provider cannot resolve leaves the editor on the default UI font and
+    /// registers nothing — the request is still consumed, so it cannot leak.
+    #[test]
+    fn an_unresolvable_editor_font_registers_nothing() {
+        struct EmptyProvider;
+        impl FontProvider for EmptyProvider {
+            fn resolve(&self, _name: &str) -> Option<FontContent> {
+                None
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut layer = TypingTextOverlayLayer::default();
+        layer.request_editor_font(&spec("Ghost-Regular"), Arc::new(EmptyProvider));
+        assert!(poll_until_settled(&mut layer, &ctx));
+        assert!(layer.editor_font_cache.is_empty());
     }
 }

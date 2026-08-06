@@ -4,11 +4,14 @@
 Offline developer/agent utilities that operate on the repository but are **not**
 part of the shipped runtime. Nothing here is imported by `src/` or the `crates/`.
 
-Two unrelated concerns live here:
+Three unrelated concerns live here:
 
 - **i18n migration** (`i18n_extract.py`) — routing the ~4,800 hardcoded Russian UI
   string literals through the `ms-i18n` `t!` / `tf!` macros. Run by hand during
   migrations and audits.
+- **font-bundle audit** (`check_font_bundle.py`) — checking `fonts/` against the app's
+  font-IDENTITY rules before the identity code ever sees the files. Run by hand when
+  the bundle changes.
 - **`run-dev/`** — the source-run entry point (update from git, provision Rust,
   `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
   and is invoked through the launchers in the project root. It has its own
@@ -16,7 +19,9 @@ Two unrelated concerns live here:
 
 ## Architecture
 The i18n tool is pure Python 3 (stdlib only — no third-party deps) and is a
-single-file pipeline. Migration is **two-step**: the tool finds and rewrites
+single-file pipeline. The font-bundle audit is the one tool here with a third-party
+dependency (`fontTools`, already installed in the project's `venv/`), because it has to
+read `name` tables. Migration is **two-step**: the tool finds and rewrites
 deterministically; a human supplies the semantic key names. The tool never
 invents a final key.
 
@@ -77,6 +82,19 @@ detection cannot be fooled by punctuation inside strings or comments.
   The module docstring documents the two-step contract, the naming convention, the
   suggested-key scheme, and the classification actions. Edit here to change
   classification rules, the suggested-key scheme, or catalog emission.
+- `check_font_bundle.py`: the font-bundle audit. Walks `fonts/` exactly as the panel's
+  discovery does (`.ttf`/`.otf`/`.ttc`, top-level `ui/` skipped) and reports, per file,
+  whether its representative face declares a SPEC-VALID PostScript name, and per shared
+  name whether the claimants are byte-identical copies (they MERGE into one entry —
+  normal, logged at INFO) or different fonts (each gets a `%hash`-suffixed identity —
+  logged at WARNING, because that changes the name projects store). Also flags a claim of
+  the reserved built-in-interface-font name and a fallback identity that itself contains
+  the `%` separator. Run:
+  `venv/bin/python tools/check_font_bundle.py [--fonts-dir fonts] [-v]`; exit `0` = the
+  bundle is unambiguous, `1` = findings, `2` = no such directory. Edit it whenever
+  `src/tabs/typing/panel/fonts.rs` changes an identity rule — the tool is only useful
+  while it predicts what the loader does, and the constants it mirrors are named in its
+  docstring.
 - `test_i18n_extract.py`: stdlib `unittest` suite. Covers lexing (raw strings,
   comments, char literals, escapes), classification precedence, `concat!` refusal,
   `format!`->`tf!` placeholder conversion, suggested-key stability/collisions, the
@@ -133,6 +151,9 @@ detection cannot be fooled by punctuation inside strings or comments.
   (notably the §C `id_salt` insertions and any `REVIEW`-flagged sites).
 
 ## Editing map
+- To change how the font bundle is audited (a validity rule, the merge key, the hash),
+  see `check_font_bundle.py` — and mirror the change from
+  `src/tabs/typing/panel/fonts.rs`, never the other way round.
 - To change what counts as a UI string / how sites are classified, see
   `classify_literal` and the callee-category sets (`LOG_CALLEES`, `ASSERT_CALLEES`,
   `KEYLIKE_CALLEES`, `is_widget_id_call`).

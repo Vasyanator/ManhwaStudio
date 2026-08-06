@@ -44,19 +44,17 @@ mod wrap;
 // контракта крейта (панель typing в приложении).
 pub use wrap::forms;
 
-// Резолвер PostScript-имени шрифта переиспользуется PSD-экспортом вкладки typing.
-// `load_selected_font_from_path` теперь cache-gated и требует `FontFaceCache`
-// (владелец — pooled `FontSystem`); внешние вызовы с одноразовой `FontSystem`
-// создают одноразовый `FontFaceCache::new()`.
+// `load_font_content` is cache-gated and requires a `FontFaceCache` (owned by the
+// pooled `FontSystem`); a caller with a one-shot `FontSystem` of its own passes a
+// one-shot `FontFaceCache::new()`.
 pub use font_registry::{
     family_has_face_of_requested_weight, family_has_matching_face, load_font_content,
-    load_selected_font_from_path, resolve_font_family_name, resolve_font_postscript_name,
 };
 pub use font_system_pool::FontFaceCache;
 
 // Caller-supplied font source: fonts reach the render path by working name
-// through a `FontProvider`; the renderer never touches the filesystem itself.
-// The path-based `load_selected_font_from_path` above is a thin compat wrapper.
+// through a `FontProvider`; the renderer never touches the filesystem itself,
+// and no path-keyed loader exists any more.
 pub use font_provider::{FontBytes, FontContent, FontContentSet, FontProvider, font_content_id};
 
 // Прогрев пула `FontSystem` из фонового потока: приложение вызывает

@@ -94,8 +94,15 @@ impl TypingCreatePanelState {
             stacked_columns,
             remap_wheel_to_horizontal,
             self.preview_enabled,
-            // Панель создания всегда работает с доступным шрифтом.
-            false,
+            // The create panel can enter the missing-font state too — a preset naming a
+            // font that is not loaded (`create_presets::apply_preset_by_name`) and a
+            // background reload whose selected identity vanished
+            // (`create_state::poll_font_reload_results`) both set it. Passing a hardcoded
+            // `false` here left that state INVISIBLE: the parameter widgets stayed live
+            // over a font the panel had already refused to keep. The font combo and the
+            // preset combo are drawn outside this gate, so the user can always recover by
+            // picking an available font (which clears the flag).
+            self.missing_font.is_some(),
         );
 
         if params_changed {
@@ -621,7 +628,11 @@ impl TypingCreatePanelState {
                                 .show_percentage(),
                         );
                     }
-                    TypingExportUiStatus::Success { done, total } => {
+                    TypingExportUiStatus::Success {
+                        done,
+                        total,
+                        warnings,
+                    } => {
                         ui.add_space(4.0);
                         let text = tf!("typing.export.done_pages_status", done = done, total = total);
                         let rich = egui::RichText::new(text).color(Color32::from_rgb(90, 230, 120));
@@ -632,6 +643,16 @@ impl TypingCreatePanelState {
                                 .show_percentage()
                                 .fill(Color32::from_rgb(90, 230, 120)),
                         );
+                        // The export SUCCEEDED, but the format could not express something
+                        // (today: a PSD font name claimed by several installed fonts). It
+                        // is drawn in the shared font-diagnostic warning colour, next to
+                        // the result it qualifies, so an approximation is never silent.
+                        for warning in warnings {
+                            ui.colored_label(
+                                super::create_presets::FONT_DIAGNOSTIC_WARNING_COLOR,
+                                warning,
+                            );
+                        }
                     }
                     TypingExportUiStatus::Error { message } => {
                         ui.add_space(4.0);

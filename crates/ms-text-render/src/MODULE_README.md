@@ -70,9 +70,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   and neither is copied on the way into fontdb.
 - `font_registry.rs`: selected/inline font loading and inline-font registry
   construction. The core loader `load_font_content` takes a resolved `FontContent`
-  (bytes + face + content id) and never touches the filesystem;
-  `load_selected_font_from_path` is a thin compat wrapper over it for the
-  path-based forms-metric measurement path. Loading is cache-gated through
+  (bytes + face + content id) and never touches the filesystem — it is the ONLY
+  loader, there is no path-keyed entry point left (the app's forms-metric path
+  resolves through its own `FontProvider` too). Loading is cache-gated through
   `FontFaceCache` (see `font_system_pool.rs`) keyed by `content_id` so a reused
   `FontSystem` does not accumulate duplicate faces. Owns `displace_bundled_faces`,
   which makes the caller's own font win over a bundled face of the same family, and

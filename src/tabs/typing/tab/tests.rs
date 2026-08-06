@@ -49,6 +49,7 @@ fn flatten_composites_raster_from_disk_fallback() {
         export_format: TypingExportFormat::Png,
         layers_primary_dir: Some(layers.clone()),
         layers_fallback_dir: None,
+        font_post_script_names: Default::default(),
     };
     let (rgba, w, h) = flatten_typing_export_page_rgba(&job).unwrap();
     assert_eq!([w, h], [20, 20]);
@@ -119,6 +120,7 @@ fn flatten_composites_raster_from_disk_fallback() {
         export_format: TypingExportFormat::Png,
         layers_primary_dir: Some(unsaved.clone()),
         layers_fallback_dir: Some(committed.clone()),
+        font_post_script_names: Default::default(),
     };
     let (rgba2, _, _) = flatten_typing_export_page_rgba(&job2).unwrap();
     assert_eq!(
@@ -176,6 +178,7 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
         export_format: TypingExportFormat::Png,
         layers_primary_dir: None, // no disk source at all
         layers_fallback_dir: None,
+        font_post_script_names: Default::default(),
     };
     let (rgba, w, h) = flatten_typing_export_page_rgba(&job).unwrap();
     assert_eq!([w, h], [20, 20]);
@@ -239,6 +242,7 @@ fn flatten_clips_mask_clip_enabled_raster_in_export() {
             export_format: TypingExportFormat::Png,
             layers_primary_dir: None,
             layers_fallback_dir: None,
+            font_post_script_names: Default::default(),
         }
     };
 
@@ -1928,18 +1932,32 @@ fn normalize_preserves_raster_transform() {
     );
 }
 
-/// The font identity now reaches the renderer BY ORIGINAL FAMILY NAME. The codec's
-/// name-resolution chain must prefer `font_original_name`, then fall back through
-/// `font_label` -> `font_family` -> `font` -> the `font_path` file stem, so legacy
-/// projects (which lack `font_original_name`) still open.
+/// Schema 2 names the font ONCE, by identity, in `font`. A schema-1 payload keeps the
+/// historical resolution chain — `font_original_name` -> `font_label` -> `font_family` ->
+/// `font` -> the `font_path` file stem — so projects written before the identity work
+/// still open and render.
+///
+/// (Was `render_params_font_name_prefers_original_name_then_falls_back`; the legacy half
+/// of the assertions is UNCHANGED, the schema-2 branch is new.)
 #[test]
-fn render_params_font_name_prefers_original_name_then_falls_back() {
+fn render_params_font_name_reads_the_identity_and_falls_back_on_legacy_data() {
     let params = |tp: Value| {
         text_render_params_from_render_data(&json!({ "text_params": tp, "effects": [] }))
             .expect("params should parse")
             .font_name
     };
-    // Original name wins over every other key.
+    // Schema 2: `font` is the identity and NO legacy key may override it.
+    assert_eq!(
+        params(json!({
+            "schema": 2,
+            "text": "x",
+            "font": "AnimeAcev05",
+            "font_original_name": "Ignored",
+            "font_label": "Ignored",
+        })),
+        "AnimeAcev05"
+    );
+    // Schema 1: original name wins over every other key.
     assert_eq!(
         params(json!({
             "text": "x",
@@ -1970,27 +1988,95 @@ fn render_params_font_name_prefers_original_name_then_falls_back() {
     );
 }
 
-/// Bug-in-waiting fixed: the whitelist rebuilder must preserve `font_original_name`.
-/// Dropping it would erase family-name resolution on every project re-normalize
-/// (e.g. re-reading a legacy `text_info.json`).
+/// A schema-2 payload omits every value equal to its frozen default; the render params
+/// must come out as if those keys had been written explicitly. Pins the fields whose
+/// schema-1 absent-meaning DIFFERS from the schema-2 default, which is exactly where a
+/// missing schema branch would silently restyle text.
 #[test]
-fn normalize_preserves_font_original_name() {
-    // Present -> carried through verbatim.
-    let obj = json!({ "text": "hi", "font_label": "стем", "font_original_name": "Real Family" });
-    let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+fn render_params_apply_the_frozen_schema_two_defaults() {
+    let parsed = text_render_params_from_render_data(&json!({
+        "text_params": { "schema": 2, "text": "x", "font": "Some-Font" }
+    }))
+    .expect("params should parse");
+    assert_eq!(parsed.line_spacing_percent, 0.0);
+    assert_eq!(parsed.line_placement_reference, LinePlacementReference::LineBox);
+    assert!(parsed.trim_extra_spaces);
+    assert!(parsed.replace_ellipsis_with_dots);
+    assert!(parsed.hanging_punctuation);
+    assert_eq!(parsed.text_shape, TextShape::Free);
+    // ...while the very same payload WITHOUT `schema` keeps its legacy meanings.
+    let legacy = text_render_params_from_render_data(&json!({
+        "text_params": { "text": "x", "font": "Some-Font" }
+    }))
+    .expect("params should parse");
+    assert_eq!(legacy.line_spacing_percent, 50.0);
     assert_eq!(
-        normalized.get("font_original_name").and_then(Value::as_str),
-        Some("Real Family")
+        legacy.line_placement_reference,
+        LinePlacementReference::GlyphHeight
     );
-    // Absent -> Null (the reader then falls back to font_label). Must not crash or fabricate.
+    assert!(!legacy.trim_extra_spaces);
+    assert!(!legacy.replace_ellipsis_with_dots);
+    assert!(!legacy.hanging_punctuation);
+    assert_eq!(legacy.text_shape, TextShape::Rectangle);
+}
+
+/// The whitelist rebuilder must carry the LEGACY font keys through verbatim: they are
+/// the only record of which font a schema-1 payload named, and the conversion pass
+/// (`upgrade_text_params_to_v2`) is the only thing allowed to remove them — and only
+/// once it has resolved them to an identity.
+///
+/// (Was `normalize_preserves_font_original_name`, which additionally asserted that an
+/// ABSENT `font_original_name` is re-emitted as `Null`. The normalizer no longer
+/// fabricates font keys at all, so the assertion is now "absent stays absent" —
+/// same intent: never lose, never invent.)
+#[test]
+fn normalize_preserves_legacy_font_keys_verbatim() {
+    // Present -> carried through verbatim, each under its own key.
+    let obj = json!({
+        "text": "hi",
+        "font_path": "/fonts/стем.ttf",
+        "font_label": "стем",
+        "font_family": "Fam",
+        "font_original_name": "Real Family",
+    });
+    let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+    for (key, value) in [
+        ("font_path", "/fonts/стем.ttf"),
+        ("font_label", "стем"),
+        ("font_family", "Fam"),
+        ("font_original_name", "Real Family"),
+    ] {
+        assert_eq!(
+            normalized.get(key).and_then(Value::as_str),
+            Some(value),
+            "'{key}' must survive the whitelist rebuild"
+        );
+    }
+    // Absent -> absent. Must not crash or fabricate a key.
     let legacy = json!({ "text": "hi", "font_label": "стем" });
     let normalized_legacy = normalize_text_params_object(legacy.as_object().unwrap(), 512);
     assert!(
-        normalized_legacy
-            .get("font_original_name")
-            .is_some_and(Value::is_null),
-        "absent original name normalizes to Null"
+        !normalized_legacy
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("font_original_name")),
+        "an absent original name must not be fabricated"
     );
+    assert!(
+        !normalized_legacy
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("font_path")),
+        "an absent path must not be fabricated"
+    );
+}
+
+/// A payload that already declares the CURRENT schema is canonical: the legacy
+/// whitelist rebuild must not run over it, or it would drop `schema`/`font` and inject
+/// legacy defaults for keys whose omission already carries meaning.
+#[test]
+fn normalize_passes_a_schema_two_payload_through_verbatim() {
+    let obj = json!({ "schema": 2, "text": "hi", "font": "Some-Font", "width_px": 300 });
+    let normalized = normalize_text_params_object(obj.as_object().unwrap(), 512);
+    assert_eq!(normalized, obj);
 }
 
 /// Finding 10 (d): the codec leg keeps the seven faux keys through `normalize`
@@ -3287,4 +3373,681 @@ fn centering_centers_survive_the_render_round_trip_through_the_doc() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// text_params schema-1 -> schema-2 conversion (phase 3 of
+// `dev-docs/font_identity_postscript_plan.md`).
+// ---------------------------------------------------------------------------
+
+/// A stub of the panel's legacy resolver: the installed font is `Real-Regular`, whose
+/// legacy forms are the family `Real Family`, the label/stem `real` and the file
+/// `/fonts/real.ttf`. Everything else is "not installed".
+fn stub_legacy_resolver(path: Option<&str>, name: Option<&str>) -> Option<String> {
+    if path.is_some_and(|path| path == "/fonts/real.ttf") {
+        return Some("Real-Regular".to_string());
+    }
+    match name.map(str::trim) {
+        Some("Real-Regular" | "Real Family" | "real") => Some("Real-Regular".to_string()),
+        _ => None,
+    }
+}
+
+/// A stub of the panel's legacy resolver for the replaced-file scenario: the file
+/// `/fonts/dialogue.ttf` now holds a DIFFERENT font, whose identity is `NewDisplay`, while
+/// the name the layer remembers (`OldDialogue`) is installed nowhere. It answers a path and
+/// a name independently, which is all the conversion ever asks of it — it offers the two
+/// separately precisely so a path can never decide the outcome (safety rule D).
+fn stub_replaced_file_resolver(path: Option<&str>, name: Option<&str>) -> Option<String> {
+    if path.is_some_and(|path| path == "/fonts/dialogue.ttf") {
+        return Some("NewDisplay".to_string());
+    }
+    match name.map(str::trim) {
+        Some("NewDisplay") => Some("NewDisplay".to_string()),
+        _ => None,
+    }
+}
+
+/// Runs the conversion with the default stub resolver.
+fn upgrade(text_params: Value) -> TextParamsUpgrade {
+    upgrade_with(text_params, &stub_legacy_resolver)
+}
+
+/// Runs the conversion with an explicit resolver stub.
+fn upgrade_with(text_params: Value, resolve: LegacyFontIdentityResolver<'_>) -> TextParamsUpgrade {
+    upgrade_text_params_to_v2(text_params.as_object().expect("object literal"), resolve)
+}
+
+fn converted_params(text_params: Value) -> serde_json::Map<String, Value> {
+    match upgrade(text_params) {
+        TextParamsUpgrade::Converted(value) => {
+            value.as_object().cloned().expect("converted object")
+        }
+        other => panic!("expected a conversion, got {other:?}"),
+    }
+}
+
+/// Every historical way of naming a font converts to the one identity key.
+#[test]
+fn conversion_resolves_every_legacy_font_form_to_the_identity() {
+    for legacy in [
+        json!({ "text": "x", "font_original_name": "Real Family" }),
+        json!({ "text": "x", "font_label": "real" }),
+        json!({ "text": "x", "font_family": "Real Family" }),
+        json!({ "text": "x", "font": "real" }),
+        // Path only: resolved by the path's file STEM, which is the last NAME candidate of
+        // the historical chain. The path itself is never handed to the resolver — see
+        // `conversion_never_takes_a_path_match_as_proof_of_identity`.
+        json!({ "text": "x", "font_path": "/fonts/real.ttf" }),
+    ] {
+        let params = converted_params(legacy.clone());
+        assert_eq!(
+            params.get("font").and_then(Value::as_str),
+            Some("Real-Regular"),
+            "legacy form {legacy} must convert to the identity"
+        );
+        assert_eq!(params.get("schema").and_then(Value::as_u64), Some(2));
+        for legacy_key in ["font_path", "font_label", "font_original_name", "font_family"] {
+            assert!(
+                !params.contains_key(legacy_key),
+                "'{legacy_key}' must be gone once the identity is known"
+            );
+        }
+    }
+}
+
+/// NON-NEGOTIABLE SAFETY RULE: an unresolvable font (not installed) must leave the
+/// payload completely untouched — its legacy keys are the only surviving record of
+/// which font the text was set in.
+#[test]
+fn conversion_keeps_the_legacy_keys_when_the_font_is_not_installed() {
+    let legacy = json!({
+        "text": "x",
+        "font_label": "ghost",
+        "font_path": "/fonts/ghost.ttf",
+        "font_original_name": "Ghost Family",
+    });
+    match upgrade(legacy.clone()) {
+        TextParamsUpgrade::UnresolvedFont { legacy_name } => {
+            assert_eq!(legacy_name.as_deref(), Some("Ghost Family"));
+        }
+        other => panic!("an uninstalled font must not be converted, got {other:?}"),
+    }
+    // And the payload it was handed is unchanged (the function takes it by reference and
+    // returns nothing to store).
+    assert_eq!(
+        legacy.get("font_path").and_then(Value::as_str),
+        Some("/fonts/ghost.ttf")
+    );
+}
+
+/// The dead keys are dropped, and the ancient `"smart"` wrap token is resolved through
+/// `aggressive_word_breaks` BEFORE that key is dropped, so nothing is lost.
+#[test]
+fn conversion_drops_dead_keys_after_using_them() {
+    let params = converted_params(json!({
+        "text": "x",
+        "font_label": "real",
+        "strict_shape_fit": true,
+        "aggressive_word_breaks": false,
+        "text_wrap_mode": "smart",
+    }));
+    assert!(!params.contains_key("strict_shape_fit"));
+    assert!(!params.contains_key("aggressive_word_breaks"));
+    assert_eq!(
+        params.get("text_wrap_mode").and_then(Value::as_str),
+        Some("minimal"),
+        "`smart` + aggressive_word_breaks=false has always meant `minimal`"
+    );
+}
+
+/// Conversion is MEANING-preserving: the legacy px/percent pairs fold into their token
+/// key, and every field whose schema-1 absent-meaning differs from the frozen schema-2
+/// default is materialized, so an old payload renders identically after conversion.
+#[test]
+fn conversion_preserves_what_a_schema_one_payload_rendered_as() {
+    let legacy = json!({
+        "text": "x",
+        "font_label": "real",
+        "line_spacing_px": 7.0,
+        "line_spacing_percent": 0.0,
+        "kerning_percent": 12.0,
+    });
+    let before = text_render_params_from_render_data(&json!({ "text_params": legacy.clone() }))
+        .expect("legacy params");
+    let converted = converted_params(legacy);
+    let after = text_render_params_from_render_data(&json!({ "text_params": converted }))
+        .expect("converted params");
+    assert_eq!(before.line_spacing_px, after.line_spacing_px);
+    assert_eq!(before.line_spacing_percent, after.line_spacing_percent);
+    assert_eq!(before.kerning_percent, after.kerning_percent);
+    assert_eq!(before.trim_extra_spaces, after.trim_extra_spaces);
+    assert_eq!(before.hanging_punctuation, after.hanging_punctuation);
+    assert_eq!(
+        before.replace_ellipsis_with_dots,
+        after.replace_ellipsis_with_dots
+    );
+    assert_eq!(before.text_shape, after.text_shape);
+    assert_eq!(
+        before.line_placement_reference,
+        after.line_placement_reference
+    );
+    assert_eq!(before.width_px, after.width_px);
+}
+
+/// The PURE-function half of the no-op guarantee: the conversion reports `AlreadyCurrent`
+/// and neither the load-time normalizer nor the writer changes one byte of an already
+/// schema-2 `text_params` object.
+///
+/// This says nothing about documents — it loads and saves nothing. The DOCUMENT-level
+/// guarantee (plan risk 1) is
+/// `loading_and_re_saving_an_already_schema_two_project_is_a_byte_level_no_op`.
+#[test]
+fn re_normalizing_and_re_writing_an_already_converted_payload_changes_no_byte() {
+    let stored = converted_params(json!({
+        "text": "Привет",
+        "font_label": "real",
+        "width_px": 480,
+        "font_size_px": 33.0,
+        "uppercase_text": true,
+    }));
+    assert_eq!(
+        upgrade(Value::Object(stored.clone())),
+        TextParamsUpgrade::AlreadyCurrent,
+        "a converted payload must never be converted again"
+    );
+    let normalized = normalize_text_params_object(&stored, 512);
+    let rewritten =
+        crate::tabs::typing::panel::text_params_schema::write_text_params(stored.clone());
+    let original_bytes = serde_json::to_string(&Value::Object(stored)).expect("serialize");
+    assert_eq!(
+        serde_json::to_string(&normalized).ok().as_deref(),
+        Some(original_bytes.as_str()),
+        "loading must not rewrite an already-current payload"
+    );
+    assert_eq!(
+        serde_json::to_string(&rewritten).ok().as_deref(),
+        Some(original_bytes.as_str()),
+        "saving must not rewrite an already-current payload"
+    );
+}
+
+/// Skipping defaults must actually SHRINK the payload — the whole point of the schema.
+/// Measured against the full schema-1 shape the panel used to write.
+#[test]
+fn conversion_shrinks_a_real_profile_payload() {
+    let legacy_size = serde_json::to_string(&legacy_profile_fixture())
+        .expect("serialize")
+        .len();
+    let converted = converted_params(legacy_profile_fixture());
+    let converted_size = serde_json::to_string(&Value::Object(converted))
+        .expect("serialize")
+        .len();
+    assert!(
+        converted_size * 3 < legacy_size,
+        "schema 2 must be far smaller: {converted_size} vs {legacy_size} bytes"
+    );
+}
+
+/// A realistic schema-1 `text_params` blob (an all-defaults profile as the panel wrote
+/// them before schema 2), used for the size measurement above.
+fn legacy_profile_fixture() -> Value {
+    json!({
+        "align": "center",
+        "allow_moderate_trees": false,
+        "drawn_lines_layout": {
+            "color_tolerance": 16,
+            "continuation_alpha": 64,
+            "letter_spacing_mul": 1.0,
+            "letter_spacing_px": 0.0,
+            "normal_offset_px": 0.0,
+            "start_alpha": 192,
+            "static_rotation_rad": 0.0,
+            "use_tangent_rotation": true
+        },
+        "enable_inline_style_tags": false,
+        "font_label": "real",
+        "font_path": "/fonts/real.ttf",
+        "font_original_name": "Real Family",
+        "font_size_px": 24.0,
+        "force_bold": false,
+        "force_italic": false,
+        "formula_layout": {
+            "letter_spacing_mul": 1.0,
+            "letter_spacing_px": 0.0,
+            "normal_offset_px": 0.0,
+            "offset_x_px": 0.0,
+            "offset_y_px": 0.0,
+            "rotation_expr": "0",
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+            "t_end": 1.0,
+            "t_start": 0.0,
+            "use_tangent_rotation": false,
+            "vars": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "x_expr": "t * w",
+            "y_expr": "0"
+        },
+        "glyph_height": "100.00%",
+        "glyph_width": "100.00%",
+        "hanging_punctuation": true,
+        "kerning": "0.00%",
+        "kerning_mode": "auto",
+        "line_spacing": "0.00%",
+        "new_line_after_sentence": false,
+        "selected_face_index": 0,
+        "shape_layout": {
+            "amplitude_px": 80.0,
+            "frequency": 1.0,
+            "height_px": 80.0,
+            "kind": "arc",
+            "length_px": 320.0,
+            "orientation": "horizontal",
+            "width_px": 320.0
+        },
+        "shape_min_width_percent": 50.0,
+        "shape_variant": 5,
+        "text": "Текст будет выглядеть так",
+        "text_color": [0, 0, 0, 255],
+        "text_layout_mode": "normal",
+        "text_line_mode": "horizontal",
+        "text_shape": "free",
+        "text_wrap_mode": "aggressive",
+        "trim_extra_spaces": true,
+        "uppercase_text": false,
+        "vector_lines_layout": {
+            "height_px": 1,
+            "letter_spacing_mul": 1.0,
+            "letter_spacing_px": 0.0,
+            "lines": [],
+            "normal_offset_px": 0.0,
+            "static_rotation_rad": 0.0,
+            "use_tangent_rotation": true,
+            "width_px": 1
+        },
+        "vertical_line_direction": "right_to_left",
+        "width_px": 300
+    })
+}
+
+
+// ---------------------------------------------------------------------------
+// Adversarial-review findings on phase 3 (see
+// `dev-docs/font_identity_postscript_plan.md`). Each test below reproduces one
+// reported defect and fails on the code as it was reported.
+// ---------------------------------------------------------------------------
+
+/// FINDING 1 (data loss). `normalize_text_params_object` rebuilds `text_params` from a
+/// WHITELIST, so any stored key missing from both halves of it (the `json!` literal and
+/// the verbatim pass-through list) is destroyed on load. Four live, panel-read parameters
+/// were missing — and since the schema-1 -> schema-2 conversion runs on the normalizer's
+/// OUTPUT, the loss became permanent the moment the converted payload was written back.
+///
+/// This is the scenario from the review: an old overlay with a rotated block, a 40 %
+/// line placement bound to the line box and anti-aliasing switched off.
+#[test]
+fn normalization_keeps_rotation_line_placement_and_anti_aliasing() {
+    let legacy = json!({
+        "text": "x",
+        "font_label": "real",
+        "global_rotation_deg": 25.0,
+        "line_placement_percent": 40.0,
+        "line_placement_reference": "line_box",
+        "anti_aliasing": "none",
+    });
+    let normalized = normalize_text_params_object(legacy.as_object().expect("object"), 512);
+    let params = normalized.as_object().expect("normalized object");
+    assert_eq!(
+        params.get("global_rotation_deg").and_then(value_as_f32),
+        Some(25.0),
+        "a rotated text block must not silently unrotate on load"
+    );
+    assert_eq!(
+        params.get("line_placement_percent").and_then(value_as_f32),
+        Some(40.0)
+    );
+    assert_eq!(
+        params.get("line_placement_reference").and_then(Value::as_str),
+        Some("line_box")
+    );
+    assert_eq!(
+        params.get("anti_aliasing").and_then(Value::as_str),
+        Some("none")
+    );
+
+    // And the conversion that follows on the SAME object keeps them, so the value written
+    // back is the stored one and not a default.
+    let converted = converted_params(normalized);
+    let after = text_render_params_from_render_data(&json!({ "text_params": converted }))
+        .expect("converted params");
+    assert_eq!(after.global_rotation_deg, 25.0);
+    assert_eq!(after.line_placement_percent, 40.0);
+    assert_eq!(
+        after.line_placement_reference,
+        crate::tabs::typing::render_next::types::LinePlacementReference::LineBox
+    );
+    assert_eq!(after.anti_aliasing, AntiAliasingMode::None);
+}
+
+/// FINDING 1, generalized: the normalizer's whitelist must cover the WHOLE schema-2 key
+/// set. A key that exists in the frozen default set but in neither half of the whitelist
+/// is a stored value with no way home.
+#[test]
+fn normalization_preserves_every_schema_two_key() {
+    use crate::tabs::typing::panel::text_params_schema;
+
+    // A schema-1 payload carrying every key schema 2 knows about (values are irrelevant
+    // here — presence after normalization is what is at stake).
+    let mut legacy = text_params_schema::frozen_v2_defaults().clone();
+    legacy.insert("font_label".to_string(), json!("real"));
+    let normalized = normalize_text_params_object(&legacy, 512);
+    let params = normalized.as_object().expect("normalized object");
+    let missing: Vec<&str> = text_params_schema::frozen_v2_defaults()
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !params.contains_key(*key))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these stored parameters are destroyed by the load-time normalization: {missing:?}"
+    );
+}
+
+/// FINDING 2 (data loss). The conversion resolves by NAME only. A stored `font_path` whose
+/// file has since been REPLACED by another font must not be taken as proof of identity:
+/// converting on that evidence would write the new font's identity into `font` and delete
+/// every legacy key, destroying the only record of the font the text was really set in.
+#[test]
+fn conversion_never_takes_a_path_match_as_proof_of_identity() {
+    let legacy = json!({
+        "text": "x",
+        "font_path": "/fonts/dialogue.ttf",
+        "font_original_name": "OldDialogue",
+    });
+    match upgrade_with(legacy.clone(), &stub_replaced_file_resolver) {
+        TextParamsUpgrade::PathOnlyFont {
+            legacy_name,
+            path_identity,
+        } => {
+            assert_eq!(legacy_name.as_deref(), Some("OldDialogue"));
+            assert_eq!(
+                path_identity, "NewDisplay",
+                "the report names the font that now occupies the path"
+            );
+        }
+        other => panic!("a path-only match must NOT be converted, got {other:?}"),
+    }
+    // The payload it was handed is untouched: the legacy keys survive verbatim.
+    assert_eq!(
+        legacy.get("font_original_name").and_then(Value::as_str),
+        Some("OldDialogue")
+    );
+    assert_eq!(
+        legacy.get("font_path").and_then(Value::as_str),
+        Some("/fonts/dialogue.ttf")
+    );
+}
+
+/// FINDING 2, at the layer level: the per-frame pass leaves such an overlay's stored
+/// payload alone, records it as needing attention, and owes no write.
+#[test]
+fn the_conversion_pass_leaves_a_path_only_match_verbatim() {
+    let stored = json!({
+        "text_params": {
+            "text": "x",
+            "font_path": "/fonts/dialogue.ttf",
+            "font_original_name": "OldDialogue",
+        }
+    });
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.overlays.push(text_runtime_from_doc_node(
+        "ov",
+        0,
+        [10.0, 20.0],
+        1.0,
+        0.0,
+        None,
+        false,
+        false,
+        0,
+        Some(stored.clone()),
+        [4, 3],
+        vec![0u8; 4 * 3 * 4],
+    ));
+    layer.convert_legacy_text_params_to_v2(&stub_replaced_file_resolver);
+    assert_eq!(
+        layer.overlays[0].render_data_json.as_ref(),
+        Some(&stored),
+        "the stored payload keeps its legacy keys byte for byte"
+    );
+    assert!(
+        layer.legacy_text_params_unresolved.contains("ov"),
+        "the layer is flagged so the report is not repeated every frame"
+    );
+    assert!(
+        !layer.placement_save_dirty,
+        "nothing was converted, so nothing is owed a write"
+    );
+}
+
+/// FINDING 3. The legacy name chain is a list of CANDIDATES: stopping at the first
+/// non-empty entry stranded a document whose family name is obsolete but whose label is
+/// still installed, leaving it schema-1 forever.
+#[test]
+fn conversion_walks_the_whole_legacy_name_chain() {
+    let params = converted_params(json!({
+        "text": "x",
+        // Not installed — the historical FIRST link of the chain.
+        "font_original_name": "Obsolete Family Name",
+        // Installed — the second link must still be tried.
+        "font_label": "real",
+    }));
+    assert_eq!(
+        params.get("font").and_then(Value::as_str),
+        Some("Real-Regular"),
+        "an unresolvable first candidate must not abort the chain"
+    );
+    for legacy_key in ["font_path", "font_label", "font_original_name", "font_family"] {
+        assert!(!params.contains_key(legacy_key));
+    }
+}
+
+/// FINDING 5 (silent geometry change). The conversion folds the legacy `*_px`/`*_percent`
+/// pairs into their token key and then DROPS the pair, so the token is the only surviving
+/// copy: rounding it to two decimals changes the layout irreversibly.
+#[test]
+fn conversion_does_not_round_away_stored_geometry() {
+    let legacy = json!({
+        "text": "x",
+        "font_label": "real",
+        "line_spacing_px": 1.2345_f64,
+        "kerning_percent": 0.006_f64,
+        "glyph_height_percent": 100.125_f64,
+    });
+    let before = text_render_params_from_render_data(&json!({ "text_params": legacy.clone() }))
+        .expect("legacy params");
+    let converted = converted_params(legacy);
+    let after = text_render_params_from_render_data(&json!({ "text_params": converted.clone() }))
+        .expect("converted params");
+    assert_eq!(
+        before.line_spacing_px, after.line_spacing_px,
+        "stored px line spacing must survive the fold exactly"
+    );
+    assert_eq!(before.kerning_percent, after.kerning_percent);
+    assert_eq!(before.glyph_height_percent, after.glyph_height_percent);
+    // The canonical two-decimal spelling is kept wherever it is exact, so payloads that
+    // need no extra precision stay comparable to the frozen schema defaults.
+    let all_defaults = converted_params(json!({
+        "text": "x",
+        "font_label": "real",
+        "line_spacing_percent": 50.0,
+    }));
+    assert_eq!(
+        all_defaults.get("line_spacing").and_then(Value::as_str),
+        Some("50.00%")
+    );
+}
+
+/// FINDING 6. The honest form of the byte-level no-op guarantee (plan risk 1): a project
+/// already written in schema 2 is loaded from `layers.json` through the real reader,
+/// projected into the tab, offered to the conversion pass, and flushed back through the
+/// real writer — and the file must come out byte for byte identical.
+///
+/// The previous test only compared the output of two pure functions on an in-memory map:
+/// it never touched a document, so it could not observe the reader, the writer, key
+/// order, float spelling, or the outer `render_data` shape (`schema_version` / an empty
+/// `effects` array) at all.
+#[test]
+fn loading_and_re_saving_an_already_schema_two_project_is_a_byte_level_no_op() {
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use crate::tabs::typing::panel::text_params_schema;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("typ_v2_noop_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Exactly what the panel writes today: schema-2 `text_params` (defaults skipped) and
+    // an outer object with no `effects` key, since the effect list is empty.
+    let mut params = text_params_schema::frozen_v2_defaults().clone();
+    params.insert("font".to_string(), json!("Real-Regular"));
+    params.insert("text".to_string(), json!("Привет"));
+    params.insert("font_size_px".to_string(), json!(33.5));
+    params.insert("uppercase_text".to_string(), json!(true));
+    let render_data = json!({ "text_params": text_params_schema::write_text_params(params) });
+
+    let img = ColorImage::filled([4, 3], Color32::GREEN);
+    let file = persist::write_text_image(&dir, 0, "ta", &img).unwrap();
+    let payload = persist::TextPayloadOut {
+        uid: "ta".into(),
+        name: "ta".into(),
+        z: 1,
+        layer_idx: 0,
+        pinned: true,
+        visible: true,
+        opacity: 1.0,
+        group_uid: None,
+        pinned_by_group: false,
+        payload_uid: "ta".into(),
+        render_data: render_data.clone(),
+        is_image: false,
+        transform: crate::models::layer_model::manifest::TransformRec {
+            cx: 10.0,
+            cy: 20.0,
+            rotation: 0.25,
+            scale: 1.0,
+        },
+        deform: None,
+        rendered_file: Some(file),
+        mask_clip: None,
+    };
+    persist::write_page_text_payload(&dir, None, 0, &[payload]).unwrap();
+    let before = std::fs::read(dir.join("layers.json")).expect("layers.json written");
+
+    // LOAD, exactly as the app does: doc read -> tab projection.
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    let mut doc = LayerDoc::new();
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes)
+        .unwrap();
+    let doc = Arc::new(Mutex::new(doc));
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.set_layer_doc(Arc::clone(&doc));
+    {
+        let guard = doc.lock().unwrap();
+        layer.sync_from_doc(0, &guard);
+    }
+    assert_eq!(layer.overlays.len(), 1, "the text node is projected");
+    assert_eq!(
+        layer.overlays[0].render_data_json.as_ref(),
+        Some(&render_data),
+        "the stored payload reaches the runtime verbatim"
+    );
+
+    // The per-frame conversion pass must recognize it as current and owe no write.
+    layer.convert_legacy_text_params_to_v2(&stub_legacy_resolver);
+    assert!(
+        !layer.placement_save_dirty,
+        "opening an already-converted project must not schedule a save"
+    );
+
+    // SAVE through the real writer.
+    doc.lock().unwrap().flush_page_text(0, &dir, None).unwrap();
+    let after = std::fs::read(dir.join("layers.json")).expect("layers.json re-written");
+    assert_eq!(
+        String::from_utf8_lossy(&after),
+        String::from_utf8_lossy(&before),
+        "loading and re-saving an already-schema-2 project must not change one byte"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FINDING 7. `route_to_doc` marked the document changed and reported success even when
+/// its closure did nothing, so a conversion targeting a uid that is not on the doc page
+/// bumped the doc version and left the layer owing a write with nothing to write.
+#[test]
+fn a_doc_edit_that_changes_nothing_marks_nothing() {
+    use crate::models::layer_model::layer_doc::{DecodedPagePayload, LayerDoc};
+    use std::sync::{Arc, Mutex};
+
+    let doc = Arc::new(Mutex::new(LayerDoc::new()));
+    // Page 0 is resident but EMPTY: the runtime overlay below has no node in the doc.
+    doc.lock().unwrap().insert_decoded_page(
+        0,
+        DecodedPagePayload {
+            nodes: Vec::new(),
+            groups: Vec::new(),
+        },
+    );
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.set_layer_doc(Arc::clone(&doc));
+
+    let version_before = doc.lock().unwrap().version();
+    assert!(
+        !layer.route_to_doc_reporting(0, |_doc| false),
+        "an edit that reports no change is not a doc write"
+    );
+    assert_eq!(
+        doc.lock().unwrap().version(),
+        version_before,
+        "a no-op edit must not bump the document version"
+    );
+
+    // The real path: a resident-but-nodeless page cannot receive the converted payload.
+    layer.overlays.push(text_runtime_from_doc_node(
+        "ghost",
+        0,
+        [10.0, 20.0],
+        1.0,
+        0.0,
+        None,
+        false,
+        false,
+        0,
+        Some(json!({ "text_params": { "text": "x", "font_label": "real" } })),
+        [4, 3],
+        vec![0u8; 4 * 3 * 4],
+    ));
+    layer.convert_legacy_text_params_to_v2(&stub_legacy_resolver);
+    assert_eq!(
+        layer.overlays[0]
+            .render_data_json
+            .as_ref()
+            .and_then(|rd| rd.get("text_params"))
+            .and_then(|p| p.get("schema")),
+        Some(&json!(2)),
+        "the runtime is still converted in memory"
+    );
+    assert_eq!(
+        doc.lock().unwrap().version(),
+        version_before,
+        "but a payload no doc node accepted changes nothing in the document"
+    );
+    assert!(
+        !layer.placement_save_dirty,
+        "and therefore owes no write"
+    );
 }

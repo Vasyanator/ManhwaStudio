@@ -281,13 +281,20 @@ impl TypingCreatePanelState {
                                                 .selected_text(selected_font_text)
                                                 .show_ui_with_wheel(ui, |ui| {
                                                     for idx in filtered_font_indices.iter().copied() {
-                                                        let (label, path, face_index, coverage) = {
+                                                        let (label, identity, content_hash, path, face_index, coverage) = {
                                                             let font = &self.fonts[idx];
                                                             (
                                                                 // DISPLAY ONLY: show the
                                                                 // display label (user rename),
                                                                 // not the raw render key.
                                                                 self.font_display_label(font),
+                                                                // IDENTITY: keys the
+                                                                // own-typeface registration.
+                                                                font.render_identity_name(),
+                                                                // BYTES: expires that
+                                                                // registration when the file
+                                                                // behind the identity changes.
+                                                                font.content_hash(),
                                                                 font.path.clone(),
                                                                 font.faces
                                                                     .first()
@@ -299,11 +306,15 @@ impl TypingCreatePanelState {
                                                         let selected = font_idx == idx;
                                                         if self.draw_font_combo_option(
                                                             ui,
-                                                            &label,
-                                                            path.as_path(),
-                                                            face_index,
-                                                            selected,
-                                                            &coverage,
+                                                            &create_presets::FontComboOption {
+                                                                label: &label,
+                                                                identity: &identity,
+                                                                content_hash,
+                                                                path: path.as_path(),
+                                                                face_index,
+                                                                selected,
+                                                                coverage: &coverage,
+                                                            },
                                                         ) {
                                                             font_idx = idx;
                                                             popup_pick = Some(idx);
@@ -1550,9 +1561,12 @@ impl TypingCreatePanelState {
                 .as_deref()
                 .is_some_and(|base| base.eq_ignore_ascii_case(label.as_str()));
             let same_by_font = {
-                let base_idx =
-                    self.find_font_idx_by_path_or_label(None, base_font_label.as_deref());
-                let label_idx = self.find_font_idx_by_path_or_label(None, Some(label.as_str()));
+                // Name-form resolution (never a path): the span may carry any legacy
+                // spelling, while the base is always an identity.
+                let base_idx = base_font_label
+                    .as_deref()
+                    .and_then(|base| self.find_font_idx_by_name_forms(base));
+                let label_idx = self.find_font_idx_by_name_forms(label.as_str());
                 base_idx.is_some() && base_idx == label_idx
             };
             if same_by_string || same_by_font {

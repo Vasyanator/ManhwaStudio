@@ -88,7 +88,7 @@ use super::panel::{
     TypingSelectedOverlayForEdit,
 };
 use super::render_next::{apply_effects_to_image, render_text_to_image};
-use super::render_next::{FontContentSet, FontProvider};
+use super::render_next::{FontContent, FontContentSet, FontProvider};
 use super::render_next::types::{
     AntiAliasingMode, HorizontalAlign, KerningMode, LinePlacementReference, PxOrPercent,
     TEXT_FORMULA_USER_VAR_COUNT,
@@ -132,7 +132,11 @@ mod geometry;
 use geometry::{ctrl_wheel_raster_rotation_step_rad, lerp, normalize_angle_deg, normalize_angle_rad};
 mod export;
 pub(super) use export::*;
-mod codec;
+// The schema-1 -> schema-2 `text_params` conversion is the ONE owner of what a legacy
+// key meant, so the sibling `panel` module reaches it directly when it upgrades stored
+// preset profile bodies (`create_presets::upgrade_profile_to_current_schema`) instead of
+// re-implementing the rules.
+pub(in crate::tabs::typing) mod codec;
 use codec::*;
 // Re-export the vector-mesh-warp decoder at the tab level so the sibling `panel`
 // module can decode a carried `raster_transform` for its live preview render.
@@ -840,6 +844,7 @@ impl TypingTabState {
             mask_snapshot,
             pending.output_dir,
             pending.export_format,
+            self.top_panel.font_post_script_names(),
         );
     }
 
@@ -1278,6 +1283,15 @@ impl CanvasHooks for TypingHooks<'_> {
         // list so background renders resolve fonts by name (and pick up reloads).
         self.text_overlays
             .set_font_provider(self.top_panel.font_provider());
+        // Convert any resident text layer still carrying the pre-identity `text_params`
+        // schema, resolving its legacy font reference through the panel's font list. The
+        // pass converts IN MEMORY and marks the layer dirty; the normal deferred save
+        // writes it. Layers whose font is not installed are left verbatim
+        // (`dev-docs/font_identity_postscript_plan.md` phase 3).
+        self.text_overlays
+            .convert_legacy_text_params_to_v2(&|path, name| {
+                self.top_panel.resolve_legacy_font_identity(path, name)
+            });
         // Mirror the panel's centering-assist toggle + bound-center kind onto the layer so its re-render
         // dispatch sites request the renderer's mean/median centers and the reconciliation drives the
         // guide frame.
@@ -1417,6 +1431,7 @@ impl CanvasHooks for TypingHooks<'_> {
                     mask_snapshot,
                     export_dir,
                     export_format,
+                    self.top_panel.font_post_script_names(),
                 );
             } else {
                 // Something the composite reads is not ready, or a save is busy. Migrated/v3 pages
@@ -1448,6 +1463,7 @@ impl CanvasHooks for TypingHooks<'_> {
                         mask_snapshot,
                         export_dir,
                         export_format,
+                        self.top_panel.font_post_script_names(),
                     );
                 }
             }
@@ -1669,6 +1685,22 @@ struct TypingCreateTextEditor {
 struct TypingCreateRenderState {
     rx: Receiver<Result<TypingOverlayDecoded, String>>,
     scene_rect: Option<Rect>,
+}
+
+/// A background resolve of the on-canvas text editor's font: which font was asked for and
+/// where its bytes will arrive.
+///
+/// The worker only calls `FontProvider::resolve` (a RAM cache hit, or one `fs::read` on a
+/// miss) and sends the outcome; the egui registration stays on the GUI thread, where the
+/// `Context` lives. `None` on the channel means the identity did not resolve — the editor
+/// then keeps the default UI font, exactly as it does while the request is in flight.
+struct TypingEditorFontRequest {
+    /// Identity that was requested, so a result arriving after the user switched fonts can
+    /// still be cached but not applied to the wrong editor.
+    font_identity: String,
+    /// Face index inside the resolved file, part of the registration key.
+    face_index: usize,
+    rx: Receiver<Option<FontContent>>,
 }
 
 struct TypingExportRenderState {
@@ -2096,12 +2128,23 @@ pub(super) struct TypingExportPageJob {
     pub(super) export_format: TypingExportFormat,
     pub(super) layers_primary_dir: Option<PathBuf>,
     pub(super) layers_fallback_dir: Option<PathBuf>,
+    /// `font identity -> PostScript name per face`, snapshotted from the typing panel's
+    /// font list when the export is dispatched. The PSD writer needs a real PostScript
+    /// name for every text layer and this job runs on a worker thread with no access to
+    /// the panel, the font list or the provider — carrying the (small) index is what lets
+    /// the export stop re-opening every font file per overlay. Empty for a PNG export.
+    pub(super) font_post_script_names: crate::tabs::typing::psd_export::FontPostScriptNames,
 }
 
 struct TypingExportResult {
     exported: usize,
     total: usize,
     output_dir: PathBuf,
+    /// Localized, deduplicated notes about what the OUTPUT FORMAT could not express, in a
+    /// run that otherwise succeeded (every page was written). Today: PSD text layers whose
+    /// font name is claimed by several installed fonts — see
+    /// `psd_export::AmbiguousExportFont`. Empty in the normal case.
+    warnings: Vec<String>,
 }
 
 enum TypingExportEvent {
@@ -2278,6 +2321,11 @@ pub(super) struct TypingTextOverlayLayer {
     /// the top panel's current font list (`refresh_font_provider`) and captured into
     /// each render request so background threads resolve fonts by name.
     font_provider: Arc<dyn FontProvider>,
+    /// Uids of overlays whose SCHEMA-1 font reference could not be resolved to an
+    /// installed font, so the "keeping the legacy keys verbatim" warning is written once
+    /// per overlay instead of once per frame. The conversion pass itself keeps retrying
+    /// them: a font list reload (an imported font arriving) can make them resolvable.
+    legacy_text_params_unresolved: std::collections::HashSet<String>,
     edit_render_latest_token: Arc<AtomicU64>,
     edit_render_next_token: u64,
     edit_render_data_dirty: bool,
@@ -2312,8 +2360,22 @@ pub(super) struct TypingTextOverlayLayer {
     create_selection: Option<TypingCreateSelection>,
     create_editor: Option<TypingCreateTextEditor>,
     create_render_state: Option<TypingCreateRenderState>,
-    editor_font_cache: HashMap<(PathBuf, usize), String>,
+    /// egui font-family name registered for the on-canvas text editor, keyed by
+    /// `(font identity, resolved content id, face index)`. Keyed on the IDENTITY, never the
+    /// file path: two panel entries can share a file (the bundled `fonts/ui` entry and a
+    /// user import of it) while being different fonts. The CONTENT ID is the one the
+    /// `FontProvider` reported for the bytes it actually served, so a font file replaced
+    /// under the same PostScript name registers afresh instead of being drawn forever from
+    /// the snapshot egui already holds (egui's `add_font` never re-reads).
+    editor_font_cache: HashMap<(String, u64, usize), String>,
     editor_font_next_id: u64,
+    /// In-flight background resolve of the on-canvas editor's font, if any.
+    ///
+    /// Obtaining the bytes means a `fs::read` on a provider cache miss, which must never
+    /// run on the GUI thread; the editor draws in the default UI font until the result
+    /// lands and `poll_editor_font_request` registers it (registration itself needs the
+    /// egui `Context` and therefore stays on the GUI thread).
+    editor_font_request: Option<TypingEditorFontRequest>,
     create_status_error: Option<(String, f64)>,
     create_status_warning: Option<(String, f64)>,
     overlays: Vec<TypingOverlayRuntime>,
@@ -2479,6 +2541,7 @@ impl Default for TypingTextOverlayLayer {
             edit_render_rx: None,
             // Empty provider until the first frame refreshes it from the top panel.
             font_provider: Arc::new(FontContentSet::default()),
+            legacy_text_params_unresolved: std::collections::HashSet::new(),
             edit_render_latest_token: Arc::new(AtomicU64::new(0)),
             edit_render_next_token: 0,
             edit_render_data_dirty: false,
@@ -2494,6 +2557,7 @@ impl Default for TypingTextOverlayLayer {
             create_render_state: None,
             editor_font_cache: HashMap::new(),
             editor_font_next_id: 0,
+            editor_font_request: None,
             create_status_error: None,
             create_status_warning: None,
             overlays: Vec::new(),

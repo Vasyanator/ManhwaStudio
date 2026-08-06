@@ -3311,6 +3311,16 @@ impl eframe::App for MangaApp {
             self.typing_tab.centering_assist_enabled(),
             self.typing_tab.centering_show_center(),
         );
+
+        // 6) Flush a still-pending per-font-settings write. A parameter edit stores the font's
+        // default profile through a multi-second DEBOUNCE (one document write per burst instead of
+        // one per keystroke), and the debounced writer is a detached thread that dies with the
+        // process — so changing a parameter and closing the app a second later used to lose the
+        // edit outright. Synchronous by necessity: no GUI frame follows this call and no thread
+        // outlives it. No-op when nothing is pending, which is the normal case.
+        if crate::tabs::typing::font_admin::flush_pending_saves() {
+            runtime_log::log_info("[app] on_exit: flushed a pending fonts_data.json write");
+        }
     }
 }
 

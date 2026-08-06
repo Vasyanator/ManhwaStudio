@@ -64,7 +64,9 @@ pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]
-pub use font_preview::{combo_font_family_name, ensure_font_family, is_font_family_bound};
+pub use font_preview::{
+    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
+};
 #[allow(unused_imports)]
 pub use hangul_keyboard::{
     HangulInsertPlacement, HangulKeyboardMode, HangulKeyboardOutcome, HangulKeyboardState,

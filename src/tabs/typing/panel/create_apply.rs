@@ -89,12 +89,19 @@ impl TypingCreatePanelState {
         let Some(render_data_obj) = render_data.as_object() else {
             return;
         };
-        let Some(text_params_obj) = render_data_obj
+        let Some(stored_text_params) = render_data_obj
             .get("text_params")
             .and_then(Value::as_object)
         else {
             return;
         };
+        // Fill in the defaults of the schema the DOCUMENT declares before reading a
+        // single field: a schema-2 payload omits everything equal to its frozen default,
+        // while a schema-1 payload is handed through untouched so the legacy
+        // absent-key rules below (which differ from today's defaults for e.g.
+        // `line_placement_reference`) keep applying to it.
+        let filled_text_params = text_params_schema::read_text_params(stored_text_params);
+        let text_params_obj = &*filled_text_params;
 
         if let Some(text) = text_params_obj.get("text").and_then(Value::as_str) {
             self.text = text.to_string();
@@ -392,28 +399,32 @@ impl TypingCreatePanelState {
             .clamp(1, 9);
 
         if apply_font_selection {
-            let font_path = text_params_obj
-                .get("font_path")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            // Name fallback mirrors the codec's read order: `font_label`, then the
-            // canonical `font_original_name` (family name). A blob carrying only the
-            // original name (e.g. a legacy in-progress project) must not spuriously
-            // flag `missing_font` — the ordered label lookup matches it.
-            let font_label = text_params_obj
-                .get("font_label")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    text_params_obj
-                        .get("font_original_name")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                });
-            self.select_font_by_path_or_label(font_path, font_label);
+            if text_params_schema::text_params_schema_version(text_params_obj)
+                >= text_params_schema::TEXT_PARAMS_SCHEMA_VERSION
+            {
+                // Schema 2: exactly one font key, holding the identity. No legacy form is
+                // consulted — accepting one here would resurrect the ambiguity the
+                // identity exists to remove.
+                let identity = text_params_obj
+                    .get("font")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                self.select_font_by_identity(identity);
+            } else {
+                // Schema 1: EVERY stored name is tried, in the one read order the schema
+                // owns (`font_original_name` → `font_label` → `font_family` → `font` →
+                // stem of `font_path`), so a blob whose first name is a family this
+                // machine no longer has still resolves through a later one. Taking only
+                // the FIRST name flagged such a blob as missing although the panel could
+                // resolve it. The path comes along only as the weak hint the resolver
+                // refuses to select on.
+                let font_path = text_params_schema::legacy_font_path(text_params_obj);
+                let candidates =
+                    text_params_schema::legacy_font_name_candidates(text_params_obj);
+                let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+                self.select_font_by_legacy_reference(font_path, &names);
+            }
         }
 
         self.effects = render_data_obj
@@ -424,28 +435,88 @@ impl TypingCreatePanelState {
         self.sync_selected_formula_preset_by_layout();
     }
 
-    pub(super) fn select_font_by_path_or_label(&mut self, font_path: Option<&str>, font_label: Option<&str>) {
-        if let Some(idx) = self.find_font_idx_by_path_or_label(font_path, font_label) {
-            self.selected_font_idx = idx;
-            self.active_font_key = self.current_font_key();
-            self.missing_font = None;
-        } else {
-            // Шрифт оверлея отсутствует среди доступных: запоминаем его имя, чтобы
-            // показать предупреждение и заблокировать рендер до выбора другого шрифта.
-            let name = font_label
-                .map(str::to_string)
-                .or_else(|| {
-                    font_path.map(|path| {
-                        Path::new(path)
-                            .file_name()
-                            .and_then(|stem| stem.to_str())
-                            .unwrap_or(path)
-                            .to_string()
-                    })
-                })
-                .unwrap_or_else(|| t!("typing.params.font_unknown_placeholder").to_string());
-            self.missing_font = Some(name);
+    /// Selects the font a schema-2 overlay names by its IDENTITY.
+    ///
+    /// On a hit the selection and the profile anchor move to that font and the
+    /// missing-font block is cleared. On a miss — including a payload with no `font` key
+    /// at all — the identity is remembered in `missing_font`, which blocks re-rendering
+    /// until the user picks an available font: an overlay must never be silently
+    /// re-rendered with a substitute font.
+    pub(super) fn select_font_by_identity(&mut self, identity: Option<&str>) {
+        match identity.and_then(|identity| self.find_font_idx_by_identity(identity)) {
+            Some(idx) => {
+                self.selected_font_idx = idx;
+                self.active_font_identity = self.current_font_identity();
+                self.missing_font = None;
+            }
+            None => {
+                self.missing_font = Some(
+                    identity
+                        .map(str::to_string)
+                        .unwrap_or_else(|| t!("typing.params.font_unknown_placeholder").to_string()),
+                );
+            }
         }
+    }
+
+    /// Selects the font a PERSISTED overlay names, from every stored font NAME (in the
+    /// schema-1 read order) plus the stored `font_path` — the legacy READ path, see
+    /// [`Self::match_font_by_legacy_reference`].
+    ///
+    /// **A NAME selects; a PATH never does.** Only a [`LegacyFontMatch::ByName`] hit moves
+    /// the selection and clears the block. When nothing but the stored path resolves, the
+    /// overlay lands in `missing_font` exactly as if the font were absent, and a warning
+    /// names the font that now occupies that path. The file sitting at a remembered
+    /// location is not proof of identity: replacing `dialogue.ttf` with another face used
+    /// to make this method select the NEW font silently, after which the next edit
+    /// re-rendered the layer in a typeface the user never chose. This mirrors
+    /// `codec::upgrade_text_params_to_v2` (safety rule D), which already refuses to
+    /// CONVERT such a layer — the selection side was the remaining hole.
+    ///
+    /// On a miss the panel remembers the name it could not resolve in `missing_font`,
+    /// which blocks re-rendering until the user picks an available font.
+    pub(super) fn select_font_by_legacy_reference(
+        &mut self,
+        font_path: Option<&str>,
+        font_names: &[&str],
+    ) {
+        let matched = self.match_font_by_legacy_reference(font_path, font_names);
+        if let Some(LegacyFontMatch::ByName(idx)) = matched {
+            self.selected_font_idx = idx;
+            self.active_font_identity = self.current_font_identity();
+            self.missing_font = None;
+            return;
+        }
+        // Шрифт оверлея отсутствует среди доступных: запоминаем его имя, чтобы
+        // показать предупреждение и заблокировать рендер до выбора другого шрифта.
+        let name = font_names
+            .iter()
+            .find(|name| !name.trim().is_empty())
+            .map(|name| (*name).to_string())
+            .or_else(|| {
+                font_path.map(|path| {
+                    Path::new(path)
+                        .file_name()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or(path)
+                        .to_string()
+                })
+            })
+            .unwrap_or_else(|| t!("typing.params.font_unknown_placeholder").to_string());
+        if let Some(LegacyFontMatch::PathOnly(idx)) = matched {
+            // Diagnosable, not silent: the user sees "font missing" while the file is
+            // right there, so the log must say which font actually lives at that path.
+            let occupant = self
+                .font_identity_name_by_idx(idx)
+                .unwrap_or_else(|| name.clone());
+            crate::runtime_log::log_warn(format!(
+                "typing: overlay font '{name}' is not installed; the file it remembered \
+                 ({}) now holds '{occupant}'. The path is not proof of identity, so the \
+                 overlay is reported as missing instead of being re-rendered in that font.",
+                font_path.unwrap_or_default()
+            ));
+        }
+        self.missing_font = Some(name);
     }
 
     pub(super) fn queue_preview_render(&mut self) {
@@ -579,6 +650,9 @@ impl TypingCreatePanelState {
         true
     }
 
+    /// Font the on-canvas create-text editor draws in: the selected font's IDENTITY plus
+    /// the selected face. `None` when no font is selected. The tab resolves the identity
+    /// through this panel's `FontProvider` to obtain the bytes.
     pub(super) fn editor_font_spec(&self) -> Option<TypingEditorFontSpec> {
         let font = self.fonts.get(self.selected_font_idx)?;
         let face_index = font
@@ -587,7 +661,7 @@ impl TypingCreatePanelState {
             .map(|face| face.face_index)
             .unwrap_or(0usize);
         Some(TypingEditorFontSpec {
-            font_path: font.path.clone(),
+            font_identity: font.render_identity_name(),
             face_index,
             ui_font_size_px: self.font_size_px.clamp(8.0, 128.0),
         })

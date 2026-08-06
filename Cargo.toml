@@ -97,6 +97,13 @@ rayon = "1"
 ag-psd = "0.1.0"
 zspell = "0.5"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+# Two users, both needing a hash whose algorithm is fixed forever: the app-managed
+# onnxruntime dylib downloader verifies archive checksums (native-only), and the typing
+# font loader derives a font file's content hash from it — that hash is spelled into a
+# PERSISTED font identity (`fonts::suffixed_font_identity_name`), so it may never change
+# with a toolchain upgrade the way `DefaultHasher` may. Kept in the SHARED dependency
+# section for the second user: the typing panel is compiled for wasm32 too.
+sha2 = "0.10"
 puffin = { version = "0.20.0", optional = true }
 # Vendored & ported to egui 0.35 (crates/puffin_egui); upstream has no 0.34/0.35
 # release. See crates/puffin_egui/Cargo.toml.
@@ -126,9 +133,6 @@ tungstenite = { version = "0.28", default-features = false, features = ["handsha
 # Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
 # dylib). Native-only: onnxruntime is a native shared library.
 ms-onnx = { path = "crates/ms-onnx" }
-# Used by the app-managed onnxruntime dylib downloader (later task) to verify
-# archive checksums.
-sha2 = "0.10"
 # Typed public errors for the native onnxruntime loader (`src/onnx_runtime`).
 # Already in the workspace tree (ms-onnx/ms-storage pin v2), so no new build cost;
 # native-only because the loader itself is native-only.

@@ -27,16 +27,17 @@ Key functions:
 - `displayable_char` / `build_reverse_glyph_map` / `finalize_kerning` (pure, unit-tested)
 
 Notes:
-The font MODEL (identity, path, display-name key) is reached ONLY through the
-`crate::tabs::typing::font_admin` facade; the display-name override API takes a `&Path`, so
-the keying scheme stays private to typing. egui own-typeface registration reuses
-`crate::widgets::ensure_font_family` (ADD-ONLY, cached per family), exactly like the category
-rows. The heavy ttf-parser work never runs on the GUI thread; the window only polls the
-channel and repaints while pending.
+The font MODEL is reached ONLY through the `crate::tabs::typing::font_admin` facade. Every
+per-font SETTING it mutates (display-name override, virtual-group membership and aliases) is
+keyed by the font's IDENTITY; the file path is kept purely as the byte source of the
+glyph/kerning analysis and the own-typeface preview. egui own-typeface registration reuses
+`crate::widgets::request_font_family` (ADD-ONLY, cached per family, bytes read OFF the GUI
+thread), exactly like the category rows. The heavy ttf-parser work never runs on the GUI
+thread either; the window only polls the channel and repaints while pending.
 */
 
 use crate::tabs::typing::font_admin::{self, FontEntry};
-use crate::widgets::{WheelComboBox, ensure_font_family};
+use crate::widgets::{PreviewFontFamily, WheelComboBox, request_font_family};
 use ms_thread as thread;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -120,13 +121,22 @@ struct RawKerningPair {
 /// a `FontEntry` snapshot so it never aliases the live category lists. Owned by
 /// `FontSettingsEditorState`.
 pub(super) struct FontPropertiesState {
-    /// Representative font FILE path (the file whose glyphs/kerning are analyzed, and the
-    /// display-name override KEY when passed to `font_admin`).
+    /// Representative font FILE path. ONLY the byte source of the glyph/kerning analysis
+    /// and the own-typeface preview — every per-font SETTING is keyed by `identity`.
     path: PathBuf,
     /// Representative face index within `path` (0 for single-face files).
     rep_face: usize,
     /// Real family/name read from the font file (shown in the identity header).
     original_name: String,
+    /// Canonical IDENTITY of the font (`FontEntry::render_identity_name`): the
+    /// representative face's PostScript name, `%hash`-suffixed on a content contest. This
+    /// is what the project persists and what the renderer resolves, so the window shows it
+    /// next to the family name; it also keys the own-typeface registrations below.
+    identity: String,
+    /// Hash of the representative file's bytes (`FontEntry::content_hash`, `0` = unknown).
+    /// Not shown: it is the byte discriminant of the own-typeface registrations below, so a
+    /// font file replaced under the same PostScript name is previewed from its NEW bytes.
+    content_hash: u64,
     /// File name of `path` (shown in the identity header).
     file_name: String,
     /// Representative face label, shown only for multi-face files (`None` otherwise).
@@ -170,12 +180,15 @@ impl FontPropertiesState {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| font.path().to_string_lossy().into_owned());
         let face_label = font.representative_face_label();
-        let name_buf = font_admin::display_name_override(font.path()).unwrap_or_default();
+        let name_buf =
+            font_admin::display_name_override(&font.render_identity_name()).unwrap_or_default();
         let default_label = super::font_settings::clean_font_display_name(font.label());
         Self {
             path: font.path().to_path_buf(),
             rep_face,
             original_name: font.original_name().to_string(),
+            identity: font.render_identity_name(),
+            content_hash: font.content_hash(),
             file_name,
             face_label,
             default_label,
@@ -212,7 +225,7 @@ impl FontPropertiesState {
         } else {
             Some(trimmed.to_string())
         };
-        font_admin::set_display_name_override(&self.path, value);
+        font_admin::set_display_name_override(&self.identity, value);
     }
 
     /// Starts the off-thread font analysis if none is cached or in flight. Reads the font
@@ -270,6 +283,12 @@ impl FontPropertiesState {
             "typing.font_settings.properties_original_name",
             name = self.original_name
         ));
+        // The identity is the name the project stores and the renderer resolves; the file
+        // path below it answers the different question "where does this font live".
+        ui.label(tf!(
+            "typing.font_settings.properties_identity",
+            name = self.identity
+        ));
         match &self.face_label {
             Some(face) => ui.label(tf!(
                 "typing.font_settings.properties_file_face",
@@ -309,9 +328,23 @@ impl FontPropertiesState {
                 ui.small(err.as_str());
             }
             Some(Ok(analysis)) => {
-                Self::draw_glyph_grid(ui, &self.path, self.rep_face, analysis);
+                Self::draw_glyph_grid(
+                    ui,
+                    &self.identity,
+                    self.content_hash,
+                    &self.path,
+                    self.rep_face,
+                    analysis,
+                );
                 ui.add_space(6.0);
-                Self::draw_kerning_section(ui, &self.path, self.rep_face, analysis);
+                Self::draw_kerning_section(
+                    ui,
+                    &self.identity,
+                    self.content_hash,
+                    &self.path,
+                    self.rep_face,
+                    analysis,
+                );
             }
         }
     }
@@ -351,7 +384,7 @@ impl FontPropertiesState {
         if self.groups_revision == Some(current) {
             return;
         }
-        self.member_of = font_admin::virtual_groups_for_font(&self.path);
+        self.member_of = font_admin::virtual_groups_for_font(&self.identity);
         self.all_group_names = font_admin::list_virtual_groups()
             .into_iter()
             .map(|group| group.name)
@@ -384,7 +417,8 @@ impl FontPropertiesState {
     /// Body of the "Группы" section. Membership mutations are collected and applied after the
     /// row loop so no store mutation happens mid-iteration.
     fn draw_groups_body(&mut self, ui: &mut egui::Ui) {
-        let path = self.path.clone();
+        // Group membership is keyed by the font's IDENTITY, never by its file.
+        let identity = self.identity.clone();
 
         if self.member_of.is_empty() {
             ui.small(t!("typing.font_settings.properties_groups_none_hint"));
@@ -436,10 +470,10 @@ impl FontPropertiesState {
                 } else {
                     Some(trimmed)
                 };
-                font_admin::set_virtual_group_member_alias(&name, &path, value);
+                font_admin::set_virtual_group_member_alias(&name, &identity, value);
             }
             if let Some(name) = remove_from {
-                font_admin::remove_virtual_group_member(&name, &path);
+                font_admin::remove_virtual_group_member(&name, &identity);
                 self.group_alias_bufs.remove(&name);
             }
         }
@@ -476,7 +510,7 @@ impl FontPropertiesState {
                     .clicked()
                     && let Some(name) = non_member.get(self.add_group_index)
                 {
-                    font_admin::add_virtual_group_member(name, &path);
+                    font_admin::add_virtual_group_member(name, &identity);
                 }
             });
         }
@@ -492,8 +526,13 @@ impl FontPropertiesState {
                 .desired_width(f32::INFINITY),
         );
         let prev_override = ui.style().override_font_id.clone();
-        if let Some(family) = ensure_font_family(ui.ctx(), &self.path, self.rep_face)
-        {
+        if let PreviewFontFamily::Ready(family) = request_font_family(
+            ui.ctx(),
+            &self.identity,
+            self.content_hash,
+            &self.path,
+            self.rep_face,
+        ) {
             ui.style_mut().override_font_id = Some(egui::FontId::new(PREVIEW_FONT_SIZE, family));
         }
         ui.label(self.preview.as_str());
@@ -502,7 +541,14 @@ impl FontPropertiesState {
 
     /// Renders the virtualized glyph grid: fixed-size cells, each drawing one supported
     /// character in the font's typeface with a `U+XXXX` hover tooltip. Only visible rows run.
-    fn draw_glyph_grid(ui: &mut egui::Ui, path: &Path, rep_face: usize, analysis: &FontAnalysis) {
+    fn draw_glyph_grid(
+        ui: &mut egui::Ui,
+        identity: &str,
+        content_hash: u64,
+        path: &Path,
+        rep_face: usize,
+        analysis: &FontAnalysis,
+    ) {
         let count = analysis.codepoints.len();
         ui.label(tf!(
             "typing.font_settings.properties_glyphs_header",
@@ -519,7 +565,7 @@ impl FontPropertiesState {
             ((ui.available_width() + spacing_x) / (GLYPH_CELL_SIZE + spacing_x)).floor() as usize,
         );
         let rows = count.div_ceil(columns);
-        let family = ensure_font_family(ui.ctx(), path, rep_face);
+        let family = own_typeface_family(ui.ctx(), identity, content_hash, path, rep_face);
         egui::ScrollArea::vertical()
             .id_salt("typing.font_settings.properties_glyph_grid")
             .max_height(GLYPH_GRID_MAX_HEIGHT)
@@ -545,6 +591,8 @@ impl FontPropertiesState {
     /// preview font size in pixels. Notes truncation when the list was capped.
     fn draw_kerning_section(
         ui: &mut egui::Ui,
+        identity: &str,
+        content_hash: u64,
         path: &Path,
         rep_face: usize,
         analysis: &FontAnalysis,
@@ -576,7 +624,7 @@ impl FontPropertiesState {
                     cap = MAX_KERNING_PAIRS
                 ));
             }
-            let family = ensure_font_family(ui.ctx(), path, rep_face);
+            let family = own_typeface_family(ui.ctx(), identity, content_hash, path, rep_face);
             let units_per_em = analysis.units_per_em;
             egui::ScrollArea::vertical()
                 .id_salt("typing.font_settings.properties_kerning_list")
@@ -622,6 +670,25 @@ pub(super) fn show(ctx: &egui::Context, state: &mut FontPropertiesState) -> bool
         });
 
     window_open
+}
+
+/// The egui family that draws this font's own typeface, or `None` while its bytes are
+/// still being read off the GUI thread (and permanently when it cannot be registered).
+///
+/// A thin adapter over `widgets::request_font_family` for the two grids that take an
+/// `Option<&egui::FontFamily>` per cell: their cells fall back to the interface font,
+/// which is exactly what `Pending` and `Unavailable` both mean for them.
+fn own_typeface_family(
+    ctx: &egui::Context,
+    identity: &str,
+    content_hash: u64,
+    path: &Path,
+    rep_face: usize,
+) -> Option<egui::FontFamily> {
+    match request_font_family(ctx, identity, content_hash, path, rep_face) {
+        PreviewFontFamily::Ready(family) => Some(family),
+        PreviewFontFamily::Pending | PreviewFontFamily::Unavailable => None,
+    }
 }
 
 /// Draws one glyph cell of fixed footprint: the character centered in the font's typeface,

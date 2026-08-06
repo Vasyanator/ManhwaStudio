@@ -180,22 +180,30 @@ The main data flow is:
    `render_next::render_text_to_image` in background workers. Fonts reach the renderer
    BY NAME, not by path: `TextRenderParams.font_name` and inline `<font=...>` tags are
    resolved through a caller-supplied `render_next::FontProvider`. That identity name is the
-   font's COLLISION-AWARE identity (`FontEntry.identity_name`): the ORIGINAL FAMILY NAME when
-   the family is unique in the panel list, else the file-stem label when two loaded files
-   share a family (a Regular+Bold pair), so each file keeps a distinct persisted identity.
-   The user display-name is for SHOWING the font in combos/lists only, never persisted or sent
-   to the renderer. Persisted `render_data.text_params` carries the identity in `font_label`
-   (kept under that historical key) AND the raw family name in `font_original_name` (the codec
-   reads it FIRST); legacy blobs that only had a stem/label still resolve via the provider's
-   aliases. The typing tab OWNS font loading and builds that provider
-   (`panel::TabFontProvider`, keyed PRIMARILY by the normalized identity with family
-   name/label/stem kept as legacy aliases, lazy file read + content-id cache). The create/edit panels
+   font's identity (`FontEntry.identity_name`): the representative face's POSTSCRIPT NAME,
+   suffixed with `%{16 hex of the content hash}` only when another file claims the same name
+   with different bytes (byte-identical claimants merge into one entry instead, on the folder
+   list AND on the combined folder+imported list), so each font keeps a distinct persisted
+   identity that does not shift when another claimant appears or disappears. A PostScript name
+   is only accepted when it is spec-valid; the `%` separator is a character the spec forbids,
+   so a suffixed identity can never be some other font's real name. The user display-name is for SHOWING the font in combos/lists only, never
+   persisted or sent to the renderer. Persisted `render_data.text_params` is SCHEMA 2 and carries
+   the identity in exactly one key, `font`; legacy blobs (no `schema` key) that had a
+   path/family/stem/label still resolve via the provider's READ-ONLY aliases and are converted
+   on load (see "Persisted `text_params` schema" below). The typing tab OWNS font loading and
+   builds that provider (`panel::TabFontProvider`, keyed PRIMARILY by the normalized identity
+   with the bundled legacy spelling, each font's own `%hash` form, the bare contested name and
+   family name/label/stem kept as legacy READ aliases, lazy file read + content-id cache). The create/edit panels
    each hold an `Arc<dyn FontProvider>` (rebuilt whenever the font list is (re)assigned);
    the tab layer refreshes its own copy each frame from the panel and captures an `Arc`
    into every render REQUEST struct so background threads resolve fonts without touching
-   the panel. `render_text_to_image(&params, &dyn FontProvider, cancel)` takes the provider
-   as its middle argument. The forms-metric path still loads its font by path via the compat
-   wrapper `render_next::load_selected_font_from_path`.
+   the panel. The PANEL ITSELF also keys on that identity now (selection, per-font profile
+   memory, combo/editor/char-table/forms-metric caches); a file path survives only as the
+   source of BYTES and inside the single legacy resolver that reads a reference persisted
+   by an older build — see `panel/MODULE_README.md`, "The panel speaks IDENTITIES". `render_text_to_image(&params, &dyn FontProvider, cancel)` takes the provider
+   as its middle argument. The advanced-form width metric resolves through the SAME provider
+   (`render_next::load_font_content` over the resolved `FontContent`), so no path-keyed
+   loader is left anywhere.
    Inline no-break tags (`<no-break>`/`<nobr>` or machine `<m j>`) are editing/form controls:
    the renderer strips them like other inline tags, while the advanced text-form picker applies
    them to the source text and writes a tag-free `formed_text` with protected ranges already kept
@@ -242,9 +250,9 @@ saving, and export.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
   `pub(in crate::tabs::typing)`) as a narrow facade — font loaders, imported-fonts add/remove +
-  revision, `&Path`-keyed display-name overrides, VIRTUAL font group CRUD + membership/alias
-  (config-only named font sets; members keyed internally by `font_settings_key`, exposed as
-  `&Path`), and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
+  revision, IDENTITY-keyed display-name overrides, VIRTUAL font group CRUD + membership/alias
+  (config-only named font sets; members referenced by font IDENTITY on both sides of the facade),
+  and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
   re-exports `FontEntry` as an opaque type. Used by the settings font-settings UI
   (`src/tabs/settings/typesetting/`); nothing else in typing is `pub(crate)` for it. Add a
   wrapper here rather than widening a panel internal.
@@ -317,6 +325,14 @@ saving, and export.
     management and font-index lookup.
   - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
   - `create_presets.rs`: create/formula preset apply & save UI, font-combo binding, face-index clamp.
+    Also owns the preset SIDE of `fonts/presets.json`: the OFF-THREAD seed
+    (`spawn_presets_seed` -> `read_presets_seed`), the deferred one-shot migration out of
+    `user_config.TextTab.create_presets` (`finish_legacy_presets_migration` ->
+    `migrate_legacy_presets`, which needs the font list to re-key legacy references) and the
+    off-thread save (`run_presets_save`). Everything the background workers produce comes back
+    as a `PresetStoreEvent` and is applied by ONE per-frame drain,
+    `poll_preset_store_events` (seed install, migration, presets merged in from another app
+    instance, save failure -> status line).
   - `create_sections.rs`: top-level section drawing (preview/params/effects/right actions) + effects_json.
   - `create_main_text.rs`: main text-param UI. The "Параметры" sub-tab is grouped into six
     collapsible sections (font / glyph metrics / layout & alignment / shape & smoothing / typeface
@@ -330,15 +346,23 @@ saving, and export.
   - `text_forms.rs`: char/byte range conversions, advanced-form range-row + sort + card (free fns).
   - `inline_tags.rs`: inline-tag machine/opening/closing build + parse, offset/stretch/color/align tokens (free fns).
   - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
-  - `fonts.rs`: font discovery/loading — folder fonts PLUS imported system-font paths
-    (`load_fonts`/`load_imported_system_fonts`), duplicate merge/disambiguation, group listing
+  - `fonts.rs`: font discovery/loading — folder fonts PLUS the imported system fonts
+    (`load_fonts` / `build_combined_font_list` / `load_imported_system_font_rows`, the last
+    of which resolves one stored entry: recorded path, else by NAME, else an unavailable
+    row), duplicate merge (key: PostScript name +
+    content hash, so byte-identical copies merge across differing FILE NAMES) and
+    render-IDENTITY assignment (`assign_font_identity_names`: the representative face's
+    PostScript name, `%hash`-suffixed on a same-name/different-bytes contest or on a claim of
+    the reserved bundled-UI name), disambiguation, group listing
     (free fns), and VIRTUAL-group injection (`apply_virtual_groups`: folds the user-defined
     `fonts_data` virtual groups into a finalized list — membership into `FontEntry.groups`,
     per-group aliases into `FontEntry.virtual_group_aliases` — and returns the merged combobox
     group list; MUST run after merge/disambiguation/identity; see `panel/MODULE_README.md`).
     `load_system_fonts` (whole-OS enumeration) is the catalog source for the
     settings font-import picker (`src/tabs/settings/typesetting/font_settings.rs`, reached via
-    the `font_admin` facade), run off the GUI thread.
+    the `font_admin` facade), run off the GUI thread; it also PUBLISHES what it enumerated as
+    the process-wide `PostScript name → file` index (`SystemFontNameIndex`) that locates a
+    moved imported system font by name.
     Coverage (`font_coverage`) is classified once per font at LOAD time (off the GUI thread) from the
     representative face's bytes against the current TYPESETTING language and cached on
     `FontEntry.coverage`; the dropdown never recomputes it. A runtime language change makes the cache
@@ -346,10 +370,17 @@ saving, and export.
     stored `coverage_language` and re-runs `spawn_font_reload` on both panels when it differs.
     Discovery also records each font's `original_name` (real family/name of the representative face,
     fallback post_script_name then file stem) for PSD export and future virtual fonts.
+    Every font FILE is read and parsed EXACTLY ONCE (`fonts::read_font_file` -> `FontFileData`): one
+    `fs::read` plus one `fontdb` parse yield the faces (each with its own `post_script_name`), the
+    representative face's family name, the coverage and the content hash together, with the bytes
+    shared into `fontdb` by `Arc` instead of copied. A file that reads but does not parse keeps a
+    placeholder entry with empty names (folder fonts) or is skipped (imported system fonts).
   - `font_provider.rs`: `TabFontProvider`, the app-side `render_next::FontProvider`. Maps a normalized
-    working name to a font — PRIMARY key is the font's original FAMILY NAME, with file-stem and
-    display-label kept as legacy aliases (deterministic FIRST-wins when two files share a family name;
-    a display-name override is never a key). Reads bytes lazily OUTSIDE its lock and caches
+    working name to a font — PRIMARY key is the font's IDENTITY (`identity_name`, its PostScript
+    name), with the bundled legacy spelling, each font's own `%hash` form, the bare contested name
+    (lowest content hash wins), the family name, the file stem and the display label kept as
+    READ-ONLY legacy aliases (deterministic FIRST-wins; a display-name override is never a key;
+    nothing writes an alias form any more). Reads bytes lazily OUTSIDE its lock and caches
     `Arc<Vec<u8>>` + content id, and carries each font's `original_name` to the renderer. Built from the
     panel's font list; shared (`Arc`) with background render threads.
   - `font_coverage.rs`: pure classification of a font's support for the selected TYPESETTING language
@@ -358,33 +389,58 @@ saving, and export.
     (Cyrillic or Latin), language-specific letters + typography from the concrete `TextLanguage`.
     Drives the red/yellow font-dropdown highlight + hover tooltip in
     `create_presets::draw_font_combo_option`. See `panel/MODULE_README.md` for the coverage/cache contract.
-  - `presets_io.rs`: TextTab preset persistence + formula/drawn/vector layout <-> `Value` conversions (free fns).
-    Retains only the READ helper `load_text_tab_imported_system_fonts` for the one-time legacy
-    migration (see `font_settings_store`); the imported-fonts WRITE path moved to `fonts_data.rs`.
+  - `presets_io.rs`: what still belongs to `user_config.json` — formula presets, per-effect-kind
+    defaults, the legacy inline-tags flag — plus the formula/drawn/vector layout <-> `Value`
+    conversions (free fns). Retains only the READ helper `load_text_tab_imported_system_fonts`
+    for the one-time legacy migration (see `font_settings_store`); the imported-fonts WRITE path
+    moved to `fonts_data.rs`, and the CREATE PRESETS moved to `presets_store.rs`.
+  - `presets_store.rs`: the SINGLE owner of `fonts/presets.json` (version 1) — schema, typed
+    `LoadOutcome`, quarantine, the atomic + crash-durable + optimistically-concurrent save with
+    a TYPED error, the read of the legacy `user_config` payload and the deletion of the
+    migrated `TextTab` keys. Preset NAMES are stored verbatim (never trimmed, so two names that
+    differ only in spaces stay two presets). Holds no font knowledge: resolution lives in
+    `create_presets`.
+  - `doc_store.rs`: the ONE crash-safe write recipe (`write_atomic`: sibling temp + `write_all`
+    + `sync_all` + CLOSE + `rename`, plus an optional parent-DIRECTORY fsync) and the ONE
+    optimistic-concurrency vocabulary (`DocumentFingerprint` / `SaveBaseline`), shared by
+    `fonts_data.rs` and `presets_store.rs`. Both used to carry their own copy, and the copies
+    had drifted. `Durability::ContentsAndDirectory` is mandatory for any document whose
+    previous home is DELETED once the write returned `Ok`.
   - `fonts_data.rs`: serde schema + disk I/O for the app-level per-font settings document
-    `fonts/fonts_data.json` (`version: 1`; imported system font paths + per-font `display_name`
-    override + user-defined `virtual_groups`, an ADDITIVE field an older binary silently drops on
-    save; `sanitize_virtual_groups` cleans them on decode AND encode). Load degrades to empty on a
-    missing/malformed file and best-effort parses an unknown
-    version; save writes a full snapshot atomically (temp sibling + rename, mirroring
-    `locale_store::write_atomic`) and creates the fonts dir if missing. `font_settings_key` derives
-    the stable per-font KEY (fonts-dir-relative forward-slash path under the fonts dir, else the
-    absolute path). Independent of `FontEntry.label` — a display override never touches rendering.
+    `fonts/fonts_data.json` (`version: 2`: `system_fonts` = imported fonts by PostScript NAME with a
+    `last_path` hint, `fonts` = per-font `display_name` override + default `profile` keyed by font
+    IDENTITY, `virtual_groups` = named member sets keyed by identity; `sanitize_virtual_groups`
+    cleans them on decode AND encode, and every unset field / empty collection is OMITTED). The
+    path-keyed `version: 1` form is READ FOREVER and decoded verbatim with
+    `FontsData.pending_migration` set (see `font_settings_store`); it is never written back. Load
+    returns a typed `LoadOutcome` (a corrupt file is quarantined, never degraded to empty) and
+    best-effort parses a newer version; save writes a full snapshot through the shared
+    `doc_store::write_atomic` (contents-only durability — nothing deletes a source after it)
+    and creates the fonts dir if missing.
+    Independent of `FontEntry.label` — a display override never touches rendering.
   - `font_settings_store.rs`: single process-global runtime store backed by `fonts_data.json`
-    (`OnceLock<RwLock<StoreState>>` = imported paths + display-name overrides + virtual groups,
-    plus ONE shared revision `AtomicU64`; the virtual-group mutators bump the same revision and
-    persist only on a real change, exactly like the other mutators). Seeded at startup from
-    `fonts_data.json`
+    (`OnceLock<RwLock<StoreState>>` = imported system fonts + per-font records + virtual groups +
+    the pending-migration flag, plus ONE shared revision `AtomicU64`; the virtual-group mutators
+    bump the same revision and persist only on a real change, exactly like the other mutators).
+    EVERYTHING is keyed by font IDENTITY; a path survives only as `SystemFontRef::last_path`, the
+    byte-source hint. Seeded at startup from `fonts_data.json`
     (`seed_imported_system_fonts_from_config`), or on first run migrates the legacy
-    `TextTab.imported_system_fonts` list once (legacy key left in place, no longer written).
+    `TextTab.imported_system_fonts` list once (never written again; the key itself is deleted
+    later, by `presets_store::drop_migrated_user_config_keys`, and only against CONTENT proof
+    that `fonts_data.json` took the list over).
     `add_/remove_imported_system_font` and `set_font_display_name_override` mutate state, bump the
     SAME revision, and persist the whole snapshot off the GUI thread via `fonts_data::save`;
-    `font_display_name_override` reads an override. Seeding does not bump the revision. The
+    `set_font_profile` writes the font's DEFAULT parameter profile through a DEBOUNCED writer and
+    does NOT bump the revision (a profile changes on every parameter edit). `migrate_legacy_font_keys`
+    performs the DEFERRED v1 re-key — see `panel/MODULE_README.md`. Seeding does not bump the revision. The
     create/edit panels watch the revision to reload their font lists; the settings font UI
     (via `font_admin`) drives the mutators. The font-administration UI itself
     (`FontSettingsEditorState`, the per-font properties window) lives OUTSIDE this module, in
     `src/tabs/settings/typesetting/`; only the MODEL is here.
-  - `ui_helpers.rs`: font matching/grouping, wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns). The generic egui font-family binding/registration helpers moved to `crate::widgets::font_preview`.
+  - `ui_helpers.rs`: per-FORM font matchers (identity first, then the READ-only legacy
+    family/label/stem/`%hash` aliases and `font_matches_path`, which only
+    `create_state::find_font_idx_by_legacy_reference` may call), group membership,
+    wheel-scroll, param rows, enum cyclers/parsers, Value readers (free fns). The generic egui font-family binding/registration helpers moved to `crate::widgets::font_preview`.
   - `effect_parse.rs`: `parse_effect_cards` (free fn).
   - `effect_defaults.rs`: user-configurable DEFAULT parameters per effect kind. Owns a
     runtime-global `OnceLock<RwLock<HashMap<discriminator, Value>>>` store (seeded at
@@ -787,16 +843,83 @@ saving, and export.
   overlay kind, placement/deform data, render data, and mask clipping state.
 - Render parameters are serialized through JSON-compatible names that are parsed in
   both `panel.rs` and `tab.rs`; keep enum string mappings synchronized when extending
-  `TextRenderParams`. The persisted `text_params` carry `font_label`, legacy `font_path`,
-  and the newer `font_original_name` (real family/name). On read, the font NAME for the
-  renderer is derived `font_label || font_family || font || font_path stem`; `font_path`
-  is kept only for back-compat and PSD; PSD export prefers `font_original_name`.
+  `TextRenderParams`.
+
+### Persisted `text_params` schema
+- **One owner**: `panel/text_params_schema.rs` owns `TEXT_PARAMS_SCHEMA_VERSION`, the FROZEN
+  per-version default set, `write_text_params` (writer) and `read_text_params` (reader).
+  Nothing else may decide what an absent key means.
+- **Schema 2** (current, written by `panel/create_render_data.rs`): the font is named ONCE, by
+  IDENTITY, under `font`; `font_path` / `font_label` / `font_original_name` / `font_family` are
+  never written. Any value equal to its frozen default is OMITTED (`text`, `width_px` and `font`
+  are always written, so the small direct readers stay correct); an empty `effects` array is
+  omitted; the dead keys `strict_shape_fit` / `aggressive_word_breaks` are dropped. Real data
+  shrinks ~1600 B → ~350 B per payload.
+- **Reading order**: every reader (`tab/codec.rs`, `panel/create_apply.rs`, `psd_export.rs`) first
+  calls `read_text_params`, which fills the defaults of the schema the DOCUMENT declares. A
+  document with no `schema` key is schema 1 and is handed through untouched, because its absent
+  keys mean the LEGACY defaults (e.g. `line_placement_reference` = `glyph_height`,
+  `trim_extra_spaces`/`hanging_punctuation`/`replace_ellipsis_with_dots` = off,
+  `text_shape` = `rectangle`, `line_spacing` = 50 %), not today's. The font name of a schema-1
+  payload is resolved through the historical chain `font_original_name → font_label →
+  font_family → font → file stem of font_path`, every form of which is still a READ-ONLY
+  provider/panel alias. That chain is kept FOREVER — old projects must keep opening. It has ONE
+  owner, `text_params_schema::legacy_font_name_candidates`, so the codec (which converts) and
+  the PSD export (which names the font for Photoshop) cannot drift apart; both take the FIRST
+  entry when they need a single name, and the conversion walks the whole list.
+- **The load-time normalizer is a WHITELIST.** `codec::normalize_text_params_object` (schema-1
+  entries only — it passes a schema-2 payload through verbatim) rebuilds `text_params` key by
+  key, so a stored key missing from BOTH its `json!` literal and its verbatim pass-through list
+  is destroyed on load, and the conversion then writes that loss back permanently. Every frozen
+  schema-2 key must appear in one half or the other; `normalization_preserves_every_schema_two_key`
+  (`tab/tests.rs`) enforces it.
+- **Conversion**: `codec::upgrade_text_params_to_v2` converts a schema-1 payload in memory
+  (folding the legacy `*_px`/`*_percent` pairs into their token key — LOSSLESSLY, via
+  `PxOrPercent::to_token_lossless`, since the token then becomes the only copy — and
+  materializing every field whose schema-1 absent-meaning differs from the frozen default, so
+  nothing re-renders differently). `TypingTextOverlayLayer::convert_legacy_text_params_to_v2`,
+  called each frame from the tab with the panel's legacy resolver, applies it to the resident
+  overlays, writes it into the doc node and marks the layer dirty — the NORMAL deferred save
+  writes it. An already schema-2 project is never touched, so opening it writes nothing; a
+  conversion no doc node accepted marks nothing either (`route_to_doc_reporting`).
+- **SAFETY RULE (non-negotiable)**: when the legacy font reference does NOT resolve (the font is
+  not installed) the payload is left completely untouched and the layer keeps its legacy keys.
+  The conversion may never destroy the only surviving record of which font the text was set in.
+- **SAFETY RULE D (non-negotiable)**: the conversion resolves by NAME; a stored `font_path` is a
+  weak hint and never evidence. Each name of the chain is offered to the resolver ALONE and in
+  order (the panel's resolver gives a supplied path absolute priority, so passing both would let
+  the path decide); the first that matches supplies the identity. A layer whose names all fail
+  while its PATH still resolves is NOT converted — the file at that path may be a different font
+  today, and converting would write that font's identity and delete the legacy keys. Such a layer
+  keeps its keys verbatim and is reported once as needing the user's attention
+  (`TextParamsUpgrade::PathOnlyFont`). Nothing is lost by refusing: rendering resolves a v1 layer
+  by name too, so a payload whose names do not resolve does not render either way.
+- **PSD export** takes the Photoshop font name from the identity: the export job carries a
+  `FontPostScriptNames` snapshot (`identity → PostScript name per face`) built by the panel at
+  dispatch, so the exporter no longer opens each font file twice per text layer. Which STORED key
+  supplies that identity is decided by the document's OWN schema, exactly as in the codec: schema
+  2 reads `font` and nothing else (a stale legacy key may not override it), schema 1 walks the
+  historical chain above.
+  - **FORMAT LIMITATION, REPORTED — not fixable.** A `.psd` records a text layer's font by
+    NAME; our identity discriminates by CONTENT. Two installed files declaring one PostScript
+    name with different bytes are two fonts here (`X%1111…` / `X%9999…`) and the baked raster
+    uses the selected one's bytes, but both go into the PSD as the bare `X`, so Photoshop may
+    bind the EDITABLE layer to the other file. The export is honest about it rather than
+    silent: the name is still written (losing the font is worse than an ambiguous name), the
+    ambiguity is logged with the page, the identity, the written name and the claimant count,
+    and it reaches the user as a warning under the export success line
+    (`psd_export::AmbiguousExportFont` → `TypingExportResult.warnings` →
+    `TypingExportUiStatus::Success.warnings`, deduplicated per PostScript name across pages).
+    PNG export produces no warnings — it bakes pixels and names no font.
 - Font discovery is CONFIG-DRIVEN: the font list is the project/app `fonts` folder PLUS the
-  user-curated imported system-font FILE paths. `TextTab.imported_system_fonts` persists those
-  paths (a JSON array of strings), owned at runtime by `panel/font_settings_store.rs`; the
-  create/edit panels snapshot them and reload the list live when the store changes. There is no
-  "use system fonts" flag — the whole-OS enumerator (`fonts::load_system_fonts`) is used only by
-  the settings font-import picker.
+  user-imported system fonts. Those are persisted in `fonts/fonts_data.json` under `system_fonts`
+  BY NAME (PostScript name) with a `last_path` byte-source hint, owned at runtime by
+  `panel/font_settings_store.rs`; the create/edit panels snapshot the hints and reload the list
+  live when the store changes. The legacy `TextTab.imported_system_fonts` key is READ once, for
+  the first-run migration, and never written again. An imported font whose hint no longer holds
+  it is LOCATED BY NAME among the installed fonts and the hint is rewritten. There is no
+  "use system fonts" flag — the whole-OS enumerator (`fonts::load_system_fonts`) is used by the
+  settings font-import picker, which also refreshes the by-name index.
 - Shared state enters through `set_bubbles_model` and `set_overlays_model`; typing must
   not duplicate ownership of project bubbles or clean overlays.
 - **`BubbleClass::Hint` bubbles are never a text source in this tab.** A hint is an author note,

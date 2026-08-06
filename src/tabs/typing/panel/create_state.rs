@@ -7,12 +7,23 @@ create-panel lifecycle/construction, focus and eyedropper tracking, font-group
 management, and font-index lookup helpers.
 
 Main responsibilities:
-- construct the create-panel state and (re)load fonts and font groups;
+- construct the create-panel state with an EMPTY font list — the constructor reads no
+  font file at all (CLAUDE.md §5); the list arrives from a background load;
 - track focused text inputs and eyedropper activation per frame;
 - manage the selected font group and pending group requests;
 - spawn and poll background font reloads (folder fonts + imported system-font paths),
   picking up live settings-side import/remove via `poll_font_settings_changes`;
-- resolve fonts by key, index, path, or label and filter them by group.
+- resolve fonts by IDENTITY (the one selection key) and, on the legacy READ path
+  only, by a persisted path/name reference; filter fonts by group.
+
+Key functions:
+- `TypingCreatePanelState::new` — construction; no font I/O.
+- `spawn_shared_font_reload` (free fn) — ONE background load serving BOTH panels.
+- `TypingCreatePanelState::poll_font_reload_results` — installs a finished load,
+  performs the INITIAL selection, marks the list authoritative and releases whatever
+  was waiting for it (the one-shot legacy-preset migration).
+- `panel_fonts_dir` / `set_test_fonts_dir` — the fonts directory a panel binds to;
+  injectable under `#[cfg(test)]`, and never the checkout's own `fonts/` there.
 
 Notes:
 Extracted verbatim from `panel.rs`. Methods are `pub(super)` so sibling child
@@ -22,49 +33,90 @@ module's types and imports.
 
 use super::*;
 
+/// Fonts directory a freshly constructed panel binds to.
+///
+/// In a normal build this is `fonts::resolve_fonts_dir()`. Under `#[cfg(test)]` it is an
+/// INJECTED directory (`set_test_fonts_dir`), defaulting to a per-thread path that does not
+/// exist: a unit test must never depend on — or be timed by — whatever font bundle happens
+/// to sit next to the developer's checkout. Tests that DO want real font files create a temp
+/// dir, copy the fixtures they need into it, and inject that.
+#[must_use]
+fn panel_fonts_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        test_fonts_dir_override().unwrap_or_else(|| {
+            // A path that is deliberately absent: every loader treats a missing fonts dir
+            // as "no fonts", which is the state these tests want and already support.
+            std::env::temp_dir().join("manhwastudio-tests-no-fonts-dir")
+        })
+    }
+    #[cfg(not(test))]
+    {
+        resolve_fonts_dir()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-THREAD so parallel tests cannot see each other's injection.
+    static TEST_FONTS_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Reads this thread's injected panel fonts directory, if any.
+#[cfg(test)]
+fn test_fonts_dir_override() -> Option<PathBuf> {
+    TEST_FONTS_DIR.with(|dir| dir.borrow().clone())
+}
+
+/// Points every panel constructed on THIS thread at `dir` (`None` restores the
+/// nonexistent default). Test-only; the production panel always resolves the real
+/// `fonts/` directory.
+#[cfg(test)]
+pub(super) fn set_test_fonts_dir(dir: Option<PathBuf>) {
+    TEST_FONTS_DIR.with(|slot| *slot.borrow_mut() = dir);
+}
+
 impl TypingCreatePanelState {
+    /// Builds a create/edit panel whose font list is EMPTY and is filled by a background
+    /// load the caller starts (`spawn_shared_font_reload`, or this panel's own
+    /// `spawn_font_reload`).
+    ///
+    /// NOTHING here touches the font directory. Scanning, reading, hashing and parsing
+    /// every font file is exactly the work CLAUDE.md §5 forbids on the GUI thread, and the
+    /// constructor used to do it TWICE per session (once per panel). The empty list is an
+    /// already-supported state: the combo shows nothing, the status line says the list is
+    /// loading, and `poll_font_reload_results` performs the initial selection when the
+    /// list lands.
     pub(super) fn new(preview_enabled: bool) -> Self {
-        let fonts_dir = resolve_fonts_dir();
+        let fonts_dir = panel_fonts_dir();
         // Snapshot the runtime-global imported system-font paths (seeded at startup from
-        // config). The initial `fonts` list holds only the folder fonts; when there are
-        // imported paths an initial `spawn_font_reload` at the end merges them in off-thread.
+        // config), so the background load merges exactly what the store knows now.
         let imported_system_fonts = super::font_settings_store::imported_system_fonts();
         let imported_fonts_revision = super::font_settings_store::imported_fonts_revision();
-        let mut fonts = load_fonts_from_dir(&fonts_dir);
-        // The bundled-stack entry belongs to the PANEL list only, and `load_fonts_from_dir`
-        // also serves the settings font-administration list, so it is injected here (and in
-        // `load_fonts` for the reload worker) rather than inside the loader.
+        // The bundled-stack entry belongs to the PANEL list only (the settings
+        // font-administration list must not get it), so it is injected here and again by
+        // `load_fonts` in the reload worker. It carries `'static` bytes and reads no file,
+        // so it is the one entry a fresh panel may already hold.
+        let mut fonts: Vec<FontEntry> = Vec::new();
         prepend_bundled_ui_font(&mut fonts);
-        // Inject the user-defined virtual font groups into the finalized (folder-only)
-        // list. Members referencing an imported system font do not resolve yet — the
-        // initial list holds only folder fonts — so they are skipped here; the group name
-        // still appears, and the trailing `spawn_font_reload` re-injects against the full
-        // combined list once the imported fonts are merged in.
-        let real_font_groups = load_font_groups(&fonts_dir);
-        let virtual_groups = super::font_settings_store::virtual_groups();
-        let font_groups =
-            apply_virtual_groups(&mut fonts, &real_font_groups, &virtual_groups, &fonts_dir);
-        let presets_by_name = if preview_enabled {
-            load_text_tab_create_presets()
-        } else {
-            HashMap::new()
-        };
+        // Font groups (real folder groups + virtual ones) arrive with the same background
+        // load; an empty list means "no group filter offered yet", which the combo already
+        // renders correctly.
+        let font_groups: Vec<String> = Vec::new();
+        // Presets live in `fonts/presets.json` and belong to the CREATE panel only. Reading
+        // that document (and the legacy `user_config.json` payload behind a pending one-shot
+        // migration) is file I/O, so it runs on a worker and lands through
+        // `poll_preset_store_events`; the panel simply starts empty.
+        let (preset_store_tx, preset_store_rx) = mpsc::channel::<PresetStoreEvent>();
+        if preview_enabled {
+            super::create_presets::spawn_presets_seed(&fonts_dir, &preset_store_tx);
+        }
         let formula_presets_by_name = load_text_tab_formula_presets();
         let (request_tx, result_rx) = spawn_preview_render_worker();
-        let status_line = if fonts.is_empty() {
-            tf!("typing.errors.no_fonts_found", fonts_dir = fonts_dir.display())
-        } else {
-            t!("typing.preview.ready_status").to_string()
-        };
+        // The list is not loaded yet, so the honest status is "loading", not "no fonts".
+        let status_line = t!("typing.fonts.reloading_status").to_string();
         let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
-        // The built-in interface font heads the list for discoverability, but it must
-        // not become the DEFAULT font of a fresh panel: keep the historical default
-        // (the first of the user's OWN fonts), and fall back to index 0 — i.e. the
-        // built-in entry — only when the user has no fonts at all.
-        let default_font_idx = fonts
-            .iter()
-            .position(|font| font.bundled_stack_font().is_none())
-            .unwrap_or(0);
         let mut state = Self {
             fonts_dir,
             fonts,
@@ -78,18 +130,21 @@ impl TypingCreatePanelState {
             font_reload_rx: None,
             latest_font_reload_token: 0,
             fonts_reload_in_flight: false,
-            combo_font_family_cache: HashMap::new(),
-            font_profiles_by_key: HashMap::new(),
-            active_font_key: None,
+            font_list_is_authoritative: false,
+            pending_legacy_presets_migration: None,
+            font_profiles_by_identity: FontProfileMemory::default(),
+            active_font_identity: None,
             missing_font: None,
-            presets_by_name,
+            presets_by_name: HashMap::new(),
+            preset_store_tx,
+            preset_store_rx,
             selected_preset_name: None,
             preset_name_input: String::new(),
             formula_presets_by_name,
             selected_formula_preset_name: None,
             formula_preset_name_input: String::new(),
             preview_enabled,
-            selected_font_idx: default_font_idx,
+            selected_font_idx: 0,
             selected_face_idx: 0,
             text: default_preview_text().to_string(),
             text_color: Color32::BLACK,
@@ -167,6 +222,8 @@ impl TypingCreatePanelState {
             advanced_form_preset: TextFormPreset::FreeNoTree,
             advanced_form_group: None,
             advanced_form_cache: None,
+            advanced_form_font: None,
+            advanced_form_font_request: None,
             formed_text: String::new(),
             advanced_text_show_formed: false,
             advanced_form_line_range: (0, 0),
@@ -180,14 +237,12 @@ impl TypingCreatePanelState {
             // until the user first opens its window.
             char_table: super::char_table::CharTableState::new(),
         };
-        state.active_font_key = state.current_font_key();
-        state.sync_current_font_profile_memory();
+        // No font has been CHOSEN yet — the list is still loading. Leaving this `None` is
+        // what tells `poll_font_reload_results` to perform the initial selection (the
+        // first of the user's OWN fonts) instead of "restoring" the bundled entry that
+        // happens to occupy index 0 in the meantime.
+        state.active_font_identity = None;
         state.sync_selected_formula_preset_by_layout();
-        // Merge the imported system fonts into the list off the GUI thread; only spawn when
-        // there are any, so an empty imported list does not trigger a redundant reload.
-        if !state.imported_system_fonts.is_empty() {
-            state.spawn_font_reload();
-        }
         state
     }
 
@@ -278,37 +333,48 @@ impl TypingCreatePanelState {
         true
     }
 
-    pub(super) fn spawn_font_reload(&mut self) {
+    /// Arms this panel for a background font reload and hands back the token the worker
+    /// must stamp its result with, plus the channel to send it on.
+    ///
+    /// Split out of [`Self::spawn_font_reload`] so ONE worker can serve BOTH panels
+    /// (see [`spawn_shared_font_reload`]): the token is per panel (a later reload of one
+    /// panel must still supersede this one for that panel only), the work is not.
+    fn arm_font_reload(&mut self) -> (u64, Sender<FontReloadResult>) {
         self.latest_font_reload_token = self.latest_font_reload_token.wrapping_add(1);
-        let token = self.latest_font_reload_token;
-        let fonts_dir = self.fonts_dir.clone();
-        let imported = self.imported_system_fonts.clone();
         let (tx, rx) = mpsc::channel::<FontReloadResult>();
         self.font_reload_rx = Some(rx);
         self.fonts_reload_in_flight = true;
         self.status_line = t!("typing.fonts.reloading_status").to_string();
+        (self.latest_font_reload_token, tx)
+    }
+
+    /// Reloads this panel's font list on a worker thread (folder fonts + imported system
+    /// fonts, groups, virtual groups). The result lands in `poll_font_reload_results`.
+    ///
+    /// Under `#[cfg(test)]` the body early-returns WITHOUT arming anything, so no unit test
+    /// scans the developer's real `fonts/` tree (or depends on what it contains); tests
+    /// drive the restore contract by handing `poll_font_reload_results` a list directly.
+    pub(super) fn spawn_font_reload(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        let (token, tx) = self.arm_font_reload();
+        let fonts_dir = self.fonts_dir.clone();
+        let imported = self.imported_system_fonts.clone();
         let _ = thread::Builder::new()
             .name("typing-font-reload-worker".to_string())
             .spawn(move || {
-                let mut fonts = load_fonts(fonts_dir.as_path(), &imported);
-                let real_font_groups = load_font_groups(fonts_dir.as_path());
-                // Read the process-global virtual groups off the GUI thread (cheap) and
-                // inject them into the freshly-loaded combined list.
-                let virtual_groups = super::font_settings_store::virtual_groups();
-                let font_groups = apply_virtual_groups(
-                    &mut fonts,
-                    &real_font_groups,
-                    &virtual_groups,
-                    fonts_dir.as_path(),
-                );
-                let _ = tx.send(FontReloadResult {
-                    token,
-                    fonts,
-                    font_groups,
-                });
+                let result = build_font_reload_result(token, &fonts_dir, &imported);
+                let _ = tx.send(result);
             });
     }
 
+    /// Installs a finished background font reload: the combined list, the group list, the
+    /// rebuilt provider, and the selection restored BY IDENTITY.
+    ///
+    /// Also the point where the list becomes AUTHORITATIVE, which releases anything that
+    /// had to wait for it — today the one-shot legacy-preset migration, whose font
+    /// references only resolve once the imported system fonts are in the list.
     pub(super) fn poll_font_reload_results(&mut self) {
         let Some(rx) = self.font_reload_rx.as_ref() else {
             return;
@@ -316,40 +382,118 @@ impl TypingCreatePanelState {
         match rx.try_recv() {
             Ok(result) => {
                 if result.token == self.latest_font_reload_token {
-                    let previous_font_key = self
-                        .active_font_key
-                        .clone()
-                        .or_else(|| self.current_font_key());
+                    // A panel that has never held a real list has nothing to RESTORE: the
+                    // only entry it can be sitting on is the synthetic bundled one, which
+                    // is not the historical default. `None` here routes the selection
+                    // through the initial-default branch below instead of "restoring" it.
+                    let previous_identity = if self.font_list_is_authoritative {
+                        self.active_font_identity
+                            .clone()
+                            .or_else(|| self.current_font_identity())
+                    } else {
+                        self.active_font_identity.clone()
+                    };
                     self.fonts = result.fonts;
                     // Rebuild the render font source from the new list so renders and
                     // inline `<font=...>` tags resolve against the reloaded fonts.
                     self.font_provider = Arc::new(TabFontProvider::from_fonts(&self.fonts));
+                    // The width-metric bytes were resolved by the PREVIOUS provider, so a
+                    // reload (a replaced, moved or re-imported font file) invalidates them
+                    // even when the identity is unchanged. Dropping them re-asks the new
+                    // provider; the form window falls back to per-character widths for the
+                    // frames in between, exactly as on first open.
+                    self.advanced_form_font = None;
+                    self.advanced_form_font_request = None;
                     self.font_groups = result.font_groups;
                     self.sync_selected_font_group();
-                    self.selected_font_idx = previous_font_key
+                    // Selection survives a reload BY IDENTITY. When the identity is gone
+                    // (the file was removed or its PostScript name changed), the panel
+                    // enters the honest `missing_font` state instead of guessing: the old
+                    // positional `min(idx, len - 1)` fallback silently handed the user a
+                    // DIFFERENT font under the same slot and re-rendered with it.
+                    let restored = previous_identity
                         .as_deref()
-                        .and_then(|font_key| self.find_font_idx_by_key(font_key))
-                        .unwrap_or_else(|| {
-                            self.selected_font_idx
-                                .min(self.fonts.len().saturating_sub(1))
-                        });
+                        .and_then(|identity| self.find_font_idx_by_identity(identity));
+                    match restored {
+                        Some(idx) => {
+                            self.selected_font_idx = idx;
+                            // The font is back: the block it caused must go with it,
+                            // otherwise the panel stays in the missing state forever.
+                            self.missing_font = None;
+                        }
+                        None => {
+                            if let Some(identity) = previous_identity.clone() {
+                                self.missing_font = Some(identity);
+                            } else {
+                                // Nothing was selected yet (this is the panel's FIRST
+                                // list): apply the historical default. The built-in
+                                // interface font heads the list for discoverability but
+                                // must not become the default, so pick the first of the
+                                // user's OWN fonts and fall back to index 0 — the built-in
+                                // entry — only when the user has none.
+                                self.selected_font_idx = self
+                                    .fonts
+                                    .iter()
+                                    .position(|font| font.bundled_stack_font().is_none())
+                                    .unwrap_or(0);
+                            }
+                            // Keep the index inside the list so the rest of the panel
+                            // (face combo, group filter) still has a valid anchor; the
+                            // `missing_font` flag is what blocks rendering.
+                            self.selected_font_idx = self
+                                .selected_font_idx
+                                .min(self.fonts.len().saturating_sub(1));
+                        }
+                    }
                     self.ensure_selected_font_in_group();
                     self.clamp_face_index();
-                    self.active_font_key = self.current_font_key();
+                    // The SOUGHT identity outlives a failed restore. Overwriting it with
+                    // `current_font_identity()` here would replace it with the identity of
+                    // the NEIGHBOUR the clamped index landed on, so the next reload — the
+                    // one where the user has put the font back — would restore that
+                    // neighbour instead of the font the panel is still waiting for.
+                    self.active_font_identity = match restored {
+                        Some(_) => self.current_font_identity(),
+                        None => previous_identity.clone().or_else(|| self.current_font_identity()),
+                    };
                     self.status_line = if self.fonts.is_empty() {
                         tf!("typing.errors.no_fonts_found_reload", arg = self.fonts_dir.display())
                     } else {
                         t!("typing.preview.ready_status").to_string()
                     };
-                    if self.preview_enabled
-                        && let Some(font_key) = self.current_font_key()
+                    // Profile memory follows the RESTORED font only. After a failed restore
+                    // the index points at a neighbour the user did not choose: applying its
+                    // profile would overwrite the panel with a stranger's parameters, and
+                    // `sync_current_font_profile_memory` would both store the missing font's
+                    // parameters under the neighbour's identity and re-anchor
+                    // `active_font_identity` to it — the very substitution `missing_font`
+                    // exists to prevent.
+                    if previous_identity.is_none() {
+                        // The panel's FIRST font: there is no earlier selection whose
+                        // parameters could be substituted, so only SEED the memory from the
+                        // panel's current parameters — exactly what the constructor did
+                        // before the font list moved off the GUI thread. Deliberately NOT
+                        // the "apply the persisted default" branch below: opening a panel is
+                        // not the user re-selecting the font, and applying it here would
+                        // change what a fresh panel shows.
+                        self.sync_current_font_profile_memory();
+                    } else if self.preview_enabled
+                        && restored.is_some()
+                        && let Some(identity) = self.current_font_identity()
                     {
-                        if let Some(profile) = self.font_profiles_by_key.get(&font_key).cloned() {
+                        if let Some(profile) = self.font_profiles_by_identity.get(&identity).cloned()
+                        {
                             self.apply_render_data_json_with_options(&profile, false);
                             self.clamp_face_index();
                         } else {
                             self.sync_current_font_profile_memory();
                         }
+                    }
+                    // The list is now the COMBINED one, so anything that had to wait for an
+                    // authoritative list may run.
+                    self.font_list_is_authoritative = true;
+                    if let Some(legacy) = self.pending_legacy_presets_migration.take() {
+                        self.finish_legacy_presets_migration(legacy);
                     }
                     self.queue_preview_render();
                 }
@@ -361,6 +505,19 @@ impl TypingCreatePanelState {
                 self.font_reload_rx = None;
                 self.fonts_reload_in_flight = false;
                 self.status_line = t!("typing.fonts.reload_error_status").to_string();
+                // A parked migration stays parked and is NOT run against the list this
+                // panel happens to hold: without the imported system fonts it would resolve
+                // none of their references, keep them verbatim and delete the legacy key.
+                // Nothing is lost — the legacy `user_config` payload is still there and the
+                // next launch retries the whole seed.
+                if self.pending_legacy_presets_migration.is_some() {
+                    crate::runtime_log::log_warn(
+                        "typing presets: the font reload failed, so the one-shot \
+                         user_config -> fonts/presets.json migration stays deferred; the \
+                         legacy keys are kept and the migration is retried on the next \
+                         launch.",
+                    );
+                }
             }
         }
     }
@@ -369,19 +526,18 @@ impl TypingCreatePanelState {
         self.fonts_reload_in_flight
     }
 
-    pub(super) fn current_font_key(&self) -> Option<String> {
-        self.font_key_by_idx(self.selected_font_idx)
-    }
-
-    pub(super) fn font_key_by_idx(&self, idx: usize) -> Option<String> {
-        self.fonts
-            .get(idx)
-            .map(|font| font.path.to_string_lossy().to_string())
+    /// IDENTITY of the currently selected font — the panel's one selection key.
+    ///
+    /// `None` only when `selected_font_idx` is out of range (an empty font list). The
+    /// value is the same string the renderer resolves and the document persists; a file
+    /// PATH is never a key (`dev-docs/font_identity_postscript_plan.md`).
+    pub(super) fn current_font_identity(&self) -> Option<String> {
+        self.font_identity_name_by_idx(self.selected_font_idx)
     }
 
     /// Canonical render/inline-tag IDENTITY name of the font at `idx`
-    /// (`render_identity_name`: the family name when unique in the list, the file-stem
-    /// label on a shared family). This is the value that reaches the renderer and is
+    /// (`render_identity_name`: the representative face's PostScript name, `%hash`-suffixed
+    /// only on a same-name/different-bytes contest). This is the value that reaches the renderer and is
     /// emitted in `<font=...>` tags — NOT a display string (use `font_display_label`
     /// for the UI).
     pub(super) fn font_identity_name_by_idx(&self, idx: usize) -> Option<String> {
@@ -407,10 +563,18 @@ impl TypingCreatePanelState {
         }
     }
 
-    pub(super) fn find_font_idx_by_key(&self, font_key: &str) -> Option<usize> {
+    /// Resolves a font by its IDENTITY (`FontEntry::render_identity_name`), compared
+    /// case-insensitively. This is the strict, non-legacy lookup: it accepts nothing but
+    /// the identity, so a stale selection key can never silently land on a different font.
+    /// Returns `None` when no loaded font carries that identity.
+    pub(super) fn find_font_idx_by_identity(&self, identity: &str) -> Option<usize> {
+        let identity_norm = fonts::normalize_font_identity(identity);
+        if identity_norm.is_empty() {
+            return None;
+        }
         self.fonts
             .iter()
-            .position(|font| font_matches_path(font, font_key))
+            .position(|font| font_matches_identity_name(font, &identity_norm))
     }
 
     pub(super) fn filtered_font_indices(&self) -> Vec<usize> {
@@ -461,95 +625,244 @@ impl TypingCreatePanelState {
         }
     }
 
-    /// Resolves a font by its persisted `font_path` (tried first) or a persisted
-    /// `font_name`/`font_label`, using the SAME precedence as `TabFontProvider` so the
-    /// combo's highlighted font is the one the renderer actually resolves for that name.
+    /// Resolves a reference persisted by an OLDER build — every stored NAME in order, then
+    /// the stored `font_path` — and reports WHICH KIND of evidence matched. THE ONLY
+    /// sanctioned place a path may take part in resolution.
     ///
-    /// Path lookup wins when it matches. Otherwise the name is matched in ordered,
-    /// whole-list passes: exact `identity_name` → original family name → file-stem label
-    /// → path stem, each pass scanning the full list before the next form is tried (the
-    /// provider keys identity first, then family, then label, then stem). This makes a
-    /// name that is one font's identity and another's alias resolve to the same font in
-    /// the panel and the provider. Returns `None` when neither form matches.
-    pub(super) fn find_font_idx_by_path_or_label(
+    /// **Names decide; a path never does.** Each candidate of `font_names` is offered to
+    /// [`Self::find_font_idx_by_name_forms`] (which accepts the identity and every legacy
+    /// alias) before the path is looked at, and a path-only hit comes back as
+    /// [`LegacyFontMatch::PathOnly`] so the caller can refuse to act on it. That is the
+    /// same rule the document conversion follows (`codec::upgrade_text_params_to_v2`,
+    /// safety rule D): a file that still sits at a remembered path is not proof that it is
+    /// the same font — replacing `dialogue.ttf` with another face used to make the panel
+    /// silently SELECT the new font, clear `missing_font`, and re-render the layer in it.
+    ///
+    /// Everything else in the panel keys on the identity alone; this helper exists for the
+    /// conversion/read path only — a legacy `render_data` blob, an old preset key, and an
+    /// inline `<font=…>` tag written before the identity became the PostScript name.
+    /// Returns `None` when neither form matches any loaded font.
+    pub(super) fn match_font_by_legacy_reference(
         &self,
         font_path: Option<&str>,
-        font_label: Option<&str>,
+        font_names: &[&str],
+    ) -> Option<LegacyFontMatch> {
+        for name in font_names {
+            if let Some(idx) = self.find_font_idx_by_name_forms(name) {
+                return Some(LegacyFontMatch::ByName(idx));
+            }
+        }
+        let path_raw = font_path?;
+        self.fonts
+            .iter()
+            .position(|font| font_matches_path(font, path_raw))
+            .map(LegacyFontMatch::PathOnly)
+    }
+
+    /// [`Self::match_font_by_legacy_reference`] for the callers that accept EITHER kind of
+    /// evidence: the codec's identity resolver (which is handed a path and a name
+    /// separately and classifies the outcome itself) and the preset profile-key ladder
+    /// (where the stored key is the only reference that ever existed, so refusing a path
+    /// would drop the profile entirely — it merely ranks below a name).
+    ///
+    /// A caller that SELECTS a font must use `match_font_by_legacy_reference` and reject
+    /// `PathOnly` instead.
+    pub(super) fn find_font_idx_by_legacy_reference(
+        &self,
+        font_path: Option<&str>,
+        font_name: Option<&str>,
     ) -> Option<usize> {
-        if let Some(path_raw) = font_path
-            && let Some(idx) = self
-                .fonts
+        let names: Vec<&str> = font_name.into_iter().collect();
+        self.match_font_by_legacy_reference(font_path, &names)
+            .map(LegacyFontMatch::font_idx)
+    }
+
+    /// Resolves a font NAME in every form `TabFontProvider` accepts, with the SAME
+    /// precedence, so the combo highlights exactly the font the renderer resolves.
+    ///
+    /// Ordered whole-list passes, mirroring `TabFontProvider::from_fonts`'s key insertion
+    /// order (each pass scans the full list before the next form is tried):
+    ///
+    /// 1. the collision-aware IDENTITY (`identity_name`) — the only non-legacy form;
+    /// 2. `fonts::BUNDLED_UI_FONT_LEGACY_IDENTITY` → the synthetic bundled entry;
+    /// 3. each font's own `{base}%{content hash}` stability alias;
+    /// 4. the bare (unsuffixed) base name, won by the LOWEST content hash, so a
+    ///    document written before the name became contested resolves the same way on
+    ///    both sides; reserved bundled spellings never fall back to a user font;
+    /// 5. the original family name, 6. the file-stem `label`, 7. the path stem.
+    ///
+    /// Forms 2-7 are READ-ONLY legacy aliases; nothing writes them any more. Returns
+    /// `None` for an empty name or no match.
+    pub(super) fn find_font_idx_by_name_forms(&self, font_name: &str) -> Option<usize> {
+        self.find_font_idx_by_name_forms_in(font_name, None)
+    }
+
+    /// [`Self::find_font_idx_by_name_forms`] restricted to `allowed` indices when given.
+    ///
+    /// The restriction applies per PASS, not after the fact: an in-group font matching a
+    /// weaker form still wins over an out-of-group font matching a stronger one, which is
+    /// what the group-preferring inline-tag lookup wants.
+    fn find_font_idx_by_name_forms_in(
+        &self,
+        font_name: &str,
+        allowed: Option<&[usize]>,
+    ) -> Option<usize> {
+        let name_norm = fonts::normalize_font_identity(font_name);
+        if name_norm.is_empty() {
+            return None;
+        }
+        // One candidate scope drives every pass, so the group restriction cannot drift
+        // between forms. The unrestricted case walks the list directly — this runs once
+        // per drawn frame for an inline `<font=…>` span, so it must not allocate.
+        let first = |predicate: &dyn Fn(&FontEntry) -> bool| match allowed {
+            Some(list) => list
                 .iter()
-                .position(|font| font_matches_path(font, path_raw))
+                .copied()
+                .find(|&idx| self.fonts.get(idx).is_some_and(predicate)),
+            None => self.fonts.iter().position(predicate),
+        };
+
+        if let Some(idx) = first(&|font| font_matches_identity_name(font, &name_norm)) {
+            return Some(idx);
+        }
+        if fonts::BUNDLED_UI_FONT_LEGACY_IDENTITY
+            .trim()
+            .eq_ignore_ascii_case(&name_norm)
+            && let Some(idx) = first(&|font| font.bundled_stack_font().is_some())
         {
             return Some(idx);
         }
-        if let Some(label_raw) = font_label {
-            let label_norm = label_raw.trim().to_ascii_lowercase();
-            if !label_norm.is_empty() {
-                return self.find_font_idx_by_label_norm(&label_norm);
-            }
+        if let Some(idx) = first(&|font| font_matches_own_hash_identity(font, &name_norm)) {
+            return Some(idx);
         }
-        None
+        // Bare contested name: the lowest content hash wins, deterministically and
+        // independently of list order (the index only breaks an exact hash tie).
+        let claims_base = |idx: usize| {
+            self.fonts
+                .get(idx)
+                .is_some_and(|font| font_matches_base_identity(font, &name_norm))
+        };
+        // `content_hash` is read through `get`, so an out-of-range index (only possible
+        // in the restricted case) sorts last instead of panicking.
+        let hash_of = |idx: usize| {
+            (
+                self.fonts.get(idx).map_or(u64::MAX, |font| font.content_hash),
+                idx,
+            )
+        };
+        let lowest_hash_claimant = match allowed {
+            Some(list) => list
+                .iter()
+                .copied()
+                .filter(|&idx| claims_base(idx))
+                .min_by_key(|&idx| hash_of(idx)),
+            None => (0..self.fonts.len())
+                .filter(|&idx| claims_base(idx))
+                .min_by_key(|&idx| hash_of(idx)),
+        };
+        if let Some(idx) = lowest_hash_claimant {
+            return Some(idx);
+        }
+        if let Some(idx) = first(&|font| font_matches_original_name(font, &name_norm)) {
+            return Some(idx);
+        }
+        if let Some(idx) = first(&|font| font_label_matches(font, &name_norm)) {
+            return Some(idx);
+        }
+        first(&|font| font_matches_stem(font, &name_norm))
     }
 
-    /// Resolves an already-normalized (trimmed, lowercased) font name to a font index
-    /// via ordered whole-list passes matching the provider's key precedence: exact
-    /// `identity_name`, then original family name, then file-stem label, then path stem.
-    /// `label_norm` must be non-empty. Returns the FIRST match in the earliest form.
-    pub(super) fn find_font_idx_by_label_norm(&self, label_norm: &str) -> Option<usize> {
-        self.fonts
-            .iter()
-            .position(|font| font_matches_identity_name(font, label_norm))
-            .or_else(|| {
-                self.fonts
-                    .iter()
-                    .position(|font| font_matches_original_name(font, label_norm))
-            })
-            .or_else(|| {
-                self.fonts
-                    .iter()
-                    .position(|font| font_label_matches(font, label_norm))
-            })
-            .or_else(|| {
-                self.fonts
-                    .iter()
-                    .position(|font| font_matches_stem(font, label_norm))
-            })
-    }
-
-    /// Resolves a font by its display label, PREFERRING a match among
-    /// `allowed_indices` (the active font group) before falling back to the whole
-    /// font list.
+    /// Resolves a font NAME, PREFERRING a match among `allowed_indices` (the active font
+    /// group) before falling back to the whole font list.
     ///
-    /// Inline `<font=…>` tags identify a font only by an ambiguous display label
-    /// (a file stem can appear both inside a group and globally, e.g. an imported
-    /// system font colliding with a group member). When a group is selected, the
-    /// in-group copy is the one the user sees and expects, so it must win; only
-    /// when no group member matches does this fall back to the global lookup.
-    /// Returns `None` when the label is empty or matches nothing. Path lookup is
-    /// intentionally NOT offered here — this resolves the label the way the combo
-    /// displays it.
+    /// Inline `<font=…>` tags may still carry an ambiguous legacy label (a file stem can
+    /// appear both inside a group and globally, e.g. an imported system font colliding
+    /// with a group member). When a group is selected, the in-group copy is the one the
+    /// user sees and expects, so it must win; only when no group member matches does this
+    /// fall back to the global lookup. Both steps use the provider-aligned form
+    /// precedence. Returns `None` when the name is empty or matches nothing. A path is
+    /// intentionally NOT accepted here — a tag never carried one.
     pub(super) fn find_font_idx_by_label_preferring_indices(
         &self,
         font_label: Option<&str>,
         allowed_indices: &[usize],
     ) -> Option<usize> {
-        let label_norm = font_label?.trim().to_ascii_lowercase();
-        if label_norm.is_empty() {
-            return None;
-        }
-        // Prefer an in-group copy so an ambiguous label resolves to the group
-        // member the user is actually looking at, not a same-named outsider.
-        if let Some(idx) = allowed_indices
-            .iter()
-            .copied()
-            .find(|&idx| self.fonts.get(idx).is_some_and(|font| font_matches_label(font, &label_norm)))
-        {
-            return Some(idx);
-        }
-        // Whole-list fallback uses the provider-aligned ordered precedence so an
-        // out-of-group name resolves to the same font the renderer would pick.
-        self.find_font_idx_by_label_norm(&label_norm)
+        let font_label = font_label?;
+        self.find_font_idx_by_name_forms_in(font_label, Some(allowed_indices))
+            .or_else(|| self.find_font_idx_by_name_forms(font_label))
+    }
+}
+
+/// Builds ONE background font-reload payload: the combined font list (folder fonts +
+/// imported system fonts, merged, sorted and identity-assigned), with the real folder
+/// groups and the user-defined virtual groups injected.
+///
+/// Free, and takes everything it needs by reference, so the SAME result can be produced
+/// once and delivered to both panels ([`spawn_shared_font_reload`]). Runs on a worker
+/// thread only: it reads, hashes and parses every font file.
+fn build_font_reload_result(
+    token: u64,
+    fonts_dir: &Path,
+    imported_system_paths: &[PathBuf],
+) -> FontReloadResult {
+    let mut fonts = load_fonts(fonts_dir, imported_system_paths);
+    let real_font_groups = load_font_groups(fonts_dir);
+    // Read the process-global virtual groups off the GUI thread (cheap) and inject them
+    // into the freshly-loaded combined list.
+    let virtual_groups = super::font_settings_store::virtual_groups();
+    let font_groups = apply_virtual_groups(&mut fonts, &real_font_groups, &virtual_groups);
+    FontReloadResult {
+        token,
+        fonts,
+        font_groups,
+    }
+}
+
+/// Starts the panels' INITIAL font load: ONE worker builds the list once and delivers a
+/// clone to each panel under that panel's own reload token.
+///
+/// Both panels resolve the same fonts dir and the same imported-font snapshot, so loading
+/// twice meant scanning, reading, hashing and parsing every font file twice for one
+/// startup. Cloning the finished list is a memcpy of already-parsed metadata; re-reading
+/// the files is I/O.
+///
+/// Each panel keeps its OWN token, so a later per-panel reload (a settings-side import, a
+/// typesetting-language change) still supersedes this one for that panel alone. Under
+/// `#[cfg(test)]` nothing is armed or spawned, for the same reason as
+/// [`TypingCreatePanelState::spawn_font_reload`].
+pub(super) fn spawn_shared_font_reload(
+    create_panel: &mut TypingCreatePanelState,
+    edit_panel: &mut TypingCreatePanelState,
+) {
+    if cfg!(test) {
+        return;
+    }
+    let fonts_dir = create_panel.fonts_dir.clone();
+    let imported = create_panel.imported_system_fonts.clone();
+    let (create_token, create_tx) = create_panel.arm_font_reload();
+    let (edit_token, edit_tx) = edit_panel.arm_font_reload();
+    let spawn_result = thread::Builder::new()
+        .name("typing-font-initial-load-worker".to_string())
+        .spawn(move || {
+            let result = build_font_reload_result(create_token, &fonts_dir, &imported);
+            let for_edit = FontReloadResult {
+                token: edit_token,
+                fonts: result.fonts.clone(),
+                font_groups: result.font_groups.clone(),
+            };
+            // A closed channel means the panel is already gone; there is nothing to hand
+            // the list to and nothing was modified, so the send result is deliberately
+            // ignored.
+            let _ = create_tx.send(result);
+            let _ = edit_tx.send(for_edit);
+        });
+    if let Err(err) = spawn_result {
+        // Both panels stay armed with a receiver nobody will ever send on, which
+        // `poll_font_reload_results` reports as a disconnected reload (a visible error
+        // status), so the failure cannot pass as an empty font folder.
+        crate::runtime_log::log_warn(format!(
+            "typing fonts: could not spawn the initial font-load worker; both panels stay \
+             without a font list until a reload is triggered again: {err}"
+        ));
     }
 }

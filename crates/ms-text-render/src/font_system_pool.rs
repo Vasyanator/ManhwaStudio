@@ -448,7 +448,7 @@ mod tests {
         with_leased_font_system,
     };
     use crate::font_provider::{FontContent, font_content_id};
-    use crate::font_registry::{load_font_content, load_selected_font_from_path};
+    use crate::font_registry::load_font_content;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -472,6 +472,14 @@ mod tests {
         }
     }
 
+    /// Reads the fixture and builds the `FontContent` a `FontProvider` would hand the
+    /// loader for it: the real bytes plus the content id derived from them.
+    fn fixture_content(font_path: &std::path::Path) -> Option<FontContent> {
+        let bytes = Arc::new(std::fs::read(font_path).ok()?);
+        let content_id = font_content_id(bytes.as_slice());
+        Some(content_with_id(&bytes, content_id))
+    }
+
     #[test]
     fn loading_same_file_twice_does_not_grow_faces() {
         let font_path = test_font_path();
@@ -490,12 +498,14 @@ mod tests {
         let mut system = font_base::new_render_font_system();
         let mut cache = FontFaceCache::new();
 
-        let first = load_selected_font_from_path(&mut system, &mut cache, &font_path, 0)
+        // The SAME content resolved twice, exactly as two renders of one font do.
+        let content = fixture_content(&font_path).expect("the fixture must be readable");
+        let first = load_font_content(&mut system, &mut cache, &content, 0)
             .expect("first font load should succeed");
         let faces_after_first = system.db().len();
         assert_eq!(cache.distinct_file_count(), 1, "one distinct file cached");
 
-        let second = load_selected_font_from_path(&mut system, &mut cache, &font_path, 0)
+        let second = load_font_content(&mut system, &mut cache, &content, 0)
             .expect("second font load should succeed");
         let faces_after_second = system.db().len();
 

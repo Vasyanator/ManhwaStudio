@@ -24,6 +24,15 @@ faux). Its `FontSystem` holds an empty fontdb plus the one selected font FILE, s
 the request is additionally gated by `metric_real_face_availability`: a face that
 file does not contain is never requested (cosmic-text would otherwise find no
 match at all and panic). See `panel/MODULE_README.md` for the fidelity trade-off.
+
+THE METRIC'S FONT BYTES ARE OBTAINED OFF THE GUI THREAD. `poll_advanced_form_font`
+dispatches a `FontProvider::resolve` (a cache miss is an `fs::read`, forbidden here —
+`CLAUDE.md` §5) and caches the result in `AdvancedFormFont`; the window enumerates
+with the coarse per-CHARACTER metric until it lands, and the arrival changes
+`AdvancedFormMetricSignature::font_content_id`, which is what rebuilds the form cache
+with real glyph widths. The same two-step shape as the on-canvas editor font
+(`tab/create_upload.rs`). The own-typeface PREVIEW of the form cards goes through
+`widgets::request_font_family`, which reads its file off-thread for the same reason.
 */
 
 use super::*;
@@ -871,15 +880,25 @@ impl TypingCreatePanelState {
     }
 
     /// Шрифт для отображения форм (тот же, что выбран в панели), или дефолтный.
-    pub(super) fn advanced_form_preview_font(&mut self, ctx: &egui::Context) -> egui::FontId {
+    ///
+    /// Пока байты выбранного шрифта читаются фоном (`widgets::request_font_family`),
+    /// возвращается интерфейсный шрифт — файл никогда не читается на GUI-потоке.
+    pub(super) fn advanced_form_preview_font(&self, ctx: &egui::Context) -> egui::FontId {
         const PREVIEW_FONT_SIZE_PX: f32 = 22.0;
         if let Some(font) = self.fonts.get(self.selected_font_idx) {
             let face_index = font
                 .faces
                 .get(self.selected_face_idx)
                 .map_or(0, |face| face.face_index);
+            // The path is only the BYTE SOURCE for the one-time egui registration; the
+            // identity plus the content hash are what the family name and the cache key
+            // are derived from (the hash expires a binding whose file was replaced).
             let path = font.path.clone();
-            if let Some(family) = self.ensure_combo_font_family(ctx, &path, face_index) {
+            let identity = font.render_identity_name();
+            let content_hash = font.content_hash();
+            if let crate::widgets::PreviewFontFamily::Ready(family) =
+                crate::widgets::request_font_family(ctx, &identity, content_hash, &path, face_index)
+            {
                 return egui::FontId::new(PREVIEW_FONT_SIZE_PX, family);
             }
         }
@@ -891,12 +910,120 @@ impl TypingCreatePanelState {
         forms::prepare_inline_no_break_text(&self.text)
     }
 
+    /// The font bytes the width metric may measure with RIGHT NOW: the ones the
+    /// background resolve produced for the currently selected font, or `None` while they
+    /// are on their way (or when that identity resolves to nothing).
+    ///
+    /// The bytes come from the panel's own `FontProvider`, i.e. from the SAME resolution
+    /// the renderer performs, so the metric can never measure a different file than the
+    /// one the page is drawn with.
+    fn advanced_form_font_content(&self) -> Option<&FontContent> {
+        let identity = self.fonts.get(self.selected_font_idx)?.render_identity_name();
+        let loaded = self.advanced_form_font.as_ref()?;
+        if loaded.identity != identity {
+            return None;
+        }
+        loaded.content.as_ref()
+    }
+
+    /// Starts (or picks up) the BACKGROUND resolve of the font the width metric measures
+    /// with, and returns whether the panel is still waiting for it.
+    ///
+    /// A `FontProvider::resolve` miss reads the font file, which must never happen on the
+    /// GUI thread (`CLAUDE.md` §5) — the same reason the on-canvas editor font goes
+    /// through `create_upload::request_editor_font`. Until the bytes arrive the form
+    /// window enumerates with the coarse per-CHARACTER metric; their arrival changes the
+    /// cache signature (`font_content_id`), which is what rebuilds the forms with real
+    /// glyph widths. Call once per frame while the window is open.
+    pub(super) fn poll_advanced_form_font(&mut self, ctx: &egui::Context) {
+        // 1. Pick up a finished resolve without blocking.
+        if let Some(request) = self.advanced_form_font_request.as_ref() {
+            match request.rx.try_recv() {
+                Ok(content) => {
+                    let identity = request.identity.clone();
+                    self.advanced_form_font_request = None;
+                    self.advanced_form_font = Some(AdvancedFormFont { identity, content });
+                }
+                Err(TryRecvError::Empty) => {
+                    // The worker schedules no frame of its own.
+                    ctx.request_repaint();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // The worker died without sending; remember the failure so the next
+                    // frame does not spawn another one for the same font.
+                    let identity = request.identity.clone();
+                    self.advanced_form_font_request = None;
+                    self.advanced_form_font = Some(AdvancedFormFont {
+                        identity,
+                        content: None,
+                    });
+                }
+            }
+        }
+
+        // 2. Ask for the current selection when nothing answers for it yet.
+        let Some(identity) = self
+            .fonts
+            .get(self.selected_font_idx)
+            .map(FontEntry::render_identity_name)
+        else {
+            return;
+        };
+        let answered = self
+            .advanced_form_font
+            .as_ref()
+            .is_some_and(|loaded| loaded.identity == identity);
+        let in_flight = self
+            .advanced_form_font_request
+            .as_ref()
+            .is_some_and(|request| request.identity == identity);
+        if answered || in_flight {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel::<Option<FontContent>>();
+        let provider = Arc::clone(&self.font_provider);
+        let worker_identity = identity.clone();
+        match thread::Builder::new()
+            .name("typing-form-metric-font".to_string())
+            .spawn(move || {
+                // A failed send only means the window was closed or the selection changed
+                // before the bytes arrived; the provider keeps them cached either way.
+                let _ = tx.send(provider.resolve(&worker_identity));
+            }) {
+            Ok(_handle) => {
+                self.advanced_form_font_request = Some(AdvancedFormFontRequest { identity, rx });
+                ctx.request_repaint();
+            }
+            Err(error) => {
+                // The window still works — it enumerates with per-character widths — but
+                // the reason must be diagnosable rather than silent.
+                self.advanced_form_font = Some(AdvancedFormFont {
+                    identity: identity.clone(),
+                    content: None,
+                });
+                crate::runtime_log::log_error(format!(
+                    "typing advanced forms: failed to spawn the width-metric font resolver; \
+                     the forms are enumerated with approximate per-character widths. \
+                     Font: {identity} Error: {error}"
+                ));
+            }
+        }
+    }
+
     /// От чего зависят пиксельные ширины глифов в окне форм.
+    ///
+    /// The font axis is its IDENTITY: two list entries that happen to share a FILE (the
+    /// built-in interface entry and a user import of `core[0]`) are measured against
+    /// different font databases, so they must not share a cache signature. The CONTENT
+    /// id of the resolved bytes is the second half of that axis — see the field.
     pub(super) fn advanced_form_metric_signature(&self) -> AdvancedFormMetricSignature {
         let font = self.fonts.get(self.selected_font_idx);
         AdvancedFormMetricSignature {
-            font_path: font.map(|font| font.path.to_string_lossy().to_string()),
-            bundled_ui_stack: font.is_some_and(|font| font.bundled_stack_font().is_some()),
+            font_identity: font.map(FontEntry::render_identity_name),
+            font_content_id: self
+                .advanced_form_font_content()
+                .map(|content| content.content_id),
             face_index: font
                 .and_then(|font| font.faces.get(self.selected_face_idx))
                 .map_or(0, |face| face.face_index),
@@ -916,12 +1043,17 @@ impl TypingCreatePanelState {
     }
 
     /// Строит попиксельную метрику ширины (`GlyphWidths`) выбранным шрифтом для
-    /// символов `source_text`. `None`, если шрифт не выбран/не читается — тогда
-    /// падаем на посимвольную метрику.
+    /// символов `source_text`. `None`, если шрифт не выбран или его байты ещё не
+    /// пришли/не читаются — тогда падаем на посимвольную метрику.
+    ///
+    /// БАЙТЫ БЕРУТСЯ ИЗ УЖЕ РАЗРЕШЁННОГО КЭША (`poll_advanced_form_font`), а не из файла:
+    /// эта функция вызывается на GUI-потоке из `rebuild_advanced_form_cache_if_needed`,
+    /// где чтение файла запрещено (`CLAUDE.md` §5).
     pub(super) fn build_advanced_form_glyph_widths(&self, source_text: &str) -> Option<forms::GlyphWidths> {
         // Единицы на em для замеров (должно совпадать с метрикой внутри forms).
         const METRIC_EM: f32 = 1000.0;
         let font = self.fonts.get(self.selected_font_idx)?;
+        let content = self.advanced_form_font_content()?;
         let face_index = font
             .faces
             .get(self.selected_face_idx)
@@ -934,9 +1066,10 @@ impl TypingCreatePanelState {
         // pooled (it deliberately avoids the system-font scan for metric-only
         // measurement), so the cache only satisfies the load API.
         let mut font_cache = FontFaceCache::new();
+        // The FACE index is the panel's selection, not the content's representative face:
+        // one file can hold several faces and the user picked one of them.
         let selected_face =
-            load_selected_font_from_path(&mut font_system, &mut font_cache, &path, face_index)
-                .ok()?;
+            load_font_content(&mut font_system, &mut font_cache, content, face_index).ok()?;
         let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
         attrs = selected_face.apply_to_attrs(attrs);
         // The metric must measure the SAME face the renderer draws, so the
@@ -1101,6 +1234,9 @@ impl TypingCreatePanelState {
         if !self.advanced_form_open {
             return false;
         }
+        // Before the cache check: the arrival of the bytes changes the metric signature,
+        // which is what makes the rebuild below switch to real glyph widths.
+        self.poll_advanced_form_font(ctx);
         self.rebuild_advanced_form_cache_if_needed();
         let font_id = self.advanced_form_preview_font(ctx);
         let current_preset = self.advanced_form_preset;

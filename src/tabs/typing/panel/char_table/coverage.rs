@@ -8,7 +8,8 @@ variant cell per font that can actually draw the symbol.
 
 Main responsibilities:
 - snapshot the panel font list into a thread-safe `(index, path, face_index)`
-  form plus a fingerprint of that list;
+  form (the path is the worker's BYTE SOURCE, never an identity) plus a
+  fingerprint of that list taken over the fonts' IDENTITIES;
 - compute, on a BACKGROUND thread, a `char -> Vec<font index>` map for the whole
   character table;
 - deliver the result over a channel the GUI thread polls, and skip the work
@@ -87,8 +88,20 @@ pub(super) struct CoverageJob {
 }
 
 impl CoverageJob {
-    /// Builds the stable fingerprint of a font list from identity, representative
-    /// file path, and representative face index.
+    /// Builds the stable fingerprint of a font list from each font's IDENTITY, the hash of
+    /// its CONTENT, and its representative face index.
+    ///
+    /// The file PATH is deliberately NOT part of it: a path is where the bytes are read
+    /// from, not what a font IS, so moving a font file between folders must not throw the
+    /// whole map away and re-read every font.
+    ///
+    /// The CONTENT HASH is part of it because the map is a statement about GLYPHS, and an
+    /// uncontested font keeps its identity when its file is replaced by a different
+    /// build under the same PostScript name — the identity only carries a `%hash` suffix
+    /// while two files contest one name. Without this component the table would keep
+    /// offering a character the font no longer draws. `0` (content unknown: the bundled
+    /// stack entry, an unreadable file) is a constant like any other hash here; those
+    /// entries are not probed anyway.
     #[must_use]
     fn fingerprint(fonts: &[FontEntry]) -> String {
         let mut out = String::with_capacity(fonts.len() * 16);
@@ -97,7 +110,7 @@ impl CoverageJob {
             append_font_fingerprint(
                 &mut out,
                 &font.render_identity_name(),
-                font.path(),
+                font.content_hash(),
                 font.representative_face_index(),
             );
         }
@@ -217,12 +230,14 @@ impl CoverageJob {
     }
 }
 
-/// Appends every font attribute that can change the computed glyph map.
-fn append_font_fingerprint(out: &mut String, identity: &str, path: &std::path::Path, face: usize) {
+/// Appends the identifying attributes of one font: its render IDENTITY, the hash of its
+/// file CONTENT, and the representative face index. Separators are the ASCII unit/record
+/// separators, which cannot occur in any of the values.
+fn append_font_fingerprint(out: &mut String, identity: &str, content_hash: u64, face: usize) {
     out.push('\u{1f}');
     out.push_str(identity);
     out.push('\u{1e}');
-    out.push_str(&path.to_string_lossy());
+    out.push_str(&content_hash.to_string());
     out.push('\u{1e}');
     out.push_str(&face.to_string());
 }
@@ -286,6 +301,34 @@ mod tests {
     /// so the test does not depend on the working directory.
     fn repo_path(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    /// Minimal single-face `FontEntry` fixture for the LIST fingerprint tests: only the
+    /// three values the fingerprint reads (identity, content hash, representative face)
+    /// plus the path, which it must ignore.
+    fn font_entry_for_tests(path: &str, identity: &str, content_hash: u64) -> FontEntry {
+        use crate::tabs::typing::panel::{FontEntryKind, FontFaceEntry, FontLanguageCoverage};
+
+        FontEntry {
+            kind: FontEntryKind::File,
+            label: identity.to_string(),
+            path: PathBuf::from(path),
+            alt_paths: Vec::new(),
+            groups: vec![None],
+            disambig: None,
+            faces: vec![FontFaceEntry {
+                label: "Face 0".to_string(),
+                face_index: 0,
+                post_script_name: identity.to_string(),
+            }],
+            coverage: FontLanguageCoverage::default(),
+            original_name: identity.to_string(),
+            post_script_name: identity.to_string(),
+            content_hash,
+            display_name: None,
+            identity_name: identity.to_string(),
+            virtual_group_aliases: std::collections::BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -356,25 +399,81 @@ mod tests {
         assert!(compute_coverage(&probes, &['A']).is_empty());
     }
 
+    /// The fingerprint tracks what a font IS (its identity + representative face) AND what
+    /// its bytes are, so a changed identity, face or CONTENT invalidates the map — and a
+    /// mere file MOVE, which changes nothing about the glyphs, does not.
     #[test]
-    fn fingerprint_changes_with_path_or_representative_face() {
+    fn fingerprint_changes_with_identity_content_or_representative_face() {
         let mut original = String::new();
-        append_font_fingerprint(&mut original, "Family", Path::new("/fonts/a.ttc"), 0);
-        let mut changed_path = String::new();
+        append_font_fingerprint(&mut original, "FamilyPS-Regular", 0x1122_3344_5566_7788, 0);
+        let mut changed_identity = String::new();
         append_font_fingerprint(
-            &mut changed_path,
-            "Family",
-            Path::new("/fonts/b.ttc"),
+            &mut changed_identity,
+            "FamilyPS-Italic",
+            0x1122_3344_5566_7788,
             0,
         );
         let mut changed_face = String::new();
-        append_font_fingerprint(
-            &mut changed_face,
-            "Family",
-            Path::new("/fonts/a.ttc"),
-            1,
-        );
-        assert_ne!(original, changed_path);
+        append_font_fingerprint(&mut changed_face, "FamilyPS-Regular", 0x1122_3344_5566_7788, 1);
+        assert_ne!(original, changed_identity);
         assert_ne!(original, changed_face);
+
+        // THE BYTE-SOURCE PROPERTY: an UNCONTESTED font keeps its PostScript name when its
+        // file is replaced by another build of the same font, so only the content hash can
+        // tell the coverage map that the glyph set may have changed.
+        let mut changed_content = String::new();
+        append_font_fingerprint(
+            &mut changed_content,
+            "FamilyPS-Regular",
+            0x9999_0000_0000_0001,
+            0,
+        );
+        assert_ne!(
+            original, changed_content,
+            "replacing the bytes behind one identity must invalidate the coverage map"
+        );
+
+        // Two fonts sharing a FILE STEM but not an identity must not fingerprint alike:
+        // keying on a path (or a stem) used to hide exactly that difference.
+        let mut same_stem_other_identity = String::new();
+        append_font_fingerprint(
+            &mut same_stem_other_identity,
+            "OtherPS-Regular",
+            0x1122_3344_5566_7788,
+            0,
+        );
+        assert_ne!(original, same_stem_other_identity);
+    }
+
+    /// The whole-list fingerprint must carry the per-font content discriminant too: a
+    /// panel list whose only change is the BYTES behind one identity has to look different,
+    /// otherwise `ensure` skips the recomputation and the table keeps offering a character
+    /// the font no longer draws.
+    #[test]
+    fn list_fingerprint_changes_when_the_bytes_behind_one_identity_change() {
+        let before = vec![font_entry_for_tests(
+            "/fonts/a.ttf",
+            "Alpha-Regular",
+            0x0000_0000_0000_0011,
+        )];
+        let after = vec![font_entry_for_tests(
+            "/fonts/a.ttf",
+            "Alpha-Regular",
+            0x0000_0000_0000_0022,
+        )];
+        assert_ne!(
+            CoverageJob::fingerprint(&before),
+            CoverageJob::fingerprint(&after)
+        );
+        // A file MOVE (same identity, same bytes) still must not invalidate anything.
+        let moved = vec![font_entry_for_tests(
+            "/fonts/moved/a.ttf",
+            "Alpha-Regular",
+            0x0000_0000_0000_0011,
+        )];
+        assert_eq!(
+            CoverageJob::fingerprint(&before),
+            CoverageJob::fingerprint(&moved)
+        );
     }
 }

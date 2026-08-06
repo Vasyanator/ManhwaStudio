@@ -37,12 +37,15 @@ the imported-fonts store, display-name overrides, and the opaque `FontEntry` typ
 own-typeface registration reuses the shared `crate::widgets` font-preview helpers. Font
 enumeration is HEAVY, so both the category lists and the system-font catalog are built on
 background threads and delivered over `mpsc` channels; the GUI only polls. Registering a
-font into egui inherently needs its bytes, so per-visible-font one-time file reads happen on
-the GUI thread; the heavy enumeration never does.
+font into egui inherently needs its bytes, but READING them does not happen here either:
+`widgets::request_font_family` queues the read on its own worker threads and the row draws
+in the interface font for those frames.
 */
 
 use crate::tabs::typing::font_admin::{self, FontEntry};
-use crate::widgets::{combo_font_family_name, ensure_font_family, is_font_family_bound};
+use crate::widgets::{
+    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
+};
 use ms_thread as thread;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -72,8 +75,11 @@ const CATEGORY_VISIBLE_ROWS: f32 = 10.0;
 struct FontCategories {
     /// Fonts discovered in the project `fonts/` folder.
     folder: Vec<FontEntry>,
-    /// User-imported system fonts (built from the store's file paths).
+    /// The LOADABLE imported system fonts, as list entries (for the group editor's pickers).
     imported: Vec<FontEntry>,
+    /// One row per stored imported system font — including the ones that could not be loaded,
+    /// which is what makes an unavailable import visible and removable.
+    imported_rows: Vec<font_admin::ImportedFontRow>,
     /// Custom (virtual) fonts. Not supported yet; always empty.
     custom: Vec<FontEntry>,
     /// Real folder-group names under `fonts/groups/`, enumerated in this same off-thread pass
@@ -101,8 +107,9 @@ pub(crate) struct FontSettingsEditorState {
     picker_catalog_rx: Option<mpsc::Receiver<Vec<FontEntry>>>,
     /// Case-insensitive search filter for the picker.
     picker_search: String,
-    /// Selected font FILE path in the picker (survives filtering).
-    picker_selected: Option<PathBuf>,
+    /// IDENTITY of the font selected in the picker (survives filtering). The row is
+    /// identified by what gets STORED on import, not by its file path.
+    picker_selected: Option<String>,
     /// egui family names the picker has previewed in their own typeface this open session.
     /// Bounds one-time `add_font` growth via `PICKER_PREVIEW_FONT_CAP`; cleared on close.
     picker_preview_families: HashSet<String>,
@@ -213,11 +220,11 @@ impl FontSettingsEditorState {
                 }
             });
 
-        egui::CollapsingHeader::new(tf!("typing.font_settings.imported_fonts_header", cats = cats.imported.len()))
+        egui::CollapsingHeader::new(tf!("typing.font_settings.imported_fonts_header", cats = cats.imported_rows.len()))
         .id_salt("font_settings_imported")
         .default_open(false)
         .show(ui, |ui| {
-            if cats.imported.is_empty() {
+            if cats.imported_rows.is_empty() {
                 ui.small(t!("typing.font_settings.imported_empty_hint"));
             } else {
                 // Virtualized like the folder list; each row additionally carries a remove
@@ -228,9 +235,9 @@ impl FontSettingsEditorState {
                     .id_salt("font_settings_imported_rows")
                     .max_height(row_height * CATEGORY_VISIBLE_ROWS)
                     .auto_shrink([false, true])
-                    .show_rows(ui, row_height, cats.imported.len(), |ui, range| {
-                        for row in range {
-                            let Some(font) = cats.imported.get(row) else {
+                    .show_rows(ui, row_height, cats.imported_rows.len(), |ui, range| {
+                        for index in range {
+                            let Some(row) = cats.imported_rows.get(index) else {
                                 continue;
                             };
                             ui.horizontal(|ui| {
@@ -239,10 +246,21 @@ impl FontSettingsEditorState {
                                     .on_hover_text(t!("typing.font_settings.remove_imported_tooltip"))
                                     .clicked()
                                 {
-                                    font_admin::remove_imported_font(font.path());
+                                    // The STORED identity is the document key; the loaded
+                                    // entry's render identity may carry a collision suffix
+                                    // and would match nothing.
+                                    font_admin::remove_imported_font(&row.stored_identity);
                                 }
-                                if Self::draw_font_name_row(ui, font) {
-                                    to_open = Some(font.clone());
+                                match &row.font {
+                                    Some(font) => {
+                                        if Self::draw_font_name_row(ui, font) {
+                                            to_open = Some(font.clone());
+                                        }
+                                    }
+                                    // No file to render it with (and nothing to open): show
+                                    // what the document records plus the reason, so the user
+                                    // can recognize the entry they are about to remove.
+                                    None => Self::draw_unavailable_imported_row(ui, row),
                                 }
                             });
                         }
@@ -288,6 +306,66 @@ impl FontSettingsEditorState {
         )
     }
 
+    /// Draws the body of an imported-font row whose file could not be used this run.
+    ///
+    /// It shows the identity the DOCUMENT records — the only thing that still identifies the
+    /// font — greyed, plus a short reason, with the recorded path and the technical detail in
+    /// the hover text. The row has no properties window (there is no file to inspect) but it
+    /// keeps its remove button, which is the whole reason it is drawn at all.
+    fn draw_unavailable_imported_row(ui: &mut egui::Ui, row: &font_admin::ImportedFontRow) {
+        let name = if row.stored_identity.trim().is_empty() {
+            // A legacy entry whose name was never learned: the path is all we have.
+            row.last_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| t!("typing.font_settings.imported_unknown_font").to_string())
+        } else {
+            row.stored_identity.clone()
+        };
+        let (reason, detail) = match &row.unavailable {
+            Some(font_admin::ImportedFontUnavailability::NoPathHint) => (
+                t!("typing.font_settings.imported_unavailable_no_path").to_string(),
+                String::new(),
+            ),
+            Some(font_admin::ImportedFontUnavailability::Unreadable(error)) => (
+                t!("typing.font_settings.imported_unavailable_unreadable").to_string(),
+                error.clone(),
+            ),
+            Some(font_admin::ImportedFontUnavailability::Unparsable) => (
+                t!("typing.font_settings.imported_unavailable_unparsable").to_string(),
+                String::new(),
+            ),
+            Some(font_admin::ImportedFontUnavailability::NameMismatch { found }) => (
+                tf!("typing.font_settings.imported_unavailable_replaced", found = found),
+                String::new(),
+            ),
+            // Unreachable by construction (`font` is `None` exactly when `unavailable` is
+            // `Some`), but a row must still say something rather than render blank.
+            None => (
+                t!("typing.font_settings.imported_unavailable_unreadable").to_string(),
+                String::new(),
+            ),
+        };
+        let mut hover = row
+            .last_path
+            .as_ref()
+            .map(|path| tf!("typing.font_settings.properties_file", file = path.display()))
+            .unwrap_or_default();
+        if !detail.is_empty() {
+            if !hover.is_empty() {
+                hover.push('\n');
+            }
+            hover.push_str(&detail);
+        }
+        let response = ui.weak(clean_font_display_name(&name));
+        if hover.is_empty() {
+            response.on_hover_text(reason.clone());
+        } else {
+            response.on_hover_text(format!("{reason}\n{hover}"));
+        }
+        ui.small(reason);
+    }
+
     /// Draws a virtualized list of own-typeface font-name rows for a category. Only the rows
     /// currently visible are read and registered into egui per frame (egui `add_font` is
     /// non-evicting), so expanding a large `fonts/` folder no longer reads+registers all N
@@ -320,15 +398,25 @@ impl FontSettingsEditorState {
     }
 
     /// Draws one font's display name as a frameless BUTTON rendered in its OWN typeface, and
-    /// returns whether it was clicked (to open the font's properties window). Registers the
-    /// font's representative face into egui on first use (guarded by `is_font_family_bound`)
-    /// and always restores the previous style font override. Falls back to the default font
-    /// when the file cannot be registered; never panics.
+    /// returns whether it was clicked (to open the font's properties window). Asks
+    /// `widgets::font_preview` for the font's representative face and always restores the
+    /// previous style font override. Draws in the default UI font for the frames the font
+    /// file is still being read OFF the GUI thread, and permanently when it cannot be
+    /// registered; never panics.
     fn draw_font_name_row(ui: &mut egui::Ui, font: &FontEntry) -> bool {
         let rep_face = font.representative_face_index();
         let body_size = egui::TextStyle::Body.resolve(ui.style()).size;
         let prev_override = ui.style().override_font_id.clone();
-        if let Some(family) = ensure_font_family(ui.ctx(), font.path(), rep_face) {
+        // The font is IDENTIFIED by its identity and by the hash of its bytes (which
+        // expires the registration when the file behind that identity is replaced); the
+        // path is only the byte source.
+        if let PreviewFontFamily::Ready(family) = request_font_family(
+            ui.ctx(),
+            &font.render_identity_name(),
+            font.content_hash(),
+            font.path(),
+            rep_face,
+        ) {
             ui.style_mut().override_font_id = Some(egui::FontId::new(body_size, family));
         }
         // `display_label()` applies the user display-name override for presentation;
@@ -363,13 +451,15 @@ impl FontSettingsEditorState {
         match thread::Builder::new()
             .name("settings-load-font-categories".to_string())
             .spawn(move || {
-                let folder = font_admin::load_folder_fonts();
-                let imported = font_admin::load_imported_fonts();
+                // ONE combined pass: the folder and imported categories must carry the same
+                // identities the typing panel resolves, which only a merged list can assign.
+                let lists = font_admin::load_font_lists();
                 // Enumerated here (filesystem I/O) so the GUI thread never scans the groups dir.
                 let folder_group_names = font_admin::list_folder_group_names();
                 let snapshot = FontCategories {
-                    folder,
-                    imported,
+                    folder: lists.folder,
+                    imported: lists.imported,
+                    imported_rows: lists.imported_rows,
                     custom: Vec::new(),
                     folder_group_names,
                     loaded_revision: current_revision,
@@ -395,6 +485,7 @@ impl FontSettingsEditorState {
                 self.categories = Some(FontCategories {
                     folder: Vec::new(),
                     imported: Vec::new(),
+                    imported_rows: Vec::new(),
                     custom: Vec::new(),
                     folder_group_names,
                     loaded_revision: current_revision,
@@ -442,7 +533,9 @@ impl FontSettingsEditorState {
         let mut preview_families = std::mem::take(&mut self.picker_preview_families);
         let mut window_open = true;
         let mut close_requested = false;
-        let mut to_add: Option<PathBuf> = None;
+        // `(identity, path)`: importing is the one place a path is still an input — it is
+        // the byte-source hint stored beside the name.
+        let mut to_add: Option<(String, PathBuf)> = None;
 
         egui::Window::new(t!("typing.font_settings.import_window_title")).id(egui::Id::new("typing.font_settings.import_window_title"))
             .open(&mut window_open)
@@ -473,11 +566,11 @@ impl FontSettingsEditorState {
         // Always keep the catalog cached so reopening the picker is instant.
         self.picker_catalog = catalog;
 
-        if let Some(path) = to_add
-            && !font_admin::add_imported_font(path.clone())
+        if let Some((identity, path)) = to_add
+            && !font_admin::add_imported_font(&identity, path.clone())
         {
             crate::runtime_log::log_info(format!(
-                "[settings] system font already imported, skipping: {}",
+                "[settings] system font '{identity}' already imported, skipping: {}",
                 path.display()
             ));
         }
@@ -551,9 +644,9 @@ fn draw_picker_body(
     ui: &mut egui::Ui,
     fonts: &[FontEntry],
     search: &mut String,
-    selected: &mut Option<PathBuf>,
+    selected: &mut Option<String>,
     preview_families: &mut HashSet<String>,
-    to_add: &mut Option<PathBuf>,
+    to_add: &mut Option<(String, PathBuf)>,
     close_requested: &mut bool,
 ) {
     ui.horizontal(|ui| {
@@ -593,13 +686,21 @@ fn draw_picker_body(
                         continue;
                     };
                     let font = &fonts[font_idx];
-                    let is_selected = selected.as_deref() == Some(font.path());
+                    let identity = font.render_identity_name();
+                    let is_selected = selected.as_deref() == Some(identity.as_str());
                     let rep_face = font.representative_face_index();
                     // Preview this row in its own typeface only if the family is already bound,
                     // already previewed this session, or we are still under the cap. Beyond the
                     // cap we render in the default font: egui `add_font` never evicts, so an
                     // unbounded catalog scroll would otherwise leak hundreds of MB of atlases.
-                    let font_name = combo_font_family_name(font.path(), rep_face);
+                    // Most catalog entries carry the `0` "content unknown" hash (the picker
+                    // enumerates faces through `fontdb` without reading whole files), so their
+                    // key degenerates to `(identity, face)` — the documented sentinel behavior
+                    // of `combo_font_family_name`. `fonts::load_system_fonts` resolves a REAL
+                    // hash for the few identities two of its files contest, which is what keeps
+                    // those two rows from sharing one registration.
+                    let content_hash = font.content_hash();
+                    let font_name = combo_font_family_name(&identity, content_hash, rep_face);
                     let allow_own = is_font_family_bound(
                         ui.ctx(),
                         &egui::FontFamily::Name(font_name.clone().into()),
@@ -607,7 +708,13 @@ fn draw_picker_body(
                         || preview_families.len() < PICKER_PREVIEW_FONT_CAP;
                     let prev_override = ui.style().override_font_id.clone();
                     if allow_own
-                        && let Some(family) = ensure_font_family(ui.ctx(), font.path(), rep_face)
+                        && let PreviewFontFamily::Ready(family) = request_font_family(
+                            ui.ctx(),
+                            &identity,
+                            content_hash,
+                            font.path(),
+                            rep_face,
+                        )
                     {
                         ui.style_mut().override_font_id =
                             Some(egui::FontId::new(body_size, family));
@@ -617,7 +724,7 @@ fn draw_picker_body(
                         ui.selectable_label(is_selected, clean_font_display_name(font.display_label()));
                     ui.style_mut().override_font_id = prev_override;
                     if response.clicked() {
-                        *selected = Some(font.path().to_path_buf());
+                        *selected = Some(identity);
                     }
                 }
             });
@@ -625,15 +732,22 @@ fn draw_picker_body(
 
     ui.separator();
     let already_imported = selected
-        .as_ref()
-        .is_some_and(|path| font_admin::is_font_imported(path));
+        .as_deref()
+        .is_some_and(font_admin::is_font_imported);
     ui.horizontal(|ui| {
         let can_add = selected.is_some() && !already_imported;
         if ui
             .add_enabled(can_add, egui::Button::new(t!("typing.font_settings.add_button")))
             .clicked()
         {
-            *to_add = selected.clone();
+            // The selection is an IDENTITY; the catalog row it came from supplies the file
+            // path stored beside it as the byte-source hint.
+            *to_add = selected.as_ref().and_then(|identity| {
+                fonts
+                    .iter()
+                    .find(|font| font.render_identity_name() == *identity)
+                    .map(|font| (identity.clone(), font.path().to_path_buf()))
+            });
             *close_requested = true;
         }
         if ui.button(t!("typing.common.cancel_button")).clicked() {

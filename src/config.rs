@@ -1050,7 +1050,11 @@ pub fn user_config_defaults() -> Value {
                 crate::tabs::typing::rotation_ctrl_wheel::DEFAULT_ROTATION_CTRL_WHEEL_MODE
                     .as_config_str(),
             "effect_defaults": {},
-            "imported_system_fonts": [],
+            // NOTE: `imported_system_fonts` is deliberately NOT defaulted here any more.
+            // Imported system fonts live in `fonts/fonts_data.json`; the legacy key is
+            // read once (migration) and then DELETED by the preset migration
+            // (`panel/presets_store::drop_migrated_user_config_keys`). Materializing an
+            // empty default would resurrect the key on every launch and defeat that.
             // Character table ("Таблица символов"): the global favorite characters
             // (single-character strings, user order), the character cell size in
             // points, and the last selected tab (a stable, non-localized group key

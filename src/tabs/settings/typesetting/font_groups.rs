@@ -29,17 +29,19 @@ add-member picker render each font name in its OWN typeface, reusing the shared
 `crate::widgets::font_preview` registration helpers exactly like the import picker: only
 VISIBLE rows register (the lists are virtualized), and a per-window family cap
 (`PICKER_PREVIEW_FONT_CAP`) bounds egui's non-evicting font atlas — rows beyond the cap fall
-back to the default font. Registering a font inherently needs its bytes, so per-visible-font
-one-time file reads happen on the GUI thread (the heavy enumeration never does).
+back to the default font. The font FILES are read on `widgets::font_preview`'s own worker
+threads, never here — a row draws in the interface font until its bytes are registered.
 */
 
 use super::font_settings::{
     PICKER_PREVIEW_FONT_CAP, PREVIEW_ROW_HEIGHT_FACTOR, clean_font_display_name, font_row_matches,
 };
 use crate::tabs::typing::font_admin::{self, FontEntry, VirtualFontGroupInfo, VirtualFontGroupMemberInfo};
-use crate::widgets::{combo_font_family_name, ensure_font_family, is_font_family_bound};
+use crate::widgets::{
+    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
+};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Maximum height (points) of the virtualized member list before it scrolls internally.
 const MEMBER_LIST_MAX_HEIGHT: f32 = 240.0;
@@ -51,9 +53,30 @@ const ADD_PICKER_MAX_HEIGHT: f32 = 240.0;
 /// Width (points) of the per-member alias text field.
 const ALIAS_EDIT_WIDTH: f32 = 160.0;
 
-/// Member-name resolver: font file path → (cleaned display name, representative face index).
-/// The face index feeds the member row's own-typeface preview registration.
-type MemberResolver = HashMap<PathBuf, (String, usize)>;
+/// Member-name resolver: font IDENTITY → the data a member row needs to draw itself.
+///
+/// The KEY is the stored member identity (`FontEntry::render_identity_name`), the same value
+/// `fonts_data.json` records, so a member keeps resolving after its file is moved or
+/// renamed. A key that resolves to nothing is a font that is not currently loaded (or a
+/// stale legacy reference an unmigrated document still carries); its row is shown greyed and
+/// is never auto-removed.
+type MemberResolver = HashMap<String, MemberRowFont>;
+
+/// What a group-member row needs about its font: the cleaned display name, the font's
+/// CONTENT HASH and representative face index (together with the identity KEY, the
+/// own-typeface preview registration key) and its file PATH, which is only the byte source
+/// of that registration.
+#[derive(Debug, Clone)]
+struct MemberRowFont {
+    display_name: String,
+    /// `FontEntry::content_hash` — the byte discriminant of the preview registration, so a
+    /// replaced font file is not drawn from the bytes egui cached for the old one.
+    content_hash: u64,
+    rep_face: usize,
+    /// Where the font's bytes live; passed to `widgets::request_font_family` as the byte
+    /// source of the one-time registration and never used as a key.
+    path: std::path::PathBuf,
+}
 
 /// Editor for the "Группы" section: create/list/delete virtual groups plus the group-editor
 /// window. Caches the virtual-group snapshot and refreshes it when the shared font-config
@@ -286,7 +309,7 @@ impl FontGroupsEditorState {
         let alias_bufs = group
             .members
             .iter()
-            .map(|member| (member.path.clone(), member.alias.clone().unwrap_or_default()))
+            .map(|member| (member.font.clone(), member.alias.clone().unwrap_or_default()))
             .collect();
         self.editor = Some(GroupEditorState {
             group_name: group.name.clone(),
@@ -325,7 +348,7 @@ impl FontGroupsEditorState {
             .map(|group| group.members.clone())
             .unwrap_or_default();
 
-        // path -> (resolved display name, representative face index). The face index is kept so
+        // identity -> (resolved display name, representative face index). The face index is kept so
         // the member list can register the font in its OWN typeface (own-typeface preview) without
         // re-reaching the FontEntry per frame. Rebuilding this over folder+imported fonts every
         // frame (plus a String per font) is wasteful while the window stays open, so it is
@@ -339,12 +362,13 @@ impl FontGroupsEditorState {
         let resolver: MemberResolver = if needs_rebuild {
             let mut map: MemberResolver = HashMap::new();
             for font in folder_fonts.iter().chain(imported_fonts.iter()) {
-                map.entry(font.path().to_path_buf()).or_insert_with(|| {
-                    (
-                        clean_font_display_name(font.display_label()),
-                        font.representative_face_index(),
-                    )
-                });
+                map.entry(font.render_identity_name())
+                    .or_insert_with(|| MemberRowFont {
+                        display_name: clean_font_display_name(font.display_label()),
+                        content_hash: font.content_hash(),
+                        rep_face: font.representative_face_index(),
+                        path: font.path().to_path_buf(),
+                    });
             }
             map
         } else {
@@ -402,15 +426,15 @@ struct GroupEditorState {
     /// Localized validation error shown under the rename row, if any. Mirrors the create
     /// row's `create_error`: set on a rejected rename, cleared on success or a text edit.
     rename_error: Option<String>,
-    /// Per-member alias edit buffers, keyed by member font path.
-    alias_bufs: HashMap<PathBuf, String>,
+    /// Per-member alias edit buffers, keyed by member font IDENTITY.
+    alias_bufs: HashMap<String, String>,
     /// Whether the inline add-member picker is expanded.
     add_open: bool,
     /// Case-insensitive search filter for the add-member picker.
     add_search: String,
-    /// Selected candidate font path in the add-member picker.
-    add_selected: Option<PathBuf>,
-    /// Cached path→(display name, representative face index) resolver for the member list, keyed
+    /// IDENTITY of the selected candidate font in the add-member picker.
+    add_selected: Option<String>,
+    /// Cached identity→(display name, representative face index) resolver for the member list, keyed
     /// by the categories snapshot revision it was built from. Rebuilt only when that revision
     /// advances. The face index feeds the member row's own-typeface preview.
     resolver_cache: Option<(u64, MemberResolver)>,
@@ -539,9 +563,9 @@ impl GroupEditorState {
         }
 
         let group_name = self.group_name.clone();
-        // Deferred store actions (applied after the scroll closure).
-        let mut alias_to_apply: Option<(PathBuf, String)> = None;
-        let mut member_to_remove: Option<PathBuf> = None;
+        // Deferred store actions (applied after the scroll closure). Keyed by IDENTITY.
+        let mut alias_to_apply: Option<(String, String)> = None;
+        let mut member_to_remove: Option<String> = None;
 
         let body_size = egui::TextStyle::Body.resolve(ui.style()).size;
         // Own-typeface names can be taller than the default body; keep the alias field's
@@ -559,37 +583,35 @@ impl GroupEditorState {
                     // Lazily seed a buffer for members added after the window opened.
                     let buf = self
                         .alias_bufs
-                        .entry(member.path.clone())
+                        .entry(member.font.clone())
                         .or_insert_with(|| member.alias.clone().unwrap_or_default());
                     ui.horizontal(|ui| {
-                        match resolver.get(member.path.as_path()) {
-                            Some((name, face)) => {
+                        match resolver.get(member.font.as_str()) {
+                            Some(row_font) => {
                                 // Render the display name in the member font's own typeface,
                                 // registered on first VISIBLE use and bounded by the shared cap.
                                 let prev_override = ui.style().override_font_id.clone();
                                 if let Some(font_id) = own_typeface_font_id(
                                     ui.ctx(),
-                                    member.path.as_path(),
-                                    *face,
+                                    member.font.as_str(),
+                                    row_font.content_hash,
+                                    row_font.path.as_path(),
+                                    row_font.rep_face,
                                     body_size,
                                     &mut self.preview_families,
                                 ) {
                                     ui.style_mut().override_font_id = Some(font_id);
                                 }
-                                ui.label(name.as_str());
+                                ui.label(row_font.display_name.as_str());
                                 ui.style_mut().override_font_id = prev_override;
                             }
                             None => {
-                                // Keep the entry; just flag that its file is not currently
-                                // loaded (do NOT auto-remove it).
-                                let file_name = member
-                                    .path
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| {
-                                        member.path.to_string_lossy().into_owned()
-                                    });
-                                ui.add(egui::Label::new(egui::RichText::new(file_name).weak()))
+                                // Keep the entry; just flag that this font is not currently
+                                // loaded (do NOT auto-remove it). The stored identity is the
+                                // only thing left to show, and it is the clue the user needs.
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(member.font.as_str()).weak(),
+                                ))
                                     .on_hover_text(t!(
                                         "typing.font_settings.group_member_missing_hint"
                                     ));
@@ -599,7 +621,7 @@ impl GroupEditorState {
                             egui::TextEdit::singleline(buf)
                                 .id_salt((
                                     "typing.font_settings.group_member_alias_edit",
-                                    member.path.as_path(),
+                                    member.font.as_str(),
                                 ))
                                 .desired_width(ALIAS_EDIT_WIDTH)
                                 .hint_text(t!(
@@ -613,7 +635,7 @@ impl GroupEditorState {
                             .clicked()
                             || submitted
                         {
-                            alias_to_apply = Some((member.path.clone(), buf.clone()));
+                            alias_to_apply = Some((member.font.clone(), buf.clone()));
                         }
                         if ui
                             .small_button("✕")
@@ -622,13 +644,13 @@ impl GroupEditorState {
                             ))
                             .clicked()
                         {
-                            member_to_remove = Some(member.path.clone());
+                            member_to_remove = Some(member.font.clone());
                         }
                     });
                 }
             });
 
-        if let Some((path, alias)) = alias_to_apply {
+        if let Some((identity, alias)) = alias_to_apply {
             let trimmed = alias.trim();
             // Blank clears the alias (reset to the font's own label).
             let value = if trimmed.is_empty() {
@@ -636,11 +658,11 @@ impl GroupEditorState {
             } else {
                 Some(trimmed)
             };
-            font_admin::set_virtual_group_member_alias(&group_name, &path, value);
+            font_admin::set_virtual_group_member_alias(&group_name, &identity, value);
         }
-        if let Some(path) = member_to_remove {
-            font_admin::remove_virtual_group_member(&group_name, &path);
-            self.alias_bufs.remove(&path);
+        if let Some(identity) = member_to_remove {
+            font_admin::remove_virtual_group_member(&group_name, &identity);
+            self.alias_bufs.remove(&identity);
         }
     }
 
@@ -668,13 +690,13 @@ impl GroupEditorState {
             return;
         }
 
-        // Candidates = folder + imported fonts that are not already members.
-        let member_paths: HashSet<&Path> =
-            members.iter().map(|member| member.path.as_path()).collect();
+        // Candidates = folder + imported fonts that are not already members (by IDENTITY).
+        let member_identities: HashSet<&str> =
+            members.iter().map(|member| member.font.as_str()).collect();
         let candidates: Vec<&FontEntry> = folder_fonts
             .iter()
             .chain(imported_fonts.iter())
-            .filter(|font| !member_paths.contains(font.path()))
+            .filter(|font| !member_identities.contains(font.render_identity_name().as_str()))
             .collect();
 
         ui.label(t!("typing.font_settings.group_add_font_header"));
@@ -720,11 +742,14 @@ impl GroupEditorState {
                             continue;
                         };
                         let font = candidates[idx];
-                        let is_selected = self.add_selected.as_deref() == Some(font.path());
+                        let identity = font.render_identity_name();
+                        let is_selected = self.add_selected.as_deref() == Some(identity.as_str());
                         // Preview the candidate in its own typeface, bounded by the shared cap.
                         let prev_override = ui.style().override_font_id.clone();
                         if let Some(font_id) = own_typeface_font_id(
                             ui.ctx(),
+                            &identity,
+                            font.content_hash(),
                             font.path(),
                             font.representative_face_index(),
                             body_size,
@@ -740,7 +765,7 @@ impl GroupEditorState {
                             .clicked();
                         ui.style_mut().override_font_id = prev_override;
                         if clicked {
-                            self.add_selected = Some(font.path().to_path_buf());
+                            self.add_selected = Some(identity);
                         }
                     }
                 });
@@ -757,8 +782,8 @@ impl GroupEditorState {
                 )
                 .clicked()
             {
-                if let Some(path) = self.add_selected.clone() {
-                    font_admin::add_virtual_group_member(&group_name, &path);
+                if let Some(identity) = self.add_selected.clone() {
+                    font_admin::add_virtual_group_member(&group_name, &identity);
                 }
                 self.close_add_section();
             }
@@ -776,30 +801,43 @@ impl GroupEditorState {
     }
 }
 
-/// Returns the `FontId` to override the style with to preview the font at `(path, face)` in its
-/// OWN typeface, or `None` to keep the default font.
+/// Returns the `FontId` to override the style with to preview the font `identity` (whose bytes
+/// live at `path`, face `face`) in its OWN typeface, or `None` to keep the default font.
+///
+/// The font is IDENTIFIED by `identity` and by `content_hash` (the hash of its file's bytes,
+/// `0` when unknown): the registration and the per-window preview budget are keyed by both,
+/// while `path` is only where the bytes are read from on first use. The hash is what expires
+/// a binding whose file was replaced — egui never re-reads registered font data.
 ///
 /// Mirrors the import picker's registration discipline (`font_settings::draw_picker_body`):
 /// the family previews only if it is already bound, already previewed this window session, or
 /// still under `PICKER_PREVIEW_FONT_CAP` — egui's `add_font` never evicts, so an unbounded
-/// scroll would otherwise leak font atlases. On first eligible use it registers the font
-/// (reading its bytes on the GUI thread) and records the family in `preview_families`. Returns
-/// `None` (default font) beyond the cap or when the file cannot be registered; never panics.
+/// scroll would otherwise leak font atlases. On first eligible use it asks
+/// `widgets::font_preview` for the font (whose bytes are read OFF the GUI thread) and records
+/// the family in `preview_families`. Returns `None` (default font) beyond the cap, while the
+/// bytes are still on their way, and permanently when the font cannot be registered; never
+/// panics.
 fn own_typeface_font_id(
     ctx: &egui::Context,
+    identity: &str,
+    content_hash: u64,
     path: &Path,
     face: usize,
     body_size: f32,
     preview_families: &mut HashSet<String>,
 ) -> Option<egui::FontId> {
-    let font_name = combo_font_family_name(path, face);
+    let font_name = combo_font_family_name(identity, content_hash, face);
     let allow_own = is_font_family_bound(ctx, &egui::FontFamily::Name(font_name.clone().into()))
         || preview_families.contains(&font_name)
         || preview_families.len() < PICKER_PREVIEW_FONT_CAP;
     if !allow_own {
         return None;
     }
-    let family = ensure_font_family(ctx, path, face)?;
+    let PreviewFontFamily::Ready(family) =
+        request_font_family(ctx, identity, content_hash, path, face)
+    else {
+        return None;
+    };
     preview_families.insert(font_name);
     Some(egui::FontId::new(body_size, family))
 }

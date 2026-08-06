@@ -6,7 +6,8 @@ Free-function UI helpers extracted verbatim from panel.rs for the typing tab's
 create/edit panels.
 
 Main responsibilities:
-- font-family binding, deterministic combo naming, group/path matching;
+- font group membership plus the per-FORM font matchers (identity first, legacy
+  family/label/stem/`%hash`/path aliases) the panel's ordered resolver runs;
 - size-to-box fitting for previews;
 - horizontal wheel-scroll handling for parameter strips;
 - the px-or-percent parameter row and the wheel-step appliers (f32/u32/u8);
@@ -112,54 +113,97 @@ pub(super) fn font_in_group(font: &FontEntry, group: &str) -> bool {
     font.groups.iter().any(|g| g.as_deref() == Some(group))
 }
 
-/// Matches a font by ANY resolution form — collision-aware identity, original family
-/// name, display-independent file-stem label, OR path stem — case-insensitively.
+/// Matches a font by its COLLISION-AWARE render identity (`identity_name`) — the PRIMARY
+/// key of both the panel selection and `TabFontProvider`. `identity_norm` must be
+/// pre-trimmed and lowercased (`fonts::normalize_font_identity`).
 ///
-/// `label_norm` MUST already be trimmed and lowercased by the caller (so the
-/// comparison stays allocation-light across the whole font list). A persisted
-/// `font_name` / inline `<font=…>` tag now carries the render identity, but legacy
-/// data used the family name / label / stem — all must map back to a font index so a
-/// persisted name never spuriously reports `missing_font`. This union predicate is
-/// intentionally form-agnostic (order-insensitive); callers that must match the
-/// PROVIDER's precedence use `find_font_idx_by_label_norm`, which runs the per-form
-/// predicates below as ordered whole-list passes. The identity is always one of the
-/// family name or the label, so it is covered by this union without a separate arm.
-pub(super) fn font_matches_label(font: &FontEntry, label_norm: &str) -> bool {
-    font_matches_identity_name(font, label_norm)
-        || font_matches_original_name(font, label_norm)
-        || font_label_matches(font, label_norm)
-        || font_matches_stem(font, label_norm)
-}
-
-/// Matches a font by its COLLISION-AWARE render identity (`identity_name`), which the
-/// provider keys FIRST. `identity_norm` must be pre-trimmed and lowercased.
+/// Every OTHER predicate in this file is a READ-ONLY LEGACY alias matcher: it exists so
+/// data written by an older build still resolves, and it is reached only through
+/// `create_state::find_font_idx_by_name_forms`, which runs the same ordered passes the
+/// provider registers its keys in.
+///
+/// Every matcher here compares with `trim().eq_ignore_ascii_case(..)` rather than by
+/// building a normalized `String`: the caller already normalized the needle
+/// (`fonts::normalize_font_identity` = trim + ASCII lowercase), the two folds are the same
+/// ASCII fold, and the font combo resolves a name on EVERY frame it draws — an allocation
+/// per font per pass would be pure waste.
 pub(super) fn font_matches_identity_name(font: &FontEntry, identity_norm: &str) -> bool {
-    font.identity_name.trim().to_ascii_lowercase() == identity_norm
+    font.identity_name.trim().eq_ignore_ascii_case(identity_norm)
 }
 
-/// Matches a font by its original FAMILY name (the provider's second-precedence
-/// alias). `name_norm` must be pre-trimmed and lowercased.
+/// Matches a font by the `{base}{IDENTITY_HASH_SEPARATOR}{own content hash}` STABILITY
+/// alias the provider registers for EVERY real font (see `TabFontProvider::from_fonts`):
+/// a document written while the base name was contested must keep resolving after the
+/// other claimant is gone. `name_norm` must be pre-trimmed and lowercased. Never matches
+/// the synthetic bundled-stack entry, which stands for a chain of files and has no
+/// content hash.
+pub(super) fn font_matches_own_hash_identity(font: &FontEntry, name_norm: &str) -> bool {
+    // A name without the separator cannot be a suffixed form; checked first so the whole
+    // pass costs one byte scan per font in the overwhelmingly common case.
+    if !name_norm.contains(fonts::IDENTITY_HASH_SEPARATOR) || font.bundled_stack_font().is_some() {
+        return false;
+    }
+    let base = font.base_identity_str();
+    if base.trim().is_empty() {
+        return false;
+    }
+    fonts::suffixed_font_identity_name(base, font.content_hash)
+        .trim()
+        .eq_ignore_ascii_case(name_norm)
+}
+
+/// Matches a font by its UNSUFFIXED base identity (the bare PostScript name) — the form
+/// persisted before the name became contested. `name_norm` must be pre-trimmed and
+/// lowercased.
+///
+/// Never matches the bundled-stack entry or a reserved bundled-UI spelling: the reserved
+/// name must not fall back to a user font, exactly as in the provider's bare-name pass.
+/// Which of several claimants wins is decided by the CALLER (lowest content hash), not
+/// here.
+pub(super) fn font_matches_base_identity(font: &FontEntry, name_norm: &str) -> bool {
+    if font.bundled_stack_font().is_some() {
+        return false;
+    }
+    let base = font.base_identity_str().trim();
+    if base.is_empty() || !base.eq_ignore_ascii_case(name_norm) {
+        return false;
+    }
+    // Checked last: it only runs for a font that actually claims the name, and a reserved
+    // spelling must never fall back to a user font.
+    !fonts::is_reserved_bundled_identity(base)
+}
+
+/// Matches a font by its original FAMILY name (a legacy read alias). `name_norm` must be
+/// pre-trimmed and lowercased.
 pub(super) fn font_matches_original_name(font: &FontEntry, name_norm: &str) -> bool {
-    !name_norm.is_empty() && font.original_name.trim().to_ascii_lowercase() == name_norm
+    !name_norm.is_empty() && font.original_name.trim().eq_ignore_ascii_case(name_norm)
 }
 
-/// Matches a font by its display-independent file-stem `label` (the provider's
-/// third-precedence alias). `label_norm` must be pre-trimmed and lowercased.
+/// Matches a font by its display-independent file-stem `label` (a legacy read alias).
+/// `label_norm` must be pre-trimmed and lowercased.
 pub(super) fn font_label_matches(font: &FontEntry, label_norm: &str) -> bool {
-    font.label.trim().to_ascii_lowercase() == label_norm
+    font.label.trim().eq_ignore_ascii_case(label_norm)
 }
 
-/// Matches a font by its PATH file stem (the provider's last-precedence alias).
-/// `stem_norm` must be pre-trimmed and lowercased.
+/// Matches a font by its PATH file stem (the provider's last-precedence legacy alias).
+/// `stem_norm` must be pre-trimmed and lowercased. The bundled-stack entry deliberately
+/// claims no stem alias (its path is a shipped `fonts/ui` file), mirroring the provider.
 pub(super) fn font_matches_stem(font: &FontEntry, stem_norm: &str) -> bool {
+    if font.bundled_stack_font().is_some() {
+        return false;
+    }
     font.path
         .file_stem()
         .and_then(|v| v.to_str())
-        .map(|stem| stem.to_ascii_lowercase() == stem_norm)
-        .unwrap_or(false)
+        .is_some_and(|stem| stem.eq_ignore_ascii_case(stem_norm))
 }
 
 /// Совпадает ли `raw`-путь с представительным или альтернативным путём шрифта.
+///
+/// LEGACY READ PATH ONLY. A path is where a font's BYTES come from, never an identity:
+/// the only sanctioned caller is `create_state::find_font_idx_by_legacy_reference`, which
+/// resolves a `font_path` persisted by an older build. Nothing may key, cache, select or
+/// persist by path (`dev-docs/font_identity_postscript_plan.md`).
 pub(super) fn font_matches_path(font: &FontEntry, raw: &str) -> bool {
     let candidate = Path::new(raw);
     font.path == candidate

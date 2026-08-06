@@ -9,30 +9,46 @@ encode/decode/normalize routines.
 
 Main responsibilities:
 - parse `render_data` / render-param JSON into `TextRenderParams` and the
-  per-layout parameter structs;
+  per-layout parameter structs, through the schema owner
+  (`panel/text_params_schema.rs`) so the document's OWN schema decides its defaults;
 - parse config-string enums (shape, wrap mode, anti-aliasing, line mode, etc.);
-- build, normalize, and decode overlay storage entries, including legacy formats.
+- build, normalize, and decode overlay storage entries, including legacy formats;
+- convert a SCHEMA-1 `text_params` payload to the current schema
+  (`upgrade_text_params_to_v2`, pure) and apply that conversion to the resident
+  overlays (`TypingTextOverlayLayer::convert_legacy_text_params_to_v2`).
 
 Notes:
 Extracted verbatim from `tab.rs`. Free fns are `pub(super)` so `tab.rs` and
 sibling submodules of `tab` can use them. `use super::*;` pulls in the parent
 module's types and imports.
+
+The legacy READ chain (`font_original_name -> font_label -> font_family -> font ->
+file stem of font_path`, and every other schema-1 fallback here) is kept FOREVER:
+a project written years ago must still open. Only the WRITE side is allowed to
+forget a format. The chain's ORDER belongs to the schema owner
+(`text_params_schema::legacy_font_name_candidates`), shared with the PSD export.
+
+Two rules govern the conversion, both about not destroying user data:
+- an unresolvable font leaves the payload completely untouched;
+- resolution goes BY NAME, walking the whole chain; a stored path is a weak hint
+  and never proof of identity (safety rule D, `upgrade_text_params_to_v2`).
+And one rule governs the legacy NORMALIZER: it rebuilds `text_params` from a
+whitelist, so every key of the frozen schema-2 default set must appear in it or the
+stored value dies on load.
 */
 
 use super::*;
+use crate::tabs::typing::panel::text_params_schema;
+use serde_json::Map;
 
 pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRenderParams> {
     let render_obj = render_data.as_object()?;
-    let text_params = render_obj.get("text_params")?.as_object()?;
-    // The renderer now references fonts by NAME (resolved through the provider),
-    // and the canonical identity is the font's ORIGINAL FAMILY NAME. Derive the
-    // working name from the persisted keys, newest/most-canonical first:
-    // `font_original_name` (the family name; present on both current data and older
-    // in-progress projects, so legacy blobs auto-upgrade to family-name resolution),
-    // then `font_label` (now also the family name; a stem/label on truly old data),
-    // then `font_family`/`font`, then the legacy `font_path` file stem. Bail only
-    // when NONE of these yields a non-empty name. The provider keeps label/stem
-    // aliases, so every one of these forms still resolves to a font.
+    let stored_params = render_obj.get("text_params")?.as_object()?;
+    // Read every parameter through the schema owner: a schema-2 payload omits values
+    // equal to their FROZEN defaults, which are materialized here; a schema-1 payload is
+    // passed through untouched so the legacy per-field defaults below keep applying.
+    let filled_params = text_params_schema::read_text_params(stored_params);
+    let text_params = &*filled_params;
     let read_name = |key: &str| {
         text_params
             .get(key)
@@ -41,23 +57,18 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     };
-    let font_name = read_name("font_original_name")
-        .or_else(|| read_name("font_label"))
-        .or_else(|| read_name("font_family"))
-        .or_else(|| read_name("font"))
-        .or_else(|| {
-            text_params
-                .get("font_path")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .and_then(|path| {
-                    Path::new(path)
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .map(ToOwned::to_owned)
-                })
-        })?;
+    // Schema 2 names the font ONCE, by identity, in `font`. Schema 1 is resolved through
+    // the historical chain — `font_original_name` (family), `font_label` (the identity on
+    // late v1 data, a stem/label on old data), `font_family`, `font`, then the `font_path`
+    // file stem — every form of which `TabFontProvider` still keeps as a READ-ONLY alias.
+    // Bail only when NONE of them yields a non-empty name.
+    let font_name = if text_params_schema::text_params_schema_version(text_params)
+        >= text_params_schema::TEXT_PARAMS_SCHEMA_VERSION
+    {
+        read_name("font")?
+    } else {
+        legacy_font_name_from_text_params(text_params)?
+    };
     let effects_json = render_obj
         .get("effects")
         .and_then(Value::as_array)
@@ -277,6 +288,376 @@ pub(super) fn text_render_params_from_render_data(render_data: &Value) -> Option
         // not persisted state; decoded params always start with nothing requested.
         extra_info: crate::tabs::typing::render_next::types::RenderExtraInfoRequest::default(),
     })
+}
+
+/// The `font_path` a SCHEMA-1 `text_params` object carries; see
+/// [`text_params_schema::legacy_font_path`], which owns the legacy read contract.
+#[must_use]
+pub(super) fn legacy_font_path_from_text_params(obj: &Map<String, Value>) -> Option<&str> {
+    text_params_schema::legacy_font_path(obj)
+}
+
+/// The FIRST name of [`text_params_schema::legacy_font_name_candidates`], i.e. the
+/// historical "best" name of a SCHEMA-1 payload. Used where a single name is all the
+/// contract allows (the decoded `TextRenderParams.font_name`, the missing-font UI text);
+/// anything that RESOLVES must walk the full candidate list instead, because the first
+/// non-empty name is routinely a family name the machine no longer has. `None` when no
+/// font is named.
+#[must_use]
+pub(super) fn legacy_font_name_from_text_params(obj: &Map<String, Value>) -> Option<String> {
+    text_params_schema::legacy_font_name_candidates(obj)
+        .into_iter()
+        .next()
+}
+
+/// Resolves a font reference persisted by an OLDER build — `(font_path, font_name)`, each
+/// optional — to the current render IDENTITY, or `None` when no installed font matches.
+///
+/// Implemented by the typing panel (`resolve_legacy_font_identity`), which owns the font
+/// list; the codec takes it as a parameter so the conversion stays a pure function.
+///
+/// The conversion never supplies both at once — see [`upgrade_text_params_to_v2`], safety
+/// rule D: each stored NAME is offered alone, and the path only afterwards, so the answer
+/// always says which kind of evidence matched. (The panel's own resolver ranks names above
+/// the path too since phase 5, but this contract does not depend on that.)
+pub(in crate::tabs::typing) type LegacyFontIdentityResolver<'a> =
+    &'a dyn Fn(Option<&str>, Option<&str>) -> Option<String>;
+
+/// Outcome of upgrading one stored `text_params` object to the current schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::tabs::typing) enum TextParamsUpgrade {
+    /// The payload already declares the current schema — nothing to do, nothing to save.
+    AlreadyCurrent,
+    /// Converted. The caller stores this object and marks the overlay changed so the
+    /// normal (deferred) save path writes it; nothing is written here.
+    Converted(Value),
+    /// A schema-1 payload whose font is NOT installed. NOTHING is converted: the legacy
+    /// keys are the only surviving record of which font the text was set in, and the
+    /// conversion must never destroy them. `legacy_name` is the best name for the
+    /// missing-font UI (`None` when the payload names no font at all).
+    UnresolvedFont { legacy_name: Option<String> },
+    /// A schema-1 payload none of whose stored NAMES resolves, while its stored
+    /// `font_path` still points at an installed font — a DIFFERENT one than the names
+    /// describe, or the same font under a name this build no longer knows. Nothing is
+    /// converted (safety rule D, see [`upgrade_text_params_to_v2`]): a file that happens
+    /// to sit at a remembered path is not proof of identity, and rewriting the layer to
+    /// `path_identity` would erase the only record of the font it was really set in.
+    ///
+    /// `legacy_name` is the layer's best stored name (`None` when it names none) and
+    /// `path_identity` the identity of whatever now lives at that path — both are for the
+    /// user-facing "needs attention" report, not for storing.
+    PathOnlyFont {
+        legacy_name: Option<String>,
+        path_identity: String,
+    },
+}
+
+/// Converts a SCHEMA-1 `text_params` object to schema 2, resolving its legacy font
+/// reference to a font IDENTITY through `resolve_identity`.
+///
+/// `resolve_identity(font_path, font_name)` is the panel's legacy resolver
+/// (`resolve_legacy_font_identity`).
+///
+/// **Safety rule D — the conversion resolves by NAME; a path is only a weak hint.** Every
+/// stored name is tried IN ORDER (`legacy_font_name_candidates_from_text_params`), each on
+/// its own, and the first that resolves supplies the identity. The stored `font_path` is
+/// never allowed to decide the outcome, because a file that still sits at a remembered
+/// path is not proof that it is the same font: replacing `dialogue.ttf` with another face
+/// would make the conversion write the NEW font's identity and drop the legacy keys, which
+/// destroys the only surviving record of the real one. It is also not a loss to ignore:
+/// rendering resolves a v1 layer by NAME too (`text_render_params_from_render_data`), so a
+/// payload whose names do not resolve does not render either way and has nothing to gain
+/// from being converted. A path that DOES resolve while no name does is reported as
+/// [`TextParamsUpgrade::PathOnlyFont`] — not converted, flagged for the user.
+///
+/// When nothing resolves at all the payload is left completely untouched — see
+/// [`TextParamsUpgrade::UnresolvedFont`].
+///
+/// The conversion is meaning-preserving, not merely mechanical:
+/// - the legacy `*_px`/`*_percent` pairs are folded into their single token key WITHOUT
+///   losing precision ([`PxOrPercent::to_token_lossless`]), so dropping them cannot change
+///   spacing;
+/// - every key whose SCHEMA-1 absent-meaning differs from the frozen schema-2 default is
+///   materialized first (`line_placement_reference`, `trim_extra_spaces`,
+///   `replace_ellipsis_with_dots`, `hanging_punctuation`, `text_shape`, `width_px`), so
+///   an old payload that omitted it keeps rendering exactly as before;
+/// - the ancient `"smart"` wrap token is resolved through
+///   [`normalize_text_wrap_mode_legacy`] BEFORE its input `aggressive_word_breaks` is
+///   dropped as a dead key.
+///
+/// Idempotent: a payload it produced reports [`TextParamsUpgrade::AlreadyCurrent`].
+#[must_use]
+pub(in crate::tabs::typing) fn upgrade_text_params_to_v2(
+    text_params: &Map<String, Value>,
+    resolve_identity: LegacyFontIdentityResolver<'_>,
+) -> TextParamsUpgrade {
+    if text_params_schema::text_params_schema_version(text_params)
+        >= text_params_schema::TEXT_PARAMS_SCHEMA_VERSION
+    {
+        return TextParamsUpgrade::AlreadyCurrent;
+    }
+    // Safety rule D: names decide, the path never does. Each candidate is offered ALONE
+    // (path = `None`), because the panel's resolver gives a supplied path absolute
+    // priority and would otherwise answer with whatever file now sits there.
+    let candidates = text_params_schema::legacy_font_name_candidates(text_params);
+    let legacy_name = candidates.first().cloned();
+    let Some(identity) = candidates
+        .iter()
+        .find_map(|name| resolve_identity(None, Some(name.as_str())))
+    else {
+        // Nothing resolved by name. A path that still resolves means the file is there but
+        // is not evidence of identity: report it so the user can repair the layer, and keep
+        // every legacy key verbatim.
+        return match legacy_font_path_from_text_params(text_params)
+            .and_then(|path| resolve_identity(Some(path), None))
+        {
+            Some(path_identity) => TextParamsUpgrade::PathOnlyFont {
+                legacy_name,
+                path_identity,
+            },
+            None => TextParamsUpgrade::UnresolvedFont { legacy_name },
+        };
+    };
+
+    let mut params = text_params.clone();
+    // 1. Fold the legacy px/percent PAIRS into the single token key, then drop them:
+    //    the pair carries real values that the schema-2 reader would otherwise lose.
+    for (token_key, legacy_px_key, legacy_percent_key, default) in [
+        (
+            "line_spacing",
+            "line_spacing_px",
+            "line_spacing_percent",
+            PxOrPercent::percent(50.0),
+        ),
+        ("kerning", "kerning_px", "kerning_percent", PxOrPercent::percent(0.0)),
+        ("glyph_height", "", "glyph_height_percent", PxOrPercent::percent(100.0)),
+        ("glyph_width", "", "glyph_width_percent", PxOrPercent::percent(100.0)),
+    ] {
+        let value = read_render_param_px_or_percent(
+            text_params,
+            token_key,
+            legacy_px_key,
+            legacy_percent_key,
+            default,
+        );
+        // LOSSLESS token: the canonical two-decimal `to_token` would silently round a
+        // stored `line_spacing_px: 1.2345` to `"1.23"`, and the legacy pair it replaces is
+        // then dropped — an irreversible geometry change. `to_token_lossless` keeps the
+        // canonical spelling whenever it round-trips and only widens when it would not.
+        params.insert(token_key.to_string(), Value::String(value.to_token_lossless()));
+        params.remove(legacy_px_key);
+        params.remove(legacy_percent_key);
+    }
+    // 2. Resolve the ancient `"smart"` wrap token while its inputs are still here.
+    if params
+        .get("text_wrap_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|token| token.eq_ignore_ascii_case("smart"))
+    {
+        let resolved = normalize_text_wrap_mode_legacy(
+            Some("smart"),
+            text_params.get("aggressive_word_breaks").and_then(Value::as_bool),
+            text_params.get("allow_moderate_trees").and_then(Value::as_bool),
+        );
+        params.insert(
+            "text_wrap_mode".to_string(),
+            Value::String(resolved.to_string()),
+        );
+    }
+    // 3. Materialize the keys whose schema-1 absent-meaning is NOT the frozen schema-2
+    //    default, so omitting them in schema 2 cannot change what the overlay looks like.
+    for (key, legacy_absent_meaning) in [
+        ("line_placement_reference", json!("glyph_height")),
+        ("trim_extra_spaces", json!(false)),
+        ("replace_ellipsis_with_dots", json!(false)),
+        ("hanging_punctuation", json!(false)),
+        ("text_shape", json!("rectangle")),
+        ("width_px", json!(TEXT_RENDER_DATA_FALLBACK_WIDTH_PX)),
+    ] {
+        params
+            .entry(key.to_string())
+            .or_insert(legacy_absent_meaning);
+    }
+    // 4. The single font key of schema 2. `write_text_params` drops the legacy ones.
+    params.insert("font".to_string(), Value::String(identity));
+    TextParamsUpgrade::Converted(text_params_schema::write_text_params(params))
+}
+
+/// Why one overlay was left unconverted, for the once-per-overlay report.
+///
+/// Kept apart from [`TextParamsUpgrade`] so the reporting loop borrows nothing from the
+/// overlay list it walked.
+#[derive(Debug, Clone)]
+enum UnconvertedTextParams {
+    /// No stored name resolves and no stored path resolves either — the font is simply
+    /// not installed. `legacy_name` is the best stored name, `None` when none is stored.
+    NoFontInstalled { legacy_name: Option<String> },
+    /// No stored NAME resolves, but the stored path does — to `path_identity`. Safety
+    /// rule D: not converted, and the user is told, because the file at that path may be
+    /// a different font entirely.
+    PathOnlyMatch {
+        legacy_name: Option<String>,
+        path_identity: String,
+    },
+}
+
+impl TypingTextOverlayLayer {
+    /// Converts every resident TEXT overlay still carrying a SCHEMA-1 `text_params`
+    /// payload to schema 2, IN MEMORY, and marks the layer dirty so the normal deferred
+    /// save writes it. Writes nothing itself.
+    ///
+    /// `resolve_identity` is the panel's legacy font resolver (path and/or any historical
+    /// name form → the current identity). An overlay whose font is not installed is left
+    /// COMPLETELY untouched — its legacy keys are the only record of which font it used —
+    /// and reported once per overlay. So is an overlay that only matches through its
+    /// stored PATH (safety rule D in [`upgrade_text_params_to_v2`]): it is reported as
+    /// needing the user's attention, naming the font that now occupies that path.
+    ///
+    /// Called once per frame from the tab: overlays materialize lazily (a doc page is
+    /// projected the first time it is visited), so a single pass at load time would miss
+    /// most of them. The pass is idempotent and cheap — one map lookup per overlay once
+    /// the payloads are current — and a document that is ALREADY schema 2 is never
+    /// touched, so opening a converted project writes nothing.
+    pub(in crate::tabs::typing) fn convert_legacy_text_params_to_v2(
+        &mut self,
+        resolve_identity: LegacyFontIdentityResolver<'_>,
+    ) {
+        let mut converted: Vec<(usize, Value)> = Vec::new();
+        let mut unresolved: Vec<(String, UnconvertedTextParams)> = Vec::new();
+        for (idx, overlay) in self.overlays.iter().enumerate() {
+            if overlay.kind != TypingOverlayKind::Text {
+                continue;
+            }
+            let Some(render_data) = overlay.render_data_json.as_ref() else {
+                continue;
+            };
+            let Some(text_params) = render_data.get("text_params").and_then(Value::as_object) else {
+                continue;
+            };
+            match upgrade_text_params_to_v2(text_params, resolve_identity) {
+                TextParamsUpgrade::AlreadyCurrent => {}
+                TextParamsUpgrade::Converted(params) => {
+                    let mut updated = render_data.clone();
+                    let Some(obj) = updated.as_object_mut() else {
+                        continue;
+                    };
+                    obj.insert("text_params".to_string(), params);
+                    converted.push((idx, updated));
+                }
+                TextParamsUpgrade::UnresolvedFont { legacy_name } => {
+                    if !self.legacy_text_params_unresolved.contains(&overlay.uid) {
+                        unresolved.push((
+                            overlay.uid.clone(),
+                            UnconvertedTextParams::NoFontInstalled { legacy_name },
+                        ));
+                    }
+                }
+                TextParamsUpgrade::PathOnlyFont {
+                    legacy_name,
+                    path_identity,
+                } => {
+                    if !self.legacy_text_params_unresolved.contains(&overlay.uid) {
+                        unresolved.push((
+                            overlay.uid.clone(),
+                            UnconvertedTextParams::PathOnlyMatch {
+                                legacy_name,
+                                path_identity,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        for (uid, reason) in unresolved {
+            match reason {
+                UnconvertedTextParams::NoFontInstalled {
+                    legacy_name: Some(name),
+                } => crate::runtime_log::log_warn(format!(
+                    "[typing] text layer '{uid}': the font it was set in ('{name}') is not \
+                     installed, so its legacy font keys are kept verbatim and it is NOT converted \
+                     to the current text_params schema. Install the font (or re-pick one for the \
+                     layer) to convert it."
+                )),
+                // A payload that names no font at all is not a user-visible problem (it
+                // cannot render either way) — keep it out of the runtime log.
+                UnconvertedTextParams::NoFontInstalled { legacy_name: None } => crate::trace_log!(
+                    cat::PERSIST,
+                    "text_params not upgraded uid={} reason=no_font_named",
+                    uid
+                ),
+                UnconvertedTextParams::PathOnlyMatch {
+                    legacy_name,
+                    path_identity,
+                } => crate::runtime_log::log_warn(format!(
+                    "[typing] text layer '{uid}': none of the font names it stores ({}) is \
+                     installed; only its remembered file path still resolves, and to a font named \
+                     '{path_identity}'. A file at a remembered path is not proof that it is the \
+                     same font, so the layer is NOT converted and keeps its legacy font keys. \
+                     Check it and re-pick its font.",
+                    legacy_name.as_deref().unwrap_or("none")
+                )),
+            }
+            self.legacy_text_params_unresolved.insert(uid);
+        }
+        if converted.is_empty() {
+            return;
+        }
+        // Grouped per page: `route_to_doc` locks the doc and RE-PROJECTS the whole page, so
+        // one call per overlay would re-project a legacy page once per text layer on the
+        // frame it is opened.
+        let mut by_page: std::collections::BTreeMap<usize, Vec<(String, Value)>> =
+            std::collections::BTreeMap::new();
+        for (idx, updated) in converted {
+            let Some(overlay) = self.overlays.get_mut(idx) else {
+                continue;
+            };
+            let page_idx = overlay.page_idx;
+            let uid = overlay.uid.clone();
+            // The runtime is updated FIRST so the conversion sticks even when the page is
+            // not resident in the doc (a legacy chapter with no doc wired): the pass then
+            // sees schema 2 next frame and does not retry.
+            overlay.render_data_json = Some(updated.clone());
+            self.legacy_text_params_unresolved.remove(&uid);
+            crate::trace_log!(
+                cat::PERSIST,
+                "text_params upgraded to schema 2 page={} uid={}",
+                page_idx,
+                uid
+            );
+            by_page.entry(page_idx).or_default().push((uid, updated));
+        }
+        let mut wrote_to_doc = false;
+        for (page_idx, payloads) in by_page {
+            // REPORTING variant: a uid that is not on the doc page (the runtime overlay
+            // outlived its node) changes nothing, and marking the document changed for it
+            // would re-project the page and rewrite `layers.json` with identical content.
+            if self.route_to_doc_reporting(page_idx, |doc| {
+                let mut changed = false;
+                for (uid, payload) in payloads {
+                    if let Some(node) = doc.node_mut(page_idx, &uid)
+                        && let crate::models::layer_model::layer_doc::NodeBody::Text {
+                            render_data,
+                            ..
+                        } = &mut node.body
+                        && *render_data != payload
+                    {
+                        *render_data = payload;
+                        changed = true;
+                    }
+                }
+                changed
+            }) {
+                wrote_to_doc = true;
+            }
+        }
+        // Only a conversion that actually reached the DOC is owed a write; a runtime-only
+        // conversion (no doc for that page) has nothing to persist, and marking dirty for
+        // it would leave the layer permanently dirty.
+        if wrote_to_doc {
+            self.mark_placement_save_dirty();
+        }
+    }
 }
 
 /// Decode a persisted `raster_transform` object into a [`VectorMeshWarp`].
@@ -816,6 +1197,16 @@ pub(super) fn normalize_text_params_object(
     obj: &serde_json::Map<String, Value>,
     fallback_width_px: u32,
 ) -> Value {
+    // A payload that already declares the CURRENT schema is canonical by construction and
+    // is passed through verbatim. Running the legacy whitelist over it would be actively
+    // destructive: the whitelist manufactures its own legacy defaults for absent keys,
+    // while in schema 2 an absent key means its FROZEN default — and it would drop
+    // `schema`/`font` entirely, unnaming the overlay's font.
+    if text_params_schema::text_params_schema_version(obj)
+        >= text_params_schema::TEXT_PARAMS_SCHEMA_VERSION
+    {
+        return Value::Object(obj.clone());
+    }
     let text = obj
         .get("text")
         .and_then(Value::as_str)
@@ -827,42 +1218,6 @@ pub(super) fn normalize_text_params_object(
         .or_else(|| obj.get("font_color_rgba").and_then(parse_rgba_value))
         .or_else(|| obj.get("color").and_then(parse_rgba_value))
         .unwrap_or([0, 0, 0, 255]);
-    let font_path = obj
-        .get("font_path")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
-    let font_label = obj
-        .get("font_label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            obj.get("font_family")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            obj.get("font")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        });
-    // The font's original FAMILY name — the canonical render identity. The whitelist
-    // rebuilder must carry it through, or re-normalizing a project (e.g. a legacy
-    // `text_info.json`) would DROP it and lose family-name resolution. Absent on truly
-    // old data -> Null (the reader then falls back to `font_label`/stem).
-    let font_original_name = obj
-        .get("font_original_name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
     let width_px = obj
         .get("width_px")
         .and_then(value_as_f32)
@@ -909,14 +1264,13 @@ pub(super) fn normalize_text_params_object(
     let mut params = json!({
         "text": text,
         "text_color": text_color,
-        "font_path": font_path,
-        "font_label": font_label,
-        "font_original_name": font_original_name,
         "font_size_px": obj.get("font_size_px").and_then(value_as_f32).or_else(|| obj.get("font_size").and_then(value_as_f32)).or_else(|| obj.get("size").and_then(value_as_f32)).unwrap_or(24.0).max(1.0),
-        "line_spacing": read_render_param_px_or_percent(obj, "line_spacing", "line_spacing_px", "line_spacing_percent", PxOrPercent::percent(50.0)).to_token(),
-        "kerning": read_render_param_px_or_percent(obj, "kerning", "kerning_px", "kerning_percent", PxOrPercent::percent(0.0)).to_token(),
-        "glyph_height": read_render_param_px_or_percent(obj, "glyph_height", "", "glyph_height_percent", PxOrPercent::percent(100.0)).to_token(),
-        "glyph_width": read_render_param_px_or_percent(obj, "glyph_width", "", "glyph_width_percent", PxOrPercent::percent(100.0)).to_token(),
+        // LOSSLESS tokens: this normalization REPLACES the legacy `*_px`/`*_percent` pair
+        // it read, so a two-decimal rounding here is not recoverable afterwards.
+        "line_spacing": read_render_param_px_or_percent(obj, "line_spacing", "line_spacing_px", "line_spacing_percent", PxOrPercent::percent(50.0)).to_token_lossless(),
+        "kerning": read_render_param_px_or_percent(obj, "kerning", "kerning_px", "kerning_percent", PxOrPercent::percent(0.0)).to_token_lossless(),
+        "glyph_height": read_render_param_px_or_percent(obj, "glyph_height", "", "glyph_height_percent", PxOrPercent::percent(100.0)).to_token_lossless(),
+        "glyph_width": read_render_param_px_or_percent(obj, "glyph_width", "", "glyph_width_percent", PxOrPercent::percent(100.0)).to_token_lossless(),
         "width_px": width_px,
         "align": align,
         "text_line_mode": text_line_mode,
@@ -949,8 +1303,26 @@ pub(super) fn normalize_text_params_object(
     // загрузке проекта (напр. `formed_text` — сформированный текст «продвинутой
     // формы»). Сохраняем как есть, если присутствуют; иначе панель подставит свои
     // дефолты при чтении.
+    //
+    // THE LIST BELOW IS A DATA-LOSS SURFACE. Every key of the frozen schema-2 default set
+    // that the literal above does not build must appear here, or a stored value dies on
+    // load — and since the schema-1 -> schema-2 conversion runs on what this function
+    // returned, that death is now PERMANENT (the converted payload is written back with
+    // the default in its place). `normalization_preserves_every_schema_two_key` in
+    // `tab/tests.rs` walks `text_params_schema::frozen_v2_defaults()` and fails when a key
+    // is missing from both halves; keep it passing rather than trimming this list.
     if let Some(map) = params.as_object_mut() {
         for key in [
+            // Legacy FONT keys, carried through VERBATIM and never manufactured. They are
+            // the only surviving record of which font a schema-1 payload named, so the
+            // normalizer must not drop them before the conversion pass has had a chance
+            // to resolve them (`upgrade_text_params_to_v2`); the conversion itself is
+            // what removes them, and only once the identity is known.
+            "font_path",
+            "font_label",
+            "font_original_name",
+            "font_family",
+            "font",
             "formed_text",
             "kerning_mode",
             "hanging_punctuation",
@@ -958,6 +1330,15 @@ pub(super) fn normalize_text_params_object(
             "trim_extra_spaces",
             "replace_ellipsis_with_dots",
             "vertical_line_direction",
+            // Vector rotation of the whole block, perpendicular line placement and its
+            // reference band, and the anti-aliasing mode: panel-read parameters
+            // (`create_apply`) with no legacy normalization of their own. Absent here they
+            // were silently reset on every load — rotation to 0, the placement reference
+            // to `glyph_height`, anti-aliasing to `strong`.
+            "global_rotation_deg",
+            "line_placement_percent",
+            "line_placement_reference",
+            "anti_aliasing",
             // Точное смещение выравнивания (слайдер лево↔право). Легаси-строка
             // `align` сохраняется отдельно для совместимости/PSD-экспорта, но
             // непрерывное значение живёт только здесь.
@@ -1040,7 +1421,9 @@ pub(super) fn parse_legacy_static_render_data(
             "font_path": Value::Null,
             "font_label": font_label,
             "font_size_px": font_size_px.max(1.0),
-            "line_spacing": line_spacing.to_token(),
+            // Lossless for the same reason as in `normalize_text_params_object`: the token
+            // replaces the legacy pair this value was folded from.
+            "line_spacing": line_spacing.to_token_lossless(),
             "width_px": width_px,
             "align": align,
             "text_line_mode": "horizontal",

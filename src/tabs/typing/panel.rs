@@ -15,7 +15,8 @@ FILE HEADER (tabs/typing/panel.rs)
     `Действия` по умолчанию якорится под preview-панелью.
 - `TypingCreatePanelState`: параметры текста/эффектов, загрузка шрифтов, рендер preview
   в фоне (включается только для режима `Создание`), память параметров по каждому шрифту
-  и именованные пресеты (содержат snapshot всех шрифтов + главный шрифт), а также
+  и именованные пресеты (`fonts/presets.json`, версия 1: ОДИН ключ-идентичность главного
+  шрифта + профили ТОЛЬКО тех шрифтов, что правились в этой сессии), а также
   отдельные пресеты формульной раскладки (`TextTab.formula_presets` в `user_config.json`).
   В базовых параметрах есть сворачиваемый блок `Расширенные параметры`,
   включая направление строки (`Горизонтальная/Вертикальная`) и режим формулы
@@ -44,7 +45,9 @@ FILE HEADER (tabs/typing/panel.rs)
   устойчивый к одиночным выбросам). Ширина строк
   меряется попиксельно: панель строит `forms::GlyphWidths` выбранным шрифтом
   (cosmic-text, кернинг пар) и передаёт как `LineWidthMetric` в `enumerate_forms`;
-  при недоступном шрифте — `CharWidthMetric` (счёт символов). Висящая пунктуация
+  при недоступном шрифте — `CharWidthMetric` (счёт символов); байты шрифта берутся
+  из `FontProvider` ФОНОВЫМ потоком (`poll_advanced_form_font`), поэтому первые кадры
+  после открытия окна метрика посимвольная. Висящая пунктуация
   оверлея учитывается (при включённой края не идут в ширину). Метрика
   перестраивается при смене текста/шрифта/начертания/висячести
   (`AdvancedFormMetricSignature`). Границы берутся из фактических данных
@@ -117,7 +120,7 @@ use crate::tabs::typing::render_next::forms::{
     self, PeakBase, PresetLabel, TextForm, TextFormPreset,
 };
 use crate::tabs::typing::segmentation::Conservatism;
-use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_path};
+use crate::tabs::typing::render_next::{FontContent, FontFaceCache, load_font_content};
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::FontProvider;
 use crate::tabs::typing::render_next::types::{
@@ -148,7 +151,7 @@ use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread as thread;
 
 const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
@@ -191,7 +194,6 @@ fn text_preset_none_label() -> &'static str {
     t!("typing.presets.none_option")
 }
 const TEXT_TAB_USE_LEGACY_INLINE_TAGS_KEY: &str = "use_legacy_inline_tags";
-const TEXT_TAB_CREATE_PRESETS_KEY: &str = "create_presets";
 const TEXT_TAB_FORMULA_PRESETS_KEY: &str = "formula_presets";
 // Per-effect-kind default parameter overrides, keyed by the effect discriminator
 // string (see `effect_defaults::effect_kind_key`); value = the one-card JSON object.
@@ -208,6 +210,10 @@ use create_main_text::collapsing_param_section;
 mod create_advanced;
 mod create_edit;
 mod create_apply;
+// The SINGLE owner of the persisted `render_data.text_params` schema (version, frozen
+// defaults, write/read). `pub(in crate::tabs::typing)` because the tab-side codec and
+// the PSD export read stored payloads through it too.
+pub(in crate::tabs::typing) mod text_params_schema;
 mod text_forms;
 use text_forms::*;
 mod inline_tags;
@@ -223,6 +229,12 @@ mod font_provider;
 use font_provider::TabFontProvider;
 mod presets_io;
 use presets_io::*;
+// The SINGLE owner of `fonts/presets.json` (the create-preset document), its atomic write
+// and the one-shot migration out of `user_config.TextTab.create_presets`.
+mod presets_store;
+/// Shared crash-safe write recipe + optimistic-concurrency vocabulary of the panel's two
+/// JSON documents (`fonts_data.json`, `presets.json`).
+pub(in crate::tabs::typing) mod doc_store;
 mod ui_helpers;
 use ui_helpers::*;
 mod effect_parse;
@@ -242,17 +254,83 @@ pub(crate) use effect_defaults::{EffectDefaultsEditorState, seed_effect_defaults
 // `font_settings_store::…`.
 pub(crate) use font_settings_store::seed_imported_system_fonts_from_config;
 
-#[derive(Clone)]
+/// One saved create preset: the font it selects plus the per-font parameter profiles it
+/// restores. Persisted in `fonts/presets.json` (`presets_store`), never in `user_config`.
+///
+/// `font` and every `font_profiles` key are the font IDENTITY. The three historical
+/// competing references (`primary_font_key` / `primary_font_path` / `primary_font_label`)
+/// collapsed into this ONE key in phase 5 of
+/// `dev-docs/font_identity_postscript_plan.md`. A value the migration could not resolve to
+/// a loaded font is kept VERBATIM in its legacy spelling rather than dropped — it is the
+/// only remaining clue about the font it meant — and `create_presets::apply_preset_by_name`
+/// still resolves such a leftover through the one legacy door.
+///
+/// The profiles here are the preset's OWN overrides; the font's DEFAULT profile lives in
+/// `fonts_data.fonts.<identity>.profile` ("variant A" of the same plan), so presets stay
+/// independent of each other and of what every font remembers on disk.
+#[derive(Debug, Clone, Default)]
 struct TypingCreatePreset {
-    primary_font_key: String,
-    primary_font_path: Option<String>,
-    primary_font_label: Option<String>,
+    font: String,
     font_profiles: HashMap<String, Value>,
 }
 
 #[derive(Clone)]
 struct TypingFormulaPreset {
     layout: TextFormulaLayoutParams,
+}
+
+/// Something a background `fonts/presets.json` worker has to tell the GUI thread.
+///
+/// One channel for all of it, because every variant ends in the same place: the create
+/// panel's `presets_by_name` (or its status line). Reading, migrating and writing the
+/// document all happen OFF the GUI thread (CLAUDE.md §5); what needs the panel — the font
+/// list the legacy references resolve against, and the widgets — happens in
+/// `create_presets::poll_preset_store_events`.
+#[derive(Debug)]
+enum PresetStoreEvent {
+    /// The startup read finished: the stored document (empty when there is none yet) and,
+    /// when a one-shot migration is owed, the legacy `user_config` payload to convert.
+    Seeded {
+        /// Presets read from `fonts/presets.json`.
+        presets: HashMap<String, TypingCreatePreset>,
+        /// `Some` only when the document was missing or corrupt, i.e. when the one-shot
+        /// migration out of `user_config.json` still has to run. An empty vector means
+        /// there was nothing to migrate — the legacy-key cleanup still runs.
+        legacy: Option<Vec<presets_store::LegacyPresetEntry>>,
+    },
+    /// A save found presets another running app instance had written and merged them into
+    /// the document; the panel adopts them so its next snapshot cannot drop them again.
+    MergedFromDisk(HashMap<String, TypingCreatePreset>),
+    /// A save failed. Carries the technical reason for the log line and the status line.
+    SaveFailed(String),
+}
+
+/// What kind of evidence resolved a font reference persisted by an OLDER build
+/// (`create_state::match_font_by_legacy_reference`).
+///
+/// The distinction is the whole point: a stored NAME (identity, family, label, stem) is
+/// evidence about the FONT, while a stored PATH is only evidence that some font file sits
+/// at that location today. A caller that SELECTS a font must act on `ByName` only —
+/// treating `PathOnly` as proof is how a replaced font file used to silently re-render a
+/// layer in a different typeface (`dev-docs/font_identity_postscript_plan.md`, safety
+/// rule D). A caller re-keying stored data may accept `PathOnly` as the weakest form, but
+/// must rank it below every name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyFontMatch {
+    /// A stored name resolved to the font at this index.
+    ByName(usize),
+    /// No stored name resolved, but the stored path still points at this loaded font.
+    PathOnly(usize),
+}
+
+impl LegacyFontMatch {
+    /// Index of the matched font, whatever the evidence was.
+    #[must_use]
+    pub(super) fn font_idx(self) -> usize {
+        match self {
+            Self::ByName(idx) | Self::PathOnly(idx) => idx,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -507,15 +585,25 @@ pub(super) enum TypingExportUiStatus {
     Success {
         done: usize,
         total: usize,
+        /// What the OUTPUT FORMAT could not express, in a run that otherwise succeeded —
+        /// shown under the success line so an approximation is never silent. Today only
+        /// the PSD font-name ambiguity (`psd_export::AmbiguousExportFont`). Usually empty.
+        warnings: Vec<String>,
     },
     Error {
         message: String,
     },
 }
 
+/// Which font the on-canvas text EDITOR should draw its text in.
+///
+/// Carries the font IDENTITY, not a path: the bytes are obtained through the panel's
+/// `FontProvider` (the same resolution the renderer performs), so the editor cannot end
+/// up showing a different file than the one that will be rendered, and the tab-side cache
+/// keys on the identity as well.
 #[derive(Clone)]
 pub(super) struct TypingEditorFontSpec {
-    pub font_path: PathBuf,
+    pub font_identity: String,
     pub face_index: usize,
     pub ui_font_size_px: f32,
 }
@@ -603,8 +691,12 @@ pub(super) enum TypingCreateImageRequest {
 
 impl Default for TypingTopPanelState {
     fn default() -> Self {
-        let create_panel = TypingCreatePanelState::new(true);
-        let edit_panel = TypingCreatePanelState::new(false);
+        let mut create_panel = TypingCreatePanelState::new(true);
+        let mut edit_panel = TypingCreatePanelState::new(false);
+        // Both panels start with an EMPTY font list and share ONE background load of it:
+        // reading, hashing and parsing every font file must not happen on the GUI thread
+        // (CLAUDE.md §5), and it must not happen twice for one startup either.
+        create_state::spawn_shared_font_reload(&mut create_panel, &mut edit_panel);
         Self {
             collapsed: false,
             mode: TypingTopPanelMode::CreateText,
@@ -746,17 +838,43 @@ pub(crate) struct FontEntry {
     /// virtual fonts synthesize it as `VirtualFont_a_b_c`. Persisted so PSD export
     /// and future virtual fonts can recover the real font identity by name.
     original_name: String,
+    /// PostScript name (`name` table id 6) of the REPRESENTATIVE face, i.e. always
+    /// `faces[0].post_script_name`, captured structurally at load time so no consumer
+    /// has to parse it back out of the decorated face `label`. Empty only when the
+    /// file could not be parsed (`fontdb` refuses a face without a PostScript name)
+    /// or for the synthetic bundled-stack entry, which stands for a whole font chain
+    /// rather than one file.
+    post_script_name: String,
+    /// Hash of the representative FILE's raw bytes (`fonts::font_content_hash`), i.e.
+    /// the same value that keys the duplicate merge. It is the source of the identity
+    /// COLLISION SUFFIX (`fonts::suffixed_font_identity_name`), which is why it is
+    /// carried on the entry rather than dropped after the merge: the suffix must be a
+    /// pure function of the entry's OWN bytes.
+    ///
+    /// `0` means "not computed": the synthetic bundled-stack entry (which stands for a
+    /// chain of files), a file that could not be READ at all, and the system-font
+    /// picker catalog (`fonts::load_system_fonts` enumerates faces through `fontdb`
+    /// without reading whole files). Those lists never feed
+    /// `assign_font_identity_names`, so a shared `0` cannot fabricate a collision on a
+    /// panel list.
+    content_hash: u64,
     /// Optional user display-name override from `fonts_data.json`, resolved at load
     /// time via `font_settings_store::font_display_name_override`. DISPLAY ONLY: it
     /// changes the name shown in the UI, never the render/inline-tag identity.
     display_name: Option<String>,
-    /// Canonical, COLLISION-AWARE render/inline-tag identity, computed for the
-    /// FINALIZED panel font list by `fonts::assign_font_identity_names`. It is the
-    /// original family name when that family is unique in the list, and falls back to
-    /// the (unique-ish) file-stem `label` when two loaded files share one family name
-    /// (e.g. a Regular + Bold pair shipped as separate files), so each file keeps a
-    /// distinct persisted identity and never silently swaps for the other. Set to the
-    /// per-entry family-or-label default at construction; overwritten by
+    /// Canonical render/inline-tag identity: the representative face's POSTSCRIPT NAME
+    /// (`name` table id 6), computed for the FINALIZED panel font list by
+    /// `fonts::assign_font_identity_names`.
+    ///
+    /// Stored with its original casing and compared case-insensitively. Two files
+    /// claiming one PostScript name with DIFFERENT bytes each get
+    /// `"{ps_name}%{16 hex digits of their own content hash}"`, so an entry's identity
+    /// is derived from its own bytes and does not shift when another claimant of the name
+    /// is added or removed. The separator is a character the PostScript spec FORBIDS
+    /// (`fonts::IDENTITY_HASH_SEPARATOR`), so a suffixed identity can never collide with
+    /// some other font's real name. A file with no VALID, readable PostScript name falls
+    /// back to `fonts::base_font_identity_str`'s rule (family name, else file-stem
+    /// `label`). Set to the per-entry base default at construction; overwritten by
     /// `assign_font_identity_names` once the full list is known.
     identity_name: String,
     /// Per-VIRTUAL-group display aliases for this font, keyed by the (merged) group
@@ -773,10 +891,10 @@ impl FontEntry {
     /// Name to SHOW in the UI: the user display-name override when set, else `label`.
     ///
     /// This is DISPLAY ONLY. The render/inline-tag identity is `render_identity_name()`
-    /// (family name when unique, file-stem `label` on a family collision), with the
-    /// label and file-stem kept as legacy resolution aliases; a display override must
-    /// never reach any of those resolution paths. `pub(crate)` so the settings
-    /// font-settings UI (via `font_admin`) can present it.
+    /// (the representative face's PostScript name), with the family name, label and
+    /// file-stem kept as legacy resolution aliases; a display override must never reach
+    /// any of those resolution paths. `pub(crate)` so the settings font-settings UI
+    /// (via `font_admin`) can present it.
     ///
     /// The bundled-stack entry is the one entry whose shown name is LOCALIZED: its
     /// stored `label`/identity is a fixed reserved string (it is persisted into
@@ -833,25 +951,72 @@ impl FontEntry {
         &self.original_name
     }
 
+    /// PostScript name (`name` table id 6) of the representative face, read from the
+    /// font file at load time.
+    ///
+    /// Returns an empty string when the file could not be parsed, when the declared name
+    /// is not spec-valid (`fonts::is_valid_post_script_name` — such a name counts as
+    /// absent everywhere), and for the synthetic bundled-stack entry (which stands for a
+    /// chain of files, not one face). It is the structural source of the render IDENTITY
+    /// (`render_identity_name`), never a display string.
+    pub(crate) fn post_script_name(&self) -> &str {
+        &self.post_script_name
+    }
+
+    /// UNSUFFIXED identity this entry claims: its representative face's PostScript
+    /// name, or the family-or-label fallback when the file carried none.
+    ///
+    /// This is the name BEFORE any collision suffix, so it is what a second claimant of
+    /// the same name would collide with and what `TabFontProvider` registers as the
+    /// bare-name resolution alias. Meaningless for the synthetic bundled-stack entry
+    /// (whose identity is reserved, not derived) — callers skip that entry.
+    fn base_identity_name(&self) -> String {
+        self.base_identity_str().to_string()
+    }
+
+    /// Borrowing form of [`Self::base_identity_name`] for the allocation-sensitive name
+    /// matchers (`ui_helpers`), which evaluate it for every font on every lookup.
+    fn base_identity_str(&self) -> &str {
+        fonts::base_font_identity_str(self.post_script_name(), &self.original_name, &self.label)
+    }
+
     /// Canonical render/inline-tag IDENTITY name — the value persisted in
     /// `render_data`/`TextRenderParams.font_name` and emitted in `<font=...>` tags.
     ///
-    /// Returns the COLLISION-AWARE `identity_name` computed for the panel list by
-    /// `fonts::assign_font_identity_names`: the original family name when that family
-    /// is unique in the list, else the file-stem `label` (so a Regular + Bold pair
-    /// shipped as two files keeps two distinct identities and neither renders the
-    /// other). It is NOT a display string — user-facing combos/lists use
-    /// `display_label()`. `TabFontProvider` keys this identity as its primary lookup
-    /// and keeps the family name / label / stem as aliases, so legacy projects that
-    /// persisted any of those forms still resolve. Falls back to the family-or-label
-    /// default if the identity was never assigned (a non-panel list).
-    pub(in crate::tabs::typing) fn render_identity_name(&self) -> String {
+    /// Returns the `identity_name` computed for the panel list by
+    /// `fonts::assign_font_identity_names`: the representative face's PostScript name,
+    /// suffixed with `%{16 hex of the content hash}` only when another file claims the
+    /// same name with different bytes (or when the base identity cannot be a valid
+    /// PostScript name; see `fonts::assign_font_identity_names`). It is NOT a display string — user-facing
+    /// combos/lists use `display_label()`. `TabFontProvider` keys this identity as its
+    /// primary lookup and keeps the family name / label / stem as READ-ONLY legacy
+    /// aliases, so projects persisted before the identity became the PostScript name
+    /// still resolve. Falls back to the per-entry base identity if the collision-aware
+    /// pass was never run (a non-panel list).
+    ///
+    /// `pub(crate)` (via the `font_admin` re-export of this opaque type) so the settings
+    /// font UI can key its own-typeface previews and its per-font window on the identity
+    /// instead of on a file path.
+    pub(crate) fn render_identity_name(&self) -> String {
         let identity = self.identity_name.trim();
         if identity.is_empty() {
-            fonts::default_font_identity_name(&self.original_name, &self.label)
+            self.base_identity_name()
         } else {
             identity.to_string()
         }
+    }
+
+    /// Hash of the representative FILE's bytes, or `0` when it was not computed (see the
+    /// `content_hash` field).
+    ///
+    /// `pub(crate)` (via the `font_admin` re-export) so every own-typeface PREVIEW site can
+    /// put it into the egui family key: a registration hands egui a SNAPSHOT of the bytes,
+    /// which egui never refreshes, so without this discriminant a replaced font file would
+    /// keep being previewed from its old content. Never a resolution key and never
+    /// persisted — the identity already carries the hash when (and only when) two files
+    /// contest one PostScript name.
+    pub(crate) fn content_hash(&self) -> u64 {
+        self.content_hash
     }
 
     /// Face index of the representative face (0 for single-face files). `pub(crate)` for
@@ -871,10 +1036,24 @@ impl FontEntry {
     }
 }
 
+/// One selectable face of a font FILE (a `.ttc` collection has several).
 #[derive(Clone)]
 struct FontFaceEntry {
+    /// DISPLAY label of the face in the face combo:
+    /// `#{index} {family} | {style} | w{weight} | {post_script_name}`. Presentation
+    /// only — every consumer that needs one of those parts reads it structurally
+    /// (`post_script_name` below, `FontEntry::original_name`), never by splitting
+    /// this string.
     label: String,
+    /// Index of the face inside its file, as passed to `fontdb`/`swash`.
     face_index: usize,
+    /// PostScript name (`name` table id 6) of THIS face as `fontdb` read it, VALIDATED
+    /// against the spec (`fonts::validated_post_script_name`). Empty for the placeholder
+    /// face of a file that could not be parsed — `fontdb` rejects a real face that
+    /// carries no PostScript name — and for a face whose declared name the spec forbids,
+    /// which is treated as no name at all so it can never become an identity. The face
+    /// `label` above still shows the raw string, so a malformed name stays diagnosable.
+    post_script_name: String,
 }
 
 /// Какой текстовый буфер сейчас активен для выделения и вставки инлайн-тегов:
@@ -1299,6 +1478,179 @@ struct FontReloadResult {
     font_groups: Vec<String>,
 }
 
+/// Per-font parameter memory of one create/edit panel, keyed by the font IDENTITY.
+///
+/// TWO LAYERS, deliberately. The in-RAM map is the SESSION memory and, unchanged from
+/// before, the payload a saved create preset carries (`TypingCreatePreset.font_profiles`).
+/// Behind it sits the font's PERSISTENT DEFAULT profile in `fonts/fonts_data.json`
+/// (`fonts_data.fonts.<identity>.profile`, the "variant A" split of
+/// `dev-docs/font_identity_postscript_plan.md`): a lookup that misses in RAM falls back to
+/// the stored default and caches it, and a store writes BOTH. That is what makes the
+/// parameters a user set for a font come back in the next session instead of dying with
+/// the panel, while presets keep their own independent per-font overrides.
+///
+/// WHICH LAYER A STORE WRITES IS DECIDED BY THE CALLER, and the rule is the ownership split
+/// of "variant A": a panel that is currently showing a PRESET updates that preset's working
+/// set only ([`DefaultProfileWrite::PresetOnly`]), never the font's persisted default.
+/// Otherwise preset A's parameters silently became the font's default and every fresh,
+/// preset-less panel opened with them.
+///
+/// The persisted write goes through `font_settings_store::set_font_profile`, which is
+/// DEBOUNCED: a profile is rewritten on every parameter edit, so an immediate atomic save
+/// per edit would be pure write amplification.
+#[derive(Debug, Default, Clone)]
+pub(super) struct FontProfileMemory {
+    /// Session memory: identity -> profile JSON. Also the preset payload.
+    ram: HashMap<String, Value>,
+}
+
+/// Whether a [`FontProfileMemory`] store also updates the font's PERSISTED DEFAULT profile.
+///
+/// The two layers have different owners ("variant A" of
+/// `dev-docs/font_identity_postscript_plan.md`): `fonts_data.fonts.<identity>.profile` is
+/// what a font remembers by itself, `presets.<name>.profiles` is what ONE preset remembers
+/// for it. An edit made while a preset is applied belongs to the preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DefaultProfileWrite {
+    /// No preset is applied: the parameters on screen are what this font should remember,
+    /// so both layers are written.
+    UpdateFontDefault,
+    /// A preset is applied: only the session map (that preset's working set) is written.
+    /// The preset itself reaches disk when the user saves it.
+    PresetOnly,
+}
+
+impl FontProfileMemory {
+    /// Wraps an existing identity-keyed profile map (a preset being applied), replacing the
+    /// session memory. Persisted defaults are untouched: applying a preset must not rewrite
+    /// what every font remembers on disk.
+    #[must_use]
+    pub(super) fn from_map(ram: HashMap<String, Value>) -> Self {
+        Self { ram }
+    }
+
+    /// Snapshot of the SESSION memory only, for storing into a preset. The persisted
+    /// defaults of fonts this session never touched deliberately stay out of it.
+    #[must_use]
+    pub(super) fn to_map(&self) -> HashMap<String, Value> {
+        self.ram.clone()
+    }
+
+    /// The profile remembered for `identity`: the session value, else the font's persisted
+    /// default (which is then cached in the session map, exactly as if the user had just
+    /// selected that font). `None` when the font has no remembered parameters at all.
+    pub(super) fn get(&mut self, identity: &str) -> Option<&Value> {
+        self.get_with(identity, Self::persisted_profile)
+    }
+
+    /// Remembers `profile` for `identity` in this session and — only with
+    /// [`DefaultProfileWrite::UpdateFontDefault`] — as the font's persisted default.
+    /// Returns the previous session value, mirroring `HashMap::insert`.
+    pub(super) fn insert(
+        &mut self,
+        identity: String,
+        profile: Value,
+        write: DefaultProfileWrite,
+    ) -> Option<Value> {
+        match write {
+            DefaultProfileWrite::UpdateFontDefault => {
+                self.insert_with(identity, profile, Self::persist_profile)
+            }
+            // The session map IS the applied preset's working set; the font's own default
+            // must not learn a preset's parameters.
+            DefaultProfileWrite::PresetOnly => self.insert_with(identity, profile, |_, _| {}),
+        }
+    }
+
+    /// [`Self::get`] with an explicit persisted-profile source, so the two-layer rule
+    /// (session hit → session; session miss → load, CACHE, return) is unit-testable without
+    /// the process-global store.
+    fn get_with(
+        &mut self,
+        identity: &str,
+        load: impl FnOnce(&str) -> Option<Value>,
+    ) -> Option<&Value> {
+        if !self.ram.contains_key(identity)
+            && let Some(stored) = load(identity)
+        {
+            self.ram.insert(identity.to_string(), stored);
+        }
+        self.ram.get(identity)
+    }
+
+    /// [`Self::insert`] with an explicit persisted-profile sink; see [`Self::get_with`].
+    fn insert_with(
+        &mut self,
+        identity: String,
+        profile: Value,
+        save: impl FnOnce(&str, &Value),
+    ) -> Option<Value> {
+        save(&identity, &profile);
+        self.ram.insert(identity, profile)
+    }
+
+    /// Reads the persisted default profile of `identity`.
+    ///
+    /// Disabled under `#[cfg(test)]`: the font-settings store is PROCESS-GLOBAL, so a panel
+    /// unit test reading it would see profiles written by any other test in the binary
+    /// (and vice versa). The persistence itself is covered by `font_settings_store`'s own
+    /// serialized tests. Same precedent as `font_settings_store::persist_off_thread`.
+    fn persisted_profile(identity: &str) -> Option<Value> {
+        if cfg!(test) {
+            return None;
+        }
+        font_settings_store::font_profile(identity)
+    }
+
+    /// Writes the persisted default profile of `identity`.
+    ///
+    /// Under `#[cfg(test)]` the process-global store is not touched (see
+    /// [`Self::persisted_profile`]); the write is RECORDED in a per-thread journal instead,
+    /// because "which layer did this edit reach" is precisely the contract of
+    /// [`DefaultProfileWrite`] and cannot be observed any other way.
+    #[cfg(test)]
+    fn persist_profile(identity: &str, _profile: &Value) {
+        PERSISTED_DEFAULT_WRITES.with(|writes| writes.borrow_mut().push(identity.to_string()));
+    }
+
+    /// Production build: the write reaches the process-global store.
+    #[cfg(not(test))]
+    fn persist_profile(identity: &str, profile: &Value) {
+        font_settings_store::set_font_profile(identity, Some(profile.clone()));
+    }
+
+    /// Whether the SESSION memory holds a profile for `identity` (ignoring the persisted
+    /// default). Test-only: production code always wants the two-layer `get`.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn contains_key(&self, identity: &str) -> bool {
+        self.ram.contains_key(identity)
+    }
+
+    /// Number of profiles in the SESSION memory. Test-only.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn stored_count(&self) -> usize {
+        self.ram.len()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Identities whose PERSISTED DEFAULT profile was written on this thread, in order.
+    /// Per-thread so parallel tests cannot see each other's writes.
+    static PERSISTED_DEFAULT_WRITES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes (and clears) the identities whose persisted default profile was written on this
+/// thread since the last call. Test-only; see [`FontProfileMemory::persist_profile`].
+#[cfg(test)]
+#[must_use]
+pub(super) fn take_persisted_default_writes() -> Vec<String> {
+    PERSISTED_DEFAULT_WRITES.with(|writes| std::mem::take(&mut *writes.borrow_mut()))
+}
+
 /// Read-only inputs for `draw_right_section`: current panel/editor state the right-side actions
 /// column reflects (mask visibility, clean-overlay visibility, movement mode, export config).
 struct TypingRightSectionInputs<'a> {
@@ -1352,14 +1704,48 @@ struct TypingCreatePanelState {
     font_reload_rx: Option<Receiver<FontReloadResult>>,
     latest_font_reload_token: u64,
     fonts_reload_in_flight: bool,
-    combo_font_family_cache: HashMap<(PathBuf, usize), String>,
-    font_profiles_by_key: HashMap<String, Value>,
-    active_font_key: Option<String>,
+    /// `true` once this panel has installed a list built by the COMBINED loader
+    /// (`fonts::load_fonts`), i.e. folder fonts AND imported system fonts together.
+    ///
+    /// `false` from construction until the first reload result lands. It gates the one-shot
+    /// legacy-preset migration: run against a list that cannot see the imported system
+    /// fonts, the migration resolves none of their references, keeps them verbatim, deletes
+    /// the legacy `user_config` key and never retries — leaving `presets.json` and
+    /// `fonts_data.json` permanently disagreeing about the same font.
+    font_list_is_authoritative: bool,
+    /// Legacy `user_config.TextTab.create_presets` payload that arrived (from the
+    /// off-thread seed) BEFORE the authoritative font list, parked until it lands.
+    ///
+    /// The read of `presets.json` and the font load run concurrently, so their finish order
+    /// is not something the panel may rely on; this is what makes the ordering a guarantee
+    /// instead of a race. Drained by `poll_font_reload_results`.
+    pending_legacy_presets_migration: Option<Vec<presets_store::LegacyPresetEntry>>,
+    /// Per-font parameter memory, keyed by the font IDENTITY: this session's map plus each
+    /// font's PERSISTED default profile behind it (see [`FontProfileMemory`]).
+    ///
+    /// Its session half is also the payload of a saved create preset
+    /// (`TypingCreatePreset.font_profiles`). A preset written by an older build carries PATH
+    /// keys; `apply_preset_by_name` converts them to identities on load (an unresolvable key
+    /// is kept verbatim rather than dropped), so nothing downstream has to know about the
+    /// legacy form.
+    font_profiles_by_identity: FontProfileMemory,
+    /// IDENTITY of the font whose profile is currently loaded into the panel fields —
+    /// the anchor `store_current_font_profile_by_idx` writes back to and the key the
+    /// selection is restored by after a background font reload.
+    active_font_identity: Option<String>,
     /// Имя шрифта выбранного для редактирования оверлея, если этот шрифт не найден
     /// среди доступных. Пока поле `Some`, рендер оверлея заблокирован, а все
     /// параметры (кроме выбора шрифта) на панели редактирования недоступны.
     missing_font: Option<String>,
     presets_by_name: HashMap<String, TypingCreatePreset>,
+    /// Sending end of the preset-store event channel, cloned into every background preset
+    /// worker (the off-GUI-thread seed read, the legacy-payload read, and each save).
+    preset_store_tx: Sender<PresetStoreEvent>,
+    /// Receiving end, drained once per frame by `create_presets::poll_preset_store_events`:
+    /// it installs the seeded document, finishes the one-shot `user_config` migration
+    /// (which needs THIS panel's font list, hence the GUI-thread half), adopts presets
+    /// another app instance wrote, and surfaces a save failure in the status line.
+    preset_store_rx: Receiver<PresetStoreEvent>,
     selected_preset_name: Option<String>,
     preset_name_input: String,
     formula_presets_by_name: HashMap<String, TypingFormulaPreset>,
@@ -1466,6 +1852,12 @@ struct TypingCreatePanelState {
     /// Выбранная группа по числу переносов слов; `None` — «Все».
     advanced_form_group: Option<usize>,
     advanced_form_cache: Option<AdvancedFormCache>,
+    /// Font bytes for the advanced-form width metric, resolved OFF the GUI thread; see
+    /// [`AdvancedFormFont`]. `None` until the window has asked for a font at all.
+    advanced_form_font: Option<AdvancedFormFont>,
+    /// In-flight resolve feeding `advanced_form_font`; at most one at a time (the newest
+    /// selection wins).
+    advanced_form_font_request: Option<AdvancedFormFontRequest>,
     /// Сформированный (разбитый на строки) текст. Если не пуст — в рендер идёт
     /// именно он, а `text` остаётся исходным. Пуст — рендерится `text`.
     formed_text: String,
@@ -1529,17 +1921,54 @@ struct AdvancedFormCache {
     truncated: bool,
 }
 
+/// The font bytes the advanced-form width metric measures with, as the panel's own
+/// `FontProvider` resolved them — i.e. exactly the bytes the renderer draws with.
+///
+/// Resolving means a possible `fs::read`, so it never happens on the GUI thread
+/// (`CLAUDE.md` §5); the window shows the coarse per-character metric until this arrives.
+struct AdvancedFormFont {
+    /// Font identity this was resolved FOR. A different selection invalidates it.
+    identity: String,
+    /// `None` when the identity resolved to nothing (unknown name, unreadable file).
+    /// Remembered rather than retried, so a missing font does not spawn a resolver per
+    /// frame for as long as the window stays open.
+    content: Option<FontContent>,
+}
+
+/// An in-flight background resolve of [`AdvancedFormFont`].
+struct AdvancedFormFontRequest {
+    /// Identity being resolved; also what tells a stale request from the current one.
+    identity: String,
+    /// Delivers the worker's result exactly once.
+    rx: Receiver<Option<FontContent>>,
+}
+
 /// От чего зависят пиксельные ширины глифов в окне форм. При смене любого поля
 /// метрику (и кэш форм) надо пересобрать.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct AdvancedFormMetricSignature {
-    font_path: Option<String>,
-    /// The selection is the BUILT-IN interface font, whose metric database also carries
-    /// the rest of the bundled `core` chain (`create_advanced::register_bundled_core_fallback`).
-    /// Kept separate from `font_path` because the built-in entry points at a real file
-    /// (`core[0]`): a user who imported that very file would otherwise share this
-    /// signature while being measured with a different database.
-    bundled_ui_stack: bool,
+    /// IDENTITY of the selected font (`FontEntry::render_identity_name`), `None` when no
+    /// font is selected.
+    ///
+    /// The identity — not the file path — is what distinguishes two measurements: the
+    /// BUILT-IN interface entry points at the real file `core[0]` and is measured with
+    /// the whole bundled `core` chain in its database
+    /// (`create_advanced::register_bundled_core_fallback`), while a user who imported
+    /// that very file is measured with that file alone. Keying on the path made those two
+    /// share a signature, which is why a separate `bundled_ui_stack` flag had to exist;
+    /// their identities differ (`ManhwaStudio-UI` vs the file's PostScript name), so the
+    /// flag is gone.
+    font_identity: Option<String>,
+    /// Content id of the font bytes the metric was built from, `None` while they are
+    /// still being resolved off the GUI thread (the cache then holds CHARACTER-width
+    /// forms) or when the identity resolves to nothing.
+    ///
+    /// It is what turns the arrival of the bytes into a cache rebuild: the identity has
+    /// not changed at that moment, so without this field the window would keep showing
+    /// the coarse fallback metric until the user touched something else. It doubles as
+    /// the "the file behind this identity was replaced" discriminant, for the same
+    /// reason `widgets::font_preview` keys its registrations by content.
+    font_content_id: Option<u64>,
     face_index: usize,
     force_bold: bool,
     force_italic: bool,

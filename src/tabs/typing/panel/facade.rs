@@ -16,6 +16,7 @@ parent module's types and imports.
 */
 
 use super::*;
+use crate::tabs::typing::psd_export::FontPostScriptNames;
 
 impl TypingTopPanelState {
     pub(in crate::tabs::typing) fn draw(
@@ -42,6 +43,11 @@ impl TypingTopPanelState {
         self.edit_panel.poll_font_settings_changes();
         self.create_panel.poll_font_reload_results();
         self.edit_panel.poll_font_reload_results();
+        // Presets belong to the CREATE panel only (`preview_enabled`): install the
+        // off-thread seed, finish the one-shot `user_config` -> `fonts/presets.json`
+        // migration once its background read lands, adopt what another app instance wrote,
+        // and surface any background save failure instead of losing it.
+        self.create_panel.poll_preset_store_events();
         self.create_panel.reset_text_input_focus_tracking();
         self.edit_panel.reset_text_input_focus_tracking();
         if self.create_panel.fonts_reload_in_flight() || self.edit_panel.fonts_reload_in_flight() {
@@ -647,6 +653,25 @@ impl TypingTopPanelState {
     /// its background render workers resolve fonts by name.
     pub(in crate::tabs::typing) fn font_provider(&self) -> Arc<dyn FontProvider> {
         self.create_panel.font_provider()
+    }
+
+    /// `identity -> per-face PostScript names` for the current font list, for the PSD
+    /// export (whose job carries neither the font list nor the provider). Built from the
+    /// create panel's list, like `font_provider`.
+    pub(in crate::tabs::typing) fn font_post_script_names(&self) -> FontPostScriptNames {
+        self.create_panel.font_post_script_names()
+    }
+
+    /// Resolves a font reference persisted by an OLDER build (path and/or name in any
+    /// historical form) to the current render identity; `None` when nothing matches.
+    /// Used by the tab's schema-1 -> schema-2 conversion of stored overlays.
+    pub(in crate::tabs::typing) fn resolve_legacy_font_identity(
+        &self,
+        font_path: Option<&str>,
+        font_name: Option<&str>,
+    ) -> Option<String> {
+        self.create_panel
+            .resolve_legacy_font_identity(font_path, font_name)
     }
 
     pub(in crate::tabs::typing) fn adjust_create_font_size_by_wheel_steps(&mut self, steps: i32) -> bool {

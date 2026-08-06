@@ -211,6 +211,10 @@ pub(super) fn parse_opening_inline_tag(raw: &str) -> Option<TypingInlineTagKind>
         return Some(TypingInlineTagKind::Align(align));
     }
 
+    // `<font=…>` carries a font IDENTITY when the app wrote it, but any LEGACY form
+    // (family name, file stem, `"{stem} [system]"` label) when an older build did. The
+    // value is taken verbatim; resolving it across all those forms is
+    // `create_state::find_font_idx_by_name_forms` / `TabFontProvider`, which agree.
     if let Some((tag_name, value)) = raw.split_once('=')
         && tag_name.trim().eq_ignore_ascii_case("font")
     {
@@ -388,6 +392,12 @@ pub(super) fn build_inline_machine_tag(style: &TypingInlineTagStyle) -> String {
         out.push_str(format!(" a={}", format_inline_align_value(align)).as_str());
     }
     if let Some(font_label) = style.font_label.as_deref() {
+        // Guard, not a transformation: the value written here is a font IDENTITY (a
+        // PostScript name), and the PostScript spec forbids `"`, `<` and `>` in one — so
+        // for every value the app itself emits this replace is a no-op by construction
+        // (`dev-docs/font_identity_postscript_plan.md`, "It is tag-safe"). It stays
+        // because the field can still hold a LEGACY name read from an old document, where
+        // a stray quote or angle bracket would break the `f="…"` attribute grammar.
         let sanitized = font_label.replace(['"', '<', '>'], "");
         out.push_str(format!(" f=\"{sanitized}\"").as_str());
     }

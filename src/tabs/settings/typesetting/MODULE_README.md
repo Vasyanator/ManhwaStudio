@@ -26,9 +26,28 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   submodule declarations. Re-exports `FontSettingsEditorState` to the parent `settings` module.
 - `font_settings.rs`: `FontSettingsEditorState`, the "Настройки шрифтов" widget. Loads the
   three font categories (folder / imported system / custom) AND the real folder-group names
-  off the GUI thread via `font_admin::{load_folder_fonts, load_imported_fonts,
-  list_folder_group_names}`, reloading live when `font_admin::fonts_revision()` advances; draws
-  each font's name in its own typeface (`crate::widgets::ensure_font_family`); and hosts a
+  off the GUI thread via `font_admin::{load_font_lists, list_folder_group_names}`, reloading
+  live when `font_admin::fonts_revision()` advances. `load_font_lists` is ONE combined pass on
+  purpose: the folder and imported categories must carry the identities the typing panel
+  resolves, and only a merged list can assign them (two independent passes hide every
+  cross-source name collision, so settings showed and wrote a bare identity where the panel had
+  assigned a `%hash`-suffixed one, and group membership / display-name overrides written here
+  silently did nothing). The imported category is rendered from `ImportedFontRow`s, one per
+  DOCUMENT entry: a font whose file is missing, unparsable, replaced, or path-less is shown
+  greyed with a localized reason and keeps its remove button — that entry is otherwise
+  impossible to get rid of, since nothing else prunes `fonts_data.json`. An unavailable row now
+  also means the font is not installed under that PostScript name EITHER: one that merely MOVED
+  is located by name and comes back as a normal row (the localized reason still describes what
+  happened at the recorded path, which is the half the user can act on). The picker's
+  system-font catalog load doubles as the refresh of that by-name index — see
+  `src/tabs/typing/panel/MODULE_README.md`. The remove button
+  passes `row.stored_identity` (the document key), NOT the loaded font's render identity, which
+  may carry a collision suffix. Draws
+  each font's name in its own typeface (`crate::widgets::request_font_family`, keyed by the
+  font's IDENTITY — `FontEntry::render_identity_name` — PLUS its `content_hash`, with the
+  path as the byte source only; the hash is what retires a binding whose file was replaced,
+  and is `0`/"unknown" for the picker catalog, which never reads whole files);
+  and hosts a
   searchable, row-virtualized picker over `font_admin::load_system_catalog()` to import a system
   font (`font_admin::add_imported_font` / `remove_imported_font` / `is_font_imported`).
   Folder/imported rows are BUTTONS that open the per-font properties window. Owns the
@@ -39,7 +58,8 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   VIRTUAL font groups and edit their members. Reaches the model ONLY through the virtual-group
   facade (`font_admin::{list_virtual_groups, create/delete/rename_virtual_group,
   add/remove_virtual_group_member, set_virtual_group_member_alias}`), caching the snapshot and
-  refreshing on `fonts_revision()`. BOTH create AND rename validation reject a blank name or a
+  refreshing on `fonts_revision()`. Members are addressed by font IDENTITY throughout — the
+  member-row resolver, the alias buffers and the add-picker selection are all identity-keyed. BOTH create AND rename validation reject a blank name or a
   case-insensitive collision with an existing virtual group OR a real folder-group name (the
   folder names are passed in from `font_settings.rs`'s off-thread pass, and threaded into the
   editor window for rename); each surfaces a red error near its row. Deletion uses an inline
@@ -47,14 +67,16 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   confirm is guarded against a physical double-click and auto-disarms when the pointer leaves the
   armed button. Owns the
   group-editor `egui::Window` (pinned `Id`, follows the group name on rename) with a virtualized
-  member list (per-member alias edit + remove; unresolved paths shown greyed, never
-  auto-removed) and an inline add-member picker mirroring the import-picker body. The member
+  member list (per-member alias edit + remove; a member identity that matches no loaded font is
+  shown greyed — the stored identity is the clue the user needs — and is never auto-removed) and an inline add-member picker mirroring the import-picker body. The member
   names and the picker candidates render in their OWN typeface via the shared
   `crate::widgets::font_preview` helpers, VISIBLE rows only, bounded by the shared
   `PICKER_PREVIEW_FONT_CAP` (reused from `font_settings.rs`).
 - `font_properties_window.rs`: the per-font PROPERTIES window (`FontPropertiesState`, one open
-  at a time on `FontSettingsEditorState`). Identity header, an editable display-name override
-  (wired to `font_admin::set_display_name_override(&Path, ..)` — the facade computes the key),
+  at a time on `FontSettingsEditorState`). Identity header — family name, the render IDENTITY
+  (the PostScript name the project persists) and the file/face — an editable display-name override
+  (wired to `font_admin::set_display_name_override(identity, ..)`; the window's `path` is only the
+  byte source of the analysis and the preview),
   a live own-typeface preview, a virtualized glyph grid, and a collapsible kerning-pair list.
   The glyph inventory + kerning are extracted OFF the GUI thread via `ttf-parser` (cmap
   codepoints confirmed by `glyph_index`; `kern` Format 0 + GPOS `PairAdjustment` Format 1/2 over
