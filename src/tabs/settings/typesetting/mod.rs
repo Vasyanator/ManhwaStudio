@@ -5,6 +5,10 @@ rendering and form iteration across the app.
 
 Main responsibilities:
 - Render the "Поворот Ctrl+колесо" chooser and persist `TextTab.rotation_ctrl_wheel_mode`.
+- Re-export the font-settings block's name-display switch types
+  (`FontNameDisplayMode` / `FontListKind` / `FontNameDisplayModes`) to the parent `settings`
+  module, which owns their `user_config.json` load/save. One mode per switchable surface:
+  the folder list, the imported list, and the virtual-group editor window.
 - Render the shared typesetting-language selector.
 - Render and persist the app-wide hanging-punctuation list, applied live via
   `crate::text_punctuation`.
@@ -35,7 +39,9 @@ mod font_groups;
 mod font_properties_window;
 mod font_settings;
 
-pub(super) use font_settings::FontSettingsEditorState;
+pub(super) use font_settings::{
+    FontListKind, FontNameDisplayMode, FontNameDisplayModes, FontSettingsEditorState,
+};
 
 use super::{SettingsTabState, save_hanging_punctuation, save_rotation_ctrl_wheel_mode};
 use crate::runtime_log;

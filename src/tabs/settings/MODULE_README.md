@@ -113,7 +113,15 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   it reaches the font MODEL exclusively through the `crate::tabs::typing::font_admin` facade (loaders,
   imported-fonts store, display-name overrides, the opaque `FontEntry` type); the store persists the
   app-level per-font settings (imported system font paths + per-font `display_name` overrides) to
-  `fonts/fonts_data.json` inside the typing subtree, NOT to `user_config.json`. All
+  `fonts/fonts_data.json` inside the typing subtree, NOT to `user_config.json`. The ONE
+  font-block setting that does live in `user_config.json` is the name-display switch
+  (`TextTab.font_list_name_mode_folder` / `…_imported` / `…_group`, `FontNameDisplayMode`): which
+  NAME the folder list, the imported list and the virtual-group editor's ADD-MEMBER picker show —
+  the user-facing display label or the font's identity (that window's member TABLE needs no
+  switch: it shows both names in adjacent columns). It is an
+  INTERFACE preference, not a font property, so it belongs to the user config and not to
+  `fonts_data.json`; `mod.rs` owns its `load_font_name_display_modes` /
+  `save_font_name_display_mode` and seeds the widget at construction. All
   blocks are wrapped in collapsed `CollapsingHeader`s.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
   `user_config.json` override persistence.

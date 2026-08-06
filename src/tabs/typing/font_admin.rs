@@ -18,6 +18,8 @@ Contract:
   thread — it walks the fonts dir / the OS font database.
 - The font lists are built as ONE combined pass, so the identities the settings UI writes
   (group membership, display-name overrides) are the identities the typing panel resolves.
+- `#[cfg(test)]` `test_lock` / `test_reset` widen the store's test harness the same narrow
+  way, so a settings-UI test can drive the real store without importing a typing internal.
 
 Key functions:
 - `load_font_lists` (folder + imported in ONE identity-consistent pass) / `load_system_catalog`
@@ -321,4 +323,21 @@ pub(crate) fn virtual_groups_for_font(identity: &str) -> Vec<(String, Option<Str
 #[must_use]
 pub(crate) fn list_folder_group_names() -> Vec<String> {
     fonts::load_font_groups(&fonts::resolve_fonts_dir())
+}
+
+/// Serializes every test that touches the PROCESS-GLOBAL font-settings store, across ALL
+/// crates' test modules — the store is one static, so a settings-UI test and a typing-model
+/// test that both reset it would otherwise race. Test-only; part of the facade so external
+/// tests never reach for a typing internal.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    font_settings_store::test_lock()
+}
+
+/// Clears the shared font-settings store to a known-empty baseline for an isolated test.
+/// Callers MUST hold [`test_lock`]. Test-only; see the store's own `test_reset` for exactly
+/// what is (and is not) reset.
+#[cfg(test)]
+pub(crate) fn test_reset() {
+    font_settings_store::test_reset();
 }

@@ -3675,7 +3675,6 @@
   "typing.errors.fonts_not_found": "Aucune police trouvée dans {arg}",
   "typing.errors.invalid_rgba_buffer": "Tampon d'image RGBA invalide.",
   "typing.errors.layout_image_too_large": "La taille de l'image de disposition ne tient pas en mémoire.",
-  "typing.errors.no_fonts_found": "Aucune police trouvée dans {fonts_dir}",
   "typing.errors.no_fonts_found_reload": "Aucune police trouvée dans {arg}",
   "typing.errors.open_clean_overlay_error": "Impossible d'ouvrir le clean overlay {clean_overlay_path} : {err}",
   "typing.errors.open_file_error": "Impossible d'ouvrir {path} : {err}",

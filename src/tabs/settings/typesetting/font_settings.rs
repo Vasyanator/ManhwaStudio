@@ -15,6 +15,12 @@ Main responsibilities:
   and imported categories each row is a button that opens the per-font PROPERTIES window
   (`font_properties_window`), which owns display-name editing plus off-thread glyph/kerning
   inspection;
+- offer, in the folder and imported categories, a per-list switch selecting WHICH name the
+  rows show — the user-facing display label or the font's identity (its PostScript name).
+  The choice is an INTERFACE preference persisted per list in `user_config.json`
+  (`TextTab.font_list_name_mode_*`), applied live and never used as a key. The same switch
+  type serves the group-editor window (`FontListKind::Group`, ONE switch driving both of
+  that window's lists), which is why the widget and the name-selection helpers live here;
 - provide an in-app searchable picker of ALL installed OS fonts (also loaded off-thread,
   virtualized so only visible rows register into egui, and capped so a full-catalog scroll
   registers at most `PICKER_PREVIEW_FONT_CAP` own-typeface previews) to import a font by
@@ -25,11 +31,14 @@ Main responsibilities:
 
 Key types:
 - `FontSettingsEditorState`
+- `FontNameDisplayMode` / `FontListKind` / `FontNameDisplayModes` (the per-list name switch)
 
 Key functions:
 - `FontSettingsEditorState::new` / `FontSettingsEditorState::ui`
+- `draw_name_mode_switch` (the shared switch widget; also used by `font_groups.rs`)
 - `font_row_matches` (pure search predicate, unit-tested)
 - `clean_font_display_name` (pure display-name cleaner, unit-tested)
+- `font_row_name_for_mode` / `unavailable_row_name` (pure name selection, unit-tested)
 
 Notes:
 This UI reaches the font MODEL ONLY through `crate::tabs::typing::font_admin` (the loaders,
@@ -42,6 +51,7 @@ font into egui inherently needs its bytes, but READING them does not happen here
 in the interface font for those frames.
 */
 
+use crate::tabs::settings::save_font_name_display_mode;
 use crate::tabs::typing::font_admin::{self, FontEntry};
 use crate::widgets::{
     PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
@@ -68,6 +78,134 @@ pub(super) const PREVIEW_ROW_HEIGHT_FACTOR: f32 = 1.6;
 
 /// Number of preview rows kept visible in a virtualized category list before it scrolls.
 const CATEGORY_VISIBLE_ROWS: f32 = 10.0;
+
+/// Which of a font's two names a settings font-list row shows.
+///
+/// This is an INTERFACE preference of the settings lists, not a property of any font: it
+/// changes what is drawn and nothing else. The displayed name is never a key — resolution
+/// always goes through the identity (see `src/tabs/typing/panel/MODULE_README.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum FontNameDisplayMode {
+    /// The user-facing name: the user's display-name override when set, else the file-stem
+    /// label (`FontEntry::display_label`). The historical behavior, and the default.
+    #[default]
+    Custom,
+    /// The font's IDENTITY — the representative face's PostScript name
+    /// (`FontEntry::render_identity_name`), i.e. the name every persisted document uses for
+    /// it. A file that declares no usable PostScript name has no identity of its own and
+    /// shows the documented identity FALLBACK (family name, else file stem); that fallback
+    /// IS what the app uses for that font, so the row stays truthful.
+    Identity,
+}
+
+impl FontNameDisplayMode {
+    /// Stable lowercase token persisted in `user_config.json`.
+    #[must_use]
+    pub(crate) fn as_config_str(self) -> &'static str {
+        match self {
+            FontNameDisplayMode::Custom => "custom",
+            FontNameDisplayMode::Identity => "identity",
+        }
+    }
+
+    /// Parses a persisted token; returns `None` for anything unrecognized so the caller
+    /// falls back to the default instead of guessing.
+    #[must_use]
+    pub(crate) fn from_config_str(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "custom" => Some(FontNameDisplayMode::Custom),
+            "identity" => Some(FontNameDisplayMode::Identity),
+            _ => None,
+        }
+    }
+}
+
+/// Which switchable font-name surface a [`FontNameDisplayMode`] belongs to.
+///
+/// Each surface carries its OWN switch and its own persisted value: the folder list, the
+/// imported-system list and the group editor are browsed for different reasons, so one shared
+/// toggle would fight the user in whichever surface they did not just touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontListKind {
+    /// "Шрифты из папки fonts" — the fonts discovered in the project `fonts/` folder.
+    Folder,
+    /// "Добавленные системные шрифты" — the imported system fonts, one row per stored entry.
+    Imported,
+    /// The ADD-MEMBER picker of the virtual-group editor window. It is the only list there
+    /// that still has a name to choose: the window's member TABLE shows the user-facing name
+    /// and the identity in adjacent columns, so nothing is hidden from it either way.
+    Group,
+}
+
+impl FontListKind {
+    /// The `TextTab` key under which this surface's name-display mode lives in
+    /// `user_config.json`. Stable: it is a persisted key, not a label.
+    #[must_use]
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            FontListKind::Folder => "font_list_name_mode_folder",
+            FontListKind::Imported => "font_list_name_mode_imported",
+            FontListKind::Group => "font_list_name_mode_group",
+        }
+    }
+
+    /// Stable `id_salt` for this surface's switch, so the localized radio labels never decide
+    /// the widget ids.
+    #[must_use]
+    fn switch_id_salt(self) -> &'static str {
+        match self {
+            FontListKind::Folder => "font_settings_folder_name_mode",
+            FontListKind::Imported => "font_settings_imported_name_mode",
+            FontListKind::Group => "font_settings_group_name_mode",
+        }
+    }
+
+    /// Localized leading label of this surface's switch. The group editor's switch governs
+    /// only its ADD list, so it names that list where a category switch just says "the list".
+    #[must_use]
+    fn switch_label(self) -> &'static str {
+        match self {
+            FontListKind::Folder | FontListKind::Imported => {
+                t!("typing.font_settings.name_mode_label")
+            }
+            FontListKind::Group => t!("typing.font_settings.name_mode_label_group"),
+        }
+    }
+}
+
+/// The name-display mode of each switchable font surface, as loaded from / written to
+/// `user_config.json`. Defaults to [`FontNameDisplayMode::Custom`] everywhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FontNameDisplayModes {
+    /// Mode of the folder-fonts list.
+    pub(crate) folder: FontNameDisplayMode,
+    /// Mode of the imported-system-fonts list.
+    pub(crate) imported: FontNameDisplayMode,
+    /// Mode of the group-editor window (both of its lists).
+    pub(crate) group: FontNameDisplayMode,
+}
+
+impl FontNameDisplayModes {
+    /// The mode currently selected for `list`.
+    #[must_use]
+    pub(crate) fn get(self, list: FontListKind) -> FontNameDisplayMode {
+        match list {
+            FontListKind::Folder => self.folder,
+            FontListKind::Imported => self.imported,
+            FontListKind::Group => self.group,
+        }
+    }
+
+    /// Mutable access to `list`'s slot, so a switch can write back without a match at the
+    /// call site.
+    fn slot_mut(&mut self, list: FontListKind) -> &mut FontNameDisplayMode {
+        match list {
+            FontListKind::Folder => &mut self.folder,
+            FontListKind::Imported => &mut self.imported,
+            FontListKind::Group => &mut self.group,
+        }
+    }
+}
 
 /// A snapshot of the three font categories, loaded together off the GUI thread.
 /// `loaded_revision` is the imported-fonts store revision at load time, used to detect
@@ -117,6 +255,13 @@ pub(crate) struct FontSettingsEditorState {
     properties: Option<super::font_properties_window::FontPropertiesState>,
     /// The "Группы" (virtual font groups) sub-editor rendered as the fourth category.
     groups_editor: super::font_groups::FontGroupsEditorState,
+    /// Which name each switchable list shows. Seeded from `user_config.json` by the owner
+    /// (`SettingsTabState::new`) and written back off-thread whenever a switch changes.
+    name_modes: FontNameDisplayModes,
+    /// Path of `user_config.json`, injected by the owner: the target of the name-mode
+    /// writes. Empty only in a `Default`-constructed state (tests), where a save would
+    /// fail and be logged rather than touch a real config.
+    user_settings_file: PathBuf,
 }
 
 // `FontEntry` is not `Debug`, so the buffered lists cannot derive it; report structural
@@ -130,15 +275,25 @@ impl std::fmt::Debug for FontSettingsEditorState {
             .field("picker_catalog_loaded", &self.picker_catalog.is_some())
             .field("properties_open", &self.properties.is_some())
             .field("groups_editor", &self.groups_editor)
+            .field("name_modes", &self.name_modes)
             .finish()
     }
 }
 
 impl FontSettingsEditorState {
-    /// Creates an uninitialized editor; category lists load lazily on the first `ui` call.
+    /// Creates an editor whose category lists load lazily on the first `ui` call.
+    ///
+    /// `user_settings_file` is the `user_config.json` this widget writes its per-list
+    /// name-display modes back to (off the GUI thread); `name_modes` are those modes as
+    /// they were read from that file. The read stays with the owner so this constructor
+    /// performs no I/O.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(user_settings_file: PathBuf, name_modes: FontNameDisplayModes) -> Self {
+        Self {
+            user_settings_file,
+            name_modes,
+            ..Self::default()
+        }
     }
 
     /// Renders the font-settings block: three category headers plus the import picker.
@@ -213,10 +368,17 @@ impl FontSettingsEditorState {
             .show(ui, |ui| {
                 if cats.folder.is_empty() {
                     ui.small(t!("typing.font_settings.folder_empty_hint"));
-                } else if let Some(font) =
-                    Self::draw_font_rows_virtualized(ui, &cats.folder, "font_settings_folder_rows")
-                {
-                    to_open = Some(font);
+                } else {
+                    // Switch first: it decides what the rows below it say.
+                    self.draw_owned_name_mode_switch(ui, FontListKind::Folder);
+                    if let Some(font) = Self::draw_font_rows_virtualized(
+                        ui,
+                        &cats.folder,
+                        "font_settings_folder_rows",
+                        self.name_modes.folder,
+                    ) {
+                        to_open = Some(font);
+                    }
                 }
             });
 
@@ -227,6 +389,9 @@ impl FontSettingsEditorState {
             if cats.imported_rows.is_empty() {
                 ui.small(t!("typing.font_settings.imported_empty_hint"));
             } else {
+                // Own switch, independent of the folder list's (see `FontListKind`).
+                self.draw_owned_name_mode_switch(ui, FontListKind::Imported);
+                let name_mode = self.name_modes.imported;
                 // Virtualized like the folder list; each row additionally carries a remove
                 // button that drives the store (bumping its revision → the lists reload).
                 let row_height =
@@ -253,14 +418,16 @@ impl FontSettingsEditorState {
                                 }
                                 match &row.font {
                                     Some(font) => {
-                                        if Self::draw_font_name_row(ui, font) {
+                                        if Self::draw_font_name_row(ui, font, name_mode) {
                                             to_open = Some(font.clone());
                                         }
                                     }
                                     // No file to render it with (and nothing to open): show
                                     // what the document records plus the reason, so the user
                                     // can recognize the entry they are about to remove.
-                                    None => Self::draw_unavailable_imported_row(ui, row),
+                                    None => {
+                                        Self::draw_unavailable_imported_row(ui, row, name_mode);
+                                    }
                                 }
                             });
                         }
@@ -281,9 +448,14 @@ impl FontSettingsEditorState {
                 // wired for the future virtual-font category.
                 if cats.custom.is_empty() {
                     ui.small(t!("typing.font_settings.custom_fonts_unsupported_hint"));
-                } else if let Some(font) =
-                    Self::draw_font_rows_virtualized(ui, &cats.custom, "font_settings_custom_rows")
-                {
+                } else if let Some(font) = Self::draw_font_rows_virtualized(
+                    ui,
+                    &cats.custom,
+                    "font_settings_custom_rows",
+                    // This category has no switch of its own (it is always empty today);
+                    // it draws the historical display label until it gains one.
+                    FontNameDisplayMode::Custom,
+                ) {
                     to_open = Some(font);
                 }
             });
@@ -296,14 +468,66 @@ impl FontSettingsEditorState {
         // floating group-editor window; the folder-group names and the loaded font lists come
         // from this off-thread snapshot (no GUI-thread filesystem work). Returns the block
         // rect (for the reveal highlight) and force-opens/scrolls on the deep-link frame.
-        self.groups_editor.ui(
+        let fonts = super::font_groups::GroupEditorFonts {
+            folder_group_names: &cats.folder_group_names,
+            folder: &cats.folder,
+            imported: &cats.imported,
+            categories_revision: cats.loaded_revision,
+        };
+        // The group editor's switch writes straight into our own mode slot (the widget owns
+        // ALL the persisted modes); compare around the call to catch the flip and persist it
+        // exactly like the two category switches do.
+        let previous_group_mode = self.name_modes.group;
+        let groups_rect = self.groups_editor.ui(
             ui,
-            &cats.folder_group_names,
-            &cats.folder,
-            &cats.imported,
-            cats.loaded_revision,
+            &fonts,
             force_reveal_groups,
-        )
+            &mut self.name_modes.group,
+        );
+        if self.name_modes.group != previous_group_mode {
+            self.persist_name_mode(FontListKind::Group, self.name_modes.group);
+        }
+        groups_rect
+    }
+
+    /// Draws one owned list's "which name to show" switch above its rows, applying a change
+    /// to the live list immediately and persisting it off the GUI thread.
+    ///
+    /// Only for the surfaces whose mode this widget OWNS (folder / imported). The group
+    /// editor's switch is drawn by `font_groups.rs` against a borrowed slot of the same
+    /// [`FontNameDisplayModes`]; its persistence is triggered in `draw_categories`.
+    fn draw_owned_name_mode_switch(&mut self, ui: &mut egui::Ui, list: FontListKind) {
+        let mut mode = self.name_modes.get(list);
+        if draw_name_mode_switch(ui, list, &mut mode) {
+            *self.name_modes.slot_mut(list) = mode;
+            self.persist_name_mode(list, mode);
+        }
+    }
+
+    /// Persists one list's name-display mode to `user_config.json` on a worker thread.
+    ///
+    /// Best-effort, like the pane's other preference writers: the live UI already shows the
+    /// new mode, so a failed write is logged with its path and reason rather than surfaced.
+    fn persist_name_mode(&self, list: FontListKind, mode: FontNameDisplayMode) {
+        let path = self.user_settings_file.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("settings-save-font-name-mode".to_string())
+            .spawn(move || {
+                if let Err(err) = save_font_name_display_mode(&path, list, mode) {
+                    crate::runtime_log::log_error(format!(
+                        "[settings] failed to persist font-name display mode '{}' for list '{}' \
+                         to {}; error={err}",
+                        mode.as_config_str(),
+                        list.config_key(),
+                        path.display()
+                    ));
+                }
+            })
+        {
+            crate::runtime_log::log_error(format!(
+                "[settings] failed to start font-name display mode save thread; error={err}"
+            ));
+        }
     }
 
     /// Draws the body of an imported-font row whose file could not be used this run.
@@ -312,15 +536,35 @@ impl FontSettingsEditorState {
     /// font — greyed, plus a short reason, with the recorded path and the technical detail in
     /// the hover text. The row has no properties window (there is no file to inspect) but it
     /// keeps its remove button, which is the whole reason it is drawn at all.
-    fn draw_unavailable_imported_row(ui: &mut egui::Ui, row: &font_admin::ImportedFontRow) {
-        let name = if row.stored_identity.trim().is_empty() {
+    ///
+    /// `mode` selects the same two names the loadable rows offer, as far as an unloadable
+    /// entry can: there is no `FontEntry` and therefore no display label, so
+    /// [`FontNameDisplayMode::Custom`] shows the user's display-name override for the stored
+    /// identity when one exists (a font renamed by the user stays recognizable after its file
+    /// disappears) and falls back to that identity otherwise, which is exactly what
+    /// [`FontNameDisplayMode::Identity`] always shows.
+    fn draw_unavailable_imported_row(
+        ui: &mut egui::Ui,
+        row: &font_admin::ImportedFontRow,
+        mode: FontNameDisplayMode,
+    ) {
+        // The override lookup is an in-memory store read (no I/O) and only runs for the
+        // handful of unavailable rows the virtualizer actually draws.
+        let display_override = match mode {
+            FontNameDisplayMode::Custom => {
+                font_admin::display_name_override(row.stored_identity.trim())
+            }
+            FontNameDisplayMode::Identity => None,
+        };
+        let name = match unavailable_row_name(mode, &row.stored_identity, display_override.as_deref())
+        {
+            Some(name) => name,
             // A legacy entry whose name was never learned: the path is all we have.
-            row.last_path
+            None => row
+                .last_path
                 .as_ref()
                 .map(|path| path.display().to_string())
-                .unwrap_or_else(|| t!("typing.font_settings.imported_unknown_font").to_string())
-        } else {
-            row.stored_identity.clone()
+                .unwrap_or_else(|| t!("typing.font_settings.imported_unknown_font").to_string()),
         };
         let (reason, detail) = match &row.unavailable {
             Some(font_admin::ImportedFontUnavailability::NoPathHint) => (
@@ -371,11 +615,12 @@ impl FontSettingsEditorState {
     /// non-evicting), so expanding a large `fonts/` folder no longer reads+registers all N
     /// fonts in a single frame. `id_salt` disambiguates sibling scroll areas. Returns the
     /// clicked font (a snapshot clone) when a row was activated, so the caller can open its
-    /// properties window.
+    /// properties window. `mode` selects which of the font's names each row shows.
     fn draw_font_rows_virtualized(
         ui: &mut egui::Ui,
         fonts: &[FontEntry],
         id_salt: &str,
+        mode: FontNameDisplayMode,
     ) -> Option<FontEntry> {
         let mut clicked: Option<FontEntry> = None;
         let row_height =
@@ -389,7 +634,7 @@ impl FontSettingsEditorState {
                     let Some(font) = fonts.get(row) else {
                         continue;
                     };
-                    if Self::draw_font_name_row(ui, font) {
+                    if Self::draw_font_name_row(ui, font, mode) {
                         clicked = Some(font.clone());
                     }
                 }
@@ -397,33 +642,41 @@ impl FontSettingsEditorState {
         clicked
     }
 
-    /// Draws one font's display name as a frameless BUTTON rendered in its OWN typeface, and
+    /// Draws one font's name as a frameless BUTTON rendered in its OWN typeface, and
     /// returns whether it was clicked (to open the font's properties window). Asks
     /// `widgets::font_preview` for the font's representative face and always restores the
     /// previous style font override. Draws in the default UI font for the frames the font
     /// file is still being read OFF the GUI thread, and permanently when it cannot be
     /// registered; never panics.
-    fn draw_font_name_row(ui: &mut egui::Ui, font: &FontEntry) -> bool {
+    ///
+    /// `mode` selects WHICH name is drawn; the typeface is unaffected, since the preview
+    /// registration is keyed by the font's identity and content either way.
+    fn draw_font_name_row(ui: &mut egui::Ui, font: &FontEntry, mode: FontNameDisplayMode) -> bool {
         let rep_face = font.representative_face_index();
         let body_size = egui::TextStyle::Body.resolve(ui.style()).size;
         let prev_override = ui.style().override_font_id.clone();
+        let identity = font.render_identity_name();
         // The font is IDENTIFIED by its identity and by the hash of its bytes (which
         // expires the registration when the file behind that identity is replaced); the
         // path is only the byte source.
         if let PreviewFontFamily::Ready(family) = request_font_family(
             ui.ctx(),
-            &font.render_identity_name(),
+            &identity,
             font.content_hash(),
             font.path(),
             rep_face,
         ) {
             ui.style_mut().override_font_id = Some(egui::FontId::new(body_size, family));
         }
-        // `display_label()` applies the user display-name override for presentation;
-        // the render key (`label`) is untouched. A frameless button reads like a clickable
-        // name row while still being a proper interactive widget.
+        // Either name is DISPLAY only: `display_label()` applies the user display-name
+        // override, the identity is the persisted PostScript name. Neither is a render key
+        // here. A frameless button reads like a clickable name row while still being a
+        // proper interactive widget.
         let clicked = ui
-            .add(egui::Button::new(clean_font_display_name(font.display_label())).frame(false))
+            .add(
+                egui::Button::new(font_row_name_for_mode(mode, font.display_label(), &identity))
+                    .frame(false),
+            )
             .on_hover_text(t!("typing.font_settings.open_properties_tooltip"))
             .clicked();
         ui.style_mut().override_font_id = prev_override;
@@ -664,7 +917,13 @@ fn draw_picker_body(
         .iter()
         .enumerate()
         .filter(|(_, font)| {
-            font_row_matches(font.label(), font.original_name(), font.display_label(), search)
+            font_row_matches(
+                font.label(),
+                font.original_name(),
+                font.display_label(),
+                &font.render_identity_name(),
+                search,
+            )
         })
         .map(|(idx, _)| idx)
         .collect();
@@ -759,14 +1018,56 @@ fn draw_picker_body(
     });
 }
 
+/// Draws a "which name to show" switch (two radio buttons) for `list`, writing the choice
+/// through `mode`. Returns `true` when this frame's interaction CHANGED it, so the caller can
+/// persist the new value.
+///
+/// Shared by every switchable surface (`font_settings.rs`'s two category lists and
+/// `font_groups.rs`'s group-editor window) so the modes, the labels and the hover texts can
+/// never drift apart. The radios carry a stable `id_salt` derived from `list` so their
+/// localized labels never decide the widget ids, and so two switches on screen at once keep
+/// separate widget state.
+pub(super) fn draw_name_mode_switch(
+    ui: &mut egui::Ui,
+    list: FontListKind,
+    mode: &mut FontNameDisplayMode,
+) -> bool {
+    let previous = *mode;
+    ui.push_id(list.switch_id_salt(), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(list.switch_label());
+            ui.radio_value(
+                mode,
+                FontNameDisplayMode::Custom,
+                t!("typing.font_settings.name_mode_custom"),
+            )
+            .on_hover_text(t!("typing.font_settings.name_mode_custom_hint"));
+            ui.radio_value(
+                mode,
+                FontNameDisplayMode::Identity,
+                t!("typing.font_settings.name_mode_identity"),
+            )
+            .on_hover_text(t!("typing.font_settings.name_mode_identity_hint"));
+        });
+    });
+    *mode != previous
+}
+
 /// Case-insensitive substring match of a font row against a search query. Empty/whitespace
-/// query matches everything. Matches the render `label`, the `original_name`, OR the
-/// `display_label` — the rows SHOW the display label (a user rename override), so a renamed
-/// font must be findable by its shown name, not only by its underlying render key.
+/// query matches everything. Matches the render `label`, the `original_name`, the
+/// `display_label` OR the `identity` — a picker row can SHOW any of them (the display label is
+/// a user rename override; the identity is what a list switched to
+/// [`FontNameDisplayMode::Identity`] draws), so a font must stay findable by every name it can
+/// be presented under, not only by its underlying render key.
+///
+/// Deliberately mode-INDEPENDENT: the search box is not retyped when the name switch flips, so
+/// a predicate that narrowed with the mode would silently drop rows the user had already
+/// found.
 pub(super) fn font_row_matches(
     label: &str,
     original_name: &str,
     display_label: &str,
+    identity: &str,
     query: &str,
 ) -> bool {
     let needle = query.trim().to_lowercase();
@@ -776,6 +1077,60 @@ pub(super) fn font_row_matches(
     label.to_lowercase().contains(&needle)
         || original_name.to_lowercase().contains(&needle)
         || display_label.to_lowercase().contains(&needle)
+        || identity.to_lowercase().contains(&needle)
+}
+
+/// Picks the text a font row shows for `mode`.
+///
+/// `display_label` is the presentation name (user override → file-stem label) and `identity`
+/// is the font's render identity — its PostScript name, or the documented family/file-stem
+/// FALLBACK when the file declares no spec-valid one. A blank `identity` (which no loaded
+/// entry produces, but which costs nothing to guard) falls back to the display label, so a
+/// row is never drawn empty.
+pub(super) fn font_row_name_for_mode(
+    mode: FontNameDisplayMode,
+    display_label: &str,
+    identity: &str,
+) -> String {
+    match mode {
+        FontNameDisplayMode::Custom => clean_font_display_name(display_label),
+        FontNameDisplayMode::Identity => {
+            let identity = identity.trim();
+            if identity.is_empty() {
+                clean_font_display_name(display_label)
+            } else {
+                identity.to_string()
+            }
+        }
+    }
+}
+
+/// Picks the text a row with NO loaded `FontEntry` shows — an unavailable imported font, or a
+/// group member whose font is not currently loaded: only the identity the document stores plus
+/// (in [`FontNameDisplayMode::Custom`]) the user's display-name override for it.
+///
+/// Returns `None` when the document records no usable identity — a legacy entry whose name was
+/// never learned — so the caller can fall back to the recorded path or a localized placeholder.
+/// A blank override is treated as absent.
+pub(super) fn unavailable_row_name(
+    mode: FontNameDisplayMode,
+    stored_identity: &str,
+    display_override: Option<&str>,
+) -> Option<String> {
+    let stored = stored_identity.trim();
+    if stored.is_empty() {
+        return None;
+    }
+    match mode {
+        FontNameDisplayMode::Custom => Some(
+            display_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(stored)
+                .to_string(),
+        ),
+        FontNameDisplayMode::Identity => Some(stored.to_string()),
+    }
 }
 
 /// Strips the internal `" [system]"` marker from a font label for display. The `" (N)"`
@@ -786,37 +1141,79 @@ pub(super) fn clean_font_display_name(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_font_display_name, font_row_matches};
+    use super::{
+        FontListKind, FontNameDisplayMode, FontNameDisplayModes, clean_font_display_name,
+        font_row_matches, font_row_name_for_mode, unavailable_row_name,
+    };
 
     #[test]
     fn empty_query_matches_everything() {
-        assert!(font_row_matches("Arial", "Arial", "Arial", ""));
-        assert!(font_row_matches("Arial", "Arial", "Arial", "   "));
+        assert!(font_row_matches("Arial", "Arial", "Arial", "Arial", ""));
+        assert!(font_row_matches("Arial", "Arial", "Arial", "Arial", "   "));
     }
 
     #[test]
     fn query_matches_label_case_insensitively() {
-        assert!(font_row_matches("Roboto-Bold [system]", "Roboto", "Roboto-Bold", "roboto"));
-        assert!(font_row_matches("Roboto-Bold [system]", "Roboto", "Roboto-Bold", "BOLD"));
+        assert!(font_row_matches(
+            "Roboto-Bold [system]",
+            "Roboto",
+            "Roboto-Bold",
+            "Roboto-Bold",
+            "roboto"
+        ));
+        assert!(font_row_matches(
+            "Roboto-Bold [system]",
+            "Roboto",
+            "Roboto-Bold",
+            "Roboto-Bold",
+            "BOLD"
+        ));
     }
 
     #[test]
     fn query_matches_original_name_when_label_differs() {
         // Label is a file stem; the real family name only lives in `original_name`.
-        assert!(font_row_matches("DejaVuSans", "DejaVu Sans", "DejaVuSans", "dejavu sans"));
+        assert!(font_row_matches(
+            "DejaVuSans",
+            "DejaVu Sans",
+            "DejaVuSans",
+            "DejaVuSans",
+            "dejavu sans"
+        ));
     }
 
     #[test]
     fn query_matches_display_label_override() {
         // Neither the render label nor the original name contains the needle, but the user's
         // display-name override (what the row SHOWS) does — the row must stay findable.
-        assert!(font_row_matches("Roboto-Bold", "Roboto", "Мой шрифт", "шрифт"));
-        assert!(!font_row_matches("Roboto-Bold", "Roboto", "Мой шрифт", "arial"));
+        assert!(font_row_matches("Roboto-Bold", "Roboto", "Мой шрифт", "Roboto-Bold", "шрифт"));
+        assert!(!font_row_matches("Roboto-Bold", "Roboto", "Мой шрифт", "Roboto-Bold", "arial"));
+    }
+
+    #[test]
+    fn query_matches_the_identity_a_switched_list_shows() {
+        // A renamed font in `Identity` mode SHOWS its PostScript name, which matches neither
+        // the file stem, the family, nor the rename; searching by what is on screen must work.
+        assert!(font_row_matches(
+            "wildwords",
+            "CC Wild Words",
+            "Мой шрифт",
+            "CCWildWords-Regular",
+            "ccwildwords-regular"
+        ));
+        // The `%hash` collision suffix is part of that shown name too.
+        assert!(font_row_matches(
+            "roboto",
+            "Roboto",
+            "Roboto",
+            "Roboto%0123456789abcdef",
+            "%0123456789ab"
+        ));
     }
 
     #[test]
     fn non_matching_query_is_rejected() {
-        assert!(!font_row_matches("Arial", "Arial", "Arial", "comic"));
+        assert!(!font_row_matches("Arial", "Arial", "Arial", "Arial", "comic"));
     }
 
     #[test]
@@ -825,5 +1222,144 @@ mod tests {
         assert_eq!(clean_font_display_name("Roboto [system] (2)"), "Roboto (2)");
         // A plain folder-font label is unchanged.
         assert_eq!(clean_font_display_name("Comic Sans"), "Comic Sans");
+    }
+
+    #[test]
+    fn name_mode_config_token_roundtrips_both_variants() {
+        for mode in [FontNameDisplayMode::Custom, FontNameDisplayMode::Identity] {
+            assert_eq!(
+                FontNameDisplayMode::from_config_str(mode.as_config_str()),
+                Some(mode)
+            );
+        }
+        // Unknown/blank tokens are rejected so the caller keeps its default.
+        assert_eq!(FontNameDisplayMode::from_config_str("postscript"), None);
+        assert_eq!(FontNameDisplayMode::from_config_str(""), None);
+        // The default is the historical behavior.
+        assert_eq!(FontNameDisplayMode::default(), FontNameDisplayMode::Custom);
+    }
+
+    #[test]
+    fn list_kinds_use_distinct_config_keys_and_id_salts() {
+        let kinds = [
+            FontListKind::Folder,
+            FontListKind::Imported,
+            FontListKind::Group,
+        ];
+        // Every pair must differ: a shared config key would make two switches overwrite each
+        // other on disk, and a shared id_salt would fuse their egui widget state.
+        for (index, list) in kinds.iter().enumerate() {
+            for other in &kinds[index + 1..] {
+                assert_ne!(list.config_key(), other.config_key(), "{list:?} vs {other:?}");
+                assert_ne!(
+                    list.switch_id_salt(),
+                    other.switch_id_salt(),
+                    "{list:?} vs {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modes_are_per_list() {
+        let mut modes = FontNameDisplayModes::default();
+        *modes.slot_mut(FontListKind::Imported) = FontNameDisplayMode::Identity;
+        // Switching one surface must not move the others.
+        assert_eq!(modes.get(FontListKind::Folder), FontNameDisplayMode::Custom);
+        assert_eq!(
+            modes.get(FontListKind::Imported),
+            FontNameDisplayMode::Identity
+        );
+        assert_eq!(modes.get(FontListKind::Group), FontNameDisplayMode::Custom);
+
+        // ...and the group-editor window has its own slot, independent of both lists.
+        *modes.slot_mut(FontListKind::Group) = FontNameDisplayMode::Identity;
+        *modes.slot_mut(FontListKind::Imported) = FontNameDisplayMode::Custom;
+        assert_eq!(modes.get(FontListKind::Group), FontNameDisplayMode::Identity);
+        assert_eq!(modes.get(FontListKind::Folder), FontNameDisplayMode::Custom);
+        assert_eq!(
+            modes.get(FontListKind::Imported),
+            FontNameDisplayMode::Custom
+        );
+    }
+
+    #[test]
+    fn row_name_follows_the_mode() {
+        // Custom mode shows the presentation label (system marker stripped).
+        assert_eq!(
+            font_row_name_for_mode(
+                FontNameDisplayMode::Custom,
+                "Roboto-Bold [system]",
+                "Roboto-Bold"
+            ),
+            "Roboto-Bold"
+        );
+        // A user rename wins in Custom mode and is invisible in Identity mode.
+        assert_eq!(
+            font_row_name_for_mode(FontNameDisplayMode::Custom, "Мой шрифт", "CCWildWords-Regular"),
+            "Мой шрифт"
+        );
+        assert_eq!(
+            font_row_name_for_mode(
+                FontNameDisplayMode::Identity,
+                "Мой шрифт",
+                "CCWildWords-Regular"
+            ),
+            "CCWildWords-Regular"
+        );
+        // A contested identity keeps its `%hash` suffix: that IS the font's name here.
+        assert_eq!(
+            font_row_name_for_mode(
+                FontNameDisplayMode::Identity,
+                "Roboto",
+                "Roboto%0123456789abcdef"
+            ),
+            "Roboto%0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn row_name_never_renders_empty_without_an_identity() {
+        // Defensive: an entry with no identity at all still shows its label.
+        assert_eq!(
+            font_row_name_for_mode(FontNameDisplayMode::Identity, "Broken [system]", "   "),
+            "Broken"
+        );
+    }
+
+    #[test]
+    fn unavailable_row_shows_the_stored_identity_in_both_modes() {
+        assert_eq!(
+            unavailable_row_name(FontNameDisplayMode::Identity, "Roboto-Medium", None),
+            Some("Roboto-Medium".to_string())
+        );
+        assert_eq!(
+            unavailable_row_name(FontNameDisplayMode::Custom, "Roboto-Medium", None),
+            Some("Roboto-Medium".to_string())
+        );
+        // Custom mode prefers the user's rename, which is how they know this entry.
+        assert_eq!(
+            unavailable_row_name(FontNameDisplayMode::Custom, "Roboto-Medium", Some("Крик")),
+            Some("Крик".to_string())
+        );
+        // Identity mode ignores the rename even when one is passed.
+        assert_eq!(
+            unavailable_row_name(FontNameDisplayMode::Identity, "Roboto-Medium", Some("Крик")),
+            Some("Roboto-Medium".to_string())
+        );
+        // A blank override is not a name.
+        assert_eq!(
+            unavailable_row_name(FontNameDisplayMode::Custom, "Roboto-Medium", Some("  ")),
+            Some("Roboto-Medium".to_string())
+        );
+    }
+
+    #[test]
+    fn unavailable_row_without_stored_identity_has_no_name() {
+        // A legacy entry whose name was never learned: the caller falls back to the path.
+        for mode in [FontNameDisplayMode::Custom, FontNameDisplayMode::Identity] {
+            assert_eq!(unavailable_row_name(mode, "   ", None), None);
+            assert_eq!(unavailable_row_name(mode, "", Some("Крик")), None);
+        }
     }
 }

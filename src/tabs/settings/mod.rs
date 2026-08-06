@@ -46,6 +46,9 @@ use crate::widgets::{
     save_custom_spellcheck_words, save_project_spellcheck_words,
     set_project_spellcheck_settings_file,
 };
+// The font-settings block's per-list name switch: the UI type lives with the widget, its
+// `user_config.json` load/save with the other settings-tab config IO in this file.
+use typesetting::{FontListKind, FontNameDisplayMode, FontNameDisplayModes};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -147,6 +150,11 @@ impl SettingsTabState {
     pub fn new(ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
         let user_settings_file = config::user_config_path();
         let typing_panel_layout = load_typing_panel_layout(&user_settings_file);
+        // Interface preference of the font-settings lists; read here (once, at construction,
+        // like the panel layout above) so the widget itself performs no I/O and still knows
+        // where to write a change back to.
+        let font_name_display_modes = load_font_name_display_modes(&user_settings_file);
+        let font_settings_file = user_settings_file.clone();
         let shared = SharedSettingsPanels::new(
             #[cfg(feature = "tutorial")]
             crate::tutorial::shared_progress(),
@@ -178,7 +186,10 @@ impl SettingsTabState {
             dragged_bubble_condition_node: None,
             hotkey_capture_command_id: None,
             effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
-            font_settings_editor: typesetting::FontSettingsEditorState::new(),
+            font_settings_editor: typesetting::FontSettingsEditorState::new(
+                font_settings_file,
+                font_name_display_modes,
+            ),
             pending_reveal: None,
             pending_reveal_expires: None,
             reveal_highlight_until: None,
@@ -480,6 +491,71 @@ fn spawn_canvas_settings_save_worker(
     });
 
     CanvasSettingsRuntime { tx, thread }
+}
+
+/// Reads every switchable font surface's name-display mode from `user_config.json`
+/// (`TextTab.font_list_name_mode_folder` / `…_imported` / `…_group`).
+///
+/// A missing file, unparsable JSON, an absent key or an unrecognized token all yield
+/// [`FontNameDisplayMode::Custom`] for that surface — the historical behavior. Like
+/// [`load_typing_panel_layout`] this performs one blocking read, so call it at construction
+/// time or off the GUI thread, never per frame.
+#[must_use]
+pub(super) fn load_font_name_display_modes(user_settings_file: &Path) -> FontNameDisplayModes {
+    let Ok(raw) = fs::read_to_string(user_settings_file) else {
+        return FontNameDisplayModes::default();
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+        return FontNameDisplayModes::default();
+    };
+    let text_tab = payload.get("TextTab").and_then(Value::as_object);
+    let mode_of = |list: FontListKind| -> FontNameDisplayMode {
+        text_tab
+            .and_then(|obj| obj.get(list.config_key()))
+            .and_then(Value::as_str)
+            .and_then(FontNameDisplayMode::from_config_str)
+            .unwrap_or_default()
+    };
+    FontNameDisplayModes {
+        folder: mode_of(FontListKind::Folder),
+        imported: mode_of(FontListKind::Imported),
+        group: mode_of(FontListKind::Group),
+    }
+}
+
+/// Persists ONE font surface's name-display mode under its `TextTab` key in
+/// `user_config.json`, preserving every other key.
+///
+/// Serialized on the process-wide `config::lock_user_config_write()` like the pane's other
+/// writers, so a background save never clobbers a concurrent one. Performs synchronous disk
+/// I/O — call it from a worker thread, never from the GUI thread. Returns a user-facing
+/// error string describing what failed.
+pub(super) fn save_font_name_display_mode(
+    user_settings_file: &Path,
+    list: FontListKind,
+    mode: FontNameDisplayMode,
+) -> Result<(), String> {
+    let _write_guard = config::lock_user_config_write();
+    let mut root = read_user_config_root(user_settings_file)?;
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err(t!("settings.config_io.prepare_root_error").to_string());
+    };
+    let mut text_tab_obj = root_obj
+        .get("TextTab")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    text_tab_obj.insert(
+        list.config_key().to_string(),
+        Value::String(mode.as_config_str().to_string()),
+    );
+    root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    if let Some(parent) = user_settings_file.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(user_settings_file, payload).map_err(|err| err.to_string())
 }
 
 pub(super) fn load_typing_panel_layout(user_settings_file: &Path) -> TypingPanelLayout {
@@ -1227,5 +1303,145 @@ mod ort_guard_tests {
         assert_eq!(config::ai_max_loaded_models_from_user_settings(&read_root(&path)), 2);
 
         let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod font_name_mode_tests {
+    use super::*;
+
+    /// Reads back a written config file as JSON.
+    fn read_root(path: &Path) -> Value {
+        let raw = fs::read_to_string(path).expect("config file written");
+        serde_json::from_str::<Value>(&raw).expect("config file is valid json")
+    }
+
+    #[test]
+    fn missing_config_reads_as_the_default_mode() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // Nothing written yet: both lists must read as the historical behavior.
+        let path = temp.path().join("user_config.json");
+        assert_eq!(
+            load_font_name_display_modes(&path),
+            FontNameDisplayModes::default()
+        );
+        assert_eq!(
+            load_font_name_display_modes(&path).folder,
+            FontNameDisplayMode::Custom
+        );
+    }
+
+    #[test]
+    fn unparsable_or_unknown_values_read_as_the_default_mode() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+
+        fs::write(&path, "{ this is not json").expect("write garbage");
+        assert_eq!(
+            load_font_name_display_modes(&path),
+            FontNameDisplayModes::default()
+        );
+
+        fs::write(
+            &path,
+            r#"{"TextTab":{"font_list_name_mode_folder":"postscript"}}"#,
+        )
+        .expect("write unknown token");
+        assert_eq!(
+            load_font_name_display_modes(&path),
+            FontNameDisplayModes::default()
+        );
+    }
+
+    #[test]
+    fn each_list_persists_its_own_mode_independently() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+
+        save_font_name_display_mode(&path, FontListKind::Imported, FontNameDisplayMode::Identity)
+            .expect("save imported mode");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.imported, FontNameDisplayMode::Identity);
+        // The other surfaces keep the default until they are switched themselves.
+        assert_eq!(modes.folder, FontNameDisplayMode::Custom);
+        assert_eq!(modes.group, FontNameDisplayMode::Custom);
+
+        save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Identity)
+            .expect("save folder mode");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.folder, FontNameDisplayMode::Identity);
+        assert_eq!(modes.imported, FontNameDisplayMode::Identity);
+        assert_eq!(modes.group, FontNameDisplayMode::Custom);
+
+        // Switching back is persisted too (the value is written, not just added once).
+        save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Custom)
+            .expect("save folder mode back");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.folder, FontNameDisplayMode::Custom);
+        assert_eq!(modes.imported, FontNameDisplayMode::Identity);
+    }
+
+    #[test]
+    fn the_group_editor_mode_persists_separately_from_both_lists() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+
+        save_font_name_display_mode(&path, FontListKind::Group, FontNameDisplayMode::Identity)
+            .expect("save group mode");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.group, FontNameDisplayMode::Identity);
+        // The group-editor window has its own key: neither category list moved with it.
+        assert_eq!(modes.folder, FontNameDisplayMode::Custom);
+        assert_eq!(modes.imported, FontNameDisplayMode::Custom);
+
+        // And switching a list back does not disturb the group window's stored choice.
+        save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Identity)
+            .expect("save folder mode");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.group, FontNameDisplayMode::Identity);
+        assert_eq!(modes.folder, FontNameDisplayMode::Identity);
+
+        save_font_name_display_mode(&path, FontListKind::Group, FontNameDisplayMode::Custom)
+            .expect("save group mode back");
+        let modes = load_font_name_display_modes(&path);
+        assert_eq!(modes.group, FontNameDisplayMode::Custom);
+        assert_eq!(modes.folder, FontNameDisplayMode::Identity);
+    }
+
+    #[test]
+    fn saving_a_mode_preserves_unrelated_config_keys() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+        fs::write(
+            &path,
+            r#"{"General":{"ui_language":"ru"},"TextTab":{"hanging_punctuation":",."}}"#,
+        )
+        .expect("write seed config");
+
+        save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Identity)
+            .expect("save folder mode");
+
+        let root = read_root(&path);
+        assert_eq!(
+            root.get("General")
+                .and_then(Value::as_object)
+                .and_then(|general| general.get("ui_language"))
+                .and_then(Value::as_str),
+            Some("ru")
+        );
+        let text_tab = root
+            .get("TextTab")
+            .and_then(Value::as_object)
+            .expect("TextTab object");
+        assert_eq!(
+            text_tab.get("hanging_punctuation").and_then(Value::as_str),
+            Some(",.")
+        );
+        assert_eq!(
+            text_tab
+                .get(FontListKind::Folder.config_key())
+                .and_then(Value::as_str),
+            Some(FontNameDisplayMode::Identity.as_config_str())
+        );
     }
 }

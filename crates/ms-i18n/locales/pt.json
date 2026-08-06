@@ -3675,7 +3675,6 @@
   "typing.errors.fonts_not_found": "Nenhuma fonte encontrada em {arg}",
   "typing.errors.invalid_rgba_buffer": "Buffer de imagem RGBA inválido.",
   "typing.errors.layout_image_too_large": "O tamanho da imagem de disposição não cabe na memória.",
-  "typing.errors.no_fonts_found": "Nenhuma fonte encontrada em {fonts_dir}",
   "typing.errors.no_fonts_found_reload": "Nenhuma fonte encontrada em {arg}",
   "typing.errors.open_clean_overlay_error": "Não foi possível abrir o clean overlay {clean_overlay_path}: {err}",
   "typing.errors.open_file_error": "Não foi possível abrir {path}: {err}",

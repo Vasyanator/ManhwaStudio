@@ -2676,6 +2676,11 @@ paths change.
         // is the synthetic built-in one, which `load_fonts` prepends for the PANEL list
         // (the folder-only pass also feeds the settings font-administration list and
         // therefore must not get it).
+        //
+        // `load_fonts` merges the PROCESS-GLOBAL store's imported system fonts on top of the
+        // directory scan, so this test has to hold the store lock: a sibling test seeding an
+        // imported font would otherwise be observed here as a font "invented" for an empty dir.
+        let _lock = super::font_settings_store::test_lock();
         let dir = unique_temp_dir("empty");
         fs::create_dir_all(&dir).expect("create temp dir");
         let via_load_fonts = load_fonts(&dir, &[]);
