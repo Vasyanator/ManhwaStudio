@@ -39,6 +39,9 @@ Key functions:
   `set_system_font_path` (the hint follows a font located by name)
 - `imported_fonts_revision`
 - `add_imported_system_font` / `remove_imported_system_font` / `is_system_font_imported`
+- BATCH mutators (`add_imported_system_fonts` / `add_virtual_group_members`): apply many
+  entries under ONE write lock with ONE revision bump and ONE persist, so a bulk import does
+  not send every open panel through a font reload per added font
 - `font_display_name_override` / `set_font_display_name_override`
 - `font_profile` / `set_font_profile`
 - `virtual_groups` / `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group`
@@ -607,6 +610,64 @@ pub(in crate::tabs::typing) fn add_imported_system_font(identity: &str, path: Pa
     true
 }
 
+/// Imports SEVERAL system fonts in ONE mutation: one write-lock section, ONE revision bump
+/// and ONE persist for the whole batch, however many fonts were added.
+///
+/// `fonts` is a slice of `(identity, path)` pairs, applied in the given order with exactly the
+/// per-font rules of [`add_imported_system_font`]: a blank identity is refused (with a warning
+/// naming the path), and a font already imported — by IDENTITY (case-insensitively) or by that
+/// exact path hint — is SKIPPED, including one added earlier in the same batch. Returns how
+/// many entries were really added.
+///
+/// Returns `0` without bumping the revision and without persisting when the batch adds nothing
+/// (an empty slice, or every entry a duplicate). Bumping per font would make every open panel
+/// reload once per imported font, which is the whole reason this batch form exists.
+pub(in crate::tabs::typing) fn add_imported_system_fonts(fonts: &[(String, PathBuf)]) -> usize {
+    // Blank identities are reported BEFORE the lock is taken: logging can block on the log
+    // sink, and the store's write lock must not be held across it.
+    for (identity, path) in fonts {
+        if identity.trim().is_empty() {
+            crate::runtime_log::log_warn(format!(
+                "typing: refusing to import a system font with no usable PostScript name. Path: {}",
+                path.display()
+            ));
+        }
+    }
+    let added = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            // A poisoned lock still holds valid data; recover it rather than panicking.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut added = 0usize;
+        for (identity, path) in fonts {
+            let identity = identity.trim();
+            if identity.is_empty() {
+                continue;
+            }
+            // Checked against the LIVE vector, so a pair duplicated inside the batch is caught
+            // by the entry its own predecessor pushed.
+            let already = guard.system_fonts.iter().any(|entry| {
+                identities_equal(&entry.font, identity) || entry.last_path.as_ref() == Some(path)
+            });
+            if already {
+                continue;
+            }
+            guard.system_fonts.push(fonts_data::SystemFontRef {
+                font: identity.to_string(),
+                last_path: Some(path.clone()),
+            });
+            added += 1;
+        }
+        added
+    };
+    if added > 0 {
+        bump_revision();
+        persist_off_thread();
+    }
+    added
+}
+
 /// Removes the imported system font named `identity` (case-insensitively). Returns `true`
 /// if an entry was removed; on a removal, bumps the revision and persists off-thread.
 /// Returns `false` (no revision bump, no persist) when nothing matched.
@@ -968,6 +1029,93 @@ pub(in crate::tabs::typing) fn add_virtual_group_member(group: &str, identity: &
         }
     };
     if added {
+        bump_revision();
+        persist_off_thread();
+    }
+    added
+}
+
+/// Adds SEVERAL fonts to the virtual group named EXACTLY `group` in ONE mutation: one
+/// write-lock section, ONE revision bump and ONE persist for the whole batch.
+///
+/// `members` is a slice of `(identity, alias)` pairs appended in the given order, so the
+/// caller's order becomes the group's member order. Per member: a blank identity is refused
+/// (with a warning), a font that is ALREADY a member is SKIPPED and its existing alias is left
+/// untouched (a batch import must never silently rewrite the aliases the user set), and a
+/// blank/whitespace-only alias is stored as `None`, exactly like
+/// [`set_virtual_group_member_alias`] normalizes it. Returns how many members were really
+/// added.
+///
+/// Returns `0` without bumping the revision and without persisting when the group is unknown
+/// (which is also logged) or the batch adds nothing.
+pub(in crate::tabs::typing) fn add_virtual_group_members(
+    group: &str,
+    members: &[(String, Option<String>)],
+) -> usize {
+    // Collected under the lock, logged after it: the log sink can block, and the store's write
+    // lock must not be held across it.
+    let mut blank_identities = 0usize;
+    let mut group_missing = false;
+    let added = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            // A poisoned lock still holds valid data; recover it rather than panicking.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard
+            .virtual_groups
+            .iter_mut()
+            .find(|candidate| candidate.name == group)
+        {
+            None => {
+                group_missing = true;
+                0usize
+            }
+            Some(candidate) => {
+                let mut added = 0usize;
+                for (identity, alias) in members {
+                    let identity = identity.trim();
+                    if identity.is_empty() {
+                        blank_identities += 1;
+                        continue;
+                    }
+                    // Checked against the LIVE member list, so a font repeated inside the batch
+                    // is caught by the member its own predecessor pushed.
+                    if candidate
+                        .members
+                        .iter()
+                        .any(|member| identities_equal(&member.font, identity))
+                    {
+                        continue;
+                    }
+                    let alias = alias
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                    candidate.members.push(fonts_data::VirtualFontGroupMember {
+                        font: identity.to_string(),
+                        alias,
+                    });
+                    added += 1;
+                }
+                added
+            }
+        }
+    };
+    if group_missing {
+        crate::runtime_log::log_warn(format!(
+            "typing: cannot add {} font(s) to the virtual group '{group}': no such group.",
+            members.len()
+        ));
+    }
+    if blank_identities > 0 {
+        crate::runtime_log::log_warn(format!(
+            "typing: skipped {blank_identities} member(s) of the virtual group '{group}' with no \
+             usable PostScript name."
+        ));
+    }
+    if added > 0 {
         bump_revision();
         persist_off_thread();
     }
@@ -2388,6 +2536,160 @@ mod tests {
 
         reset_store();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batch import must add every NEW font, skip the ones already imported (by identity,
+    /// case-insensitively, or by the exact path hint) including duplicates inside the batch
+    /// itself, and cost exactly ONE revision bump — the reason the batch form exists.
+    #[test]
+    fn a_batch_import_adds_every_new_font_with_one_revision_bump() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(add_imported_system_font(
+            "Old-Regular",
+            PathBuf::from("fonts/old.ttf")
+        ));
+        let before = imported_fonts_revision();
+        let added = add_imported_system_fonts(&[
+            ("New-Regular".to_string(), PathBuf::from("fonts/new.ttf")),
+            // Already imported, differently cased -> skipped.
+            ("old-regular".to_string(), PathBuf::from("fonts/other.ttf")),
+            // Same font again inside the batch -> skipped.
+            ("New-Regular".to_string(), PathBuf::from("fonts/copy.ttf")),
+            // Same PATH hint as an entry we just added -> skipped.
+            ("Third-Regular".to_string(), PathBuf::from("fonts/new.ttf")),
+            ("Second-Regular".to_string(), PathBuf::from("fonts/two.ttf")),
+        ]);
+        assert_eq!(added, 2, "only the two genuinely new fonts are added");
+        assert_eq!(
+            imported_fonts_revision(),
+            before + 1,
+            "the whole batch costs ONE revision bump"
+        );
+        let guard = store().read().unwrap_or_else(|p| p.into_inner());
+        let names: Vec<&str> = guard
+            .system_fonts
+            .iter()
+            .map(|entry| entry.font.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Old-Regular", "New-Regular", "Second-Regular"],
+            "added in the order the caller passed, appended after what was there"
+        );
+    }
+
+    /// A batch that adds nothing must not bump the revision: a bump forces every open panel
+    /// through a font reload, and there would be nothing new to show.
+    #[test]
+    fn a_batch_import_that_adds_nothing_does_not_bump_the_revision() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(add_imported_system_font(
+            "Only-Regular",
+            PathBuf::from("fonts/only.ttf")
+        ));
+        let before = imported_fonts_revision();
+        assert_eq!(add_imported_system_fonts(&[]), 0, "an empty batch adds nothing");
+        assert_eq!(
+            add_imported_system_fonts(&[
+                ("Only-Regular".to_string(), PathBuf::from("fonts/moved.ttf")),
+                // Blank identity: refused, never stored.
+                ("   ".to_string(), PathBuf::from("fonts/blank.ttf")),
+            ]),
+            0,
+            "a duplicate and a blank identity add nothing"
+        );
+        assert_eq!(
+            imported_fonts_revision(),
+            before,
+            "no add -> no revision bump"
+        );
+        assert_eq!(
+            imported_system_fonts(),
+            vec![PathBuf::from("fonts/only.ttf")],
+            "the blank-identity entry must not have been stored"
+        );
+    }
+
+    /// The batch group add must append the members in the caller's order, skip a font that is
+    /// already a member WITHOUT touching its alias, normalize a blank alias to `None`, and
+    /// bump the revision exactly once.
+    #[test]
+    fn a_batch_of_group_members_appends_in_order_and_keeps_existing_aliases() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("Звуки"));
+        assert!(add_virtual_group_member("Звуки", "Kept-Regular"));
+        assert!(set_virtual_group_member_alias(
+            "Звуки",
+            "Kept-Regular",
+            Some("Оставить")
+        ));
+        let before = imported_fonts_revision();
+        let added = add_virtual_group_members(
+            "Звуки",
+            &[
+                ("First-Regular".to_string(), Some("Первый".to_string())),
+                // Already a member (differently cased): skipped, alias untouched.
+                ("kept-regular".to_string(), Some("Перезапись".to_string())),
+                ("Second-Regular".to_string(), Some("   ".to_string())),
+                // Repeated inside the batch: skipped.
+                ("first-regular".to_string(), None),
+                // Blank identity: refused.
+                ("  ".to_string(), None),
+            ],
+        );
+        assert_eq!(added, 2, "only the two genuinely new members are added");
+        assert_eq!(
+            imported_fonts_revision(),
+            before + 1,
+            "the whole batch costs ONE revision bump"
+        );
+        let groups = virtual_groups();
+        let members: Vec<(&str, Option<&str>)> = groups[0]
+            .members
+            .iter()
+            .map(|member| (member.font.as_str(), member.alias.as_deref()))
+            .collect();
+        assert_eq!(
+            members,
+            vec![
+                ("Kept-Regular", Some("Оставить")),
+                ("First-Regular", Some("Первый")),
+                ("Second-Regular", None),
+            ],
+            "existing member keeps its alias; new ones append in order, blank alias -> None"
+        );
+    }
+
+    /// An unknown group and an empty batch both change nothing — and therefore must not bump
+    /// the revision either.
+    #[test]
+    fn a_batch_of_group_members_into_no_group_changes_nothing() {
+        let _lock = lock_tests();
+        reset_store();
+        assert!(create_virtual_group("Звуки"));
+        let before = imported_fonts_revision();
+        assert_eq!(
+            add_virtual_group_members("Нет такой", &[("A-Regular".to_string(), None)]),
+            0,
+            "an unknown group adds nothing"
+        );
+        assert_eq!(
+            add_virtual_group_members("Звуки", &[]),
+            0,
+            "an empty batch adds nothing"
+        );
+        assert_eq!(
+            imported_fonts_revision(),
+            before,
+            "no add -> no revision bump"
+        );
+        assert!(
+            virtual_groups()[0].members.is_empty(),
+            "nothing was stored in the existing group"
+        );
     }
 
     /// DEFECT 10 (merge rules). A second running instance added group G1 and a display name

@@ -104,6 +104,9 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     resolves to the lowest-hash claimant", so the located file is the file that name means
     everywhere else; and being a function of the candidates' BYTES rather than of enumeration
     order (which follows directory iteration), it picks the same file on every run.
+    `locate_system_font_file_by_identity` is the `pub(in crate::tabs::typing)` wrapper the
+    `font_admin` facade calls; it keeps only the CONFIRMED identity + path, because the parsed
+    font data the private lookup returns must not leave this module.
   - In TEST builds the enumerator is stubbed: it returns only what a test installed
     (`test_install_system_faces`), never the machine's real fonts, so no unit test depends on
     what happens to be installed. `test_system_font_index_builds` is what pins "step 1 does not
@@ -175,6 +178,12 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   imported system fonts + per-font records + virtual groups + the pending-migration flag behind
   one `RwLock`, sharing ONE revision counter. Any user-visible mutation bumps the revision (so
   settings lists and typing panels reload) and persists the whole snapshot off the GUI thread.
+  BATCH mutators exist for the bulk paths (`add_imported_system_fonts`,
+  `add_virtual_group_members`): one write-lock section, ONE bump and ONE persist per batch —
+  a per-entry loop would send every open panel through a font reload per added entry. They skip
+  what already exists (including a duplicate inside the batch itself), keep an existing member's
+  alias, refuse a blank identity with a log warning, and bump/persist nothing when nothing was
+  added.
   Persistence is SERIALIZED via a process-global `save_lock` and the writer thread snapshots the
   store AFRESH inside that lock, so concurrent mutations coalesce to the newest state and never
   race on the shared per-process temp file. Startup seeding uses `load_outcome`: `Loaded` uses the

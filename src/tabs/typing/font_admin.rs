@@ -25,6 +25,13 @@ Key functions:
 - `load_font_lists` (folder + imported in ONE identity-consistent pass) / `load_system_catalog`
 - `flush_pending_saves` (app-exit flush of the debounced per-font-settings write)
 - `fonts_revision` / `add_imported_font` / `remove_imported_font` / `is_font_imported`
+- BULK entry points for an import that adds many fonts at once — `add_imported_fonts` /
+  `add_virtual_group_members` (ONE revision bump + ONE document write per batch), plus
+  `locate_system_font_by_identity` (find an INSTALLED font by PostScript name; BLOCKING,
+  off-thread only) and the pure `is_valid_post_script_name` check
+- IDENTITY COMPARISON: `normalize_font_identity` (trim + ASCII lowercase — THE rule every
+  identity lookup in the app uses) and `is_bundled_ui_font_identity` (the synthetic bundled
+  interface-font entry is NOT in `load_font_lists`, so availability checks must know it)
 - `display_name_override` / `set_display_name_override`
 - virtual font groups (config-only named font sets): `list_virtual_groups` /
   `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group` /
@@ -38,6 +45,10 @@ Key mapping:
   facade takes an `&str` identity, never a path. The ONE exception is importing a system
   font: that inherently starts from a FILE the user picked, so `add_imported_font` takes
   both the identity to store and the path to remember as the byte-source hint.
+- Identities are COMPARED through `normalize_font_identity` (trim + ASCII lowercase) and
+  never byte-for-byte: documents legitimately carry an identity in a different casing than
+  the loaded font declares (the deferred legacy-key migration leaves such keys alone on
+  purpose), and the typing panel resolves them normalized.
 */
 
 use std::path::PathBuf;
@@ -197,6 +208,102 @@ pub(crate) fn fonts_revision() -> u64 {
 /// afterwards is keyed by its name.
 pub(crate) fn add_imported_font(identity: &str, path: PathBuf) -> bool {
     font_settings_store::add_imported_system_font(identity, path)
+}
+
+/// An installed system font found by name: the identity the file actually claims plus the file
+/// it was read from.
+///
+/// `identity` is the CONFIRMED PostScript name in the casing the file declares — the key every
+/// per-font setting is stored under. `path` is only the byte-source hint to record with an
+/// import; it is never a key.
+#[derive(Debug, Clone)]
+pub(crate) struct SystemFontLocation {
+    /// Confirmed PostScript name of the located font.
+    pub(crate) identity: String,
+    /// File the identity was read from.
+    pub(crate) path: std::path::PathBuf,
+}
+
+/// Finds the font INSTALLED IN THE SYSTEM whose PostScript name is `post_script_name`.
+///
+/// BLOCKING and potentially VERY HEAVY: a cold lookup builds the process-wide system-font name
+/// index (a scan of the whole OS font database) and reads every candidate file. Call it ONLY
+/// off the GUI thread.
+///
+/// Returns `None` for a blank name, when no installed font declares it, and when every
+/// candidate turned out not to claim it after all. When several installed files declare one
+/// name, the returned file is the lowest-content-hash one (ties broken by the
+/// lexicographically first path) — the same claimant the bare name resolves to everywhere else
+/// in the app.
+#[must_use]
+pub(crate) fn locate_system_font_by_identity(post_script_name: &str) -> Option<SystemFontLocation> {
+    fonts::locate_system_font_file_by_identity(post_script_name).map(|(identity, path)| {
+        SystemFontLocation { identity, path }
+    })
+}
+
+/// Imports SEVERAL system fonts as ONE store mutation: one revision bump and one document
+/// write for the whole batch, not one per font.
+///
+/// `fonts` holds `(identity, path)` pairs — the font's PostScript name and the hint of where
+/// its bytes were last seen — applied in the given order. An entry whose font is already
+/// imported (by identity, case-insensitively, or by that exact path) is SKIPPED, and a blank
+/// identity is refused with a log warning. Returns how many fonts were really added; `0` means
+/// nothing changed, and then the revision is NOT bumped and nothing is persisted.
+///
+/// Prefer this over a loop of [`add_imported_font`] for a bulk import: every bump makes each
+/// open panel reload its font list.
+pub(crate) fn add_imported_fonts(fonts: &[(String, PathBuf)]) -> usize {
+    font_settings_store::add_imported_system_fonts(fonts)
+}
+
+/// Adds SEVERAL fonts to virtual group `group` as ONE store mutation: one revision bump and
+/// one document write for the whole batch, not one per member.
+///
+/// `members` holds `(identity, alias)` pairs appended in the given order, so the caller's order
+/// becomes the group's member order. A font that is already a member is SKIPPED and KEEPS its
+/// existing alias (a batch add never overwrites what the user set); a blank or whitespace-only
+/// alias is stored as "no alias"; a blank identity is refused with a log warning. Returns how
+/// many members were really added; `0` (nothing added, or no such group — which is logged)
+/// leaves the revision untouched and persists nothing.
+pub(crate) fn add_virtual_group_members(group: &str, members: &[(String, Option<String>)]) -> usize {
+    font_settings_store::add_virtual_group_members(group, members)
+}
+
+/// Normalizes a font IDENTITY for COMPARISON and MAP KEYS: `trim` + ASCII lowercase.
+///
+/// THE rule every identity comparison in the app must go through — the panel's virtual-group
+/// merge (`fonts::apply_virtual_groups`), the store's member lookups and the settings UI all
+/// key on this, so a member persisted as `roboto-bold` and a font loaded as `Roboto-Bold` are
+/// one font everywhere. Comparing identities byte-for-byte instead makes the settings UI flag
+/// as missing a member the typing panel resolves without trouble.
+///
+/// Identities are always STORED with their original casing; only comparisons fold it, so the
+/// result is a lookup key and must never be written back to a document. Pure and cheap;
+/// GUI-thread safe.
+#[must_use]
+pub(crate) fn normalize_font_identity(name: &str) -> String {
+    fonts::normalize_font_identity(name)
+}
+
+/// Whether `identity` names the synthetic BUNDLED interface-font entry (in either the current
+/// or the legacy spelling, case-insensitively).
+///
+/// That entry is not part of [`load_font_lists`] — it is prepended to the TYPING PANEL's font
+/// list instead — so a caller that decides "is this identity available?" from the font
+/// categories alone must special-case it, or it reports the built-in font as missing. Pure and
+/// cheap; GUI-thread safe.
+#[must_use]
+pub(crate) fn is_bundled_ui_font_identity(identity: &str) -> bool {
+    fonts::is_reserved_bundled_identity(identity)
+}
+
+/// Whether `name` is usable as a font IDENTITY, i.e. is a spec-valid PostScript font name:
+/// after trimming, 1..=63 printable ASCII characters with no space and none of the PostScript
+/// delimiters `[](){}<>/%`. Pure and cheap; GUI-thread safe.
+#[must_use]
+pub(crate) fn is_valid_post_script_name(name: &str) -> bool {
+    fonts::is_valid_post_script_name(name)
 }
 
 /// Removes a previously-imported system font by its IDENTITY. Returns `false` when it was

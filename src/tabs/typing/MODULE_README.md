@@ -253,7 +253,12 @@ saving, and export.
   revision, IDENTITY-keyed display-name overrides, VIRTUAL font group CRUD + membership/alias
   (config-only named font sets; members referenced by font IDENTITY on both sides of the facade),
   and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
-  re-exports `FontEntry` as an opaque type. Used by the settings font-settings UI
+  re-exports `FontEntry` as an opaque type. For a BULK import (many fonts at once) it also
+  exposes `locate_system_font_by_identity` (find an INSTALLED font by PostScript name →
+  `SystemFontLocation { identity, path }`; BLOCKING, off-thread only), the batch mutators
+  `add_imported_fonts` / `add_virtual_group_members` (ONE revision bump + ONE document write per
+  batch, skipping what already exists and never overwriting an existing member alias) and the
+  pure `is_valid_post_script_name` check. Used by the settings font-settings UI
   (`src/tabs/settings/typesetting/`); nothing else in typing is `pub(crate)` for it. Add a
   wrapper here rather than widening a panel internal.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
@@ -430,6 +435,9 @@ saving, and export.
     that `fonts_data.json` took the list over).
     `add_/remove_imported_system_font` and `set_font_display_name_override` mutate state, bump the
     SAME revision, and persist the whole snapshot off the GUI thread via `fonts_data::save`;
+    the BATCH forms (`add_imported_system_fonts` / `add_virtual_group_members`) apply a whole
+    slice under ONE write lock with ONE bump and ONE persist, and bump nothing when they added
+    nothing;
     `set_font_profile` writes the font's DEFAULT parameter profile through a DEBOUNCED writer and
     does NOT bump the revision (a profile changes on every parameter edit). `migrate_legacy_font_keys`
     performs the DEFERRED v1 re-key — see `panel/MODULE_README.md`. Seeding does not bump the revision. The

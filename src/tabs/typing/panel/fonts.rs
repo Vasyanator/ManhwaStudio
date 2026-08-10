@@ -43,6 +43,8 @@ Main responsibilities:
   a lazily built, process-cached `PostScript name -> file(s)` map over the installed
   faces, so a system font that moved or was repackaged re-links itself. HEAVY to
   build (whole OS font database) — every caller is off the GUI thread.
+  `locate_system_font_file_by_identity` is the typing-wide (`font_admin`) wrapper over it,
+  returning just the confirmed identity plus the file path.
 - offer the bundled `fonts/ui` stack as ONE selectable font of the PANEL list
   (`BUNDLED_UI_FONT_IDENTITY`, `bundled_ui_font_entry`, `prepend_bundled_ui_font`);
   see "Built-in interface font" in `MODULE_README.md` for the full contract.
@@ -76,8 +78,12 @@ fn apply_display_name_overrides(entries: &mut [FontEntry]) {
 /// `font_provider::normalize_name` (and therefore by the renderer's
 /// `normalize_inline_font_label`), so a name keys identically wherever it is looked up.
 /// Identities are always STORED with their original casing; only comparisons fold it.
+///
+/// Visible to the whole typing module so `font_admin` can re-export it: the settings font
+/// UI must decide "is this stored member identity loaded?" by exactly this rule, or it
+/// flags as missing a member the panel resolves fine.
 #[must_use]
-pub(super) fn normalize_font_identity(name: &str) -> String {
+pub(in crate::tabs::typing) fn normalize_font_identity(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
@@ -121,7 +127,7 @@ const POST_SCRIPT_NAME_MAX_LEN: usize = 63;
 /// in the app trims (`normalize_font_identity`), so a name that only offends by a
 /// trailing space is not thrown away; an INTERIOR space still invalidates it.
 #[must_use]
-pub(super) fn is_valid_post_script_name(name: &str) -> bool {
+pub(in crate::tabs::typing) fn is_valid_post_script_name(name: &str) -> bool {
     let name = name.trim();
     if name.is_empty() || name.len() > POST_SCRIPT_NAME_MAX_LEN {
         return false;
@@ -244,8 +250,13 @@ pub(in crate::tabs::typing) const BUNDLED_UI_FONT_LEGACY_IDENTITY: &str = "Manhw
 
 /// Whether `name` claims the reserved bundled-UI identity in EITHER spelling
 /// (case-insensitively). Used to keep a user font from taking the reserved name.
+///
+/// Visible to the whole typing module so `font_admin` can re-export it: the synthetic
+/// bundled entry is NOT part of the settings font categories, yet the panel list carries
+/// it (`prepend_bundled_ui_font`), so a group member holding this identity is present for
+/// the panel and must not be reported as missing by the settings UI.
 #[must_use]
-pub(super) fn is_reserved_bundled_identity(name: &str) -> bool {
+pub(in crate::tabs::typing) fn is_reserved_bundled_identity(name: &str) -> bool {
     let normalized = normalize_font_identity(name);
     normalized == normalize_font_identity(BUNDLED_UI_FONT_IDENTITY)
         || normalized == normalize_font_identity(BUNDLED_UI_FONT_LEGACY_IDENTITY)
@@ -2087,6 +2098,30 @@ fn locate_system_font_by_identity(identity: &str) -> Option<LoadedSystemFontFile
         ));
     }
     Some(best)
+}
+
+/// Locates the INSTALLED font whose PostScript name is `post_script_name` and reports the
+/// identity the winning file actually claims together with that file's path.
+///
+/// The typing-wide entry point to the by-name lookup (the facade `font_admin` wraps this one).
+/// It returns only what a caller outside this module can key on — the CONFIRMED identity, in
+/// the casing the file itself declares, and the byte-source path — because the parsed font
+/// data [`locate_system_font_by_identity`] carries is private to `panel`.
+///
+/// BLOCKING and potentially VERY HEAVY: a cold lookup builds the process-wide system-font name
+/// index (a scan of the whole OS font database) and every candidate file is read and parsed.
+/// Callers MUST be off the GUI thread.
+///
+/// Returns `None` for a blank name, when nothing installed declares it, and when no candidate
+/// turned out to claim it after all. The selection rule among several claimants (lowest content
+/// hash, ties broken by the lexicographically first path) is documented on
+/// [`locate_system_font_by_identity`].
+#[must_use]
+pub(in crate::tabs::typing) fn locate_system_font_file_by_identity(
+    post_script_name: &str,
+) -> Option<(String, PathBuf)> {
+    locate_system_font_by_identity(post_script_name)
+        .map(|located| (located.identity_name, located.path))
 }
 
 /// Enumerates ALL OS-installed fonts (one `FontEntry` per file) for the settings
