@@ -4109,6 +4109,7 @@
   "typing.section.shape": "Форма и сглаживание",
   "typing.section.text_processing": "Обработка текста",
   "typing.section.weight": "Начертание",
+  "typing.status.raster_geometry_save_failed": "Не удалось сохранить перемещение слоя на диск. Повторим при следующем сохранении; подробности в журнале.",
   "typing.vector_transform.base_render_channel_error": "Фоновый рендер базового изображения векторной трансформации прерван.",
   "typing.vector_transform.build_params_error": "Не удалось построить параметры рендера для векторной трансформации.",
   "typing.vector_transform.no_render_data_error": "У текстового оверлея нет render_data для векторной трансформации.",

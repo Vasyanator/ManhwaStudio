@@ -5,8 +5,11 @@ Purpose:
 Per-page overlay drawing and interaction for the typing tab. Hosts the large
 `draw_page_overlays` method that renders and drives egui interaction for the
 text/image overlays and interleaved read-only raster layers on a single page,
-plus the small helpers it relies on for repaint gating, pixel snapping, on-screen
-visibility clamping, and vertical drag page transitions.
+plus the small helpers it relies on for repaint gating, pixel snapping, and
+on-screen visibility clamping.
+
+A layer NEVER changes page by being dragged: a drag clamps at the page's overlay
+bound (`clamp_page_point`) and the layer keeps its `page_idx`.
 
 `draw_page_overlays` takes the per-page `PageView` transform (from `mesh_geometry`)
 and a `TypingPageInteractionPolicy` snapshot (built in the canvas hook); its `ctx`
@@ -103,6 +106,13 @@ impl TypingTextOverlayLayer {
             self.drag_state = None;
             self.drag_has_changes = false;
         }
+        // A move session whose overlay no longer exists cannot be settled (there is nothing left to
+        // read or persist), so drop it rather than leaving it pointing at a shifted layer.
+        if self.move_session.as_ref().is_some_and(|session| {
+            matches!(session.target, TypingLayerMoveTarget::Overlay(idx) if idx >= self.overlays.len())
+        }) {
+            self.move_session = None;
+        }
         if self
             .width_resize_drag
             .is_some_and(|state| state.overlay_idx >= self.overlays.len())
@@ -189,13 +199,9 @@ impl TypingTextOverlayLayer {
             self.try_rotate_selected_raster_by_ctrl_wheel(ui, page_idx);
             self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
             self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
-            self.try_move_selected_overlay_by_arrow_shortcuts(
-                ui,
-                view,
-                panel_text_input_focused,
-                strict_pixel_movement,
-            );
-            self.try_move_selected_raster_by_arrow_shortcuts(
+            // ONE arrow-nudge entry for both layer kinds; it resolves the selected target itself and
+            // consumes the arrow keys only once every guard has passed.
+            self.try_move_selected_layer_by_arrow_shortcuts(
                 ui,
                 view,
                 panel_text_input_focused,
@@ -219,6 +225,10 @@ impl TypingTextOverlayLayer {
                 .as_ref()
                 .is_some_and(|state| state.overlay_idx == idx && state.page_idx == page_idx)
             {
+                continue;
+            }
+            // An open move session runs the limit itself, as part of its own apply step.
+            if self.layer_move_session_targets(TypingLayerMoveTarget::Overlay(idx), page_idx) {
                 continue;
             }
             if self.enforce_overlay_visibility_limit(idx, view, strict_pixel_movement) {
@@ -855,21 +865,16 @@ impl TypingTextOverlayLayer {
                             });
                             continue;
                         }
-                        let Some((
-                            mut start_center_page_px,
-                            start_angle_deg,
-                            has_mesh,
-                            mut start_mesh,
-                        )) = self.overlays.get(entry.idx).map(|overlay| {
-                            (
-                                overlay.center_page_px,
-                                overlay.angle_deg,
-                                overlay.deform_mesh.is_some(),
-                                overlay.deform_mesh.clone().unwrap_or_else(|| {
-                                    default_overlay_quad_mesh(overlay, view)
-                                }),
-                            )
-                        })
+                        let Some((start_angle_deg, has_mesh, start_mesh)) =
+                            self.overlays.get(entry.idx).map(|overlay| {
+                                (
+                                    overlay.angle_deg,
+                                    overlay.deform_mesh.is_some(),
+                                    overlay.deform_mesh.clone().unwrap_or_else(|| {
+                                        default_overlay_quad_mesh(overlay, view)
+                                    }),
+                                )
+                            })
                         else {
                             continue;
                         };
@@ -886,13 +891,6 @@ impl TypingTextOverlayLayer {
                             self.selected_overlay_idx
                         );
                         self.selected_overlay_idx = Some(entry.idx);
-                        let mut mode = if pointer_on_rotate_handle {
-                            TypingOverlayDragMode::Rotate
-                        } else if has_mesh {
-                            TypingOverlayDragMode::MoveMesh
-                        } else {
-                            TypingOverlayDragMode::MoveCenter
-                        };
                         let start_mesh_scene = scene_mesh_points(&start_mesh, view);
                         let start_center_scene = deform_mesh_center_scene(&start_mesh_scene);
                         let start_pointer_angle_rad =
@@ -905,108 +903,137 @@ impl TypingTextOverlayLayer {
                                 .get(entry.idx)
                                 .and_then(|overlay| overlay.deform_mesh.clone())
                             {
-                                mode = TypingOverlayDragMode::MoveMesh;
-                                if let Some(handle_idx) = pointer_on_handle {
-                                    mode = match self.deform_mode {
+                                // A handle or brush edits the mesh's SHAPE and keeps `drag_state`;
+                                // anything else in raster transform mode is a whole-layer MOVE and
+                                // goes to the shared move session.
+                                let deform_mode = if let Some(handle_idx) = pointer_on_handle {
+                                    match self.deform_mode {
                                         TypingDeformMode::Perspective => {
-                                            TypingOverlayDragMode::PerspectiveHandle(handle_idx)
+                                            Some(TypingOverlayDragMode::PerspectiveHandle(handle_idx))
                                         }
                                         TypingDeformMode::Bend => {
-                                            TypingOverlayDragMode::BendHandle(handle_idx)
+                                            Some(TypingOverlayDragMode::BendHandle(handle_idx))
                                         }
                                         TypingDeformMode::Frame => {
-                                            TypingOverlayDragMode::FrameHandle(handle_idx)
+                                            Some(TypingOverlayDragMode::FrameHandle(handle_idx))
                                         }
                                         TypingDeformMode::Grid => {
-                                            TypingOverlayDragMode::GridHandle(handle_idx)
+                                            Some(TypingOverlayDragMode::GridHandle(handle_idx))
                                         }
-                                        _ => TypingOverlayDragMode::MoveMesh,
-                                    };
-                                } else if self.deform_mode.is_brush_mode() && pointer_inside_visual
-                                {
-                                    mode = TypingOverlayDragMode::BrushStroke(self.deform_mode);
-                                }
-                                let snapped_on_drag_start =
-                                    if matches!(mode, TypingOverlayDragMode::MoveMesh) {
-                                        let page_size = page_size_from_image_rect(image_rect, zoom);
-                                        self.snap_overlay_to_pixel_position(
-                                            entry.idx, page_size, true,
-                                        )
-                                    } else {
-                                        false
-                                    };
-                                let current_mesh = if snapped_on_drag_start {
-                                    self.overlays
-                                        .get(entry.idx)
-                                        .and_then(|overlay| overlay.deform_mesh.clone())
-                                        .unwrap_or(current_mesh)
+                                        // Brush modes own no discrete handles, so a handle hit under
+                                        // one of them is not a handle drag: it falls through to the
+                                        // whole-layer move below.
+                                        TypingDeformMode::Bulge
+                                        | TypingDeformMode::Pinch
+                                        | TypingDeformMode::Push
+                                        | TypingDeformMode::Twirl
+                                        | TypingDeformMode::Restore
+                                        | TypingDeformMode::Smooth
+                                        | TypingDeformMode::Stretch
+                                        | TypingDeformMode::Fold => None,
+                                    }
+                                } else if self.deform_mode.is_brush_mode() && pointer_inside_visual {
+                                    Some(TypingOverlayDragMode::BrushStroke(self.deform_mode))
                                 } else {
-                                    current_mesh
+                                    None
                                 };
-                                if snapped_on_drag_start
-                                    && let Some(overlay) = self.overlays.get(entry.idx)
-                                {
-                                    start_center_page_px = overlay.center_page_px;
+                                match deform_mode {
+                                    Some(mode) => {
+                                        crate::trace_log!(
+                                            cat::INPUT,
+                                            "overlay_drag_begin transform=true idx={} page={} mode={:?} deform_mode={:?}",
+                                            entry.idx,
+                                            page_idx,
+                                            mode,
+                                            self.deform_mode
+                                        );
+                                        self.drag_state = Some(TypingOverlayDragState {
+                                            overlay_idx: entry.idx,
+                                            page_idx,
+                                            pointer_start_scene: pointer_pos,
+                                            mode,
+                                            start_has_mesh: has_mesh,
+                                            start_angle_deg,
+                                            start_pointer_angle_rad,
+                                            start_mesh: current_mesh,
+                                        });
+                                        self.drag_has_changes = false;
+                                    }
+                                    None => {
+                                        crate::trace_log!(
+                                            cat::INPUT,
+                                            "overlay_move_begin transform=true idx={} page={}",
+                                            entry.idx,
+                                            page_idx
+                                        );
+                                        // `false` = the overlay's geometry could not be
+                                        // snapshotted; no session opens, so the press simply does
+                                        // not become a drag (nothing is left half-started).
+                                        if !self.begin_layer_move(
+                                            TypingLayerMoveTarget::Overlay(entry.idx),
+                                            page_idx,
+                                            TypingLayerMoveSource::Pointer,
+                                            Some(pointer_pos),
+                                            view,
+                                        ) {
+                                            crate::trace_log!(
+                                                cat::INPUT,
+                                                "overlay_move_begin_failed transform=true idx={} page={}",
+                                                entry.idx,
+                                                page_idx
+                                            );
+                                        }
+                                    }
                                 }
-                                crate::trace_log!(
-                                    cat::INPUT,
-                                    "overlay_drag_begin transform=true idx={} page={} mode={:?} deform_mode={:?}",
-                                    entry.idx,
-                                    page_idx,
-                                    mode,
-                                    self.deform_mode
-                                );
-                                self.drag_state = Some(TypingOverlayDragState {
-                                    overlay_idx: entry.idx,
-                                    page_idx,
-                                    pointer_start_scene: pointer_pos,
-                                    mode,
-                                    start_has_mesh: has_mesh,
-                                    start_center_page_px,
-                                    start_angle_deg,
-                                    start_pointer_angle_rad,
-                                    start_mesh: current_mesh,
-                                });
-                                self.drag_has_changes = snapped_on_drag_start;
                                 continue;
                             }
                         }
 
-                        let snapped_on_drag_start = if matches!(
-                            mode,
-                            TypingOverlayDragMode::MoveCenter | TypingOverlayDragMode::MoveMesh
-                        ) {
-                            let page_size = page_size_from_image_rect(image_rect, zoom);
-                            self.snap_overlay_to_pixel_position(entry.idx, page_size, true)
-                        } else {
-                            false
-                        };
-                        if snapped_on_drag_start && let Some(overlay) = self.overlays.get(entry.idx)
-                        {
-                            start_center_page_px = overlay.center_page_px;
-                            start_mesh = overlay.deform_mesh.clone().unwrap_or_else(|| {
-                                default_overlay_quad_mesh(overlay, view)
+                        if pointer_on_rotate_handle {
+                            crate::trace_log!(
+                                cat::INPUT,
+                                "overlay_drag_begin transform=false idx={} page={} mode=Rotate",
+                                entry.idx,
+                                page_idx
+                            );
+                            self.drag_state = Some(TypingOverlayDragState {
+                                overlay_idx: entry.idx,
+                                page_idx,
+                                pointer_start_scene: pointer_pos,
+                                mode: TypingOverlayDragMode::Rotate,
+                                start_has_mesh: has_mesh,
+                                start_angle_deg,
+                                start_pointer_angle_rad,
+                                start_mesh,
                             });
+                            self.drag_has_changes = false;
+                        } else {
+                            // Whole-layer move (with or without a deform mesh): one shared primitive,
+                            // which also owns the whole-pixel snap — bound to the first DISPLACEMENT,
+                            // so a bare click no longer moves or dirties the layer.
+                            crate::trace_log!(
+                                cat::INPUT,
+                                "overlay_move_begin transform=false idx={} page={}",
+                                entry.idx,
+                                page_idx
+                            );
+                            // `false` = the overlay's geometry could not be snapshotted; no session
+                            // opens, so the press simply does not become a drag.
+                            if !self.begin_layer_move(
+                                TypingLayerMoveTarget::Overlay(entry.idx),
+                                page_idx,
+                                TypingLayerMoveSource::Pointer,
+                                Some(pointer_pos),
+                                view,
+                            ) {
+                                crate::trace_log!(
+                                    cat::INPUT,
+                                    "overlay_move_begin_failed transform=false idx={} page={}",
+                                    entry.idx,
+                                    page_idx
+                                );
+                            }
                         }
-                        crate::trace_log!(
-                            cat::INPUT,
-                            "overlay_drag_begin transform=false idx={} page={} mode={:?}",
-                            entry.idx,
-                            page_idx,
-                            mode
-                        );
-                        self.drag_state = Some(TypingOverlayDragState {
-                            overlay_idx: entry.idx,
-                            page_idx,
-                            pointer_start_scene: pointer_pos,
-                            mode,
-                            start_has_mesh: has_mesh,
-                            start_center_page_px,
-                            start_angle_deg,
-                            start_pointer_angle_rad,
-                            start_mesh,
-                        });
-                        self.drag_has_changes = snapped_on_drag_start;
                     }
                 }
 
@@ -1075,6 +1102,23 @@ impl TypingTextOverlayLayer {
                 }
 
                 if response.dragged() {
+                    // A whole-layer MOVE is driven by the shared move session, not `drag_state`:
+                    // check it FIRST, since the two never coexist for the same overlay.
+                    if self.layer_move_session_targets(
+                        TypingLayerMoveTarget::Overlay(entry.idx),
+                        page_idx,
+                    ) {
+                        if let Some(pointer_pos) = pointer_pos {
+                            self.drive_pointer_layer_move(
+                                TypingLayerMoveTarget::Overlay(entry.idx),
+                                page_idx,
+                                pointer_pos,
+                                view,
+                                strict_pixel_movement,
+                            );
+                        }
+                        continue;
+                    }
                     let Some(mut state) = self.drag_state.take() else {
                         continue;
                     };
@@ -1092,97 +1136,20 @@ impl TypingTextOverlayLayer {
                         (pointer_pos.x - state.pointer_start_scene.x) / zoom.max(f32::EPSILON),
                         (pointer_pos.y - state.pointer_start_scene.y) / zoom.max(f32::EPSILON),
                     ];
-                    let delta_page_px = match state.mode {
-                        TypingOverlayDragMode::MoveCenter | TypingOverlayDragMode::MoveMesh => {
-                            quantize_drag_page_delta(raw_delta_page_px, strict_pixel_movement)
-                        }
-                        TypingOverlayDragMode::PerspectiveHandle(_)
-                        | TypingOverlayDragMode::BendHandle(_)
-                        | TypingOverlayDragMode::FrameHandle(_)
-                        | TypingOverlayDragMode::GridHandle(_)
-                        | TypingOverlayDragMode::BrushStroke(_)
-                        | TypingOverlayDragMode::Rotate => raw_delta_page_px,
-                    };
-                    let move_center_transition = match state.mode {
-                        TypingOverlayDragMode::MoveCenter => {
-                            Some(self.remap_drag_vertical_page_transition(
-                                state.page_idx,
-                                state.start_center_page_px[1] + delta_page_px[1],
-                                page_size,
-                            ))
-                        }
-                        _ => None,
-                    };
-                    let move_mesh_transition = match state.mode {
-                        TypingOverlayDragMode::MoveMesh => {
-                            let mut raw_mesh = state.start_mesh.clone();
-                            raw_mesh.translate(delta_page_px[0], delta_page_px[1], page_size);
-                            let center_y =
-                                raw_mesh.points_px.iter().map(|point| point[1]).sum::<f32>()
-                                    / raw_mesh.points_px.len().max(1) as f32;
-                            let (next_page_idx, next_center_v) = self
-                                .remap_drag_vertical_page_transition(
-                                    state.page_idx,
-                                    center_y,
-                                    page_size,
-                                );
-                            Some((raw_mesh, center_y, next_page_idx, next_center_v))
-                        }
-                        _ => None,
-                    };
+                    // Every mode left here is a NON-move gesture, so the drag delta is used raw (the
+                    // whole-pixel quantization belongs to the move session).
+                    let delta_page_px = raw_delta_page_px;
                     let mut overlay_changed = false;
-                    let mut page_changed = false;
                     if let Some(overlay) = self.overlays.get_mut(entry.idx) {
                         let prev_center_page_px = overlay.center_page_px;
                         let prev_angle = overlay.angle_deg;
                         let prev_mesh = overlay.deform_mesh.clone();
-                        let prev_page_idx = overlay.page_idx;
                         match state.mode {
-                            TypingOverlayDragMode::MoveCenter => {
-                                let (next_page_idx, next_y_px) =
-                                    move_center_transition.unwrap_or((
-                                        state.page_idx,
-                                        clamp_overlay_page_coord(
-                                            state.start_center_page_px[1] + delta_page_px[1],
-                                            page_size[1],
-                                        ),
-                                    ));
-                                overlay.center_page_px = clamp_page_point(
-                                    [state.start_center_page_px[0] + delta_page_px[0], next_y_px],
-                                    page_size,
-                                );
-                                overlay.page_idx = next_page_idx;
-                                page_changed = overlay.page_idx != prev_page_idx;
-                            }
-                            TypingOverlayDragMode::MoveMesh => {
-                                let (mut deform_mesh, center_y, next_page_idx, next_center_y) =
-                                    move_mesh_transition.unwrap_or((
-                                        state.start_mesh.clone(),
-                                        state
-                                            .start_mesh
-                                            .points_px
-                                            .iter()
-                                            .map(|point| point[1])
-                                            .sum::<f32>()
-                                            / state.start_mesh.points_px.len().max(1) as f32,
-                                        state.page_idx,
-                                        state
-                                            .start_mesh
-                                            .points_px
-                                            .iter()
-                                            .map(|point| point[1])
-                                            .sum::<f32>()
-                                            / state.start_mesh.points_px.len().max(1) as f32,
-                                    ));
-                                if next_page_idx != state.page_idx {
-                                    let shift_y = next_center_y - center_y;
-                                    deform_mesh.translate(0.0, shift_y, page_size);
-                                }
-                                overlay.deform_mesh = Some(deform_mesh);
-                                overlay.page_idx = next_page_idx;
-                                page_changed = overlay.page_idx != prev_page_idx;
-                                sync_overlay_center_from_deform_mesh(overlay, page_size);
-                            }
+                            // UNREACHABLE in practice, kept only so this match stays exhaustive over
+                            // the project's own enum (CLAUDE.md §17 — no catch-all arm): `MoveMesh`
+                            // is produced solely by `vector_transform.rs`, which drives it through
+                            // its own `vector_transform_drag` state and never through `drag_state`.
+                            TypingOverlayDragMode::MoveMesh => {}
                             TypingOverlayDragMode::PerspectiveHandle(handle_idx) => {
                                 if handle_idx < 4 {
                                     overlay.deform_mesh = Some(apply_perspective_corner_drag(
@@ -1282,14 +1249,12 @@ impl TypingTextOverlayLayer {
                         if overlay.center_page_px != prev_center_page_px
                             || (overlay.angle_deg - prev_angle).abs() > 1e-4
                             || overlay.deform_mesh != prev_mesh
-                            || overlay.page_idx != prev_page_idx
                         {
                             self.drag_has_changes = true;
                             overlay_changed = true;
                         }
                     }
-                    if !page_changed
-                        && self.enforce_overlay_visibility_limit(entry.idx, view, strict_pixel_movement)
+                    if self.enforce_overlay_visibility_limit(entry.idx, view, strict_pixel_movement)
                     {
                         self.drag_has_changes = true;
                         overlay_changed = true;
@@ -1297,14 +1262,15 @@ impl TypingTextOverlayLayer {
                     if overlay_changed {
                         self.mark_overlay_geometry_changed(entry.idx, true);
                     }
+                    // A brush stroke ACCUMULATES: re-anchor the start state to what was just
+                    // committed so the next frame's displacement stacks on it.
                     let brush_continue =
                         matches!(state.mode, TypingOverlayDragMode::BrushStroke(_));
-                    if (page_changed || brush_continue)
+                    if brush_continue
                         && let Some(overlay) = self.overlays.get(entry.idx)
                     {
                         state.page_idx = overlay.page_idx;
                         state.pointer_start_scene = pointer_pos;
-                        state.start_center_page_px = overlay.center_page_px;
                         state.start_angle_deg = overlay.angle_deg;
                         if let Some(mesh) = overlay.deform_mesh.clone() {
                             state.start_mesh = mesh;
@@ -1634,7 +1600,7 @@ impl TypingTextOverlayLayer {
         }
         self.draw_auto_typing_debug_visuals(&painter, page_idx, image_rect, auto_typing_settings);
         if !mask_panel_open && !layout_editor_active {
-            self.interact_page_rasters(ui, view, &painter);
+            self.interact_page_rasters(ui, view, &painter, strict_pixel_movement);
         }
         draw_entries
             .into_iter()
@@ -1657,32 +1623,13 @@ impl TypingTextOverlayLayer {
             || self.save_rx.is_some()
             || !self.pending_upload_indices.is_empty()
             || self.drag_state.is_some()
+            // A move session must keep frames coming: a KEYBOARD session ends on the first frame
+            // with no arrow held, and without a repaint that frame may never be drawn — stranding
+            // the write until some unrelated interaction.
+            || self.move_session.is_some()
             || self.vector_transform_drag.is_some()
             || self.vector_transform_base_rx.is_some()
             || self.layout_editor.is_some()
-    }
-
-    pub(super) fn snap_overlay_to_pixel_position(
-        &mut self,
-        overlay_idx: usize,
-        page_size: [usize; 2],
-        defer_mask_refresh: bool,
-    ) -> bool {
-        let Some(overlay) = self.overlays.get(overlay_idx) else {
-            return false;
-        };
-        let previous_center = overlay.center_page_px;
-        let previous_mesh = overlay.deform_mesh.clone();
-        let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
-            return false;
-        };
-        snap_overlay_center_to_pixels_if_enabled(overlay, true, page_size);
-        let changed =
-            overlay.center_page_px != previous_center || overlay.deform_mesh != previous_mesh;
-        if changed {
-            self.mark_overlay_geometry_changed(overlay_idx, defer_mask_refresh);
-        }
-        changed
     }
 
     pub(super) fn enforce_overlay_visibility_limit(
@@ -1751,30 +1698,6 @@ impl TypingTextOverlayLayer {
         }
         snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, page_size);
         true
-    }
-
-    pub(super) fn remap_drag_vertical_page_transition(
-        &self,
-        mut page_idx: usize,
-        mut y_px: f32,
-        page_size: [usize; 2],
-    ) -> (usize, f32) {
-        let min_v = overlay_uv_min() * page_size[1].max(1) as f32;
-        let max_v = overlay_uv_max() * page_size[1].max(1) as f32;
-        loop {
-            if y_px > max_v && page_idx + 1 < self.page_count {
-                y_px = min_v + (y_px - max_v);
-                page_idx += 1;
-                continue;
-            }
-            if y_px < min_v && page_idx > 0 {
-                y_px = max_v - (min_v - y_px);
-                page_idx -= 1;
-                continue;
-            }
-            break;
-        }
-        (page_idx, clamp_overlay_page_coord(y_px, page_size[1]))
     }
 }
 
@@ -1967,15 +1890,13 @@ impl TypingTextOverlayLayer {
             }
             return;
         };
-        // A whole-layer move drag (body MoveCenter/MoveMesh) makes the frame FOLLOW; a Rotate drag,
-        // corner-frame resize, re-render, or kind switch leaves the frame anchored (layer moves back).
-        let move_drag_active = self.drag_state.as_ref().is_some_and(|state| {
-            state.overlay_idx == idx
-                && matches!(
-                    state.mode,
-                    TypingOverlayDragMode::MoveCenter | TypingOverlayDragMode::MoveMesh
-                )
-        });
+        // An open move session on this overlay makes the frame FOLLOW, regardless of what drives it
+        // (pointer or arrows); a Rotate drag, corner-frame resize, re-render, or kind switch leaves
+        // the frame anchored (the layer moves back).
+        let move_drag_active = self
+            .move_session
+            .as_ref()
+            .is_some_and(|session| session.target == TypingLayerMoveTarget::Overlay(idx));
         if move_drag_active {
             if let Some(overlay) = self.overlays.get_mut(idx)
                 && let Some(frame) = overlay.centering_frame.as_mut()

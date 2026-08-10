@@ -138,8 +138,10 @@ now-retired `#[serde(default)]` from the canonical struct (the migration is its 
     rasters and their non-destructive effects.
   - Targeted single-raster ops (both tabs, e.g. the typing tab adding/moving/effecting an external
     image as a raster without rewriting the whole page): `add_page_raster` (append one node + PNG on
-    top), `update_raster_transform` (geometry only, no PNG), `update_raster_geometry` (transform + deform
-    mesh together — the typing raster perspective transform mode), and `update_raster_effects`
+    top), `update_raster_geometry` (transform + deform mesh together, no PNG — the ONE targeted
+    geometry writer, used by the typing raster perspective transform mode; `deform` is written
+    verbatim, so `None` CLEARS an existing mesh and a transform-only edit must pass the node's current
+    mesh), and `update_raster_effects`
     (non-destructive: sets the `effects` chain + writes/clears the `rendered_file` PNG, leaving
     `base_file` intact so effects are reversible across restarts). All preserve every other node/group.
     A raster's `mask_clip` flag (typing tab; **rasters default OFF**) round-trips through `LayerRec.mask_clip`

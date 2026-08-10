@@ -80,20 +80,25 @@ The main data flow is:
    budget and draws them through the canvas hook layer. It also displays the unified **raster
    layers** interleaved with the overlays by band Z (`TypingRasterLayer` / `ensure_raster_layers_for_page`
    via `layer_model::persist::load_page_rasters`). Rasters are now **editable** in this tab, not
-   read-only: `interact_page_rasters` adds canvas select + move/rotate drag (parity with overlays;
-   scale via `-`/`=`/`0`, arrow-key pixel nudge via `try_move_selected_raster_by_arrow_shortcuts`,
-   Ctrl/Cmd+wheel ordinary rotation via `try_rotate_selected_raster_by_ctrl_wheel` — rasters have no
-   vector rotation, so it always rotates `transform.rotation` regardless of `RotationCtrlWheelMode`).
+   read-only: `interact_page_rasters` adds canvas select + rotate drag, and hands a whole-layer MOVE
+   (pointer drag as well as arrow-key nudge) to the shared move primitive in `tab/move_layer.rs` — the
+   same primitive text overlays use, so both kinds and both input sources share every side effect (see
+   "Layer move" below). Scale is `-`/`=`/`0`; Ctrl/Cmd+wheel ordinary rotation is
+   `try_rotate_selected_raster_by_ctrl_wheel` — rasters have no vector rotation, so it always rotates
+   `transform.rotation` regardless of `RotationCtrlWheelMode`.
    The raster selection is `selected_raster_idx` PLUS `selected_raster_page` (kept in lock-step: set
    together in `select_raster`, cleared together everywhere). The page pairing is REQUIRED because
    `draw_page_overlays` runs once per visible page — the per-page shortcut handlers (rotate/scale/nudge)
    guard on `selected_raster_page == Some(page_idx)` so one gesture only affects the raster on its own
-   page, not the same bare index on other simultaneously-visible pages. Ctrl+wheel rotation, keyboard
-   scale/nudge, and image-panel transform sliders DEFER their disk writes off the GUI thread via
-   `persist_raster_transform_deferred`; deformed keyboard nudges use
-   `persist_raster_deform_deferred`. Both route geometry to the doc live, then call
-   `doc.enqueue_page_save` inline so the coalescing background saver and its later durability barriers
-   cover the edit instead of performing a per-event synchronous manifest rewrite.
+   page, not the same bare index on other simultaneously-visible pages. EVERY raster geometry write
+   from this tab is DEFERRED off the GUI thread: Ctrl+wheel rotation, keyboard scale, the image-panel
+   transform controls and a settled move go through `persist_raster_transform_deferred`, and a settled
+   move of a DEFORMED raster through `persist_raster_deform_deferred`. Both route the geometry to the
+   doc live, then call `doc.enqueue_page_save` inline so the coalescing background saver and its later
+   durability barriers cover the edit instead of performing a per-event synchronous manifest rewrite.
+   The only remaining SYNCHRONOUS raster writer is `persist_raster_deform`
+   (`persist::update_raster_geometry`), used by perspective transform mode's enter/reset menu actions
+   and its handle-drag end — a separate gesture, out of the move primitive's scope.
    Selecting a raster opens the **same right-side edit panel that image
    overlays use** (scale + rotation + the effects cards, no text params): `selected_item_for_edit`
    builds an `Image`-kind `TypingSelectedOverlayForEdit` carrying a `TypingEditTarget::Raster{page,uid}`,
@@ -104,8 +109,10 @@ The main data flow is:
    saver path; writes a `_fx` PNG, keeps the base; sync `persist::update_raster_effects` fallback when
    no doc/saver), so effects survive a restart and removing them restores the original. One selection
    at a time across the two kinds (`selected_raster_idx` vs `selected_overlay_idx`, funnelled through
-   `select_raster`). Transforms persist via `persist::update_raster_transform` (no whole-page
-   rewrite). A **right-click (ПКМ) canvas context menu** on a selected raster mirrors the text-overlay
+   `select_raster`, which also SETTLES an open move session, so a gesture interrupted by a selection
+   change still lands its write). Panel transform edits persist through
+   `persist_raster_transform_deferred` (doc + enqueued page save), never a synchronous manifest
+   rewrite. A **right-click (ПКМ) canvas context menu** on a selected raster mirrors the text-overlay
    menu (`raster_context_menu` → deferred `apply_raster_menu_actions`). In normal mode the menu is
    attached to a response re-created EVERY frame (like text overlays / transform mode): the SELECTED
    raster's response is created unconditionally (id `("typing_raster", page, sel)`), so the menu stays
@@ -129,7 +136,9 @@ The main data flow is:
    `persist::update_raster_geometry`), paired "Выйти" / "Сбросить трансформацию" (`doc.set_deform(None)`);
    "Включить/Выключить обрезание маской" (raster mask-clip, **DEFAULT OFF** — `NodeBody::Raster.mask_clip`
    round-trips through `LayerRec.mask_clip`; `set_raster_mask_clip` bumps generation so
-   `prepare_raster_mask_clips` re-clips via `mask_layer::clip_overlay_rgba_if_needed` and re-uploads);
+   `prepare_raster_mask_clips` re-clips via `mask_layer::clip_overlay_color_image_in_place` — which
+   clips straight into a REUSED `ColorImage` buffer, because this path also runs every frame a
+   mask-clipped raster is moved — and re-uploads);
    "Порядок" ▲▼ (`move_raster_in_unified_z` → the shared uid-based band-Z core `move_node_in_unified_z`,
    reused with the overlay reorder); "Удалить слой" (`remove_raster` → `doc.remove_node` +
    `flush_page_dropping_raster` so the deleted raster does not resurrect on disk). Everything routes
@@ -276,7 +285,9 @@ saving, and export.
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
-  - `selection_rasters.rs`: overlay/raster selection, remove, raster interact/menu/drag/transform/deform.
+  - `selection_rasters.rs`: overlay/raster selection, remove, raster interact/menu/transform/deform and
+    the NON-move raster drags (rotate, perspective corner handle) — a whole-layer move belongs to
+    `move_layer.rs`.
     Also `resize_selected_overlay_width` (the on-canvas width-guide drag handle): it edits the selected
     text overlay's `text_params.width_px` and re-renders via the SAME `dispatch_vector_rerender` tail as
     Ctrl+wheel rotation (latest-wins re-render + render_data write-back + placement save), so canvas and
@@ -288,6 +299,12 @@ saving, and export.
     flags + `TypingCenteringAssistConfig`) built in the canvas hook before `text_overlays` is borrowed; its
     `ctx` comes from `ui.ctx()`. Plus repaint/visibility/pixel-snap and centering-assist helpers
     (`draw_centering_assist` takes a `CenteringMarker` + `PageView` + centering config).
+  - `move_layer.rs`: the ONE whole-layer MOVE primitive — the move session's lifecycle
+    (`begin_layer_move` / `drive_pointer_layer_move` / `add_keyboard_layer_move_step` /
+    `settle_layer_move` / `drive_layer_move_settle`), the single arrow-nudge entry point for both
+    layer kinds (`try_move_selected_layer_by_arrow_shortcuts`, guards included) and the mapping of a
+    move onto the two geometry stores. Its pure math lives in `mesh_geometry.rs`; see the "Layer move"
+    contract below.
   - `vector_transform.rs`: on-canvas VECTOR transform mode for text overlays (Phase 3a + 3b) — seeds a
     transient 13x13 working mesh over the overlay's oriented source-rect footprint, reuses the shared
     deform handles/brushes to edit it, and bakes the result into
@@ -302,7 +319,8 @@ saving, and export.
     working mesh (`draw_textured_deform_mesh`) so the text bends in real time until the sharp PNG lands;
     the plain baked PNG is hidden for that overlay while the warped preview draws, and it falls back to
     the wireframe-only draw until the base is ready.
-  - `mesh_geometry.rs`: deform-mesh/handle math, overlay geometry, hit-tests, unified-Z helpers (pure fns).
+  - `mesh_geometry.rs`: deform-mesh/handle math, overlay geometry, hit-tests, unified-Z helpers and the
+    layer-move "apply a total delta to a session base" math (pure fns).
     Owns `PageView` (`Copy` per-page page↔scene transform: `page_idx` + `image_rect` + `zoom`), the
     argument bundle threaded through the per-page draw/interaction/geometry helpers; its `page_size_px` /
     `scene_from_page_px` / `page_px_from_scene` methods wrap the same-named free fns (kept as the math
@@ -499,6 +517,96 @@ saving, and export.
   text preview). The create-preview panel needs no call: it shows a rendered IMAGE, not
   egui text. The call is idempotent, must run on the GUI thread inside a frame, and does its
   work on a worker thread — see `src/ui_fonts.rs`.
+- **Layer move: ONE primitive, two input sources, two layer kinds** (`tab/move_layer.rs`). Translating
+  a layer — text/image overlay or raster, by pointer drag or by arrow keys — is a single *move session*
+  (`TypingLayerMoveSession`, at most one open). Nothing else may move a layer: rotation, deform-handle,
+  brush and vector-warp drags are NOT moves and keep their own drag states and settle blocks.
+  - **The delta is applied to the session BASE, never incrementally to the live geometry.** The base is
+    the layer's geometry snapshotted at gesture start (the deform grid when the layer has one — both
+    kinds RENDER from the mesh when present — else the affine center); a pointer frame RECOMPUTES the
+    total delta from the press position, a key press ADDS its step to it. Meshes move RIGIDLY
+    (`translate_rigid`). This is what makes the gesture idempotent: a held arrow at the page bound
+    cannot cumulatively squash a mesh, and a move out to the bound and back returns the exact original
+    geometry. Boundary POLICY is unchanged — a layer may hang off the page (`clamp_page_point` at ±0.9
+    page) and is clipped there.
+  - **The whole-pixel snap of the base runs on the FIRST real displacement, not on the press.** A click
+    that never moves the pointer must change no geometry and must not mark the project edited; the
+    session's `has_changes` gates the settle, so such a click leaves no trace at all.
+  - **A keyboard gesture ends by HELD keys, not by key events.** `drive_layer_move_settle` settles a
+    `Keyboard` session on the first frame where `key_down` reports no arrow held (level-triggered, so
+    OS key-repeat gaps do not split one hold into many gestures, and egui's focus-loss clearing of
+    `keys_down` ends a session left open by an alt-tab). A `Pointer` session settles when the primary
+    button is up. `wants_repaint()` includes `move_session.is_some()`, or the release frame might never
+    be drawn and the write would strand.
+  - **Exactly ONE settle site**: `TypingTabState::draw` calls `drive_layer_move_settle(ctx)` once per
+    frame AFTER `canvas.draw`, immediately before `drive_placement_save_debounce` — same reasoning as
+    the debounce tick, since the move is applied inside `canvas.draw`'s callees. Settling elsewhere is
+    limited to the interruptions that would otherwise drop the write: `clear_selection`,
+    `select_raster`, `remove_overlay`, `remove_raster`, and — load-bearing — the WHOLE-DOCUMENT flush
+    `flush_text_layers`, which settles FIRST (before `sync_overlay_state_into_doc`, so a moved text
+    layer's geometry is in what gets pushed, and before the doc flush, so a moved raster's geometry
+    has reached the document). It must sit there and not only in the `flush_text_layers_if_dirty`
+    wrapper, because `MangaApp`'s page operations and save-to-project call `flush_text_layers`
+    DIRECTLY — and a raster move lives nowhere but this tab's runtime projection until it settles, so
+    a page op would reload over it and a save would merge without it, both reporting success. The
+    wrapper keeps its own settle too, since it decides whether to flush at all
+    (`has_pending_placement_save`) BEFORE calling it.
+    `draw` stops the moment the tab is left, so a gesture still open then would otherwise be invisible
+    to every dirty check and lost silently; for the same reason `has_pending_text_edits` counts an open
+    session with changes (`has_unsettled_layer_move`). The in-session flush points (selection / page
+    change / idle debounce) must NOT settle — the pointer or arrow may still be down, and ending the
+    session under a live gesture would freeze it for the rest of the press. The DISCARD path
+    (`discard_pending_placement_save`) DROPS the session instead of settling it, per the discard rule
+    below.
+  - **Per-frame effects are live; the disk write is deferred and happens once per GESTURE.** During the
+    gesture the primitive invalidates the moved layer's mask clip (overlay: geometry-changed mark;
+    raster: `clipped_image = None`, no doc round-trip) and re-runs the overlay visibility limit. On
+    settle an overlay re-binds its centering frame, flushes a stale texture and only
+    `mark_placement_save_dirty`s; a raster dispatches exactly one `persist_raster_transform_deferred`
+    or `persist_raster_deform_deferred` for the whole gesture. No move performs a synchronous
+    `layers.json` write on the GUI thread. Both deferred persists RETURN a `RasterPersistDispatch`
+    for the same reason `request_overlay_placement_save` does: the settle retires the gesture, so it
+    may not read an unscheduled write as success. Two things decide that verdict, and BOTH are
+    load-bearing: `route_to_doc`'s result (`false` = no document, or the page is not resident / the
+    node is gone) and the enqueue's result — `enqueue_page_save` returns `Ok(())` even for a page the
+    document does not hold, so skipping the first check reports a write that would save nothing as
+    `Enqueued`. `NotEnqueued` carries a `RasterPersistFailure` because the two classes need opposite
+    handling: `NotWired` (no layers dir / no document / poisoned lock / document rejected it) is
+    logged and NOT retried, since every later attempt reproduces it into a loop; `WriteFailed` (the
+    enqueue's synchronous `flush_page` fallback failed — a locked file, an antivirus hold, a momentary
+    permission error) is possibly transient, so the page joins `raster_save_retry_pages`, is surfaced
+    to the user (`typing.status.raster_geometry_save_failed`, parked in `pending_status_error` and
+    published by the next `drive_layer_move_settle`, which has a `Context`), and is retried by
+    `retry_failed_raster_page_saves` at FLUSH POINTS only — never per frame. A queue that can never
+    drain (the tab is no longer wired to a chapter) is dropped loudly instead of carried.
+  - **Guards run before any key is consumed**, so a rejected gesture leaves the arrows to their real
+    owner: any focused widget (`panel_text_input_focused` / `egui_wants_keyboard_input`), a text
+    overlay in VECTOR transform mode (moving it would invalidate the normalized warp points) and a
+    raster in perspective transform mode. Each kind's arrow rule mirrors that kind's mouse rule — which
+    is why a text overlay in RASTER transform mode is still movable by arrows.
+  - **A layer NEVER changes page by being dragged.** The cross-page drag transition no longer exists;
+    dragging past a page boundary clamps within the layer's own page.
+  - An open session is index-bookkeeping-aware like the drag states: `sync_from_doc` remaps a raster
+    session by uid across a reproject, the per-page bounds checks drop a session whose layer is gone,
+    and the raster interaction treats an open session as an active gesture (it owns the pointer, so it
+    neither loses the topmost-by-Z gate nor reads as a click on empty canvas).
+  - **A reprojection RE-APPLIES an open session** (`reapply_layer_move_after_reproject`, the last step
+    of `sync_from_doc`). Gesture geometry reaches the document only on settle, so a rebuild from the
+    document restores the PRE-gesture state; a pointer session self-heals only on the next frame the
+    pointer moves, and a keyboard session never does, so the move would be reverted and the settle
+    would persist the revert. Re-applying `base + delta` is exactly idempotent and therefore free when
+    the reprojection did not disturb the layer. The visibility limit is not re-run there (no `PageView`
+    at a doc sync); the next interaction frame covers it.
+  - **Known boundary behaviour of the shared rigid translation.** `translate_rigid` (and therefore
+    every mesh move) yields ZERO on an axis where the mesh's control-point box is already wider than
+    the page's allowed span (2.8 sides) — no translation can make it fit. The rule is shared with the
+    centering-assist reconciliation, whose one-step convergence proof depends on it. Reading a raster's
+    stored `DeformRec` as a move base also NORMALIZES its points into that band (every mesh in this tab
+    already satisfies it, `TypingOverlayDeformMesh::new` being the only constructor), and since a move
+    now writes the mesh back, that normalization is persisted by the first move of a mesh authored
+    elsewhere. Under strict pixel movement the whole-pixel snap runs AFTER the page clamp, so a layer
+    driven into the bound still rests on the grid — except exactly at the bound, whose coordinate is
+    fractional and where feasibility wins.
 - **Text-layer EDIT writes are DEFERRED; STRUCTURAL writes stay EAGER.** An edit (placement, geometry,
   mask-clip toggle, render-data) only calls `mark_placement_save_dirty` (`tab/persist.rs`), which
   writes nothing. The write happens at a FLUSH POINT. This is what stops a drag from spawning a save
@@ -945,7 +1053,10 @@ saving, and export.
 - The tab is `tab.rs` (data model + facade + hooks + wiring) plus behavior submodules under
   `tab/`. Add a new field to `TypingTabState`/`TypingTextOverlayLayer` in `tab.rs`; put the
   logic in the matching submodule below.
-- To change overlay/raster selection, movement, or context menus, edit `tab/selection_rasters.rs`.
+- To change overlay/raster selection, non-move drags (rotate / deform handles), or context menus, edit
+  `tab/selection_rasters.rs`.
+- To change how a layer MOVES (pointer or arrows, either layer kind — clamp, pixel snap, settle,
+  persistence), edit `tab/move_layer.rs`; its pure delta math lives in `tab/mesh_geometry.rs`.
 - To change the master per-page drawing, edit `tab/draw_page.rs`.
 - To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
 - To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.

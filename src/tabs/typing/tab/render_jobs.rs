@@ -30,10 +30,6 @@ impl TypingTextOverlayLayer {
         self.edit_render_rx = None;
     }
 
-    pub(super) fn set_page_count(&mut self, page_count: usize) {
-        self.page_count = page_count;
-    }
-
     pub(super) fn set_clean_overlays_model(&mut self, model: Option<Arc<Mutex<CleanOverlaysModel>>>) {
         self.clean_overlays_model = model;
     }
@@ -511,7 +507,9 @@ impl TypingTextOverlayLayer {
         layer.transform.scale = user_scale.clamp(0.05, 20.0);
         layer.transform.rotation = rotation_deg.to_radians();
         let transform = layer.transform;
-        self.persist_raster_transform_deferred(page_idx, uid, transform);
+        // Nothing is retired on this write and a failure is already logged with full context
+        // inside, so the dispatch outcome is informational at this call site.
+        let _: RasterPersistDispatch = self.persist_raster_transform_deferred(page_idx, uid, transform);
     }
 
     /// Applies an effects edit (non-destructive) from the image panel to a raster: updates the

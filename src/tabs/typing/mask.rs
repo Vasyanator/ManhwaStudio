@@ -620,6 +620,77 @@ impl TypingMaskLayer {
         mask_changed
     }
 
+    /// Clips `image` IN PLACE against this page's binary mask, returning whether any pixel survived
+    /// (i.e. whether the clipped image is worth keeping at all — `false` mirrors the `None` of
+    /// [`Self::clip_overlay_rgba_if_needed`] and means the caller should keep showing the unclipped
+    /// layer). `false` is also returned, with `image` untouched, when the page has no usable mask or
+    /// the mesh is malformed.
+    ///
+    /// Exists for the LIVE per-frame path (a raster being dragged re-clips every frame it moves).
+    /// The `&[u8]` variant costs three full W×H×4 buffers per call — an un-premultiply pass into a
+    /// `Vec`, the clip's own `to_vec`, and a re-multiply pass back into a `ColorImage` — which on a
+    /// full-page raster is tens of megabytes of copying per frame on the GUI thread. Masking out a
+    /// pixel means alpha = 0, and a premultiplied `Color32` with alpha 0 is exactly
+    /// `Color32::TRANSPARENT`, so the same result is reached by writing the pixels directly. That
+    /// also drops the lossy unmultiply→multiply round trip the old path performed on every SURVIVING
+    /// pixel.
+    ///
+    /// `deform_mesh_points_uv` maps the layer's own (u, v) onto page UV, exactly as in the `&[u8]`
+    /// variant; `image` must be the UNCLIPPED source pixels.
+    pub fn clip_overlay_color_image_in_place(
+        &self,
+        page_idx: usize,
+        image: &mut egui::ColorImage,
+        deform_mesh_cols: usize,
+        deform_mesh_rows: usize,
+        deform_mesh_points_uv: &[[f32; 2]],
+    ) -> bool {
+        let Some(mask) = self.masks.get(&page_idx) else {
+            return false;
+        };
+        let [width, height] = image.size;
+        if width == 0 || height == 0 || image.pixels.len() != width * height {
+            return false;
+        }
+        if mask.data.is_empty() || mask.width == 0 || mask.height == 0 {
+            return false;
+        }
+        if deform_mesh_cols < 2
+            || deform_mesh_rows < 2
+            || deform_mesh_points_uv.len() != deform_mesh_cols.saturating_mul(deform_mesh_rows)
+        {
+            return false;
+        }
+
+        let mut touched_active = false;
+        for y in 0..height {
+            let tv = (y as f32 + 0.5) / height as f32;
+            for x in 0..width {
+                let px_idx = y * width + x;
+                // Already fully transparent: the mask cannot change it, and skipping avoids the
+                // (dominant) mesh sample for the large empty margins a rendered layer usually has.
+                if image.pixels[px_idx].a() == 0 {
+                    continue;
+                }
+                let tu = (x as f32 + 0.5) / width as f32;
+                let uv = sample_deform_mesh_uv(
+                    deform_mesh_cols,
+                    deform_mesh_rows,
+                    deform_mesh_points_uv,
+                    tu,
+                    tv,
+                );
+                if sample_mask_active(mask, uv[0], uv[1]) {
+                    touched_active = true;
+                } else {
+                    // Premultiplied alpha: zero alpha zeroes the whole pixel.
+                    image.pixels[px_idx] = Color32::TRANSPARENT;
+                }
+            }
+        }
+        touched_active
+    }
+
     pub fn clip_overlay_rgba_if_needed(
         &self,
         page_idx: usize,

@@ -24,8 +24,12 @@ FILE HEADER (tabs/typing/tab.rs)
     контекстное меню ПКМ, удаление (`ПКМ/Del`),
     ручка вращения выделенного оверлея (вне transform-mode), поворот `Ctrl+колесо`
     на `2°` за шаг при выделенном оверлее (иначе событие остаётся у canvas-zoom),
-    сдвиг выделенного оверлея стрелками (`1px`, `Shift+стрелки` = `5px`, кроме фокуса
-    в текстовом поле панели),
+    сдвиг ВЫДЕЛЕННОГО слоя (текстового или растрового) стрелками (`1px`,
+    `Shift+стрелки` = `5px`; не срабатывает, когда клавиатуру ждёт любой сфокусированный
+    виджет, и в режимах трансформации, где мышь тоже не двигает слой). Мышь и стрелки
+    используют ОДИН примитив перемещения (`tab/move_layer.rs`), поэтому побочные эффекты
+    (кламп страницы, попиксельная привязка, лимит видимости, инвалидация обрезки маской,
+    отложенная запись) у них общие; перетаскиванием слой НИКОГДА не меняет страницу,
     `Shift+колесо` меняет размер шрифта: в режиме без выделения — на панели `Создание текста`,
     при выделенном `text`-оверлее — в edit-параметрах с live-рендером (в обоих случаях
     с consume wheel-события до `CanvasView`, чтобы не скроллить холст; когда курсор
@@ -153,6 +157,7 @@ mod render_jobs;
 mod selection_rasters;
 mod autotype;
 mod draw_page;
+mod move_layer;
 mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
@@ -645,9 +650,14 @@ impl TypingTabState {
     /// enqueued. That over-reporting is harmless for an unsaved-changes prompt, but it makes this
     /// unusable as a post-flush "did everything land?" check. `MangaApp::start_page_op`, the other
     /// caller, therefore reads it BEFORE its flush and only to answer "was there anything to lose?".
+    /// An OPEN move gesture counts too: `settle_layer_move` is the only place a move marks the layer
+    /// dirty (text) or reaches the document (raster), and it is driven from `draw`, which stops at
+    /// the moment this question is usually asked (tab leave / exit dialog). Without that term a
+    /// layer moved with the mouse or arrow keys still held would be reported as "nothing pending".
     #[must_use]
     pub fn has_pending_text_edits(&self) -> bool {
         self.text_overlays.has_pending_placement_save()
+            || self.text_overlays.has_unsettled_layer_move()
     }
 
     /// DROPS every pending text-layer edit without writing it. For the DISCARD path only
@@ -875,7 +885,6 @@ impl TypingTabState {
         let save_busy = self.save_busy;
         let _frame_span = crate::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
         let canvas_rect = ui.max_rect();
-        self.text_overlays.set_page_count(project.pages.len());
         // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
         // re-project the current page from it (in-memory; no disk reload).
         self.text_overlays
@@ -980,6 +989,13 @@ impl TypingTabState {
         // interaction; and after a gesture the tick following the last mark only RE-SEEDED the window,
         // so the flush landed at ~2x `PLACEMENT_SAVE_IDLE_DEBOUNCE_SECS` after two wakeups. Seeing the
         // mark on the same frame restores the documented single 1.5 s window.
+        //
+        // The layer-move settle runs immediately before it, for the SAME reason and in the same
+        // order: the move is applied inside `canvas.draw`'s callees, so settling earlier would
+        // observe the release only on the next frame — delaying the write by a frame and stranding
+        // it entirely when the release frame is the last one drawn. Settling here also lets the
+        // `mark_placement_save_dirty` it performs seed the debounce window on the same frame.
+        self.text_overlays.drive_layer_move_settle(ctx);
         self.text_overlays.drive_placement_save_debounce(ctx);
 
         if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.is_panel_open() {
@@ -1777,9 +1793,45 @@ struct TypingRasterDragState {
     start_mesh: Option<TypingOverlayDeformMesh>,
 }
 
+/// Whether a DEFERRED raster geometry persist actually scheduled a disk write.
+///
+/// Mirrors the reason `PlacementSaveDispatch` exists for text: a caller that RETIRES state on the
+/// strength of the write (a move settle, which then forgets the gesture) may only do so once the
+/// write is genuinely owned by the saver. The deferred persists can reach neither disk nor document
+/// when the tab is not wired to a chapter, and silently returning there is how an edit disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RasterPersistDispatch {
+    /// The change reached the shared document AND a coalescing page save was enqueued behind it. The
+    /// background saver and its durability barriers own the write from here.
+    Enqueued,
+    /// NOTHING was scheduled to disk. The cause is logged where it is detected and classified here,
+    /// because the two classes need opposite handling; the caller must not report success either way.
+    NotEnqueued(RasterPersistFailure),
+}
+
+/// Why a deferred raster geometry write did not reach the document saver.
+///
+/// The split exists because "retry" is right for exactly one of them: an I/O failure may be
+/// transient (`enqueue_page_save` falls back to a SYNCHRONOUS `flush_page` when no background saver
+/// is enabled, and that can fail on a locked file, an antivirus hold, or a momentary permission
+/// error), whereas a structural failure is reproduced identically on every later attempt and would
+/// turn a retry into an endless loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RasterPersistFailure {
+    /// Structural: no layers dir, no shared document, a poisoned document lock, or the document did
+    /// not accept the change (the page is not resident / the node is gone). Not retried.
+    NotWired,
+    /// The write was attempted and FAILED. Queued for ONE retry per flush point (never per frame)
+    /// via `raster_save_retry_pages`, and surfaced to the user.
+    WriteFailed,
+}
+
+/// What a `TypingRasterDragState` drag does to the raster's geometry.
+///
+/// A whole-layer MOVE is deliberately absent: like the text overlay's, it is owned by the shared
+/// move session (`TypingLayerMoveSession`, `tab/move_layer.rs`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypingRasterDragMode {
-    Move,
     Rotate,
     /// Dragging one of the deform mesh's 4 corner handles (perspective transform mode).
     PerspectiveHandle(usize),
@@ -2152,9 +2204,16 @@ enum TypingExportEvent {
     Finished(Result<TypingExportResult, String>),
 }
 
+/// What a `TypingOverlayDragState` drag does to the overlay's geometry.
+///
+/// A whole-layer MOVE is deliberately absent: it is owned by the shared move session
+/// (`TypingLayerMoveSession`, `tab/move_layer.rs`), which both the pointer and the arrow keys drive.
+/// Everything here is a NON-move gesture and keeps its own drag state and settle block.
 #[derive(Debug, Clone, Copy)]
 enum TypingOverlayDragMode {
-    MoveCenter,
+    /// Whole-mesh move of the VECTOR transform's transient WORKING mesh
+    /// (`vector_transform.rs`). This is not a layer move — it edits the warp being authored, never
+    /// the layer's placement — which is why it survives the move-primitive migration.
     MoveMesh,
     PerspectiveHandle(usize),
     BendHandle(usize),
@@ -2162,6 +2221,74 @@ enum TypingOverlayDragMode {
     GridHandle(usize),
     BrushStroke(TypingDeformMode),
     Rotate,
+}
+
+/// Which layer a move session drives. The page is on the session, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypingLayerMoveTarget {
+    /// Text/image overlay: index into `self.overlays`.
+    Overlay(usize),
+    /// Raster layer: index into `raster_layers_by_page[page_idx]`.
+    Raster(usize),
+}
+
+/// What drives the delta — decides how the session ENDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypingLayerMoveSource {
+    /// Pointer drag: ends when the primary button is up.
+    Pointer,
+    /// Arrow-key nudge: ends on the first frame with no arrow key held.
+    Keyboard,
+}
+
+/// Geometry snapshot a move session applies its delta to.
+///
+/// The delta is ALWAYS applied to this base, never incrementally to the live geometry, so a held
+/// arrow and a dragged pointer produce identical results and repeated application at a page edge
+/// cannot accumulate (a per-point clamp would otherwise squash a mesh permanently).
+#[derive(Debug, Clone)]
+enum TypingLayerMoveBase {
+    /// No deform mesh: the layer's center in page px.
+    Center([f32; 2]),
+    /// Deform mesh present: the whole control grid at session start (page px), plus the affine
+    /// center captured with it.
+    Mesh {
+        mesh: TypingOverlayDeformMesh,
+        /// Affine center (page px) at session start. A RASTER renders from its mesh but still
+        /// hit-tests and rotates about `transform.cx/cy`, so the write path shifts THIS value by the
+        /// mesh's applied delta instead of accumulating onto the live center. An overlay derives its
+        /// center from the moved mesh centroid and ignores this field.
+        center: [f32; 2],
+    },
+}
+
+/// ONE layer-move gesture, shared by the pointer drag and the arrow nudge and by both layer kinds.
+///
+/// Every side effect of a move (page clamp, whole-pixel snap, visibility limit, mask-clip
+/// invalidation, centering-frame rebinding, dirty marking, deferred persistence) lives on this one
+/// primitive (`tab/move_layer.rs`) instead of being re-derived per input source.
+#[derive(Debug, Clone)]
+struct TypingLayerMoveSession {
+    target: TypingLayerMoveTarget,
+    page_idx: usize,
+    source: TypingLayerMoveSource,
+    /// Geometry at session start; rewritten ONCE by the strict-pixel snap (see `snap_applied`).
+    base: TypingLayerMoveBase,
+    /// Page size captured at session start (stable under zoom; needed on settle).
+    page_size_px: [usize; 2],
+    /// Scene position of the pointer at drag start; `None` for a keyboard session.
+    pointer_start_scene: Option<Pos2>,
+    /// TOTAL delta from `base` in page px (pointer: recomputed each frame; keyboard: accumulated).
+    delta_page_px: [f32; 2],
+    /// Whether the one-shot strict-pixel snap of `base` has already run. The snap is bound to the
+    /// FIRST real displacement, not to the press, so a bare click changes nothing.
+    snap_applied: bool,
+    /// The strict-pixel-movement policy observed on the last apply, remembered so a re-apply that has
+    /// no access to the per-frame policy snapshot (`reapply_layer_move_after_reproject`) reproduces
+    /// the same geometry instead of a differently-rounded one. `false` until the first apply.
+    strict_pixel_movement: bool,
+    /// Whether any geometry actually changed — gates the settle-time persist.
+    has_changes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2220,6 +2347,8 @@ enum TypingLayoutFrameHandle {
     Left,
 }
 
+/// Active NON-move overlay drag (rotation, a deform handle, or a brush stroke). A whole-layer move
+/// is not represented here — see `TypingLayerMoveSession`.
 #[derive(Debug, Clone)]
 struct TypingOverlayDragState {
     overlay_idx: usize,
@@ -2227,7 +2356,6 @@ struct TypingOverlayDragState {
     pointer_start_scene: Pos2,
     mode: TypingOverlayDragMode,
     start_has_mesh: bool,
-    start_center_page_px: [f32; 2],
     start_angle_deg: f32,
     start_pointer_angle_rad: f32,
     start_mesh: TypingOverlayDeformMesh,
@@ -2421,9 +2549,13 @@ pub(super) struct TypingTextOverlayLayer {
     deform_tool_settings: TypingDeformToolSettings,
     drag_state: Option<TypingOverlayDragState>,
     drag_has_changes: bool,
+    /// The ONE open layer-move gesture, if any (`tab/move_layer.rs`). Shared by the pointer drag and
+    /// the arrow nudge and by both layer kinds; at most one may be open at a time. Settled once per
+    /// frame by `drive_layer_move_settle`, and by `clear_selection` / `remove_overlay` so a gesture
+    /// interrupted by a selection change or a delete still lands its write.
+    move_session: Option<TypingLayerMoveSession>,
     width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
-    page_count: usize,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
     /// resolved lazily for legacy-overlay uv→px decoding when handing a page to the shared doc.
     page_image_paths: HashMap<usize, PathBuf>,
@@ -2476,6 +2608,18 @@ pub(super) struct TypingTextOverlayLayer {
     raster_drag_state: Option<TypingRasterDragState>,
     /// True while a raster drag has produced an unsaved transform change.
     raster_drag_has_changes: bool,
+    /// Pages whose deferred raster geometry write FAILED with an I/O error and is owed a retry.
+    ///
+    /// The geometry itself is already in the shared document (the failure is strictly the disk
+    /// enqueue), so a retry only has to re-enqueue the page save. Retried at FLUSH POINTS only —
+    /// never per frame — so a persistently failing write cannot spin. `BTreeSet` for a stable,
+    /// deterministic retry order.
+    raster_save_retry_pages: BTreeSet<usize>,
+    /// A user-facing status message produced where no `egui::Context` was available (a settle driven
+    /// from a flush point). Published by the next `drive_layer_move_settle`, which has one. At app
+    /// exit no further frame is drawn, so there the structured log is the only record — the same
+    /// limitation the deferred text flush already documents.
+    pending_status_error: Option<String>,
     /// Shared unified layer document (app-owned). The single source of truth for per-page layer
     /// MODEL state; the per-page projections (`raster_layers_by_page`, `overlays`, `bands_by_page`)
     /// are rebuilt from it by `sync_from_doc`. `None` until `set_layer_doc` is called.
@@ -2581,9 +2725,9 @@ impl Default for TypingTextOverlayLayer {
             deform_tool_settings: TypingDeformToolSettings::default(),
             drag_state: None,
             drag_has_changes: false,
+            move_session: None,
             width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
-            page_count: 0,
             page_image_paths: HashMap::new(),
             page_sizes_px: HashMap::new(),
             clean_overlays_model: None,
@@ -2604,6 +2748,8 @@ impl Default for TypingTextOverlayLayer {
             selected_raster_page: None,
             raster_drag_state: None,
             raster_drag_has_changes: false,
+            raster_save_retry_pages: BTreeSet::new(),
+            pending_status_error: None,
             layer_doc: None,
             raster_texture_generations: HashMap::new(),
             migration_rx: None,

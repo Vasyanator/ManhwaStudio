@@ -134,6 +134,10 @@ impl TypingTextOverlayLayer {
     pub(super) fn discard_pending_placement_save(&mut self) {
         self.clear_placement_save_dirty();
         self.save_requested_while_busy = false;
+        // DROP, never settle: settling would mark the layer dirty again (text) or hand the geometry
+        // to the document and enqueue a page save (raster) — re-creating, through the saver's sync
+        // fallback, the very staging dir this path deletes, with the edits the user discarded.
+        self.discard_layer_move();
     }
 
     /// Writes a deferred edit if one is pending, via the normal detached placement-save worker.
@@ -150,6 +154,11 @@ impl TypingTextOverlayLayer {
     /// no longer retry, which at exit is silent data loss (the barrier cannot cover a job that was
     /// never enqueued).
     pub(super) fn flush_placement_save_if_dirty(&mut self, reason: TypingSaveFlushReason) {
+        // Retry a raster write that failed with an I/O error, BEFORE the early return: the raster
+        // queue is independent of the text dirty flags, so gating it on them would strand it. This is
+        // the in-session flush point (selection / page change / idle debounce / layout-editor exit),
+        // which is exactly the "human pace, not per frame" cadence the retry wants.
+        self.retry_failed_raster_page_saves();
         if !self.has_pending_placement_save() {
             return;
         }
@@ -251,6 +260,17 @@ impl TypingTextOverlayLayer {
     /// and every resident page enqueued. A flush that could not run (no dir/doc, poisoned lock) leaves
     /// it dirty so a later flush point retries instead of treating the edit as saved.
     pub(super) fn flush_text_layers_if_dirty(&mut self, reason: TypingSaveFlushReason) {
+        // Settle an in-flight move BEFORE deciding whether anything is owed. This is the tab-leave /
+        // exit path: `TypingTabState::draw` — and with it `drive_layer_move_settle`, the only place a
+        // move marks the layer dirty or hands raster geometry to the document — stops being called
+        // the moment the user leaves the tab, so a gesture still open here would otherwise be
+        // invisible to the check below and the edit would be lost without a trace.
+        //
+        // Safe to settle unconditionally at THIS flush point only: leaving the tab or closing the app
+        // genuinely ends the gesture. The in-session flush points (selection / page change / idle
+        // debounce) must NOT do this — the pointer or the arrow key may still be down, and ending the
+        // session under a live gesture would freeze it for the rest of the press.
+        self.settle_layer_move();
         if !self.has_pending_placement_save() {
             return;
         }
@@ -481,6 +501,24 @@ impl TypingTextOverlayLayer {
         &mut self,
     ) -> Result<TypingTextFlushOutcome, TypingTextFlushError> {
         let _persist_span = crate::trace_scope!(cat::PERSIST, "flush_text_layers");
+        // Settle an in-flight move FIRST — before `sync_overlay_state_into_doc` below, so a moved
+        // TEXT layer's geometry is in the state that gets pushed, and before the doc flush, so a
+        // moved RASTER's geometry has reached the document.
+        //
+        // This is the whole-document flush, and it has THREE callers, all of which are points of no
+        // return where the gesture is genuinely over: the tab-leave/exit flush, `MangaApp`'s page
+        // operations (which remap the page-keyed trees and reload the project behind them), and
+        // save-to-project (which merges staging into the committed tree and then deletes staging).
+        // The two `app.rs` callers reach `flush_text_layers` DIRECTLY, so settling only in
+        // `flush_text_layers_if_dirty` left both of them able to reload or merge over an unsettled
+        // gesture — the raster half of which lives nowhere but the runtime projection.
+        //
+        // The IN-SESSION flush points (selection change, page change, idle debounce, layout-editor
+        // exit) do not come through here — they use `flush_placement_save_if_dirty` — which is what
+        // keeps a live gesture from being frozen mid-press by a routine flush.
+        self.settle_layer_move();
+        // A previously failed raster write gets its retry at the same points.
+        self.retry_failed_raster_page_saves();
         let mut outcome = TypingTextFlushOutcome::default();
         let Some(layers_dir) = self.layers_primary_dir.clone() else {
             return Err(TypingTextFlushError::NoLayersDir);

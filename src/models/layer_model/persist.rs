@@ -604,8 +604,8 @@ pub fn add_page_raster(
 /// unsaved staging dir. Without it the edit would silently no-op (the unsaved manifest has no such
 /// page yet), so a scale/effects change made in the typing tab would never reach PS or export.
 ///
-/// Load-bearing: the DIRECT callers of `update_raster_transform` / `update_raster_effects` (typing
-/// tab's drag-persist + effects-apply, PS editor's effects-apply) target a single node and bypass
+/// Load-bearing: the DIRECT callers of `update_raster_geometry` / `update_raster_effects` (typing
+/// tab's perspective-transform persist + effects-apply, PS editor's effects-apply) target a single node and bypass
 /// `LayerDoc::flush_page` (which stages the whole page via `save_page_rasters`), so without this they
 /// would silently no-op on a committed-only page. Kept for them.
 fn ensure_page_staged(
@@ -627,46 +627,13 @@ fn ensure_page_staged(
     Ok(())
 }
 
-pub fn update_raster_transform(
-    layers_dir: &Path,
-    page_idx: usize,
-    uid: &str,
-    transform: TransformRec,
-    fallback_dir: Option<&Path>,
-) -> Result<(), String> {
-    let _span = crate::trace_scope!(
-        cat::PERSIST,
-        "update_raster_transform page={} uid={}",
-        page_idx,
-        uid
-    );
-    let manifest_path = layers_dir.join(MANIFEST_FILE);
-    let _guard = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut manifest = read_manifest(&manifest_path)?.unwrap_or_else(LayersManifest::empty);
-    ensure_page_staged(&mut manifest, page_idx, fallback_dir)?;
-    let Some(page) = manifest.pages.iter_mut().find(|p| p.img_idx == page_idx) else {
-        return Ok(());
-    };
-    if let Some(node) = page
-        .tree
-        .iter_mut()
-        .find(|r| r.kind == LayerKindRec::Raster && r.uid == uid)
-    {
-        node.transform = Some(transform);
-        // The unsaved staging dir may not exist yet (e.g. right after "save to project" removed it),
-        // so create it before writing — otherwise the edit would be silently lost.
-        crate::storage::storage()
-            .create_dir_all(layers_dir.to_string_lossy().as_ref())
-            .map_err(|e| format!("create {}: {e}", layers_dir.display()))?;
-        write_manifest(&manifest_path, &manifest)?;
-    }
-    Ok(())
-}
-
 /// Updates a single raster node's transform AND deform mesh (no PNG IO) — used by the typing tab's
 /// raster perspective transform mode, where a mesh-handle drag changes both the deform grid and the
-/// affine transform (kept in sync). Mirrors [`update_raster_transform`]'s single-node, staging-aware
-/// write. A no-op if the page or node is absent.
+/// affine transform (kept in sync). Single-node and staging-aware: `ensure_page_staged` seeds a
+/// committed-only page so the edit is not silently lost. A no-op if the page or node is absent.
+///
+/// `deform` is written verbatim, so `None` CLEARS an existing mesh — pass the node's current mesh
+/// when only the transform changes.
 pub fn update_raster_geometry(
     layers_dir: &Path,
     page_idx: usize,
@@ -919,7 +886,7 @@ pub fn write_page_text_payload(
     // and replaces the committed page wholesale — silently DROPPING the rasters. Seeding here (only when
     // the page is absent from staging, so a session that already staged a raster deletion is not undone)
     // carries the committed rasters/groups onto the staging page so the text replace keeps them. Mirrors
-    // `update_raster_effects`/`update_raster_transform`, which already stage via `ensure_page_staged`.
+    // `update_raster_effects`/`update_raster_geometry`, which already stage via `ensure_page_staged`.
     ensure_page_staged(&mut manifest, page_idx, fallback_dir)?;
 
     // Keep every non-text node (rasters) plus the page's PS groups; replace only the text nodes.
@@ -3543,7 +3510,7 @@ mod tests {
             rotation: 0.5,
             scale: 2.0,
         };
-        update_raster_transform(&dir, 0, "img", t1, None).unwrap();
+        update_raster_geometry(&dir, 0, "img", t1, None, None).unwrap();
         let loaded = load_page_rasters(&dir, None, 0).unwrap();
         let added = loaded.layers.iter().find(|l| l.uid == "img").unwrap();
         assert!(
@@ -3964,7 +3931,7 @@ mod tests {
         .unwrap();
 
         // Typing edits scale → 1.5 via a targeted update on the (empty) unsaved dir, committed as fallback.
-        update_raster_transform(
+        update_raster_geometry(
             &unsaved,
             0,
             "r",
@@ -3974,6 +3941,7 @@ mod tests {
                 rotation: 0.0,
                 scale: 1.5,
             },
+            None,
             Some(committed.as_path()),
         )
         .unwrap();
@@ -3986,7 +3954,7 @@ mod tests {
 
         // Without a fallback the edit can't reach the committed-only page (the bug): the reader still
         // sees the original scale 1.0.
-        update_raster_transform(
+        update_raster_geometry(
             &unsaved_nofb,
             0,
             "r",
@@ -3996,6 +3964,7 @@ mod tests {
                 rotation: 0.0,
                 scale: 1.5,
             },
+            None,
             None,
         )
         .unwrap();

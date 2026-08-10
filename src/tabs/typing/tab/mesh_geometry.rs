@@ -13,6 +13,10 @@ Main responsibilities:
   overlays;
 - sample and deform quad/mesh control points, and convert between page, scene,
   and UV coordinate spaces with clamping;
+- layer-MOVE pure math shared by the pointer drag and the arrow nudge
+  (`moved_center_from_base` / `moved_mesh_from_base` / `snapped_move_center_base` /
+  `snapped_move_mesh_base`, `arrow_nudge_step_px`): apply a total delta to a session
+  BASE, never to the live geometry. Behaviour lives in `tab/move_layer.rs`.
 - centering-assist ("Помочь с центровкой") pure math: chosen-center mapping
   (`centering_chosen_center_page_px` incl. the affine + deform-mesh cases and the
   image/mean/median fallback), guide-frame corner positions
@@ -1454,6 +1458,147 @@ fn rigid_axis_delta(delta: f32, box_min: f32, box_max: f32, side_px: usize) -> f
     let lo = overlay_uv_min() * side - box_min;
     let hi = overlay_uv_max() * side - box_max;
     if lo > hi { 0.0 } else { delta.clamp(lo, hi) }
+}
+
+// ---------------------------------------------------------------------------
+// Layer move — pure "apply a TOTAL delta to a session base" math.
+//
+// Every mover (pointer drag, arrow nudge; text overlay, raster layer) goes
+// through these, so applying the same delta twice to the same base yields the
+// same geometry: a held arrow at the page edge cannot accumulate, and a mesh
+// keeps its internal shape. See `tab/move_layer.rs` for the behaviour that
+// drives them.
+// ---------------------------------------------------------------------------
+
+/// Center (page px) after moving `base` by the TOTAL `delta`, clamped to the page's overlay bounds.
+///
+/// Idempotent in `delta`: the result depends only on `base + delta`, never on the current center, so
+/// re-applying the same delta re-lands on the same point.
+///
+/// The whole-pixel snap under `strict_pixel_movement` runs AFTER the clamp, not only on the session
+/// base: the clamp bound is `±0.9 * side`, which is fractional for most page sizes, so a layer driven
+/// into the bound would otherwise come to rest off the pixel grid. (Rounding is re-clamped, so at the
+/// bound itself the fractional bound wins — the position is feasible, which matters more.)
+#[must_use]
+pub(super) fn moved_center_from_base(
+    base: [f32; 2],
+    delta: [f32; 2],
+    page_size: [usize; 2],
+    strict_pixel_movement: bool,
+) -> [f32; 2] {
+    let moved = clamp_page_point([base[0] + delta[0], base[1] + delta[1]], page_size);
+    if !strict_pixel_movement {
+        return moved;
+    }
+    clamp_page_point([moved[0].round(), moved[1].round()], page_size)
+}
+
+/// Mesh after RIGIDLY moving `base` by the TOTAL `delta`, plus the delta actually APPLIED after the
+/// page clamp (which is what a paired affine center must be shifted by).
+///
+/// Rigid means every control point shifts by ONE shared delta (`TypingOverlayDeformMesh::translate_rigid`),
+/// so the mesh's internal shape is preserved and a move into the page bound stops instead of piling
+/// the leading control points onto it. Under `strict_pixel_movement` the CLAMPED result is snapped
+/// back onto the pixel grid by a second rigid shift (same reason as `moved_center_from_base`), and the
+/// returned delta covers both shifts.
+///
+/// LIMITATION (inherited from `rigid_box_in_page_delta`): on an axis where the mesh's control-point
+/// box is already WIDER than the page's allowed span (`overlay_uv_max - overlay_uv_min` = 2.8 sides),
+/// no translation can make it fit, so the allowed delta is zero and the mesh does not move on that
+/// axis. Reaching that state needs a mesh ~2.8× the page side; the rule is shared with the
+/// centering-assist reconciliation, whose one-step convergence proof depends on it.
+#[must_use]
+pub(super) fn moved_mesh_from_base(
+    base: &TypingOverlayDeformMesh,
+    delta: [f32; 2],
+    page_size: [usize; 2],
+    strict_pixel_movement: bool,
+) -> (TypingOverlayDeformMesh, [f32; 2]) {
+    let mut moved = base.clone();
+    let mut applied = moved.translate_rigid(delta[0], delta[1], page_size);
+    if strict_pixel_movement {
+        let centroid = deform_mesh_centroid_px(&moved);
+        let snap = moved.translate_rigid(
+            centroid[0].round() - centroid[0],
+            centroid[1].round() - centroid[1],
+            page_size,
+        );
+        applied = [applied[0] + snap[0], applied[1] + snap[1]];
+    }
+    (moved, applied)
+}
+
+/// The move base for an affine layer after the one-shot whole-pixel snap.
+///
+/// With `strict_pixel_movement` off this is the identity: the snap exists only so a strict-pixel
+/// gesture starts from an integer position and therefore stays on integers for every later delta.
+#[must_use]
+pub(super) fn snapped_move_center_base(
+    center: [f32; 2],
+    strict_pixel_movement: bool,
+    page_size: [usize; 2],
+) -> [f32; 2] {
+    if !strict_pixel_movement {
+        return center;
+    }
+    clamp_page_point([center[0].round(), center[1].round()], page_size)
+}
+
+/// The move base for a deform mesh after the one-shot whole-pixel snap.
+///
+/// The mesh is shifted RIGIDLY by the rounding delta of its control-point CENTROID (the value the
+/// runtime keeps as the layer center), so the snap can never deform it. Identity when
+/// `strict_pixel_movement` is off.
+#[must_use]
+pub(super) fn snapped_move_mesh_base(
+    mesh: &TypingOverlayDeformMesh,
+    strict_pixel_movement: bool,
+    page_size: [usize; 2],
+) -> TypingOverlayDeformMesh {
+    if !strict_pixel_movement {
+        return mesh.clone();
+    }
+    let centroid = deform_mesh_centroid_px(mesh);
+    let mut snapped = mesh.clone();
+    snapped.translate_rigid(
+        centroid[0].round() - centroid[0],
+        centroid[1].round() - centroid[1],
+        page_size,
+    );
+    snapped
+}
+
+/// One arrow-key nudge step in page px, from the keys consumed this frame.
+///
+/// Both arrays are in `[left, right, up, down]` order: `plain_lrud` are the unmodified arrows (1 px)
+/// and `shift_lrud` the SHIFT ones (5 px). Opposite directions cancel and a plain + SHIFT press of
+/// the same direction add up, because egui reports each combination separately and a frame may carry
+/// several. `[0.0, 0.0]` means nothing was pressed — callers must then leave the layer alone.
+#[must_use]
+pub(super) fn arrow_nudge_step_px(plain_lrud: [bool; 4], shift_lrud: [bool; 4]) -> [f32; 2] {
+    const SHIFT_STEP_PX: f32 = 5.0;
+    let axis = |negative: bool, positive: bool| f32::from(positive) - f32::from(negative);
+    [
+        axis(plain_lrud[0], plain_lrud[1])
+            + axis(shift_lrud[0], shift_lrud[1]) * SHIFT_STEP_PX,
+        axis(plain_lrud[2], plain_lrud[3])
+            + axis(shift_lrud[2], shift_lrud[3]) * SHIFT_STEP_PX,
+    ]
+}
+
+/// Arithmetic mean of a mesh's control points (page px) — the value the overlay runtime mirrors as
+/// its `center_page_px` (`sync_overlay_center_from_deform_mesh`), unclamped.
+#[must_use]
+pub(super) fn deform_mesh_centroid_px(mesh: &TypingOverlayDeformMesh) -> [f32; 2] {
+    let (sum_x, sum_y) = mesh
+        .points_px
+        .iter()
+        .fold((0.0f32, 0.0f32), |(acc_x, acc_y), point| {
+            (acc_x + point[0], acc_y + point[1])
+        });
+    // Page meshes always carry `cols * rows >= 4` points; `max(1)` only guards a degenerate empty mesh.
+    let count = mesh.points_px.len().max(1) as f32;
+    [sum_x / count, sum_y / count]
 }
 
 /// Fixed-point target CENTER (page px) for one centering-assist reconciliation step.

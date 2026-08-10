@@ -3932,6 +3932,7 @@
   "typing.section.shape": "Forma e suavização",
   "typing.section.text_processing": "Processamento de texto",
   "typing.section.weight": "Estilo da fonte",
+  "typing.status.raster_geometry_save_failed": "Não foi possível salvar o movimento da camada no disco. Será tentado novamente no próximo salvamento; veja o registro.",
   "typing.vector_transform.base_render_channel_error": "O render em segundo plano da imagem base da transformação vetorial foi interrompido.",
   "typing.vector_transform.build_params_error": "Não foi possível construir os parâmetros de render para a transformação vetorial.",
   "typing.vector_transform.no_render_data_error": "A sobreposição de texto não tem render_data para a transformação vetorial.",

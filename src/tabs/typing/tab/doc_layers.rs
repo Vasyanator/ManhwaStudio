@@ -466,6 +466,17 @@ impl TypingTextOverlayLayer {
             .raster_drag_state
             .as_ref()
             .and_then(|d| prev_raster_uids.get(d.raster_idx).cloned());
+        // Same treatment for an open RASTER move session (`tab/move_layer.rs`): a reproject can land
+        // mid-gesture (a PS-tab edit bumps the doc version), and without the uid remap the session
+        // would keep writing — and persisting — a positional index that now names a stranger raster.
+        let move_raster_uid = self.move_session.as_ref().and_then(|session| {
+            match session.target {
+                TypingLayerMoveTarget::Raster(idx) if session.page_idx == page_idx => {
+                    prev_raster_uids.get(idx).cloned()
+                }
+                TypingLayerMoveTarget::Raster(_) | TypingLayerMoveTarget::Overlay(_) => None,
+            }
+        });
 
         let mut prev_rasters: HashMap<String, egui::TextureHandle> = self
             .raster_layers_by_page
@@ -552,6 +563,17 @@ impl TypingTextOverlayLayer {
                     }
                 }
                 None => self.raster_drag_state = None,
+            }
+        }
+        if let Some(uid) = &move_raster_uid {
+            match rasters.iter().position(|l| &l.uid == uid) {
+                Some(new_idx) => {
+                    if let Some(session) = self.move_session.as_mut() {
+                        session.target = TypingLayerMoveTarget::Raster(new_idx);
+                    }
+                }
+                // The raster is gone: nothing to move and nothing to persist, so drop the session.
+                None => self.move_session = None,
             }
         }
 
@@ -705,6 +727,14 @@ impl TypingTextOverlayLayer {
             self.selected_overlay_idx = None;
             self.pending_select_raster_uid = None;
         }
+
+        // Everything above restored this page's geometry FROM THE DOCUMENT — both the raster
+        // projection and the overlay runtimes. An in-flight move gesture has NOT reached the document
+        // yet (it only does on settle), so without this the reprojection silently reverts the move
+        // and the settle then persists the reverted state. Re-applying `base + delta` is idempotent,
+        // so it costs nothing when the reprojection did not disturb the moved layer. Runs LAST, after
+        // both stores and after the raster uid remap that keeps the session addressing its own layer.
+        self.reapply_layer_move_after_reproject(page_idx);
 
         // Record the doc version we just projected so the per-frame `maybe_reproject_from_doc_version`
         // check does not redundantly re-project until the doc changes again.

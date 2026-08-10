@@ -3932,6 +3932,7 @@
   "typing.section.shape": "Forme et lissage",
   "typing.section.text_processing": "Traitement du texte",
   "typing.section.weight": "Style de caractère",
+  "typing.status.raster_geometry_save_failed": "Impossible d'enregistrer le déplacement du calque sur le disque. Nouvelle tentative lors de la prochaine sauvegarde ; voir le journal.",
   "typing.vector_transform.base_render_channel_error": "Le rendu de l'image de base de la transformation vectorielle en arrière-plan a été interrompu.",
   "typing.vector_transform.build_params_error": "Impossible de construire les paramètres de rendu pour la transformation vectorielle.",
   "typing.vector_transform.no_render_data_error": "Le calque de superposition de texte n'a pas de render_data pour la transformation vectorielle.",

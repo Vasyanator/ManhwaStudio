@@ -748,17 +748,24 @@ impl TypingTextOverlayLayer {
                     .iter()
                     .map(|&p| page_px_to_uv(p, page_size))
                     .collect();
-                let src_rgba = color_image_to_rgba(&layer.image);
-                if let Some(clipped) = mask_layer.clip_overlay_rgba_if_needed(
+                // Clip straight into a `ColorImage`, reusing the previous buffer when its size still
+                // matches. This path runs EVERY frame a mask-clipped raster is being moved, so the
+                // old `ColorImage -> Vec<u8> -> clip's own to_vec -> ColorImage` chain cost three
+                // full W×H×4 buffers plus two per-pixel alpha conversions per frame — tens of MB on
+                // a full-page raster, on the GUI thread. One reused buffer and one copy remain.
+                let mut clipped = match layer.clipped_image.take() {
+                    Some(previous) if previous.size == layer.image.size => previous,
+                    Some(_) | None => layer.image.clone(),
+                };
+                clipped.pixels.copy_from_slice(&layer.image.pixels);
+                if mask_layer.clip_overlay_color_image_in_place(
                     page_idx,
-                    [w, h],
-                    &src_rgba,
+                    &mut clipped,
                     mesh.cols,
                     mesh.rows,
                     &points_uv,
                 ) {
-                    layer.clipped_image =
-                        Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &clipped));
+                    layer.clipped_image = Some(clipped);
                     // Force re-upload with the clipped pixels.
                     layer.texture = None;
                 }

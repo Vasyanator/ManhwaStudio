@@ -701,11 +701,25 @@ fn raster_selection_tracks_by_uid_across_a_reorder() {
     layer.raster_drag_state = Some(TypingRasterDragState {
         page_idx: 0,
         raster_idx: r0_pos,
-        mode: TypingRasterDragMode::Move,
+        mode: TypingRasterDragMode::Rotate,
         pointer_start_scene: Pos2::ZERO,
         start_transform: tf,
         start_pointer_angle_rad: 0.0,
         start_mesh: None,
+    });
+    // ...and an open MOVE session on the same raster: it must be remapped by uid too, or it would
+    // keep writing (and, on settle, PERSIST) a stranger raster after the reorder.
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Raster(r0_pos),
+        page_idx: 0,
+        source: TypingLayerMoveSource::Pointer,
+        base: TypingLayerMoveBase::Center([1.0, 1.0]),
+        page_size_px: [100, 100],
+        pointer_start_scene: Some(Pos2::ZERO),
+        delta_page_px: [0.0, 0.0],
+        snap_applied: false,
+        strict_pixel_movement: false,
+        has_changes: false,
     });
 
     // Reorder r0 UP past r1 in the doc, then reproject.
@@ -734,6 +748,11 @@ fn raster_selection_tracks_by_uid_across_a_reorder() {
         Some(r0_new),
         "drag state follows r0 by uid"
     );
+    assert_eq!(
+        layer.move_session.as_ref().map(|s| s.target),
+        Some(TypingLayerMoveTarget::Raster(r0_new)),
+        "the move session follows r0 by uid"
+    );
     // The stale position now holds r1 — proof a positional tracker would have retargeted.
     assert_eq!(rasters[r0_pos].uid, "r1");
     let _ = r1_pos;
@@ -746,6 +765,10 @@ fn raster_selection_tracks_by_uid_across_a_reorder() {
     assert_eq!(
         layer.selected_raster_idx, None,
         "selection cleared when its raster is gone"
+    );
+    assert!(
+        layer.move_session.is_none(),
+        "the move session is dropped when its raster is gone"
     );
     assert_eq!(
         layer.selected_raster_page, None,
@@ -2874,7 +2897,11 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
         rotation: 0.5,
         scale: 1.5,
     };
-    layer.persist_raster_transform_deferred(0, "raster", transform);
+    assert_eq!(
+        layer.persist_raster_transform_deferred(0, "raster", transform),
+        RasterPersistDispatch::Enqueued,
+        "a wired tab reports the deferred transform write as scheduled"
+    );
     let handle = {
         let guard = doc
             .lock()
@@ -2903,7 +2930,11 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
         rows: 2,
         points_px: vec![[10.0, 20.0], [30.0, 20.0], [10.0, 40.0], [30.0, 40.0]],
     };
-    layer.persist_raster_deform_deferred(0, "raster", transform, Some(deform.clone()));
+    assert_eq!(
+        layer.persist_raster_deform_deferred(0, "raster", transform, Some(deform.clone())),
+        RasterPersistDispatch::Enqueued,
+        "a wired tab reports the deferred deform write as scheduled"
+    );
     let handle = doc
         .lock()
         .unwrap_or_else(|_| panic!("deferred-raster test document lock poisoned"))
@@ -4050,4 +4081,667 @@ fn a_doc_edit_that_changes_nothing_marks_nothing() {
         !layer.placement_save_dirty,
         "and therefore owes no write"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Layer move primitive (`tab/move_layer.rs` + its pure math in `mesh_geometry.rs`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn move_from_base_is_idempotent_at_page_edge() {
+    // Applying the SAME total delta to the SAME base twice must produce identical geometry, even
+    // when the delta is far past the page bound. This is what makes a held arrow (and a pointer
+    // parked at the edge) safe: the old `mesh.translate` clamped per point and squashed the mesh a
+    // little more on every application.
+    let page_size = [100usize, 100usize];
+    let base = TypingOverlayDeformMesh::new(
+        2,
+        2,
+        vec![[10.0f32, 10.0], [30.0, 10.0], [10.0, 40.0], [30.0, 40.0]],
+        page_size,
+    )
+    .expect("2x2 mesh with 4 points is valid");
+
+    let (first, applied_first) = moved_mesh_from_base(&base, [1000.0, 1000.0], page_size, false);
+    let (second, applied_second) = moved_mesh_from_base(&base, [1000.0, 1000.0], page_size, false);
+    assert_eq!(
+        first.points_px, second.points_px,
+        "re-applying the same delta to the same base is idempotent"
+    );
+    assert_eq!(applied_first, applied_second, "and reports the same applied delta");
+
+    // Every inter-point offset is unchanged: the mesh translated rigidly, it did not deform.
+    for (idx, (after, before)) in first.points_px.iter().zip(base.points_px.iter()).enumerate() {
+        let expected = [before[0] + applied_first[0], before[1] + applied_first[1]];
+        assert!(
+            (after[0] - expected[0]).abs() <= 1e-3 && (after[1] - expected[1]).abs() <= 1e-3,
+            "point {idx} shifted by the shared delta: {after:?} vs {expected:?}"
+        );
+    }
+    // And it stopped exactly at the page's overlay bound instead of piling up on it.
+    let bounds = deform_mesh_bounds_px(&first);
+    let max = overlay_uv_max() * 100.0;
+    assert!(
+        (bounds.right() - max).abs() <= 1e-3 && (bounds.bottom() - max).abs() <= 1e-3,
+        "box rests on the overlay bound: {bounds:?}"
+    );
+}
+
+#[test]
+fn moved_center_from_base_clamps_to_overlay_bounds() {
+    // An affine layer may hang off the page but not beyond ±0.9 of a page side (`clamp_page_point`),
+    // and the move primitive must not widen or narrow that boundary policy.
+    let page_size = [200usize, 100usize];
+    let far = moved_center_from_base([50.0, 50.0], [10_000.0, 10_000.0], page_size, false);
+    assert!(
+        (far[0] - overlay_uv_max() * 200.0).abs() <= 1e-3
+            && (far[1] - overlay_uv_max() * 100.0).abs() <= 1e-3,
+        "huge positive delta lands on the max bound: {far:?}"
+    );
+    let near = moved_center_from_base([50.0, 50.0], [-10_000.0, -10_000.0], page_size, false);
+    assert!(
+        (near[0] - overlay_uv_min() * 200.0).abs() <= 1e-3
+            && (near[1] - overlay_uv_min() * 100.0).abs() <= 1e-3,
+        "huge negative delta lands on the min bound: {near:?}"
+    );
+    // A delta that stays inside is applied verbatim.
+    assert_eq!(
+        moved_center_from_base([50.0, 50.0], [1.5, -2.5], page_size, false),
+        [51.5, 47.5]
+    );
+}
+
+#[test]
+fn snapped_move_base_rounds_center_once() {
+    let page_size = [100usize, 100usize];
+    // Affine base: strict pixel movement rounds the center to whole pixels...
+    assert_eq!(
+        snapped_move_center_base([10.4, 20.6], true, page_size),
+        [10.0, 21.0]
+    );
+    // ...and is the identity when the setting is off.
+    assert_eq!(
+        snapped_move_center_base([10.4, 20.6], false, page_size),
+        [10.4, 20.6]
+    );
+
+    // Mesh base: shifts RIGIDLY by the centroid's rounding delta, preserving the shape.
+    let mesh = TypingOverlayDeformMesh::new(
+        2,
+        2,
+        vec![[10.4f32, 20.6], [30.4, 20.6], [10.4, 40.6], [30.4, 40.6]],
+        page_size,
+    )
+    .expect("2x2 mesh with 4 points is valid");
+    let centroid = deform_mesh_centroid_px(&mesh);
+    let expected_shift = [
+        centroid[0].round() - centroid[0],
+        centroid[1].round() - centroid[1],
+    ];
+    let snapped = snapped_move_mesh_base(&mesh, true, page_size);
+    for (idx, (after, before)) in snapped.points_px.iter().zip(mesh.points_px.iter()).enumerate() {
+        let expected = [before[0] + expected_shift[0], before[1] + expected_shift[1]];
+        assert!(
+            (after[0] - expected[0]).abs() <= 1e-3 && (after[1] - expected[1]).abs() <= 1e-3,
+            "mesh point {idx} shifted rigidly by the rounding delta: {after:?} vs {expected:?}"
+        );
+    }
+    let snapped_centroid = deform_mesh_centroid_px(&snapped);
+    assert!(
+        (snapped_centroid[0] - snapped_centroid[0].round()).abs() <= 1e-3
+            && (snapped_centroid[1] - snapped_centroid[1].round()).abs() <= 1e-3,
+        "the snapped mesh centroid is on whole pixels: {snapped_centroid:?}"
+    );
+    // Strict off is the identity for a mesh too.
+    assert_eq!(
+        snapped_move_mesh_base(&mesh, false, page_size).points_px,
+        mesh.points_px
+    );
+}
+
+#[test]
+fn layer_move_settles_rules() {
+    use move_layer::layer_move_settles;
+    // A pointer gesture ends with the button, and ignores the arrow keys entirely.
+    assert!(!layer_move_settles(TypingLayerMoveSource::Pointer, true, false));
+    assert!(!layer_move_settles(TypingLayerMoveSource::Pointer, true, true));
+    assert!(layer_move_settles(TypingLayerMoveSource::Pointer, false, true));
+    assert!(layer_move_settles(TypingLayerMoveSource::Pointer, false, false));
+    // A keyboard gesture ends on the first frame with no arrow HELD, and ignores the pointer.
+    assert!(!layer_move_settles(TypingLayerMoveSource::Keyboard, false, true));
+    assert!(!layer_move_settles(TypingLayerMoveSource::Keyboard, true, true));
+    assert!(layer_move_settles(TypingLayerMoveSource::Keyboard, true, false));
+    assert!(layer_move_settles(TypingLayerMoveSource::Keyboard, false, false));
+}
+
+#[test]
+fn move_session_snap_defers_to_first_displacement() {
+    use move_layer::snap_move_base_on_first_displacement;
+    let page_size = [100usize, 100usize];
+    let mut base = TypingLayerMoveBase::Center([10.4, 20.6]);
+    let mut snap_applied = false;
+
+    // A press with no movement (a bare click): nothing snaps, nothing is marked as snapped.
+    assert!(!snap_move_base_on_first_displacement(
+        &mut base,
+        snap_applied,
+        [0.0, 0.0],
+        true,
+        page_size
+    ));
+    assert!(!snap_applied);
+    match &base {
+        TypingLayerMoveBase::Center(center) => assert_eq!(*center, [10.4, 20.6]),
+        TypingLayerMoveBase::Mesh { .. } => panic!("base kind must not change"),
+    }
+
+    // The first real displacement snaps the base exactly once.
+    assert!(snap_move_base_on_first_displacement(
+        &mut base,
+        snap_applied,
+        [3.0, 0.0],
+        true,
+        page_size
+    ));
+    snap_applied = true;
+    match &base {
+        TypingLayerMoveBase::Center(center) => assert_eq!(*center, [10.0, 21.0]),
+        TypingLayerMoveBase::Mesh { .. } => panic!("base kind must not change"),
+    }
+
+    // Later frames of the SAME gesture never re-snap, so the base stays the fixed origin the total
+    // delta is measured from (re-snapping would drift the layer by a fraction of a pixel per frame).
+    assert!(!snap_move_base_on_first_displacement(
+        &mut base,
+        snap_applied,
+        [7.5, -2.5],
+        true,
+        page_size
+    ));
+    match &base {
+        TypingLayerMoveBase::Center(center) => assert_eq!(*center, [10.0, 21.0]),
+        TypingLayerMoveBase::Mesh { .. } => panic!("base kind must not change"),
+    }
+}
+
+#[test]
+fn arrow_nudge_step_px_combines_plain_and_shift() {
+    // Order is [left, right, up, down]; SHIFT steps 5 px. egui reports the plain and SHIFT
+    // combinations separately, so a frame can carry both and they must ADD.
+    const NONE: [bool; 4] = [false; 4];
+    assert_eq!(arrow_nudge_step_px(NONE, NONE), [0.0, 0.0]);
+
+    // right + shift-right = 1 + 5.
+    assert_eq!(
+        arrow_nudge_step_px([false, true, false, false], [false, true, false, false]),
+        [6.0, 0.0]
+    );
+    // up (-1) + shift-down (+5) = +4 on the y axis.
+    assert_eq!(
+        arrow_nudge_step_px([false, false, true, false], [false, false, false, true]),
+        [0.0, 4.0]
+    );
+    // Opposite directions cancel on each axis.
+    assert_eq!(arrow_nudge_step_px([true, true, true, true], NONE), [0.0, 0.0]);
+    assert_eq!(arrow_nudge_step_px(NONE, [true, true, true, true]), [0.0, 0.0]);
+    // A plain step is exactly one page pixel, in the screen sense (right/down positive).
+    assert_eq!(arrow_nudge_step_px([true, false, true, false], NONE), [-1.0, -1.0]);
+    assert_eq!(arrow_nudge_step_px(NONE, [true, false, true, false]), [-5.0, -5.0]);
+}
+
+#[test]
+fn tab_leave_flush_settles_an_open_move_and_reports_it_as_pending() {
+    // Defect: `settle_layer_move` is the only place a move marks the layer dirty, and it is driven
+    // from `TypingTabState::draw` — which stops the instant the user leaves the tab or closes the
+    // app. A gesture still open at that moment must not vanish: the flush point settles it FIRST,
+    // and until it does, `has_unsettled_layer_move` reports it as owed work.
+    let mut layer = TypingTextOverlayLayer {
+        overlays: vec![text_runtime_from_doc_node(
+            "t0",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            false,
+            0,
+            None,
+            [4, 3],
+            vec![0u8; 4 * 3 * 4],
+        )],
+        ..Default::default()
+    };
+    assert!(!layer.has_unsettled_layer_move());
+    assert!(!layer.has_pending_placement_save());
+
+    // A gesture that has actually moved the layer, still open (pointer/arrow held).
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Overlay(0),
+        page_idx: 0,
+        source: TypingLayerMoveSource::Keyboard,
+        base: TypingLayerMoveBase::Center([10.0, 20.0]),
+        page_size_px: [100, 100],
+        pointer_start_scene: None,
+        delta_page_px: [20.0, 0.0],
+        snap_applied: true,
+        strict_pixel_movement: false,
+        has_changes: true,
+    });
+    assert!(
+        layer.has_unsettled_layer_move(),
+        "an open gesture with changes is owed work"
+    );
+
+    // The tab-leave / exit flush settles it before deciding whether anything is owed.
+    layer.flush_text_layers_if_dirty(TypingSaveFlushReason::TabLeave);
+    assert!(
+        layer.move_session.is_none(),
+        "the flush point consumed the open gesture"
+    );
+    assert!(
+        layer.placement_save_dirty,
+        "settling marked the moved text layer dirty; the flush then had something to write \
+         (it stays dirty here because this bare test layer has no layers dir wired)"
+    );
+}
+
+#[test]
+fn discard_drops_an_open_move_without_marking_anything() {
+    // The DISCARD path throws unwritten edits away and deletes the staging dir, so it must DROP an
+    // open gesture rather than settle it — settling would re-mark the layer dirty (and, for a
+    // raster, enqueue a page save that re-creates the dir through the saver's sync fallback).
+    let mut layer = TypingTextOverlayLayer {
+        overlays: vec![text_runtime_from_doc_node(
+            "t0",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            false,
+            0,
+            None,
+            [4, 3],
+            vec![0u8; 4 * 3 * 4],
+        )],
+        ..Default::default()
+    };
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Overlay(0),
+        page_idx: 0,
+        source: TypingLayerMoveSource::Pointer,
+        base: TypingLayerMoveBase::Center([10.0, 20.0]),
+        page_size_px: [100, 100],
+        pointer_start_scene: Some(Pos2::ZERO),
+        delta_page_px: [20.0, 0.0],
+        snap_applied: true,
+        strict_pixel_movement: false,
+        has_changes: true,
+    });
+
+    layer.discard_pending_placement_save();
+    assert!(layer.move_session.is_none(), "discard drops the gesture");
+    assert!(
+        !layer.placement_save_dirty && !layer.has_unsettled_layer_move(),
+        "and leaves nothing behind that could re-dispatch the discarded write"
+    );
+}
+
+#[test]
+fn reproject_reapplies_an_open_raster_move() {
+    // Defect: a gesture's geometry only reaches the document on settle, so a reprojection triggered
+    // by another tab restored the PRE-gesture geometry and the settle then persisted the reverted
+    // state. A keyboard nudge could not self-heal at all (no further pointer motion to recompute
+    // from). Re-applying `base + delta` after the rebuild fixes it and is idempotent.
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use std::collections::HashMap;
+
+    let dir = std::env::temp_dir().join(format!("typ_reapply_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let start = crate::models::layer_model::manifest::TransformRec {
+        cx: 10.0,
+        cy: 20.0,
+        rotation: 0.0,
+        scale: 1.0,
+    };
+    persist::add_page_raster(
+        &dir,
+        None,
+        0,
+        "r0",
+        "R",
+        true,
+        1.0,
+        start,
+        &ColorImage::filled([2, 2], Color32::WHITE),
+    )
+    .unwrap();
+
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
+
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc);
+
+    // An arrow nudge of +20 px that has NOT settled yet: the live projection carries it, the
+    // document still holds the original transform.
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Raster(0),
+        page_idx: 0,
+        source: TypingLayerMoveSource::Keyboard,
+        base: TypingLayerMoveBase::Center([start.cx, start.cy]),
+        page_size_px: [100, 100],
+        pointer_start_scene: None,
+        delta_page_px: [20.0, 0.0],
+        snap_applied: true,
+        strict_pixel_movement: false,
+        has_changes: true,
+    });
+    layer.raster_layers_by_page.get_mut(&0).unwrap()[0]
+        .transform
+        .cx = start.cx + 20.0;
+
+    // Another tab edits the page -> reprojection rebuilds this page from the document.
+    layer.sync_from_doc(0, &doc);
+
+    assert!(
+        (layer.raster_layers_by_page[&0][0].transform.cx - (start.cx + 20.0)).abs() <= 1e-3,
+        "the open gesture is re-applied on top of the reprojection instead of being reverted"
+    );
+    assert!(
+        layer.move_session.is_some(),
+        "and the gesture stays open so the user can keep nudging"
+    );
+
+    // Idempotent: a second reprojection changes nothing further.
+    layer.sync_from_doc(0, &doc);
+    assert!(
+        (layer.raster_layers_by_page[&0][0].transform.cx - (start.cx + 20.0)).abs() <= 1e-3,
+        "re-applying the same base+delta is idempotent"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deferred_raster_persist_reports_an_unscheduled_write() {
+    // Defect: the deferred persists returned silently when the tab was not wired to a chapter, while
+    // `settle_layer_move` had already consumed the gesture — the move was gone with no trace. They
+    // now REPORT it so the settle can log the loss instead of closing the gesture as successful.
+    let transform = crate::models::layer_model::manifest::TransformRec {
+        cx: 1.0,
+        cy: 2.0,
+        rotation: 0.0,
+        scale: 1.0,
+    };
+    // No layers dir and no document: nothing can be scheduled.
+    let mut bare = TypingTextOverlayLayer::default();
+    assert_eq!(
+        bare.persist_raster_transform_deferred(0, "r0", transform),
+        RasterPersistDispatch::NotEnqueued(RasterPersistFailure::NotWired)
+    );
+    assert_eq!(
+        bare.persist_raster_deform_deferred(0, "r0", transform, None),
+        RasterPersistDispatch::NotEnqueued(RasterPersistFailure::NotWired)
+    );
+
+    // A layers dir but still no shared document: the geometry reaches nothing that writes.
+    let mut dir_only = TypingTextOverlayLayer {
+        layers_primary_dir: Some(std::env::temp_dir().join("typ_persist_report_never_written")),
+        ..Default::default()
+    };
+    assert_eq!(
+        dir_only.persist_raster_transform_deferred(0, "r0", transform),
+        RasterPersistDispatch::NotEnqueued(RasterPersistFailure::NotWired)
+    );
+}
+
+#[test]
+fn strict_pixel_move_snaps_after_the_page_clamp() {
+    // Defect: only the session BASE was snapped, so a layer driven into the page bound came to rest
+    // on the clamp's fractional coordinate (±0.9 * side). The snap must run AFTER the clamp.
+    let page_size = [101usize, 101usize];
+    // Far past the bound: the clamp lands on 1.9 * 101 = 191.9, which must then round to 192... but
+    // rounding away from the feasible range is re-clamped, so the bound itself wins.
+    let at_bound = moved_center_from_base([50.0, 50.0], [10_000.0, 0.0], page_size, true);
+    assert!(
+        (at_bound[0] - overlay_uv_max() * 101.0).abs() <= 1e-3,
+        "at the bound the feasible (fractional) position wins over the pixel grid: {at_bound:?}"
+    );
+    // Inside the page the result is always on the grid, even from a fractional base.
+    let inside = moved_center_from_base([10.4, 20.6], [5.0, 5.0], page_size, true);
+    assert_eq!(inside, [15.0, 26.0]);
+    // A mesh snaps its centroid the same way, rigidly.
+    let mesh = TypingOverlayDeformMesh::new(
+        2,
+        2,
+        vec![[10.4f32, 20.6], [30.4, 20.6], [10.4, 40.6], [30.4, 40.6]],
+        page_size,
+    )
+    .expect("2x2 mesh with 4 points is valid");
+    let (moved, applied) = moved_mesh_from_base(&mesh, [5.0, 5.0], page_size, true);
+    let centroid = deform_mesh_centroid_px(&moved);
+    assert!(
+        (centroid[0] - centroid[0].round()).abs() <= 1e-3
+            && (centroid[1] - centroid[1].round()).abs() <= 1e-3,
+        "the moved mesh centroid lands on whole pixels: {centroid:?}"
+    );
+    // The reported applied delta covers BOTH the move and the snap, so a paired affine center that
+    // follows it stays locked to the mesh.
+    let before = deform_mesh_centroid_px(&mesh);
+    assert!(
+        (applied[0] - (centroid[0] - before[0])).abs() <= 1e-3
+            && (applied[1] - (centroid[1] - before[1])).abs() <= 1e-3,
+        "applied delta accounts for the post-clamp snap: {applied:?}"
+    );
+}
+
+#[test]
+fn whole_document_flush_settles_an_open_move() {
+    // `MangaApp`'s page operations and save-to-project call `flush_text_layers` DIRECTLY, not
+    // `flush_text_layers_if_dirty`. Both are points of no return (a page op reloads the project; a
+    // save merges staging and deletes it), so the settle has to live in `flush_text_layers` itself —
+    // settling only in the `_if_dirty` wrapper left both able to reload or merge over an unsettled
+    // gesture, whose raster half exists nowhere but the runtime projection.
+    let mut layer = TypingTextOverlayLayer {
+        overlays: vec![text_runtime_from_doc_node(
+            "t0",
+            0,
+            [10.0, 20.0],
+            1.0,
+            0.0,
+            None,
+            false,
+            false,
+            0,
+            None,
+            [4, 3],
+            vec![0u8; 4 * 3 * 4],
+        )],
+        ..Default::default()
+    };
+    layer.move_session = Some(TypingLayerMoveSession {
+        target: TypingLayerMoveTarget::Overlay(0),
+        page_idx: 0,
+        source: TypingLayerMoveSource::Keyboard,
+        base: TypingLayerMoveBase::Center([10.0, 20.0]),
+        page_size_px: [100, 100],
+        pointer_start_scene: None,
+        delta_page_px: [20.0, 0.0],
+        snap_applied: true,
+        strict_pixel_movement: false,
+        has_changes: true,
+    });
+
+    // The flush itself cannot run on this bare layer (no layers dir), which is precisely the case
+    // `app.rs` treats as ABORT — but the settle must have happened before that decision.
+    let outcome = layer.flush_text_layers();
+    assert!(
+        matches!(outcome, Err(TypingTextFlushError::NoLayersDir)),
+        "a bare layer still reports the flush as unrunnable"
+    );
+    assert!(
+        layer.move_session.is_none(),
+        "the whole-document flush settled the open gesture first"
+    );
+    assert!(
+        layer.placement_save_dirty,
+        "and the settle marked the moved layer dirty, so the abort path sees work is owed"
+    );
+}
+
+#[test]
+fn deferred_raster_persist_is_not_enqueued_when_the_document_rejects_it() {
+    // `enqueue_page_save` returns `Ok(())` even for a page the document does not hold, so reporting
+    // `Enqueued` without checking `route_to_doc` was a false positive: the settle retired the
+    // gesture and the moved geometry was in no save snapshot.
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use std::collections::HashMap;
+
+    let dir = std::env::temp_dir().join(format!("typ_route_reject_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let transform = crate::models::layer_model::manifest::TransformRec {
+        cx: 1.0,
+        cy: 2.0,
+        rotation: 0.0,
+        scale: 1.0,
+    };
+    persist::add_page_raster(
+        &dir,
+        None,
+        0,
+        "r0",
+        "R",
+        true,
+        1.0,
+        transform,
+        &ColorImage::filled([2, 2], Color32::WHITE),
+    )
+    .unwrap();
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, &dir, None, None, &page_sizes).unwrap();
+    let doc = Arc::new(Mutex::new(doc));
+    let mut layer = TypingTextOverlayLayer {
+        layers_primary_dir: Some(dir.clone()),
+        layer_doc: Some(Arc::clone(&doc)),
+        ..Default::default()
+    };
+
+    // Page 0 IS resident: a normal write is scheduled.
+    assert_eq!(
+        layer.persist_raster_transform_deferred(0, "r0", transform),
+        RasterPersistDispatch::Enqueued
+    );
+    // Page 7 is NOT resident in the document, so nothing meaningful can be written for it — even
+    // though `enqueue_page_save` would happily return `Ok(())`.
+    assert_eq!(
+        layer.persist_raster_transform_deferred(7, "r0", transform),
+        RasterPersistDispatch::NotEnqueued(RasterPersistFailure::NotWired),
+        "a document that did not accept the change must not be reported as a scheduled write"
+    );
+    assert!(
+        !layer.raster_save_retry_pages.contains(&7),
+        "a structural rejection is NOT queued for retry (it would reproduce forever)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_raster_write_is_queued_and_retried_at_the_next_flush_point() {
+    // `enqueue_page_save` falls back to a SYNCHRONOUS `flush_page` when no background saver runs, and
+    // that can fail transiently (locked file, antivirus, a momentary permission error). Such a write
+    // must not be swallowed with the gesture: it is queued and retried at flush points — never per
+    // frame, so a permanently failing write cannot spin.
+    use crate::models::layer_model::layer_doc::LayerDoc;
+    use crate::models::layer_model::persist;
+    use std::collections::HashMap;
+
+    let root = std::env::temp_dir().join(format!("typ_retry_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let good = root.join("layers");
+    let transform = crate::models::layer_model::manifest::TransformRec {
+        cx: 1.0,
+        cy: 2.0,
+        rotation: 0.0,
+        scale: 1.0,
+    };
+    persist::add_page_raster(
+        &good,
+        None,
+        0,
+        "r0",
+        "R",
+        true,
+        1.0,
+        transform,
+        &ColorImage::filled([2, 2], Color32::WHITE),
+    )
+    .unwrap();
+    let mut doc = LayerDoc::new();
+    let mut page_sizes: HashMap<usize, [usize; 2]> = HashMap::new();
+    page_sizes.insert(0, [100, 100]);
+    doc.ensure_page_loaded(0, &good, None, None, &page_sizes).unwrap();
+    let doc = Arc::new(Mutex::new(doc));
+
+    // An UNWRITABLE layers dir: its parent is a regular file, so creating it always fails.
+    let blocker = root.join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let unwritable = blocker.join("layers");
+
+    let mut layer = TypingTextOverlayLayer {
+        layers_primary_dir: Some(unwritable),
+        layer_doc: Some(Arc::clone(&doc)),
+        ..Default::default()
+    };
+    let moved = crate::models::layer_model::manifest::TransformRec {
+        cx: 40.0,
+        ..transform
+    };
+    assert_eq!(
+        layer.persist_raster_transform_deferred(0, "r0", moved),
+        RasterPersistDispatch::NotEnqueued(RasterPersistFailure::WriteFailed),
+        "an I/O failure is reported as a FAILED write, not as a structural one"
+    );
+    assert!(
+        layer.raster_save_retry_pages.contains(&0),
+        "and the page is queued for a retry"
+    );
+    assert!(
+        layer.pending_status_error.is_some(),
+        "a write failure is surfaced to the user, not only logged"
+    );
+
+    // The condition clears (the real dir is reachable again) and the next flush point drains it.
+    layer.layers_primary_dir = Some(good.clone());
+    layer.retry_failed_raster_page_saves();
+    assert!(
+        layer.raster_save_retry_pages.is_empty(),
+        "a successful retry drops the page from the queue"
+    );
+    let reloaded = persist::load_page_rasters(&good, None, 0).unwrap();
+    assert!(
+        (reloaded.layers[0].transform.cx - 40.0).abs() <= 1e-6,
+        "and the geometry the failed write carried is on disk"
+    );
+
+    // A queue that can never drain (the tab is no longer wired) is dropped instead of carried.
+    layer.raster_save_retry_pages.insert(3);
+    layer.layer_doc = None;
+    layer.retry_failed_raster_page_saves();
+    assert!(
+        layer.raster_save_retry_pages.is_empty(),
+        "an unwirable queue is dropped, so nothing accumulates for the rest of the session"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

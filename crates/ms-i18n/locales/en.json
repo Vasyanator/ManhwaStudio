@@ -4109,6 +4109,7 @@
   "typing.section.shape": "Shape & smoothing",
   "typing.section.text_processing": "Text processing",
   "typing.section.weight": "Typeface style",
+  "typing.status.raster_geometry_save_failed": "Could not save the layer move to disk. It will be retried at the next save; see the log for details.",
   "typing.vector_transform.base_render_channel_error": "Background base-image render for vector transform was interrupted.",
   "typing.vector_transform.build_params_error": "Could not build render parameters for vector transform.",
   "typing.vector_transform.no_render_data_error": "The text overlay has no render_data for vector transform.",

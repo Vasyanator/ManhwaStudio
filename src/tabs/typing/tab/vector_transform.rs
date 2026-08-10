@@ -751,10 +751,8 @@ impl TypingTextOverlayLayer {
                     ),
                     None => state.start_mesh.clone(),
                 },
-                // MoveCenter / Rotate are never produced for a vector edit; keep the mesh unchanged.
-                TypingOverlayDragMode::MoveCenter | TypingOverlayDragMode::Rotate => {
-                    state.start_mesh.clone()
-                }
+                // Rotate is never produced for a vector edit; keep the mesh unchanged.
+                TypingOverlayDragMode::Rotate => state.start_mesh.clone(),
             };
             state.has_changes = true;
             // Brush strokes accumulate: re-anchor to the just-committed mesh + current pointer so the

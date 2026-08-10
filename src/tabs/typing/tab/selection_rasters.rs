@@ -5,9 +5,15 @@ Purpose:
 Selection state and raster-layer canvas interaction for the typing tab: clearing
 and switching the single active selection (text overlay vs raster), the edit-panel
 selection payload, overlay/raster removal, wheel/keyboard transform shortcuts
-(rotate, scale, arrow-nudge), raster deform-mesh seeding, geometry persistence
-routing, and the full raster select/move/rotate/perspective canvas interaction
-with its context menu.
+(rotate, scale), raster deform-mesh seeding, geometry persistence routing, and the
+raster select/rotate/perspective canvas interaction with its context menu.
+
+NOT here — a whole-layer MOVE, by pointer or by arrow keys, for either layer kind:
+that is the shared move session in `tab/move_layer.rs`. `interact_page_rasters`
+delegates its move drag to it and only keeps the non-move gestures, and the arrow
+nudge has ONE merged entry point there. Geometry writes from this file are
+DEFERRED (`persist_raster_transform_deferred` / `persist_raster_deform_deferred`)
+except the perspective-handle drag end, which still writes synchronously.
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
@@ -21,6 +27,9 @@ use super::*;
 
 impl TypingTextOverlayLayer {
     pub(super) fn clear_selection(&mut self) {
+        // A move gesture interrupted by a selection change must still land its write, so settle it
+        // (a no-op when nothing moved) before the selection state is torn down.
+        self.settle_layer_move();
         if crate::trace::trace_enabled()
             && (self.selected_overlay_idx.is_some() || self.selected_raster_idx.is_some())
         {
@@ -49,6 +58,9 @@ impl TypingTextOverlayLayer {
     /// `selected_raster_page` is set alongside `selected_raster_idx` so per-page shortcut handlers can
     /// tell which page the selection lives on.
     pub(super) fn select_raster(&mut self, page_idx: usize, raster_idx: usize) {
+        // A selection change is a focus loss for whatever was being moved: settle first so the
+        // gesture's write is never dropped (a no-op when nothing moved, and when no session is open).
+        self.settle_layer_move();
         if self.selected_raster_idx != Some(raster_idx) || self.selected_raster_page != Some(page_idx)
         {
             crate::trace_log!(
@@ -150,6 +162,9 @@ impl TypingTextOverlayLayer {
         if overlay_idx >= self.overlays.len() {
             return;
         }
+        // Settle any open move gesture BEFORE the index fixups: settling consumes the session, so
+        // no stale index can survive the removal, and a move of a DIFFERENT layer still lands.
+        self.settle_layer_move();
         // Capture the doc-node identity (TEXT overlays only) before removing the runtime, so the
         // matching node can be dropped from the shared doc afterward.
         let doc_node = self
@@ -268,6 +283,9 @@ impl TypingTextOverlayLayer {
         else {
             return;
         };
+        // Settle any open move gesture BEFORE the index fixups: settling consumes the session, so no
+        // stale index can survive the removal, and a move of a DIFFERENT layer still lands its write.
+        self.settle_layer_move();
         crate::trace_log!(
             cat::TYPING,
             "remove_raster page={} raster_idx={} uid={}",
@@ -635,7 +653,10 @@ impl TypingTextOverlayLayer {
             return;
         }
         let (uid, transform) = (layer.uid.clone(), layer.transform);
-        self.persist_raster_transform_deferred(page_idx, &uid, transform);
+        // Nothing is retired on this write and a failure is already logged with full context
+        // inside, so the dispatch outcome is informational at this call site.
+        let _: RasterPersistDispatch =
+            self.persist_raster_transform_deferred(page_idx, &uid, transform);
         ui.ctx().request_repaint();
     }
 
@@ -708,7 +729,10 @@ impl TypingTextOverlayLayer {
             idx,
             transform.rotation
         );
-        self.persist_raster_transform_deferred(page_idx, &uid, transform);
+// Nothing is retired on this write and a failure is already logged with full context
+        // inside, so the dispatch outcome is informational at this call site.
+        let _: RasterPersistDispatch =
+            self.persist_raster_transform_deferred(page_idx, &uid, transform);
         ui.ctx().request_repaint();
     }
 
@@ -754,63 +778,174 @@ impl TypingTextOverlayLayer {
         Some(mesh)
     }
 
-    pub(super) fn persist_raster_transform(
-        &mut self,
-        page_idx: usize,
-        uid: &str,
-        transform: crate::models::layer_model::manifest::TransformRec,
-    ) {
-        let Some(dir) = self.layers_primary_dir.clone() else {
-            return;
-        };
-        let fallback = self.layers_fallback_dir.clone();
-        // Route the MODEL change to the shared doc: it bumps the doc version (so the PS tab
-        // re-projects) and re-projects this tab's page.
-        let uid_owned = uid.to_string();
-        self.route_to_doc(page_idx, |doc| doc.set_transform(page_idx, &uid_owned, transform));
-        // Persist to disk so the transform survives a reload / save-to-project.
-        if let Err(err) = crate::models::layer_model::persist::update_raster_transform(
-            &dir,
-            page_idx,
-            uid,
-            transform,
-            fallback.as_deref(),
-        ) {
-            crate::runtime_log::log_warn(format!("[typing] persist raster transform: {err}"));
-        }
-    }
-
-    /// Like [`persist_raster_transform`] but DEFERS the disk write to the shared doc's coalescing
-    /// background saver (off the GUI thread) instead of a synchronous manifest rewrite. Used by the
-    /// Ctrl+wheel rotation, whose rapid per-notch events must not block the GUI thread with file I/O
-    /// per event (CLAUDE.md §5). The in-memory doc is updated LIVE (so the transform is visible
-    /// immediately and the PS tab re-projects), and only the disk persist is deferred and coalesced.
+    /// Routes a raster's affine transform to the shared doc and DEFERS the disk write to the doc's
+    /// coalescing background saver (off the GUI thread) — the ONLY transform-persist path this tab
+    /// has, because every producer is a rapid gesture (Ctrl+wheel rotation, keyboard scale, the
+    /// rotate drag, a move settle) whose per-event synchronous manifest rewrite would block the GUI
+    /// thread with file I/O (CLAUDE.md §5). The in-memory doc is updated LIVE (so the transform is
+    /// visible immediately and the PS tab re-projects); only the disk persist is deferred.
     ///
     /// This is the async counterpart of `persist_current_page_rasters`' synchronous `flush_page`: a
     /// transform-only change marks no pixels dirty, so the enqueued job re-encodes no PNGs.
     /// `enqueue_page_save` itself falls back to a synchronous `flush_page` when no saver is enabled.
+    ///
+    /// Returns whether the DISK write was scheduled ([`RasterPersistDispatch`]). A caller that
+    /// retires state on the strength of this write (a move settle, which then forgets the gesture)
+    /// must not treat `NotEnqueued` as success.
+    #[must_use]
     pub(super) fn persist_raster_transform_deferred(
         &mut self,
         page_idx: usize,
         uid: &str,
         transform: crate::models::layer_model::manifest::TransformRec,
-    ) {
+    ) -> RasterPersistDispatch {
         let Some(dir) = self.layers_primary_dir.clone() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "no layers directory is wired for this chapter",
+            );
         };
         let fallback = self.layers_fallback_dir.clone();
         // Live in-memory update: bumps the doc version (PS tab re-projects) and re-projects this page.
+        // Its result is LOAD-BEARING: `false` means the document did not take the change (no doc, or
+        // the page is not resident / the node is gone), and `enqueue_page_save` returns `Ok(())` even
+        // for a page the document does not hold — so skipping this check reports a write that would
+        // save nothing as `Enqueued`.
         let uid_owned = uid.to_string();
-        self.route_to_doc(page_idx, |doc| doc.set_transform(page_idx, &uid_owned, transform));
+        if !self.route_to_doc(page_idx, |doc| doc.set_transform(page_idx, &uid_owned, transform)) {
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "the shared layer document did not accept the change (no document wired, or the page is not resident / the node is gone)",
+            );
+        }
         // Defer the disk write to the doc's coalescing background saver.
         let Some(doc) = self.layer_doc.clone() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "no shared layer document is wired",
+            );
         };
         let Ok(mut guard) = doc.lock() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "the shared layer document lock is poisoned",
+            );
         };
         if let Err(err) = guard.enqueue_page_save(page_idx, &dir, fallback.as_deref()) {
-            crate::runtime_log::log_warn(format!("[typing] defer raster transform save: {err}"));
+            drop(guard);
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::WriteFailed,
+                &format!("enqueue_page_save failed: {err}"),
+            );
+        }
+        // A successful write for this page supersedes any earlier failure queued for it.
+        self.raster_save_retry_pages.remove(&page_idx);
+        RasterPersistDispatch::Enqueued
+    }
+
+    /// Reports a raster geometry write that reached no disk queue: logs ONE structured warning with
+    /// the full context, queues a retry when the cause may be transient, and returns
+    /// [`RasterPersistDispatch::NotEnqueued`] so the caller cannot read the failure as success.
+    ///
+    /// `reason` is a technical, non-localized cause for the log only. `failure` decides the handling:
+    /// `WriteFailed` is queued for one retry per flush point and surfaced to the user, `NotWired` is
+    /// only logged (retrying reproduces it, which would loop forever).
+    #[must_use]
+    fn report_raster_persist_not_enqueued(
+        &mut self,
+        page_idx: usize,
+        uid: &str,
+        failure: RasterPersistFailure,
+        reason: &str,
+    ) -> RasterPersistDispatch {
+        match failure {
+            RasterPersistFailure::WriteFailed => {
+                // The geometry IS in the shared document (the failure is strictly the disk enqueue),
+                // so the retry only has to re-enqueue this page.
+                self.raster_save_retry_pages.insert(page_idx);
+                crate::runtime_log::log_error(format!(
+                    "[typing] raster geometry write FAILED.\n\
+                     Page: {page_idx}\nLayer uid: {uid}\nCause: {reason}\n\
+                     Effect: the change is live in the shared document but is not on disk yet. It is \
+                     queued for another attempt at the next save point; if that keeps failing, the \
+                     change is lost when the session ends."
+                ));
+                // The user must see a write failure (CLAUDE.md §7). No `egui::Context` reaches here
+                // (a settle can be driven from a flush point), so park it for the next frame.
+                self.pending_status_error =
+                    Some(t!("typing.status.raster_geometry_save_failed").to_string());
+            }
+            RasterPersistFailure::NotWired => {
+                crate::runtime_log::log_warn(format!(
+                    "[typing] raster geometry change was NOT scheduled to disk.\n\
+                     Page: {page_idx}\nLayer uid: {uid}\nCause: {reason}\n\
+                     Effect: the change stays visible on screen, but nothing will write it — it is \
+                     lost on reload unless another edit of the same page is saved. Not retried: this \
+                     cause is reproduced identically by every later attempt."
+                ));
+            }
+        }
+        RasterPersistDispatch::NotEnqueued(failure)
+    }
+
+    /// Re-enqueues the page saves that a previous deferred raster write could not schedule because of
+    /// an I/O failure (`RasterPersistFailure::WriteFailed`).
+    ///
+    /// Driven from FLUSH POINTS only — never per frame — so a persistently failing write retries at a
+    /// human pace (selection change, page change, the 1.5 s idle debounce, tab leave, exit) instead of
+    /// spinning. A page that fails again stays queued; one that succeeds, or that can no longer be
+    /// written at all for a structural reason, is dropped from the queue.
+    pub(super) fn retry_failed_raster_page_saves(&mut self) {
+        if self.raster_save_retry_pages.is_empty() {
+            return;
+        }
+        let (Some(dir), Some(doc)) = (self.layers_primary_dir.clone(), self.layer_doc.clone())
+        else {
+            // Structural: the tab is no longer wired to a chapter, so the queue can never drain.
+            // Drop it (loudly) rather than carry it for the rest of the session.
+            crate::runtime_log::log_warn(format!(
+                "[typing] dropping {} queued raster page save retr(y/ies): the tab is no longer \
+                 wired to a chapter (no layers directory or no shared document).",
+                self.raster_save_retry_pages.len()
+            ));
+            self.raster_save_retry_pages.clear();
+            return;
+        };
+        let fallback = self.layers_fallback_dir.clone();
+        let pages: Vec<usize> = self.raster_save_retry_pages.iter().copied().collect();
+        let Ok(mut guard) = doc.lock() else {
+            crate::runtime_log::log_warn(
+                "[typing] raster page save retry skipped: the shared layer document lock is poisoned.",
+            );
+            return;
+        };
+        for page_idx in pages {
+            match guard.enqueue_page_save(page_idx, &dir, fallback.as_deref()) {
+                Ok(()) => {
+                    self.raster_save_retry_pages.remove(&page_idx);
+                    crate::trace_log!(
+                        cat::PERSIST,
+                        "raster_page_save_retry page={} result=enqueued",
+                        page_idx
+                    );
+                }
+                Err(err) => {
+                    crate::runtime_log::log_warn(format!(
+                        "[typing] raster page save retry failed again.\nPage: {page_idx}\n\
+                         Cause: {err}\nThe page stays queued for the next save point."
+                    ));
+                }
+            }
         }
     }
 
@@ -869,43 +1004,87 @@ impl TypingTextOverlayLayer {
     /// document saver. The saver captures both the affine transform and the full deform mesh, so
     /// rapid keyboard nudges update the live doc immediately without rewriting `layers.json` on the
     /// GUI thread. As with [`persist_raster_transform_deferred`], no saver keeps the existing
-    /// synchronous `flush_page` fallback.
+    /// synchronous `flush_page` fallback, and the return value reports whether the DISK write was
+    /// scheduled — a caller that forgets the edit afterwards must not treat `NotEnqueued` as success.
+    #[must_use]
     pub(super) fn persist_raster_deform_deferred(
         &mut self,
         page_idx: usize,
         uid: &str,
         transform: crate::models::layer_model::manifest::TransformRec,
         deform: Option<crate::models::layer_model::manifest::DeformRec>,
-    ) {
+    ) -> RasterPersistDispatch {
         let Some(dir) = self.layers_primary_dir.clone() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "no layers directory is wired for this chapter",
+            );
         };
         let fallback = self.layers_fallback_dir.clone();
         let uid_owned = uid.to_string();
         let deform_for_doc = deform.clone();
-        self.route_to_doc(page_idx, |doc| {
+        // Load-bearing result — see `persist_raster_transform_deferred`.
+        if !self.route_to_doc(page_idx, |doc| {
             doc.set_transform(page_idx, &uid_owned, transform);
             doc.set_deform(page_idx, &uid_owned, deform_for_doc);
-        });
+        }) {
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "the shared layer document did not accept the change (no document wired, or the page is not resident / the node is gone)",
+            );
+        }
         let Some(doc) = self.layer_doc.clone() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "no shared layer document is wired",
+            );
         };
         let Ok(mut guard) = doc.lock() else {
-            return;
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::NotWired,
+                "the shared layer document lock is poisoned",
+            );
         };
         if let Err(err) = guard.enqueue_page_save(page_idx, &dir, fallback.as_deref()) {
-            crate::runtime_log::log_warn(format!("[typing] defer raster deform save: {err}"));
+            drop(guard);
+            return self.report_raster_persist_not_enqueued(
+                page_idx,
+                uid,
+                RasterPersistFailure::WriteFailed,
+                &format!("enqueue_page_save failed: {err}"),
+            );
         }
+        self.raster_save_retry_pages.remove(&page_idx);
+        RasterPersistDispatch::Enqueued
     }
 
     /// Canvas select + move/rotate drag for raster layers (parity with overlays). Runs after the
     /// overlay interaction so overlays win pointer ties; draws the selection decoration. The raster
     /// pixels themselves are drawn in the unified merged-fill pass.
+    ///
+    /// A whole-layer MOVE is NOT handled here: it is delegated to the shared move session
+    /// (`tab/move_layer.rs`), which is what gives the raster drag page clamping, whole-pixel snapping
+    /// under `strict_pixel_movement`, live mask-clip re-clipping, visible movement of a DEFORMED
+    /// raster, and a single DEFERRED write per gesture. Rotation and the perspective corner handles
+    /// keep their own `raster_drag_state`.
+    ///
+    /// `strict_pixel_movement` is the tab's "move layers by whole pixels" policy for this frame; it
+    /// is only forwarded to the move session (rotation and the corner handles are not pixel-snapped),
+    /// which quantizes the drag delta and keeps the layer on the pixel grid.
     pub(super) fn interact_page_rasters(
         &mut self,
         ui: &mut egui::Ui,
         view: PageView,
         painter: &egui::Painter,
+        strict_pixel_movement: bool,
     ) {
         let page_idx = view.page_idx;
         let image_rect = view.image_rect;
@@ -933,8 +1112,18 @@ impl TypingTextOverlayLayer {
             self.raster_drag_state = None;
             self.raster_drag_has_changes = false;
         }
+        // A move session pointing at a raster index this page no longer has cannot be settled (there
+        // is nothing left to read or persist), so drop it rather than let it write a stranger raster.
+        // Only THIS page's session is judged: the same index exists on every page.
+        if self.move_session.as_ref().is_some_and(|session| {
+            matches!(session.target, TypingLayerMoveTarget::Raster(idx)
+                if session.page_idx == page_idx && idx >= count)
+        }) {
+            self.move_session = None;
+        }
 
-        // Drag-end: persist the final geometry (transform, and the mesh for a perspective edit).
+        // Drag-end: persist the final geometry of a NON-move drag (rotation, or the mesh for a
+        // perspective edit). A move settles through `drive_layer_move_settle` instead.
         let primary_down = ui.input(|i| i.pointer.primary_down());
         if !primary_down
             && let Some(state) = self.raster_drag_state.take()
@@ -950,7 +1139,12 @@ impl TypingTextOverlayLayer {
                 if matches!(state.mode, TypingRasterDragMode::PerspectiveHandle(_)) {
                     self.persist_raster_deform(state.page_idx, &uid, transform, deform);
                 } else {
-                    self.persist_raster_transform(state.page_idx, &uid, transform);
+                    // Rotation DEFERS its write like every other rapid raster gesture (Ctrl+wheel
+                    // rotate already did), so no manifest rewrite runs on the GUI thread. The
+                    // rotate drag retires no state on it and a failure is logged inside, so the
+                    // dispatch outcome is informational here.
+                    let _: RasterPersistDispatch =
+                        self.persist_raster_transform_deferred(state.page_idx, &uid, transform);
                 }
             }
             self.raster_drag_has_changes = false;
@@ -1070,6 +1264,21 @@ impl TypingTextOverlayLayer {
             })
             .collect();
         let pointer = ui.ctx().pointer_latest_pos();
+        // The raster index this page's ACTIVE gesture owns, if any: a non-move `raster_drag_state`
+        // (rotate / perspective handle) or a shared move session. Either way the gesture owns the
+        // raster's response Id and the pointer for the frame.
+        let active_drag_idx = self
+            .raster_drag_state
+            .as_ref()
+            .filter(|state| state.page_idx == page_idx)
+            .map(|state| state.raster_idx);
+        let active_move_idx = self.move_session.as_ref().and_then(|session| {
+            match session.target {
+                TypingLayerMoveTarget::Raster(idx) if session.page_idx == page_idx => Some(idx),
+                TypingLayerMoveTarget::Raster(_) | TypingLayerMoveTarget::Overlay(_) => None,
+            }
+        });
+        let active_gesture_idx = active_drag_idx.or(active_move_idx);
 
         // === Unified topmost-at-pointer gate (text vs raster) ===
         // The raster interaction runs AFTER the overlay pass, and egui gives the LATER-registered widget
@@ -1079,7 +1288,7 @@ impl TypingTextOverlayLayer {
         // the raster pass below gates out. If a RASTER is on top (text now allowed BELOW a raster), do
         // NOT set the overlay gate, so the raster pass can take it. Skipped during an active drag (the
         // drag owns the pointer) and when an overlay already claimed the click this frame.
-        if self.raster_drag_state.is_none() && !self.primary_pointer_targets_overlay_this_frame {
+        if active_gesture_idx.is_none() && !self.primary_pointer_targets_overlay_this_frame {
             let topmost_raster_z = topmost_raster_target(&entries, pointer, image_rect, None)
                 .and_then(|(idx, _, _, _)| {
                     self.raster_layers_by_page
@@ -1109,27 +1318,42 @@ impl TypingTextOverlayLayer {
             }
         }
 
-        if let Some(state) = self.raster_drag_state.clone() {
-            // Continue an active drag (same Id keeps egui's drag association). This owns the selected
-            // raster's `("typing_raster", page_idx, raster_idx)` Id for the frame, so the branches below
-            // must NOT also create a resp for it.
-            if let Some((_, quad, _)) = entries.iter().find(|(i, _, _)| *i == state.raster_idx) {
+        if let Some(active_idx) = active_gesture_idx {
+            // Continue an active gesture (same Id keeps egui's drag association). This owns the
+            // raster's `("typing_raster", page_idx, raster_idx)` Id for the frame, so the branches
+            // below must NOT also create a resp for it.
+            if let Some((_, quad, _)) = entries.iter().find(|(i, _, _)| *i == active_idx) {
                 let resp = ui.interact(
                     egui::Rect::from_points(quad),
-                    egui::Id::new(("typing_raster", page_idx, state.raster_idx)),
+                    egui::Id::new(("typing_raster", page_idx, active_idx)),
                     egui::Sense::click_and_drag(),
                 );
                 if (resp.dragged() || primary_down)
                     && let Some(p) = pointer
                 {
-                    self.apply_raster_drag(&state, p, view);
+                    // A rotate / perspective drag applies itself; a MOVE is driven by the shared
+                    // session, which recomputes the total delta from the press position.
+                    match self.raster_drag_state.clone() {
+                        Some(state) if state.raster_idx == active_idx => {
+                            self.apply_raster_drag(&state, p, view);
+                        }
+                        Some(_) | None => {
+                            self.drive_pointer_layer_move(
+                                TypingLayerMoveTarget::Raster(active_idx),
+                                page_idx,
+                                p,
+                                view,
+                                strict_pixel_movement,
+                            );
+                        }
+                    }
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
                 // Keep the menu attached to the selected raster's resp even mid-drag, so it persists.
                 self.raster_context_menu(
                     &resp,
                     page_idx,
-                    state.raster_idx,
+                    active_idx,
                     false,
                     &mut menu_enter_transform,
                     &mut menu_exit_transform,
@@ -1180,26 +1404,46 @@ impl TypingTextOverlayLayer {
                             .and_then(|v| v.get(sel))
                             .map(|l| l.transform)
                     {
-                        crate::trace_log!(
-                            cat::INPUT,
-                            "raster_drag_begin owner=selected idx={} selected_was={:?} reason=selected_under_pointer",
-                            sel,
-                            self.selected_raster_idx
-                        );
-                        self.raster_drag_state = Some(TypingRasterDragState {
-                            page_idx,
-                            raster_idx: sel,
-                            mode: if on_rotate {
-                                TypingRasterDragMode::Rotate
-                            } else {
-                                TypingRasterDragMode::Move
-                            },
-                            pointer_start_scene: p,
-                            start_transform,
-                            start_pointer_angle_rad: pointer_angle_rad(sel_center, p),
-                            start_mesh: None,
-                        });
-                        self.raster_drag_has_changes = false;
+                        if on_rotate {
+                            crate::trace_log!(
+                                cat::INPUT,
+                                "raster_drag_begin owner=selected idx={} mode=Rotate reason=selected_under_pointer",
+                                sel
+                            );
+                            self.raster_drag_state = Some(TypingRasterDragState {
+                                page_idx,
+                                raster_idx: sel,
+                                mode: TypingRasterDragMode::Rotate,
+                                pointer_start_scene: p,
+                                start_transform,
+                                start_pointer_angle_rad: pointer_angle_rad(sel_center, p),
+                                start_mesh: None,
+                            });
+                            self.raster_drag_has_changes = false;
+                        } else {
+                            crate::trace_log!(
+                                cat::INPUT,
+                                "raster_move_begin owner=selected idx={} reason=selected_under_pointer",
+                                sel
+                            );
+                            // `false` = the raster's geometry could not be snapshotted (e.g. a
+                            // malformed stored mesh); no session opens, so the press does not
+                            // become a drag instead of moving something half-defined.
+                            if !self.begin_layer_move(
+                                TypingLayerMoveTarget::Raster(sel),
+                                page_idx,
+                                TypingLayerMoveSource::Pointer,
+                                Some(p),
+                                view,
+                            ) {
+                                crate::trace_log!(
+                                    cat::INPUT,
+                                    "raster_move_begin_failed owner=selected idx={} page={}",
+                                    sel,
+                                    page_idx
+                                );
+                            }
+                        }
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                 }
@@ -1267,25 +1511,43 @@ impl TypingTextOverlayLayer {
                     {
                         crate::trace_log!(
                             cat::INPUT,
-                            "raster_drag_begin owner=reselect idx={} selected_was={:?} reason=no_selected_under_pointer",
+                            "raster_gesture_begin owner=reselect idx={} rotate={} selected_was={:?} reason=no_selected_under_pointer",
                             idx,
+                            on_rotate,
                             self.selected_raster_idx
                         );
+                        // `select_raster` funnels through `clear_selection`-like teardown, so it must
+                        // run BEFORE the gesture state is set, not after.
                         self.select_raster(page_idx, idx);
-                        self.raster_drag_state = Some(TypingRasterDragState {
-                            page_idx,
-                            raster_idx: idx,
-                            mode: if on_rotate {
-                                TypingRasterDragMode::Rotate
-                            } else {
-                                TypingRasterDragMode::Move
-                            },
-                            pointer_start_scene: p,
-                            start_transform,
-                            start_pointer_angle_rad: pointer_angle_rad(center, p),
-                            start_mesh: None,
-                        });
-                        self.raster_drag_has_changes = false;
+                        if on_rotate {
+                            self.raster_drag_state = Some(TypingRasterDragState {
+                                page_idx,
+                                raster_idx: idx,
+                                mode: TypingRasterDragMode::Rotate,
+                                pointer_start_scene: p,
+                                start_transform,
+                                start_pointer_angle_rad: pointer_angle_rad(center, p),
+                                start_mesh: None,
+                            });
+                            self.raster_drag_has_changes = false;
+                        } else {
+                            // See the selected-raster branch: a failed snapshot simply does not
+                            // start a drag.
+                            if !self.begin_layer_move(
+                                TypingLayerMoveTarget::Raster(idx),
+                                page_idx,
+                                TypingLayerMoveSource::Pointer,
+                                Some(p),
+                                view,
+                            ) {
+                                crate::trace_log!(
+                                    cat::INPUT,
+                                    "raster_move_begin_failed owner=reselect idx={} page={}",
+                                    idx,
+                                    page_idx
+                                );
+                            }
+                        }
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                     self.raster_context_menu(
@@ -1305,8 +1567,10 @@ impl TypingTextOverlayLayer {
         }
 
         // Deselect when clicking empty image area (no raster and no overlay targeted this frame).
+        // An active gesture — including a move session, which has no `raster_drag_state` — owns the
+        // pointer, so it must never be read as a click on empty canvas.
         if self.selected_raster_idx.is_some()
-            && self.raster_drag_state.is_none()
+            && active_gesture_idx.is_none()
             && !self.primary_pointer_targets_overlay_this_frame
         {
             let clicked_empty = ui.input(|i| {
@@ -1497,7 +1761,8 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Applies an in-progress raster drag (move or rotate) to the cached transform.
+    /// Applies an in-progress NON-move raster drag (rotation or a perspective corner handle) to the
+    /// cached projection. A whole-layer move goes through the shared move session instead.
     pub(super) fn apply_raster_drag(
         &mut self,
         state: &TypingRasterDragState,
@@ -1513,13 +1778,6 @@ impl TypingTextOverlayLayer {
             return;
         };
         match state.mode {
-            TypingRasterDragMode::Move => {
-                let z = zoom.max(f32::EPSILON);
-                layer.transform.cx =
-                    state.start_transform.cx + (pointer.x - state.pointer_start_scene.x) / z;
-                layer.transform.cy =
-                    state.start_transform.cy + (pointer.y - state.pointer_start_scene.y) / z;
-            }
             TypingRasterDragMode::Rotate => {
                 let center =
                     view.scene_from_page_px([state.start_transform.cx, state.start_transform.cy]);
@@ -1552,176 +1810,5 @@ impl TypingTextOverlayLayer {
             }
         }
         self.raster_drag_has_changes = true;
-    }
-
-    pub(super) fn try_move_selected_overlay_by_arrow_shortcuts(
-        &mut self,
-        ui: &mut egui::Ui,
-        view: PageView,
-        panel_text_input_focused: bool,
-        strict_pixel_movement: bool,
-    ) {
-        let page_idx = view.page_idx;
-        if panel_text_input_focused {
-            return;
-        }
-
-        let Some(selected_idx) = self.selected_overlay_idx else {
-            return;
-        };
-        let Some(selected_overlay) = self.overlays.get(selected_idx) else {
-            return;
-        };
-        if selected_overlay.page_idx != page_idx {
-            return;
-        }
-
-        let (left_1, right_1, up_1, down_1, left_5, right_5, up_5, down_5) =
-            ui.ctx().input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown),
-                )
-            });
-
-        let delta_x_px = (right_1 as i32 - left_1 as i32) + (right_5 as i32 - left_5 as i32) * 5;
-        let delta_y_px = (down_1 as i32 - up_1 as i32) + (down_5 as i32 - up_5 as i32) * 5;
-        if delta_x_px == 0 && delta_y_px == 0 {
-            return;
-        }
-
-        let page_delta = [delta_x_px as f32, delta_y_px as f32];
-        let page_size = view.page_size_px();
-        if let Some(overlay) = self.overlays.get_mut(selected_idx) {
-            if let Some(mesh) = overlay.deform_mesh.as_mut() {
-                mesh.translate(page_delta[0], page_delta[1], page_size);
-                sync_overlay_center_from_deform_mesh(overlay, page_size);
-            } else {
-                overlay.center_page_px = clamp_page_point(
-                    [
-                        overlay.center_page_px[0] + page_delta[0],
-                        overlay.center_page_px[1] + page_delta[1],
-                    ],
-                    page_size,
-                );
-            }
-            snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, page_size);
-        }
-
-        let _ = self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement);
-        // An arrow nudge is an EXPLICIT layer move: the centering frame FOLLOWS the layer, so re-bind
-        // the frame center to the moved chosen center before the reconciliation can yank it back.
-        self.sync_centering_frame_to_layer(selected_idx, page_size);
-        // EDIT (arrow-key nudge): deferred; held arrows mark every frame and write once on settle.
-        self.mark_placement_save_dirty();
-        ui.ctx().request_repaint();
-    }
-
-    /// Nudges the selected RASTER layer by whole page pixels with the arrow keys (parity with the
-    /// overlay nudge `try_move_selected_overlay_by_arrow_shortcuts`). SHIFT moves by 5 px. Mirrors the
-    /// raster mouse-drag Move path: a perspective-deformed raster translates its mesh, otherwise the
-    /// affine `transform.cx/cy` move (clamped to the page, snapped to whole pixels when
-    /// `strict_pixel_movement`). The change is routed to the shared doc and enqueued for persistence,
-    /// so OS key-repeat never performs manifest I/O on the GUI thread.
-    ///
-    /// Gated on `selected_raster_idx` (mutually exclusive with `selected_overlay_idx`, so it only
-    /// consumes the arrow keys when a raster is selected; the overlay nudge, called first, returns
-    /// before consuming keys when no overlay is selected) AND on `selected_raster_page == Some(page_idx)`
-    /// so, since this runs once per visible page, only the raster on the owning page is nudged.
-    pub(super) fn try_move_selected_raster_by_arrow_shortcuts(
-        &mut self,
-        ui: &mut egui::Ui,
-        view: PageView,
-        panel_text_input_focused: bool,
-        strict_pixel_movement: bool,
-    ) {
-        let page_idx = view.page_idx;
-        if panel_text_input_focused {
-            return;
-        }
-
-        let Some(selected_idx) = self.selected_raster_idx else {
-            return;
-        };
-        // Only nudge the raster on the page that OWNS the selection (this runs once per visible page).
-        if self.selected_raster_page != Some(page_idx) {
-            return;
-        }
-        let has_layer = self
-            .raster_layers_by_page
-            .get(&page_idx)
-            .is_some_and(|v| selected_idx < v.len());
-        if !has_layer {
-            return;
-        }
-
-        let (left_1, right_1, up_1, down_1, left_5, right_5, up_5, down_5) =
-            ui.ctx().input_mut(|input| {
-                (
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown),
-                )
-            });
-
-        let delta_x_px = (right_1 as i32 - left_1 as i32) + (right_5 as i32 - left_5 as i32) * 5;
-        let delta_y_px = (down_1 as i32 - up_1 as i32) + (down_5 as i32 - up_5 as i32) * 5;
-        if delta_x_px == 0 && delta_y_px == 0 {
-            return;
-        }
-
-        let page_delta = [delta_x_px as f32, delta_y_px as f32];
-        let page_size = view.page_size_px();
-        let Some(layer) = self
-            .raster_layers_by_page
-            .get_mut(&page_idx)
-            .and_then(|v| v.get_mut(selected_idx))
-        else {
-            return;
-        };
-
-        // A perspective-deformed raster (mesh present) renders from its mesh points, so translate the
-        // mesh; the plain affine raster moves its center. Matches the mouse-drag Move path.
-        if let Some(rec) = layer.deform.as_ref() {
-            let Some(mut mesh) = TypingOverlayDeformMesh::from_deform_rec(rec, page_size) else {
-                return;
-            };
-            mesh.translate(page_delta[0], page_delta[1], page_size);
-            layer.deform = Some(crate::models::layer_model::manifest::DeformRec {
-                cols: mesh.cols,
-                rows: mesh.rows,
-                points_px: mesh.points_px.clone(),
-            });
-            let (uid, transform, deform) =
-                (layer.uid.clone(), layer.transform, layer.deform.clone());
-            self.persist_raster_deform_deferred(page_idx, &uid, transform, deform);
-        } else {
-            let mut center = clamp_page_point(
-                [
-                    layer.transform.cx + page_delta[0],
-                    layer.transform.cy + page_delta[1],
-                ],
-                page_size,
-            );
-            if strict_pixel_movement {
-                center = clamp_page_point([center[0].round(), center[1].round()], page_size);
-            }
-            layer.transform.cx = center[0];
-            layer.transform.cy = center[1];
-            let (uid, transform) = (layer.uid.clone(), layer.transform);
-            self.persist_raster_transform_deferred(page_idx, &uid, transform);
-        }
-        ui.ctx().request_repaint();
     }
 }
