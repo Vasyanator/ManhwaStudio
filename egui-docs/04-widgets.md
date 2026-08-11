@@ -26,8 +26,10 @@ Why — two reasons, both invisible in the type system:
    (§2 below). A stock `egui::Slider` does not participate in the guard and will be driven
    by wheel events meant for the popup.
 
-Known exception still in the tree: `src/tabs/typing/tab/panels.rs:399` uses a raw
-`egui::Slider`. Treat it as debt, not a precedent.
+Known exceptions still in the tree: `src/ai_backend_panel.rs` (the "max loaded models"
+slider, drawn twice) and `src/launcher/new_project/window.rs` (fetch parallelism) use a raw
+`egui::Slider`. Treat them as debt, not a precedent — the typing layout editor's opacity
+slider, which used to head this list, is a `WheelSlider` now.
 
 ## 1. The project widget set (`src/widgets/`)
 

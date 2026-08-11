@@ -50,6 +50,10 @@ const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../../app_icon.ico");
 const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../../app_icon_512.png");
 const LAUNCHER_APP_ID: &str = "manhwastudio_rs.launcher";
 const LAUNCHER_TEST_APP_ID: &str = "manhwastudio_rs.launcher_test";
+/// Inner size of the launcher window, in logical pixels. The launcher never restores a stored
+/// size; this is also the size the startup placement centers on the chosen monitor.
+#[cfg(not(target_arch = "wasm32"))]
+const LAUNCHER_DEFAULT_INNER_SIZE: [f32; 2] = [1360.0, 860.0];
 
 pub fn run_launcher(
     user_settings: &serde_json::Value,
@@ -106,10 +110,19 @@ fn run_launcher_internal(
         projects_root.display()
     ));
 
+    // The launcher follows the primary-monitor choice but NOT the studio's stored size: the
+    // `Window` geometry section describes the studio window, and the launcher keeps its own
+    // dimensions (`SizePolicy::KeepDefault`).
+    let placement = crate::window_geometry::plan_startup_placement(
+        &crate::window_geometry::load_window_settings(),
+        LAUNCHER_DEFAULT_INNER_SIZE,
+        crate::window_geometry::SizePolicy::KeepDefault,
+    );
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1360.0, 860.0])
+        .with_inner_size(LAUNCHER_DEFAULT_INNER_SIZE)
         .with_min_inner_size([980.0, 680.0])
         .with_app_id(launcher_app_id(test_mode));
+    let viewport = crate::window_geometry::apply_placement(viewport, &placement);
     #[cfg(not(target_os = "windows"))]
     let viewport = viewport.with_maximized(true);
     let viewport = apply_launcher_window_metadata(viewport);
@@ -128,6 +141,10 @@ fn run_launcher_internal(
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            // Publish the monitor list for the settings page and refresh the "largest monitor"
+            // fallback: the launcher is often the only window a user opens before choosing a
+            // monitor, so it must not depend on the studio having run first.
+            crate::window_geometry::refresh_monitors(cc.winit_window().map(Arc::as_ref));
             crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
             theme::configure_context(&cc.egui_ctx);
             // Global interface scale (`General.ui_scale_percent`): applied per-`Context`,

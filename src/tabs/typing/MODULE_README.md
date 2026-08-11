@@ -33,6 +33,74 @@ through `TypingHooks`. The canvas remains the common viewer/input surface; typin
 extra page overlays, selection handles, deform tools, mask preview/input, and top-left
 floating UI.
 
+Every floating PANEL of this tab is a tab of the shared panel dock (`src/widgets/panel_dock`,
+`dev-docs/dockable_panels_plan.md`). `TypingTabState::panel_dock` (a `PanelDockState`, its own
+field so the borrow checker can split it from `top_panel` / `text_overlays` / `mask_layer`) holds
+the layout; `TypingHooks::draw_canvas_overlay_top_left` runs `top_panel.begin_frame` → the dock →
+`top_panel.end_frame`.
+
+Eight tabs in six default panels (`typing_default_dock_layout`), two columns:
+
+| tab id | caption | body | default panel |
+|---|---|---|---|
+| `typing.preview` | «Превью текста» | `TypingTopPanelState::draw_preview_tab_body` | `#0`, under the `CanvasView` controls panel, pinned size |
+| `typing.params` | «Параметры» | `…::draw_params_tab_body` | `#1`, flush with the dock area's right edge, pinned size |
+| `typing.effects` | «Эффекты» | `…::draw_effects_tab_body` | `#1` |
+| `typing.actions` | «Действия» | `…::draw_actions_tab_body` | `#2`, under panel `#0`, pinned size |
+| `typing.layers` | «Слои» | `TypingTextOverlayLayer::draw_layers_tab_body` | `#2` |
+| `typing.mask` | «Маска обрезки» | `TypingMaskLayer::draw_mask_tab_body` | `#3`, under panel `#1` |
+| `typing.deform` | «Режим деформации» | `TypingTextOverlayLayer::draw_deformation_tab_body` | `#4`, under panel `#2` |
+| `typing.layout_editor` | «Редактирование раскладки» | `TypingTextOverlayLayer::draw_layout_editor_tab_body` | `#5`, under panel `#4` |
+
+Which tabs are drawn is ONE pure rule set, `TypingDockTabVisibility::resolve`: «Превью текста» in
+«Создание» mode, «Маска» while the mask editor is open, «Режим деформации» while an overlay is in
+transform mode, «Редактирование раскладки» while that editor owns the canvas, and «Слои» everywhere
+EXCEPT while it does (its body is a no-op then). A panel with no visible tab drops out of the
+frame's chain and its dependants inherit its anchor, so each column closes over the hole — «Действия/
+Слои» rises into the preview's place while editing, and the layout editor sits directly under it
+because deformation and layout editing are never active together. The conditional panels are
+anchored to DISTINCT targets for the same reason: the SOLVER is a total function and lays two
+panels sharing target+edge+align on top of each other, so a hand-written default must chain them
+instead — the docking GESTURE avoids that on its own (`drag::resolve_slot`), a default cannot.
+
+The three unconditional panels carry a pinned `size_override` (`TYPING_DEFAULT_*_PANEL_SIZE_PX`),
+transcribed from a hand-tuned arrangement; the conditional ones stay content-sized and are
+therefore the first to give when a column does not fit the dock area.
+
+Position, size, collapse and tab activation of every panel belong to the dock layout — no typing
+state owns them. Because several bodies need `&mut TypingTopPanelState`, three need
+`&mut TypingTextOverlayLayer` and one needs `&mut TypingMaskLayer`, they reach their state through
+`TypingDockCx`, the per-frame dock context, not through captured borrows.
+
+That layout is PERSISTED (`widgets::panel_dock::persist`). `load_persisted_panel_layouts` is called
+once by `MangaApp::new` with the startup `user_settings` snapshot and must stay ahead of the first
+frame, because a restored layout only wins over `typing_default_dock_layout` by being installed
+before `ensure_default_layout` runs; it installs the layouts first and the detached windows second,
+because a window no restored layout puts a panel in is not opened. `take_dirty_panel_layouts` is
+polled by `app.rs` right after this tab draws and again in `on_exit`; it hands the app-owned writer
+thread a snapshot of the layouts AND the windows. The default builder is also the DICTIONARY of
+this tab's tab keys, so a new `TabId` must be added to it or the stored arrangement will drop that
+tab on every load.
+
+Any of these tabs can be pulled out into a real OS window (`widgets::panel_dock::window`). Such a
+window is an immediate child viewport and therefore exists only while it is SHOWN every frame —
+which `PanelDock::end` does only while this tab draws. `draw_idle_dock_sub_windows` is the other
+half of that contract: `MangaApp::ui` calls it on every frame where another program tab is active,
+so the user's detached windows survive a tab switch (empty and grey, by the user's decision). It
+must never run on a frame where this tab drew, or the viewport would be shown twice in one pass.
+
+Two deliberate behaviour changes came with the migration: the mask and deformation panels are now
+movable and collapsible (they were fixed and always expanded), and the layout editor keeps one
+user-controlled width instead of widening itself in Editing mode.
+
+**Panels go in the dock; scene-anchored overlays and toasts do NOT.** The create-editor's
+"идёт рендер" hint and its error/warning toasts (`tab/create_upload.rs`) stay plain
+`egui::Area`s on `Order::Foreground`: they are transient, TTL-bound and anchored to the scene or to
+the canvas' top centre, none of which a dock panel can express, and the dock is for panels by design
+(`dev-docs/dockable_panels_plan.md` §1, non-goals). The same holds for the on-canvas handles and
+guides. Only a surface a user would call a panel — a titled box with content they may want to move,
+resize or collapse — becomes a dock tab.
+
 The main data flow is:
 
 1. `ProjectData` provides page paths. Text overlays (their `text_info.json` metadata and PNGs) now
@@ -142,27 +210,21 @@ The main data flow is:
    "Порядок" ▲▼ (`move_raster_in_unified_z` → the shared uid-based band-Z core `move_node_in_unified_z`,
    reused with the overlay reorder); "Удалить слой" (`remove_raster` → `doc.remove_node` +
    `flush_page_dropping_raster` so the deleted raster does not resurrect on disk). Everything routes
-   through the shared doc; the PS tab sees it via the version watch. The LAYERS list lives as the «Слои»
-   tab of the combined floating **Actions/Layers panel**: `TypingTopPanelState::draw_vertical_panel`
-   draws the panel Area/Frame + a 2-tab header (collapse toggle + `selectable_value` «Действия» / «Слои»,
-   `actions_panel_tab`, default «Действия», expanded) mirroring the Параметры/Эффекты panel; the
-   «Действия» arm holds the mask/import/export actions, the «Слои» arm calls
-   `TypingTextOverlayLayer::draw_layers_tab_body(ui, page_idx)` (the layer state lives on `text_overlays`,
-   so `draw` takes `&mut TypingTextOverlayLayer` + `page_idx`). The «Слои» body is ONE unified,
+   through the shared doc; the PS tab sees it via the version watch. The LAYERS list is the «Слои» dock
+   tab (`typing.layers`), sharing a panel with «Действия»; its body is
+   `TypingTextOverlayLayer::draw_layers_tab_body(ui, page_idx)`, because the layer state lives on
+   `text_overlays`. The «Слои» body is ONE unified,
    interleaved list of ALL the page's layers — text overlays, image overlays, AND rasters — ordered by
    unified band-Z DESCENDING (top first), with overlay-above-raster on a Z tie (`order_unified_layer_rows`,
    the canvas/hit-test tie-break). Every row has ⬆/⬇ moving it one step in the unified Z (overlay →
    `move_overlay_in_unified_z`, raster → `move_raster_in_unified_z`; both route through the shared doc band
    reorder so kinds interleave), at most one move per frame; clicking a row selects it (opening the
-   right-side edit panel). The list WIDTH is user-resizable (`egui::Resize`, `resizable([true,false])`, so
-   HEIGHT follows content) and PERSISTED in
-   `layers_panel_width`, clamped to a MIN width that fits exactly `LAYERS_PANEL_MIN_PREVIEW_CHARS` (5)
-   preview chars (`overhead + 5*char_px`, so it can't shrink below the 5-char width). On the «Слои» tab the
-   combined panel's Frame width is `max(actions_width, layers_panel_width)` (`layers_panel_width()`
-   accessor) so the inner resize can actually widen it. HEIGHT follows
+   right-side edit panel). The list WIDTH is whatever the dock panel gives it — the panel's own resize
+   grip is the only width control, and the preview char budget is derived from `ui.available_width()`
+   each frame (`preview_char_budget`, floor `LAYERS_PANEL_MIN_PREVIEW_CHARS` = 5). HEIGHT follows
    content, capped at `LAYERS_PANEL_DEFAULT_ROWS` (8) rows by the inner `ScrollArea::max_height` +
    `auto_shrink([false,true])` (a short list hugs; >8 rows scroll); `row_height` is derived from a
-   measured galley, not a magic number. Only width is user-adjustable. A text row's label is
+   measured galley, not a magic number. A text row's label is
    `Текст ({preview})` where
    `preview = text_preview_label(render_data_json.text_params.text, max_chars)` — the first `max_chars`
    Unicode chars + trailing dots brought to ≥3 (regular dot = 1, ellipsis `…` = 3, accounting for
@@ -292,7 +354,9 @@ saving, and export.
     text overlay's `text_params.width_px` and re-renders via the SAME `dispatch_vector_rerender` tail as
     Ctrl+wheel rotation (latest-wins re-render + render_data write-back + placement save), so canvas and
     edit-panel width stay in sync.
-  - `panels.rs`: deformation panel, layers-tab body, layout-editor floating panels.
+  - `panels.rs`: the deformation, «Слои» and layout-editor dock tab BODIES, plus the layout
+    editor's lifecycle (enter/exit, re-render) and its on-page overlay. No panel of its own —
+    the dock owns every frame, header and position.
   - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
   - `draw_page.rs`: `draw_page_overlays` (master per-page draw) — takes the per-page `PageView`
     transform plus a `TypingPageInteractionPolicy` snapshot (mask/focus/eyedropper/auto-type/strict-pixel
@@ -342,8 +406,15 @@ saving, and export.
   they read the models' private fields directly; moved methods/free-fns are `pub(super)` (or
   `pub(in crate::tabs::typing)` for the `TypingTopPanelState` methods that `tab.rs` calls).
 - `panel/` submodules:
-  - `facade.rs`: whole `impl TypingTopPanelState` — public facade, vertical/preview panel drawing,
-    request queues (`pub(in crate::tabs::typing)` for the methods `tab.rs` calls).
+  - `facade.rs`: whole `impl TypingTopPanelState` — public facade, the four dock tab BODIES
+    (`draw_preview_tab_body`, `draw_params_tab_body`, `draw_effects_tab_body`,
+    `draw_actions_tab_body`), request queues (`pub(in crate::tabs::typing)` for the methods `tab.rs`
+    calls). The frame is bracketed by `begin_frame` (font upkeep, background-job polling, preview
+    render pump) and `end_frame` (drains the settings deep-link a tab body raised); the dock runs
+    between them, so every body sees this frame's polled results and every click it raised is
+    consumed in the same frame. Panel position, size, collapse and tab activation belong to the dock
+    layout, not to this module; `active_main_tab` is only a mirror of which of «Параметры»/«Эффекты»
+    drew, needed by `emit_edit_request` to tell an image-effects edit from a pure transform.
   - `create_state.rs`: `TypingCreatePanelState` construction, focus/eyedropper tracking, font-group
     management and font-index lookup.
   - `create_render_data.rs`: render-data/effects/font-profile/shape-layout JSON building + profile sync.
@@ -486,7 +557,9 @@ saving, and export.
   - `tests.rs`: `#[cfg(test)]` unit tests for the panel.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
   tiled mask preview textures, brush/fill editing, async loading/saving, and export
-  snapshots.
+  snapshots. Its UI is the `typing.mask` dock tab body (`draw_mask_tab_body`); the
+  status line's TTL is ticked every frame by `expire_status_error`, since the body only
+  runs while the panel is open.
 - `auto_typing.rs`: optical center computation for rendered overlays and region-growing
   bubble detection from the shared composited page cache.
 - `rotation_ctrl_wheel.rs`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,

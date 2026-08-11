@@ -1004,6 +1004,33 @@ pub fn user_config_defaults() -> Value {
             "opengl_enabled": false,
             "opengl_device": "auto"
         },
+        // Startup monitor + main-window geometry, owned by `src/window_geometry.rs`
+        // (self-versioned: the file has no global schema version). The nulls are the
+        // "nothing known yet" state `merge_missing` materializes for existing users:
+        // `monitor` is the user's explicit choice, `auto_monitor` the largest monitor the
+        // last run saw, `main` the restored (non-maximized) geometry of the studio window.
+        // `maximized: true` preserves the historical hardcoded `with_maximized(true)`.
+        // The version literal mirrors `window_geometry::WINDOW_SECTION_VERSION` (that module
+        // is native-only, so it cannot be referenced here); a drift test in `window_geometry`
+        // asserts they stay equal.
+        "Window": {
+            "version": 1,
+            "monitor": null,
+            "auto_monitor": null,
+            "main": null,
+            "maximized": true
+        },
+        // Dockable-panel arrangement, owned by `src/widgets/panel_dock/persist.rs`
+        // (self-versioned, like `Window`, because the file has no global schema
+        // version). `tabs` is keyed by `AppTab::key()` and materialized by the dock's
+        // writer as soon as the user reorganises a panel; `sub_windows` lists the OS
+        // windows panels were detached into, and a panel's `host` addresses one of them
+        // by index. The version comes from the owning module, so the two cannot drift.
+        "PanelLayout": {
+            "version": crate::widgets::panel_dock::PANEL_LAYOUT_SECTION_VERSION,
+            "tabs": {},
+            "sub_windows": []
+        },
         "NewProjectWindow": {
             "ImageUrlPrefs": {
                 "mto.to": "https://*.mb*.org/media/",

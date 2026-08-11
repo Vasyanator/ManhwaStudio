@@ -106,8 +106,9 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
 use crate::canvas::{
-    BubbleClass, CanvasBottomHint, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
-    CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget, parse_image_text_areas,
+    BubbleClass, CANVAS_LEFT_TOP_CONTROLS_AREA_ID, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
+    CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget,
+    parse_image_text_areas,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -117,9 +118,15 @@ use crate::models::bubbles_model::BubblesModel;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::paste_image;
 use crate::project::{Bubble, ProjectData};
+use crate::tabs::AppTab;
 use crate::tabs::typing::TypingTopPanelState;
 // Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use crate::widgets::WheelSlider;
+use crate::widgets::panel_dock::persist as panel_dock_persist;
+use crate::widgets::panel_dock::{
+    DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
+    PanelNode, TabId,
+};
 use eframe::egui;
 use egui::{Color32, ColorImage, Id, Mesh, Pos2, Rect, Sense, Stroke, TextureOptions, Vec2};
 use serde_json::{Value, json};
@@ -173,7 +180,99 @@ pub(crate) use mesh_geometry::text_preview_label;
 pub(in crate::tabs::typing) use mesh_geometry::PageView;
 
 const TEXT_INFO_FILE_NAME: &str = "text_info.json";
-const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
+
+// Dock tabs of the «Текст» program tab. Every id is a stable, non-localised
+// literal: it is the identity the persisted layout and every egui id of the
+// owning panel derive from (`dev-docs/i18n_exclusions.md`).
+/// «Превью текста» — the create-mode render preview.
+const TYPING_PREVIEW_TAB: TabId = TabId::new("typing.preview");
+/// «Параметры» — presets plus the text/transform parameters of the current mode.
+const TYPING_PARAMS_TAB: TabId = TabId::new("typing.params");
+/// «Эффекты» — the effect cards of the current mode.
+const TYPING_EFFECTS_TAB: TabId = TabId::new("typing.effects");
+/// «Действия» — mask/clean/import/export actions, auto-typing, centering assist.
+const TYPING_ACTIONS_TAB: TabId = TabId::new("typing.actions");
+/// «Слои» — the unified per-page layer list.
+const TYPING_LAYERS_TAB: TabId = TabId::new("typing.layers");
+/// «Маска» — the clipping-mask tools; shown only while the mask editor is open.
+const TYPING_MASK_TAB: TabId = TabId::new("typing.mask");
+/// «Режим деформации» — the deform tool picker; shown only while an overlay is in
+/// transform mode.
+const TYPING_DEFORM_TAB: TabId = TabId::new("typing.deform");
+/// «Редактирование раскладки» — the vector layout editor; shown only while it owns
+/// the canvas.
+const TYPING_LAYOUT_EDITOR_TAB: TabId = TabId::new("typing.layout_editor");
+
+/// Outer width, in points, the preview panel starts at — the width its own
+/// floating panel used before the migration.
+const TYPING_PREVIEW_TAB_DEFAULT_WIDTH_PX: f32 = 300.0;
+/// Outer height, in points, used for the preview panel on the very first frame,
+/// before its content has been measured once.
+const TYPING_PREVIEW_TAB_INITIAL_HEIGHT_PX: f32 = 320.0;
+/// Smallest outer size, in points, the dock may shrink the preview panel to. The
+/// preview image box alone is `CREATE_PREVIEW_HEIGHT_PX` tall, so anything below
+/// this would scroll away the whole picture.
+const TYPING_PREVIEW_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(240.0, 200.0);
+
+/// Outer size, in points, the «Параметры»/«Эффекты» panel starts at — the width
+/// and the content-driven height its own floating panel used before the
+/// migration.
+const TYPING_PARAMS_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(420.0, 290.0);
+/// Smallest outer size, in points, of the «Параметры»/«Эффекты» panel. The width
+/// is the old hard minimum; below it the parameter rows start wrapping into
+/// unreadable columns.
+const TYPING_PARAMS_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(340.0, 160.0);
+
+/// Outer size, in points, the «Действия»/«Слои» panel starts at.
+const TYPING_ACTIONS_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(320.0, 240.0);
+/// Smallest outer size, in points, of the «Действия»/«Слои» panel — the old hard
+/// minimum width of the actions panel.
+const TYPING_ACTIONS_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(260.0, 160.0);
+/// Outer size, in points, the «Слои» tab starts its panel at. The width is the
+/// old fixed layer-list width, wide enough for a 5+ character text preview.
+const TYPING_LAYERS_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(260.0, 260.0);
+
+/// Outer size, in points, the «Маска» panel starts at. The width is the one its
+/// own fixed-position panel had before the migration.
+const TYPING_MASK_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(280.0, 300.0);
+/// Smallest outer size, in points, of the «Маска» panel: below this width the two
+/// wheel sliders lose their labels.
+const TYPING_MASK_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(240.0, 160.0);
+
+/// Outer size, in points, the «Режим деформации» panel starts at — wide enough for
+/// the mode buttons to wrap into a few rows instead of one per row.
+const TYPING_DEFORM_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(340.0, 220.0);
+/// Smallest outer size, in points, of the «Режим деформации» panel.
+const TYPING_DEFORM_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(260.0, 140.0);
+
+/// Outer size, in points, the «Редактирование раскладки» panel starts at. The width
+/// is the one the editor's own panel used in Editing mode, which is the mode it
+/// opens in and the only one that shows the vector-line params.
+const TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(360.0, 420.0);
+/// Smallest outer size, in points, of the «Редактирование раскладки» panel.
+const TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(300.0, 160.0);
+
+/// Outer size, in points, the DEFAULT arrangement pins the «Превью текста» panel
+/// to (`typing_default_dock_layout`). Taken from the hand-tuned arrangement the
+/// default reproduces and rounded to whole points; it shares its width with
+/// [`TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX`] so the left column reads as ONE column.
+const TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX: egui::Vec2 = egui::Vec2::new(277.0, 292.0);
+/// Outer size, in points, the DEFAULT arrangement pins the «Параметры»/«Эффекты»
+/// panel to: the tall right-hand column the parameter sections need to be usable
+/// without scrolling on the first frame.
+const TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX: egui::Vec2 = egui::Vec2::new(435.0, 533.0);
+/// Outer size, in points, the DEFAULT arrangement pins the «Действия»/«Слои»
+/// panel to. Same width as the preview above it, tall enough for the action rows
+/// plus a few layer rows.
+const TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX: egui::Vec2 = egui::Vec2::new(277.0, 285.0);
+
+/// Points kept free along the RIGHT edge of the dock area for the canvas'
+/// vertical scrollbar.
+///
+/// The dock lays panels out inside the area it is given, so reserving the strip
+/// here is what keeps a right-anchored panel from sitting on the scrollbar —
+/// exactly what the old parameters panel did by hand before the migration.
+const TYPING_DOCK_AREA_SCROLLBAR_RESERVE_PX: f32 = 24.0;
 const TEXT_OVERLAY_UPLOAD_TEXTURE_BUDGET_PER_FRAME: usize = 4;
 const TEXT_OVERLAY_UPLOAD_BYTES_BUDGET_PER_FRAME: usize = 8 * 1024 * 1024;
 const TEXT_OVERLAY_TRANSFORM_HANDLE_RADIUS_PX: f32 = 7.0;
@@ -191,8 +290,6 @@ const TEXT_EDITOR_MIN_HEIGHT_PX: f32 = 72.0;
 /// Minimum text-preview characters a text row shows (the narrowest panel). The panel cannot shrink below
 /// the width that fits exactly this many chars.
 const LAYERS_PANEL_MIN_PREVIEW_CHARS: usize = 5;
-/// Default panel width (px) — roughly the old fixed 260, enough for ~5+ preview chars.
-const LAYERS_PANEL_DEFAULT_WIDTH: f32 = 260.0;
 /// Default visible height of the layer list, in ROWS, before the inner scroll kicks in.
 const LAYERS_PANEL_DEFAULT_ROWS: usize = 8;
 /// Fixed horizontal overhead (px) of a text row that is NOT preview text: the ⬆/⬇ buttons + item
@@ -218,8 +315,6 @@ const TEXT_SHAPE_VARIANT_TILE_GAP_PX: f32 = 8.0;
 const TEXT_SHAPE_VARIANT_PANEL_PADDING_PX: f32 = 10.0;
 const TEXT_SHAPE_VARIANT_PANEL_MENU_GAP_PX: f32 = 4.0;
 const TEXT_SHAPE_VARIANT_CHECKER_SIDE_PX: f32 = 14.0;
-const TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX: f32 = 360.0;
-const TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX: f32 = 300.0;
 const TEXT_LAYOUT_EDITOR_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
 const TEXT_LAYOUT_EDITOR_FRAME_MIN_SIDE_PX: f32 = 24.0;
 /// Centering assist: the guide frame is created this factor larger than the layer footprint.
@@ -413,6 +508,12 @@ pub struct TypingTabState {
     canvas: CanvasView,
     text_overlays: TypingTextOverlayLayer,
     top_panel: TypingTopPanelState,
+    /// Panel-dock state of this program tab (layouts + last-frame measurements).
+    /// Deliberately its OWN field, disjoint from `top_panel` and `text_overlays`:
+    /// `PanelDock::begin` borrows it for the whole frame while the tab bodies
+    /// borrow those two, and only disjoint fields let the borrow checker split
+    /// them (`dev-docs/dockable_panels_plan.md` §4.2).
+    panel_dock: PanelDockState,
     mask_layer: TypingMaskLayer,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
     /// shared with the PS tab. `None` until `set_layer_doc` is called by app.rs.
@@ -567,6 +668,7 @@ impl Default for TypingTabState {
             canvas,
             text_overlays: TypingTextOverlayLayer::default(),
             top_panel: TypingTopPanelState::default(),
+            panel_dock: PanelDockState::new(),
             mask_layer: TypingMaskLayer::default(),
             layer_doc: None,
             save_busy: false,
@@ -598,6 +700,57 @@ impl TypingTabState {
 
     pub fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
         self.top_panel.set_panel_layout(layout);
+    }
+
+    /// Restores this tab's dockable-panel arrangement from an already loaded
+    /// `user_config.json` snapshot. Performs no I/O.
+    ///
+    /// Call once, before the first frame: a restored layout wins over
+    /// [`typing_default_dock_layout`], while an absent, malformed, newer or
+    /// invalid stored layout silently degrades to it (every reason is logged by
+    /// `panel_dock::persist`). Tabs the stored layout does not mention are
+    /// re-created by the dock on the frame that declares them.
+    pub fn load_persisted_panel_layouts(&mut self, user_settings: &Value) {
+        let restored = panel_dock_persist::layouts_from_user_settings(
+            user_settings,
+            &[(
+                AppTab::Typing.key(),
+                typing_default_dock_layout as fn() -> DockLayout,
+            )],
+        );
+        // Layouts first: the sub-window install drops a window no restored layout
+        // puts a panel in, so it has to see them.
+        self.panel_dock.install_persisted_layouts(restored.layouts);
+        self.panel_dock
+            .install_persisted_sub_windows(restored.sub_windows);
+    }
+
+    /// Keeps this tab's detached panel windows on screen while ANOTHER program
+    /// tab is active (requirement 12 of `dev-docs/dockable_panels_plan.md` §1).
+    ///
+    /// An immediate viewport only exists while it is shown every pass, and
+    /// `PanelDock::end` — which shows them — runs only while the «Текст» tab
+    /// draws. Without this the user's detached windows would vanish on a tab
+    /// switch and come back somewhere else. The windows are shown EMPTY, which is
+    /// the behaviour the user chose for a program tab that has nothing to put in
+    /// them.
+    ///
+    /// Call it once per frame and ONLY on a frame where this tab did not draw.
+    pub fn draw_idle_dock_sub_windows(&mut self, ctx: &egui::Context) {
+        self.panel_dock.show_idle_sub_windows(ctx);
+    }
+
+    /// Hands out this tab's panel layouts when the user reorganised them since
+    /// the last call, for the app-owned writer to persist.
+    ///
+    /// Polled once per frame right after the tab draws (and once more from
+    /// `MangaApp::on_exit`), because the dock raises its dirty flag while the
+    /// gesture is still in flight — on every frame of a panel drag.
+    #[must_use]
+    pub fn take_dirty_panel_layouts(
+        &mut self,
+    ) -> Option<crate::widgets::panel_dock::PanelLayoutSnapshot> {
+        self.panel_dock.take_dirty_layouts()
     }
 
     /// Flushes the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
@@ -940,10 +1093,11 @@ impl TypingTabState {
             self.text_overlays.clear_selection();
         }
 
-        let (canvas, text_overlays, top_panel, mask_layer) = (
+        let (canvas, text_overlays, top_panel, panel_dock, mask_layer) = (
             &mut self.canvas,
             &mut self.text_overlays,
             &mut self.top_panel,
+            &mut self.panel_dock,
             &mut self.mask_layer,
         );
         canvas.set_zoom_blocked(
@@ -953,6 +1107,7 @@ impl TypingTabState {
         let mut hooks = TypingHooks {
             text_overlays,
             top_panel,
+            panel_dock,
             mask_layer,
             pending_create_text_from_bubble: None,
             page_overlay_occluders: HashMap::new(),
@@ -1212,9 +1367,219 @@ pub(in crate::tabs::typing) struct TypingPageInteractionPolicy {
     pub centering: TypingCenteringAssistConfig,
 }
 
+/// Default panel arrangement of the «Текст» program tab.
+///
+/// Six panels in two columns. The arrangement is the one the maintainer settled on
+/// by hand and it was transcribed from the `PanelLayout` section their
+/// `user_config.json` held: the anchors and the pinned sizes below are that
+/// arrangement, with the sizes rounded to whole points and the anchor fractions —
+/// all of them within four percent of the free travel, i.e. a couple of points of
+/// drag residue — flushed to `0.0`, so both columns start exactly at their side.
+///
+/// The LEFT column hangs off the `CanvasView` controls panel, the RIGHT one off the
+/// dock area's right edge; inside a column every panel is anchored to the one above
+/// it, so a panel with nothing to draw drops out of the frame's chain and the ones
+/// below it move up into its place (`panel_dock::frame_layout`). Top to bottom, that
+/// is «Превью текста» → «Действия»/«Слои» → «Режим деформации» → «Редактирование
+/// раскладки» on the left and «Параметры»/«Эффекты» → «Маска» on the right:
+/// * `#0` — «Превью текста», under the `CanvasView` controls panel (create mode),
+///   pinned to [`TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX`];
+/// * `#1` — «Параметры» + «Эффекты», flush with the right edge of the dock area,
+///   pinned to [`TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX`];
+/// * `#2` — «Действия» + «Слои», under `#0`, pinned to
+///   [`TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX`]. When the preview is hidden (edit
+///   mode) it inherits `#0`'s anchor and rises into the preview's place;
+/// * `#3` — «Маска», under `#1` (mask editor open);
+/// * `#4` — «Режим деформации», under `#2` (an overlay in transform mode);
+/// * `#5` — «Редактирование раскладки», under `#4`. The two never show together —
+///   opening the layout editor leaves transform mode — so it normally sits directly
+///   under «Действия», whose anchor it inherits for that frame.
+///
+/// The three panels that carry a size are pinned with a `size_override`, so they
+/// are the LAST to give when the chain does not fit the dock area
+/// (`solver::SHRINK_PRIORITIES`) and the conditional, content-sized panels below
+/// them absorb the deficit first. Every pinned size clears both the physical floors
+/// (`PANEL_MIN_WIDTH`, one header plus `PANEL_MIN_BODY_HEIGHT`) and the minimums
+/// their tabs declare.
+///
+/// The conditional panels are deliberately given DISTINCT anchors rather than a
+/// shared one, and that is why «Режим деформации» hangs off «Действия» instead of
+/// off the preview it visually follows: the SOLVER lays two panels anchored to the
+/// same target on the same edge with the same alignment on top of each other,
+/// because it is a total function of whatever layout it is given. The docking
+/// gesture never produces that arrangement (`panel_dock::drag::resolve_slot` queues
+/// the second panel behind the first), but a hand-written default like this one
+/// still has to respect the rule itself. Chaining them costs nothing visually: a
+/// hidden panel leaves the frame's chain and hands its own anchor down, so the
+/// column closes over the hole.
+///
+/// Used only when no layout exists yet for this program tab.
+fn typing_default_dock_layout() -> DockLayout {
+    let mut layout = DockLayout::new();
+    let preview = PanelId::new(0);
+    let params = PanelId::new(1);
+    let actions = PanelId::new(2);
+    let deform = PanelId::new(4);
+    let panels = [
+        (
+            preview,
+            vec![TYPING_PREVIEW_TAB],
+            PanelAnchor::CanvasControls {
+                edge: DockEdge::Bottom,
+                along: 0.0,
+            },
+            Some(TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX),
+        ),
+        (
+            params,
+            vec![TYPING_PARAMS_TAB, TYPING_EFFECTS_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.0,
+            },
+            Some(TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX),
+        ),
+        (
+            actions,
+            vec![TYPING_ACTIONS_TAB, TYPING_LAYERS_TAB],
+            PanelAnchor::Panel {
+                target: preview,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            Some(TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX),
+        ),
+        (
+            PanelId::new(3),
+            vec![TYPING_MASK_TAB],
+            PanelAnchor::Panel {
+                target: params,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            None,
+        ),
+        (
+            deform,
+            vec![TYPING_DEFORM_TAB],
+            PanelAnchor::Panel {
+                target: actions,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            None,
+        ),
+        (
+            PanelId::new(5),
+            vec![TYPING_LAYOUT_EDITOR_TAB],
+            PanelAnchor::Panel {
+                target: deform,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            None,
+        ),
+    ];
+    for (id, tabs, anchor, size) in panels {
+        let node = match PanelNode::new(id, HostId::MainWindow, tabs) {
+            Ok(mut node) => {
+                node.anchor = anchor;
+                // A pinned default size is a manual size for the solver's shrink
+                // tiers: the conditional panels below give way before these do.
+                node.size_override = size;
+                node
+            }
+            Err(error) => {
+                crate::runtime_log::log_warn(format!(
+                    "[typing] default dock layout: could not build panel {id} ({error}); \
+                     the dock will create one per orphaned tab on its own"
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = layout.insert_panel(node) {
+            crate::runtime_log::log_warn(format!(
+                "[typing] default dock layout: could not insert panel {id} ({error}); \
+                 the dock will create one per orphaned tab on its own"
+            ));
+        }
+    }
+    layout
+}
+
+/// Which of the «Текст» dock tabs are drawn this frame.
+///
+/// Three of the five conditional tabs replace a panel that used to gate itself
+/// inside its own draw method; collecting the whole rule set in one pure value
+/// keeps those rules — including the one coupling between two tabs («Слои» steps
+/// aside while the layout editor owns the canvas) — in a single readable place
+/// instead of spread over eight declarations. «Параметры», «Эффекты» and
+/// «Действия» are unconditional and therefore not represented here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TypingDockTabVisibility {
+    /// «Превью текста»: only while the panel is in create («Создание») mode.
+    preview: bool,
+    /// «Слои»: hidden while the layout editor owns the canvas — its body is a
+    /// no-op then, so a visible tab would show an empty panel.
+    layers: bool,
+    /// «Маска»: only while the mask editor is open.
+    mask: bool,
+    /// «Режим деформации»: only while an overlay is in on-canvas transform mode.
+    deform: bool,
+    /// «Редактирование раскладки»: only while the vector layout editor is open.
+    layout_editor: bool,
+}
+
+impl TypingDockTabVisibility {
+    /// Resolves the per-frame visibility of the conditional tabs from the four
+    /// runtime modes that drive them.
+    #[must_use]
+    fn resolve(
+        create_text_mode: bool,
+        mask_panel_open: bool,
+        transform_mode_active: bool,
+        layout_editor_active: bool,
+    ) -> Self {
+        Self {
+            preview: create_text_mode,
+            layers: !layout_editor_active,
+            mask: mask_panel_open,
+            deform: transform_mode_active,
+            layout_editor: layout_editor_active,
+        }
+    }
+}
+
+/// Per-frame context the panel dock hands to one «Текст» tab body at a time.
+///
+/// The bodies capture nothing of their own on purpose: four of the eight tabs
+/// need `&mut TypingTopPanelState` (preview, params, effects, actions), three
+/// need `&mut TypingTextOverlayLayer` («Слои», deformation, layout editor) and
+/// «Маска» needs `&mut TypingMaskLayer`. Closures capturing those borrows
+/// directly could not coexist in the dock's queue; exclusive, sequential access
+/// through this context lets every body reach exactly what it needs without
+/// cloning any of the states or wrapping them in a `RefCell`.
+///
+/// The three borrows are DISJOINT fields of `TypingTabState`, which is what makes
+/// the context constructible at all — and none of them is the `PanelDockState` the
+/// dock itself borrows for the frame.
+struct TypingDockCx<'a> {
+    /// Owner of the preview, parameters, effects and actions bodies.
+    top_panel: &'a mut TypingTopPanelState,
+    /// Owner of the «Слои», «Режим деформации» and «Редактирование раскладки»
+    /// bodies.
+    text_overlays: &'a mut TypingTextOverlayLayer,
+    /// Owner of the «Маска» body.
+    mask_layer: &'a mut TypingMaskLayer,
+    /// Page whose layers the «Слои» tab lists and whose mask the «Маска» tab
+    /// clears.
+    page_idx: usize,
+}
+
 struct TypingHooks<'a> {
     text_overlays: &'a mut TypingTextOverlayLayer,
     top_panel: &'a mut TypingTopPanelState,
+    panel_dock: &'a mut PanelDockState,
     mask_layer: &'a mut TypingMaskLayer,
     pending_create_text_from_bubble: Option<BubbleCreateTextRequest>,
     page_overlay_occluders: HashMap<usize, Vec<[Pos2; 4]>>,
@@ -1401,27 +1766,123 @@ impl CanvasHooks for TypingHooks<'_> {
                 self.top_panel,
             );
         }
-        // The combined Actions/Layers panel: the «Слои» tab body is rendered by `text_overlays` (which
-        // owns the layer/overlay state), routed through the Actions panel's tab UI on `top_panel`.
-        // Read the layout-editor-active flag first (immutable) so it does not alias the mutable
-        // `&mut self.text_overlays` passed into `draw`; the panel uses it to avoid sitting under the
-        // top-left layout-editor panel.
-        let layout_editor_active = self.text_overlays.layout_editor_active();
-        self.top_panel.draw(
-            ctx,
-            canvas_rect,
-            self.text_overlays,
-            canvas.current_page_idx(),
-            layout_editor_active,
+        // Every floating «Текст» panel is a dock tab. The visibility flags are read
+        // first (immutably) so they do not alias the mutable borrows the dock context
+        // takes below.
+        let page_idx = canvas.current_page_idx();
+        // The mask layer's own open flag mirrors the panel's, and both the «Маска»
+        // tab's visibility and the on-page mask input read it. Synced BEFORE the dock
+        // so the tab and the canvas agree within one frame; the sync itself is idempotent.
+        let mask_panel_open = self.top_panel.is_mask_panel_open();
+        self.mask_layer.set_panel_open(ctx, mask_panel_open);
+        // The mask status line has a TTL and must keep expiring while the panel is
+        // closed — the tab body only runs while it is open.
+        self.mask_layer.expire_status_error(ctx);
+        let tabs_visible = TypingDockTabVisibility::resolve(
+            self.top_panel.is_create_text_mode(),
+            mask_panel_open,
+            self.text_overlays.transform_mode_overlay_idx.is_some(),
+            self.text_overlays.layout_editor_active(),
         );
-        // Draws the merged mode+params+opacity panel in Editing and the plain mode
-        // switch in Preview; the params section self-gates on Editing mode.
-        if self.text_overlays.layout_editor_active() {
-            self.text_overlays
-                .draw_layout_editor_panels(ctx, canvas_rect);
+        // The panel's per-frame prologue runs first, then the dock: the tab bodies must
+        // see THIS frame's polled render results, not the previous frame's.
+        self.top_panel.begin_frame(ctx);
+        {
+            let dock_state = &mut *self.panel_dock;
+            dock_state.ensure_default_layout(AppTab::Typing.key(), typing_default_dock_layout);
+            // Same rect the preview panel anchored to before the migration: the
+            // CanvasView controls panel, read from its last-frame area rect.
+            let canvas_controls =
+                ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
+            // The canvas' vertical scrollbar lives on the right edge of `canvas_rect`;
+            // keeping it out of the dock area is what stops a right-anchored panel from
+            // covering it.
+            let area_rect = Rect::from_min_max(
+                canvas_rect.min,
+                Pos2::new(
+                    (canvas_rect.right() - TYPING_DOCK_AREA_SCROLLBAR_RESERVE_PX)
+                        .max(canvas_rect.left()),
+                    canvas_rect.bottom(),
+                ),
+            );
+            let mut cx = TypingDockCx {
+                top_panel: &mut *self.top_panel,
+                text_overlays: &mut *self.text_overlays,
+                mask_layer: &mut *self.mask_layer,
+                page_idx,
+            };
+            let mut dock = PanelDock::begin(
+                ctx,
+                dock_state,
+                DockArea {
+                    rect: area_rect,
+                    canvas_controls,
+                    layout_key: AppTab::Typing.key(),
+                },
+            );
+            dock.tab(TYPING_PREVIEW_TAB)
+                .title(|| t!("typing.preview.panel_heading"))
+                .visible(tabs_visible.preview)
+                .min_size(TYPING_PREVIEW_TAB_MIN_SIZE_PX)
+                .initial_size(egui::vec2(
+                    TYPING_PREVIEW_TAB_DEFAULT_WIDTH_PX,
+                    TYPING_PREVIEW_TAB_INITIAL_HEIGHT_PX,
+                ))
+                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_preview_tab_body(ui));
+            dock.tab(TYPING_PARAMS_TAB)
+                .title(|| t!("typing.panel.params_tab"))
+                .min_size(TYPING_PARAMS_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_PARAMS_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_params_tab_body(ui));
+            dock.tab(TYPING_EFFECTS_TAB)
+                .title(|| t!("typing.panel.effects_tab"))
+                .min_size(TYPING_PARAMS_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_PARAMS_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_effects_tab_body(ui));
+            dock.tab(TYPING_ACTIONS_TAB)
+                .title(|| t!("typing.panel.actions_tab"))
+                .min_size(TYPING_ACTIONS_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_ACTIONS_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_actions_tab_body(ui));
+            dock.tab(TYPING_LAYERS_TAB)
+                .title(|| t!("typing.panel.layers_tab"))
+                .visible(tabs_visible.layers)
+                .min_size(TYPING_ACTIONS_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_LAYERS_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| {
+                    cx.text_overlays.draw_layers_tab_body(ui, cx.page_idx);
+                });
+            dock.tab(TYPING_MASK_TAB)
+                .title(|| t!("typing.mask.panel_title"))
+                .visible(tabs_visible.mask)
+                .min_size(TYPING_MASK_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_MASK_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| {
+                    cx.mask_layer.draw_mask_tab_body(ui, cx.page_idx);
+                });
+            dock.tab(TYPING_DEFORM_TAB)
+                .title(|| t!("typing.deform.panel_heading"))
+                .visible(tabs_visible.deform)
+                .min_size(TYPING_DEFORM_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_DEFORM_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| {
+                    cx.text_overlays.draw_deformation_tab_body(ui);
+                });
+            dock.tab(TYPING_LAYOUT_EDITOR_TAB)
+                .title(|| t!("typing.layout_editor.mode_heading"))
+                .visible(tabs_visible.layout_editor)
+                .min_size(TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| {
+                    cx.text_overlays.draw_layout_editor_tab_body(ui);
+                });
+            // The drawn rects are deliberately dropped: every «Текст» surface that used
+            // to anchor itself to another one is inside the dock's own layout now.
+            drop(dock.end(&mut cx));
         }
-        self.text_overlays
-            .draw_deformation_mode_panel(ctx, canvas_rect);
+        // Runs after the dock so a deep-link click raised inside a tab body is drained
+        // in the same frame the app polls for it.
+        self.top_panel.end_frame();
         if let Some(request) = self.top_panel.take_create_image_request() {
             let center_page_px = viewport_center_page_px_for_page(canvas_rect, canvas, project);
             self.text_overlays.request_create_image_overlay(
@@ -1490,10 +1951,6 @@ impl CanvasHooks for TypingHooks<'_> {
         if let Some(visible) = self.top_panel.take_clean_overlays_visible_request() {
             canvas.set_clean_overlays_visible_for_canvas_only(visible);
         }
-        self.mask_layer
-            .set_panel_open(ctx, self.top_panel.is_mask_panel_open());
-        self.mask_layer
-            .draw_panel(ctx, canvas_rect, canvas.current_page_idx());
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
             self.top_panel.sync_selected_overlay_for_edit(None);
@@ -2636,10 +3093,6 @@ pub(super) struct TypingTextOverlayLayer {
     /// initial overlay load completes, so it does not race the loader on the overlay PNGs it renames.
     /// `(committed_layers_dir, legacy_text_images_dir, unsaved_layers_dir, page_paths)`.
     pending_migration: Option<PendingMigrationRequest>,
-    /// User-chosen WIDTH (px) of the floating "Слои страницы" panel, persisted across frames/pages.
-    /// Clamped to `>= LAYERS_PANEL_MIN_WIDTH` (the width at which a text preview shows exactly 5 chars).
-    /// Wider → text rows show more preview chars before the trailing dots (min 5).
-    layers_panel_width: f32,
     /// In-flight async "preload all pages" pass (Phase 1 whole-project residency primitive). `Some`
     /// while a preload is running; cleared on completion. Decode runs off the GUI thread; the per-frame
     /// `drive_page_preload` applies ready pages in bounded batches through the memoized doc path.
@@ -2754,7 +3207,6 @@ impl Default for TypingTextOverlayLayer {
             raster_texture_generations: HashMap::new(),
             migration_rx: None,
             pending_migration: None,
-            layers_panel_width: LAYERS_PANEL_DEFAULT_WIDTH,
             preload_all_state: None,
             preload_all_progress: (0, 0),
             pending_export_after_preload: None,

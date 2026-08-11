@@ -59,7 +59,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   source GPU trimming, shared viewport sync, AI backend health wiring, and global hotkey dispatch.
 - `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
   the background project load behind a loading screen (or an error screen with exit/return-to-
-  launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it.
+  launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it. It also owns
+  the window itself from the first frame, so the `WindowGeometryTracker` (monitor/position/size
+  persistence) and the Windows first-frame maximize workaround live here.
 - `project.rs`: chapter data models, project path discovery, project/settings loading,
   legacy `scr`/`src` and `cleaned`/`clean_layers` folder normalization, magic-byte JPEG->PNG
   conversion in `src`/`cleaned`/`clean_layers`, clean-layer filename normalization (including the
@@ -84,6 +86,37 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   are left untouched on disk rather than paying for startup rename I/O for a field with no reader. If
   a future tab-visibility feature ever reads `enabled_tabs`, that change owns the one-time cleanup
   migration (keyed by `AppTab::key()`).
+- `config_saver.rs`: the ONE debouncing writer thread behind every `user_config.json` section that
+  is written from the GUI thread by a user gesture — today the `PanelLayout` section
+  (`widgets/panel_dock/persist.rs`) and the `Window` section (`window_geometry.rs`). It owns the
+  durability policy of those sections: 700 ms coalescing into one write, a failed write HELD and
+  retried with a capped backoff instead of dropped, newer payloads folded over the held one by the
+  section's own `SaverPayload::coalesce`, a final attempt on `flush_and_join` and on a disconnected
+  channel, and a definitive loss logged as an error naming cause, path and context. A section
+  supplies only its payload's fold rule, its typed error's `SaverError::is_retryable` verdict and
+  its write step; change the policy here, not in a consumer.
+- Dockable-panel arrangement: `widgets/panel_dock/persist.rs` owns the self-versioned `PanelLayout`
+  section of `user_config.json` (one entry per program tab, keyed by `AppTab::key()`). It is the
+  only writer of that section and does all of its I/O on a `config_saver` thread
+  (`PanelLayoutWriter`, owned by `MangaApp`, flushed in `on_exit`); `app.rs` polls the tab's dock
+  state for a dirty layout once per frame. Loading happens once before the first frame, from the
+  startup `user_settings` snapshot, so a stored layout wins over the tab's default one. The section
+  also carries the dock's detached OS windows (`sub_windows`), which a panel addresses through its
+  `host`; `app.rs` additionally calls `TypingTabState::draw_idle_dock_sub_windows` on every frame
+  where the «Текст» tab is NOT active, because those windows are immediate viewports and exist only
+  while they are shown.
+- `window_geometry.rs`: native-only (`#[cfg(not(wasm32))]`) owner of the self-versioned `Window`
+  section of `user_config.json` — the user's primary-monitor choice, the largest monitor seen
+  last run, and the studio window's restored position/size/maximized state. Provides the pure
+  startup planner (`plan_startup_placement` / `apply_placement`, fed to `ViewportBuilder` before
+  any window exists), the pure monitor resolver (`resolve_monitor`, degrading to the largest
+  monitor with a typed reason), the process-wide monitor mirror for the settings selector, and
+  `WindowGeometryTracker` (per-frame `ViewportInfo` sampling + a `config_saver` writer thread +
+  `on_exit` flush; the tracker only compares each sample against the last one it queued, so the
+  saver is the last owner of a queued sample and must not drop it on a failed write). This is the
+  ONLY reason `winit` is a direct dependency: egui/eframe expose
+  no monitor list. Wayland is detected and refused explicitly (no geometry persisted, no
+  relocation, a message in the settings UI) instead of failing silently.
 - `memory_manager.rs`: image-cache memory profile, pressure classification, budget policy, and
   typed eviction ordering for cache owners; it does not own image data or GPU handles.
 - `python_manager.rs`: the only Rust-side owner of Python environment discovery, Python command
@@ -270,6 +303,11 @@ prompts instead of blocking the GUI thread.
   `main.rs` and `args.rs`.
 - User/project config defaults, runtime roots, model root paths, or global path helpers:
   `config.rs`.
+- Which monitor a window opens on, restoring/persisting the main window's position, size or
+  maximized state, or the primary-monitor selector: `window_geometry.rs`. The startup call
+  sites are `main.rs::run_main_window` and `launcher/mod.rs::run_launcher_internal` (viewport
+  builder), the runtime owner is `studio_bootstrap.rs` (`WindowGeometryTracker`), and the UI is
+  the monitor row in `general_settings_panel.rs`.
 - Memory profile, pressure thresholds, budgets, or cache eviction ordering policy:
   `memory_manager.rs`.
 - UI localization on disk (editable `locale/` folder, embedded-catalog reconcile, active UI-language
@@ -278,8 +316,8 @@ prompts instead of blocking the GUI thread.
 - Python environment lookup, Python command construction, shell activation, or process spawning
   contracts: `python_manager.rs`.
 - GPU/accelerator detection shared by installer/settings/runtime: `gpu_utils.rs`.
-- General settings editor (projects directory, global memory profile, interface scale, UI language,
-  and a duplicate surface for the typesetting-language selector owned by
+- General settings editor (projects directory, global memory profile, interface scale, primary
+  monitor, UI language, and a duplicate surface for the typesetting-language selector owned by
   `tabs/settings/typesetting.rs`) shared by the studio settings tab AND the launcher settings page:
   `general_settings_panel.rs`. Per-UI
   `GeneralSettingsPanelState` + a returned `GeneralSettingsOutcome`; synchronous persistence to

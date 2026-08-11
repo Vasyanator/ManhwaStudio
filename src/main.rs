@@ -51,6 +51,7 @@ mod backend_ipc;
 mod bubble_status;
 mod canvas;
 mod config;
+mod config_saver;
 mod general_settings_panel;
 pub mod gpu_utils;
 mod i18n_resolve;
@@ -109,6 +110,10 @@ mod tools;
 #[cfg(feature = "tutorial")]
 mod tutorial;
 pub mod widgets;
+// Startup monitor + window geometry contract (`Window` section of `user_config.json`).
+// Native-only: it talks to winit monitors and OS windows, neither of which exists on web.
+#[cfg(not(target_arch = "wasm32"))]
+mod window_geometry;
 
 // `runtime_log` and `trace` now live in the standalone `ms-log` crate. These
 // re-exports keep the existing `crate::runtime_log::…` / `crate::trace::…` module
@@ -181,6 +186,10 @@ const UPDATE_ASSET_NAME: &str = "ManhwaStudio.zip";
 const MAIN_WINDOW_APP_ID: &str = "manhwastudio_rs";
 #[cfg(not(target_os = "linux"))]
 const MAIN_WINDOW_APP_ID: &str = "manhwastudio_rs.main";
+/// Inner size of the studio window on a first run, in logical pixels. Also the size the
+/// startup placement centers on a monitor when no geometry has been stored yet.
+#[cfg(not(target_arch = "wasm32"))]
+const STUDIO_DEFAULT_INNER_SIZE: [f32; 2] = [1400.0, 900.0];
 const UPDATE_CHECK_WINDOW_APP_ID: &str = "manhwastudio_rs.update_check";
 const BASIC_LAUNCHER_WINDOW_APP_ID: &str = "manhwastudio_rs.basic_launcher";
 
@@ -1379,13 +1388,27 @@ fn run_main_window(
         project_dir.display()
     );
 
+    // Startup geometry from the `Window` config section: which monitor to open on, plus the
+    // position/size the studio window was left at. Monitors cannot be enumerated before the
+    // window exists (see `window_geometry`'s header), so the placement is derived from the
+    // stored monitor rect alone; the live list is reconciled once the window is up.
+    let window_settings = window_geometry::load_window_settings();
+    let placement = window_geometry::plan_startup_placement(
+        &window_settings,
+        STUDIO_DEFAULT_INNER_SIZE,
+        window_geometry::SizePolicy::RestoreStored,
+    );
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 900.0])
+        .with_inner_size(STUDIO_DEFAULT_INNER_SIZE)
         .with_min_inner_size([900.0, 600.0])
         .with_app_id(MAIN_WINDOW_APP_ID);
+    viewport = window_geometry::apply_placement(viewport, &placement);
+    // Windows keeps the historical workaround: `with_maximized` in the builder leaves the
+    // window unmaximized there, so `StudioBootstrapApp` sends the command on its first frame
+    // instead (it reads the same stored flag).
     #[cfg(not(target_os = "windows"))]
     {
-        viewport = viewport.with_maximized(true);
+        viewport = viewport.with_maximized(placement.maximized);
     }
     if let Some(icon) = load_embedded_icon_data() {
         viewport = viewport.with_icon(icon);
@@ -1419,6 +1442,10 @@ fn run_main_window(
         native_options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
+            // First point in the process where monitors can be listed at all (a second winit
+            // `EventLoop` cannot exist). Publishes them for the settings UI and refreshes the
+            // "largest monitor" fallback the NEXT start places on.
+            window_geometry::refresh_monitors(cc.winit_window().map(std::sync::Arc::as_ref));
             ui_fonts::install_with_roots(&cc.egui_ctx, ui_fonts::Tier::Full, &font_roots);
             // Global interface scale (`General.ui_scale_percent`): per-`Context`, so the
             // studio applies it for itself exactly like the launcher does for its window.

@@ -1,18 +1,20 @@
 /*
 FILE HEADER (tabs/typing/panel.rs)
-- Назначение: панель вкладки `Текст` в вертикальном формате с набором плавающих панелей
-  для режимов `Создание` и `Редактирование` выбранного оверлея.
-  Для режима `Создание` отдельное preview остаётся в плавающей панели (drag + collapse).
+- Назначение: состояние панели вкладки `Текст` для режимов `Создание` и
+  `Редактирование` выбранного оверлея. Сами панели живут в панельном доке
+  (`src/widgets/panel_dock`): вкладки `typing.preview`, `typing.params`,
+  `typing.effects`, `typing.actions` объявляются в `tab.rs`, а их тела — методы
+  `TypingTopPanelState` в `panel/facade.rs`. Позиция, размер, сворачивание и
+  активная вкладка принадлежат раскладке дока, а не этому модулю.
 - Ключевые сущности:
-  - `TypingTopPanelState`: общее состояние панели (layout/collapsed/mode, create/edit state,
+  - `TypingTopPanelState`: общее состояние панели (mode, create/edit state,
     биндинг к выделенному оверлею, переключатель панели маски обрезки и очередь
-    edit-запросов в `tab.rs`, состояние чекбокса видимости clean-overlay и
-    состояние плавающих панелей preview/vertical, а также состояние панели
-    `Авто-тайп` (debug + параметры смещения).
-    Используются 2 отдельных окна:
-    основная панель с вкладками `Параметры` (пресеты + основные параметры)
-    и `Эффекты`, а также окно `Действия` (маска/импорт/экспорт);
-    `Действия` по умолчанию якорится под preview-панелью.
+    edit-запросов в `tab.rs`, состояние чекбокса видимости clean-overlay,
+    а также состояние панели `Авто-тайп` (debug + параметры смещения)).
+    `active_main_tab` — только зеркало того, какая из вкладок
+    `Параметры`/`Эффекты` рисовалась последней; его единственный потребитель —
+    `emit_edit_request`, который по нему отличает правку эффектов картинки от
+    чистой трансформации.
 - `TypingCreatePanelState`: параметры текста/эффектов, загрузка шрифтов, рендер preview
   в фоне (включается только для режима `Создание`), память параметров по каждому шрифту
   и именованные пресеты (`fonts/presets.json`, версия 1: ОДИН ключ-идентичность главного
@@ -74,11 +76,12 @@ FILE HEADER (tabs/typing/panel.rs)
     эмитит edit-запрос для немедленного фонового рендера.
   - `TypingTopPanelState::auto_typing_settings`: отдаёт параметры панели `Авто-тайп`
     (debug + смещение центра вниз) для runtime-логики в `tab.rs`.
-  - `TypingTopPanelState::draw_create_preview_panel`: рисует отдельную плавающую preview-панель,
-    скрывает её в `EditText`, но сохраняет пользовательскую позицию.
-  - `TypingTopPanelState::draw_vertical_panel`: рисует основную вкладочную панель
-    параметров/эффектов и отдельную панель действий; для image-оверлея вкладка
-    эффектов скрывается.
+  - `TypingTopPanelState::draw_preview_tab_body`: тело вкладки `typing.preview`
+    панельного дока; сама панель (позиция/размер/сворачивание) принадлежит доку.
+  - `TypingTopPanelState::draw_params_tab_body` / `draw_effects_tab_body` /
+    `draw_actions_tab_body`: тела вкладок дока `typing.params`, `typing.effects`
+    и `typing.actions`; для image-оверлея вкладка `Параметры` показывает только
+    трансформацию, а `Эффекты` остаётся доступной.
   - wheel-helpers (`cycle_wrapped_index`, scroll helpers): обслуживают
     переключение индексов и прокрутку панелей.
   - загрузка шрифтов config-driven: список = папка `fonts` ПЛЮС пользовательский набор
@@ -114,7 +117,6 @@ use crate::config;
 use crate::trace::cat;
 use crate::tabs::typing::auto_typing::TypingAutoTypingSettings;
 use crate::tabs::typing::tab::TypingExportFormat;
-use crate::tabs::typing::tab::TypingTextOverlayLayer;
 use crate::tabs::typing::tab::decode_vector_mesh_warp;
 use crate::tabs::typing::render_next::forms::{
     self, PeakBase, PresetLabel, TextForm, TextFormPreset,
@@ -154,24 +156,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread as thread;
 
-const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
-const TYPING_VERTICAL_PANEL_AREA_ID: &str = "typing_canvas_vertical_panel";
-const TYPING_VERTICAL_ACTIONS_PANEL_AREA_ID: &str = "typing_canvas_vertical_actions_panel";
-const TYPING_VERTICAL_PANEL_DEFAULT_WIDTH_PX: f32 = 420.0;
-const TYPING_VERTICAL_PANEL_MIN_WIDTH_PX: f32 = 340.0;
-const TYPING_VERTICAL_PANEL_MAX_WIDTH_PX: f32 = 560.0;
-const TYPING_VERTICAL_ACTIONS_DEFAULT_WIDTH_PX: f32 = 320.0;
-const TYPING_VERTICAL_ACTIONS_MIN_WIDTH_PX: f32 = 260.0;
-const TYPING_VERTICAL_ACTIONS_MAX_WIDTH_PX: f32 = 420.0;
-const TYPING_VERTICAL_PANEL_GAP_PX: f32 = 12.0;
-const TYPING_VERTICAL_PANEL_SCROLLBAR_RESERVE_PX: f32 = 24.0;
-const TYPING_VERTICAL_PANEL_INITIAL_HEIGHT_RATIO: f32 = 0.8;
-const TYPING_VERTICAL_PANEL_DEFAULT_HEIGHT_PX: f32 = 290.0;
-const TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX: f32 = 120.0;
-const TYPING_PREVIEW_PANEL_AREA_ID: &str = "typing_canvas_preview_panel";
-const TYPING_PREVIEW_PANEL_CONTROLS_GAP_PX: f32 = 10.0;
-const TYPING_VERTICAL_ACTIONS_PANEL_PREVIEW_GAP_PX: f32 = 18.0;
-const TYPING_PREVIEW_PANEL_DEFAULT_WIDTH_PX: f32 = 300.0;
 const CREATE_PREVIEW_HEIGHT_PX: f32 = 200.0;
 const EDIT_TEXT_FIELD_HEIGHT_PX: f32 = 170.0;
 
@@ -503,20 +487,15 @@ pub enum TypingTopPanelMode {
 }
 
 pub struct TypingTopPanelState {
-    collapsed: bool,
     mode: TypingTopPanelMode,
-    vertical_panel: TypingFloatingPanelState,
-    vertical_actions_panel: TypingFloatingPanelState,
-    /// Active tab of the combined Actions/Layers panel (default «Действия»).
-    actions_panel_tab: TypingActionsPanelTab,
-    vertical_panel_tab: TypingVerticalMainTab,
-    vertical_panel_params_content_height_px: f32,
-    vertical_panel_effects_content_height_px: f32,
-    vertical_panel_resize_revision: u64,
-    vertical_panel_last_tab: TypingVerticalMainTab,
-    vertical_panel_last_auto_target_height_px: f32,
-    last_canvas_height_px: f32,
-    create_preview_panel: TypingFloatingPreviewPanelState,
+    /// Which of the two main dock tabs («Параметры» / «Эффекты») drew last.
+    ///
+    /// The dock owns tab activation; this is only a MIRROR, refreshed by whichever
+    /// of the two bodies ran this frame. Its single consumer is
+    /// `emit_edit_request`, which must know whether an image overlay is being
+    /// edited through its effects (re-render) or only its transform (no re-render)
+    /// — including when the request comes from a hotkey rather than the panel.
+    active_main_tab: TypingMainTab,
     create_panel: TypingCreatePanelState,
     edit_panel: TypingCreatePanelState,
     edit_overlay_idx: Option<usize>,
@@ -698,19 +677,8 @@ impl Default for TypingTopPanelState {
         // (CLAUDE.md §5), and it must not happen twice for one startup either.
         create_state::spawn_shared_font_reload(&mut create_panel, &mut edit_panel);
         Self {
-            collapsed: false,
             mode: TypingTopPanelMode::CreateText,
-            vertical_panel: TypingFloatingPanelState::default(),
-            vertical_actions_panel: TypingFloatingPanelState::default(),
-            actions_panel_tab: TypingActionsPanelTab::Actions,
-            vertical_panel_tab: TypingVerticalMainTab::Parameters,
-            vertical_panel_params_content_height_px: 0.0,
-            vertical_panel_effects_content_height_px: 0.0,
-            vertical_panel_resize_revision: 0,
-            vertical_panel_last_tab: TypingVerticalMainTab::Parameters,
-            vertical_panel_last_auto_target_height_px: 0.0,
-            last_canvas_height_px: 0.0,
-            create_preview_panel: TypingFloatingPreviewPanelState::default(),
+            active_main_tab: TypingMainTab::Parameters,
             create_panel,
             edit_panel,
             edit_overlay_idx: None,
@@ -742,51 +710,16 @@ impl Default for TypingTopPanelState {
     }
 }
 
-
-#[derive(Default)]
-struct TypingFloatingPreviewPanelState {
-    collapsed: bool,
-    pos: Option<egui::Pos2>,
-}
-
-#[derive(Default)]
-struct TypingFloatingPanelState {
-    collapsed: bool,
-    pos: Option<egui::Pos2>,
-    user_positioned: bool,
-}
-
+/// The two main dock tabs of the «Текст» tab's parameters panel.
+///
+/// Only a mirror of what the dock drew — the tab captions and the tab identities
+/// (`typing.params` / `typing.effects`) live in `tab.rs`, next to the other dock
+/// tab declarations.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum TypingVerticalMainTab {
+enum TypingMainTab {
     #[default]
     Parameters,
     Effects,
-}
-
-impl TypingVerticalMainTab {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Parameters => t!("typing.panel.params_tab"),
-            Self::Effects => t!("typing.panel.effects_tab"),
-        }
-    }
-}
-
-/// The two tabs of the combined Actions/Layers floating panel.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum TypingActionsPanelTab {
-    #[default]
-    Actions,
-    Layers,
-}
-
-impl TypingActionsPanelTab {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Actions => t!("typing.panel.actions_tab"),
-            Self::Layers => t!("typing.panel.layers_tab"),
-        }
-    }
 }
 
 /// What a `FontEntry` stands for.

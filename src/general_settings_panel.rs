@@ -103,6 +103,11 @@ pub struct GeneralSettingsPanelState {
     /// [`Self::ui_scale_percent`] only while the user is still dragging the slider;
     /// see the apply rule in [`draw_general_settings_panel`].
     pub applied_ui_scale_percent: u32,
+    /// The user's explicit primary-monitor choice (`Window.monitor`), or `None` for "auto",
+    /// which means the largest connected monitor. Native-only: there are no OS monitors in a
+    /// web build.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub preferred_monitor: Option<crate::window_geometry::MonitorKey>,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
 }
@@ -188,6 +193,8 @@ impl GeneralSettingsPanelState {
             // The surface applied this same value to its egui context when the window
             // was created (`apply_ui_scale_to_context`), so nothing is pending.
             applied_ui_scale_percent: ui_scale_percent,
+            #[cfg(not(target_arch = "wasm32"))]
+            preferred_monitor: seed_preferred_monitor(),
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
@@ -314,6 +321,10 @@ pub fn draw_general_settings_panel(
 
     ui.separator();
 
+    draw_primary_monitor_setting(ui, state);
+
+    ui.separator();
+
     // Interface-language selector. Populated once from the on-disk `locale/` folder
     // (see `scan_locale_options`); changing it persists and live-installs the locale.
     ui.label(t!("settings.general.ui_language_label"));
@@ -413,6 +424,139 @@ pub fn draw_text_language_setting(ui: &mut egui::Ui, id_salt: &str) {
         set_text_language(selected_language);
         persist_text_language(selected_language);
     }
+}
+
+/// Reads the persisted primary-monitor choice for a freshly constructed panel state.
+///
+/// A config read failure is logged and treated as "no choice made": the selector then shows
+/// "auto" instead of a stale value, and the next explicit pick repairs the section.
+#[cfg(not(target_arch = "wasm32"))]
+fn seed_preferred_monitor() -> Option<crate::window_geometry::MonitorKey> {
+    let settings = crate::config::load_raw_user_settings_for_startup().unwrap_or_else(|err| {
+        runtime_log::log_error(format!(
+            "[general-settings] failed to read the primary-monitor choice; showing 'auto'; \
+             error={err:#}"
+        ));
+        serde_json::Value::Null
+    });
+    crate::window_geometry::window_settings_from_user_settings(&settings).monitor
+}
+
+/// Renders the primary-monitor selector: the monitor the program opens its windows on.
+///
+/// The option list comes from the monitors the live window can see
+/// (`window_geometry::monitor_snapshot`), so it is only populated once some window has
+/// published one. Every state in which the choice cannot work — no monitor list at all, or a
+/// session (Wayland) whose compositor owns window placement — is stated in the UI instead of
+/// silently hiding the control.
+///
+/// A change persists `Window.monitor` synchronously and asks the studio window to move onto
+/// the new monitor right away; other windows follow at their next start.
+#[cfg(not(target_arch = "wasm32"))]
+fn draw_primary_monitor_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    use crate::window_geometry::{self, MonitorKey, MonitorResolution};
+
+    ui.label(t!("settings.general.monitor_label"));
+    ui.small(t!("settings.general.monitor_hint"));
+
+    let Some(snapshot) = window_geometry::monitor_snapshot() else {
+        ui.small(t!("settings.general.monitor_unavailable_hint"));
+        return;
+    };
+    if !snapshot.position_supported {
+        ui.small(t!("settings.general.monitor_wayland_hint"));
+        return;
+    }
+    if snapshot.monitors.is_empty() {
+        ui.small(t!("settings.general.monitor_unavailable_hint"));
+        return;
+    }
+
+    let selected_text = match state.preferred_monitor.as_ref() {
+        None => t!("settings.general.monitor_auto_option").to_string(),
+        Some(chosen) => match window_geometry::resolve_monitor(Some(chosen), &snapshot.monitors) {
+            MonitorResolution::Preferred(index) => snapshot
+                .monitors
+                .get(index)
+                .map_or_else(String::new, |monitor| monitor_option_label(monitor, index)),
+            // The chosen monitor is not connected right now. The choice is kept (the monitor
+            // may come back), so the selector says so instead of silently showing "auto".
+            MonitorResolution::NoMonitors | MonitorResolution::Fallback { .. } => tf!(
+                "settings.general.monitor_missing_option",
+                name = monitor_display_name(chosen, 0)
+            ),
+        },
+    };
+
+    let mut chosen: Option<MonitorKey> = state.preferred_monitor.clone();
+    ui.horizontal_wrapped(|ui| {
+        WheelComboBox::from_label(t!("settings.general.monitor_combo_label"))
+            .id_salt("settings.general.monitor_combo")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut chosen,
+                    None,
+                    t!("settings.general.monitor_auto_option"),
+                );
+                for (index, monitor) in snapshot.monitors.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut chosen,
+                        Some(monitor.clone()),
+                        monitor_option_label(monitor, index),
+                    );
+                }
+            });
+    });
+
+    if chosen == state.preferred_monitor {
+        return;
+    }
+    state.preferred_monitor = chosen.clone();
+    if let Err(err) = window_geometry::persist_preferred_monitor(chosen.clone()) {
+        runtime_log::log_error(format!("[general-settings] {err}"));
+        state.status =
+            GeneralSettingsStatus::Error(t!("settings.general.monitor_save_error").to_string());
+        return;
+    }
+    // Applying live is what makes the setting verifiable; a window without a geometry tracker
+    // (the launcher) simply picks the choice up at its next start.
+    if let Some(monitor) = chosen {
+        window_geometry::request_relocation(monitor);
+    }
+}
+
+/// Web stub of the primary-monitor selector: a browser tab has no OS monitors to choose from,
+/// so the row states that instead of disappearing.
+#[cfg(target_arch = "wasm32")]
+fn draw_primary_monitor_setting(ui: &mut egui::Ui, _state: &mut GeneralSettingsPanelState) {
+    ui.label(t!("settings.general.monitor_label"));
+    ui.small(t!("settings.general.monitor_unavailable_hint"));
+}
+
+/// Combo entry for one monitor: its name (or an index-based placeholder) plus its resolution.
+#[cfg(not(target_arch = "wasm32"))]
+fn monitor_option_label(monitor: &crate::window_geometry::MonitorKey, index: usize) -> String {
+    tf!(
+        "settings.general.monitor_option",
+        name = monitor_display_name(monitor, index),
+        width = monitor.w,
+        height = monitor.h
+    )
+}
+
+/// The monitor's OS name, or a 1-based positional placeholder when the platform reports none.
+#[cfg(not(target_arch = "wasm32"))]
+fn monitor_display_name(monitor: &crate::window_geometry::MonitorKey, index: usize) -> String {
+    monitor
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || tf!("settings.general.monitor_unnamed", index = index + 1),
+            ToString::to_string,
+        )
 }
 
 /// Renders the global interface-scale slider (percent of native size) and applies a

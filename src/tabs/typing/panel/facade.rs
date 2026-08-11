@@ -2,31 +2,39 @@
 File: panel/facade.rs
 
 Purpose:
-Holds the `impl TypingTopPanelState` inherent block extracted verbatim from
-`panel.rs`. This is the public-facing top-panel state facade: mode/layout
-management, selected-overlay edit sync + request queue, auto-typing settings,
-and the vertical parameters/actions panel plus the create-preview panel drawing.
+Holds the `impl TypingTopPanelState` inherent block extracted from `panel.rs`.
+This is the public-facing top-panel state facade: mode management,
+selected-overlay edit sync + request queue, auto-typing settings, and the BODIES
+of the panel-dock tabs this state owns.
+
+Main responsibilities:
+- bracket the frame: `begin_frame` (font upkeep, background-job polling, preview
+  render pump) before the dock, `end_frame` (settings deep-link drain) after it;
+- draw the four dock tab bodies — `draw_preview_tab_body`, `draw_params_tab_body`,
+  `draw_effects_tab_body`, `draw_actions_tab_body` — into the `Ui` the dock gives
+  them. The surrounding panel (position, size, collapse, tab header) belongs to
+  the dock layout; nothing here creates an `Area` or a `Frame` of its own;
+- turn what a section reports into a queued request for `tab.rs` to drain.
 
 Notes:
-Extracted verbatim from `panel.rs`. Method visibility was escalated one level
-because the impl moved a directory deeper: the former `pub(super)` methods are
-now `pub(in crate::tabs::typing)` so the sibling `tab.rs` can still call them,
-and the former private methods are now `pub(super)`. `use super::*;` pulls in the
-parent module's types and imports.
+Method visibility was escalated one level because the impl moved a directory
+deeper: the former `pub(super)` methods are now `pub(in crate::tabs::typing)` so
+the sibling `tab.rs` can still call them, and the former private methods are now
+`pub(super)`. `use super::*;` pulls in the parent module's types and imports.
 */
 
 use super::*;
 use crate::tabs::typing::psd_export::FontPostScriptNames;
 
 impl TypingTopPanelState {
-    pub(in crate::tabs::typing) fn draw(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        text_overlays: &mut TypingTextOverlayLayer,
-        page_idx: usize,
-        layout_editor_active: bool,
-    ) {
+    /// Per-frame prologue: font-list upkeep, background-job polling and the
+    /// preview render pump.
+    ///
+    /// Separate from the tab bodies because every one of them lives in the panel
+    /// dock now: the dock must see THIS frame's polled state, not the previous
+    /// frame's, so the caller runs this first, then the dock, then
+    /// [`TypingTopPanelState::end_frame`]. Must be called exactly once per frame.
+    pub(in crate::tabs::typing) fn begin_frame(&mut self, ctx: &egui::Context) {
         // Cached font coverage (`FontEntry.coverage`) is computed at load time against the
         // then-current typesetting language. If the user has since changed the language, that
         // cache is stale, so reload both font lists off-thread to recompute coverage. The
@@ -70,15 +78,17 @@ impl TypingTopPanelState {
                 ctx.request_repaint();
             }
         }
+    }
 
-        self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx, layout_editor_active);
-
-        // Drain a settings deep-link request (font-group "?" help icon) from either
-        // sub-panel AFTER the panels have drawn, so a click bubbles up in the SAME
-        // frame the app polls `take_settings_link`. Draining before the draw would
-        // leave a click dormant for a frame — and a rapid second click would then
-        // survive the tab switch and unexpectedly re-navigate to Settings when the
-        // user later returns to the typing tab.
+    /// Per-frame epilogue: drains the in-app settings deep-link a font-group "?"
+    /// help icon raised on either sub-panel.
+    ///
+    /// Must run AFTER the dock drew this frame's tabs, so a click bubbles up in
+    /// the SAME frame the app polls `take_settings_link`. Draining before the
+    /// draw would leave a click dormant for a frame — and a rapid second click
+    /// would then survive the tab switch and unexpectedly re-navigate to
+    /// Settings when the user later returns to the typing tab.
+    pub(in crate::tabs::typing) fn end_frame(&mut self) {
         if let Some(link) = self
             .create_panel
             .take_settings_link_request()
@@ -115,504 +125,187 @@ impl TypingTopPanelState {
         }
     }
 
-    /// Draws the floating vertical panels (Параметры/Эффекты + Действия/Слои).
+    /// Body of the «Параметры» dock tab (`typing.params`).
     ///
-    /// When `layout_editor_active` is true the top-left layout-editor panel is on screen; the
-    /// Actions/Layers panel is then pushed below that panel's bottom edge if the two would
-    /// overlap horizontally, so it is not hidden underneath it.
-    pub(super) fn draw_vertical_panel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        text_overlays: &mut TypingTextOverlayLayer,
-        page_idx: usize,
-        layout_editor_active: bool,
-    ) {
+    /// In «Создание» it draws the preset row plus the full text parameters; in
+    /// «Редактирование» it draws the selected layer's parameters, or — for an
+    /// IMAGE layer — only its transform, because a foreign picture has no text
+    /// parameters. A settled edit emits the re-render request itself: the panel
+    /// that changed is the one that knows something changed.
+    pub(in crate::tabs::typing) fn draw_params_tab_body(&mut self, ui: &mut egui::Ui) {
+        self.active_main_tab = TypingMainTab::Parameters;
         // Для image-оверлея вкладка «Параметры» показывает только трансформацию, но вкладка
         // «Эффекты» доступна так же, как для текста — эффекты применяются к сторонней картинке.
         let image_edit_only = self.mode == TypingTopPanelMode::EditText
             && self.edit_overlay_kind == Some(TypingOverlayKind::Image);
-        if self.vertical_panel_tab != self.vertical_panel_last_tab {
-            self.vertical_panel_resize_revision =
-                self.vertical_panel_resize_revision.wrapping_add(1);
-            self.vertical_panel_last_tab = self.vertical_panel_tab;
-            ctx.request_repaint();
+        if self.mode == TypingTopPanelMode::CreateText {
+            self.create_panel.draw_create_presets_section(ui);
+            ui.add_space(6.0);
         }
-        if self.last_canvas_height_px > 0.0
-            && (canvas_rect.height() - self.last_canvas_height_px).abs() >= 1.0
-        {
-            self.vertical_panel_resize_revision =
-                self.vertical_panel_resize_revision.wrapping_add(1);
-            ctx.request_repaint();
+        // The text-params panel is grouped into labelled collapsible sections, so a
+        // floating heading above them would group nothing and is dropped. The
+        // image-only panel is NOT sectioned, so it keeps its heading.
+        if image_edit_only {
+            ui.label(egui::RichText::new(t!("typing.panel.image_params_heading")).strong());
         }
-        self.last_canvas_height_px = canvas_rect.height();
-        let panel_w = TYPING_VERTICAL_PANEL_DEFAULT_WIDTH_PX
-            .clamp(
-                TYPING_VERTICAL_PANEL_MIN_WIDTH_PX,
-                TYPING_VERTICAL_PANEL_MAX_WIDTH_PX,
-            )
-            .min((canvas_rect.width() - TYPING_VERTICAL_PANEL_GAP_PX * 2.0).max(220.0));
-        let actions_panel_w = TYPING_VERTICAL_ACTIONS_DEFAULT_WIDTH_PX
-            .clamp(
-                TYPING_VERTICAL_ACTIONS_MIN_WIDTH_PX,
-                TYPING_VERTICAL_ACTIONS_MAX_WIDTH_PX,
-            )
-            .min((canvas_rect.width() - TYPING_VERTICAL_PANEL_GAP_PX * 2.0).max(220.0));
-        let viewport_rect = ctx.content_rect();
-        let min_x = viewport_rect.left();
-        let right_limit = viewport_rect.right() - TYPING_VERTICAL_PANEL_SCROLLBAR_RESERVE_PX;
-        let max_x = (right_limit - panel_w).max(min_x);
-        let actions_min_x = canvas_rect.left();
-        let actions_max_x = (canvas_rect.right() - actions_panel_w).max(actions_min_x);
-        let min_y = canvas_rect.top();
-        let max_y = (canvas_rect.bottom() - 48.0).max(min_y);
-        let default_panel_top = canvas_rect.top() + TYPING_VERTICAL_PANEL_GAP_PX;
-        let default_pos = egui::pos2(
-            (right_limit - panel_w - TYPING_VERTICAL_PANEL_GAP_PX).max(min_x),
-            default_panel_top,
-        );
-        let panel_pos = self
-            .vertical_panel
-            .pos
-            .filter(|_| self.vertical_panel.user_positioned)
-            .unwrap_or(default_pos)
-            .clamp(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
-        let viewport_target_height =
-            (canvas_rect.height() * TYPING_VERTICAL_PANEL_INITIAL_HEIGHT_RATIO).clamp(
-                TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX,
-                (canvas_rect.height() - TYPING_VERTICAL_PANEL_GAP_PX * 2.0)
-                    .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX),
-            );
-        let available_panel_height = (canvas_rect.height() - TYPING_VERTICAL_PANEL_GAP_PX * 2.0)
-            .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX);
-        let current_content_height = match self.vertical_panel_tab {
-            TypingVerticalMainTab::Parameters => self.vertical_panel_params_content_height_px,
-            TypingVerticalMainTab::Effects => self.vertical_panel_effects_content_height_px,
-        };
-        let panel_default_height = if current_content_height > 0.0 {
-            current_content_height
-                .min(viewport_target_height)
-                .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX)
-        } else {
-            viewport_target_height.max(TYPING_VERTICAL_PANEL_DEFAULT_HEIGHT_PX)
-        };
-        let panel_max_height = if current_content_height > 0.0 {
-            current_content_height
-                .min(available_panel_height)
-                .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX)
-        } else {
-            available_panel_height
-        };
-        let auto_target_height = compute_typing_vertical_panel_auto_height(
-            current_content_height,
-            viewport_target_height,
-            available_panel_height,
-        );
-        if self.vertical_panel_last_auto_target_height_px > 0.0
-            && (auto_target_height - self.vertical_panel_last_auto_target_height_px).abs() >= 1.0
-        {
-            self.vertical_panel_resize_revision =
-                self.vertical_panel_resize_revision.wrapping_add(1);
-            ctx.request_repaint();
-        }
-        self.vertical_panel_last_auto_target_height_px = auto_target_height;
-
         let mut changed = false;
-        let params_area_response = egui::Area::new(TYPING_VERTICAL_PANEL_AREA_ID.into())
-            .order(egui::Order::Foreground)
-            .movable(true)
-            .interactable(true)
-            .current_pos(panel_pos)
-            .show(ctx, |ui| {
-                ui.set_width(panel_w);
-                ui.set_min_width(panel_w);
-                ui.set_max_width(panel_w);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(panel_w);
-                    ui.set_min_width(panel_w);
-                    ui.set_max_width(panel_w);
-                    ui.horizontal(|ui| {
-                        let toggle_icon = if self.collapsed { "▶" } else { "▼" };
-                        let toggle_hint = if self.collapsed {
-                            t!("typing.panel.expand_text_panel_tooltip")
-                        } else {
-                            t!("typing.panel.collapse_text_panel_tooltip")
-                        };
-                        if ui
-                            .small_button(toggle_icon)
-                            .on_hover_text(toggle_hint)
-                            .clicked()
-                        {
-                            self.collapsed = !self.collapsed;
-                        }
-                        ui.selectable_value(
-                            &mut self.vertical_panel_tab,
-                            TypingVerticalMainTab::Parameters,
-                            TypingVerticalMainTab::Parameters.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.vertical_panel_tab,
-                            TypingVerticalMainTab::Effects,
-                            TypingVerticalMainTab::Effects.label(),
-                        );
-                    });
-                    if self.collapsed {
-                        return;
+        ui.scope(|ui| {
+            ui.style_mut().always_scroll_the_only_direction = true;
+            egui::ScrollArea::horizontal()
+                .id_salt("typing_vertical_params_hscroll")
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    scroll_bar: true,
+                    drag: egui::scroll_area::DragScroll::Always,
+                    mouse_wheel: false,
+                })
+                .auto_shrink([false, true])
+                .show(ui, |ui| match self.mode {
+                    TypingTopPanelMode::CreateText => {
+                        self.create_panel.clamp_face_index();
+                        self.create_panel.draw_params_section(ui, true, false);
                     }
-
-                    ui.add_space(4.0);
-                    egui::Resize::default()
-                        .id_salt((
-                            "typing_vertical_main_resize",
-                            self.vertical_panel_resize_revision,
-                        ))
-                        .resizable([false, true])
-                        .default_size(egui::vec2(ui.available_width(), panel_default_height))
-                        .min_size(egui::vec2(0.0, TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX))
-                        .max_size(egui::vec2(ui.available_width(), panel_max_height))
-                        .show(ui, |ui| {
-                            let mut content_height_px = 0.0;
-                            egui::ScrollArea::vertical()
-                                .id_salt("typing_vertical_main_vscroll")
-                                .show(ui, |ui| match self.vertical_panel_tab {
-                                    TypingVerticalMainTab::Parameters => {
-                                        if self.mode == TypingTopPanelMode::CreateText {
-                                            self.create_panel.draw_create_presets_section(ui);
-                                            ui.add_space(6.0);
-                                        }
-                                        // The text-params panel is now grouped into
-                                        // labelled collapsible sections, so a floating
-                                        // heading above them would group nothing and is
-                                        // dropped. The image-only panel is NOT sectioned,
-                                        // so it keeps its heading.
-                                        if image_edit_only {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    t!("typing.panel.image_params_heading"),
-                                                )
-                                                .strong(),
-                                            );
-                                        }
-                                        ui.scope(|ui| {
-                                            ui.style_mut().always_scroll_the_only_direction = true;
-                                            egui::ScrollArea::horizontal()
-                                                .id_salt("typing_vertical_params_hscroll")
-                                                .scroll_source(egui::scroll_area::ScrollSource {
-                                                    scroll_bar: true,
-                                                    drag: egui::scroll_area::DragScroll::Always,
-                                                    mouse_wheel: false,
-                                                })
-                                                .auto_shrink([false, true])
-                                                .show(ui, |ui| match self.mode {
-                                                    TypingTopPanelMode::CreateText => {
-                                                        self.create_panel.clamp_face_index();
-                                                        self.create_panel
-                                                            .draw_params_section(ui, true, false);
-                                                    }
-                                                    TypingTopPanelMode::EditText => {
-                                                        if image_edit_only {
-                                                            changed |= self
-                                                                .edit_panel
-                                                                .draw_image_transform_only_section(
-                                                                    ui, false,
-                                                                );
-                                                        } else {
-                                                            changed |= self
-                                                                .edit_panel
-                                                                .draw_edit_params_section(
-                                                                    ui, true, false,
-                                                                );
-                                                        }
-                                                    }
-                                                });
-                                        });
-                                        content_height_px = ui.min_rect().height();
-                                    }
-                                    TypingVerticalMainTab::Effects => {
-                                        changed |= match self.mode {
-                                            TypingTopPanelMode::CreateText => {
-                                                self.create_panel.draw_effects_section(ui, true)
-                                            }
-                                            TypingTopPanelMode::EditText => {
-                                                // Эффекты тоже вызывают перерендер:
-                                                // при ненайденном шрифте блокируем их
-                                                // вместе с остальными параметрами.
-                                                let font_missing =
-                                                    self.edit_panel.missing_font.is_some();
-                                                ui.add_enabled_ui(!font_missing, |ui| {
-                                                    self.edit_panel.draw_effects_section(ui, true)
-                                                })
-                                                .inner
-                                            }
-                                        };
-                                        content_height_px = ui.min_rect().height();
-                                    }
-                                });
-                            match self.vertical_panel_tab {
-                                TypingVerticalMainTab::Parameters => {
-                                    self.vertical_panel_params_content_height_px =
-                                        content_height_px;
-                                }
-                                TypingVerticalMainTab::Effects => {
-                                    self.vertical_panel_effects_content_height_px =
-                                        content_height_px;
-                                }
-                            }
-                            let measured_auto_target_height =
-                                compute_typing_vertical_panel_auto_height(
-                                    content_height_px,
-                                    viewport_target_height,
-                                    available_panel_height,
-                                );
-                            if (measured_auto_target_height
-                                - self.vertical_panel_last_auto_target_height_px)
-                                .abs()
-                                >= 1.0
-                            {
-                                self.vertical_panel_last_auto_target_height_px =
-                                    measured_auto_target_height;
-                                self.vertical_panel_resize_revision =
-                                    self.vertical_panel_resize_revision.wrapping_add(1);
-                                ctx.request_repaint();
-                            }
-                            if content_height_px > 0.0 && content_height_px < panel_max_height {
-                                ctx.request_repaint();
-                            }
-                        });
-                });
-            });
-        if params_area_response.response.dragged() {
-            self.vertical_panel.user_positioned = true;
-        }
-        if self.vertical_panel.user_positioned {
-            self.vertical_panel.pos = Some(params_area_response.response.rect.min);
-        }
-
-        let params_rect = params_area_response.response.rect;
-        let preview_rect =
-            self.draw_create_preview_panel(ctx, canvas_rect, panel_pos.x, panel_pos.y, panel_w);
-        let actions_default_anchor = preview_rect.unwrap_or(params_rect);
-        let actions_default_pos = egui::pos2(
-            actions_default_anchor.min.x,
-            actions_default_anchor.max.y + TYPING_VERTICAL_ACTIONS_PANEL_PREVIEW_GAP_PX,
-        );
-        let mut actions_pos = self
-            .vertical_actions_panel
-            .pos
-            .unwrap_or(actions_default_pos)
-            .clamp(
-                egui::pos2(actions_min_x, min_y),
-                egui::pos2(actions_max_x, max_y),
-            );
-        // On the «Слои» tab the layer list's inner width-resize (persisted `layers_panel_width`) must be
-        // able to widen the panel, so let the Frame grow to at least that width; the «Действия» tab keeps
-        // the fixed actions width. (Both tabs share the resulting width.)
-        let panel_w_for_tab = if self.actions_panel_tab == TypingActionsPanelTab::Layers
-            && !self.vertical_actions_panel.collapsed
-        {
-            actions_panel_w.max(text_overlays.layers_panel_width())
-        } else {
-            actions_panel_w
-        };
-        // While the layout-editor panel floats at the top-left, keep the Actions/Layers panel
-        // from being hidden under it: if the two overlap horizontally, drop the panel's top just
-        // below the layout panel's bottom edge. Uses the layout panel's last-frame rect from
-        // memory (it is drawn after this panel); its Id matches `Area::new("...mode_panel")`.
-        if layout_editor_active
-            && let Some(layout_rect) =
-                ctx.memory(|mem| mem.area_rect(Id::new("typing_layout_editor_mode_panel")))
-        {
-            let overlaps_x =
-                actions_pos.x < layout_rect.right() && actions_pos.x + panel_w_for_tab > layout_rect.left();
-            let min_top = layout_rect.bottom() + TYPING_VERTICAL_PANEL_GAP_PX;
-            if overlaps_x && actions_pos.y < min_top {
-                actions_pos.y = min_top.clamp(min_y, max_y);
-            }
-        }
-        let actions_area_response = egui::Area::new(TYPING_VERTICAL_ACTIONS_PANEL_AREA_ID.into())
-            .order(egui::Order::Foreground)
-            .movable(true)
-            .interactable(true)
-            .current_pos(actions_pos)
-            .show(ctx, |ui| {
-                ui.set_width(panel_w_for_tab);
-                ui.set_min_width(panel_w_for_tab);
-                ui.set_max_width(panel_w_for_tab);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(panel_w_for_tab);
-                    ui.set_min_width(panel_w_for_tab);
-                    ui.set_max_width(panel_w_for_tab);
-                    // 2-tab header (mirrors the Параметры/Эффекты panel): collapse toggle + «Действия» /
-                    // «Слои» tabs.
-                    ui.horizontal(|ui| {
-                        let toggle_icon = if self.vertical_actions_panel.collapsed {
-                            "▶"
+                    TypingTopPanelMode::EditText => {
+                        if image_edit_only {
+                            changed |= self
+                                .edit_panel
+                                .draw_image_transform_only_section(ui, false);
                         } else {
-                            "▼"
-                        };
-                        let toggle_hint = if self.vertical_actions_panel.collapsed {
-                            t!("typing.panel.expand_panel_tooltip")
-                        } else {
-                            t!("typing.panel.collapse_panel_tooltip")
-                        };
-                        if ui
-                            .small_button(toggle_icon)
-                            .on_hover_text(toggle_hint)
-                            .clicked()
-                        {
-                            self.vertical_actions_panel.collapsed =
-                                !self.vertical_actions_panel.collapsed;
-                        }
-                        ui.selectable_value(
-                            &mut self.actions_panel_tab,
-                            TypingActionsPanelTab::Actions,
-                            TypingActionsPanelTab::Actions.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.actions_panel_tab,
-                            TypingActionsPanelTab::Layers,
-                            TypingActionsPanelTab::Layers.label(),
-                        );
-                    });
-                    if self.vertical_actions_panel.collapsed {
-                        return;
-                    }
-                    ui.add_space(4.0);
-                    match self.actions_panel_tab {
-                        TypingActionsPanelTab::Actions => {
-                            let actions = match self.mode {
-                                TypingTopPanelMode::CreateText => {
-                                    self.create_panel.draw_right_section(
-                                        ui,
-                                        TypingRightSectionInputs {
-                                            mask_panel_open: self.mask_panel_open,
-                                            clean_overlays_visible: self.clean_overlays_visible,
-                                            strict_pixel_movement: self.strict_pixel_movement,
-                                            export_default_dir: self.export_default_dir.as_deref(),
-                                            export_status: &self.export_status,
-                                            export_format: self.export_format,
-                                        },
-                                    )
-                                }
-                                TypingTopPanelMode::EditText => self.edit_panel.draw_right_section(
-                                    ui,
-                                    TypingRightSectionInputs {
-                                        mask_panel_open: self.mask_panel_open,
-                                        clean_overlays_visible: self.clean_overlays_visible,
-                                        strict_pixel_movement: self.strict_pixel_movement,
-                                        export_default_dir: self.export_default_dir.as_deref(),
-                                        export_status: &self.export_status,
-                                        export_format: self.export_format,
-                                    },
-                                ),
-                            };
-                            if actions.toggle_mask {
-                                self.mask_panel_open = !self.mask_panel_open;
-                            }
-                            if let Some(visible) = actions.changed_clean_overlays {
-                                self.clean_overlays_visible = visible;
-                                self.pending_clean_overlays_visible = Some(visible);
-                            }
-                            if let Some(format) = actions.changed_export_format {
-                                self.export_format = format;
-                            }
-                            if let Some(path) = actions.export_to_folder {
-                                self.pending_export_to_folder = Some(path);
-                            }
-                            if actions.round_text_positions {
-                                self.pending_round_text_positions = true;
-                            }
-                            if actions.create_image_request.is_some() {
-                                self.pending_create_image_request = actions.create_image_request;
-                            }
-                            if let Some(strict_pixel_movement) =
-                                actions.changed_strict_pixel_movement
-                            {
-                                self.strict_pixel_movement = strict_pixel_movement;
-                            }
-                            self.draw_auto_typing_controls(ui);
-                            // Centering assist ("Помочь с центровкой"): a page-anchored guide frame the
-                            // user drags to a bubble; the selected text layer stays centered in it.
-                            let centering_toggle = ui
-                                .checkbox(
-                                    &mut self.centering_assist_enabled,
-                                    t!("typing.panel.centering_assist_toggle"),
-                                )
-                                .on_hover_text(t!(
-                                    "typing.panel.centering_assist_hotkey_hint"
-                                ));
-                            if centering_toggle.changed()
-                                && self.centering_assist_enabled
-                                && self.mode == TypingTopPanelMode::EditText
-                            {
-                                // Toggled ON while editing: re-render the selected overlay immediately so
-                                // its mean/median centers are computed and the frame appears without
-                                // another edit.
-                                self.emit_edit_request();
-                            }
-                            if self.centering_assist_enabled {
-                                // Indented (visible only when enabled): the bound-center selector. Both
-                                // centers are already computed while enabled, so switching does NOT
-                                // re-render — the reconciliation re-binds the layer to the new center.
-                                ui.indent(Id::new("typing.panel.centering_kind_combo_label"), |ui| {
-                                    // "Показывать центр": gates ONLY the drawn bound-center marker; the
-                                    // frame, handles, and binding stay governed by the assist toggle.
-                                    ui.checkbox(
-                                        &mut self.centering_show_center,
-                                        t!("typing.panel.centering_show_center"),
-                                    );
-                                    let combo = WheelComboBox::from_label(t!(
-                                        "typing.panel.centering_kind_combo_label"
-                                    ))
-                                    .id_salt("typing.panel.centering_kind_combo_label")
-                                    .selected_text(match self.centering_assist_kind {
-                                        CenteringAssistCenterKind::Image => {
-                                            t!("typing.panel.centering_kind_image")
-                                        }
-                                        CenteringAssistCenterKind::Mean => {
-                                            t!("typing.panel.centering_kind_mean")
-                                        }
-                                        CenteringAssistCenterKind::Median => {
-                                            t!("typing.panel.centering_kind_median")
-                                        }
-                                    })
-                                    .show_ui_with_wheel(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.centering_assist_kind,
-                                            CenteringAssistCenterKind::Image,
-                                            t!("typing.panel.centering_kind_image"),
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.centering_assist_kind,
-                                            CenteringAssistCenterKind::Mean,
-                                            t!("typing.panel.centering_kind_mean"),
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.centering_assist_kind,
-                                            CenteringAssistCenterKind::Median,
-                                            t!("typing.panel.centering_kind_median"),
-                                        );
-                                    });
-                                    if let Some(steps) = combo.wheel_steps {
-                                        self.centering_assist_kind = cycle_centering_assist_kind(
-                                            self.centering_assist_kind,
-                                            steps,
-                                        );
-                                    }
-                                });
-                            }
-                        }
-                        TypingActionsPanelTab::Layers => {
-                            text_overlays.draw_layers_tab_body(ui, page_idx);
+                            changed |= self.edit_panel.draw_edit_params_section(ui, true, false);
                         }
                     }
                 });
-            });
-        self.vertical_actions_panel.pos = Some(actions_area_response.response.rect.min);
-
-        if self.mode == TypingTopPanelMode::EditText && changed {
+        });
+        if changed && self.mode == TypingTopPanelMode::EditText {
             self.emit_edit_request();
         }
+    }
+
+    /// Body of the «Эффекты» dock tab (`typing.effects`).
+    ///
+    /// Available for both text and image layers. While the edited layer's font is
+    /// missing the whole section is disabled: effects re-render the layer, and a
+    /// re-render with a substituted font would silently change what is on the page.
+    pub(in crate::tabs::typing) fn draw_effects_tab_body(&mut self, ui: &mut egui::Ui) {
+        self.active_main_tab = TypingMainTab::Effects;
+        let changed = match self.mode {
+            TypingTopPanelMode::CreateText => self.create_panel.draw_effects_section(ui, true),
+            TypingTopPanelMode::EditText => {
+                let font_missing = self.edit_panel.missing_font.is_some();
+                ui.add_enabled_ui(!font_missing, |ui| {
+                    self.edit_panel.draw_effects_section(ui, true)
+                })
+                .inner
+            }
+        };
+        if changed && self.mode == TypingTopPanelMode::EditText {
+            self.emit_edit_request();
+        }
+    }
+
+    /// Body of the «Действия» dock tab (`typing.actions`): mask / clean-overlay /
+    /// import / export actions, the «Авто-тайп» block, and the centering assist.
+    ///
+    /// Everything the section reports is turned into a queued request here; the
+    /// tab itself performs no project work.
+    pub(in crate::tabs::typing) fn draw_actions_tab_body(&mut self, ui: &mut egui::Ui) {
+        let inputs = TypingRightSectionInputs {
+            mask_panel_open: self.mask_panel_open,
+            clean_overlays_visible: self.clean_overlays_visible,
+            strict_pixel_movement: self.strict_pixel_movement,
+            export_default_dir: self.export_default_dir.as_deref(),
+            export_status: &self.export_status,
+            export_format: self.export_format,
+        };
+        let actions = match self.mode {
+            TypingTopPanelMode::CreateText => self.create_panel.draw_right_section(ui, inputs),
+            TypingTopPanelMode::EditText => self.edit_panel.draw_right_section(ui, inputs),
+        };
+        if actions.toggle_mask {
+            self.mask_panel_open = !self.mask_panel_open;
+        }
+        if let Some(visible) = actions.changed_clean_overlays {
+            self.clean_overlays_visible = visible;
+            self.pending_clean_overlays_visible = Some(visible);
+        }
+        if let Some(format) = actions.changed_export_format {
+            self.export_format = format;
+        }
+        if let Some(path) = actions.export_to_folder {
+            self.pending_export_to_folder = Some(path);
+        }
+        if actions.round_text_positions {
+            self.pending_round_text_positions = true;
+        }
+        if actions.create_image_request.is_some() {
+            self.pending_create_image_request = actions.create_image_request;
+        }
+        if let Some(strict_pixel_movement) = actions.changed_strict_pixel_movement {
+            self.strict_pixel_movement = strict_pixel_movement;
+        }
+        self.draw_auto_typing_controls(ui);
+        self.draw_centering_assist_controls(ui);
+    }
+
+    /// Centering assist ("Помочь с центровкой"): a page-anchored guide frame the
+    /// user drags to a bubble; the selected text layer stays centered in it.
+    fn draw_centering_assist_controls(&mut self, ui: &mut egui::Ui) {
+        let centering_toggle = ui
+            .checkbox(
+                &mut self.centering_assist_enabled,
+                t!("typing.panel.centering_assist_toggle"),
+            )
+            .on_hover_text(t!("typing.panel.centering_assist_hotkey_hint"));
+        if centering_toggle.changed()
+            && self.centering_assist_enabled
+            && self.mode == TypingTopPanelMode::EditText
+        {
+            // Toggled ON while editing: re-render the selected overlay immediately so
+            // its mean/median centers are computed and the frame appears without
+            // another edit.
+            self.emit_edit_request();
+        }
+        if !self.centering_assist_enabled {
+            return;
+        }
+        // Indented (visible only when enabled): the bound-center selector. Both
+        // centers are already computed while enabled, so switching does NOT
+        // re-render — the reconciliation re-binds the layer to the new center.
+        ui.indent(Id::new("typing.panel.centering_kind_combo_label"), |ui| {
+            // "Показывать центр": gates ONLY the drawn bound-center marker; the
+            // frame, handles, and binding stay governed by the assist toggle.
+            ui.checkbox(
+                &mut self.centering_show_center,
+                t!("typing.panel.centering_show_center"),
+            );
+            let combo = WheelComboBox::from_label(t!("typing.panel.centering_kind_combo_label"))
+                .id_salt("typing.panel.centering_kind_combo_label")
+                .selected_text(match self.centering_assist_kind {
+                    CenteringAssistCenterKind::Image => t!("typing.panel.centering_kind_image"),
+                    CenteringAssistCenterKind::Mean => t!("typing.panel.centering_kind_mean"),
+                    CenteringAssistCenterKind::Median => t!("typing.panel.centering_kind_median"),
+                })
+                .show_ui_with_wheel(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.centering_assist_kind,
+                        CenteringAssistCenterKind::Image,
+                        t!("typing.panel.centering_kind_image"),
+                    );
+                    ui.selectable_value(
+                        &mut self.centering_assist_kind,
+                        CenteringAssistCenterKind::Mean,
+                        t!("typing.panel.centering_kind_mean"),
+                    );
+                    ui.selectable_value(
+                        &mut self.centering_assist_kind,
+                        CenteringAssistCenterKind::Median,
+                        t!("typing.panel.centering_kind_median"),
+                    );
+                });
+            if let Some(steps) = combo.wheel_steps {
+                self.centering_assist_kind =
+                    cycle_centering_assist_kind(self.centering_assist_kind, steps);
+            }
+        });
     }
 
     pub(in crate::tabs::typing) fn build_create_text_render_bundle(
@@ -923,7 +616,7 @@ impl TypingTopPanelState {
                 let rotation_deg = normalize_angle_deg(self.edit_panel.overlay_rotation_deg);
                 // Изменения во вкладке «Эффекты» требуют перерендера картинки; чистая
                 // трансформация (масштаб/угол) применяется на показе без перерендера.
-                if self.vertical_panel_tab == TypingVerticalMainTab::Effects {
+                if self.active_main_tab == TypingMainTab::Effects {
                     Some(TypingOverlayEditRequest::ImageEffects {
                         target,
                         render_data_json: self.edit_panel.build_image_effects_render_data(),
@@ -941,86 +634,21 @@ impl TypingTopPanelState {
         };
     }
 
-    pub(super) fn draw_create_preview_panel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        panel_left: f32,
-        panel_top: f32,
-        panel_width: f32,
-    ) -> Option<Rect> {
-        if self.mode != TypingTopPanelMode::CreateText {
-            return None;
-        }
+    /// `true` while the panel is in «Создание» mode — the only mode in which the
+    /// «Превью текста» dock tab has anything to show.
+    #[must_use]
+    pub(in crate::tabs::typing) fn is_create_text_mode(&self) -> bool {
+        self.mode == TypingTopPanelMode::CreateText
+    }
 
-        let min_x = canvas_rect.left();
-        let max_x = (canvas_rect.right() - 80.0).max(min_x);
-        let min_y = canvas_rect.top();
-        let max_y = (canvas_rect.bottom() - 40.0).max(min_y);
-        let controls_rect =
-            ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
-        let default_pos = controls_rect
-            .map(|rect| {
-                egui::pos2(
-                    rect.left(),
-                    rect.bottom() + TYPING_PREVIEW_PANEL_CONTROLS_GAP_PX,
-                )
-            })
-            .unwrap_or(egui::pos2(
-                panel_left,
-                panel_top + TYPING_PREVIEW_PANEL_CONTROLS_GAP_PX,
-            ));
-        let panel_pos = self
-            .create_preview_panel
-            .pos
-            .unwrap_or(default_pos)
-            .clamp(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
-        let panel_w = TYPING_PREVIEW_PANEL_DEFAULT_WIDTH_PX.min(panel_width.max(220.0));
-
-        let area_response = egui::Area::new(TYPING_PREVIEW_PANEL_AREA_ID.into())
-            .order(egui::Order::Foreground)
-            .movable(true)
-            .interactable(true)
-            .current_pos(panel_pos)
-            .show(ctx, |ui| {
-                ui.set_width(panel_w);
-                ui.set_min_width(panel_w);
-                ui.set_max_width(panel_w);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(panel_w);
-                    ui.set_min_width(panel_w);
-                    ui.set_max_width(panel_w);
-                    ui.horizontal(|ui| {
-                        let toggle_icon = if self.create_preview_panel.collapsed {
-                            "▶"
-                        } else {
-                            "▼"
-                        };
-                        let toggle_hint = if self.create_preview_panel.collapsed {
-                            t!("typing.preview.expand_tooltip")
-                        } else {
-                            t!("typing.preview.collapse_tooltip")
-                        };
-                        if ui
-                            .small_button(toggle_icon)
-                            .on_hover_text(toggle_hint)
-                            .clicked()
-                        {
-                            self.create_preview_panel.collapsed =
-                                !self.create_preview_panel.collapsed;
-                        }
-                        ui.label(t!("typing.preview.panel_heading"));
-                    });
-                    if self.create_preview_panel.collapsed {
-                        return;
-                    }
-                    ui.add_space(4.0);
-                    self.create_panel.draw_preview_section(ui);
-                });
-            });
-
-        self.create_preview_panel.pos = Some(area_response.response.rect.min);
-        Some(area_response.response.rect)
+    /// Body of the «Превью текста» dock tab: the create panel's preview section
+    /// (status line, per-render font diagnostics, the rendered image).
+    ///
+    /// Called by the panel dock from `TypingHooks::draw_canvas_overlay_top_left`;
+    /// the panel owns no position, size or collapse state of its own any more —
+    /// the dock's layout does.
+    pub(in crate::tabs::typing) fn draw_preview_tab_body(&mut self, ui: &mut egui::Ui) {
+        self.create_panel.draw_preview_section(ui);
     }
 
     pub(super) fn draw_auto_typing_controls(&mut self, ui: &mut egui::Ui) {

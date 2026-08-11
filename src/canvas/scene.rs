@@ -43,8 +43,8 @@ use super::types::{
 };
 use super::view_transform::DVec2;
 use super::{
-    BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
-    OnTopFocusMode, ViewTransform,
+    BubbleCopyPasteTarget, CANVAS_LEFT_TOP_CONTROLS_AREA_ID, CanvasHintHelp, CanvasHintRow,
+    CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode, ViewTransform,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::project::ProjectData;
@@ -1346,7 +1346,7 @@ impl CanvasView {
         let target_width = self.scene.controls_content_width;
         // Max width of this frame's chip-free rows, accumulated below.
         let mut natural_width: f32 = 0.0;
-        let controls_area = egui::Area::new("canvas_left_top_controls".into())
+        let controls_area = egui::Area::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID.into())
             .movable(true)
             .default_pos(canvas_rect.left_top() + egui::vec2(12.0, 12.0))
             .show(ctx, |ui| {

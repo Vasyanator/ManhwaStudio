@@ -39,6 +39,7 @@ use crate::app::MangaApp;
 use crate::project::ProjectData;
 use crate::runtime_log;
 use crate::tabs::AppTab;
+use crate::window_geometry::{self, WindowGeometryTracker};
 use anyhow::Context;
 use ms_thread as thread;
 use std::path::PathBuf;
@@ -126,9 +127,14 @@ pub struct StudioBootstrapApp {
     close_after_load: bool,
     /// Tab restored after a structural-operation reload; selection intentionally does not persist.
     reload_tab: Option<AppTab>,
+    /// Observes this window's monitor/position/size and persists them (`Window` config
+    /// section). Lives here rather than in `MangaApp` because the shell owns the window from
+    /// the first frame, including the loading and error screens.
+    geometry: WindowGeometryTracker,
     /// Windows-only workaround mirrored from `MangaApp`: `with_maximized` is skipped in the
     /// viewport builder there, so the shell maximizes the root window on its first frame
-    /// (otherwise the loading screen shows in the unmaximized 1400x900 window).
+    /// (otherwise the loading screen shows in the unmaximized 1400x900 window). Now gated on
+    /// the persisted state: a window left un-maximized must not be maximized again on Windows.
     #[cfg(target_os = "windows")]
     maximize_root_window_on_first_frame: bool,
 }
@@ -140,6 +146,12 @@ impl StudioBootstrapApp {
         ai_backend: AiBackendHandle,
         return_to_launcher_flag: Arc<AtomicBool>,
     ) -> Self {
+        // Read from disk, not from `user_settings`: that snapshot is taken once per session in
+        // `run_main` and reused for every window, so a monitor chosen in a previous window of
+        // the same session would be invisible here.
+        let window_settings = window_geometry::load_window_settings();
+        #[cfg(target_os = "windows")]
+        let maximize_root_window_on_first_frame = window_settings.maximized.unwrap_or(true);
         Self {
             state: BootstrapState::Loading { rx },
             ai_backend,
@@ -147,8 +159,9 @@ impl StudioBootstrapApp {
             return_to_launcher_flag,
             close_after_load: false,
             reload_tab: None,
+            geometry: WindowGeometryTracker::new(&window_settings),
             #[cfg(target_os = "windows")]
-            maximize_root_window_on_first_frame: true,
+            maximize_root_window_on_first_frame,
         }
     }
 
@@ -277,6 +290,10 @@ impl eframe::App for StudioBootstrapApp {
         // egui 0.35: `App::ui` receives the window-root `Ui`. Keep a borrowed `Context`
         // handle for the context-level calls (viewport commands, repaint scheduling) below.
         let ctx = ui.ctx().clone();
+        // The winit handle is cloned out of `frame` before the borrow below: `MangaApp::ui`
+        // takes `frame` mutably, and a live `&Window` borrowed from it would conflict.
+        let window = frame.winit_window().cloned();
+        self.geometry.observe(&ctx, window.as_deref());
         #[cfg(target_os = "windows")]
         if self.maximize_root_window_on_first_frame {
             self.maximize_root_window_on_first_frame = false;
@@ -332,9 +349,13 @@ impl eframe::App for StudioBootstrapApp {
     /// Forwards eframe's shutdown hook to the real app once it exists: `MangaApp::on_exit`
     /// drains the background layer saver, and skipping it would lose queued layer writes.
     /// Before the project arrives there is nothing to drain.
+    ///
+    /// The window geometry is flushed here too: the writer thread coalesces samples behind a
+    /// debounce, so a resize in the last moments before closing would otherwise be dropped.
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let BootstrapState::Running(app) = &mut self.state {
             app.on_exit(gl);
         }
+        self.geometry.flush_and_join();
     }
 }

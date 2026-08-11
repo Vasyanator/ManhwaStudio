@@ -79,6 +79,28 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   (always appending), plus a quick row of frequent onomatopoeia jamo.
   All jamo arithmetic and caption tables come from `ms_text_util::hangul`. The jamo captions and the
   `∅` marker are Unicode data, deliberately not localized (`dev-docs/i18n_exclusions.md`).
+- `panel_dock/`: the dockable-panel system (design contract:
+  `dev-docs/dockable_panels_plan.md`). It is a subsystem, not a single widget, and has its own
+  `MODULE_README.md`. Pure layer: `model.rs` holds the panel/tab graph (`DockLayout`, `PanelNode`,
+  `PanelAnchor`) with its invariants — mutated only through its checked operations, never through a
+  handed-out `&mut PanelNode` — and `solver.rs` resolves that graph into rects (`solve` →
+  `SolvedLayout`) preserving `DOCK_GAP`, shrinking on both axes exactly the panels whose size places
+  an overflowing edge — the ones the user resized by hand LAST — and translating what is left over.
+  Neither file may touch `egui::Context`, `Ui` or `Memory`.
+  Widget layer: `PanelTab` DECLARES one tab per frame (title, visibility, min/initial size, body),
+  `CollapsiblePanel` draws one panel, and the `PanelDock` frame driver (`begin` →
+  `tab(..).show(..)` → `end`) queues every body and runs them in panel order — which is what lets
+  two tabs borrow `&mut` of two different fields of the caller. Its `PanelDockState` must live in
+  its own caller field, disjoint from everything the bodies touch. A panel is as big as its LARGEST
+  tab, its body fills that size and scrolls both axes, and what it reports back is the CONTENT's
+  size — never the drawn one. Gesture layer: `drag.rs` decides
+  where a dragged panel would dock (`find_snap`), keeps two panels out of one slot
+  (`resolve_slot`), and answers where a dropped tab lands; the widgets only REPORT the gestures and
+  the driver applies them through the model. Persistence layer: `persist.rs` owns the
+  self-versioned `PanelLayout` section of `user_config.json` and `PanelLayoutWriter`, its handle on
+  the shared `config_saver::ConfigSaver` writer thread, which the application feeds from
+  `PanelDockState::take_dirty_layouts`; it is the only file of the subsystem that reaches the disk,
+  and the debounce/retry policy behind it lives in `src/config_saver.rs`. Sub-windows are a later phase.
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
   list.
 - `editable_combo_box.rs`: editable combo box combining free text input and predefined values.
@@ -123,6 +145,12 @@ loading, word checks, and dictionary writes still run off the GUI thread.
   scroll areas permanently blocked.
 - `ViewportColorSelector` samples only egui screenshot events for its own token; callers own the
   selected color and any durable persistence.
+- Every floating panel of the studio must be built from `CollapsiblePanel` + `PanelTab` — no
+  hand-rolled `Area + Frame::popup` panels and no bare `egui::Window` used as a panel. (Migration of
+  the existing surfaces is phased; new panels have no exemption.) Its layout solver is a pure
+  function: it keeps no egui state, does no I/O and no logging, and returns the same rects for the
+  same inputs. Dock panels stay on `egui::Order::Foreground`, because canvas input gating is z-order
+  based.
 - `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
   (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
   (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but
@@ -139,3 +167,5 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 - To change viewport eyedropper behavior, edit `viewport_color_selector.rs`.
 - To change jamo keyboard layout or latch semantics, edit `hangul_keyboard.rs`; the syllable
   arithmetic and the compatibility-jamo tables belong to `crates/ms-text-util/src/hangul.rs`.
+- To change panel docking (arrangement rules, gaps, shrinking, or later the panel widgets), edit
+  `panel_dock/` and read its own `MODULE_README.md` first.

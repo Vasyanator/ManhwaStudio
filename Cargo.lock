@@ -3370,6 +3370,7 @@ dependencies = [
  "web-sys",
  "web-time",
  "windows-sys 0.59.0",
+ "winit",
  "winresource",
  "zeno",
  "zip",

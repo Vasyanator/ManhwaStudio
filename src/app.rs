@@ -90,6 +90,7 @@ use crate::tabs::translation::{
 };
 use crate::tabs::typing::{TypingSaveFlushReason, TypingTabState, TypingTextFlushError};
 use crate::tabs::wiki::WikiTabState;
+use crate::widgets::panel_dock::PanelLayoutWriter;
 use eframe::egui;
 use egui::{Align2, ColorImage, TextureOptions};
 use ms_thread::{self as thread, JoinHandle};
@@ -220,6 +221,13 @@ pub struct MangaApp {
     typing_tab: TypingTabState,
     ps_editor_tab: PsEditorTabState,
     page_manager_tab: PageManagerTabState,
+    /// The single writer of the `PanelLayout` section of `user_config.json`
+    /// (`src/widgets/panel_dock/persist.rs`). One per studio window, owned here
+    /// rather than by a tab's `PanelDockState`, because that state is also built
+    /// in tests and by every program tab that draws panels, and none of them may
+    /// spawn a thread or reach the disk. Tabs are polled for a dirty layout once
+    /// per frame; the writer coalesces the burst and writes off the GUI thread.
+    panel_layout_writer: PanelLayoutWriter,
     /// Shared unified layer document: the source of truth for per-page layer MODEL state, held by
     /// both view tabs (`Arc<Mutex<…>>`). Each tab re-projects its current page whenever the doc's
     /// `version` changes (the in-memory cross-tab sync). This field keeps the `Arc` alive.
@@ -676,6 +684,10 @@ impl MangaApp {
         cleaning_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut typing_tab = TypingTabState::default();
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
+        // Dockable-panel arrangement, restored from the snapshot already in hand. It must be
+        // installed BEFORE the first frame: the dock builds the default layout for any key that
+        // has none, and the default is what the restored layout has to win over.
+        typing_tab.load_persisted_panel_layouts(&user_settings);
         typing_tab.set_hint_collapsed(typing_hint_collapsed);
         typing_tab.set_centering_assist_persisted_state(
             typing_centering_assist_enabled,
@@ -778,6 +790,7 @@ impl MangaApp {
             typing_tab,
             ps_editor_tab,
             page_manager_tab,
+            panel_layout_writer: PanelLayoutWriter::spawn(),
             layer_doc,
             characters_tab: CharactersTabState::default(),
             terms_tab: TermsTabState::default(),
@@ -3111,6 +3124,13 @@ impl eframe::App for MangaApp {
                 egui::CentralPanel::default().show(ui, |ui| {
                     typing.draw(ctx, ui, project, page_infos, textures, status);
                 });
+                // Panel-layout persistence poll. It sits right after the draw because the dock
+                // raises its dirty flag DURING the gesture — on every frame a panel drag advances
+                // — so the flag must be picked up in the same frame it was raised; the writer is
+                // what turns that per-frame stream into one debounced write.
+                if let Some(layouts) = typing.take_dirty_panel_layouts() {
+                    self.panel_layout_writer.store(layouts);
+                }
                 // In-app deep link from the typing panel's font-group "?" help icon:
                 // switch to the settings tab and reveal the requested block.
                 if let Some(link) = typing.take_settings_navigation_request() {
@@ -3171,6 +3191,15 @@ impl eframe::App for MangaApp {
             AppTab::Wiki => {
                 egui::CentralPanel::default().show(ui, |ui| self.wiki_tab.draw(ui));
             }
+        }
+        // The typing tab's detached panel windows are immediate viewports: they
+        // exist only while they are shown every pass, and the tab that shows them
+        // stopped drawing the moment another program tab became active. Requirement
+        // 11 of `dev-docs/dockable_panels_plan.md` says they stay open and empty
+        // instead, so they are shown here — and ONLY here, because showing one
+        // viewport twice in a pass would render it twice.
+        if !matches!(self.active_tab, AppTab::Typing) {
+            self.typing_tab.draw_idle_dock_sub_windows(ctx);
         }
         // Close the active-tab draw scope before the post-draw GPU trim / memory phases.
         #[cfg(feature = "profiling")]
@@ -3321,6 +3350,15 @@ impl eframe::App for MangaApp {
         if crate::tabs::typing::font_admin::flush_pending_saves() {
             runtime_log::log_info("[app] on_exit: flushed a pending fonts_data.json write");
         }
+
+        // 7) Flush the dockable-panel layouts. A last poll first, because the frame that raised
+        // the dirty flag may be the one the close arrived in and no further frame will poll it;
+        // then the writer's own debounce window is drained synchronously and its thread joined.
+        // Both steps are no-ops when nothing changed.
+        if let Some(layouts) = self.typing_tab.take_dirty_panel_layouts() {
+            self.panel_layout_writer.store(layouts);
+        }
+        self.panel_layout_writer.flush_and_join();
     }
 }
 

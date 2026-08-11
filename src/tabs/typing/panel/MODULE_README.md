@@ -746,7 +746,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   off the GUI thread) against the then-current typesetting language; the dropdown
   never recomputes it.
 - Because the language can change at runtime, that cache can go stale.
-  `TypingTopPanelState::draw` (`facade.rs`) stores the language the cache was
+  `TypingTopPanelState::begin_frame` (`facade.rs`) stores the language the cache was
   built against in `coverage_language` and, when `text_language()` differs, calls
   `spawn_font_reload` on both panels to reload the font lists and recompute
   coverage off-thread. This is self-healing: any caller of
@@ -842,7 +842,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `tab/codec.rs::upgrade_text_params_to_v2`.
 - To change what a language requires, see `font_coverage.rs`
   (`script_chars_for_group`, `extra_chars_for_language`, the `*_EXTRA_CHARS` sets).
-- To change when coverage is recomputed, see `facade.rs::draw` (language-change
+- To change when coverage is recomputed, see `facade.rs::begin_frame` (language-change
   detection) and `create_state.rs::spawn_font_reload`.
 - To change the highlight colors / tooltip, see `create_presets.rs`
   (`draw_font_combo_option`, `font_coverage_tooltip`).

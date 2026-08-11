@@ -4745,3 +4745,372 @@ fn a_failed_raster_write_is_queued_and_retried_at_the_next_flush_point() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
+    let layout = typing_default_dock_layout();
+    assert_eq!(layout.validate(), Ok(()));
+    assert_eq!(layout.panels().len(), 6);
+
+    let preview = layout
+        .panel(PanelId::new(0))
+        .expect("the preview panel exists");
+    assert_eq!(preview.tabs, vec![TYPING_PREVIEW_TAB]);
+    assert_eq!(
+        preview.anchor,
+        PanelAnchor::CanvasControls {
+            edge: DockEdge::Bottom,
+            along: 0.0,
+        }
+    );
+    assert_eq!(
+        preview.size_override,
+        Some(TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX)
+    );
+
+    let params = layout
+        .panel(PanelId::new(1))
+        .expect("the parameters panel exists");
+    assert_eq!(params.tabs, vec![TYPING_PARAMS_TAB, TYPING_EFFECTS_TAB]);
+    assert_eq!(params.active_tab, TYPING_PARAMS_TAB);
+    assert_eq!(
+        params.anchor,
+        PanelAnchor::ViewportEdge {
+            edge: DockEdge::Right,
+            along: 0.0,
+        }
+    );
+    assert_eq!(
+        params.size_override,
+        Some(TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX)
+    );
+
+    let actions = layout
+        .panel(PanelId::new(2))
+        .expect("the actions panel exists");
+    assert_eq!(actions.tabs, vec![TYPING_ACTIONS_TAB, TYPING_LAYERS_TAB]);
+    assert_eq!(actions.active_tab, TYPING_ACTIONS_TAB);
+    // Hanging off the preview panel is what makes «Действия/Слои» rise into the
+    // preview's place once the preview tab is hidden in edit mode.
+    assert_eq!(
+        actions.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+    assert_eq!(
+        actions.size_override,
+        Some(TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX)
+    );
+    assert_eq!(
+        actions.size_override.map(|size| size.x),
+        preview.size_override.map(|size| size.x),
+        "the left column is ONE column: the preview and the panel under it share a width"
+    );
+
+    // The three conditional panels continue the two columns instead of sharing an
+    // anchor with an existing panel: identical target+edge+align would lay them out
+    // on top of each other.
+    let mask = layout.panel(PanelId::new(3)).expect("the mask panel exists");
+    assert_eq!(mask.tabs, vec![TYPING_MASK_TAB]);
+    assert_eq!(
+        mask.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(1),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+    let deform = layout
+        .panel(PanelId::new(4))
+        .expect("the deformation panel exists");
+    assert_eq!(deform.tabs, vec![TYPING_DEFORM_TAB]);
+    assert_eq!(
+        deform.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(2),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+    let layout_editor = layout
+        .panel(PanelId::new(5))
+        .expect("the layout-editor panel exists");
+    assert_eq!(layout_editor.tabs, vec![TYPING_LAYOUT_EDITOR_TAB]);
+    assert_eq!(
+        layout_editor.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(4),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+
+    // The conditional panels follow their content instead of a pinned size: they
+    // are the ones that give way when the column does not fit the dock area.
+    for id in [PanelId::new(3), PanelId::new(4), PanelId::new(5)] {
+        let panel = layout.panel(id).expect("a conditional panel exists");
+        assert_eq!(panel.size_override, None, "{id} must stay content-sized");
+    }
+
+    // A pinned size must clear what the panel's own tabs declare as their minimum,
+    // or the very first solve would shrink the default arrangement.
+    for (size, min) in [
+        (
+            TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX,
+            TYPING_PREVIEW_TAB_MIN_SIZE_PX,
+        ),
+        (
+            TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX,
+            TYPING_PARAMS_TAB_MIN_SIZE_PX,
+        ),
+        (
+            TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX,
+            TYPING_ACTIONS_TAB_MIN_SIZE_PX,
+        ),
+    ] {
+        assert!(
+            size.x >= min.x.max(crate::widgets::panel_dock::PANEL_MIN_WIDTH)
+                && size.y >= min.y,
+            "the pinned {size:?} is below the declared minimum {min:?}"
+        );
+    }
+
+    // Every declared tab has exactly one home, so the dock never has to invent a
+    // panel of its own for the typing tab.
+    for tab in [
+        TYPING_PREVIEW_TAB,
+        TYPING_PARAMS_TAB,
+        TYPING_EFFECTS_TAB,
+        TYPING_ACTIONS_TAB,
+        TYPING_LAYERS_TAB,
+        TYPING_MASK_TAB,
+        TYPING_DEFORM_TAB,
+        TYPING_LAYOUT_EDITOR_TAB,
+    ] {
+        assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
+    }
+}
+
+/// The layout must not merely be well-formed — it must PLACE the panels apart. A
+/// panel that becomes visible on top of another one is the defect this test exists
+/// for, and it is what "разведены якорями" means in practice.
+///
+/// Two frames are checked: the worst case, where EVERY conditional tab («Маска»,
+/// «Режим деформации», «Редактирование раскладки») is visible at once — more than
+/// the runtime ever shows together — and the ordinary frame where a conditional
+/// panel drops out of the chain and its dependants inherit its anchor
+/// (`panel_dock::frame_layout`, built on `DockLayout::remove_panel`).
+#[test]
+fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
+    use crate::widgets::panel_dock::{DOCK_GAP, PanelChrome, PanelSizes, SolvedLayout, solve};
+
+    let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+    let controls = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::new(220.0, 36.0));
+    // What each panel's tabs contribute. The three panels the default pins carry a
+    // `size_override`, so the solver uses that instead; the conditional ones are
+    // content-sized and these are the sizes they start at.
+    let sizes: PanelSizes = [
+        (PanelId::new(0), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
+        (PanelId::new(1), TYPING_PARAMS_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(2), TYPING_ACTIONS_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(3), TYPING_MASK_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(4), TYPING_DEFORM_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(5), TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX),
+    ]
+    .into_iter()
+    .collect();
+    let mins: PanelSizes = [
+        (PanelId::new(0), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
+        (PanelId::new(1), TYPING_PARAMS_TAB_MIN_SIZE_PX),
+        (PanelId::new(2), TYPING_ACTIONS_TAB_MIN_SIZE_PX),
+        (PanelId::new(3), TYPING_MASK_TAB_MIN_SIZE_PX),
+        (PanelId::new(4), TYPING_DEFORM_TAB_MIN_SIZE_PX),
+        (PanelId::new(5), TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX),
+    ]
+    .into_iter()
+    .collect();
+    let solve_default = |layout: &DockLayout| {
+        solve(
+            layout,
+            HostId::MainWindow,
+            area,
+            &sizes,
+            &mins,
+            Some(controls),
+            PanelChrome::default(),
+        )
+    };
+    let assert_pairwise_disjoint = |solved: &SolvedLayout, frame: &str| {
+        let placed: Vec<(PanelId, Rect)> = solved.iter().map(|(id, p)| (id, p.rect)).collect();
+        for (i, (left_id, left)) in placed.iter().enumerate() {
+            for (right_id, right) in placed.iter().skip(i + 1) {
+                assert!(
+                    !left.intersect(*right).is_positive(),
+                    "{frame}: panels {left_id} and {right_id} overlap: {left:?} vs {right:?}"
+                );
+            }
+        }
+    };
+
+    let layout = typing_default_dock_layout();
+    let solved = solve_default(&layout);
+    assert_eq!(solved.len(), 6, "every panel of the layout is placed");
+    assert_pairwise_disjoint(&solved, "every tab visible");
+    // On a dock area of a typical maximized window the whole arrangement — pinned
+    // sizes included — still fits, so nothing is pushed off screen or shrunk on the
+    // very first frame.
+    for (id, panel) in solved.iter() {
+        assert!(
+            area.contains_rect(panel.rect),
+            "panel {id} leaves the dock area: {:?} in {area:?}",
+            panel.rect
+        );
+    }
+
+    let rect = |id: u32| {
+        solved
+            .get(PanelId::new(id))
+            .expect("a panel of the default layout is solved")
+            .rect
+    };
+    // The left column, top to bottom: preview, actions/layers, deform, layout
+    // editor — exactly one `DOCK_GAP` apart, sharing their left edge.
+    for (upper, lower) in [(0, 2), (2, 4), (4, 5)] {
+        let (above, below) = (rect(upper), rect(lower));
+        assert!(
+            (below.top() - above.bottom() - DOCK_GAP).abs() <= 0.5,
+            "panel {lower} must sit one gap under panel {upper}: {above:?} vs {below:?}"
+        );
+        assert!(
+            (below.left() - above.left()).abs() <= 0.5,
+            "panel {lower} must line up with panel {upper}: {above:?} vs {below:?}"
+        );
+    }
+    // The right column: «Маска» one gap under «Параметры»/«Эффекты», which sits at
+    // the area's right edge (a `ViewportEdge` anchor is inset by one `DOCK_GAP`).
+    let (params, mask) = (rect(1), rect(3));
+    assert!((mask.top() - params.bottom() - DOCK_GAP).abs() <= 0.5);
+    assert!((params.right() - (area.right() - DOCK_GAP)).abs() <= 0.5);
+    // …and the two columns do not meet.
+    assert!(rect(2).right() < params.left());
+
+    // An ordinary frame: «Режим деформации» is not shown, so its panel leaves the
+    // chain and «Редактирование раскладки» inherits its anchor — the column has to
+    // close over the hole instead of stacking two panels under «Действия».
+    let mut without_deform = typing_default_dock_layout();
+    without_deform
+        .remove_panel(PanelId::new(4))
+        .expect("the deformation panel is part of the default layout");
+    let solved = solve_default(&without_deform);
+    assert_eq!(solved.len(), 5);
+    assert_pairwise_disjoint(&solved, "deformation hidden");
+    let actions = solved
+        .get(PanelId::new(2))
+        .expect("the actions panel is solved")
+        .rect;
+    let layout_editor = solved
+        .get(PanelId::new(5))
+        .expect("the layout-editor panel is solved")
+        .rect;
+    assert!(
+        (layout_editor.top() - actions.bottom() - DOCK_GAP).abs() <= 0.5,
+        "the layout editor must rise into the hidden panel's place: \
+         {actions:?} vs {layout_editor:?}"
+    );
+
+    // A dock area too small for the whole worst case: the shrink drains the
+    // content-sized panels first and the panels stay apart even when the chain
+    // cannot fit at its floors.
+    let cramped = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(900.0, 620.0));
+    let solved = solve(
+        &layout,
+        HostId::MainWindow,
+        cramped,
+        &sizes,
+        &mins,
+        Some(controls),
+        PanelChrome::default(),
+    );
+    assert_eq!(solved.len(), 6);
+    assert_pairwise_disjoint(&solved, "cramped dock area");
+}
+
+/// The conditional tabs and the one coupling between two of them («Слои» steps
+/// aside for the layout editor), pinned as a pure rule set.
+#[test]
+fn the_conditional_dock_tabs_follow_their_modes() {
+    let idle = TypingDockTabVisibility::resolve(false, false, false, false);
+    assert_eq!(
+        idle,
+        TypingDockTabVisibility {
+            preview: false,
+            layers: true,
+            mask: false,
+            deform: false,
+            layout_editor: false,
+        }
+    );
+
+    let creating = TypingDockTabVisibility::resolve(true, false, false, false);
+    assert!(creating.preview && creating.layers);
+
+    let masking = TypingDockTabVisibility::resolve(false, true, false, false);
+    assert!(masking.mask);
+    assert!(!masking.deform && !masking.layout_editor);
+
+    let deforming = TypingDockTabVisibility::resolve(false, false, true, false);
+    assert!(deforming.deform);
+    assert!(deforming.layers, "the layer list stays available while deforming");
+
+    // The layout editor owns the canvas: its own tab appears and the layer list,
+    // whose body is a no-op then, steps aside.
+    let editing_layout = TypingDockTabVisibility::resolve(false, false, false, true);
+    assert!(editing_layout.layout_editor);
+    assert!(!editing_layout.layers);
+}
+
+/// The Editing/Preview switch inside the layout-editor tab is a MODE switch, not a
+/// tab switch — which is why it stayed inside the tab BODY instead of becoming two
+/// dock tabs. The two directions are not symmetric: entering Editing only flips the
+/// mode, while entering Preview additionally re-renders the edited layer (here: the
+/// defensive branch of that re-render, which closes an editor bound to a layer that
+/// no longer exists). A tab header can express neither.
+#[test]
+fn the_layout_editor_mode_switch_keeps_its_two_sided_behaviour() {
+    let ctx = egui::Context::default();
+    let mut layer = TypingTextOverlayLayer {
+        layout_editor: Some(TypingLayoutEditorState {
+            overlay_idx: 0,
+            page_idx: 0,
+            frame_page_rect: Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(100.0, 50.0)),
+            mode: TypingLayoutEditorMode::Preview,
+            active_line_idx: 0,
+            lines: Vec::new(),
+            frame_drag: None,
+            line_drag: None,
+            preview_opacity: 0.5,
+        }),
+        ..TypingTextOverlayLayer::default()
+    };
+    assert!(!layer.layout_editor_editing_active());
+
+    // Editing: mode only, no side effect on the editor's lifetime.
+    layer.enter_layout_editor_editing();
+    assert_eq!(
+        layer.layout_editor.as_ref().map(|editor| editor.mode),
+        Some(TypingLayoutEditorMode::Editing)
+    );
+    assert!(layer.layout_editor_editing_active());
+
+    // Preview: re-renders the edited layer. This editor points at an overlay that
+    // does not exist, so the re-render's guard closes it — an effect the switch has
+    // and a tab header could not.
+    layer.enter_layout_editor_preview(&ctx);
+    assert!(
+        layer.layout_editor.is_none(),
+        "entering Preview runs the re-render, which drops an editor without a layer"
+    );
+}

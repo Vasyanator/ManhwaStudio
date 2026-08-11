@@ -104,6 +104,13 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # with a toolchain upgrade the way `DefaultHasher` may. Kept in the SHARED dependency
 # section for the second user: the typing panel is compiled for wasm32 too.
 sha2 = "0.10"
+# Typed public errors (`#[derive(thiserror::Error)]`) across the whole crate — the
+# native onnxruntime loader, but also plenty of cross-target code: `page_ops`,
+# `models::clean_assign`, `locale_store`, the typing tab and the dockable-panel
+# subsystem (`widgets::panel_dock`). It therefore belongs in the SHARED section:
+# thiserror is a proc macro plus a `core`-only runtime shim, so it costs the wasm
+# build nothing beyond the derive it already needs.
+thiserror = "2"
 puffin = { version = "0.20.0", optional = true }
 # Vendored & ported to egui 0.35 (crates/puffin_egui); upstream has no 0.34/0.35
 # release. See crates/puffin_egui/Cargo.toml.
@@ -133,10 +140,15 @@ tungstenite = { version = "0.28", default-features = false, features = ["handsha
 # Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
 # dylib). Native-only: onnxruntime is a native shared library.
 ms-onnx = { path = "crates/ms-onnx" }
-# Typed public errors for the native onnxruntime loader (`src/onnx_runtime`).
-# Already in the workspace tree (ms-onnx/ms-storage pin v2), so no new build cost;
-# native-only because the loader itself is native-only.
-thiserror = "2"
+# Monitor enumeration for the startup-monitor / window-geometry contract
+# (`src/window_geometry.rs`). egui/eframe expose no monitor list at all — only the
+# raw window (`CreationContext::winit_window` / `Frame::winit_window`), whose type
+# comes from this exact crate — so winit has to be a direct dependency to call
+# `available_monitors()` / `current_monitor()`. Same version eframe already pulls in
+# (0.30.x in `Cargo.lock`), so the types unify and no second copy is built;
+# `default-features = false` adds nothing to the feature union eframe already
+# selects (notably it must not switch Wayland decorations on by itself).
+winit = { version = "0.30", default-features = false }
 
 # Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
 # (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /

@@ -35,6 +35,17 @@ FILE HEADER (widgets/mod.rs)
     draws: it never mutates text and never touches `egui::TextEditState`, it
     returns a `HangulKeyboardOutcome` (`insert` + `replace_previous`) and the
     consumer decides where the text goes.
+  - `panel_dock`: the dockable-panel system (`dev-docs/dockable_panels_plan.md`).
+    Pure layer: `DockLayout` + `PanelNode` describe how panels and their tabs are
+    arranged and anchored, and `solve()` resolves that graph into rects (gap
+    preservation, clamping into the host area, even shrinking). Widget layer:
+    `PanelTab` declares one tab per frame, `CollapsiblePanel` draws one panel, and
+    the `PanelDock` frame driver (`begin` → `tab(..).show(..)` → `end`) queues the
+    tab bodies and runs them in panel order, so two tabs can borrow `&mut` of two
+    different fields of the caller. `drag.rs` owns the reorganisation gestures,
+    `persist.rs` the `PanelLayout` section of `user_config.json`, and `window.rs`
+    the detached OS windows a tab can be dragged into (immediate child viewports,
+    one per `HostId::SubWindow`).
   - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
     localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
     short-lived background worker, or both — text above the animation. An optional
@@ -48,6 +59,7 @@ mod font_preview;
 mod hangul_keyboard;
 mod help_hint;
 mod marked_scroll;
+pub mod panel_dock;
 mod seed_spin_box;
 mod spellchecked_line;
 mod text_edit_plus;
@@ -78,6 +90,14 @@ pub use help_hint::{HelpHint, HelpHintResponse};
 pub use marked_scroll::{
     ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,
     MarkedScrollOutput, ScrollMark, ScrollSector, ScrollSpan, arrow, paint_marks_on_bar,
+};
+#[allow(unused_imports)]
+pub use panel_dock::{
+    CollapsiblePanel, CollapsiblePanelOutput, DetachTrigger, DockArea, DockEdge, DockLayout,
+    DockModelError, DragEndContext, HostId, MoveTabOutcome, PanelAnchor, PanelChrome, PanelDock,
+    PanelDockOutput, PanelDockState, PanelId, PanelLayoutError, PanelLayoutSnapshot,
+    PanelLayoutWriter, PanelNode, PanelSizes, PanelTab, PanelTabHeader, SolvedLayout, SolvedPanel,
+    SubWindowNode, TabId,
 };
 #[allow(unused_imports)]
 pub use seed_spin_box::{SeedSpinBox, random_seed};

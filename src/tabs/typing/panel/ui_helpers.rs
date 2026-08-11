@@ -498,23 +498,6 @@ pub(super) fn cycle_text_layout_mode(mode: &mut TextLayoutMode, steps: i32) -> b
     true
 }
 
-pub(super) fn compute_typing_vertical_panel_auto_height(
-    content_height_px: f32,
-    viewport_target_height: f32,
-    available_panel_height: f32,
-) -> f32 {
-    if content_height_px > 0.0 {
-        content_height_px
-            .min(viewport_target_height)
-            .min(available_panel_height)
-            .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX)
-    } else {
-        viewport_target_height
-            .min(available_panel_height)
-            .max(TYPING_VERTICAL_SECTION_MIN_HEIGHT_PX)
-    }
-}
-
 pub(super) fn parse_text_shape_str(raw: &str) -> Option<TextShape> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "free" => Some(TextShape::Free),

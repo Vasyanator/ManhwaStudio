@@ -9,8 +9,11 @@ FILE HEADER (tabs/typing/mask.rs)
   - `TypingPageMask`: runtime-состояние маски страницы (0/255, tile-texture cache, dirty-tiles).
 - Ключевые методы:
   - `ensure_loader_started` + `poll_loader`: фоновая загрузка всех `mask_page_*.png`.
-  - `set_panel_open` + `draw_panel`: открытие/закрытие панели маски, UI кнопок,
-    переключение режима заливки и слайдер допуска цвета.
+  - `set_panel_open` + `draw_mask_tab_body`: открытие/закрытие маски и содержимое
+    вкладки `typing.mask` панельного дока (кнопки, переключение режима заливки,
+    слайдер допуска цвета). Саму панель — позицию, размер, сворачивание и заголовок
+    вкладки — рисует док (`src/widgets/panel_dock`); `expire_status_error`
+    вызывается каждый кадр, чтобы TTL статуса истекал и при закрытой панели.
   - `draw_page_mask_overlay_and_handle_input`: рисование маски поверх страницы и кисть
     (`ЛКМ` рисует, `ПКМ`/`Shift+ЛКМ` стирает) без блокировки GUI; размер кисти
     меняется общей `MaskBrush` из `src/tools/mask_brush.rs` (`Shift+колесо`, `-`/`=`/`+`),
@@ -47,10 +50,6 @@ use ms_thread as thread;
 
 const MASK_FILE_PREFIX: &str = "mask_page_";
 const MASK_FILE_SUFFIX: &str = ".png";
-const MASK_PANEL_AREA_ID: &str = "typing_mask_editor_panel";
-const MASK_PANEL_TOP_MARGIN_PX: f32 = 220.0;
-const MASK_PANEL_WIDTH_PX: f32 = 280.0;
-const MASK_PANEL_RIGHT_MARGIN_PX: f32 = 16.0;
 const MASK_BRUSH_SLIDER_MIN_RADIUS_PX: usize = 1;
 const MASK_BRUSH_SLIDER_MAX_RADIUS_PX: usize = 200;
 const MASK_STATUS_ERROR_SECONDS: f64 = 4.0;
@@ -396,7 +395,13 @@ impl TypingMaskLayer {
         self.changed_pages.drain().collect()
     }
 
-    pub fn draw_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect, current_page_idx: usize) {
+    /// Drops the panel's status line once its display time has elapsed.
+    ///
+    /// Called once per frame by the typing tab, independently of whether the mask
+    /// dock tab is drawn: the tab's body only runs while the panel is open, so an
+    /// error raised right before closing it would otherwise still be waiting there
+    /// when the user reopens the panel minutes later.
+    pub fn expire_status_error(&mut self, ctx: &egui::Context) {
         let now_s = ctx.input(|i| i.time);
         if self
             .status_error
@@ -405,90 +410,88 @@ impl TypingMaskLayer {
         {
             self.status_error = None;
         }
-        if !self.panel_open {
-            return;
-        }
+    }
 
-        let panel_pos = egui::pos2(
-            canvas_rect.right() - MASK_PANEL_WIDTH_PX - MASK_PANEL_RIGHT_MARGIN_PX,
-            canvas_rect.top() + MASK_PANEL_TOP_MARGIN_PX,
-        );
-        egui::Area::new(Id::new(MASK_PANEL_AREA_ID))
-            .order(egui::Order::Foreground)
-            .fixed_pos(panel_pos)
-            .show(ctx, |ui| {
-                ui.set_width(MASK_PANEL_WIDTH_PX);
-                ui.set_min_width(MASK_PANEL_WIDTH_PX);
-                ui.set_max_width(MASK_PANEL_WIDTH_PX);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(egui::RichText::new(t!("typing.mask.panel_title")).strong());
-                    ui.label(tf!("typing.mask.page_status", current_page_idx = current_page_idx.saturating_add(1)));
-                    if !self.fill_mode {
-                        let mut radius = self.mask_brush.radius_px();
-                        if ui
-                            .add(
-                                WheelSlider::new(
-                                    &mut radius,
-                                    MASK_BRUSH_SLIDER_MIN_RADIUS_PX
-                                        ..=MASK_BRUSH_SLIDER_MAX_RADIUS_PX,
-                                )
-                                .text(t!("typing.mask.brush_px_label")),
-                            )
-                            .changed()
-                        {
-                            self.mask_brush.set_radius_px(radius);
-                        }
-                    }
-                    let mut tolerance = self.fill_tolerance;
-                    if ui
-                        .add(
-                            WheelSlider::new(
-                                &mut tolerance,
-                                MASK_FILL_TOLERANCE_MIN..=MASK_FILL_TOLERANCE_MAX,
-                            )
-                            .text(t!("typing.mask.color_tolerance_label")),
-                        )
-                        .changed()
-                    {
-                        self.fill_tolerance = tolerance;
-                    }
-                    let fill_button_label = if self.fill_mode {
-                        t!("typing.mask.undo_fill_button")
-                    } else {
-                        t!("typing.mask.fill_button")
-                    };
-                    if ui.button(fill_button_label).clicked() {
-                        self.fill_mode = !self.fill_mode;
-                        self.active_stroke = None;
-                        if !self.fill_mode {
-                            self.fill_job_rx = None;
-                        }
-                        ctx.request_repaint();
-                    }
-                    if self.fill_job_rx.is_some() {
-                        ui.label(t!("typing.mask.fill_processing_status"));
-                    }
-                    let clear_enabled = self.masks.contains_key(&current_page_idx);
-                    if ui
-                        .add_enabled(clear_enabled, egui::Button::new(t!("typing.mask.clear_page_button")))
-                        .clicked()
-                    {
-                        self.clear_mask_page(current_page_idx);
-                    }
-                    ui.separator();
-                    if self.fill_mode {
-                        ui.label(t!("typing.mask.hint_fill_by_color"));
-                        ui.label(t!("typing.mask.hint_cursor_crosshair"));
-                    } else {
-                        ui.label(t!("typing.mask.hint_draw"));
-                        ui.label(t!("typing.mask.hint_erase"));
-                    }
-                    if let Some((message, _)) = self.status_error.as_ref() {
-                        ui.separator();
-                        ui.colored_label(Color32::from_rgb(240, 110, 110), message);
-                    }
-                });
-            });
+    /// Renders the «Маска» dock tab BODY: the brush radius (in brush mode), the
+    /// fill colour tolerance, the fill-mode toggle, the per-page clear button, the
+    /// mode hints and the status line.
+    ///
+    /// The surrounding panel — position, size, collapse and the tab header —
+    /// belongs to the panel dock (`src/widgets/panel_dock`); this method only fills
+    /// the `ui` it is given, and the dock only runs it while the panel is open
+    /// (`is_panel_open`). `current_page_idx` is the 0-based page the clear button
+    /// acts on; it is shown 1-based.
+    pub fn draw_mask_tab_body(&mut self, ui: &mut egui::Ui, current_page_idx: usize) {
+        ui.label(tf!(
+            "typing.mask.page_status",
+            current_page_idx = current_page_idx.saturating_add(1)
+        ));
+        if !self.fill_mode {
+            let mut radius = self.mask_brush.radius_px();
+            if ui
+                .add(
+                    WheelSlider::new(
+                        &mut radius,
+                        MASK_BRUSH_SLIDER_MIN_RADIUS_PX..=MASK_BRUSH_SLIDER_MAX_RADIUS_PX,
+                    )
+                    .text(t!("typing.mask.brush_px_label")),
+                )
+                .changed()
+            {
+                self.mask_brush.set_radius_px(radius);
+            }
+        }
+        let mut tolerance = self.fill_tolerance;
+        if ui
+            .add(
+                WheelSlider::new(
+                    &mut tolerance,
+                    MASK_FILL_TOLERANCE_MIN..=MASK_FILL_TOLERANCE_MAX,
+                )
+                .text(t!("typing.mask.color_tolerance_label")),
+            )
+            .changed()
+        {
+            self.fill_tolerance = tolerance;
+        }
+        let fill_button_label = if self.fill_mode {
+            t!("typing.mask.undo_fill_button")
+        } else {
+            t!("typing.mask.fill_button")
+        };
+        if ui.button(fill_button_label).clicked() {
+            self.fill_mode = !self.fill_mode;
+            self.active_stroke = None;
+            if !self.fill_mode {
+                self.fill_job_rx = None;
+            }
+            ui.ctx().request_repaint();
+        }
+        if self.fill_job_rx.is_some() {
+            ui.label(t!("typing.mask.fill_processing_status"));
+        }
+        let clear_enabled = self.masks.contains_key(&current_page_idx);
+        if ui
+            .add_enabled(
+                clear_enabled,
+                egui::Button::new(t!("typing.mask.clear_page_button")),
+            )
+            .clicked()
+        {
+            self.clear_mask_page(current_page_idx);
+        }
+        ui.separator();
+        if self.fill_mode {
+            ui.label(t!("typing.mask.hint_fill_by_color"));
+            ui.label(t!("typing.mask.hint_cursor_crosshair"));
+        } else {
+            ui.label(t!("typing.mask.hint_draw"));
+            ui.label(t!("typing.mask.hint_erase"));
+        }
+        if let Some((message, _)) = self.status_error.as_ref() {
+            ui.separator();
+            ui.colored_label(Color32::from_rgb(240, 110, 110), message);
+        }
     }
 
     pub fn draw_page_mask_overlay_and_handle_input(&mut self, ui: &mut egui::Ui, view: PageView) -> bool {

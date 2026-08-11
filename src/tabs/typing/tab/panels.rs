@@ -2,15 +2,18 @@
 File: tab/panels.rs
 
 Purpose:
-Panel-drawing methods for the typing tab's canvas overlays: the deformation-mode
-popup, the unified per-page layers list, and the vector layout-editor panels
-(the single mode panel that also hosts the vector-lines params + preview-opacity
-slider while Editing, editor lifecycle enter/exit, and the on-page editor overlay
-that paints the edited layer dimmed under the frame).
+Dock tab BODIES of the typing tab plus the layout editor's lifecycle: the
+deformation-mode body, the unified per-page layers list, the layout-editor body
+(mode switch + vector-lines params + preview-opacity), the editor's enter/exit and
+re-render, and the on-page editor overlay that paints the edited layer dimmed under
+the frame.
 
 Notes:
-Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
-submodules of `tab` can use them. `use super::*;` pulls in the parent module's
+The three bodies own no panel: position, size, collapse and the tab header belong
+to the panel dock (`src/widgets/panel_dock`), declared in `tab.rs`. A body only
+fills the `ui` it is handed and returns.
+Methods are `pub(super)` (or `pub(in crate::tabs::typing)` for the bodies the tab's
+dock declaration calls) so `tab.rs` and sibling submodules of `tab` can use them. `use super::*;` pulls in the parent module's
 types and imports. Struct/enum definitions and the rest of the big
 `impl TypingTextOverlayLayer` block remain in `tab.rs`; these methods reach the
 private items that stay there as descendants of module `tab`.
@@ -19,96 +22,89 @@ private items that stay there as descendants of module `tab`.
 use super::*;
 
 impl TypingTextOverlayLayer {
-    pub(super) fn draw_deformation_mode_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+    /// Renders the «Режим деформации» dock tab BODY: the deform-tool picker, the
+    /// handle-density controls of the two grid modes and the brush radius/strength
+    /// of the brush modes.
+    ///
+    /// The surrounding panel belongs to the panel dock (`src/widgets/panel_dock`);
+    /// this method only fills the `ui` it is given, and the dock only runs it while
+    /// an overlay is in transform mode. The content keeps the red accent the
+    /// stand-alone panel used to carry in its own frame: it marks a canvas mode in
+    /// which every drag deforms the layer instead of moving it, and the dock's
+    /// neutral panel frame cannot express that.
+    pub(in crate::tabs::typing) fn draw_deformation_tab_body(&mut self, ui: &mut egui::Ui) {
         if self.transform_mode_overlay_idx.is_none() {
             return;
         }
-        let area_pos = canvas_rect.left_top() + egui::vec2(16.0, 16.0);
-        egui::Area::new("typing_deformation_mode_panel".into())
-            .order(egui::Order::Foreground)
-            .fixed_pos(area_pos)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .fill(Color32::from_rgba_unmultiplied(95, 22, 22, 235))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(255, 110, 110)))
-                    .show(ui, |ui| {
-                        ui.visuals_mut().override_text_color =
-                            Some(Color32::from_rgb(255, 235, 235));
-                        ui.label(egui::RichText::new(t!("typing.deform.panel_heading")).strong());
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for mode in [
-                                TypingDeformMode::Perspective,
-                                TypingDeformMode::Bend,
-                                TypingDeformMode::Frame,
-                                TypingDeformMode::Grid,
-                                TypingDeformMode::Bulge,
-                                TypingDeformMode::Pinch,
-                                TypingDeformMode::Push,
-                                TypingDeformMode::Twirl,
-                                TypingDeformMode::Restore,
-                                TypingDeformMode::Smooth,
-                                TypingDeformMode::Stretch,
-                                TypingDeformMode::Fold,
-                            ] {
-                                ui.selectable_value(&mut self.deform_mode, mode, mode.label());
-                            }
-                        });
-                        if matches!(
-                            self.deform_mode,
-                            TypingDeformMode::Frame | TypingDeformMode::Grid
-                        ) {
-                            ui.add_space(6.0);
-                            ui.label(t!("typing.deform.point_density_label"));
-                            ui.horizontal_wrapped(|ui| {
-                                let max_side_points = TEXT_OVERLAY_DEFORM_SURFACE_COLS
-                                    .min(TEXT_OVERLAY_DEFORM_SURFACE_ROWS);
-                                for side_points in 3..=max_side_points {
-                                    ui.selectable_value(
-                                        &mut self.frame_handle_side_points,
-                                        side_points,
-                                        format!("{side_points}*{side_points}"),
-                                    );
-                                }
-                            });
-                            ui.checkbox(&mut self.pull_neighbor_handles, t!("typing.deform.drag_neighbors"));
-                        }
-                        if self.deform_mode.is_brush_mode() {
-                            ui.add_space(6.0);
-                            ui.add(
-                                WheelSlider::new(
-                                    &mut self.deform_tool_settings.brush_radius_px,
-                                    16.0..=280.0,
-                                )
-                                .text(t!("typing.deform.radius_label")),
-                            );
-                            ui.add(
-                                WheelSlider::new(
-                                    &mut self.deform_tool_settings.brush_strength,
-                                    0.05..=1.5,
-                                )
-                                .text(t!("typing.deform.strength_label")),
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(95, 22, 22, 235))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(255, 110, 110)))
+            .inner_margin(egui::Margin::same(6))
+            .show(ui, |ui| {
+                ui.visuals_mut().override_text_color = Some(Color32::from_rgb(255, 235, 235));
+                ui.horizontal_wrapped(|ui| {
+                    for mode in [
+                        TypingDeformMode::Perspective,
+                        TypingDeformMode::Bend,
+                        TypingDeformMode::Frame,
+                        TypingDeformMode::Grid,
+                        TypingDeformMode::Bulge,
+                        TypingDeformMode::Pinch,
+                        TypingDeformMode::Push,
+                        TypingDeformMode::Twirl,
+                        TypingDeformMode::Restore,
+                        TypingDeformMode::Smooth,
+                        TypingDeformMode::Stretch,
+                        TypingDeformMode::Fold,
+                    ] {
+                        ui.selectable_value(&mut self.deform_mode, mode, mode.label());
+                    }
+                });
+                if matches!(
+                    self.deform_mode,
+                    TypingDeformMode::Frame | TypingDeformMode::Grid
+                ) {
+                    ui.add_space(6.0);
+                    ui.label(t!("typing.deform.point_density_label"));
+                    ui.horizontal_wrapped(|ui| {
+                        let max_side_points =
+                            TEXT_OVERLAY_DEFORM_SURFACE_COLS.min(TEXT_OVERLAY_DEFORM_SURFACE_ROWS);
+                        for side_points in 3..=max_side_points {
+                            ui.selectable_value(
+                                &mut self.frame_handle_side_points,
+                                side_points,
+                                format!("{side_points}*{side_points}"),
                             );
                         }
                     });
+                    ui.checkbox(
+                        &mut self.pull_neighbor_handles,
+                        t!("typing.deform.drag_neighbors"),
+                    );
+                }
+                if self.deform_mode.is_brush_mode() {
+                    ui.add_space(6.0);
+                    ui.add(
+                        WheelSlider::new(&mut self.deform_tool_settings.brush_radius_px, 16.0..=280.0)
+                            .text(t!("typing.deform.radius_label")),
+                    );
+                    ui.add(
+                        WheelSlider::new(&mut self.deform_tool_settings.brush_strength, 0.05..=1.5)
+                            .text(t!("typing.deform.strength_label")),
+                    );
+                }
             });
     }
 
-    /// Task C: compact, collapsible layers list for the current page. Shows the read-only PS raster
-    /// rows (name + visibility) followed by this tab's text/image overlays, which can be reordered
-    /// (up/down) within the page. Reordering rewrites overlay array order, hence persisted z.
-    /// Renders the «Слои» tab BODY (the unified interleaved layer list with per-row ⬆/⬇ move,
-    /// text-preview names, the width-resize, and the 8-row scroll) into the supplied `ui`. The outer
-    /// Area/Frame and the tab header/collapse are provided by the combined Actions/Layers panel (drawn
-    /// from `TypingTopPanelState`). The WIDTH is still user-resizable here and persisted in
-    /// `layers_panel_width`, driving the per-width `max_chars` preview budget. No-op while the layout
-    /// editor is active.
-    /// The current persisted «Слои» list width — lets the combined panel size its Frame so the list's
-    /// inner width-resize can actually widen the panel.
-    pub(in crate::tabs::typing) fn layers_panel_width(&self) -> f32 {
-        self.layers_panel_width
-    }
-
+    /// Renders the «Слои» dock tab BODY: one unified, interleaved list of the page's
+    /// text layers, image layers and read-only PS raster layers, ordered by unified
+    /// band-Z descending, with per-row ⬆/⬇ move and an 8-row inner scroll.
+    ///
+    /// The surrounding panel — position, size, collapse and the tab header — belongs
+    /// to the panel dock (`src/widgets/panel_dock`); this method only fills the `ui`
+    /// it is given. The text-preview character budget follows the ACTUAL width of
+    /// that `ui`, so widening the dock panel widens the previews. No-op while the
+    /// layout editor is active.
     pub(in crate::tabs::typing) fn draw_layers_tab_body(&mut self, ui: &mut egui::Ui, page_idx: usize) {
         if self.layout_editor.is_some() {
             return;
@@ -176,107 +172,94 @@ impl TypingTextOverlayLayer {
         let row_height = (line_height + ui.ctx().global_style().spacing.item_spacing.y).max(1.0);
         let list_height = row_height * LAYERS_PANEL_DEFAULT_ROWS as f32;
 
-        // MIN width = overhead + exactly `LAYERS_PANEL_MIN_PREVIEW_CHARS` chars of preview, so at the
-        // narrowest the preview shows 5 chars and the panel can't shrink further. Clamp the persisted
-        // width up to it.
-        let min_width =
-            LAYERS_PANEL_ROW_OVERHEAD_PX + LAYERS_PANEL_MIN_PREVIEW_CHARS as f32 * char_px;
-        if self.layers_panel_width < min_width {
-            self.layers_panel_width = min_width;
-        }
-        let panel_width = self.layers_panel_width;
-        // Preview char budget from the CURRENT width: how many chars fit after the fixed overhead.
-        let max_chars = preview_char_budget(panel_width - LAYERS_PANEL_ROW_OVERHEAD_PX, char_px);
+        // Preview char budget from the width the dock panel actually gave us: how many
+        // chars fit after the fixed row overhead. `preview_char_budget` floors at
+        // `LAYERS_PANEL_MIN_PREVIEW_CHARS`, so a panel narrower than that degrades to
+        // the 5-char preview instead of collapsing the label away. The panel WIDTH is
+        // resized on the dock's own grip now — there is no inner `egui::Resize` left,
+        // and therefore no `id_salt` revision to keep in sync.
+        let max_chars =
+            preview_char_budget(ui.available_width() - LAYERS_PANEL_ROW_OVERHEAD_PX, char_px);
 
-        let mut new_width = panel_width;
-        // Width-only resize for the list; HEIGHT follows content, capped at ~8 rows by the ScrollArea
-        // (`auto_shrink` lets a short list hug). The combined panel's Frame + the «Слои» tab supply the
-        // surrounding chrome.
-        egui::Resize::default()
-            .id_salt("typing_layers_panel_resize")
-            .resizable([true, false])
-            .default_size(egui::vec2(panel_width, 0.0))
-            .min_size(egui::vec2(min_width, 0.0))
+        // HEIGHT follows content, capped at ~8 rows by this scroll area (`auto_shrink`
+        // lets a short list hug). The dock's own body scroll area handles whatever is
+        // still too tall for the panel.
+        egui::ScrollArea::vertical()
+            .id_salt("typing_layers_list_vscroll")
+            .max_height(list_height)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                new_width = ui.available_width().max(min_width);
-                egui::ScrollArea::vertical()
-                    .max_height(list_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        if ordered_rows.is_empty() {
-                            ui.weak(t!("typing.layers.no_layers_hint"));
-                        }
-                        for row in &ordered_rows {
-                            match *row {
-                                TypingLayerRow::Overlay(ov_idx) => {
-                                    let Some(overlay) = self.overlays.get(ov_idx) else {
-                                        continue;
-                                    };
-                                    let label = match overlay.kind {
-                                        TypingOverlayKind::Text => {
-                                            let text = overlay
-                                                .render_data_json
-                                                .as_ref()
-                                                .and_then(|rd| rd.get("text_params"))
-                                                .and_then(|tp| tp.get("text"))
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("");
-                                            let preview = text_preview_label(text, max_chars);
-                                            if preview.is_empty() {
-                                                t!("typing.layers.text_row_label").to_string()
-                                            } else {
-                                                tf!("typing.layers.text_row_with_preview_label", preview = preview)
-                                            }
-                                        }
-                                        TypingOverlayKind::Image => t!("typing.layers.image_row_label").to_string(),
-                                    };
-                                    let selected = self.selected_overlay_idx == Some(ov_idx);
-                                    // The row carries a preview of the overlay's own
-                                    // chapter text, drawn with the UI font chain, so it
-                                    // needs the extended tier for the same reason the
-                                    // text field does. One call per assembled row label;
-                                    // cheap and idempotent (`ui_fonts::ensure_covers`).
-                                    crate::ui_fonts::ensure_covers(ui.ctx(), &label);
-                                    ui.horizontal(|ui| {
-                                        if ui.button("⬆").clicked() {
-                                            move_row = Some((*row, true));
-                                        }
-                                        if ui.button("⬇").clicked() {
-                                            move_row = Some((*row, false));
-                                        }
-                                        if ui.selectable_label(selected, label).clicked() {
-                                            select_overlay = Some(ov_idx);
-                                        }
-                                    });
+                if ordered_rows.is_empty() {
+                    ui.weak(t!("typing.layers.no_layers_hint"));
+                }
+                for row in &ordered_rows {
+                    match *row {
+                        TypingLayerRow::Overlay(ov_idx) => {
+                            let Some(overlay) = self.overlays.get(ov_idx) else {
+                                continue;
+                            };
+                            let label = match overlay.kind {
+                                TypingOverlayKind::Text => {
+                                    let text = overlay
+                                        .render_data_json
+                                        .as_ref()
+                                        .and_then(|rd| rd.get("text_params"))
+                                        .and_then(|tp| tp.get("text"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let preview = text_preview_label(text, max_chars);
+                                    if preview.is_empty() {
+                                        t!("typing.layers.text_row_label").to_string()
+                                    } else {
+                                        tf!("typing.layers.text_row_with_preview_label", preview = preview)
+                                    }
                                 }
-                                TypingLayerRow::Raster(raster_idx) => {
-                                    let Some(layer) = self
-                                        .raster_layers_by_page
-                                        .get(&page_idx)
-                                        .and_then(|v| v.get(raster_idx))
-                                    else {
-                                        continue;
-                                    };
-                                    let selected = self.selected_raster_idx == Some(raster_idx);
-                                    let label = format!("🖼 {}", layer.name);
-                                    ui.horizontal(|ui| {
-                                        if ui.button("⬆").clicked() {
-                                            move_row = Some((*row, true));
-                                        }
-                                        if ui.button("⬇").clicked() {
-                                            move_row = Some((*row, false));
-                                        }
-                                        if ui.selectable_label(selected, label).clicked() {
-                                            select_raster = Some(raster_idx);
-                                        }
-                                    });
+                                TypingOverlayKind::Image => t!("typing.layers.image_row_label").to_string(),
+                            };
+                            let selected = self.selected_overlay_idx == Some(ov_idx);
+                            // The row carries a preview of the overlay's own
+                            // chapter text, drawn with the UI font chain, so it
+                            // needs the extended tier for the same reason the
+                            // text field does. One call per assembled row label;
+                            // cheap and idempotent (`ui_fonts::ensure_covers`).
+                            crate::ui_fonts::ensure_covers(ui.ctx(), &label);
+                            ui.horizontal(|ui| {
+                                if ui.button("⬆").clicked() {
+                                    move_row = Some((*row, true));
                                 }
-                            }
+                                if ui.button("⬇").clicked() {
+                                    move_row = Some((*row, false));
+                                }
+                                if ui.selectable_label(selected, label).clicked() {
+                                    select_overlay = Some(ov_idx);
+                                }
+                            });
                         }
-                    });
+                        TypingLayerRow::Raster(raster_idx) => {
+                            let Some(layer) = self
+                                .raster_layers_by_page
+                                .get(&page_idx)
+                                .and_then(|v| v.get(raster_idx))
+                            else {
+                                continue;
+                            };
+                            let selected = self.selected_raster_idx == Some(raster_idx);
+                            let label = format!("🖼 {}", layer.name);
+                            ui.horizontal(|ui| {
+                                if ui.button("⬆").clicked() {
+                                    move_row = Some((*row, true));
+                                }
+                                if ui.button("⬇").clicked() {
+                                    move_row = Some((*row, false));
+                                }
+                                if ui.selectable_label(selected, label).clicked() {
+                                    select_raster = Some(raster_idx);
+                                }
+                            });
+                        }
+                    }
+                }
             });
-        // Persist the (clamped) user-chosen width for next frame.
-        self.layers_panel_width = new_width.max(min_width);
 
         if let Some(idx) = select_overlay {
             self.selected_overlay_idx = Some(idx);
@@ -301,126 +284,88 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    /// Draws the floating layout-editor UI while the editor is active. No-op when the editor
-    /// is closed. Delegates to the single mode panel, which merges the mode switch, the
-    /// vector-lines params, and the preview-opacity slider (params + slider shown only in Editing).
-    pub(super) fn draw_layout_editor_panels(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
+    /// Renders the «Редактирование раскладки» dock tab BODY: the Editing/Preview mode
+    /// switch, a red "Выйти", and — only in Editing — the "Векторные" vector-lines params
+    /// plus a "Прозрачность превью" slider bound to
+    /// `TypingLayoutEditorState::preview_opacity`.
+    ///
+    /// The surrounding panel belongs to the panel dock (`src/widgets/panel_dock`); this
+    /// method only fills the `ui` it is given, and the dock only runs it while the editor
+    /// is open. The Editing/Preview switch stays a MODE switch inside the body and is
+    /// deliberately not modelled as two dock tabs: the two modes have different side
+    /// effects (entering Preview re-renders the layer), which a tab header cannot carry.
+    ///
+    /// A settled line-param edit (smoothing / direction / distance mode / flip / add-remove
+    /// line) re-renders the layer via `rerender_layout_editor_overlay`, like an on-canvas
+    /// frame resize.
+    pub(in crate::tabs::typing) fn draw_layout_editor_tab_body(&mut self, ui: &mut egui::Ui) {
         if self.layout_editor.is_none() {
             return;
         }
-        self.draw_layout_editor_mode_panel(ctx, canvas_rect);
-    }
-
-    /// Draws the top-left "Редактирование раскладки" panel: title + red "Выйти" + the
-    /// Editing/Preview toggle, and — only in Editing — the "Векторные" vector-lines params
-    /// (in a bounded scroll area) plus a "Прозрачность превью" slider bound to
-    /// `TypingLayoutEditorState::preview_opacity`. The panel is widened in Editing to fit the params.
-    /// A settled line-param edit (smoothing / direction / distance mode / flip / add-remove line)
-    /// re-renders the layer via `rerender_layout_editor_overlay`, like an on-canvas frame resize.
-    pub(super) fn draw_layout_editor_mode_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
-        let controls_rect =
-            ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
-        let default_pos = controls_rect
-            .map(|rect| egui::pos2(rect.left(), rect.bottom() + 8.0))
-            .unwrap_or(canvas_rect.left_top() + Vec2::new(16.0, 16.0));
-        // Editing hosts the merged vector-lines params + opacity slider, so it needs the
-        // wide panel; Preview only shows the compact mode switch, so it stays narrow.
         let editing = self.layout_editor_editing_active();
-        let panel_width = if editing {
-            TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX
-        } else {
-            TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX
-        };
         // Set by the vector-lines params sub-panel when a line param settles this frame; the layer
-        // is re-rendered after the panel closes (its `&mut self` borrow must end first).
+        // is re-rendered afterwards, once the `&mut self` borrows the drawing takes have ended.
         let mut params_changed = false;
-        egui::Area::new("typing_layout_editor_mode_panel".into())
-            .order(egui::Order::Foreground)
-            .movable(true)
-            .interactable(true)
-            .default_pos(default_pos)
-            .show(ctx, |ui| {
-                ui.set_width(panel_width);
-                egui::Frame::popup(ui.style())
-                    .fill(Color32::from_rgba_unmultiplied(36, 36, 44, 240))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(120, 140, 180)))
-                    .show(ui, |ui| {
-                        ui.set_width(panel_width);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t!("typing.layout_editor.mode_heading"))
-                                    .strong()
-                                    .color(Color32::from_rgb(245, 245, 255)),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let exit = egui::Button::new(
-                                        egui::RichText::new(t!("typing.layout_editor.exit_button")).strong().color(Color32::WHITE),
-                                    )
-                                    .fill(Color32::from_rgb(180, 38, 38));
-                                    if ui.add(exit).clicked() {
-                                        self.exit_layout_editor();
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let mode = self
-                                .layout_editor
-                                .as_ref()
-                                .map(|editor| editor.mode)
-                                .unwrap_or(TypingLayoutEditorMode::Editing);
-                            if ui
-                                .selectable_label(
-                                    mode == TypingLayoutEditorMode::Editing,
-                                    t!("typing.layout_editor.edit_mode_tab"),
-                                )
-                                .clicked()
-                            {
-                                self.enter_layout_editor_editing();
-                            }
-                            if ui
-                                .selectable_label(
-                                    mode == TypingLayoutEditorMode::Preview,
-                                    t!("typing.layout_editor.preview_mode_tab"),
-                                )
-                                .clicked()
-                            {
-                                self.enter_layout_editor_preview(ctx);
-                            }
-                        });
-                        // The vector-lines params and the on-canvas preview-opacity
-                        // control live inside this panel, but only in Editing mode.
-                        if editing {
-                            ui.separator();
-                            ui.label(egui::RichText::new(t!("typing.layout_editor.vector_mode_tab")).strong());
-                            egui::ScrollArea::vertical()
-                                .max_height(360.0)
-                                .show(ui, |ui| {
-                                    if let Some(editor) = self.layout_editor.as_mut() {
-                                        params_changed |=
-                                            draw_layout_editor_vector_lines_tab(ui, editor);
-                                    }
-                                });
-                            ui.separator();
-                            ui.label(t!("typing.layout_editor.preview_opacity_label"));
-                            if let Some(editor) = self.layout_editor.as_mut() {
-                                ui.add(
-                                    egui::Slider::new(&mut editor.preview_opacity, 0.0..=1.0)
-                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                        .show_value(true),
-                                );
-                            }
-                        }
-                    });
+        ui.horizontal(|ui| {
+            let mode = self
+                .layout_editor
+                .as_ref()
+                .map(|editor| editor.mode)
+                .unwrap_or(TypingLayoutEditorMode::Editing);
+            if ui
+                .selectable_label(
+                    mode == TypingLayoutEditorMode::Editing,
+                    t!("typing.layout_editor.edit_mode_tab"),
+                )
+                .clicked()
+            {
+                self.enter_layout_editor_editing();
+            }
+            if ui
+                .selectable_label(
+                    mode == TypingLayoutEditorMode::Preview,
+                    t!("typing.layout_editor.preview_mode_tab"),
+                )
+                .clicked()
+            {
+                self.enter_layout_editor_preview(ui.ctx());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let exit = egui::Button::new(
+                    egui::RichText::new(t!("typing.layout_editor.exit_button"))
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(Color32::from_rgb(180, 38, 38));
+                if ui.add(exit).clicked() {
+                    self.exit_layout_editor();
+                }
             });
-        // A settled line-param edit on the panel re-renders the layer, matching the on-canvas
-        // frame-resize / point-edit path. The `&mut self` borrow held by the panel above has
-        // ended here, so re-rendering (which also needs `&mut self`) is safe.
+        });
+        // The vector-lines params and the on-canvas preview-opacity control live in this
+        // body, but only in Editing mode. No inner scroll area: the dock panel's own body
+        // scroll owns the overflow, and a second bounded one would trap the wheel.
+        if editing {
+            ui.separator();
+            ui.label(egui::RichText::new(t!("typing.layout_editor.vector_mode_tab")).strong());
+            if let Some(editor) = self.layout_editor.as_mut() {
+                params_changed |= draw_layout_editor_vector_lines_tab(ui, editor);
+            }
+            ui.separator();
+            ui.label(t!("typing.layout_editor.preview_opacity_label"));
+            if let Some(editor) = self.layout_editor.as_mut() {
+                ui.add(
+                    WheelSlider::new(&mut editor.preview_opacity, 0.0..=1.0)
+                        .wheel_step(0.05)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .show_value(true),
+                );
+            }
+        }
+        // A settled line-param edit re-renders the layer, matching the on-canvas
+        // frame-resize / point-edit path.
         if params_changed {
-            self.rerender_layout_editor_overlay(ctx);
+            self.rerender_layout_editor_overlay(ui.ctx());
         }
     }
 

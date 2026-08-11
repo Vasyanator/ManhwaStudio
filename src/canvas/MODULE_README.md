@@ -252,6 +252,11 @@ X range before the old overflow point.
   inside the specific `CanvasView`.
 - Canvas scroll areas need per-instance egui ids. Cross-tab viewport sync must go through
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
+- `CANVAS_LEFT_TOP_CONTROLS_AREA_ID` (`mod.rs`) is the ONE definition of the top-left controls
+  panel's `Id`. Tabs place their own floating UI under that panel by reading its last-frame area
+  rect out of `egui::Memory`, so a second literal elsewhere would silently drift; import the
+  constant instead. Its rect is also exposed directly as
+  `CanvasView::canvas_left_top_controls_rect`.
 - The canvas does NOT load fonts. Bubble text is drawn with the egui family named by
   `helpers::BUBBLE_TEXT_FONT_FAMILY_NAME`, which is an alias of
   `crate::ui_fonts::BUBBLE_TEXT_FAMILY_NAME`; the chain behind that family is installed once

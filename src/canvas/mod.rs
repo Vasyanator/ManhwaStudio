@@ -317,6 +317,16 @@ const IMAGE_BUBBLE_META_THROTTLE: Duration = Duration::from_secs(1);
 /// sampling is wanted to read individual source pixels.
 pub(crate) const PIXEL_INSPECTION_MIN_DEVICE_PX: f32 = 4.0;
 
+/// `Id` source of the canvas' own top-left controls panel (page counter, zoom,
+/// bubble toggles), drawn by `scene.rs`.
+///
+/// The panel belongs to `CanvasView`, so this is the ONE definition of its id:
+/// other tabs read its last-frame rect out of `egui::Memory` to place their own
+/// floating UI under it (the panel dock exposes it as
+/// `PanelAnchor::CanvasControls`), and a second literal would silently drift.
+/// Not localizable — an `Id` source, see `dev-docs/i18n_exclusions.md`.
+pub(crate) const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
+
 /// Device pixels rendered per source pixel for a given canvas zoom and DPI.
 ///
 /// `zoom` is screen points per source pixel; `pixels_per_point` is device
