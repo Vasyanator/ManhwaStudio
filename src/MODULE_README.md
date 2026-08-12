@@ -276,6 +276,10 @@ prompts instead of blocking the GUI thread.
   or project paths in feature modules.
 - Image cache retention decisions should use `memory_manager.rs` policy objects. Cache owners keep
   pixels and texture handles local and must not move them into the manager.
+- Floating panels are declared as tabs of the panel dock (`widgets/panel_dock/`, widgets
+  `CollapsiblePanel` + `PanelTab`), never as a hand-rolled `Area + Frame::popup` panel or an
+  `egui::Window`. Edge-glued `egui::Panel` and overlay `Area`s (toasts, tooltips, scene overlays)
+  are unaffected. See `widgets/MODULE_README.md` and `egui-docs/01-app-shell.md` §3.1.
 - Rust code that discovers Python, starts Python scripts/daemons, or builds activation snippets
   must go through `python_manager.rs`. Long-lived Python daemons must use its managed spawn helper
   so Windows assigns them to a kill-on-close Job Object.

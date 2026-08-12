@@ -54,6 +54,15 @@ model/backend calls, text rendering, export, or synchronous save-heavy workflows
   large parsing, export, or worker joins.
 - Shared model locks must be short-lived and released before callbacks, canvas rendering, disk
   writes, or expensive computation.
+- Every FLOATING panel of a tab (a surface hovering over the canvas with a title strip, not an
+  edge-glued `egui::Panel`) must be a TAB OF THE PANEL DOCK: `CollapsiblePanel` + `PanelTab` from
+  `widgets/panel_dock/`, declared through `PanelDock::begin` → `.tab(id)` → `.end(&mut cx)`. A
+  hand-rolled `Area + Frame::popup` panel or an `egui::Window` used as a panel is a defect — it
+  loses docking, collapse, persistence, and tear-off into an OS window. `typing/tab.rs` is the
+  reference call site; `egui-docs/01-app-shell.md` §3.1 is the recipe. The floating surfaces of
+  `cleaning/`, `translation/`, and `ps_editor/` are not migrated yet — that is phased debt, not an
+  exemption for new panels. `Area` stays legitimate for toasts, tooltips, and scene-anchored
+  overlays.
 - New maintained source subdirectories under `tabs/` need their own `MODULE_README.md`.
 
 ## Editing map

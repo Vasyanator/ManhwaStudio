@@ -360,7 +360,10 @@ the docs, not from habit:**
   fits**, and only build a new one when nothing fits - then say why.
 * Some choices are already made for you and are not open to re-litigation: `egui::Slider`,
   `egui::ComboBox`, and `egui::DragValue` are **forbidden** in product UI - use the
-  `Wheel*` replacements (`04-widgets.md` §0). An AI-gated action uses `AiButton`, not a
+  `Wheel*` replacements (`04-widgets.md` §0.2). **Any floating panel is a tab of the panel
+  dock** - `CollapsiblePanel` + `PanelTab` from `src/widgets/panel_dock/` are mandatory, and
+  a hand-rolled `Area + Frame::popup` panel or an `egui::Window` used as a panel is a defect
+  (`01-app-shell.md` §3.1, `04-widgets.md` §0.1). An AI-gated action uses `AiButton`, not a
   hand-threaded `add_enabled(..)`. A settings pane shared by studio and launcher uses the
   double-interface pattern (`04-widgets.md` §7).
 * A new widget inherits the project's contracts: no literal user-visible strings

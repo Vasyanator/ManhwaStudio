@@ -31,6 +31,13 @@ that we paint through a `Painter` and never allocate a widget there (§3).
 `Area::new(Id)` (egui-0.35.0/src/containers/area.rs:133); `Area::show(ctx, …)` takes a **`&Context`**
 (area.rs:406), unlike `Panel::show` which takes a `&mut Ui`.
 
+**Scope, before you reach for it:** `Area` is for decoration and transient surfaces the user cannot
+dock, resize, or persist — toasts, tooltips, scene-anchored overlays, the tutorial blocker. It is
+**not** how a floating panel is made in this project: a panel with a title strip, a collapse arrow
+and a remembered position is a tab of the panel dock (`src/widgets/panel_dock/`, mandatory — see
+`01-app-shell.md` §3.1 and `04-widgets.md` §0.1). The dock itself uses `Area` under the hood; your
+call site does not.
+
 Builders that matter for overlays:
 
 * `.order(Order)` — area.rs:235.

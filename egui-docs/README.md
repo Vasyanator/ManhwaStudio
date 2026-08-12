@@ -41,6 +41,7 @@ This folder exists so that no agent ever has to guess.
 |---|---|
 | write *any* egui code after a break | [`00-version-map.md`](00-version-map.md) — what you remember vs. what exists |
 | add a window, panel, tab, or the app's `fn ui` | [`01-app-shell.md`](01-app-shell.md) |
+| add a **floating** panel to a workspace tab | [`01-app-shell.md` §3.1](01-app-shell.md) — it is a dock tab, never an `Area` or a `Window` |
 | draw on a canvas: shapes, meshes, textures, images | [`02-painting.md`](02-painting.md) |
 | handle clicks, drags, the mouse wheel, or hotkeys | [`03-input.md`](03-input.md) |
 | add a widget, a settings pane, or a slider/combobox | [`04-widgets.md`](04-widgets.md) |
@@ -72,7 +73,11 @@ and still counts as a defect.
 
 - **Do not use `egui::Slider` / `egui::ComboBox` / `egui::DragValue` directly in
   product UI.** Use the `Wheel*` widgets from `src/widgets/` (`README_AGENT.md`,
-  §"Виджеты"). See `04-widgets.md` §0.
+  §"Виджеты"). See `04-widgets.md` §0.2.
+- **Do not build a floating panel out of `Area` + `Frame::popup`, and do not use
+  `egui::Window` as one.** Every floating panel of the studio is declared as a tab of
+  the panel dock (`CollapsiblePanel` + `PanelTab`, `src/widgets/panel_dock/`). See
+  `01-app-shell.md` §3.1 and `04-widgets.md` §0.1.
 - **No literal user-visible strings.** Everything goes through `t!` / `tf!` / `tp!`.
   See `05-ids-and-i18n.md` §3.
 - **A localized label requires a stable `id_salt`.** egui derives widget `Id` from the
@@ -87,7 +92,7 @@ and still counts as a defect.
 egui-docs/
   README.md            this file — entry point and routing
   00-version-map.md    stale-memory API -> real 0.35 API, with removal proofs
-  01-app-shell.md      eframe::App, panels, viewports, startup, fonts, theme
+  01-app-shell.md      eframe::App, panels (incl. the floating-panel rule), viewports, startup
   02-painting.md       Painter, Shape, Mesh, Color32, ColorImage, textures
   03-input.md          InputState, pointer, Sense, Response, keyboard, hotkeys
   04-widgets.md        the project widget set; atoms; the forbidden egui widgets

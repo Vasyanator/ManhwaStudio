@@ -121,6 +121,68 @@ egui::CentralPanel::default().show(ui, |ui| {
 });
 ```
 
+## 3.1 Floating panels are NOT egui panels — hard project rule
+
+Everything in §3 is about panels **glued to an edge of the window**: the tab bar, the PS-editor
+tool column, the central canvas. Those stay `egui::Panel`.
+
+A **floating** panel — one that hovers over the canvas, has a title strip, collapses, and can be
+moved by the user — is not an egui construct here at all. There is exactly one way to make one:
+
+> Declare a **tab** on the panel dock. Never write `Area` + `Frame::popup` with a hand-rolled
+> collapse arrow, and never use `egui::Window` as a panel.
+
+The dock is `src/widgets/panel_dock/` (contract: `dev-docs/dockable_panels_plan.md`, details:
+`src/widgets/panel_dock/MODULE_README.md`). Its two widgets are mandatory, not preferred:
+`PanelTab` (src/widgets/panel_dock/tab.rs:43) declares one tab, `CollapsiblePanel`
+(src/widgets/panel_dock/panel.rs:232) draws one panel. **You never construct either directly** —
+the frame driver does. You call `PanelDock::begin` → `.tab(id)` … → `.end(&mut cx)`
+(src/widgets/panel_dock/mod.rs:644, :663, :718).
+
+You declare **tabs, not panels.** Which panel a tab lands in, where that panel sits, whether it is
+docked to another one or torn off into its own OS window — all of that belongs to the user's saved
+layout, not to your call site:
+
+```rust
+// src/tabs/typing/tab.rs:1814 — the canonical call site
+let mut dock = PanelDock::begin(ctx, dock_state, DockArea {
+    rect: area_rect,                  // where panels may live (the canvas area)
+    canvas_controls,                  // extra snap target, not a dock panel itself
+    layout_key: AppTab::Typing.key(), // NEVER a localized tab title
+});
+dock.tab(TYPING_PREVIEW_TAB)
+    .title(|| t!("typing.preview.panel_heading")) // localized title, literal TabId
+    .visible(tabs_visible.preview)                // a hidden tab is simply not declared this frame
+    .min_size(TYPING_PREVIEW_TAB_MIN_SIZE_PX)
+    .initial_size(/* … */)                        // FIRST run only; afterwards the layout wins
+    .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_preview_tab_body(ui));
+// … the other tabs …
+drop(dock.end(&mut cx));
+```
+
+Consequences worth knowing before you write the body:
+
+* **`TabId` is a literal `&'static str`** and is persisted. It must never come from a localized
+  title — a language switch would orphan the user's layout.
+* **The body is `FnOnce(&mut Ui, &mut C)`** and captures nothing. `end(cx)` hands your per-frame
+  context to one body at a time, which is the only reason several tabs of one frame can touch the
+  same heavy state without cloning it or wrapping it in `RefCell`.
+* **`initial_size`/`min_size` seed the first frame only.** After that the size is the user's, it is
+  persisted, and the solver may shrink it. Do not fight it by forcing a size in the body.
+* **The body scrolls on both axes by itself.** Do not add your own `ScrollArea` around the whole
+  body; you would nest two scroll areas and the outer one would win.
+* **Panels live on `Order::Foreground`.** Canvas input gating is z-order based
+  (`crate::input_util::pointer_over_floating_area`), so a panel lowered below that order stops
+  shielding the canvas underneath it and clicks fall through onto the artwork.
+
+What is still legitimately an `Area`: toasts, tooltips, scene-anchored overlays, the tutorial
+blocker — decoration and transient surfaces that the user cannot dock, resize, or persist. See
+`06-overlays.md`.
+
+Migration state: the «Текст» tab is fully on the dock (8 tabs). The remaining floating surfaces of
+cleaning / translation / ps_editor move over in phases. **A surface not yet migrated is not a
+precedent** — new panels have no exemption.
+
 ## 4. Startup: `run_native` / `NativeOptions` / `ViewportBuilder` / `CreationContext`
 
 ```rust
@@ -210,6 +272,12 @@ Gotchas, all verified in the source docs:
 Other users of the pattern: src/launcher/psd_import_window.rs via src/launcher/app.rs:699,
 src/launcher/new_project/window.rs:2047 (screen capture) and :6757
 (src/launcher/new_project/batch_processing/window.rs).
+
+**Do not open a viewport for a floating panel.** A panel torn off into its own OS window is still a
+dock tab; the dock owns that window (`src/widgets/panel_dock/window.rs`), draws one
+`show_viewport_immediate` per sub-window every frame, persists it, and closes it when its last panel
+leaves. Rolling your own viewport for a panel would take it out of the layout, out of persistence,
+and out of the user's «Переместить в окно →» menu. See §3.1.
 
 ## 6. Repaint model
 
@@ -304,3 +372,7 @@ the result actually happens. The font loader above is the canonical example.
 * To change fonts (which files load, family names, fallback order): `src/ui_fonts.rs` and
   `fonts/ui/MODULE_README.md`.
 * To change the PS-editor panel layout (top/left/right/central): `src/tabs/ps_editor/mod.rs:1698-1851`.
+* To add or change a **floating** panel of a workspace tab: declare a dock tab at that tab's call
+  site (`src/tabs/typing/tab.rs:1814` is the reference) — never a new `Area`. To change docking
+  behaviour itself (gaps, shrinking, drag, sub-windows): `src/widgets/panel_dock/`, its
+  `MODULE_README.md` first.

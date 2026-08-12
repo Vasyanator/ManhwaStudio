@@ -5,7 +5,29 @@ Target: `egui`/`eframe` **0.35.0** from crates.io. All egui claims below are cit
 `~/.cargo/registry/src/index.crates.io-*/egui-0.35.0/src/`. Do not write egui code from
 memory of 0.27-0.31 — several APIs on this page did not exist then.
 
-## 0. The hard project rule (read first)
+## 0. The hard project rules (read first)
+
+### 0.1 Floating panels belong to the panel dock
+
+**Do NOT build a floating panel out of `Area` + `Frame::popup`, and do NOT use `egui::Window` as
+one.** Every floating panel of the studio is declared as a **tab** of the panel dock — the two
+widgets `CollapsiblePanel` (`src/widgets/panel_dock/panel.rs:232`) and `PanelTab`
+(`src/widgets/panel_dock/tab.rs:43`) are **mandatory**, and you reach them through the frame driver
+`PanelDock::begin` → `.tab(id)` → `.end(&mut cx)` (`src/widgets/panel_dock/mod.rs:644`) rather than
+constructing them yourself. Full call-site recipe and rationale: `01-app-shell.md` §3.1; the rule as
+written: `README_AGENT.md` §"Панельный док" and `src/widgets/panel_dock/MODULE_README.md`.
+
+Why — a hand-rolled panel silently loses everything the user expects of a panel: docking with a
+stable gap, snapping, collapse, a persisted position and size, tear-off into an OS sub-window, the
+«Переместить в окно →» menu, and the shrink-instead-of-overflow behaviour when the viewport gets
+small. None of that is visible in the type system either.
+
+Legitimate `Area` users are decoration and transient surfaces the user cannot dock or persist —
+toasts, tooltips, scene-anchored overlays, the tutorial blocker (`06-overlays.md`). Un-migrated
+floating surfaces in cleaning / translation / ps_editor are debt on a phased migration, **not a
+precedent**: new panels have no exemption.
+
+### 0.2 No stock `Slider` / `ComboBox` / `DragValue`
 
 **Do NOT use `egui::Slider` or `egui::ComboBox` directly in product UI** — use the `Wheel*`
 replacements from `src/widgets/`. That is the rule as written in `README_AGENT.md:616`. It
@@ -49,6 +71,7 @@ Public surface is `src/widgets/mod.rs:43-72`; the module contract is
 | `AiButton` | `src/widgets/ai_button.rs:31-96` | Button for an AI tool that gates itself on runtime capabilities (§3). |
 | `ViewportColorSelector` | `src/widgets/viewport_color_selector.rs:28` | Color swatch + eyedropper that samples a viewport pixel through egui screenshot events. Stateful, owns a screenshot token. |
 | `MarkedScrollArea` | `src/widgets/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
+| `PanelTab` + `CollapsiblePanel` | `src/widgets/panel_dock/` | The **only** way to make a floating panel (§0.1). Declared per frame through `PanelDock`, never constructed directly. Owns collapse, docking, resize, persistence and tear-off into an OS window. |
 
 ## 2. `wheel_input_guard.rs` — the process-global popup guard
 
