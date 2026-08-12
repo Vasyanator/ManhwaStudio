@@ -18,9 +18,9 @@ What is covered:
 - untracked files are never touched by any path
 - Invoke-Git                            -> stderr never lands in Output
 - Test-ObjectId / Convert-ToCount       -> only well-formed values are accepted
-- self-fingerprints                     -> contaminated output degrades to '?',
-                                           '?' on either side is not a change
-- EOL repair pass                       -> never touches a file with real edits
+- array returns                         -> 0/1/many survive the call boundary
+- self-update detection                 -> git names the run-dev paths an update
+                                           touched; exit 8 only when it did
 - stash guard                           -> a pop never restores somebody else's entry
 
 Run:  pwsh -NoProfile -File tools/run-dev/test_run_dev.ps1
@@ -34,6 +34,8 @@ Windows-only and are deliberately not exercised.
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
+# Russian test names are unreadable in the console's OEM code page otherwise.
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $SelfDir = Split-Path -Parent $PSCommandPath
 $script:Pass = 0
@@ -66,6 +68,11 @@ git config --file $env:GIT_CONFIG_GLOBAL init.defaultBranch master
 try {
     . (Join-Path $SelfDir 'run-dev.ps1')
 
+    # run-dev.ps1 sets 'Stop' at script scope, and dot-sourcing brings that here.
+    # Under 'Stop' every native command that writes to stderr — `git clone` on an
+    # empty repository, for one — becomes a terminating error and kills the run.
+    $ErrorActionPreference = 'Continue'
+
     # Silence the script's own chatter; tests assert on state, not on prose.
     function Say  { param([string] $Text = '') }
     function Step { param([string] $Text) }
@@ -73,9 +80,16 @@ try {
     function Warn { param([string] $Text) }
     function Info { param([string] $Text) }
 
-    # `Die` must not kill the test process; record the code and unwind instead.
+    # `Die` / `Exit-WithBanner` must not kill the test process; record the code and
+    # unwind instead. Both are stubbed: the restart notice goes through the banner
+    # directly, not through Die.
     function Die {
         param([int] $Code, [string[]] $Lines)
+        $script:LastDieCode = $Code
+        throw "DIE:$Code"
+    }
+    function Exit-WithBanner {
+        param([int] $Code, [string] $Title, [System.ConsoleColor] $Color, [string[]] $Lines)
         $script:LastDieCode = $Code
         throw "DIE:$Code"
     }
@@ -317,101 +331,92 @@ try {
     Check 'стек stash при этом не тронут' (@(git stash list).Count) 1
 
     # ---------------------------------------------------------------------
-    Note 'Починка концов строк не трогает настоящие правки'
+    Note 'Возврат массива из функции: 0, 1 и много элементов'
     # ---------------------------------------------------------------------
 
-    # Repair-SelfEol переписывает файл только когда git считает его изменённым,
-    # а diff пуст (чистое несоответствие концов строк). Настоящая правка обязана
-    # остаться нетронутой.
-    # Only root-level self-files are asserted on: $SelfFiles spells the nested
-    # ones with backslashes, which resolve to a real path on Windows only, and
-    # this file is meant to run under pwsh on either platform.
-    $eol = Join-Path $Sandbox 'eolrepo'
-    [void](New-Item -ItemType Directory -Path $eol -Force)
-    Set-Location $eol
+    # Регрессия на исходную причину ложных перезапусков: `return ,$a` отдаёт
+    # ВНУТРЕННИЙ массив одним объектом, поэтому @(вызов) всегда даёт Count=1 —
+    # даже для пустого массива. Конвенция проекта: возвращать массив как есть,
+    # принимать через @(...). См. tools/run-dev/MODULE_README.md.
+    function Test-ReturnEmpty { $a = @();        return $a }
+    function Test-ReturnOne   { $a = @('x');     return $a }
+    function Test-ReturnMany  { $a = @('x','y'); return $a }
+    function Test-ReturnComma { $a = @();        return ,$a }
+
+    Check 'пустой массив -> Count 0'   (@(Test-ReturnEmpty)).Count 0
+    Check 'один элемент  -> Count 1'   (@(Test-ReturnOne)).Count   1
+    Check 'много         -> Count 2'   (@(Test-ReturnMany)).Count  2
+    Check 'элемент остаётся строкой'   (@(Test-ReturnOne))[0] 'x'
+    # Именно так выглядел баг: запрещённая форма даёт Count=1 на пустом массиве.
+    Check 'запрещённая форма ,$a ломает пустой случай' (@(Test-ReturnComma)).Count 1
+
+    # ---------------------------------------------------------------------
+    Note 'Какие файлы run-dev затронуло обновление — спрашиваем у git'
+    # ---------------------------------------------------------------------
+
+    # Механизм: HEAD до обновления сравнивается с HEAD после, и git сам называет
+    # затронутые пути. Пути задаются в git-нотации (прямые слэши).
+    $selfwc = Join-Path $Sandbox 'selfupd'
+    [void](New-Item -ItemType Directory -Path (Join-Path $selfwc 'tools/run-dev') -Force)
+    Set-Location $selfwc
     git init -q
-    Set-Content 'run-dev.Linux.sh'    'launcher' -NoNewline
-    Set-Content 'run-dev.Windows.bat' 'bat'      -NoNewline
-    git add -A; git commit -qm 'self files'
-    $script:RepoRoot = $eol
-    $script:Git      = 'git'
-    Set-Content 'run-dev.Windows.bat' 'НАСТОЯЩАЯ ПРАВКА' -NoNewline
-    Repair-SelfEol
-    Check 'файл с настоящей правкой не тронут' `
-          (Get-Content 'run-dev.Windows.bat' -Raw).Trim() 'НАСТОЯЩАЯ ПРАВКА'
-    Check 'нетронутый файл остался прежним' `
-          (Get-Content 'run-dev.Linux.sh' -Raw).Trim() 'launcher'
-    Repair-SelfEol
-    Check 'проход идемпотентен' `
-          (Get-Content 'run-dev.Windows.bat' -Raw).Trim() 'НАСТОЯЩАЯ ПРАВКА'
+    Set-Content 'tools/run-dev/run-dev.sh'  'core'     -NoNewline
+    Set-Content 'tools/run-dev/run-dev.ps1' 'windows'  -NoNewline
+    Set-Content 'run-dev.Linux.sh'          'launcher' -NoNewline
+    Set-Content 'src.txt'                   'other'    -NoNewline
+    git add -A; git commit -qm 'base'
 
-    # Сломанный внешний diff: git пишет только в stderr и выходит ненулевым кодом.
-    # Пустой stdout НЕ должен читаться как «diff пуст» — иначе checkout уничтожит
-    # несохранённые правки пользователя.
-    $env:GIT_EXTERNAL_DIFF = Join-Path $Sandbox 'no-such-diff-tool'
-    Repair-SelfEol
-    Check 'сломанный GIT_EXTERNAL_DIFF не приводит к затиранию' `
-          (Get-Content 'run-dev.Windows.bat' -Raw).Trim() 'НАСТОЯЩАЯ ПРАВКА'
-    Remove-Item Env:GIT_EXTERNAL_DIFF
-    git checkout -q -- 'run-dev.Windows.bat'
+    $script:RepoRoot        = $selfwc
+    $script:Git             = 'git'
+    $script:AdoptedReplaced = $false
+    $script:PreHead         = (git rev-parse HEAD).Trim()
 
-    # Конфликт слияния (XY = UU) — не «несоответствие концов строк», трогать нельзя.
-    git checkout -q -b other
-    Set-Content 'run-dev.Linux.sh' 'ветка other' -NoNewline
-    git commit -q -am 'other'
-    git checkout -q master
-    Set-Content 'run-dev.Linux.sh' 'ветка master' -NoNewline
-    git commit -q -am 'master'
-    git merge -q other 2>$null
-    Check 'конфликт действительно создан' `
-          ((git status --porcelain --untracked-files=no -- 'run-dev.Linux.sh') -replace '^(..).*', '$1') 'UU'
-    Repair-SelfEol
-    Check 'конфликтующий файл не тронут' `
-          (@(Select-String -Path 'run-dev.Linux.sh' -Pattern '<<<<<<<').Count) 1
-    git merge --abort 2>$null
+    Check 'HEAD не сдвинулся — список пуст' (@(Get-ChangedSelfPaths)).Count 0
 
-    # ---------------------------------------------------------------------
-    Note 'Отпечатки самих скриптов run-dev'
-    # ---------------------------------------------------------------------
+    Set-Content 'src.txt' 'other changed' -NoNewline
+    git commit -qam 'чужой коммит'
+    Check 'обновление мимо run-dev — список пуст' (@(Get-ChangedSelfPaths)).Count 0
 
-    git checkout -q -- 'run-dev.Windows.bat'
-    $fp1 = Get-SelfFingerprints
-    Check 'снимок покрывает все исполняемые файлы' $fp1.Count 5
-    Check 'отсутствующий файл помечен как -'       $fp1['run-dev.MacOS.command'] '-'
-    Check 'присутствующий файл имеет объектный id' (Test-ObjectId $fp1['run-dev.Linux.sh']) $true
-    Check 'повторный снимок идентичен' (@(Get-ChangedSelfFiles -Before $fp1 -After (Get-SelfFingerprints))).Count 0
+    Set-Content 'tools/run-dev/run-dev.sh' 'core updated' -NoNewline
+    git commit -qam 'правка run-dev'
+    $changed = @(Get-ChangedSelfPaths)
+    Check 'затронут файл run-dev — git называет его' $changed.Count 1
+    Check 'путь в git-нотации' $changed[0] 'tools/run-dev/run-dev.sh'
 
-    Set-Content 'run-dev.Linux.sh' 'изменено обновлением' -NoNewline
-    $fp2 = Get-SelfFingerprints
-    $changed = @(Get-ChangedSelfFiles -Before $fp1 -After $fp2)
-    Check 'изменение скрипта замечено'    $changed.Count 1
-    Check 'назван именно изменённый файл' $changed[0] 'run-dev.Linux.sh'
+    Set-Content 'run-dev.Linux.sh'          'launcher updated' -NoNewline
+    Set-Content 'tools/run-dev/run-dev.ps1' 'windows updated'  -NoNewline
+    git commit -qam 'правка нескольких лаунчеров'
+    Check 'перечислены все затронутые файлы' `
+          ((@(Get-ChangedSelfPaths) | Sort-Object) -join ' ') `
+          'run-dev.Linux.sh tools/run-dev/run-dev.ps1 tools/run-dev/run-dev.sh'
 
-    # '?' с ЛЮБОЙ стороны — «неизвестно», а не «изменилось»: сбой git между
-    # снимками не должен фабриковать требование перезапуска.
-    $unknown = @{}
-    foreach ($k in $fp1.Keys) { $unknown[$k] = '?' }
-    Check 'сбой git с одной стороны — не изменение' `
-          (@(Get-ChangedSelfFiles -Before $fp1 -After $unknown)).Count 0
-    Check 'сбой git с другой стороны — тоже не изменение' `
-          (@(Get-ChangedSelfFiles -Before $unknown -After $fp1)).Count 0
-
-    # Загрязнённый вывод git не должен становиться «отпечатком»: он не сравним
-    # сам с собой на следующем запуске.
-    $realInvokeGit = ${function:Invoke-Git}
-    function Invoke-Git {
-        param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
-        return [pscustomobject]@{
-            ExitCode = 0
-            Output   = "warning: in the working copy of 'x', LF will be replaced by CRLF"
-            Error    = ''
+    # Runs Assert-NoSelfUpdate, returning the code Exit-WithBanner would exit with.
+    function Invoke-SelfCheck {
+        $script:LastDieCode = 0
+        try { Assert-NoSelfUpdate | Out-Null } catch {
+            if ("$_" -notlike '*DIE:*') { throw }
         }
+        return $script:LastDieCode
     }
-    $polluted = Get-SelfFingerprints
-    ${function:Invoke-Git} = $realInvokeGit
-    Check 'текст вместо хэша отбраковывается' $polluted['run-dev.Linux.sh'] '?'
-    Check 'мусорный снимок не считается изменением' `
-          (@(Get-ChangedSelfFiles -Before $fp1 -After $polluted)).Count 0
+
+    Check 'run-dev обновился -> код 8' (Invoke-SelfCheck) 8
+
+    $script:PreHead = (git rev-parse HEAD).Trim()
+    Check 'HEAD на месте -> продолжаем' (Invoke-SelfCheck) 0
+
+    Set-Content 'src.txt' 'other changed again' -NoNewline
+    git commit -qam 'снова чужой коммит'
+    Check 'обновление мимо run-dev -> продолжаем' (Invoke-SelfCheck) 0
+
+    $script:PreHead = ''
+    Check 'HEAD не запоминался (-NoUpdate) -> продолжаем' (Invoke-SelfCheck) 0
+
+    # Ветка adoption: базового коммита нет, решение принимает сама стадия.
+    $script:PreHead         = (git rev-parse HEAD).Trim()
+    $script:AdoptedReplaced = $true
+    Check 'adoption заменил файлы -> код 8' (Invoke-SelfCheck) 8
+    $script:AdoptedReplaced = $false
+
 
 } finally {
     Set-Location ([System.IO.Path]::GetTempPath())

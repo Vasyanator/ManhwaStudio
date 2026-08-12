@@ -20,10 +20,10 @@ The algorithm, every branch of it, and the rationale for each decision are speci
 Three stages, in order, identical on all platforms:
 
 ```
-Stage 1 (git)   locate git -> fingerprint the run-dev files -> adopt a non-repo ZIP copy
-                -> fetch -> merge
-   (in main)    re-fingerprint: stop with exit 8 if run-dev itself changed. Deliberately at
-                the call site, not inside the stage: Stage 1 has many early returns
+Stage 1 (git)   locate git -> remember HEAD -> adopt a non-repo ZIP copy -> fetch -> merge
+   (in main)    HEAD moved? ask git which run-dev paths the range touched; exit 8 if any.
+                Deliberately at the call site, not inside the stage: Stage 1 has many
+                early returns
 Stage 2 (rust)  read MSRV from Cargo.toml -> pick/provision toolchain -> check C compiler
 Stage 3 (run)   phase 1: cargo run ... -- --check-venv --ignore-installed   (builds; GUI only
                          when the environment is incomplete; non-zero -> exit 7)
@@ -61,7 +61,7 @@ committed and never shows up as a local change during Stage 1:
   BOM-less script as the system ANSI code page and mangles every Russian message. Edit here for
   anything Windows-specific, including MinGit and MinGW-w64 provisioning.
 - `test_run_dev.sh`: contract tests for the git stage, the version helpers, and the self-update
-  fingerprints. Sources `run-dev.sh` with `MS_RUN_DEV_SOURCE_ONLY=1` and drives its functions
+  detection. Sources `run-dev.sh` with `MS_RUN_DEV_SOURCE_ONLY=1` and drives its functions
   against throwaway repositories in a temp dir. No network, no cargo, no contact with the user's
   repository. Run: `bash tools/run-dev/test_run_dev.sh`.
 - `test_run_dev.ps1`: the same contract, asserted against `run-dev.ps1` so the two implementations
@@ -98,33 +98,40 @@ committed and never shows up as a local change during Stage 1:
 - **The C toolchain is probed before cargo runs.** `aws-lc-sys` (`translators`/`genai` → `reqwest`
   → `rustls` → `aws-lc-rs`) compiles C and assembly on every native target, so it is a real
   prerequisite; probing converts a wall of linker errors 200 crates deep into one clear message.
-- **An update that rewrites run-dev stops the run (exit 8), it does not continue.** The executed
-  files are fingerprinted with `git hash-object --no-filters` before Stage 1 touches the tree and
-  again after it; any difference means the running process is stale. Nothing is rolled back — the
-  update is applied and correct, only a restart is needed. The fingerprinted set is the five
-  executed files, not the whole module: changing `test_run_dev.sh` or this document cannot affect a
-  run in flight.
-- **`--no-filters` on `git hash-object` is not optional.** With the filter applied, `core.autocrlf`
-  (true by default on Git for Windows) makes a CRLF and an LF copy of the same file hash
-  identically, so a line-ending-only rewrite of `run-dev.Windows.bat` — the one file where that is
-  fatal — would be invisible. A `?` fingerprint means "unknown" on either side of the comparison and
-  never counts as a change, so a transient git failure cannot fabricate a restart request.
+- **An update that changes run-dev stops the run (exit 8), it does not continue.** The question is
+  put to git, not to the filesystem: HEAD is remembered before Stage 1, and afterwards
+  `git diff --name-only <pre-HEAD> HEAD -- <self paths>` names what the update touched. HEAD
+  unchanged means nothing was updated and nothing is checked. Nothing is rolled back — the update is
+  applied and correct, only a restart is needed. The queried set is the five executed files, not the
+  whole module: changing `test_run_dev.sh` or this document cannot affect a run in flight.
+- **Never compare the files' bytes to answer that question.** The earlier `git hash-object`
+  implementation made the answer depend on line endings, `core.autocrlf`, clean/smudge filters,
+  `.gitattributes`, and the rewrites `git stash push` performs through the `eol` attribute — each of
+  which reported a change for an update that changed nothing. `SELF_PATHS` / `$SelfGitPaths` are
+  **git pathspecs**: repository-relative, forward slashes, in both implementations. Windows
+  separators would match nothing at all.
+- **The adoption branch answers from what it did, not from inspection.** A ZIP copy has no "before"
+  commit. Taking the repository's version replaces every tracked file, so that path sets
+  `ADOPTED_REPLACED` / `$script:AdoptedReplaced` and a restart is requested; keeping the files, or a
+  ZIP that already matched `origin`, replaces nothing and asks for nothing.
 - **git's stderr never reaches captured output, and every captured value is validated by shape.**
   git writes advisory text to stderr on *successful* commands; merged into the output it becomes a
-  bogus fingerprint, a bogus `rev-list --count`, or a bogus dirty tree — the observed cause of
-  repeated false exit-8 restarts on Windows. `run-dev.sh` redirects stderr to `/dev/null`;
+  bogus `rev-list --count` or a bogus dirty tree. `run-dev.sh` redirects stderr to `/dev/null`;
   `Invoke-Git` in `run-dev.ps1` returns `Output` (stdout) and `Error` (stderr) separately, split by
-  object type so ordering cannot matter. On top of that, a fingerprint is accepted only if it is an
-  object id (`is_object_id` / `Test-ObjectId`) and a count only if it is a bare number (`to_count` /
-  `Convert-ToCount`); anything else degrades to `?` or `0` instead of becoming data.
-- **Line-ending mismatches of the self-files are settled before the first snapshot.**
-  `normalize_self_eol` / `Repair-SelfEol` re-checks-out a self-file **only** when all three hold:
-  `git status` exited 0, its porcelain state is exactly one line of plain unstaged modification
-  (`" M "`), and `git diff --quiet --no-ext-diff` exited 0. Otherwise `git stash push` would settle
-  the mismatch mid-update (it checks files out through the `eol` attribute) and the fingerprints
-  would report a self-update no commit caused, on every run. Never weaken those three tests, and in
-  particular never judge the diff by its captured output: a failing diff prints nothing to stdout,
-  and treating that as "no differences" makes this pass overwrite real local edits.
+  object type so ordering cannot matter. On top of that, an object id is accepted only if it has the
+  right shape (`is_object_id` / `Test-ObjectId`) and a count only if it is a bare number
+  (`to_count` / `Convert-ToCount`); anything else degrades to empty or `0` instead of becoming
+  data.
+- **A function that returns a collection returns a plain array, and every caller wraps the call in
+  `@(...)`.** Never `return ,$x`: the unary comma hands the *inner* array over as one object, so
+  `@(call).Count` is 1 even for an empty list. That single line is what made the restart banner fire
+  on every launch and print `System.Object[]` as the changed file. Verified on PowerShell 5.1 and
+  locked down by `test_run_dev.ps1` ("Возврат массива из функции"), which asserts 0/1/many and that
+  the forbidden form breaks the empty case.
+- **PowerShell string comparison is case-insensitive; object ids are not.** Use `-cmatch` / `-ceq`
+  when validating or comparing git object ids, so the two implementations accept exactly the same
+  values (`test_run_dev.ps1` caught this on the real machine: `-match '^[0-9a-f]{40}$'` accepts
+  upper-case hex, the POSIX `case` glob does not).
 - **A stash entry is restored by identity, never by position.** `push` exits 0 having saved nothing,
   and the stash is shared with every other git client — an IDE can push or drop an entry between our
   push and our pop. Both implementations record the commit id their push created and pop exactly
@@ -165,10 +172,10 @@ committed and never shows up as a local change during Stage 1:
   call `& $script:Git … 2>&1` directly: that is how stderr gets into parsed data.
 - To change how a ZIP copy is adopted, see `adopt_repository` / `Invoke-RepositoryAdoption`.
 - To change toolchain selection or provisioning, see `rust_stage` / `Invoke-RustStage`.
-- To change which files force a restart after an update, edit `SELF_FILES` / `$SelfFiles` (keep the
-  two lists in the same order) and the detection in `capture_self_fingerprints` /
-  `Get-SelfFingerprints`. A file added there whose line endings matter needs a rule in the root
-  `.gitattributes` as well.
+- To change which files force a restart after an update, edit `SELF_PATHS` / `$SelfGitPaths` (git
+  notation, same order in both) — the detection itself, `self_changed_paths` /
+  `Get-ChangedSelfPaths`, needs no changes. A file added there whose line endings matter needs a rule
+  in the root `.gitattributes` as well.
 - To change what is passed to the application, see `run_stage` + `cargo_run_app` (sh) /
   `Invoke-RunStage` + `Invoke-CargoRun` (ps1). The environment check is `check_environment` /
   `Assert-AppEnvironment`; the flags it relies on (`--check-venv`, `--ignore-installed`) are
@@ -181,13 +188,14 @@ committed and never shows up as a local change during Stage 1:
 ## Testing status
 
 `test_run_dev.sh` covers the git stage — the part that can destroy a user's work — including the
-restore-after-conflict path, the stash guard, the EOL repair pass, the value parsers, and the
-self-update fingerprints down to `check_self_update` returning exit 8. `test_run_dev.ps1` asserts
-the same contract against `run-dev.ps1`, plus the stream separation in `Invoke-Git`; it needs pwsh,
-which is not available in every development environment here, so a change that only runs the sh
-suite is a change whose Windows half is unverified — say so rather than implying both were run.
-Neither suite covers Stage 2 or 3: provisioning asserts against real downloads and Stage 3 means a
-full cargo build plus a GUI. Those paths are verified by hand.
+restore-after-conflict path, the stash guard, the value parsers, and the self-update detection down
+to `check_self_update` returning exit 8. `test_run_dev.ps1` asserts the same contract against
+`run-dev.ps1`, plus the stream separation in `Invoke-Git` and the array-return convention. It needs
+Windows PowerShell or pwsh, which is not available in every development environment here, so a
+change that only runs the sh suite is a change whose Windows half is unverified — say so rather than
+implying both were run. Two bugs reached users because that half went unrun, so run it on a real
+machine when one is reachable. Neither suite covers Stage 2 or 3: provisioning asserts against real
+downloads and Stage 3 means a full cargo build plus a GUI. Those paths are verified by hand.
 
 Before trusting a change, on each platform: fresh ZIP without git, clean repo behind origin, dirty
 repo with non-overlapping edits, dirty repo with overlapping edits that merge, dirty repo with

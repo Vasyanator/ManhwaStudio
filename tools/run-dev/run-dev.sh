@@ -9,8 +9,8 @@
 #
 # Main responsibilities:
 # - Stage 1 (git): locate git, adopt a non-repository ZIP copy, fetch, and merge
-#   local changes automatically when they do not truly conflict; detect that the
-#   update rewrote run-dev itself and ask for a restart instead of continuing.
+#   local changes automatically when they do not truly conflict; ask git whether
+#   the update changed run-dev itself and request a restart instead of continuing.
 # - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
 #   toolchain, provision an isolated one under installer_files/ when needed.
 # - Stage 3: two sequential cargo runs — an environment check that only shows a
@@ -18,8 +18,7 @@
 #
 # Key functions:
 # - git_stage(), adopt_repository(), update_with_local_changes()
-# - normalize_self_eol(), capture_self_fingerprints(), self_changed_files(),
-#   self_updated(), check_self_update()
+# - self_changed_paths(), check_self_update()
 # - is_object_id(), to_count(), stash_top(), quote_args(), restart_command()
 # - rust_stage(), required_msrv(), ensure_c_toolchain()
 # - cargo_run_app(), check_environment(), run_stage()
@@ -50,11 +49,13 @@ APP_BIN="manhwastudio_rs"
 # `git stash push` (used by every rollback path) landed in git 2.13.
 GIT_MIN="2.13.0"
 
-# Files that are *executed* by a run-dev launch. When the git stage rewrites any
-# of them the running scripts no longer match what is on disk, so the run stops
-# and asks for a restart. Test/doc files of the module are deliberately absent:
-# changing them cannot affect an in-flight run.
-SELF_FILES="tools/run-dev/run-dev.sh tools/run-dev/run-dev.ps1 run-dev.Linux.sh run-dev.MacOS.command run-dev.Windows.bat"
+# Files that are *executed* by a run-dev launch, in git notation: repository
+# relative, forward slashes, because these strings are pathspecs handed to git and
+# nothing else. When an update changes any of them the running scripts no longer
+# match what is on disk, so the run stops and asks for a restart. Test/doc files
+# of the module are deliberately absent: changing them cannot affect an in-flight
+# run.
+SELF_PATHS="tools/run-dev/run-dev.sh tools/run-dev/run-dev.ps1 run-dev.Linux.sh run-dev.MacOS.command run-dev.Windows.bat"
 
 # Exit codes; see dev-docs/run_dev_plan.md.
 EXIT_GENERIC=1
@@ -83,9 +84,14 @@ GIT=""
 CARGO=""
 MS_OS=""
 ADOPTED=0
+# Set by the adoption branch when it replaced the files on disk with the
+# repository's version — the one case where there is no "before" commit to diff.
+ADOPTED_REPLACED=0
 MANAGED_RUST=0
-# Fingerprints of SELF_FILES taken before the git stage touched the tree.
-SELF_BEFORE=""
+# HEAD as it was before Stage 1 touched anything. It is both the rollback point of
+# `update_with_local_changes` and the left side of the "what did the update
+# change" diff; there is deliberately only one such value.
+PRE_HEAD=""
 # The command line this run was started with, echoed back in the restart hint.
 RUN_DEV_ARGV=""
 
@@ -374,7 +380,11 @@ handle_adopted_tree() {
     local choice; choice=$(ask "1")
 
     case "$choice" in
+        # Taking the repository's version replaces every tracked file, run-dev
+        # included, and there is no "before" commit to diff against here — so the
+        # branch records what it did for check_self_update.
         1) stash_local "run-dev: содержимое архива $(date '+%Y-%m-%d %H:%M')"
+           ADOPTED_REPLACED=1
            ok "Файлы обновлены до origin/$BRANCH." ;;
         2) warn "Файлы оставлены без изменений." ;;
         *) die "$EXIT_ABORTED" "Отменено пользователем." ;;
@@ -471,7 +481,11 @@ do_merge() {
 # Rolls the tree back to exactly its pre-update state on any failure.
 update_with_local_changes() {
     local ahead="$1"
-    local pre_head; pre_head=$($GIT rev-parse HEAD)
+    # PRE_HEAD is the single pre-update HEAD of this run: the rollback point here
+    # and the left side of the self-update diff later. git_stage sets it; the
+    # fallback keeps the function usable on its own (tests drive it directly).
+    if [ -z "$PRE_HEAD" ]; then PRE_HEAD=$($GIT rev-parse HEAD); fi
+    local pre_head="$PRE_HEAD"
 
     # Three-dot diff = what the INCOMING commits touch (from the merge base),
     # which is the set that can actually collide with local edits.
@@ -560,114 +574,18 @@ update_with_local_changes() {
 # logic. The fix is not to be clever about reloading, it is to notice and ask for
 # a restart.
 
-# Prints "<path> <hash>" for every SELF_FILES entry. `git hash-object` is used
-# because git is already located by the time this runs and it works outside a
-# repository too.
+# Prints, one path per line, the run-dev files the update actually changed:
+# exactly what `git diff --name-only <before> <after>` reports for SELF_PATHS.
 #
-# `--no-filters` is mandatory, not a detail: without it git applies the path's
-# clean/eol filter, so under `core.autocrlf=true` a CRLF and an LF copy of the
-# same file hash identically. An update that rewrites run-dev.Windows.bat only in
-# its line endings would then pass unnoticed — and that is exactly the byte-level
-# change cmd.exe cannot survive mid-run. It also stops a change to .gitattributes
-# from appearing as a change to every file at once.
-#
-# A file absent on this platform is recorded as "-" (it exists in the repository
-# regardless of the OS, so its appearance is a real change); anything that is not
-# a well-formed object id — a failed command, empty output, a stray line — is
-# recorded as "?", which self_changed_files treats as "unknown, not changed".
-# The shape is validated rather than trusted: a fingerprint is only useful if it
-# can be compared, and text that merely happens to be non-empty compares unequal
-# to itself on the next run.
-capture_self_fingerprints() {
-    local f h
-    for f in $SELF_FILES; do
-        if [ -f "$REPO_ROOT/$f" ]; then
-            h=$($GIT hash-object --no-filters -- "$REPO_ROOT/$f" 2>/dev/null)
-            is_object_id "$h" || h="?"
-        else
-            h="-"
-        fi
-        printf '%s %s\n' "$f" "$h"
-    done
-}
-
-# Restores the self-files whose working copy differs from the index in line
-# endings ONLY, before the "before" snapshot is taken.
-#
-# Why such files exist: `.gitattributes` pins each of them to a specific `eol`,
-# while a working copy created earlier (a different `core.autocrlf`, a source ZIP,
-# an editor) may hold the other convention. Git does not repair that by itself —
-# but `git stash push` does, because it checks the file back out through the
-# attribute. So a plain "update with local changes" silently rewrites the bytes of
-# scripts that are executing right now, which the fingerprints then report as a
-# self-update: a restart request for an update that changed nothing, repeated on
-# every run because the state never settles.
-#
-# Why it cannot lose work — three conditions, all required, because this function
-# overwrites a file from the index and any doubt means "leave it alone":
-#   1. `git status` must SUCCEED. Its empty output is only meaningful when the
-#      command actually ran.
-#   2. The porcelain state must be exactly one line of plain unstaged
-#      modification (" M "). Merge conflicts and every other XY state are none of
-#      this function's business.
-#   3. Emptiness of the diff is decided by the EXIT CODE of
-#      `git diff --quiet --no-ext-diff`, never by captured output. A diff that
-#      fails — a configured-and-broken GIT_EXTERNAL_DIFF, a broken diff driver —
-#      writes nothing to stdout, and reading that as "no differences" would
-#      destroy the user's unsaved edits. `--no-ext-diff` keeps an external
-#      differ out of the decision in the first place.
-# Exit code 0 then means: identical to the index once filters are applied, i.e.
-# the difference is exactly the byte encoding.
-#
-# Rewriting a file that is being executed is safe here for the same structural
-# reason the update itself is (see the header): every interpreter has already
-# read past the point it would need to re-read. It is also idempotent — after one
-# pass the state matches the attribute and later runs find nothing to do.
-normalize_self_eol() {
-    local f path st rc
-    for f in $SELF_FILES; do
-        path="$REPO_ROOT/$f"
-        [ -f "$path" ] || continue
-
-        st=$($GIT status --porcelain --untracked-files=no -- "$path" 2>/dev/null)
-        rc=$?
-        [ "$rc" = 0 ] || continue
-        [ -n "$st" ] || continue
-        [ "$(printf '%s\n' "$st" | wc -l | tr -d ' ')" = "1" ] || continue
-        case "$st" in
-            " M "*) ;;
-            *) continue ;;
-        esac
-
-        $GIT diff --quiet --no-ext-diff -- "$path" 2>/dev/null || continue
-
-        git_q checkout -- "$path" || true
-    done
-}
-
-# Prints the fingerprint recorded for file `$2` inside snapshot `$1`, or nothing.
-fingerprint_of() {
-    printf '%s\n' "$1" | awk -v f="$2" '$1 == f { print $2; exit }'
-}
-
-# Prints, one per line, the SELF_FILES entries whose fingerprint differs between
-# snapshot `$1` (taken before the update) and snapshot `$2` (taken after it).
-# A "?" on EITHER side means the hash was unknown at that moment, which is never
-# evidence of a change: a git hiccup between the two snapshots must not fabricate
-# a restart request for an update that touched nothing.
-self_changed_files() {
-    local f a b
-    for f in $SELF_FILES; do
-        a=$(fingerprint_of "$1" "$f")
-        b=$(fingerprint_of "$2" "$f")
-        if [ "$a" = "?" ] || [ "$b" = "?" ]; then continue; fi
-        if [ "$a" != "$b" ]; then printf '%s\n' "$f"; fi
-    done
-}
-
-# True when the update rewrote at least one file this run is executing.
-self_updated() {
-    [ -n "$(self_changed_files "$1" "$2")" ]
+# Asking git which paths a commit range touched is the whole mechanism. The
+# previous implementation hashed the files before and after and compared the
+# bytes, which made the answer depend on line endings, clean/smudge filters and
+# the incidental rewrites `git stash push` performs — none of which have anything
+# to do with "did the update change run-dev". git already knows the answer.
+self_changed_paths() {
+    [ -n "$PRE_HEAD" ] || return 0
+    # shellcheck disable=SC2086
+    $GIT diff --name-only "$PRE_HEAD" HEAD -- $SELF_PATHS 2>/dev/null
 }
 
 # Renders the given arguments as one copy-pasteable command line, single-quoting
@@ -697,13 +615,37 @@ restart_command() {
     fi
 }
 
-# Stops the run when Stage 1 rewrote run-dev itself. Nothing is rolled back: the
+# Stops the run when Stage 1 replaced run-dev itself. Nothing is rolled back: the
 # update is applied and correct, only the running scripts are stale.
+#
+# Two sources of truth, no hashing:
+#   - a normal update: HEAD moved, so ask git which of SELF_PATHS the commit range
+#     touched. HEAD unchanged means nothing was updated at all — nothing to check.
+#   - an adopted ZIP copy: there is no "before" commit to diff against, and the
+#     adoption may have replaced every tracked file at once. The branch reports
+#     what it did through ADOPTED_REPLACED, so the answer comes from the stage
+#     itself rather than from a guess.
 check_self_update() {
-    [ -n "$SELF_BEFORE" ] || return 0
-    local after
-    after=$(capture_self_fingerprints)
-    self_updated "$SELF_BEFORE" "$after" || return 0
+    local changed=""
+
+    if [ "$ADOPTED_REPLACED" = 1 ]; then
+        notice_exit "$EXIT_RESTART_REQUIRED" "НУЖЕН ПЕРЕЗАПУСК" \
+            "Файлы проекта, включая сам скрипт запуска run-dev, заменены" \
+            "на актуальную версию из репозитория." \
+            "" \
+            "Обновление уже применено, откатывать ничего не нужно." \
+            "Запустите run-dev ещё раз, чтобы дальше работала новая версия:" \
+            "" \
+            "    $(restart_command)"
+    fi
+
+    [ -n "$PRE_HEAD" ] || return 0
+    local head_now
+    head_now=$($GIT rev-parse HEAD 2>/dev/null) || return 0
+    [ "$head_now" != "$PRE_HEAD" ] || return 0
+
+    changed=$(self_changed_paths)
+    [ -n "$changed" ] || return 0
 
     # One positional argument per line: banner_exit indents each argument it is
     # given, so passing the file list as a single multi-line string would indent
@@ -715,7 +657,7 @@ check_self_update() {
         [ -n "$f" ] || continue
         set -- "$@" "    $f"
     done <<EOF
-$(self_changed_files "$SELF_BEFORE" "$after")
+$changed
 EOF
 
     notice_exit "$EXIT_RESTART_REQUIRED" "НУЖЕН ПЕРЕЗАПУСК" "$@" \
@@ -729,18 +671,18 @@ EOF
 git_stage() {
     step "Проверка обновлений"
     locate_git
-    # Settle any line-ending-only mismatch first, otherwise `git stash push`
-    # would settle it mid-update and the fingerprints would read that as a
-    # self-update. Then snapshot: from here on, any change to these files really
-    # did come from the update.
-    normalize_self_eol
-    SELF_BEFORE=$(capture_self_fingerprints)
 
     if ! is_repository; then
         if ! adopt_repository; then return 0; fi
         handle_adopted_tree
         return 0
     fi
+
+    # The pre-update HEAD: rollback point for the merge paths and left side of
+    # the "did the update change run-dev itself" diff. Taken before anything can
+    # move it. An empty repository has no HEAD; then there is nothing to compare
+    # and nothing to update either.
+    PRE_HEAD=$($GIT rev-parse HEAD 2>/dev/null) || PRE_HEAD=""
 
     if ! git_q remote get-url origin; then
         info "Удалённый репозиторий не настроен, добавляю origin."

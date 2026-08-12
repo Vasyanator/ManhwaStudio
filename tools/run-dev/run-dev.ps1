@@ -9,8 +9,8 @@ run the app with `cargo run --bin manhwastudio_rs --release`.
 Main responsibilities:
 - Stage 1 (git): provision portable MinGit when git is absent, adopt a working
   copy unpacked from a source ZIP, fetch, and merge local changes automatically
-  when they do not truly conflict; detect that the update rewrote run-dev itself
-  and ask for a restart instead of continuing.
+  when they do not truly conflict; ask git whether the update changed run-dev
+  itself and request a restart instead of continuing.
 - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
   toolchain, provision an isolated one plus MinGW-w64 under installer_files/.
 - Stage 3: two sequential cargo runs — an environment check that only shows a
@@ -18,7 +18,7 @@ Main responsibilities:
 
 Key functions:
 - Invoke-GitStage, Install-MinGit, Invoke-RepositoryAdoption, Update-WithLocalChanges
-- Repair-SelfEol, Get-SelfFingerprints, Get-ChangedSelfFiles, Assert-NoSelfUpdate
+- Get-ChangedSelfPaths, Assert-NoSelfUpdate
 - Invoke-Git (stdout and stderr are never mixed)
 - Get-StashTop, Get-StashRefFor, Invoke-StashPop, Restore-StashEntry
 - Invoke-RustStage, Install-ManagedRust, Install-Mingw, Assert-CToolchain
@@ -71,14 +71,16 @@ $GitApiMinGit = 'https://api.github.com/repos/git-for-windows/git/releases/lates
 $GitApiMingw  = 'https://api.github.com/repos/brechtsanders/winlibs_mingw/releases/latest'
 $RustupUrlGnu = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe'
 
-# Files that are *executed* by a run-dev launch. When the git stage rewrites any
-# of them the running scripts no longer match what is on disk, so the run stops
-# and asks for a restart. Test/doc files of the module are deliberately absent:
-# changing them cannot affect an in-flight run. Kept in the same order as
-# SELF_FILES in run-dev.sh.
-$SelfFiles = @(
-    'tools\run-dev\run-dev.sh',
-    'tools\run-dev\run-dev.ps1',
+# Files that are *executed* by a run-dev launch, in GIT notation: repository
+# relative, forward slashes, because these strings are pathspecs handed to git and
+# nothing else. Windows path separators would silently match nothing. When an
+# update changes any of them the running scripts no longer match what is on disk,
+# so the run stops and asks for a restart. Test/doc files of the module are
+# deliberately absent: changing them cannot affect an in-flight run. Kept in the
+# same order as SELF_PATHS in run-dev.sh.
+$SelfGitPaths = @(
+    'tools/run-dev/run-dev.sh',
+    'tools/run-dev/run-dev.ps1',
     'run-dev.Linux.sh',
     'run-dev.MacOS.command',
     'run-dev.Windows.bat')
@@ -99,9 +101,14 @@ $script:RepoRoot    = $null
 $script:Git         = $null
 $script:Cargo       = $null
 $script:Adopted     = $false
+# Set by the adoption branch when it replaced the files on disk with the
+# repository's version — the one case where there is no "before" commit to diff.
+$script:AdoptedReplaced = $false
 $script:ManagedRust = $false
-# Fingerprints of $SelfFiles taken before the git stage touched the tree.
-$script:SelfBefore  = $null
+# HEAD as it was before Stage 1 touched anything. It is both the rollback point of
+# Update-WithLocalChanges and the left side of the "what did the update change"
+# diff; there is deliberately only one such value.
+$script:PreHead     = ''
 # Exit code of the most recent Invoke-CargoRun; see that function for why the
 # code is passed through state instead of being returned.
 $script:LastRunCode = 0
@@ -245,7 +252,10 @@ line — is not a usable fingerprint.
 function Test-ObjectId {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-    return ($Text.Trim() -match '^[0-9a-f]{40}$|^[0-9a-f]{64}$')
+    # -cmatch, not -match: PowerShell's -match is case-INSENSITIVE, which would
+    # accept upper-case hex that git never produces and that the POSIX
+    # implementation rejects. The two must agree byte for byte.
+    return ($Text.Trim() -cmatch '^[0-9a-f]{40}$|^[0-9a-f]{64}$')
 }
 
 # --- Download / archive helpers ----------------------------------------------
@@ -521,6 +531,10 @@ function Resolve-AdoptedTree {
             # [void]: Save-LocalChanges returns a flag, which would otherwise be
             # printed to the console by this statement.
             [void](Save-LocalChanges "run-dev: содержимое архива $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
+            # Taking the repository's version replaces every tracked file, run-dev
+            # included, and there is no "before" commit to diff against here — so
+            # the branch records what it did for Assert-NoSelfUpdate.
+            $script:AdoptedReplaced = $true
             Ok "Файлы обновлены до origin/$Branch."
         }
         '2' { Warn 'Файлы оставлены без изменений.' }
@@ -559,7 +573,8 @@ function Get-StashRefFor {
     if ($list.ExitCode -ne 0) { return '' }
     foreach ($line in ($list.Output -split "`r?`n")) {
         $parts = $line.Trim() -split '\s+', 2
-        if ($parts.Count -eq 2 -and $parts[0] -eq $Id.Trim()) { return $parts[1] }
+        # -ceq: object ids are compared byte-exactly, as on the POSIX side.
+        if ($parts.Count -eq 2 -and $parts[0] -ceq $Id.Trim()) { return $parts[1] }
     }
     return ''
 }
@@ -652,7 +667,12 @@ Restores the tree to exactly its pre-update state on any failure.
 #>
 function Update-WithLocalChanges {
     param([int] $Ahead)
-    $preHead = Get-GitOut 'rev-parse' 'HEAD'
+    # $script:PreHead is the single pre-update HEAD of this run: the rollback
+    # point here and the left side of the self-update diff later. Invoke-GitStage
+    # sets it; the fallback keeps the function usable on its own (tests drive it
+    # directly).
+    if (-not $script:PreHead) { $script:PreHead = (Get-GitOut 'rev-parse' 'HEAD').Trim() }
+    $preHead = $script:PreHead
 
     # Three-dot diff = what the INCOMING commits touch (from the merge base),
     # which is the set that can actually collide with local edits.
@@ -744,119 +764,27 @@ function Update-WithLocalChanges {
 
 <#
 .SYNOPSIS
-Returns a hashtable {relative path -> fingerprint} for every $SelfFiles entry.
-`git hash-object` is used because git is already located by the time this runs.
-
-`--no-filters` is mandatory, not a detail: without it git applies the path's
-clean/eol filter, so under core.autocrlf=true (the Git for Windows default) a
-CRLF and an LF copy of the same file hash identically. An update that rewrites
-run-dev.Windows.bat only in its line endings would then pass unnoticed — and that
-is exactly the byte-level change cmd.exe cannot survive mid-run. It also stops a
-change to .gitattributes from appearing as a change to every file at once.
-
-A file absent on this machine is recorded as '-' (it exists in the repository
-regardless of the OS, so its arrival is a real change); anything that is not a
-well-formed object id — a failed command, empty output, a stray line — is
-recorded as '?', which Get-ChangedSelfFiles treats as "unknown, not changed".
-The shape is validated rather than trusted: a fingerprint is only useful if it
-can be compared, and text that merely happens to be non-empty compares unequal
-to itself on the next run.
-#>
-function Get-SelfFingerprints {
-    $map = @{}
-    foreach ($rel in $SelfFiles) {
-        $full = Join-Path $script:RepoRoot $rel
-        if (Test-Path $full) {
-            $probe = Invoke-Git 'hash-object' '--no-filters' '--' $full
-            if ($probe.ExitCode -eq 0 -and (Test-ObjectId $probe.Output)) {
-                $map[$rel] = $probe.Output.Trim()
-            } else {
-                $map[$rel] = '?'
-            }
-        } else {
-            $map[$rel] = '-'
-        }
-    }
-    return $map
-}
-
-<#
-.SYNOPSIS
-Restores the $SelfFiles whose working copy differs from the index in line endings
-ONLY, before the "before" snapshot is taken. Silent no-op when there is nothing
-to settle.
+Returns the run-dev paths the update actually changed: exactly what
+`git diff --name-only <before> <after>` reports for $SelfGitPaths. Always an
+array, possibly empty.
 
 .DESCRIPTION
-Why such files exist: .gitattributes pins each of them to a specific `eol`, while
-a working copy created earlier (a different core.autocrlf — true is the Git for
-Windows default — a source ZIP, an editor) may hold the other convention. Git does
-not repair that by itself, but `git stash push` does, because it checks the file
-back out through the attribute. So a plain "update with local changes" silently
-rewrites the bytes of scripts that are executing right now, which the fingerprints
-then report as a self-update: a restart request for an update that changed
-nothing, repeated on every run because the state never settles. This is the
-Windows-only half of that bug; the POSIX side runs the same pass to keep one
-contract.
+Asking git which paths a commit range touched is the whole mechanism. The
+previous implementation hashed the files before and after and compared the bytes,
+which made the answer depend on line endings, clean/smudge filters and the
+incidental rewrites `git stash push` performs — none of which have anything to do
+with "did the update change run-dev". git already knows the answer.
 
-Why it cannot lose work — three conditions, all required, because this function
-overwrites a file from the index and any doubt means "leave it alone":
-1. `git status` must SUCCEED. Its empty output is only meaningful when the
-   command actually ran.
-2. The porcelain state must be exactly one line of plain unstaged modification
-   (" M "). Merge conflicts and every other XY state are none of this function's
-   business.
-3. Emptiness of the diff is decided by the EXIT CODE of
-   `git diff --quiet --no-ext-diff`, never by captured output. A diff that fails
-   — a configured-and-broken GIT_EXTERNAL_DIFF, a broken diff driver — writes
-   nothing to stdout, and reading that as "no differences" would destroy the
-   user's unsaved edits. `--no-ext-diff` keeps an external differ out of the
-   decision in the first place.
-Exit code 0 then means: identical to the index once filters are applied, i.e. the
-difference is exactly the byte encoding.
-
-Rewriting a file that is being executed is safe here for the same structural
-reason the update itself is (see the file header): every interpreter has already
-read past the point it would need to re-read. It is also idempotent — after one
-pass the state matches the attribute and later runs find nothing to do.
+Returns a plain array and is consumed as `@(Get-ChangedSelfPaths)`; see the array
+convention in tools/run-dev/MODULE_README.md.
 #>
-function Repair-SelfEol {
-    foreach ($rel in $SelfFiles) {
-        $full = Join-Path $script:RepoRoot $rel
-        if (-not (Test-Path $full)) { continue }
-
-        $status = Invoke-Git 'status' '--porcelain' '--untracked-files=no' '--' $full
-        if ($status.ExitCode -ne 0) { continue }
-        $lines = @($status.Output -split "`r?`n" | Where-Object { $_.Trim() })
-        if ($lines.Count -ne 1) { continue }
-        if ($lines[0] -notmatch '^ M ') { continue }
-
-        if ((Invoke-Git 'diff' '--quiet' '--no-ext-diff' '--' $full).ExitCode -ne 0) { continue }
-
-        [void](Invoke-Git 'checkout' '--' $full)
-    }
-}
-
-<#
-.SYNOPSIS
-Returns the $SelfFiles entries whose fingerprint differs between the snapshot
-taken before the update and the one taken after it. Always an array, possibly
-empty.
-
-A '?' on EITHER side means the hash was unknown at that moment, which is never
-evidence of a change: a git hiccup between the two snapshots must not fabricate a
-restart request for an update that touched nothing.
-#>
-function Get-ChangedSelfFiles {
-    param([hashtable] $Before, [hashtable] $After)
-    $changed = @()
-    foreach ($rel in $SelfFiles) {
-        $b = if ($Before.ContainsKey($rel)) { $Before[$rel] } else { '' }
-        $a = if ($After.ContainsKey($rel))  { $After[$rel]  } else { '' }
-        if ($a -eq '?' -or $b -eq '?') { continue }
-        if ($a -ne $b) { $changed += $rel }
-    }
-    # The unary comma stops PowerShell from unrolling a 0/1-element array.
-    return ,$changed
+function Get-ChangedSelfPaths {
+    if (-not $script:PreHead) { return @() }
+    # Not $args: that name is an automatic variable inside a function.
+    $gitArgs = @('diff', '--name-only', $script:PreHead, 'HEAD', '--') + $SelfGitPaths
+    $probe = Invoke-Git @gitArgs
+    if ($probe.ExitCode -ne 0) { return @() }
+    return @($probe.Output -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() })
 }
 
 <#
@@ -885,13 +813,37 @@ function Get-RestartCommand {
 
 <#
 .SYNOPSIS
-Stops the run when Stage 1 rewrote run-dev itself. Nothing is rolled back: the
+Stops the run when Stage 1 replaced run-dev itself. Nothing is rolled back: the
 update is applied and correct, only the running scripts are stale. Returns
-normally when nothing that this run executes has changed.
+normally when the update did not touch them.
+
+.DESCRIPTION
+Two sources of truth, no hashing:
+- a normal update: HEAD moved, so ask git which of $SelfGitPaths the commit range
+  touched. HEAD unchanged means nothing was updated at all — nothing to check.
+- an adopted ZIP copy: there is no "before" commit to diff against, and the
+  adoption may have replaced every tracked file at once. That branch reports what
+  it did through $script:AdoptedReplaced, so the answer comes from the stage
+  itself rather than from a guess.
 #>
 function Assert-NoSelfUpdate {
-    if (-not $script:SelfBefore) { return }
-    $changed = @(Get-ChangedSelfFiles -Before $script:SelfBefore -After (Get-SelfFingerprints))
+    if ($script:AdoptedReplaced) {
+        Exit-WithBanner -Code $ExitRestartRequired -Title 'НУЖЕН ПЕРЕЗАПУСК' -Color Yellow -Lines @(
+            'Файлы проекта, включая сам скрипт запуска run-dev, заменены',
+            'на актуальную версию из репозитория.',
+            '',
+            'Обновление уже применено, откатывать ничего не нужно.',
+            'Запустите run-dev ещё раз, чтобы дальше работала новая версия:',
+            '',
+            "    $(Get-RestartCommand)")
+    }
+
+    if (-not $script:PreHead) { return }
+    $headNow = Get-GitOut 'rev-parse' 'HEAD'
+    if (-not (Test-ObjectId $headNow)) { return }
+    if ($headNow.Trim() -ceq $script:PreHead) { return }
+
+    $changed = @(Get-ChangedSelfPaths)
     if ($changed.Count -eq 0) { return }
 
     $lines = @(
@@ -912,18 +864,19 @@ function Assert-NoSelfUpdate {
 function Invoke-GitStage {
     Step 'Проверка обновлений'
     Find-Git
-    # Settle any line-ending-only mismatch first, otherwise `git stash push`
-    # would settle it mid-update and the fingerprints would read that as a
-    # self-update. Then snapshot: from here on, any change to these files really
-    # did come from the update.
-    Repair-SelfEol
-    $script:SelfBefore = Get-SelfFingerprints
 
     if (-not (Test-GitOk 'rev-parse' '--git-dir')) {
         if (-not (Invoke-RepositoryAdoption)) { return }
         Resolve-AdoptedTree
         return
     }
+
+    # The pre-update HEAD: rollback point for the merge paths and left side of
+    # the "did the update change run-dev itself" diff. Taken before anything can
+    # move it. An empty repository has no HEAD; then there is nothing to compare
+    # and nothing to update either.
+    $head = Get-GitOut 'rev-parse' 'HEAD'
+    $script:PreHead = if (Test-ObjectId $head) { $head.Trim() } else { '' }
 
     if (-not (Test-GitOk 'remote' 'get-url' 'origin')) {
         Info 'Удалённый репозиторий не настроен, добавляю origin.'

@@ -16,10 +16,9 @@
 # - "discard local" option                -> updated, changes recoverable in stash
 # - non-repository (ZIP) adoption         -> history grafted, files untouched
 # - untracked files are never touched by any path
-# - self-fingerprints                     -> a rewritten run-dev script is detected
-#                                            and stops the run with exit code 8
-# - fingerprint/count parsing             -> only well-formed values are accepted
-# - EOL repair pass                       -> never touches a file with real edits
+# - self-update detection                 -> git names the run-dev paths an update
+#                                            touched; exit 8 only when it did
+# - object id / count parsing             -> only well-formed values are accepted
 # - stash guard                           -> a pop never restores somebody else's entry
 #
 # Run: bash tools/run-dev/test_run_dev.sh
@@ -294,137 +293,71 @@ restore_stash_entry "" ; check "пустой id — ничего не делае
 check "стек stash по-прежнему цел" "$(git stash list | wc -l | tr -d ' ')" "1"
 
 # ---------------------------------------------------------------------------
-note "Починка концов строк не трогает настоящие правки"
+note "Какие файлы run-dev затронуло обновление — спрашиваем у git"
 # ---------------------------------------------------------------------------
 
-# normalize_self_eol перезаписывает файл только когда git считает его изменённым,
-# а diff пуст (чистое несоответствие кодировки концов строк). Любая настоящая
-# правка обязана остаться нетронутой — иначе «починка» уничтожит работу.
-EOLWC="$SANDBOX/eolrepo"
-mkdir -p "$EOLWC/tools/run-dev"
+# Механизм: HEAD до обновления сравнивается с HEAD после, и git сам называет
+# затронутые пути. Никаких байтовых отпечатков: они зависели от концов строк,
+# фильтров clean/smudge и побочных перезаписей `git stash push`.
+
+SELFWC="$SANDBOX/selfupd"
+mkdir -p "$SELFWC/tools/run-dev"
 (
     set -e
-    cd "$EOLWC"
+    cd "$SELFWC"
     git init -q
     printf 'core\n'     > tools/run-dev/run-dev.sh
     printf 'windows\n'  > tools/run-dev/run-dev.ps1
     printf 'launcher\n' > run-dev.Linux.sh
-    printf 'bat\n'      > run-dev.Windows.bat
-    git add -A && git commit -qm "self files"
+    printf 'other\n'    > src.txt
+    git add -A && git commit -qm "base"
 )
-REPO_ROOT="$EOLWC"; GIT="git"
-cd "$EOLWC" || exit 1
-printf 'НАСТОЯЩАЯ ПРАВКА\n' > tools/run-dev/run-dev.sh
-printf 'bat\r\n'            > run-dev.Windows.bat
-normalize_self_eol
-check "файл с настоящей правкой не тронут" \
-      "$(cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
-check "нетронутый файл остался прежним" "$(cat run-dev.Linux.sh)" "launcher"
-check "проход идемпотентен (второй раз тоже ничего не ломает)" \
-      "$(normalize_self_eol; cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
+REPO_ROOT="$SELFWC"; GIT="git"; MS_OS="linux"; RUN_DEV_ARGV=""
+cd "$SELFWC" || exit 1
+ADOPTED_REPLACED=0
+PRE_HEAD=$(git rev-parse HEAD)
 
-# Сломанный внешний diff: git пишет только в stderr и выходит ненулевым кодом.
-# Пустой stdout НЕ должен читаться как «diff пуст» — иначе checkout уничтожит
-# несохранённые правки пользователя.
-GIT_EXTERNAL_DIFF="$SANDBOX/no-such-diff-tool"; export GIT_EXTERNAL_DIFF
-normalize_self_eol
-check "сломанный GIT_EXTERNAL_DIFF не приводит к затиранию" \
-      "$(cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
-unset GIT_EXTERNAL_DIFF
-git checkout -q -- tools/run-dev/run-dev.sh run-dev.Windows.bat
+check "HEAD не сдвинулся — список пуст" "$(self_changed_paths)" ""
 
-# Конфликт слияния (XY = UU) — не «несоответствие концов строк», трогать нельзя.
-(
-    set -e
-    cd "$EOLWC"
-    git checkout -q -b other HEAD~0
-    printf 'ветка other\n' > run-dev.Linux.sh
-    git commit -q -am "other"
-    git checkout -q master
-    printf 'ветка master\n' > run-dev.Linux.sh
-    git commit -q -am "master"
-    git merge -q other >/dev/null 2>&1 || true
-)
-check "конфликт действительно создан" \
-      "$(git -C "$EOLWC" status --porcelain --untracked-files=no -- run-dev.Linux.sh | cut -c1-2)" "UU"
-normalize_self_eol
-check "конфликтующий файл не тронут" \
-      "$(grep -c '<<<<<<<' "$EOLWC/run-dev.Linux.sh")" "1"
-git -C "$EOLWC" merge --abort >/dev/null 2>&1 || true
+# Коммит, не касающийся run-dev.
+printf 'other changed\n' > src.txt
+git commit -qam "чужой коммит"
+check "обновление мимо run-dev — список пуст" "$(self_changed_paths)" ""
 
-# ---------------------------------------------------------------------------
-note "Отпечатки самих скриптов run-dev"
-# ---------------------------------------------------------------------------
+# Коммит, меняющий один из исполняемых файлов run-dev.
+printf 'core updated\n' > tools/run-dev/run-dev.sh
+git commit -qam "правка run-dev"
+check "затронут файл run-dev — git называет его" \
+      "$(self_changed_paths)" "tools/run-dev/run-dev.sh"
 
-# A throwaway tree that only contains the executable run-dev files. The macOS and
-# Windows launchers are deliberately absent: on any single machine two of the
-# five files are missing, and that must not read as a change by itself.
-FPROOT="$SANDBOX/selffiles"
-mkdir -p "$FPROOT/tools/run-dev"
-printf 'core\n'     > "$FPROOT/tools/run-dev/run-dev.sh"
-printf 'windows\n'  > "$FPROOT/tools/run-dev/run-dev.ps1"
-printf 'launcher\n' > "$FPROOT/run-dev.Linux.sh"
-
-REPO_ROOT="$FPROOT"
-GIT="git"
-MS_OS="linux"
-RUN_DEV_ARGV=""
-
-FP1=$(capture_self_fingerprints)
-check "снимок покрывает все исполняемые файлы" \
-      "$(printf '%s\n' "$FP1" | wc -l | tr -d ' ')" "5"
-check "хэш совпадает с git hash-object" \
-      "$(fingerprint_of "$FP1" "run-dev.Linux.sh")" "$(git hash-object "$FPROOT/run-dev.Linux.sh")"
-check "отсутствующий файл помечен как -" \
-      "$(fingerprint_of "$FP1" "run-dev.Windows.bat")" "-"
-
-FP2=$(capture_self_fingerprints)
-check "повторный снимок идентичен"      "$(self_changed_files "$FP1" "$FP2")" ""
-self_updated "$FP1" "$FP2"; check "без изменений перезапуск не нужен" "$?" "1"
-
-# --no-filters: with core.autocrlf=true git would hash a CRLF and an LF copy of
-# the same file identically, and a line-ending-only rewrite of run-dev.Windows.bat
-# is exactly the corruption the block layout of that file guards against.
-printf 'launcher\r\n' > "$FPROOT/run-dev.Linux.sh"
-git config --file "$SANDBOX/gitconfig" core.autocrlf true
-FP_CRLF=$(capture_self_fingerprints)
-check "перевод строк CRLF<->LF виден в отпечатке" \
-      "$(self_changed_files "$FP1" "$FP_CRLF")" "run-dev.Linux.sh"
-git config --file "$SANDBOX/gitconfig" --unset core.autocrlf
-printf 'launcher\n' > "$FPROOT/run-dev.Linux.sh"
-
-# A git failure between the two snapshots must not fabricate a restart request.
-SAVED_GIT="$GIT"
-GIT="$SANDBOX/no-such-git"
-FP_BROKEN=$(capture_self_fingerprints)
-GIT="$SAVED_GIT"
-check "нехэшируемый файл помечен как ?" "$(fingerprint_of "$FP_BROKEN" "run-dev.Linux.sh")" "?"
-check "сбой git с одной стороны — не изменение" "$(self_changed_files "$FP1" "$FP_BROKEN")" ""
-check "сбой git с другой стороны — тоже не изменение" "$(self_changed_files "$FP_BROKEN" "$FP1")" ""
-
-printf 'core updated\n' > "$FPROOT/tools/run-dev/run-dev.sh"
-FP3=$(capture_self_fingerprints)
-self_updated "$FP1" "$FP3"; check "изменение скрипта замечено" "$?" "0"
-check "назван именно изменённый файл" \
-      "$(self_changed_files "$FP1" "$FP3")" "tools/run-dev/run-dev.sh"
-
-# A file that did not exist locally and arrives with the update is a change too.
-printf 'bat\n' > "$FPROOT/run-dev.Windows.bat"
-FP4=$(capture_self_fingerprints)
-check "появившийся файл другой платформы — тоже изменение" \
-      "$(self_changed_files "$FP3" "$FP4")" "run-dev.Windows.bat"
+# Несколько файлов сразу — все перечислены, в git-нотации.
+printf 'launcher updated\n' > run-dev.Linux.sh
+printf 'windows updated\n'  > tools/run-dev/run-dev.ps1
+git commit -qam "правка нескольких лаунчеров"
+check "перечислены все затронутые файлы" \
+      "$(self_changed_paths | sort | tr '\n' ' ')" \
+      "run-dev.Linux.sh tools/run-dev/run-dev.ps1 tools/run-dev/run-dev.sh "
 
 # Runs check_self_update in a subshell so its `exit` cannot abort the test run.
 run_self_check() { ( check_self_update >/dev/null 2>&1 ); printf '%s\n' "$?"; }
 
-SELF_BEFORE="$FP1"
-check "скрипт обновился -> код 8" "$(run_self_check)" "8"
+check "run-dev обновился -> код 8" "$(run_self_check)" "8"
 
-SELF_BEFORE=$(capture_self_fingerprints)
-check "ничего не менялось -> продолжаем" "$(run_self_check)" "0"
+PRE_HEAD=$(git rev-parse HEAD)
+check "HEAD на месте -> продолжаем" "$(run_self_check)" "0"
 
-SELF_BEFORE=""
-check "снимок не снимался (--no-update) -> продолжаем" "$(run_self_check)" "0"
+printf 'other changed again\n' > src.txt
+git commit -qam "снова чужой коммит"
+check "обновление мимо run-dev -> продолжаем" "$(run_self_check)" "0"
+
+PRE_HEAD=""
+check "HEAD не запоминался (--no-update) -> продолжаем" "$(run_self_check)" "0"
+
+# Ветка adoption: базового коммита нет, решение принимает сама стадия.
+PRE_HEAD=$(git rev-parse HEAD)
+ADOPTED_REPLACED=1
+check "adoption заменил файлы -> код 8" "$(run_self_check)" "8"
+ADOPTED_REPLACED=0
 
 check "команда перезапуска для Linux" "$(restart_command)" "./run-dev.Linux.sh"
 MS_OS="macos"; RUN_DEV_ARGV="--debug"
