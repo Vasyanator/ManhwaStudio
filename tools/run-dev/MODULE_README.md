@@ -95,6 +95,19 @@ committed and never shows up as a local change during Stage 1:
 - **No invented download URLs.** Asset URLs are resolved from the GitHub releases API at run time.
   When the API is unreachable the scripts fail with the manual download page, rather than falling
   back to a guessed or pinned-stale URL.
+- **Every download is resumable, verified and atomic.** Bytes go to `<dest>.part` and are renamed
+  into place only when complete, so the destination never holds a truncated file; an interrupted run
+  keeps the `.part` and the next run continues from it (and the error message says so); the asset
+  size from the GitHub API is checked against the finished file; a `<asset>.sha256` sidecar, when
+  published, is verified and a mismatch deletes the `.part`. A missing sidecar skips the check — it
+  is a bonus, never a prerequisite. Same contract as `src/installer/utils.rs::download_asset`; do not
+  add a second one.
+- **The fallback downloader is not a stub.** `curl.exe` is tried first (it resumes and retries by
+  itself), but `Get-RemoteFile` falls through to the .NET implementation on **any** curl failure, not
+  only when curl is absent: on the machine this was debugged on curl gets an empty reply from the
+  GitHub CDN (exit 52) while `HttpWebRequest` downloads the same URL fine. The .NET path therefore
+  implements `Range` resume and progress reporting for real. Look up `curl.exe` with
+  `-CommandType Application`: in Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`.
 - **The C toolchain is probed before cargo runs.** `aws-lc-sys` (`translators`/`genai` → `reqwest`
   → `rustls` → `aws-lc-rs`) compiles C and assembly on every native target, so it is a real
   prerequisite; probing converts a wall of linker errors 200 crates deep into one clear message.
@@ -180,6 +193,10 @@ committed and never shows up as a local change during Stage 1:
   `Invoke-RunStage` + `Invoke-CargoRun` (ps1). The environment check is `check_environment` /
   `Assert-AppEnvironment`; the flags it relies on (`--check-venv`, `--ignore-installed`) are
   defined in `src/args.rs`.
+- To change anything about downloading — retries, resume, verification, progress — edit
+  `Get-RemoteFile` and its two primitives (`Invoke-CurlDownload`, `Invoke-DotNetDownload`) in
+  `run-dev.ps1` and `download` in `run-dev.sh`; the contract itself is `dev-docs/run_dev_plan.md`
+  §2.3a. `Resolve-GithubAsset` is what supplies the expected size and the checksum sidecar.
 - To change the Windows host triple or why GNU is used, see `dev-docs/run_dev_plan.md` §2.4 first.
 - To raise the required Rust version, edit `rust-version` in the root `Cargo.toml`. Do not touch
   the scripts.

@@ -272,16 +272,34 @@ install_hint() {
     else printf 'установите пакет: %s\n' "$pkg_linux"; fi
 }
 
-# Downloads `$1` to `$2` using whichever of curl/wget exists.
+# Downloads `$1` to `$2`. Returns 127 when neither curl nor wget exists.
+#
+# Same contract as the Windows implementation (and as
+# `src/installer/utils.rs::download_asset`), so the project has one principle:
+# the bytes land in `<dest>.part` and are renamed into place only when the
+# transfer finished, so `$2` never holds a truncated file; an interrupted run
+# leaves the `.part` behind and the next run CONTINUES from it (`curl -C -` /
+# `wget -c`) instead of starting over; transient failures are retried by the
+# downloader itself.
 download() {
-    local url="$1" dest="$2"
+    local url="$1" dest="$2" part="$2.part" rc
     if have curl; then
-        curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$dest"
+        curl --proto '=https' --tlsv1.2 -fL --show-error \
+             --retry 5 --retry-delay 2 --connect-timeout 30 \
+             -A "ManhwaStudio-run-dev" -C - -o "$part" "$url"
+        rc=$?
     elif have wget; then
-        wget -q "$url" -O "$dest"
+        wget -c --tries=5 --timeout=30 -U "ManhwaStudio-run-dev" -O "$part" "$url"
+        rc=$?
     else
         return 127
     fi
+
+    if [ "$rc" != "0" ] || [ ! -s "$part" ]; then
+        # The partial file is kept on purpose: it is what the next run resumes.
+        return "$rc"
+    fi
+    mv -f "$part" "$dest"
 }
 
 # =============================================================================
@@ -826,7 +844,8 @@ install_managed_rust() {
         fi
         die "$EXIT_NO_RUST" \
             "Не удалось скачать установщик Rust с https://sh.rustup.rs" \
-            "Проверьте интернет-соединение."
+            "Проверьте интернет-соединение и запустите run-dev ещё раз —" \
+            "загрузка продолжится с того места, на котором оборвалась."
     fi
 
     export RUSTUP_HOME="$(rust_root)/rustup"

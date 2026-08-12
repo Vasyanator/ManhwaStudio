@@ -364,6 +364,64 @@ MS_OS="macos"; RUN_DEV_ARGV="--debug"
 check "команда перезапуска для macOS с аргументами" \
       "$(restart_command)" "./run-dev.MacOS.command --debug"
 
+# ---------------------------------------------------------------------------
+note "Загрузка: .part, докачка и выбор загрузчика"
+# ---------------------------------------------------------------------------
+
+# Контракт download(): байты идут в <dest>.part и переименовываются на место
+# только когда файл дошёл целиком; оборванная загрузка оставляет .part, с
+# которого продолжит следующий запуск.
+DLDIR="$SANDBOX/dl"
+mkdir -p "$DLDIR"
+
+# Успешная загрузка: файл на месте, .part не остался.
+# `download` берёт curl/wget из PATH — подставляем свой, чтобы не ходить в сеть.
+FAKEBIN="$SANDBOX/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/curl" <<'FAKE'
+#!/usr/bin/env bash
+# Минимальный curl: понимает -o <файл> и -C - (докачку), пишет фиксированный ответ.
+out=""; prev=""
+for a in "$@"; do
+    if [ "$prev" = "-o" ]; then out="$a"; fi
+    prev="$a"
+done
+[ -n "$out" ] || exit 2
+if [ "${FAKE_CURL_FAIL:-0}" = "1" ]; then
+    printf 'обрыв' >> "$out"     # частичные байты остаются на диске
+    exit 18
+fi
+printf 'ЦЕЛИКОМ' > "$out"
+exit 0
+FAKE
+chmod +x "$FAKEBIN/curl"
+SAVED_PATH="$PATH"
+PATH="$FAKEBIN:$PATH"
+
+download "https://example.invalid/x" "$DLDIR/ok.bin"; check "успех: код 0" "$?" "0"
+check "успех: файл на месте"        "$(cat "$DLDIR/ok.bin")" "ЦЕЛИКОМ"
+check "успех: .part не остался"     "$(test -e "$DLDIR/ok.bin.part" && echo yes || echo no)" "no"
+
+FAKE_CURL_FAIL=1 download "https://example.invalid/y" "$DLDIR/bad.bin"
+check "обрыв: код не 0"             "$?" "18"
+check "обрыв: конечного файла нет"  "$(test -e "$DLDIR/bad.bin" && echo yes || echo no)" "no"
+check "обрыв: .part сохранён для докачки" "$(cat "$DLDIR/bad.bin.part")" "обрыв"
+
+# Повторный запуск дописывает в тот же .part (эмуляция -C -), затем переименовывает.
+FAKE_CURL_FAIL=1 download "https://example.invalid/y" "$DLDIR/bad.bin"
+check "докачка: .part продолжает расти" "$(cat "$DLDIR/bad.bin.part")" "обрывобрыв"
+
+download "https://example.invalid/y" "$DLDIR/bad.bin"; check "докачка: успех" "$?" "0"
+check "докачка: файл на месте"      "$(cat "$DLDIR/bad.bin")" "ЦЕЛИКОМ"
+check "докачка: .part убран"        "$(test -e "$DLDIR/bad.bin.part" && echo yes || echo no)" "no"
+
+# Ни curl, ни wget -> 127, и это отличимо от сетевой ошибки.
+mkdir -p "$SANDBOX/empty-path"
+PATH="$SANDBOX/empty-path"
+download "https://example.invalid/z" "$DLDIR/none.bin"
+check "нет ни curl, ни wget -> 127" "$?" "127"
+PATH="$SAVED_PATH"
+
 check "аргумент с пробелом цитируется" \
       "$(quote_args -- --project "/tmp/a b/x")" "-- --project '/tmp/a b/x'"
 check "аргументы без пробелов не цитируются" "$(quote_args --debug --yes)" "--debug --yes"

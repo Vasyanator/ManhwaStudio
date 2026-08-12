@@ -418,6 +418,66 @@ try {
     $script:AdoptedReplaced = $false
 
 
+    # ---------------------------------------------------------------------
+    Note 'Загрузка: .part, проверка размера и контрольной суммы'
+    # ---------------------------------------------------------------------
+
+    # Сеть здесь не нужна: проверяются те части контракта, которые работают с
+    # локальным файлом — имя .part, критерий завершённости и сверка SHA-256.
+    $dl = Join-Path $Sandbox 'dl'
+    [void](New-Item -ItemType Directory -Path $dl -Force)
+    $target = Join-Path $dl 'asset.zip'
+    $part   = "$target.part"
+
+    Check 'размер форматируется по-человечески' (Format-Bytes 274029684) '261 МБ'
+    Check 'мелкий размер тоже'                  (Format-Bytes 130)       '130 Б'
+
+    Set-Content -LiteralPath $part -Value 'полный файл' -NoNewline -Encoding Ascii
+    $len = (Get-Item $part).Length
+    Check 'точный размер -> завершено'   (Test-DownloadComplete -Part $part -ExpectedSize $len) $true
+    Check 'короче ожидаемого -> нет'     (Test-DownloadComplete -Part $part -ExpectedSize ($len + 1)) $false
+    Check 'длиннее ожидаемого -> нет'    (Test-DownloadComplete -Part $part -ExpectedSize ($len - 1)) $false
+    Check 'размер неизвестен -> хватает непустого' (Test-DownloadComplete -Part $part) $true
+    Check 'нет файла -> не завершено'    (Test-DownloadComplete -Part (Join-Path $dl 'нет.part')) $false
+
+    # Сверка суммы: сайдкар отдаём через file:// — сеть не нужна, код тот же.
+    $hash = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLower()
+    $side = Join-Path $dl 'asset.sha256'
+    Set-Content -LiteralPath $side -Value "$hash  asset.zip" -Encoding Ascii
+    $sideUrl = ([Uri]$side).AbsoluteUri
+
+    $okHash = $true
+    try { Assert-Sha256 -Part $part -Sha256Url $sideUrl } catch { $okHash = $false }
+    Check 'совпавшая сумма не мешает'  $okHash $true
+    Check 'файл при этом цел'          (Test-Path $part) $true
+
+    Set-Content -LiteralPath $side -Value ('0' * 64 + '  asset.zip') -Encoding Ascii
+    $badHash = $false
+    try { Assert-Sha256 -Part $part -Sha256Url $sideUrl } catch { $badHash = $true }
+    Check 'несовпавшая сумма -> ошибка'        $badHash $true
+    Check 'битый .part удалён, а не докачан'   (Test-Path $part) $false
+
+    # Сайдкара нет — это не ошибка, проверка просто пропускается.
+    Set-Content -LiteralPath $part -Value 'снова файл' -NoNewline -Encoding Ascii
+    $missing = $true
+    try { Assert-Sha256 -Part $part -Sha256Url ([Uri](Join-Path $dl 'нетсайдкара.sha256')).AbsoluteUri }
+    catch { $missing = $false }
+    Check 'нет сайдкара -> не ошибка'  $missing $true
+    Check 'файл не пострадал'          (Test-Path $part) $true
+
+    # Выбор загрузчика: curl.exe должен искаться как ПРИЛОЖЕНИЕ, потому что в
+    # Windows PowerShell `curl` — это алиас Invoke-WebRequest.
+    $curlApp = @(Get-Command 'curl.exe' -CommandType Application -ErrorAction SilentlyContinue)
+    $curlAny = @(Get-Command 'curl' -ErrorAction SilentlyContinue)
+    if ($curlAny.Count -gt 0) {
+        Check 'curl без .exe может оказаться алиасом IWR' `
+              ($curlAny[0].CommandType -eq 'Application') `
+              ($PSVersionTable.PSVersion.Major -ge 6)
+    }
+    if ($curlApp.Count -gt 0) {
+        Check 'curl.exe разрешается в приложение' $curlApp[0].CommandType 'Application'
+    }
+
 } finally {
     Set-Location ([System.IO.Path]::GetTempPath())
     Remove-Item -Recurse -Force $Sandbox -ErrorAction SilentlyContinue

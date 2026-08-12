@@ -266,43 +266,300 @@ function Get-DownloadDir {
     return $d
 }
 
+$UserAgent = 'ManhwaStudio-run-dev'
+
 <#
 .SYNOPSIS
-Downloads $Url to $Destination over TLS 1.2+. Throws on failure.
+Enables TLS 1.2 for this process. Windows PowerShell 5.1 still defaults to TLS
+1.0 on older builds, which github.com and static.rust-lang.org both refuse.
 #>
-function Get-RemoteFile {
-    param([string] $Url, [string] $Destination)
-    # Windows PowerShell 5.1 still defaults to TLS 1.0 on older builds, which
-    # github.com and static.rust-lang.org both refuse.
+function Set-TlsDefaults {
     try {
         [Net.ServicePointManager]::SecurityProtocol =
             [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
     } catch { }
-    Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing `
-        -Headers @{ 'User-Agent' = 'ManhwaStudio-run-dev' }
 }
 
 <#
 .SYNOPSIS
-Resolves the browser_download_url of the first asset on a GitHub "latest release"
-whose name matches $Pattern. Returns $null when the API is unreachable or no
-asset matches — the caller must then fail loudly rather than invent a URL.
+Formats a byte count as a human-readable size for progress and error messages.
+#>
+function Format-Bytes {
+    param([long] $Bytes)
+    if ($Bytes -ge 1073741824) { return ('{0:N1} ГБ' -f ($Bytes / 1073741824)) }
+    if ($Bytes -ge 1048576)    { return ('{0:N0} МБ' -f ($Bytes / 1048576)) }
+    if ($Bytes -ge 1024)       { return ('{0:N0} КБ' -f ($Bytes / 1024)) }
+    return "$Bytes Б"
+}
+
+<#
+.SYNOPSIS
+Downloads $Url into the partial file $Part with curl.exe, resuming whatever is
+already there. Throws when curl exits non-zero.
+
+.DESCRIPTION
+`-C -` is the resume; `--retry` handles transient errors on its own; `-f` turns an
+HTTP error status into a non-zero exit instead of a saved error page. curl is
+tried first because it retries and resumes without any help from us — but it is
+NOT trusted to be available or even to work: on the machine this was debugged on,
+curl reaches the release CDN and gets an empty reply (exit 52) while the .NET
+stack downloads the same URL fine. Hence Get-RemoteFile falls through to the
+other implementation on ANY failure, not only when curl.exe is missing.
+#>
+function Invoke-CurlDownload {
+    param([string] $CurlPath, [string] $Url, [string] $Part)
+    $curlArgs = @(
+        '--fail', '--location', '--show-error',
+        '--retry', '5', '--retry-delay', '2',
+        '--connect-timeout', '30',
+        '--user-agent', $UserAgent,
+        '--continue-at', '-',
+        '--progress-bar',
+        '--output', $Part, $Url)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $CurlPath @curlArgs
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0) { throw "curl завершился с кодом $code" }
+}
+
+<#
+.SYNOPSIS
+Downloads $Url into the partial file $Part with the .NET stack, resuming from the
+bytes already on disk and retrying while the transfer keeps making progress.
+Throws when it cannot finish.
+
+.DESCRIPTION
+This is not a fallback stub: on a link that drops mid-transfer — the failure that
+motivated this loader, a 274 MB archive dying with "connection was closed
+unexpectedly" — it is the implementation that gets the file. Each attempt sends a
+Range header for the current file length and appends; an attempt that transferred
+anything resets the failure counter, so a flaky link makes progress instead of
+starting over. A server that answers 200 instead of 206 does not support ranges,
+so the partial file is discarded rather than appended to (that would corrupt it).
+#>
+function Invoke-DotNetDownload {
+    param([string] $Url, [string] $Part, [long] $ExpectedSize = 0)
+    $maxStall = 4
+    $stall = 0
+    while ($true) {
+        $offset = if (Test-Path $Part) { (Get-Item $Part).Length } else { 0 }
+        if ($ExpectedSize -gt 0 -and $offset -ge $ExpectedSize) { return }
+        $before = $offset
+        $resp = $null; $in = $null; $out = $null
+        try {
+            $req = [Net.HttpWebRequest]::Create($Url)
+            $req.UserAgent = $UserAgent
+            $req.Timeout = 60000
+            $req.ReadWriteTimeout = 300000
+            if ($offset -gt 0) { $req.AddRange($offset) }
+            $resp = $req.GetResponse()
+
+            # 200 to a ranged request means "ranges not supported": start over
+            # rather than append to bytes that are about to be repeated.
+            $mode = [IO.FileMode]::Append
+            if ($offset -gt 0 -and $resp.StatusCode -ne [Net.HttpStatusCode]::PartialContent) {
+                $mode = [IO.FileMode]::Create
+                $offset = 0
+            }
+            $total = if ($ExpectedSize -gt 0) { $ExpectedSize } else { $offset + $resp.ContentLength }
+
+            $in  = $resp.GetResponseStream()
+            $out = New-Object IO.FileStream($Part, $mode, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $buffer = New-Object byte[] 262144
+            $done = $offset
+            $tick = [Diagnostics.Stopwatch]::StartNew()
+            while (($read = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $out.Write($buffer, 0, $read)
+                $done += $read
+                if ($tick.Elapsed.TotalSeconds -ge 2) {
+                    Write-Progress-Line -Done $done -Total $total
+                    $tick.Restart()
+                }
+            }
+            Write-Progress-Line -Done $done -Total $total -Final
+            return
+        } catch {
+            $now = if (Test-Path $Part) { (Get-Item $Part).Length } else { 0 }
+            if ($now -gt $before) { $stall = 0 } else { $stall++ }
+            if ($stall -ge $maxStall) { throw }
+            Start-Sleep -Seconds 2
+        } finally {
+            if ($out)  { $out.Dispose() }
+            if ($in)   { $in.Dispose() }
+            if ($resp) { $resp.Close() }
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+Prints one in-place progress line. $ProgressPreference is deliberately off (it
+makes Invoke-WebRequest several times slower on 5.1), so a long download would
+otherwise look like a hang.
+#>
+function Write-Progress-Line {
+    param([long] $Done, [long] $Total, [switch] $Final)
+    $text = if ($Total -gt 0) {
+        '    Загружено: {0} из {1} ({2:N0}%)' -f (Format-Bytes $Done), (Format-Bytes $Total), (100 * $Done / $Total)
+    } else {
+        '    Загружено: {0}' -f (Format-Bytes $Done)
+    }
+    Write-Host ("`r" + $text.PadRight(60)) -NoNewline
+    if ($Final) { Write-Host '' }
+}
+
+<#
+.SYNOPSIS
+Downloads $Url to $Destination: resumable, verified, and never leaving a partial
+file at the destination path. Throws with a Russian, actionable message when the
+file could not be completed.
+
+.DESCRIPTION
+Contract, deliberately the same as `src/installer/utils.rs::download_asset`, so
+the project has one principle rather than two:
+- the bytes go to `<Destination>.part` and are renamed into place only once the
+  file is complete, so $Destination never holds a truncated download;
+- an interrupted run leaves the `.part` file alone, and the next run CONTINUES
+  from it instead of starting over;
+- $ExpectedSize (0 = unknown) is checked against the finished file — a short file
+  is an error, not something to hand on to the unzipper;
+- $Sha256Url (empty = none published) is fetched and verified; a mismatch deletes
+  the `.part` file, because resuming corrupt bytes can never succeed.
+Two implementations are tried in order and the second runs whenever the first
+fails, not only when it is absent; see Invoke-CurlDownload.
+#>
+function Get-RemoteFile {
+    param(
+        [string] $Url,
+        [string] $Destination,
+        [long]   $ExpectedSize = 0,
+        [string] $Sha256Url = ''
+    )
+    Set-TlsDefaults
+    $part = "$Destination.part"
+
+    $have = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
+    if ($ExpectedSize -gt 0 -and $have -gt $ExpectedSize) {
+        # Longer than the asset itself: not a resumable prefix, whatever it is.
+        Remove-Item -Force $part -ErrorAction SilentlyContinue
+        $have = 0
+    }
+    if ($have -gt 0) { Info "Продолжаю прерванную загрузку, уже есть $(Format-Bytes $have)" }
+
+    $problems = @()
+    $curl = Get-Command 'curl.exe' -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    if ($curl -and -not $env:MS_RUN_DEV_NO_CURL) {
+        try { Invoke-CurlDownload -CurlPath $curl.Source -Url $Url -Part $part }
+        catch { $problems += "curl: $($_.Exception.Message)" }
+    }
+    if (-not (Test-DownloadComplete -Part $part -ExpectedSize $ExpectedSize)) {
+        if ($problems.Count -gt 0) {
+            # curl leaves its own progress bar on screen before failing, so say
+            # plainly that the run is not over and something else is taking over.
+            Warn 'Загрузка через curl не удалась, пробую встроенный загрузчик.'
+        }
+        try { Invoke-DotNetDownload -Url $Url -Part $part -ExpectedSize $ExpectedSize }
+        catch { $problems += ".NET: $($_.Exception.Message)" }
+    }
+
+    if (-not (Test-DownloadComplete -Part $part -ExpectedSize $ExpectedSize)) {
+        $got = if (Test-Path $part) { (Get-Item $part).Length } else { 0 }
+        $detail = if ($ExpectedSize -gt 0) {
+            "Получено $(Format-Bytes $got) из $(Format-Bytes $ExpectedSize)."
+        } else {
+            "Получено $(Format-Bytes $got)."
+        }
+        throw ("$detail " + ($problems -join '; '))
+    }
+
+    if ($Sha256Url) { Assert-Sha256 -Part $part -Sha256Url $Sha256Url }
+
+    if (Test-Path $Destination) { Remove-Item -Force $Destination }
+    Move-Item -LiteralPath $part -Destination $Destination -Force
+}
+
+<#
+.SYNOPSIS
+True when the partial file is finished: the exact expected size, or — when no
+size is known — simply present and non-empty.
+#>
+function Test-DownloadComplete {
+    param([string] $Part, [long] $ExpectedSize = 0)
+    if (-not (Test-Path $Part)) { return $false }
+    $len = (Get-Item $Part).Length
+    if ($ExpectedSize -gt 0) { return ($len -eq $ExpectedSize) }
+    return ($len -gt 0)
+}
+
+<#
+.SYNOPSIS
+Verifies $Part against the checksum published next to the asset. Throws (and
+deletes the partial file) on a mismatch; a sidecar that cannot be fetched is a
+warning, never a failure — the checksum is a bonus, not a prerequisite.
+#>
+function Assert-Sha256 {
+    param([string] $Part, [string] $Sha256Url)
+    $tmp = "$Part.sha256"
+    try {
+        Invoke-WebRequest -Uri $Sha256Url -OutFile $tmp -UseBasicParsing `
+            -Headers @{ 'User-Agent' = $UserAgent }
+        $text = (Get-Content -LiteralPath $tmp -Raw)
+    } catch {
+        Warn 'Не удалось получить контрольную сумму, проверка пропущена.'
+        return
+    } finally {
+        Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+    }
+
+    $m = [regex]::Match($text, '[0-9a-fA-F]{64}')
+    if (-not $m.Success) {
+        Warn 'Файл контрольной суммы не распознан, проверка пропущена.'
+        return
+    }
+    $actual = (Get-FileHash -LiteralPath $Part -Algorithm SHA256).Hash
+    if ($actual -ne $m.Value) {
+        Remove-Item -Force $Part -ErrorAction SilentlyContinue
+        throw 'контрольная сумма не совпала, файл повреждён (скачается заново)'
+    }
+    Info 'Контрольная сумма совпала.'
+}
+
+<#
+.SYNOPSIS
+Resolves the first asset of a GitHub "latest release" whose name matches
+$Pattern, as an object with Url, Size and Sha256Url. Returns $null when the API
+is unreachable or nothing matches — the caller must then fail loudly rather than
+invent a URL.
+
+.DESCRIPTION
+Size comes from the API rather than from the transfer, so the downloader can tell
+"finished" from "the connection closed near the end". Sha256Url points at the
+`<asset>.sha256` sidecar when the release publishes one (winlibs does) and is
+empty otherwise; a missing sidecar skips verification, it never blocks an install.
 #>
 function Resolve-GithubAsset {
     param([string] $ApiUrl, [string] $Pattern)
+    Set-TlsDefaults
     try {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol =
-                [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
-        } catch { }
         $release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing `
-            -Headers @{ 'User-Agent' = 'ManhwaStudio-run-dev' }
+            -Headers @{ 'User-Agent' = $UserAgent }
     } catch {
         return $null
     }
     $asset = $release.assets | Where-Object { $_.name -match $Pattern } | Select-Object -First 1
     if (-not $asset) { return $null }
-    return $asset.browser_download_url
+
+    $sidecarName = $asset.name + '.sha256'
+    $sidecar = $release.assets | Where-Object { $_.name -eq $sidecarName } | Select-Object -First 1
+    return [pscustomobject]@{
+        Name      = $asset.name
+        Url       = $asset.browser_download_url
+        Size      = [long]$asset.size
+        Sha256Url = if ($sidecar) { $sidecar.browser_download_url } else { '' }
+    }
 }
 
 <#
@@ -406,8 +663,8 @@ function Install-MinGit {
     } else {
         '^MinGit-.*-64-bit\.zip$'
     }
-    $url = Resolve-GithubAsset -ApiUrl $GitApiMinGit -Pattern $pattern
-    if (-not $url) {
+    $asset = Resolve-GithubAsset -ApiUrl $GitApiMinGit -Pattern $pattern
+    if (-not $asset) {
         Die $ExitNoGit @(
             'Не удалось узнать адрес загрузки Git с GitHub.',
             'Проверьте интернет-соединение, либо установите Git вручную:',
@@ -419,14 +676,26 @@ function Install-MinGit {
     $zip = Join-Path (Get-DownloadDir) 'MinGit.zip'
     $dst = Join-Path $script:RepoRoot 'installer_files\git'
     try {
-        Info "Загрузка: $url"
-        Get-RemoteFile -Url $url -Destination $zip
-        Expand-ZipTo -ZipPath $zip -Destination $dst
+        Info "Загрузка: $($asset.Name)  ($(Format-Bytes $asset.Size))"
+        Get-RemoteFile -Url $asset.Url -Destination $zip `
+                       -ExpectedSize $asset.Size -Sha256Url $asset.Sha256Url
     } catch {
         Die $ExitNoGit @(
-            'Не удалось скачать или распаковать Git.',
+            'Не удалось скачать Git.',
             "Причина: $($_.Exception.Message)",
-            'Установите Git вручную: https://git-scm.com/download/win')
+            '',
+            'Запустите run-dev ещё раз: загрузка продолжится с того места,',
+            'на котором оборвалась, а не начнётся заново.',
+            'Либо установите Git вручную: https://git-scm.com/download/win')
+    }
+    try {
+        Expand-ZipTo -ZipPath $zip -Destination $dst
+    } catch {
+        Remove-Item -Force $zip -ErrorAction SilentlyContinue
+        Die $ExitNoGit @(
+            'Архив с Git скачался, но распаковать его не удалось.',
+            "Причина: $($_.Exception.Message)",
+            'Проверьте, хватает ли места на диске, и запустите run-dev снова.')
     } finally {
         if (Test-Path $zip) { Remove-Item -Force $zip -ErrorAction SilentlyContinue }
     }
@@ -1022,12 +1291,15 @@ function Install-ManagedRust {
 
     $init = Join-Path (Get-DownloadDir) 'rustup-init.exe'
     try {
+        # No published size or checksum for this one: it is a plain static URL,
+        # not a GitHub release asset. Resume and retries still apply.
         Get-RemoteFile -Url $RustupUrlGnu -Destination $init
     } catch {
         Die $ExitNoRust @(
             'Не удалось скачать установщик Rust.',
             "Причина: $($_.Exception.Message)",
-            'Проверьте интернет-соединение.')
+            'Проверьте интернет-соединение и запустите run-dev ещё раз —',
+            'загрузка продолжится с того места, на котором оборвалась.')
     }
 
     $env:RUSTUP_HOME = Join-Path (Get-RustRoot) 'rustup'
@@ -1071,8 +1343,8 @@ function Install-Mingw {
     Info 'которая собирает исходники на C и ассемблере.'
     Info 'Устанавливается только внутрь installer_files\mingw64.'
 
-    $url = Resolve-GithubAsset -ApiUrl $GitApiMingw -Pattern '^winlibs-x86_64-.*mingw-w64.*\.zip$'
-    if (-not $url) {
+    $asset = Resolve-GithubAsset -ApiUrl $GitApiMingw -Pattern '^winlibs-x86_64-.*mingw-w64.*\.zip$'
+    if (-not $asset) {
         Die $ExitNoCc @(
             'Не удалось узнать адрес загрузки MinGW-w64 с GitHub.',
             'Проверьте интернет-соединение, либо установите его вручную:',
@@ -1084,14 +1356,31 @@ function Install-Mingw {
     $tmp  = Join-Path $script:RepoRoot 'installer_files\_mingw_tmp'
     $dest = Get-MingwDir
     try {
-        Info "Загрузка: $url"
-        Get-RemoteFile -Url $url -Destination $zip
-        Expand-ZipTo -ZipPath $zip -Destination $tmp
+        Info "Загрузка: $($asset.Name)"
+        Info "Размер: $(Format-Bytes $asset.Size) — это надолго, окно не зависло."
+        Get-RemoteFile -Url $asset.Url -Destination $zip `
+                       -ExpectedSize $asset.Size -Sha256Url $asset.Sha256Url
     } catch {
         Die $ExitNoCc @(
-            'Не удалось скачать или распаковать MinGW-w64.',
+            'Не удалось скачать MinGW-w64.',
             "Причина: $($_.Exception.Message)",
-            'Установите его вручную: https://winlibs.com/')
+            '',
+            'Запустите run-dev ещё раз: загрузка продолжится с того места,',
+            'на котором оборвалась, а не начнётся заново.',
+            'Если связь рвётся постоянно — скачайте архив вручную:',
+            '    https://winlibs.com/',
+            'и распакуйте его в installer_files\mingw64.')
+    }
+    try {
+        Expand-ZipTo -ZipPath $zip -Destination $tmp
+    } catch {
+        Remove-Item -Force $zip -ErrorAction SilentlyContinue
+        Die $ExitNoCc @(
+            'Архив MinGW-w64 скачался, но распаковать его не удалось.',
+            "Причина: $($_.Exception.Message)",
+            'Чаще всего это нехватка места на диске: архив весит',
+            "$(Format-Bytes $asset.Size), а распакованный тулчейн — заметно больше.",
+            'Освободите место и запустите run-dev снова.')
     } finally {
         if (Test-Path $zip) { Remove-Item -Force $zip -ErrorAction SilentlyContinue }
     }
