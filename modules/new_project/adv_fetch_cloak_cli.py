@@ -15,8 +15,9 @@ Main items:
   descramble sites are covered) and finalizes them through a content pipeline: blank (single-colour)
   frames are dropped globally, per-element repeats collapsed by stable WeakMap id, records clustered
   by perceptual hash so one page seen through several layers is one page, the highest-fidelity
-  representative is kept per cluster, pages are ordered by DOM/geometry/URL signals, and size-outlier
-  pages are flagged as probable junk.
+  representative is kept per cluster, pages are ordered by the site's own published page index when
+  that index passes the authority gate (`_site_page_index_authority`) and otherwise by
+  DOM/geometry/URL signals, and size-outlier pages are flagged as probable junk.
 
 Protocol:
 - `_handle_command({"command": ...})` runs one command and reports a single
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
@@ -129,6 +131,49 @@ class DeepCaptureState:
     # ("canvas", str(weakmap_id)) key; once present a key keeps its slot and is never
     # moved or removed when it later leaves the page. Guarded by ``lock``.
     dom_order_keys: list[tuple[str, str]] = field(default_factory=list)
+    # Site-published page index (see `DOM_PAGE_INDEX_ATTRIBUTES`) per DOM key, merged
+    # across drains with first-seen priority. Only keys whose element (or one of its
+    # ancestors) carries such an attribute appear here. Guarded by ``lock``.
+    dom_page_indices: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Maps a DOM key to the representative key of the DOM element it came from, so the
+    # up-to-four URL variants one `<img>` emits collapse into a single element when
+    # coverage ratios are computed. First reading wins. Guarded by ``lock``.
+    dom_key_elements: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+
+
+# Attributes a site may use to publish an explicit, 1-based (or 0-based - only the
+# relative order matters) reading index for a page container. Deep capture reads the
+# first of these found on the capturable element itself or its closest ancestor, in this
+# priority order, and only accepts a plain non-negative integer value.
+DOM_PAGE_INDEX_ATTRIBUTES = ("data-page", "data-index", "data-idx", "aria-posinset")
+
+# Minimum share of indexed elements whose published indices must already be
+# non-decreasing in document order for the index to be trusted (4/5). A real page index
+# agrees with document order almost everywhere; two unrelated indexed lists (a thumbnail
+# strip plus the pages, or pages plus an ad rail) restart their numbering and fall well
+# below this.
+_PAGE_INDEX_MONOTONIC_NUMERATOR = 4
+_PAGE_INDEX_MONOTONIC_DENOMINATOR = 5
+
+# Sentinel document-order position for a record whose canvas element / URL never showed
+# up in the DOM read. It ties last inside its sort tier instead of jumping ahead of
+# records whose document position is actually known.
+_UNKNOWN_DOM_POSITION = sys.maxsize
+
+
+@dataclass(frozen=True)
+class DeepCaptureDomReading:
+    """One raw read of the page's capturable elements in document order.
+
+    `keys` are the de-duplicated ("image", url) / ("canvas", str(weakmap_id)) keys in
+    document order. `page_indices` holds the site-published reading index of the keys
+    whose element (or an ancestor) publishes one. `key_elements` maps every key to the
+    representative key of its DOM element, so the several URL variants of one `<img>`
+    can be counted as one element; keys absent from it are their own element.
+    """
+    keys: list[tuple[str, str]] = field(default_factory=list)
+    page_indices: dict[tuple[str, str], int] = field(default_factory=dict)
+    key_elements: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,9 +184,23 @@ class DeepCaptureDomOrder:
     DOM traversal order; `element_to_index` maps a canvas WeakMap id to the same order
     space. Used to sort captured pages by their order of appearance in the page rather
     than by network arrival order or URL-embedded numbers.
+
+    `url_to_page` / `element_to_page` carry the site's own published page index (see
+    `DOM_PAGE_INDEX_ATTRIBUTES`) in the same key spaces, and are populated **only** when
+    `authoritative` is True (see `_site_page_index_authority` for the gate). They are
+    then gap-filled: a key whose element publishes no index inherits the index of its
+    nearest indexed predecessor in document order, so a partially tagged document stays
+    one sequence instead of splitting into an indexed and an unindexed sort tier; such
+    ties are resolved by document order inside `_deep_capture_sort_key`.
+
+    On a site that publishes no such attributes both maps are empty and `authoritative`
+    is False, so ordering behaves exactly as if this tier did not exist.
     """
     url_to_index: dict[str, int]
     element_to_index: dict[int, int]
+    url_to_page: dict[str, int] = field(default_factory=dict)
+    element_to_page: dict[int, int] = field(default_factory=dict)
+    authoritative: bool = False
 
 
 def _run_inline(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -655,8 +714,14 @@ class CloakFetchDaemon:
         capture.stop_event.set()
         self._capture_deep_updates_once()
         self._settle_deep_image_reads()
+        # Accumulate on both sides of the screenshot pass: `ElementHandle.screenshot()`
+        # scrolls each canvas into view, which on a virtual-scroll reader is exactly what
+        # recycles the elements the merge depends on. The read before it keeps the
+        # pre-scroll document order; the read after it picks up whatever the scrolling
+        # attached (first-seen wins, so the earlier reading is never rewritten).
         self._accumulate_deep_dom_order()
         self._capture_visible_canvas_screenshots_if_needed(capture)
+        self._accumulate_deep_dom_order()
         dom_order = self._finalize_dom_capture_order(capture)
         with capture.lock:
             entries = list(capture.entries)
@@ -668,14 +733,19 @@ class CloakFetchDaemon:
             entries, page_url, output_dir, cancel_file, dom_order
         )
 
-    def _read_dom_order_keys(self) -> list[tuple[str, str]]:
-        """Read the current document order of page images/canvases as ordered keys."""
+    def _read_dom_order_keys(self) -> DeepCaptureDomReading:
+        """Read the current document order of page images/canvases.
+
+        Returns the `DeepCaptureDomReading` produced by `_deep_capture_dom_keys_from_raw`.
+        A failed read is not fatal for deep capture (ordering just falls back to weaker
+        signals), so it is logged and reported as an empty reading.
+        """
         try:
             with self._page_lock:
                 raw = self._require_page().evaluate(COLLECT_DOM_IMAGE_ORDER_JS)
         except Exception:  # noqa: BLE001
             LOG.debug("Failed to read DOM image order during deep capture", exc_info=True)
-            return []
+            return DeepCaptureDomReading()
         return _deep_capture_dom_keys_from_raw(raw)
 
     def _accumulate_deep_dom_order(self) -> None:
@@ -685,30 +755,75 @@ class CloakFetchDaemon:
         still attached, then preserved after a virtual-scroll reader recycles them out of
         the DOM. Accumulation is plain first-seen append (no anchor-based insertion), which
         keeps groups in reading order even when consecutive polls catch non-overlapping
-        windows. The live order is reconciled with the current DOM at stop.
+        windows. Any site-published page index seen for a key is recorded alongside it,
+        as is the DOM element the key belongs to (first reading wins in both cases, so a
+        container the reader recycles cannot rewrite history). The live order is
+        reconciled with the current DOM at stop.
         """
         capture = self._deep_capture
         if capture is None or not self._deep_capture_active:
             return
-        current_keys = self._read_dom_order_keys()
-        if not current_keys:
+        reading = self._read_dom_order_keys()
+        if not reading.keys:
             return
         with capture.lock:
             seen = set(capture.dom_order_keys)
-            _append_first_seen_keys(capture.dom_order_keys, seen, current_keys)
+            _append_first_seen_keys(capture.dom_order_keys, seen, reading.keys)
+            for key, page_index in reading.page_indices.items():
+                capture.dom_page_indices.setdefault(key, page_index)
+            for key, element_key in reading.key_elements.items():
+                capture.dom_key_elements.setdefault(key, element_key)
 
     def _finalize_dom_capture_order(self, capture: DeepCaptureState) -> DeepCaptureDomOrder:
-        """Build the document-order index, prepending pages that left the DOM by stop."""
-        stop_keys = self._read_dom_order_keys()
+        """Build the document-order index used to sort captured pages at stop time.
+
+        Merges the accumulated first-seen order with the live stop-time DOM order
+        (`_combine_dom_order`) and projects the result into the URL / canvas-element key
+        spaces. The site-published page index (`DOM_PAGE_INDEX_ATTRIBUTES`) is promoted to
+        the primary ordering signal only when `_site_page_index_authority` accepts it over
+        the *elements* of that merged order; it is then gap-filled so unindexed elements
+        keep their document position instead of dropping into a weaker tier. When the
+        index is refused, the returned order is bit-for-bit what it was before the index
+        tier existed.
+        """
+        stop_reading = self._read_dom_order_keys()
         with capture.lock:
             seen_keys = list(capture.dom_order_keys)
-        keys = _combine_dom_order(seen_keys, stop_keys)
+            page_indices = dict(capture.dom_page_indices)
+            key_elements = dict(capture.dom_key_elements)
+        # First-seen readings win: a key's index was recorded while its element was
+        # actually attached, which is exactly the reading a recycled container can lose.
+        for key, page_index in stop_reading.page_indices.items():
+            page_indices.setdefault(key, page_index)
+        for key, element_key in stop_reading.key_elements.items():
+            key_elements.setdefault(key, element_key)
+        keys = _combine_dom_order(seen_keys, stop_reading.keys)
+
+        # Collapse keys into DOM elements before measuring anything: one <img> emits up
+        # to four URL variants sharing a slot while one <canvas> emits a single key, so a
+        # key-counted ratio is systematically biased towards "the images are indexed".
+        elements, element_page_index = _group_dom_keys_by_element(keys, key_elements, page_indices)
+        authoritative, reason = _site_page_index_authority(
+            [(element[0], element_page_index[element]) for element in elements]
+        )
+        # Gap fill only makes sense once the index is trusted; while it is refused the
+        # page maps must stay empty so the sort key never reaches the index tier.
+        resolved_page = (
+            _fill_page_index_gaps(elements, element_page_index) if authoritative else {}
+        )
+
         url_to_index: dict[str, int] = {}
         element_to_index: dict[int, int] = {}
-        for order, (kind, value) in enumerate(keys):
+        url_to_page: dict[str, int] = {}
+        element_to_page: dict[int, int] = {}
+        for order, key in enumerate(keys):
+            kind, value = key
+            page_index = resolved_page.get(key_elements.get(key, key))
             if kind == "image":
                 if value and value not in url_to_index:
                     url_to_index[value] = order
+                    if page_index is not None:
+                        url_to_page[value] = page_index
             elif kind == "canvas":
                 try:
                     element_id = int(value)
@@ -716,12 +831,31 @@ class CloakFetchDaemon:
                     continue
                 if element_id > 0 and element_id not in element_to_index:
                     element_to_index[element_id] = order
+                    if page_index is not None:
+                        element_to_page[element_id] = page_index
+        indexed_elements = sum(
+            1 for element in elements if element_page_index[element] is not None
+        )
         _debug_log(
             "cloak deep capture: finalized DOM order for %d image url(s), %d canvas element(s)",
             len(url_to_index),
             len(element_to_index),
         )
-        return DeepCaptureDomOrder(url_to_index, element_to_index)
+        _debug_log(
+            "cloak deep capture: site page index %s (%s; %d/%d dom element(s) carry one; attributes=%s)",
+            "authoritative" if authoritative else "ignored",
+            reason,
+            indexed_elements,
+            len(elements),
+            ",".join(DOM_PAGE_INDEX_ATTRIBUTES),
+        )
+        return DeepCaptureDomOrder(
+            url_to_index,
+            element_to_index,
+            url_to_page,
+            element_to_page,
+            authoritative,
+        )
 
     def _ensure_browser(self) -> None:
         if self._context is not None and self._browser_session_alive():
@@ -2541,18 +2675,75 @@ COLLECT_DEEP_ELEMENT_SNAPSHOTS_JS = """
 # plain-<img> sites) instead of by network arrival or URL-embedded numbers. Emits image
 # URLs (all candidate attributes share one slot) and canvas WeakMap ids, walking shadow
 # roots and same-origin iframes in document order.
+#
+# Each entry additionally carries `page_index`: the site's own published reading index,
+# read from the first of `data-page` / `data-index` / `data-idx` / `aria-posinset`
+# (DOM_PAGE_INDEX_ATTRIBUTES) found on the element itself or its closest ancestor, or
+# null when the site publishes none. This is what lets a virtual-scroll reader that
+# renders some pages as <img> and others as <canvas> be ordered as one sequence: the
+# containers usually all exist from first paint, so a single read yields the whole
+# mapping. The walk is strictly observe-only - it only reads attributes - and memoized
+# per ancestor, because this collector runs on every status poll.
 COLLECT_DOM_IMAGE_ORDER_JS = """
 () => {
   const state = window.__mfDeepCapture;
   const out = [];
   const seenUrls = new Set();
+  const indexAttrs = ["data-page", "data-index", "data-idx", "aria-posinset"];
+  // Ancestor -> resolved page index (or null), valid for this one evaluation. Every
+  // <img>/<source>/<canvas> of one page container shares the same ancestor chain, so
+  // without this each element re-reads the same attributes up to the document root.
+  const indexCache = new Map();
   let order = 0;
-  const addUrl = (slot, value) => {
+  // Closest self-or-ancestor page index; crosses shadow boundaries via the host so a
+  // page container outside the shadow root is still found. It cannot climb out of an
+  // iframe (an iframe document's root node has no host), which is safe: the index is
+  // then simply absent for elements inside that frame. Bounded to keep the walk cheap
+  // on deep trees.
+  const pageIndexOf = (node) => {
+    const chain = [];
+    let current = node;
+    for (let hops = 0; current && hops < 64; hops += 1) {
+      if (hops > 0) {
+        if (indexCache.has(current)) {
+          const cached = indexCache.get(current);
+          for (const visited of chain) indexCache.set(visited, cached);
+          return cached;
+        }
+        chain.push(current);
+      }
+      if (current.getAttribute) {
+        for (const attr of indexAttrs) {
+          let raw = null;
+          try { raw = current.getAttribute(attr); } catch (_) { raw = null; }
+          if (typeof raw !== "string") continue;
+          const text = raw.trim();
+          if (!/^[0-9]{1,7}$/.test(text)) continue;
+          const value = parseInt(text, 10);
+          for (const visited of chain) indexCache.set(visited, value);
+          return value;
+        }
+      }
+      let next = current.parentElement || null;
+      if (!next && current.getRootNode) {
+        try {
+          const root = current.getRootNode();
+          next = root && root.host ? root.host : null;
+        } catch (_) { next = null; }
+      }
+      current = next;
+    }
+    // Only cache "no index" when the chain really ended: a hop-budget cut-off is
+    // relative to the node the walk started from, so an ancestor may still have one.
+    if (!current) { for (const visited of chain) indexCache.set(visited, null); }
+    return null;
+  };
+  const addUrl = (slot, pageIndex, value) => {
     if (typeof value !== "string") return;
     const url = value.trim();
     if (!url || seenUrls.has(url)) return;
     seenUrls.add(url);
-    out.push({ order: slot, kind: "image", url });
+    out.push({ order: slot, kind: "image", url, page_index: pageIndex });
   };
   const walk = (root) => {
     if (!root || !root.querySelectorAll) return;
@@ -2560,16 +2751,23 @@ COLLECT_DOM_IMAGE_ORDER_JS = """
       const tag = String(node.tagName || "").toLowerCase();
       if (tag === "img") {
         const slot = order++;
-        addUrl(slot, node.currentSrc || "");
-        addUrl(slot, node.src || "");
-        addUrl(slot, node.getAttribute("src") || "");
-        addUrl(slot, node.getAttribute("data-src") || "");
+        const pageIndex = pageIndexOf(node);
+        addUrl(slot, pageIndex, node.currentSrc || "");
+        addUrl(slot, pageIndex, node.src || "");
+        addUrl(slot, pageIndex, node.getAttribute("src") || "");
+        addUrl(slot, pageIndex, node.getAttribute("data-src") || "");
       } else if (tag === "source") {
         const slot = order++;
-        addUrl(slot, node.src || "");
-        addUrl(slot, node.getAttribute("src") || "");
+        const pageIndex = pageIndexOf(node);
+        addUrl(slot, pageIndex, node.src || "");
+        addUrl(slot, pageIndex, node.getAttribute("src") || "");
       } else if (tag === "canvas") {
-        out.push({ order: order++, kind: "canvas", element_id: (state && state.elementId ? state.elementId(node) : 0) });
+        out.push({
+          order: order++,
+          kind: "canvas",
+          element_id: (state && state.elementId ? state.elementId(node) : 0),
+          page_index: pageIndexOf(node),
+        });
       }
       if (node.shadowRoot) walk(node.shadowRoot);
     }
@@ -3124,6 +3322,30 @@ def _canvas_reject_reason(item: dict[str, Any]) -> str:
     return "unknown reject reason"
 
 
+def _deep_capture_lookup_dom_value(
+    entry: dict[str, Any],
+    url: str,
+    element_map: dict[int, int],
+    url_map: dict[str, int],
+) -> Optional[int]:
+    """Look a capture up in one canvas-element / image-URL key-space pair.
+
+    Canvas captures resolve through their WeakMap `element_id`, image/network captures
+    through their real URL. Returns `None` when neither key is present in the maps.
+    """
+    metadata = entry.get("metadata")
+    if isinstance(metadata, dict):
+        element_id = metadata.get("element_id")
+        try:
+            if element_id is not None and int(element_id) in element_map:
+                return element_map[int(element_id)]
+        except (TypeError, ValueError):
+            pass
+    if url and url in url_map:
+        return url_map[url]
+    return None
+
+
 def _deep_capture_resolved_dom_index(
     entry: dict[str, Any],
     url: str,
@@ -3136,17 +3358,27 @@ def _deep_capture_resolved_dom_index(
     """
     if dom_order is None:
         return None
-    metadata = entry.get("metadata")
-    if isinstance(metadata, dict):
-        element_id = metadata.get("element_id")
-        try:
-            if element_id is not None and int(element_id) in dom_order.element_to_index:
-                return dom_order.element_to_index[int(element_id)]
-        except (TypeError, ValueError):
-            pass
-    if url and url in dom_order.url_to_index:
-        return dom_order.url_to_index[url]
-    return None
+    return _deep_capture_lookup_dom_value(
+        entry, url, dom_order.element_to_index, dom_order.url_to_index
+    )
+
+
+def _deep_capture_resolved_page_index(
+    entry: dict[str, Any],
+    url: str,
+    dom_order: Optional[DeepCaptureDomOrder],
+) -> Optional[int]:
+    """Resolve the site's own published page index for a capture, if authoritative.
+
+    Returns `None` unless the stop-time DOM read marked the site page index
+    authoritative (see `DeepCaptureDomOrder`) *and* this capture's canvas element or
+    image URL carries one, so a site that publishes no such attribute is unaffected.
+    """
+    if dom_order is None or not dom_order.authoritative:
+        return None
+    return _deep_capture_lookup_dom_value(
+        entry, url, dom_order.element_to_page, dom_order.url_to_page
+    )
 
 
 def _deep_capture_sort_key(
@@ -3154,33 +3386,56 @@ def _deep_capture_sort_key(
     image: Image.Image,
     fallback_index: int,
     dom_order: Optional[DeepCaptureDomOrder] = None,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int]:
+    """Sort key placing a captured page in reading order.
+
+    Returns `(primary_rank, primary_value, dom_position, source_rank, fallback_index,
+    area_rank)`. `primary_rank` names the strongest ordering signal available for this
+    capture, in descending trust: 0 the site's own published page index (only when the
+    DOM read marked it authoritative), 1 combined document order, 2 per-snapshot DOM walk
+    order, 3 on-page geometry, 4 a URL-embedded page number, 5 capture order. Records that
+    resolve through different tiers are grouped tier by tier, so the tiers must stay
+    ordered from most to least trustworthy.
+
+    `dom_position` is the record's place in combined document order, or
+    `_UNKNOWN_DOM_POSITION` when it has none. It sits immediately after `primary_value`
+    so that any tie inside a tier - most importantly several pages sharing one published
+    index, which is what a single shared `data-index` wrapper produces - degrades to
+    document order instead of to network arrival order.
+    """
     url = str(entry.get("url") or "")
+    page_index = _deep_capture_resolved_page_index(entry, url, dom_order)
     dom_index = _deep_capture_resolved_dom_index(entry, url, dom_order)
     dom_walk_order = _deep_capture_dom_order(entry)
     absolute_top = _deep_capture_canvas_top(url)
     sequence = _deep_capture_url_sequence(url)
     source = str(entry.get("source") or "")
     source_rank = _deep_capture_source_rank(source)
-    # Document order is the reliable reading order; fall back to per-snapshot DOM walk
-    # order, then on-page geometry, then URL-embedded page numbers, then capture order.
-    if dom_index is not None:
+    # The site's own published page index is the ground truth when it exists (it orders
+    # canvas and <img> pages in one sequence even when only one kind survives in the
+    # DOM); then document order, per-snapshot DOM walk order, on-page geometry,
+    # URL-embedded page numbers, and finally capture order.
+    if page_index is not None:
         primary_rank = 0
+        primary_value = page_index
+    elif dom_index is not None:
+        primary_rank = 1
         primary_value = dom_index
     elif dom_walk_order is not None:
-        primary_rank = 1
+        primary_rank = 2
         primary_value = dom_walk_order
     elif absolute_top is not None:
-        primary_rank = 2
+        primary_rank = 3
         primary_value = absolute_top
     elif sequence is not None:
-        primary_rank = 3
+        primary_rank = 4
         primary_value = sequence
     else:
-        primary_rank = 4
+        primary_rank = 5
         primary_value = int(entry.get("order") or fallback_index)
+    dom_position = _UNKNOWN_DOM_POSITION if dom_index is None else dom_index
     area_rank = -int(image.width * image.height)
-    return (primary_rank, primary_value, source_rank, fallback_index, area_rank)
+    return (primary_rank, primary_value, dom_position, source_rank, fallback_index, area_rank)
 
 
 def _deep_capture_item_metadata(item: dict[str, Any]) -> dict[str, Any]:
@@ -3370,18 +3625,44 @@ def _deep_capture_canvas_top(url: str) -> Optional[int]:
         return None
 
 
-def _deep_capture_dom_keys_from_raw(raw: Any) -> list[tuple[str, str]]:
-    """Parse COLLECT_DOM_IMAGE_ORDER_JS output into ordered, de-duplicated DOM keys.
+def _dom_page_index_value(raw: Any) -> Optional[int]:
+    """Normalize a raw `page_index` payload value to a non-negative int, else None.
+
+    The collector JS already restricts itself to plain non-negative integers; this is
+    the Python-side guard against a malformed/injected payload (booleans, floats,
+    strings, negatives are all rejected).
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if not isinstance(raw, int):
+        return None
+    return raw if raw >= 0 else None
+
+
+def _deep_capture_dom_keys_from_raw(raw: Any) -> DeepCaptureDomReading:
+    """Parse COLLECT_DOM_IMAGE_ORDER_JS output into one `DeepCaptureDomReading`.
 
     Keys are ("image", url) for `<img>`/`<source>` candidate URLs and ("canvas",
-    str(weakmap_id)) for canvases, in document order. Multiple URL variants of one
-    `<img>` (currentSrc/src/data-src) appear as adjacent keys so any of them can match a
-    captured entry's URL.
+    str(weakmap_id)) for canvases, de-duplicated and in document order. Multiple URL
+    variants of one `<img>` (currentSrc/src/data-src) appear as adjacent keys so any of
+    them can match a captured entry's URL; they all share the payload's `order` slot, and
+    `key_elements` maps each of them to the first key of that slot so callers can count
+    DOM elements rather than URL variants. A payload item without a usable integer
+    `order` is treated as its own element (the conservative direction: it can only make
+    the element count larger, never claim a shared index covers more than it does).
+
+    `page_indices` maps a key to the site's own published reading index (see
+    `DOM_PAGE_INDEX_ATTRIBUTES`) when the payload carried one; keys whose element
+    published no index are simply absent, so the mapping is empty on sites that use no
+    such attributes.
     """
     keys: list[tuple[str, str]] = []
+    page_indices: dict[tuple[str, str], int] = {}
+    key_elements: dict[tuple[str, str], tuple[str, str]] = {}
+    slot_elements: dict[int, tuple[str, str]] = {}
     seen: set[tuple[str, str]] = set()
     if not isinstance(raw, list):
-        return keys
+        return DeepCaptureDomReading(keys, page_indices, key_elements)
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -3405,7 +3686,134 @@ def _deep_capture_dom_keys_from_raw(raw: Any) -> list[tuple[str, str]]:
             continue
         seen.add(key)
         keys.append(key)
-    return keys
+        page_index = _dom_page_index_value(item.get("page_index"))
+        if page_index is not None:
+            page_indices[key] = page_index
+        slot = item.get("order")
+        if isinstance(slot, int) and not isinstance(slot, bool):
+            key_elements[key] = slot_elements.setdefault(slot, key)
+        else:
+            key_elements[key] = key
+    return DeepCaptureDomReading(keys, page_indices, key_elements)
+
+
+def _group_dom_keys_by_element(
+    keys: list[tuple[str, str]],
+    key_elements: dict[tuple[str, str], tuple[str, str]],
+    page_indices: dict[tuple[str, str], int],
+) -> tuple[list[tuple[str, str]], dict[tuple[str, str], Optional[int]]]:
+    """Collapse ordered DOM keys into the DOM elements they came from.
+
+    Returns `(elements, element_page_index)`: the representative key of every distinct
+    element, in first-appearance (document) order, and each element's published page
+    index (the first one found among its keys, `None` when it publishes none). Counting
+    elements instead of keys is required wherever a ratio is computed, because one
+    `<img>` contributes up to four keys and one `<canvas>` exactly one.
+    """
+    elements: list[tuple[str, str]] = []
+    element_page_index: dict[tuple[str, str], Optional[int]] = {}
+    for key in keys:
+        element = key_elements.get(key, key)
+        if element not in element_page_index:
+            elements.append(element)
+            element_page_index[element] = None
+        if element_page_index[element] is None:
+            element_page_index[element] = page_indices.get(key)
+    return elements, element_page_index
+
+
+def _longest_non_decreasing_length(values: list[int]) -> int:
+    """Length of the longest non-decreasing subsequence of `values` (patience sorting)."""
+    tails: list[int] = []
+    for value in values:
+        position = bisect_right(tails, value)
+        if position == len(tails):
+            tails.append(value)
+        else:
+            tails[position] = value
+    return len(tails)
+
+
+def _site_page_index_authority(
+    elements: list[tuple[str, Optional[int]]],
+) -> tuple[bool, str]:
+    """Decide whether a site-published page index may drive page ordering.
+
+    `elements` is one entry per distinct DOM element **in document order**:
+    `(key_space, page_index or None)` where `key_space` is "image" or "canvas". Returns
+    `(authoritative, reason)`; `reason` names the rule that refused it, or `"accepted"`.
+
+    The index is accepted only when it behaves like a real reading index:
+    - at least two elements publish one (a single value defines no order);
+    - every key space that exists in the document has at least one indexed element, so an
+      index that never touches the canvases cannot claim to order them;
+    - a strict majority of elements publish one (site chrome images are emitted by the
+      same DOM walk, so full coverage is unreachable, but the pages must dominate);
+    - the values discriminate: at least two distinct values, and distinct values must
+      cover at least half the indexed elements, so a wrapper handing every page the same
+      `data-index` is refused instead of collapsing the whole chapter into one tie;
+    - the values already agree with document order almost everywhere (see
+      `_PAGE_INDEX_MONOTONIC_NUMERATOR`), which rejects two unrelated indexed lists - a
+      thumbnail strip plus the pages, or pages plus an ad rail - whose numbering restarts.
+    """
+    if not elements:
+        return False, "no dom elements"
+    indexed = [(space, value) for space, value in elements if value is not None]
+    if len(indexed) < 2:
+        return False, "fewer than two indexed elements"
+    indexed_spaces = {space for space, _ in indexed}
+    for space in sorted({space for space, _ in elements}):
+        if space not in indexed_spaces:
+            return False, f"no indexed element in the {space} key space"
+    if len(indexed) * 2 <= len(elements):
+        return False, "indexed elements are not a majority"
+    values = [value for _, value in indexed]
+    distinct = len(set(values))
+    if distinct < 2 or distinct * 2 < len(indexed):
+        return False, "index values are not discriminative"
+    monotonic = _longest_non_decreasing_length(values)
+    if (
+        monotonic * _PAGE_INDEX_MONOTONIC_DENOMINATOR
+        < len(indexed) * _PAGE_INDEX_MONOTONIC_NUMERATOR
+    ):
+        return False, "index disagrees with document order"
+    return True, "accepted"
+
+
+def _fill_page_index_gaps(
+    elements: list[tuple[str, str]],
+    element_page_index: dict[tuple[str, str], Optional[int]],
+) -> dict[tuple[str, str], int]:
+    """Give every element a page slot once the published index is trusted.
+
+    An element that publishes no index inherits the index of its nearest indexed
+    predecessor in document order (elements before the first indexed one get one slot
+    less, so they stay in front). Without this, an untagged page - a canvas the site does
+    not tag, an `<img>` whose wrapper lost the attribute - would resolve no index, fall
+    into the next sort tier, and be concatenated after *every* indexed page instead of
+    staying where the document puts it. Inherited slots tie with their predecessor and
+    are separated by document order in `_deep_capture_sort_key`.
+
+    Returns an empty mapping when no element publishes an index.
+    """
+    first_index = next(
+        (
+            element_page_index[element]
+            for element in elements
+            if element_page_index[element] is not None
+        ),
+        None,
+    )
+    if first_index is None:
+        return {}
+    resolved: dict[tuple[str, str], int] = {}
+    current = first_index - 1
+    for element in elements:
+        value = element_page_index[element]
+        if value is not None:
+            current = value
+        resolved[element] = current
+    return resolved
 
 
 def _append_first_seen_keys(
@@ -3428,18 +3836,68 @@ def _append_first_seen_keys(
 def _combine_dom_order(
     seen_keys: list[tuple[str, str]], stop_keys: list[tuple[str, str]]
 ) -> list[tuple[str, str]]:
-    """Final document order: pages gone from the DOM, then the live stop-time order.
+    """Final document order: the live stop-time order with vanished keys spliced back in.
 
     `stop_keys` (current DOM document order at stop) is the reliable order for everything
-    still on the page. Keys seen earlier but absent at stop are the pages that scrolled
-    out of a virtual-scroll reader (typically the first ones, loaded right after reload);
-    they are prepended in first-seen order so they keep their reading position instead of
-    falling back to capture/network arrival order. Pages still present keep the stop order
-    untouched, so the common case is identical to a single stop-time read.
+    still on the page, because a fast non-overlapping scroll can scramble pure first-seen
+    accumulation. Keys seen earlier but absent at stop are the pages a virtual-scroll
+    reader recycled out of the DOM; their only surviving evidence is `seen_keys`.
+
+    Merge rule: every vanished key is anchored to the *next* key that follows it in
+    `seen_keys` and is still present at stop, and is emitted immediately before that
+    anchor, preserving the first-seen order within one anchor group. Vanished keys with
+    no surviving successor are appended at the end.
+
+    Invariants:
+    - keys present at stop keep their stop-time relative order, unchanged;
+    - a vanished key stays interleaved between its first-seen neighbours instead of being
+      hoisted into a leading block (the defect this rule fixes: on a reader that renders
+      some pages as `<img>` (which persist) and others as `<canvas>` (which are torn
+      down), a leading block splits one chapter into two ordered halves);
+    - nothing vanished -> the result is exactly `stop_keys`;
+    - nothing present at stop -> the result is exactly the first-seen order;
+    - the output is de-duplicated and contains the union of both inputs.
+
+    Precondition: both inputs must already be de-duplicated (they are: `stop_keys` comes
+    from `_deep_capture_dom_keys_from_raw`, `seen_keys` from `_append_first_seen_keys`).
+    With a repeated anchor in `seen_keys` a vanished group attaches to its first
+    occurrence only, which is well defined but not what a caller would expect.
+
+    Call-order dependency: `seen_keys` must be accumulated *around* anything that scrolls
+    the page. `ElementHandle.screenshot()` scrolls elements into view and so recycles
+    them on a virtual-scroll reader, which is why `stop_deep_intercept` accumulates both
+    before and after the canvas screenshot pass - the pre-scroll reading is the only
+    evidence left for keys that pass tears down.
     """
     stop_set = set(stop_keys)
-    vanished = [key for key in seen_keys if key not in stop_set]
-    return vanished + stop_keys
+    # Group vanished keys by the surviving key they precede in first-seen order.
+    anchored: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    pending: list[tuple[str, str]] = []
+    for key in seen_keys:
+        if key in stop_set:
+            if pending:
+                anchored.setdefault(key, []).extend(pending)
+                pending = []
+        else:
+            pending.append(key)
+    trailing = pending
+
+    combined: list[tuple[str, str]] = []
+    emitted: set[tuple[str, str]] = set()
+
+    def _emit(key: tuple[str, str]) -> None:
+        if key in emitted:
+            return
+        emitted.add(key)
+        combined.append(key)
+
+    for key in stop_keys:
+        for vanished in anchored.get(key, ()):
+            _emit(vanished)
+        _emit(key)
+    for vanished in trailing:
+        _emit(vanished)
+    return combined
 
 
 def _deep_capture_is_canvas_source(source: str) -> bool:
