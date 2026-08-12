@@ -53,7 +53,19 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   window and update continuation entry, project
   validation, launcher handoff, direct project opening, and Linux/Windows integration hooks.
 - `args.rs`: `clap` CLI contract, including visible startup/update flags, the update-check test
-  override, and hidden installer/update continuation flags.
+  override, the environment-check and run-from-sources flags, and hidden installer/update
+  continuation flags.
+- `venv_check.rs`: native-only, GUI-free readiness check of the managed Python environment
+  behind `--check-venv`. Reads `General.ai_install_type` from the root's `user_config.json`
+  (never writing it), resolves the interpreter through `python_manager`, and compares the
+  dependency set required for that install type (`installer::utils::required_dependency_specs`)
+  against `pip freeze` via `missing_specs_for_readiness` (which accepts interchangeable
+  distributions of the same module) plus `installed_torch_is_current` for the `Full` PyTorch
+  minimum version. Those two predicates are SHARED with the repair worker, so "ready" always
+  implies the worker would have nothing to do. Any failure to VERIFY readiness (unreadable
+  config, unresolvable interpreter, failed probe) is reported as NOT ready — the check never
+  claims readiness it could not confirm. It performs no installation and opens no window; the
+  window and the exit code belong to `main.rs`.
 - `app.rs`: root `eframe::App`, shared model construction, tab wiring, unified source-page +
   clean-overlay loader polling, source-page geometry metadata, incremental texture upload and
   source GPU trimming, shared viewport sync, AI backend health wiring, global hotkey dispatch, and
@@ -253,6 +265,33 @@ Startup first resolves config and runtime paths, initializes logging, handles hi
 and either opens a validated project or starts the Rust launcher. The launcher returns a typed
 outcome to startup; it does not start the editor on its own.
 
+Startup routing order in `run_main`: CLI parse -> (Linux desktop integration and the isolated
+backend-socket seed, both decided by `--ignore-installed`) -> Windows service flags -> config /
+locale / UI-scale seeding -> `--check-venv` (terminal) -> `--continue-update` -> `--update` ->
+`--test-launcher` -> AI backend supervisor -> project resolution -> studio window.
+
+Before any of that, `reject_conflicting_startup_flags` validates the command line: combining
+`--ignore-installed` with a flag that manages an installed copy (`args::INSTALLED_COPY_FLAGS` —
+visible `--update` and the hidden install/update/uninstall/shortcut service flags) exits with code
+2. This runs FIRST because several of those flags act immediately; the decision itself is the pure,
+unit-tested `args::conflicting_installed_copy_flags`.
+
+Two startup flags change that routing:
+- `--check-venv` is TERMINAL: it checks the environment (`venv_check.rs`), exits 0 with a printed
+  message when it is complete, otherwise opens the installer in environment-repair mode and exits
+  0 (repaired AND re-verified) or 1 (cancelled / failed / still not ready). A repair that reports
+  success is re-checked before exiting 0, so the caller never receives a broken environment. It
+  never opens the launcher or studio and never starts the AI backend. `main.rs` calls
+  `std::process::exit` there so the code is exact instead of the generic error exit of an `anyhow`
+  return.
+- `--ignore-installed` marks a run from a source checkout: no Linux desktop-entry write, no Windows
+  existing-install discovery, no missing-environment prompt (straight to the launcher), no startup
+  update check (so the launcher's update notice never appears) and a refusal at every self-update
+  entry point, plus a per-root backend socket name
+  (`backend_ipc::seed_isolated_backend_socket_name`, seeded right after CLI parsing). The flag is
+  threaded explicitly through `StartupRoutingFlags`; the socket name is the only process-global,
+  because the supervisor and the IPC client must agree on it without a shared call path.
+
 When a chapter opens, `ProjectData::load` builds the typed project snapshot on a background thread
 while `StudioBootstrapApp` shows a loading screen. `MangaApp::new` then constructs `BubblesModel`,
 `CleanOverlaysModel`, and `TextMaskModel`, shares them with tabs, and starts one unified decode
@@ -313,6 +352,9 @@ prompts instead of blocking the GUI thread.
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
   `main.rs` and `args.rs`.
+- What counts as a complete Python environment, or the `--check-venv` exit contract:
+  `venv_check.rs` (decision) + `main.rs::run_check_venv_flow` (window + exit code) +
+  `installer/utils.rs::required_dependency_specs` (the required set).
 - User/project config defaults, runtime roots, model root paths, or global path helpers:
   `config.rs`.
 - Which monitor a window opens on, restoring/persisting the main window's position, size or

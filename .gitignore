@@ -3,8 +3,10 @@
 # documentation, and small runtime assets that are safe to share.
 *
 
-# Repository metadata for the Git mirror.
+# Repository metadata for the Git mirror. .gitattributes carries the line-ending
+# contract of the run-dev launchers, so it must reach every clone and ZIP.
 !.gitignore
+!.gitattributes
 
 # Rust package, lockfile, and target configuration.
 !.cargo/

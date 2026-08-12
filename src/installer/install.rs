@@ -7,6 +7,8 @@ Owns the installer UI and installer-specific window flows.
 Main responsibilities:
 - draw the egui installation, existing-install, and uninstall progress windows;
 - collect install target, dependency profile, and PyTorch choices from the user;
+- host the two installer purposes (`InstallerPurpose`): a full application install and the
+  environment-repair mode that only provisions the Python environment of an existing root;
 - surface actions for a detected existing install, including launching, shortcut creation,
   reinstall, and updating that installed executable;
 - start background installer workers and consume their progress events;
@@ -56,6 +58,23 @@ pub enum InstallerOutcome {
     Failed(String),
 }
 
+/// What an installer window is being opened for.
+///
+/// The two purposes share the same window, screens and progress plumbing but not
+/// the same worker or set of side effects.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum InstallerPurpose {
+    /// Full application install: pick a location (possibly elevated), deploy the app
+    /// archive and executable, create shortcuts/registry entries, then offer to launch
+    /// the installed copy.
+    FullInstall,
+    /// Repair the managed Python environment of an existing root directory. The
+    /// location screen is skipped (the root is fixed), and the worker only provisions
+    /// the environment — see `utils::run_environment_repair_worker` for the list of
+    /// things this mode must never do.
+    EnvironmentRepair,
+}
+
 #[cfg(target_os = "windows")]
 pub enum ExistingInstallAction {
     NoInstallFound,
@@ -98,10 +117,50 @@ pub fn run_python_installer_window(
     root_dir: &Path,
     auto_install_target: Option<PathBuf>,
 ) -> Result<InstallerOutcome, String> {
+    run_installer_window(
+        root_dir,
+        auto_install_target,
+        InstallerPurpose::FullInstall,
+        t!("installer.install.window_title"),
+    )
+}
+
+/// Opens the installer in environment-repair mode for `root_dir`.
+///
+/// The window starts directly on the dependency-profile screen (no install-location
+/// step) and provisions only the managed Python environment of `root_dir`; it never
+/// deploys application files, shortcuts, registry entries, or launches another copy.
+/// Blocks until the window closes.
+///
+/// Returns [`InstallerOutcome::Completed`] when the environment was provisioned,
+/// [`InstallerOutcome::Cancelled`] when the user closed the window first, and
+/// [`InstallerOutcome::Failed`] with a user-facing message when a stage failed.
+///
+/// # Errors
+/// Returns an error when the window itself cannot be created or its result cannot
+/// be read back.
+pub fn run_environment_repair_window(root_dir: &Path) -> Result<InstallerOutcome, String> {
+    run_installer_window(
+        root_dir,
+        None,
+        InstallerPurpose::EnvironmentRepair,
+        t!("installer.repair.window_title"),
+    )
+}
+
+/// Shared window shell for both installer purposes.
+///
+/// `auto_install_target` is the elevation-continuation target of a full install; it
+/// is unused (and must be `None`) in repair mode, where the target is `root_dir`.
+fn run_installer_window(
+    root_dir: &Path,
+    auto_install_target: Option<PathBuf>,
+    purpose: InstallerPurpose,
+    window_title: &str,
+) -> Result<InstallerOutcome, String> {
     let shared_result = Arc::new(Mutex::new(None::<InstallerOutcome>));
     let shared_result_for_app = Arc::clone(&shared_result);
     let root_dir = root_dir.to_path_buf();
-    let auto_install_target = auto_install_target.clone();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([700.0, 470.0])
         .with_min_inner_size([620.0, 380.0]);
@@ -115,7 +174,7 @@ pub fn run_python_installer_window(
     };
 
     eframe::run_native(
-        t!("installer.install.window_title"),
+        window_title,
         native_options,
         Box::new(move |cc| {
             crate::ui_fonts::install(&cc.egui_ctx, crate::ui_fonts::Tier::Core);
@@ -123,6 +182,7 @@ pub fn run_python_installer_window(
                 root_dir.clone(),
                 Arc::clone(&shared_result_for_app),
                 auto_install_target.clone(),
+                purpose,
             )))
         }),
     )
@@ -584,6 +644,7 @@ impl eframe::App for ExistingInstallApp {
 }
 
 struct InstallerApp {
+    purpose: InstallerPurpose,
     root_dir: PathBuf,
     install_location_choice: InstallLocationChoice,
     custom_install_base_dir_input: String,
@@ -613,9 +674,11 @@ impl InstallerApp {
         root_dir: PathBuf,
         result_sink: Arc<Mutex<Option<InstallerOutcome>>>,
         auto_install_target: Option<PathBuf>,
+        purpose: InstallerPurpose,
     ) -> Self {
         let custom_install_base_dir_input = root_dir.to_string_lossy().to_string();
         let mut app = Self {
+            purpose,
             root_dir,
             install_location_choice: InstallLocationChoice::AllUsers,
             custom_install_base_dir_input,
@@ -639,8 +702,18 @@ impl InstallerApp {
             invite_telegram: true,
             invite_discord: false,
         };
-        if let Some(target_dir) = auto_install_target {
-            app.apply_auto_install_target(target_dir);
+        match purpose {
+            InstallerPurpose::FullInstall => {
+                if let Some(target_dir) = auto_install_target {
+                    app.apply_auto_install_target(target_dir);
+                }
+            }
+            InstallerPurpose::EnvironmentRepair => {
+                // The target is fixed to the current root: repair never asks where to
+                // install and never shows the location screen.
+                let target_dir = app.root_dir.clone();
+                app.show_dependency_profile_choice(target_dir);
+            }
         }
         app
     }
@@ -794,7 +867,16 @@ impl InstallerApp {
         self.stage_progress = 0.0;
         self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
-        self.overall_label = tf!("installer.install.installing_to_status", install_target_dir = install_target_dir.display());
+        self.overall_label = match self.purpose {
+            InstallerPurpose::FullInstall => tf!(
+                "installer.install.installing_to_status",
+                install_target_dir = install_target_dir.display()
+            ),
+            InstallerPurpose::EnvironmentRepair => tf!(
+                "installer.repair.setting_up_env_status",
+                install_target_dir = install_target_dir.display()
+            ),
+        };
         self.console_lines.clear();
         self.torch_choice_prompt = None;
         self.pending_ai_install_type = match dependency_profile {
@@ -802,16 +884,25 @@ impl InstallerApp {
             InstallDependencyProfile::Full => config::AiInstallType::Full,
         };
 
+        let purpose = self.purpose;
         let _ = ms_thread::Builder::new()
             .name("mini-launcher-python-installer".to_string())
             .spawn(move || {
-                let result = run_install_worker(
-                    root_dir,
-                    launcher_exe_path,
-                    dependency_profile,
-                    torch_selection,
-                    &tx,
-                );
+                let result = match purpose {
+                    InstallerPurpose::FullInstall => run_install_worker(
+                        root_dir,
+                        launcher_exe_path,
+                        dependency_profile,
+                        torch_selection,
+                        &tx,
+                    ),
+                    InstallerPurpose::EnvironmentRepair => run_environment_repair_worker(
+                        root_dir,
+                        dependency_profile,
+                        torch_selection,
+                        &tx,
+                    ),
+                };
                 let _ = tx.send(InstallEvent::Finished(result));
             });
     }
@@ -888,14 +979,35 @@ impl eframe::App for InstallerApp {
                     }
                 },
                 InstallEvent::Finished(Ok(())) => {
+                    let mut persist_error = None;
                     if let Some(install_target_dir) = self.install_target_dir.as_deref() {
                         match persist_ai_install_type_for_install_target(
                             install_target_dir,
                             self.pending_ai_install_type,
                         ) {
                             Ok(()) => self.console_lines.push(tf!("installer.install.ai_type_saved_log", arg = self.pending_ai_install_type.as_str())),
-                            Err(err) => self.console_lines.push(tf!("installer.install.ai_type_save_error_log", err = err)),
+                            Err(err) => {
+                                self.console_lines.push(tf!("installer.install.ai_type_save_error_log", err = err));
+                                persist_error = Some(err);
+                            }
                         }
+                    }
+                    // Environment repair is contracted to leave a READY environment behind,
+                    // and readiness includes the recorded install type: without it the next
+                    // `--check-venv` would ask for the dependency profile again on every
+                    // launch. A failed write is therefore a failed repair, not a footnote.
+                    // A full install keeps the historical behavior (the app is deployed and
+                    // usable; the install type is re-detected at startup).
+                    if let (InstallerPurpose::EnvironmentRepair, Some(err)) =
+                        (self.purpose, persist_error)
+                    {
+                        let message = tf!("installer.repair.ai_type_save_failed", err = err);
+                        self.state = UiState::Failed;
+                        self.current_operation = t!("installer.install.install_error").to_string();
+                        self.stage_label = t!("installer.install.stage_failed").to_string();
+                        self.overall_label = message.clone();
+                        self.set_result(InstallerOutcome::Failed(message));
+                        continue;
                     }
                     self.state = UiState::Completed;
                     self.current_operation = t!("installer.common.install_complete").to_string();
@@ -1011,7 +1123,14 @@ impl eframe::App for InstallerApp {
                     }
                     UiState::DependencyProfileChoice => {
                         ui.add_space((center_height * 0.16).max(8.0));
-                        ui.label(t!("installer.install.choose_deps_set_label"));
+                        ui.label(match self.purpose {
+                            InstallerPurpose::FullInstall => {
+                                t!("installer.install.choose_deps_set_label")
+                            }
+                            InstallerPurpose::EnvironmentRepair => {
+                                t!("installer.repair.choose_deps_set_label")
+                            }
+                        });
                         ui.add_space(8.0);
                         if ui
                             .add_sized([300.0, 38.0], egui::Button::new(t!("installer.install.fast_install_option")))
@@ -1085,6 +1204,20 @@ impl eframe::App for InstallerApp {
                                     });
                             });
                         }
+                    }
+                    // Environment repair finishes with nothing to deploy or launch:
+                    // no shortcuts, no invites, no "open the installed copy".
+                    UiState::Completed if self.purpose == InstallerPurpose::EnvironmentRepair => {
+                        ui.add_space((center_height * 0.25).max(12.0));
+                        ui.horizontal_centered(|ui| {
+                            ui.heading(t!("installer.repair.env_ready_heading"));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal_centered(|ui| {
+                            if ui.button(t!("installer.common.close_button")).clicked() {
+                                finish_outcome = Some(InstallerOutcome::Completed);
+                            }
+                        });
                     }
                     UiState::Completed => {
                         ui.add_space((center_height * 0.25).max(12.0));

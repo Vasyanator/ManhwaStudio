@@ -1,0 +1,25 @@
+# Line-ending contract for the run-dev entry points.
+#
+# These files must arrive with the right line endings on every platform, whether
+# they come from `git clone` or from GitHub's "Download ZIP" (`git archive`
+# honours the `eol` attribute, so both paths are covered). `text eol=<x>` is used
+# rather than `-text`: it normalises the blob to LF on check-in, so a contributor
+# whose editor or `core.autocrlf` setting disagrees cannot commit the wrong bytes
+# and silently break the invariant — the working copy is fixed on checkout
+# instead.
+#
+# run-dev.Windows.bat: cmd.exe is only specified for CRLF batch files, and
+# multi-line `( … )` blocks are exactly where LF-only files misparse. That block
+# is what protects the launcher from being rewritten while it runs
+# (dev-docs/run_dev_plan.md, "Updating files that are being executed"), so LF
+# here would silently disable the protection.
+run-dev.Windows.bat      text eol=crlf
+
+# The POSIX launchers and the shared core: a CRLF shebang line is not executable.
+run-dev.Linux.sh         text eol=lf
+run-dev.MacOS.command    text eol=lf
+tools/run-dev/*.sh       text eol=lf
+
+# tools/run-dev/run-dev.ps1 is deliberately absent: PowerShell accepts either
+# line ending, and what actually matters there — the UTF-8 BOM — is not affected
+# by any line-ending attribute.

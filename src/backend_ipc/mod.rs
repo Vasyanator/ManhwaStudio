@@ -9,7 +9,8 @@ framed transport and re-exports everything the rest of the crate imports as
 Submodules:
 - `transport`: dual-transport connection primitives (`backend_socket_path`,
   `connect_path`/`connect_ws`/`connect_endpoint`, `BackendStream`,
-  `BackendEndpoint`, and the process-global WS endpoint holder).
+  `BackendEndpoint`, the process-global WS endpoint holder, and the
+  process-global per-root socket-name holder used by `--ignore-installed`).
 - `protocol`: Rust mirror of `modules/ai_backend/ipc/protocol.py` — protocol
   version, kind/topic/method/header constants.
 - `frame`: the frame codec (`Frame`, `read_frame`, `write_frame`) implementing
@@ -32,7 +33,10 @@ pub mod transport;
 
 // `backend_socket_path` is the single source of truth for the IPC socket path,
 // used by the launcher/settings call sites via `backend_ipc::backend_socket_path()`.
-pub use transport::backend_socket_path;
+// `seed_isolated_backend_socket_name` is the startup-only knob that makes that path
+// unique per runtime root (`--ignore-installed`); it must be called before any
+// backend client or supervisor exists.
+pub use transport::{backend_socket_path, seed_isolated_backend_socket_name};
 
 // Dual-transport endpoint API. The backend supervisor publishes the loopback WS
 // endpoint via `set_ws_endpoint`; `current_backend_endpoint` selects the transport

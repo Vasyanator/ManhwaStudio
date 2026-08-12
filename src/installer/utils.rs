@@ -9,6 +9,9 @@ Main responsibilities:
 - create the managed Python environment and install Python dependencies;
 - install static base dependencies for every install and torch-dependent extras only for full installs;
 - install CPU or GPU PyTorch wheels selected by the UI;
+- provision ONLY the Python environment for the installer's environment-repair mode
+  (`run_environment_repair_worker`): no app archive, executable, icon, shortcut, registry or
+  elevation work, and no destruction of an existing working environment;
 - sanitize ZIP entry path components that are invalid on Windows before writing files;
 - handle platform integration helpers such as elevation, shortcuts, registry entries, and uninstall cleanup.
 - on Windows Program Files installs, create the root install directory and grant inheritable Users
@@ -477,6 +480,285 @@ pub(super) fn run_install_worker(
     Ok(())
 }
 
+/// Provisions ONLY the managed Python environment of an existing installation root.
+///
+/// This backs the installer's environment-repair mode (`--check-venv` and the
+/// repair window). Compared to [`run_install_worker`] it deliberately does NOT
+/// touch the application itself: no `ManhwaStudio.zip` download or extraction, no
+/// executable copy, no icon, no shortcuts, no Windows registry entries, no
+/// elevation and no post-install finalization. It also never destroys an existing
+/// working environment — in particular the user's own `venv/` in the root is
+/// reused as-is and never deleted.
+///
+/// Steps: create `installer_files/` (+ `downloads/`), ensure the `uv` runtime,
+/// reuse or create the managed interpreter, install the still-missing base
+/// dependencies and — for [`InstallDependencyProfile::Full`] — the Torch stage plus
+/// the still-missing torch extras.
+///
+/// `torch_selection` is ignored for `Fast`. Progress is reported through `tx` with
+/// stage weights covering this reduced set of stages.
+///
+/// # Errors
+/// Returns a user-facing message when a directory cannot be created, `uv` cannot be
+/// resolved, no interpreter can be provisioned, or a package installation fails.
+pub(super) fn run_environment_repair_worker(
+    root_dir: PathBuf,
+    dependency_profile: InstallDependencyProfile,
+    torch_selection: TorchInstallSelection,
+    tx: &mpsc::Sender<InstallEvent>,
+) -> Result<(), String> {
+    let mut progress_cursor = 0.0_f32;
+    let prep_range = alloc_progress_range(&mut progress_cursor, 0.05);
+    let uv_range = alloc_progress_range(&mut progress_cursor, 0.25);
+    let python_range = alloc_progress_range(&mut progress_cursor, 0.10);
+    let base_deps_range = alloc_progress_range(&mut progress_cursor, 0.25);
+    let torch_range = alloc_progress_range(&mut progress_cursor, 0.15);
+    let torch_deps_range = (progress_cursor, 1.0_f32);
+
+    // Only the installer-owned subtree is created here; `prepare_install_root_dir`
+    // (root creation + Windows ACL rewrite) belongs to a real install, not a repair.
+    let _ = tx.send(InstallEvent::Step(
+        t!("installer.repair.preparing_dirs_status").to_string(),
+    ));
+    let installer_dir = root_dir.join("installer_files");
+    fs::create_dir_all(&installer_dir)
+        .map_err(|e| tf!("installer.utils.create_installer_files_error", e = e))?;
+    let downloads_dir = installer_dir.join("downloads");
+    fs::create_dir_all(&downloads_dir)
+        .map_err(|e| tf!("installer.utils.create_installer_downloads_error", e = e))?;
+    send_progress(
+        tx,
+        1.0,
+        t!("installer.common.preparation"),
+        prep_range.1,
+        t!("installer.utils.preparation_done"),
+    );
+
+    let uv_exe = ensure_uv_runtime(&root_dir, tx, uv_range.0, uv_range.1)?;
+    let python_exe = ensure_repair_python_environment(&root_dir, &uv_exe, tx, python_range)?;
+    let pip_runner = resolve_runtime_pip_runner(&root_dir, &python_exe);
+    send_console_line(
+        tx,
+        format!(
+            "[Env] Python: {}; installer: {}",
+            python_exe.display(),
+            pip_runner.label()
+        ),
+    );
+
+    let installed = freeze_installed_packages(&pip_runner, &python_exe, &root_dir, None)?;
+    let _ = tx.send(InstallEvent::Step(
+        t!("installer.utils.installing_base_deps_status").to_string(),
+    ));
+    install_missing_static_dependencies(
+        DependencyInstallRequest {
+            root_dir: &root_dir,
+            pip_runner: &pip_runner,
+            python_exe: &python_exe,
+            tx,
+            label: t!("installer.utils.base_deps_label"),
+            dependencies: BASE_DEPENDENCIES,
+            overall_start: base_deps_range.0,
+            overall_end: base_deps_range.1,
+        },
+        &installed,
+    )?;
+
+    match dependency_profile {
+        InstallDependencyProfile::Fast => {
+            send_progress(
+                tx,
+                1.0,
+                t!("installer.utils.pytorch_fast_mode"),
+                torch_range.1,
+                t!("installer.utils.pytorch_skipped"),
+            );
+            send_progress(
+                tx,
+                1.0,
+                t!("installer.utils.torch_deps_fast_mode"),
+                torch_deps_range.1,
+                t!("installer.utils.torch_deps_skipped"),
+            );
+        }
+        InstallDependencyProfile::Full => {
+            // A current PyTorch is left alone: re-running the Torch stage would
+            // force-reinstall a multi-gigabyte wheel that the environment already has.
+            // The predicate is shared with the readiness check, so "ready" and "nothing
+            // left for the worker to do" can never drift apart.
+            let current_torch =
+                installed_torch_is_current(&installed).then(|| installed_torch_version(&installed));
+            match current_torch.flatten() {
+                Some(version) => {
+                    send_console_line(
+                        tx,
+                        tf!("installer.repair.pytorch_already_installed_log", version = version),
+                    );
+                    send_progress(
+                        tx,
+                        1.0,
+                        t!("installer.utils.pytorch_already_current_status"),
+                        torch_range.1,
+                        t!("installer.utils.pytorch_stage_done"),
+                    );
+                }
+                None => install_torch_stage(
+                    &root_dir,
+                    &pip_runner,
+                    &python_exe,
+                    &torch_selection,
+                    tx,
+                    torch_range.0,
+                    torch_range.1,
+                )?,
+            }
+
+            // Re-probe: the Torch stage pulls in transitive packages, so the pre-Torch
+            // snapshot would over-report the missing torch extras.
+            let installed = freeze_installed_packages(&pip_runner, &python_exe, &root_dir, None)?;
+            install_missing_static_dependencies(
+                DependencyInstallRequest {
+                    root_dir: &root_dir,
+                    pip_runner: &pip_runner,
+                    python_exe: &python_exe,
+                    tx,
+                    label: t!("installer.utils.torch_deps_label"),
+                    dependencies: TORCH_DEPENDENCIES,
+                    overall_start: torch_deps_range.0,
+                    overall_end: torch_deps_range.1,
+                },
+                &installed,
+            )?;
+        }
+    }
+
+    send_progress(
+        tx,
+        1.0,
+        t!("installer.repair.env_ready_status"),
+        1.0,
+        t!("installer.repair.env_ready_status"),
+    );
+    Ok(())
+}
+
+/// Resolves the interpreter the repair worker installs packages into.
+///
+/// A working environment found by `python_manager` (managed `installer_files/venv`,
+/// a user `venv/`, a conda env, or a standalone interpreter) is reused verbatim —
+/// repair must never delete an environment the user still relies on. Only when no
+/// interpreter resolves at all is a fresh uv-managed `installer_files/venv` created,
+/// after removing a leftover broken one (that directory is installer-owned).
+///
+/// `overall_range` is the slice of the overall progress bar this step reports into.
+///
+/// # Errors
+/// Returns a user-facing message when the managed venv cannot be removed, `uv`
+/// fails to install Python 3.11 or to create the venv, or no interpreter can be
+/// resolved inside the freshly created venv.
+fn ensure_repair_python_environment(
+    root_dir: &Path,
+    uv_exe: &Path,
+    tx: &mpsc::Sender<InstallEvent>,
+    overall_range: (f32, f32),
+) -> Result<PathBuf, String> {
+    if let Ok(python_exe) = python_manager::resolve_python_executable(root_dir) {
+        send_console_line(
+            tx,
+            tf!("installer.repair.reusing_env_log", python = python_exe.display()),
+        );
+        send_progress(
+            tx,
+            1.0,
+            t!("installer.utils.python_env_ready"),
+            overall_range.1,
+            t!("installer.utils.python_env_ready"),
+        );
+        return Ok(python_exe);
+    }
+
+    let managed_venv_dir = root_dir.join("installer_files").join("venv");
+    let _ = tx.send(InstallEvent::Step(
+        t!("installer.utils.creating_new_venv_status").to_string(),
+    ));
+    if managed_venv_dir.exists() {
+        // Reached only when NO interpreter resolved anywhere, so this directory is a
+        // broken installer-managed leftover. The user's own `venv/` is never here.
+        fs::remove_dir_all(&managed_venv_dir).map_err(|e| {
+            tf!("installer.utils.remove_old_env_error", managed_venv_dir = managed_venv_dir.display(), e = e)
+        })?;
+    }
+
+    let uv_env = build_uv_env(root_dir)?;
+    run_command_with_retry(
+        uv_exe,
+        root_dir,
+        &["python", "install", PYTHON_VERSION_REQUEST],
+        &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
+        2,
+        Some(tx),
+        &uv_env.as_env_slice(),
+    )?;
+    send_progress(
+        tx,
+        0.5,
+        t!("installer.utils.creating_venv_status"),
+        lerp(overall_range.0, overall_range.1, 0.5),
+        t!("installer.utils.creating_venv_status"),
+    );
+    let managed_venv_dir_str = managed_venv_dir.to_string_lossy().into_owned();
+    run_command_with_retry(
+        uv_exe,
+        root_dir,
+        &[
+            "venv",
+            "--python",
+            PYTHON_VERSION_REQUEST,
+            &managed_venv_dir_str,
+        ],
+        t!("installer.utils.create_venv_action"),
+        2,
+        Some(tx),
+        &uv_env.as_env_slice(),
+    )?;
+    let python_exe = python_manager::resolve_python_executable_in_dir(&managed_venv_dir)?;
+    send_progress(
+        tx,
+        1.0,
+        t!("installer.utils.python_env_ready"),
+        overall_range.1,
+        t!("installer.utils.python_env_ready"),
+    );
+    Ok(python_exe)
+}
+
+/// Installs only the dependencies of `request` that `installed` does not provide.
+///
+/// `installed` is a `pip freeze` snapshot (see [`freeze_installed_packages`]). When
+/// nothing is missing the request is skipped entirely — including the pip/wheel
+/// upgrade [`install_static_python_dependencies`] performs — and the stage is
+/// reported as complete.
+fn install_missing_static_dependencies(
+    request: DependencyInstallRequest<'_>,
+    installed: &HashMap<String, String>,
+) -> Result<(), String> {
+    let missing = missing_dependency_specs(request.dependencies, installed);
+    if missing.is_empty() {
+        send_progress(
+            request.tx,
+            1.0,
+            t!("installer.utils.python_deps_current_status"),
+            request.overall_end,
+            t!("installer.utils.deps_current_status"),
+        );
+        return Ok(());
+    }
+    install_static_python_dependencies(DependencyInstallRequest {
+        dependencies: &missing,
+        ..request
+    })
+}
+
 pub(crate) fn run_torch_upgrade_worker(
     root_dir: PathBuf,
     torch_selection: TorchInstallSelection,
@@ -903,9 +1185,12 @@ fn ensure_uv_managed_python_environment(
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
 ) -> Result<(PathBuf, PathBuf), String> {
+    // `ensure_uv_runtime` reports on the installer event channel (it is shared with the
+    // install/repair workers), so the update channel is bridged into it here.
+    let install_tx = UpdateToInstallEventBridge { tx }.sender();
     let uv_exe = ensure_uv_runtime(
         root_dir,
-        tx,
+        &install_tx,
         overall_range.0,
         lerp(overall_range.0, overall_range.1, 0.45),
     )?;
@@ -989,9 +1274,18 @@ fn build_uv_env(root_dir: &Path) -> Result<UvEnv, String> {
     })
 }
 
+/// Resolves the installer-managed `uv` executable, downloading and unpacking it
+/// into `installer_files/uv` when it is not there yet.
+///
+/// Reports through the installer event channel; update-flow callers bridge their
+/// own channel into it (`UpdateToInstallEventBridge`).
+///
+/// # Errors
+/// Returns a user-facing message when the release asset cannot be fetched,
+/// downloaded, extracted, or when no `uv` executable is found afterwards.
 fn ensure_uv_runtime(
     root_dir: &Path,
-    tx: &mpsc::Sender<UpdateWorkerEvent>,
+    tx: &mpsc::Sender<InstallEvent>,
     overall_start: f32,
     overall_end: f32,
 ) -> Result<PathBuf, String> {
@@ -999,11 +1293,11 @@ fn ensure_uv_runtime(
     if uv_dir.is_dir()
         && let Ok(uv_exe) = resolve_uv_executable(&uv_dir)
     {
-        send_update_progress(tx, 1.0, t!("installer.utils.uv_already_installed"), overall_end, t!("installer.utils.uv_ready"));
+        send_progress(tx, 1.0, t!("installer.utils.uv_already_installed"), overall_end, t!("installer.utils.uv_ready"));
         return Ok(uv_exe);
     }
 
-    let _ = tx.send(UpdateWorkerEvent::Step(
+    let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.downloading_uv_for_update_status").to_string(),
     ));
     fs::create_dir_all(&uv_dir)
@@ -1013,11 +1307,10 @@ fn ensure_uv_runtime(
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
     let asset = fetch_latest_uv_asset(detect_platform()?, &detect_arch()?)?;
     let archive_path = downloads_dir.join(&asset.name);
-    let install_tx = UpdateToInstallEventBridge { tx }.sender();
     download_asset(
         &asset.browser_download_url,
         &archive_path,
-        &install_tx,
+        tx,
         overall_start,
         lerp(overall_start, overall_end, 0.55),
         "uv",
@@ -1031,7 +1324,7 @@ fn ensure_uv_runtime(
     extract_archive(
         &archive_path,
         &uv_dir,
-        &install_tx,
+        tx,
         t!("installer.utils.extract_uv_stage"),
         lerp(overall_start, overall_end, 0.55),
         overall_end,
@@ -1060,11 +1353,10 @@ fn maybe_update_torch(
     install_tx: &mpsc::Sender<InstallEvent>,
     overall_range: (f32, f32),
 ) -> Result<UpdateContinuationOutcome, String> {
-    let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, tx)?;
-    let installed_torch = installed.get("torch").map(String::as_str);
-    if installed_torch
-        .is_some_and(|version| compare_version_strings(version, TORCH_VERSION).is_ge())
-    {
+    let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, Some(tx))?;
+    // Same predicate as the repair worker and the readiness check: one definition of
+    // "the installed PyTorch is new enough".
+    if installed_torch_is_current(&installed) {
         send_update_progress(
             tx,
             1.0,
@@ -1110,24 +1402,15 @@ fn install_missing_dependencies_for_update(
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
 ) -> Result<(), String> {
-    let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, tx)?;
-    let mut required = BASE_DEPENDENCIES
-        .iter()
-        .copied()
-        .filter(|dep| dependency_marker_matches_current_platform(dep))
-        .collect::<Vec<_>>();
+    let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, Some(tx))?;
+    // PyTorch itself is deliberately absent from this list: the update flow installs
+    // or refreshes it through the dedicated Torch stage (`maybe_update_torch`), which
+    // needs the right wheel index.
+    let mut required = BASE_DEPENDENCIES.to_vec();
     if install_type == config::AiInstallType::Full {
         required.extend(TORCH_DEPENDENCIES.iter().copied());
     }
-
-    let missing = required
-        .into_iter()
-        .filter(|dep| {
-            dependency_package_name(dep)
-                .map(|name| !installed.contains_key(&normalize_package_name(name)))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
+    let missing = missing_dependency_specs(&required, &installed);
 
     if missing.is_empty() {
         send_update_progress(
@@ -1239,11 +1522,21 @@ fn remove_staged_platform_binary(staging_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn freeze_installed_packages(
+/// Returns the packages installed in `python_exe`'s environment as a map of
+/// normalized package name -> version, taken from `pip freeze`.
+///
+/// `tx` is optional: update/repair workers pass their console channel so the
+/// executed command is echoed into the installer console, while non-interactive
+/// callers (the `--check-venv` console flow) pass `None` and stay silent.
+///
+/// # Errors
+/// Returns the command output when `pip freeze` cannot be started or exits with a
+/// failure status. A failed probe is never reported as "nothing installed".
+pub(crate) fn freeze_installed_packages(
     pip_runner: &PipInstallRunner,
     python_exe: &Path,
     root_dir: &Path,
-    tx: &mpsc::Sender<UpdateWorkerEvent>,
+    tx: Option<&mpsc::Sender<UpdateWorkerEvent>>,
 ) -> Result<HashMap<String, String>, String> {
     let (executable, args) = match pip_runner {
         PipInstallRunner::Uv(uv_exe) => {
@@ -1264,7 +1557,9 @@ fn freeze_installed_packages(
         ),
     };
     let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-    send_update_console_line(tx, format!("$ {} {}", executable.display(), args.join(" ")));
+    if let Some(tx) = tx {
+        send_update_console_line(tx, format!("$ {} {}", executable.display(), args.join(" ")));
+    }
     let (status, output) = run_command_streaming(executable, root_dir, &args_ref, None, &[])?;
     if !status.success() {
         return Err(tf!("installer.utils.uv_pip_freeze_error", output = output.trim()));
@@ -1288,6 +1583,172 @@ fn parse_pip_freeze_line(line: &str) -> Option<(String, String)> {
     Some((normalize_package_name(name), version.trim().to_string()))
 }
 
+/// Package name of PyTorch itself.
+///
+/// PyTorch is not part of [`TORCH_DEPENDENCIES`] and is deliberately absent from
+/// [`required_dependency_specs`]: unlike every other dependency it has a VERSION
+/// requirement, not a presence requirement, so it is expressed by
+/// [`installed_torch_is_current`] instead.
+const TORCH_PACKAGE_NAME: &str = "torch";
+
+/// The PyTorch version a `Full` environment must provide at minimum.
+pub(crate) const REQUIRED_TORCH_VERSION: &str = TORCH_VERSION;
+
+/// Returns the installed PyTorch version, if the environment has one.
+///
+/// `installed` is a `pip freeze` snapshot keyed by normalized package name (see
+/// [`freeze_installed_packages`]).
+#[must_use]
+pub(crate) fn installed_torch_version(installed: &HashMap<String, String>) -> Option<&str> {
+    installed.get(TORCH_PACKAGE_NAME).map(String::as_str)
+}
+
+/// Whether `installed` provides a PyTorch at or above [`REQUIRED_TORCH_VERSION`].
+///
+/// This is the SINGLE predicate behind both "is this environment ready?" (the
+/// `--check-venv` flow) and "may the repair worker skip the Torch stage?". They must
+/// never disagree: a readiness answer of "ready" has to imply that the worker would
+/// have nothing left to do.
+///
+/// An absent torch is not current. A version string that does not parse as a version
+/// compares BELOW the requirement (see `compare_version_strings`), so an unreadable
+/// version is treated as "not current" — the safe direction, because it can only
+/// cause an extra repair offer, never a false "ready". Local wheel suffixes
+/// (`2.9.1+cu126`, `2.12.0+rocm7.2`) compare above the bare requirement, as intended.
+#[must_use]
+pub(crate) fn installed_torch_is_current(installed: &HashMap<String, String>) -> bool {
+    installed_torch_version(installed)
+        .is_some_and(|version| compare_version_strings(version, REQUIRED_TORCH_VERSION).is_ge())
+}
+
+/// Returns the full dependency spec list a working environment must provide for
+/// `install_type`.
+///
+/// `Base` requires the base group; `Full` additionally requires the torch-dependent
+/// extras. `None` (no recorded install type) is treated like `Base`: callers that
+/// need a user decision must detect the missing install type themselves — this
+/// function never guesses a *smaller* requirement than reality.
+///
+/// PyTorch itself is NOT in this list: its requirement is a minimum version, which a
+/// presence-only spec cannot express. Callers checking a `Full` environment must also
+/// consult [`installed_torch_is_current`].
+///
+/// The returned specs are raw dependency strings (they may carry version pins and
+/// environment markers); filter them with [`missing_dependency_specs`].
+#[must_use]
+pub(crate) fn required_dependency_specs(
+    install_type: config::AiInstallType,
+) -> Vec<&'static str> {
+    let mut required = BASE_DEPENDENCIES.to_vec();
+    match install_type {
+        config::AiInstallType::None | config::AiInstallType::Base => {}
+        config::AiInstallType::Full => required.extend(TORCH_DEPENDENCIES.iter().copied()),
+    }
+    required
+}
+
+/// Returns the subset of `required` that still has to be installed.
+///
+/// A spec is skipped when its environment marker does not apply to the current
+/// platform (e.g. `onnxruntime-directml; platform_system == "Windows"` off
+/// Windows). A spec counts as installed when its package name — normalized the
+/// same way as `pip freeze` output — is a key of `installed`. Versions are NOT
+/// compared: this answers "is the package present at all", which is what both the
+/// readiness check and the repair worker need.
+#[must_use]
+pub(crate) fn missing_dependency_specs<'a>(
+    required: &[&'a str],
+    installed: &HashMap<String, String>,
+) -> Vec<&'a str> {
+    required
+        .iter()
+        .copied()
+        .filter(|dep| dependency_marker_matches_current_platform(dep))
+        .filter(|dep| {
+            dependency_package_name(dep)
+                .map(|name| !installed.contains_key(&normalize_package_name(name)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// PyPI distributions that all ship the same importable `onnxruntime` module.
+///
+/// Mirrors the distribution list probed by `src/ai_install_probe.rs`, plus the WebGPU
+/// build. Exactly one of them can be installed at a time (they collide on the module),
+/// so from the runtime's point of view any single one satisfies "onnxruntime is
+/// available".
+const ONNXRUNTIME_DISTRIBUTIONS: &[&str] = &[
+    "onnxruntime",
+    "onnxruntime-gpu",
+    "onnxruntime-directml",
+    "onnxruntime-openvino",
+    "onnxruntime-migraphx",
+    "onnxruntime-webgpu",
+];
+
+/// Returns the interchangeable distributions of `normalized_name`, if it belongs to a
+/// family where several distributions provide the same Python module.
+///
+/// This table is READINESS-ONLY and intentionally softer than installation. Installing
+/// must pick ONE concrete distribution (`BASE_DEPENDENCIES` names `onnxruntime` off
+/// Windows and `onnxruntime-directml` on Windows); checking only has to answer "will
+/// the runtime find this module?", and a user or a GPU-specific setup may legitimately
+/// have chosen a different build of the same thing. Treating those as missing would
+/// offer a repair on every launch of a perfectly working environment.
+fn equivalent_distributions(normalized_name: &str) -> Option<&'static [&'static str]> {
+    ONNXRUNTIME_DISTRIBUTIONS
+        .iter()
+        .any(|candidate| normalize_package_name(candidate) == normalized_name)
+        .then_some(ONNXRUNTIME_DISTRIBUTIONS)
+}
+
+/// Whether `dep` is satisfied by an interchangeable distribution in `installed`.
+///
+/// Returns `false` for every dependency outside [`equivalent_distributions`].
+fn dependency_satisfied_by_equivalent(dep: &str, installed: &HashMap<String, String>) -> bool {
+    let Some(name) = dependency_package_name(dep) else {
+        return false;
+    };
+    equivalent_distributions(&normalize_package_name(name)).is_some_and(|variants| {
+        variants
+            .iter()
+            .any(|variant| installed.contains_key(&normalize_package_name(variant)))
+    })
+}
+
+/// Returns the specs from `required` that a READINESS check must report as missing.
+///
+/// Same as [`missing_dependency_specs`], except that a spec is also considered
+/// satisfied when an interchangeable distribution of it is installed (see
+/// [`equivalent_distributions`]). Installation deliberately keeps the strict rule:
+/// this softer view only decides whether to bother the user with a repair.
+#[must_use]
+pub(crate) fn missing_specs_for_readiness<'a>(
+    required: &[&'a str],
+    installed: &HashMap<String, String>,
+) -> Vec<&'a str> {
+    missing_dependency_specs(required, installed)
+        .into_iter()
+        .filter(|dep| !dependency_satisfied_by_equivalent(dep, installed))
+        .collect()
+}
+
+/// Whether `dep`'s PEP 508 environment marker applies to the platform this binary
+/// runs on.
+///
+/// Supported markers — the only ones used by [`BASE_DEPENDENCIES`] and
+/// [`TORCH_DEPENDENCIES`] — are exactly `platform_system == "Windows"` and
+/// `platform_system != "Windows"`. A dependency with NO marker, or with any marker
+/// this function does not recognize, is reported as applying to the current platform.
+///
+/// That fail-open direction is deliberate: an unrecognized marker can only lead to a
+/// package being considered required where it is not (an unnecessary install or an
+/// unnecessary repair offer), never to a package being skipped and an environment
+/// wrongly called ready. A full PEP 508 evaluator is out of scope here — the two
+/// markers above are the whole contract of the embedded dependency lists.
+///
+/// Adding a dependency with a different marker REQUIRES extending this function.
 fn dependency_marker_matches_current_platform(dep: &str) -> bool {
     let Some((_, marker)) = dep.split_once(';') else {
         return true;
@@ -2600,8 +3061,12 @@ fn resolve_uv_executable(uv_dir: &Path) -> Result<PathBuf, String> {
     Err(tf!("installer.utils.uv_executable_not_found_error", uv_dir = uv_dir.display()))
 }
 
-enum PipInstallRunner {
+/// Which program installs Python packages into the managed environment.
+#[derive(Debug)]
+pub(crate) enum PipInstallRunner {
+    /// A resolved `uv` executable driving `uv pip ...` against an explicit interpreter.
     Uv(PathBuf),
+    /// Fallback: the environment's own `python -m pip`.
     PythonPip,
 }
 
@@ -2614,7 +3079,10 @@ impl PipInstallRunner {
     }
 }
 
-fn resolve_runtime_pip_runner(root_dir: &Path, python_exe: &Path) -> PipInstallRunner {
+/// Picks the package installer for an already-provisioned environment: the `uv`
+/// next to the interpreter, then the installer-managed `installer_files/uv`, then
+/// any `uv` on `PATH`, and finally `python -m pip`.
+pub(crate) fn resolve_runtime_pip_runner(root_dir: &Path, python_exe: &Path) -> PipInstallRunner {
     let uv_name = if cfg!(target_os = "windows") {
         "uv.exe"
     } else {
@@ -4220,12 +4688,186 @@ mod tests {
         LINUX_BINARY_ASSET_NAME_AARCH64, LINUX_BINARY_ASSET_NAME_X86_64,
         MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
-        compare_version_strings, dependency_package_name, is_retryable_http_status,
-        normalize_package_name, parse_content_range_total, parse_executable_version_output,
-        parse_pip_freeze_packages, platform_binary_asset_name, platform_executable_file_name,
+        BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, REQUIRED_TORCH_VERSION, TORCH_DEPENDENCIES,
+        compare_version_strings, dependency_package_name, installed_torch_is_current,
+        installed_torch_version, is_retryable_http_status, missing_dependency_specs,
+        missing_specs_for_readiness, normalize_package_name, parse_content_range_total,
+        parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
+        platform_executable_file_name, required_dependency_specs,
         sanitize_windows_archive_path_component,
     };
+    use crate::config::AiInstallType;
     use std::cmp::Ordering;
+    use std::collections::HashMap;
+
+    /// Builds a `pip freeze` style snapshot from `name==version` pairs, normalizing
+    /// the keys exactly like the real parser does.
+    fn installed_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, version)| (normalize_package_name(name), (*version).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn required_specs_grow_with_the_install_type() {
+        let base = required_dependency_specs(AiInstallType::Base);
+        let full = required_dependency_specs(AiInstallType::Full);
+        let none = required_dependency_specs(AiInstallType::None);
+
+        // `None` carries no smaller requirement than `Base`: an unknown install type
+        // is a UI decision, not a licence to require less.
+        assert_eq!(none, base, "None must require the same set as Base");
+        assert_eq!(
+            base.len(),
+            BASE_DEPENDENCIES.len(),
+            "Base must require exactly the base group"
+        );
+        assert_eq!(
+            full.len(),
+            BASE_DEPENDENCIES.len() + TORCH_DEPENDENCIES.len(),
+            "Full must add exactly the torch extras"
+        );
+        // torch has a MINIMUM VERSION requirement, which a presence-only spec cannot
+        // express, so it lives in `installed_torch_is_current` instead of this list.
+        assert!(
+            !full.contains(&"torch"),
+            "torch must not be a presence-only spec"
+        );
+        for dep in &base {
+            assert!(full.contains(dep), "Full must be a superset of Base ({dep})");
+        }
+    }
+
+    #[test]
+    fn torch_requirement_is_version_aware() {
+        assert!(
+            !installed_torch_is_current(&installed_map(&[])),
+            "an absent torch is not current"
+        );
+        assert!(
+            !installed_torch_is_current(&installed_map(&[("torch", "1.13.1")])),
+            "a torch below the requirement is not current"
+        );
+        assert!(
+            installed_torch_is_current(&installed_map(&[("torch", REQUIRED_TORCH_VERSION)])),
+            "exactly the required version is current"
+        );
+        assert!(
+            installed_torch_is_current(&installed_map(&[("torch", "2.12.0")])),
+            "a newer torch is current"
+        );
+        assert!(
+            installed_torch_is_current(&installed_map(&[("torch", "2.12.0+rocm7.2")])),
+            "a local wheel suffix must not drop the version below the requirement"
+        );
+        assert!(
+            !installed_torch_is_current(&installed_map(&[("torch", "not-a-version")])),
+            "an unreadable version must fail closed, never pass as current"
+        );
+        assert_eq!(
+            installed_torch_version(&installed_map(&[("torch", "2.9.1")])),
+            Some("2.9.1")
+        );
+        assert_eq!(installed_torch_version(&installed_map(&[])), None);
+    }
+
+    /// The readiness view accepts any interchangeable onnxruntime distribution, while
+    /// the strict (installation) view keeps requiring the exact one.
+    #[test]
+    fn readiness_accepts_every_onnxruntime_distribution() {
+        let required = [
+            "onnxruntime; platform_system != \"Windows\"",
+            "onnxruntime-directml; platform_system == \"Windows\"",
+        ];
+        for variant in ONNXRUNTIME_DISTRIBUTIONS {
+            let installed = installed_map(&[(variant, "1.27.0")]);
+            assert!(
+                missing_specs_for_readiness(&required, &installed).is_empty(),
+                "{variant} must satisfy the onnxruntime requirement for readiness"
+            );
+        }
+        // Underscore/case spellings normalize like any other package name.
+        let installed = installed_map(&[("ONNXRuntime_WebGPU", "1.27.0")]);
+        assert!(
+            missing_specs_for_readiness(&required, &installed).is_empty(),
+            "the equivalence table must compare normalized package names"
+        );
+    }
+
+    #[test]
+    fn readiness_still_reports_onnxruntime_when_no_variant_is_installed() {
+        let installed = installed_map(&[("numpy", "2.4.4")]);
+        let required = [
+            "onnxruntime; platform_system != \"Windows\"",
+            "onnxruntime-directml; platform_system == \"Windows\"",
+        ];
+        assert_eq!(
+            missing_specs_for_readiness(&required, &installed).len(),
+            1,
+            "with no onnxruntime distribution installed the platform's spec stays missing"
+        );
+        // Installation is unaffected by the readiness leniency.
+        let installed_variant = installed_map(&[("onnxruntime-webgpu", "1.27.0")]);
+        assert_eq!(
+            missing_dependency_specs(&required, &installed_variant).len(),
+            1,
+            "the strict install view must keep requiring its exact distribution"
+        );
+    }
+
+    #[test]
+    fn readiness_does_not_soften_unrelated_packages() {
+        let installed = installed_map(&[("onnxruntime-webgpu", "1.27.0")]);
+        assert_eq!(
+            missing_specs_for_readiness(&["numpy", "Pillow"], &installed),
+            vec!["numpy", "Pillow"],
+            "the equivalence table must only cover the onnxruntime family"
+        );
+    }
+
+    #[test]
+    fn missing_specs_ignore_installed_packages_and_normalize_names() {
+        // `Pillow` -> `pillow` and `manga-ocr` vs `manga_ocr` must both be recognized
+        // as installed despite the differing spelling in the freeze output.
+        let installed = installed_map(&[("pillow", "11.0.0"), ("manga_ocr", "0.1.14")]);
+        let missing = missing_dependency_specs(&["Pillow", "manga-ocr", "numpy"], &installed);
+        assert_eq!(missing, vec!["numpy"]);
+    }
+
+    #[test]
+    fn missing_specs_ignore_version_pins_and_extras() {
+        let installed = installed_map(&[("torch", "2.9.1")]);
+        assert!(
+            missing_dependency_specs(&["torch==2.9.1"], &installed).is_empty(),
+            "a pinned spec must match the installed package by name"
+        );
+        assert_eq!(
+            missing_dependency_specs(&["torchvision>=0.24"], &installed),
+            vec!["torchvision>=0.24"],
+            "an absent package stays missing and is returned as the original spec"
+        );
+    }
+
+    #[test]
+    fn missing_specs_apply_platform_markers() {
+        let installed = installed_map(&[]);
+        let required = [
+            "onnxruntime; platform_system != \"Windows\"",
+            "onnxruntime-directml; platform_system == \"Windows\"",
+        ];
+        let missing = missing_dependency_specs(&required, &installed);
+        assert_eq!(
+            missing.len(),
+            1,
+            "exactly one of the two mutually exclusive specs applies here"
+        );
+        if cfg!(target_os = "windows") {
+            assert!(missing[0].starts_with("onnxruntime-directml"));
+        } else {
+            assert!(missing[0].starts_with("onnxruntime;"));
+        }
+    }
 
     #[test]
     fn parse_content_range_total_extracts_total_size() {

@@ -7,6 +7,12 @@
 # double click; the path is resolved from $0 because Finder starts the process
 # with the working directory set to the user's home, not to the project.
 #
+# The last statement is `exec`, and that matters: run-dev updates the working
+# copy, this launcher included, and bash reads a script incrementally. `exec`
+# replaces the process before any update can land, so bash never comes back to
+# read a file that changed underneath it. Keep the hand-off as the final
+# statement; do not append anything after it.
+#
 # All arguments are forwarded, e.g.:  ./run-dev.MacOS.command --no-update
 # ---------------------------------------------------------------------------
 

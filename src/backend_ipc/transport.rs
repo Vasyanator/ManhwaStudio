@@ -19,7 +19,10 @@ Key structures:
   (Condvar-signalled) and an outbound message channel — it never touches the socket.
 
 Key functions:
-- backend_socket_path(): standard AF_UNIX path (matches the Python side).
+- backend_socket_path(): AF_UNIX path (matches the Python side).
+- isolated_backend_socket_name()/seed_isolated_backend_socket_name(): per-root socket
+  file name used by `--ignore-installed`, so a copy run from a source checkout never
+  shares a backend process with an installed copy.
 - connect_path(): connect-with-timeout against an explicit Unix path.
 - connect_ws(): TCP connect + WS handshake (`ws://127.0.0.1:<port>/?token=<token>`)
   + I/O thread spawn.
@@ -55,7 +58,10 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+// The socket-name holder is target-neutral: `backend_socket_path` (and therefore the
+// isolation seed) stays available on wasm for display/logging call sites.
+use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,15 +109,78 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
-/// Returns the standard AF_UNIX socket path used to reach the Python AI backend.
+/// Base file name of the AF_UNIX socket shared with the Python backend.
+const BACKEND_SOCKET_FILE_NAME: &str = "manhwastudio_backend_socket";
+
+/// Process-global socket file name, seeded at most once during startup.
+///
+/// Read-only after seeding: `--ignore-installed` calls
+/// [`seed_isolated_backend_socket_name`] right after CLI parsing, before any
+/// backend client or supervisor exists, so every later reader (the IPC client, the
+/// supervisor's `--socket` argument, the settings UI) observes the same value.
+/// Unseeded, [`backend_socket_path`] keeps the historical shared path.
+static BACKEND_SOCKET_NAME: OnceLock<String> = OnceLock::new();
+
+/// Derives the per-root socket file name used when the program runs from a source
+/// checkout (`--ignore-installed`).
+///
+/// `program_dir` is the runtime root of THIS copy. The name is
+/// `manhwastudio_backend_socket_<hash>`, where `<hash>` is an FNV-1a-64 digest of
+/// the canonicalized root path rendered as 16 hex digits: stable across runs of the
+/// same copy (so a restarted studio finds its own backend) and different for a
+/// different root (so a dev copy never adopts the installed copy's backend). A path
+/// that cannot be canonicalized (missing directory, permission error) is hashed
+/// as-is — a stable name matters more here than a canonical one.
+#[must_use]
+pub fn isolated_backend_socket_name(program_dir: &Path) -> String {
+    let canonical = std::fs::canonicalize(program_dir).unwrap_or_else(|_| program_dir.to_path_buf());
+    let digest = fnv1a_64(canonical.to_string_lossy().as_bytes());
+    format!("{BACKEND_SOCKET_FILE_NAME}_{digest:016x}")
+}
+
+/// FNV-1a 64-bit digest. Hand-rolled on purpose: `DefaultHasher` gives no
+/// cross-version stability guarantee, and the socket name must stay identical
+/// across restarts and program versions for the same root directory.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// Seeds the process-global isolated socket name for `program_dir`.
+///
+/// Must be called before the first backend connection or supervisor spawn; the
+/// first call wins and later calls are ignored (the value is read-only afterwards).
+/// Returns the name in effect after the call, for logging.
+pub fn seed_isolated_backend_socket_name(program_dir: &Path) -> &'static str {
+    let name = isolated_backend_socket_name(program_dir);
+    BACKEND_SOCKET_NAME.get_or_init(|| name).as_str()
+}
+
+/// Returns the socket file name currently in effect: the isolated name when
+/// [`seed_isolated_backend_socket_name`] ran, otherwise the shared default.
+#[must_use]
+fn backend_socket_file_name() -> &'static str {
+    BACKEND_SOCKET_NAME
+        .get()
+        .map_or(BACKEND_SOCKET_FILE_NAME, String::as_str)
+}
+
+/// Returns the AF_UNIX socket path used to reach the Python AI backend.
 ///
 /// This is the single source of truth for the path: the framed IPC client
 /// connects here and the Python backend binds the same path, so a manually
 /// launched backend needs no `--socket` argument.
 ///
-/// Path by platform:
+/// Path by platform (with the default, non-isolated file name):
 /// - unix: `/tmp/manhwastudio_backend_socket`
 /// - windows: `std::env::temp_dir().join("manhwastudio_backend_socket")`
+///
+/// Under `--ignore-installed` the file name carries a per-root suffix (see
+/// [`seed_isolated_backend_socket_name`]) so a copy launched from a source
+/// checkout never shares a backend with an installed copy.
 #[must_use]
 pub fn backend_socket_path() -> PathBuf {
     // `not(windows)` covers unix (identical to the previous `cfg(unix)` path) and
@@ -119,11 +188,11 @@ pub fn backend_socket_path() -> PathBuf {
     // since the socket transport itself is compiled out.
     #[cfg(not(windows))]
     {
-        PathBuf::from("/tmp/manhwastudio_backend_socket")
+        PathBuf::from("/tmp").join(backend_socket_file_name())
     }
     #[cfg(windows)]
     {
-        std::env::temp_dir().join("manhwastudio_backend_socket")
+        std::env::temp_dir().join(backend_socket_file_name())
     }
 }
 
@@ -871,6 +940,48 @@ mod tests {
             PathBuf::from("/tmp/manhwastudio_backend_socket"),
             "unix socket path must match the documented constant"
         );
+    }
+
+    /// The isolated socket name is a pure function of the root directory: the same
+    /// root yields the same name (so a restarted copy finds its own backend) and a
+    /// different root yields a different one (so two copies never collide).
+    #[test]
+    fn isolated_socket_name_is_stable_per_root_and_distinct_across_roots() {
+        // Non-existent paths on purpose: canonicalization must degrade to the raw
+        // path instead of collapsing distinct roots onto one name.
+        let first = Path::new("/opt/manhwastudio-a");
+        let second = Path::new("/opt/manhwastudio-b");
+
+        assert_eq!(
+            isolated_backend_socket_name(first),
+            isolated_backend_socket_name(first),
+            "the same root must always produce the same socket name"
+        );
+        assert_ne!(
+            isolated_backend_socket_name(first),
+            isolated_backend_socket_name(second),
+            "different roots must produce different socket names"
+        );
+        assert!(
+            isolated_backend_socket_name(first).starts_with("manhwastudio_backend_socket_"),
+            "the isolated name must extend the shared base name"
+        );
+        assert_ne!(
+            isolated_backend_socket_name(first),
+            "manhwastudio_backend_socket",
+            "the isolated name must never equal the shared default"
+        );
+    }
+
+    /// Without seeding, the effective file name stays the shared default, so a
+    /// normal launch keeps talking to the historical socket path.
+    ///
+    /// This test deliberately does NOT call `seed_isolated_backend_socket_name`:
+    /// the seed is a process-global `OnceLock`, and seeding it here would change
+    /// what `socket_path_has_expected_suffix` observes in the same test process.
+    #[test]
+    fn default_socket_file_name_is_used_when_isolation_is_not_seeded() {
+        assert_eq!(backend_socket_file_name(), "manhwastudio_backend_socket");
     }
 
     /// Round-trip: a throwaway `UnixListener` accepts one connection and

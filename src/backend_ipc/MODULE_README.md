@@ -37,10 +37,19 @@ on unix and the WS endpoint published via `set_ws_endpoint()` on windows. The ba
 supervisor (a different module) parses the backend's `MS_BACKEND_WS_PORT=<port>` line
 and calls `set_ws_endpoint(port, token)`.
 
+Socket isolation: `backend_socket_path()` normally yields the shared
+`manhwastudio_backend_socket` path. Under `--ignore-installed`, `main.rs` calls
+`seed_isolated_backend_socket_name(program_dir)` right after CLI parsing, which appends
+a stable FNV-1a-64 digest of the canonicalized runtime root to the file name. That makes
+a copy launched from a source checkout use its own socket instead of adopting (or being
+adopted by) an installed copy's backend. The WS transport needs no equivalent: its port
+is ephemeral and published per process.
+
 ## Files and submodules
 - `mod.rs`: module root and re-exports (`BackendClient`, `CallError`, `CallHandle`,
-  `shared_client`, `Frame`, `read_frame`, `write_frame`, `backend_socket_path`, and —
-  native only — `BackendEndpoint`, `set_ws_endpoint`, `current_backend_endpoint`).
+  `shared_client`, `Frame`, `read_frame`, `write_frame`, `backend_socket_path`,
+  `seed_isolated_backend_socket_name`, and — native only — `BackendEndpoint`,
+  `set_ws_endpoint`, `current_backend_endpoint`).
 - `protocol.rs`: constants mirroring `modules/ai_backend/ipc/protocol.py` (version,
   kinds, statuses, topics, method names, header keys) + header builders. Values must
   match Python byte-for-byte. Edit here when the shared contract changes.
@@ -76,6 +85,10 @@ and calls `set_ws_endpoint(port, token)`.
   keep `modules/ai_backend/ipc` in sync.
 - To add/adjust a method, topic, or header key, see `protocol.rs` (mirror Python).
 - To change how a connection is opened, timed out, or shut down, see `transport.rs`.
+- To change the socket path (including the per-root isolation), see `transport.rs` — it is the
+  single source both the IPC client and the supervisor's `--socket` argument read from. The
+  isolation seed is process-global and must stay write-once, before any client or supervisor
+  exists.
 - To add a new transport variant, extend `BackendEndpoint` + `Inner` and match all arms
   (no `_ =>` on the project enums), then wire it into `connect_endpoint`.
 - To change request routing, reconnect, or subscriptions, see `client.rs`.

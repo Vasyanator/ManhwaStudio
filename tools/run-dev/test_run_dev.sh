@@ -16,6 +16,8 @@
 # - "discard local" option                -> updated, changes recoverable in stash
 # - non-repository (ZIP) adoption         -> history grafted, files untouched
 # - untracked files are never touched by any path
+# - self-fingerprints                     -> a rewritten run-dev script is detected
+#                                            and stops the run with exit code 8
 #
 # Run: bash tools/run-dev/test_run_dev.sh
 #
@@ -219,6 +221,90 @@ git merge -q --ff-only origin/master
 RC=$(run_git_stage)
 check "код возврата"        "$RC" "0"
 check "ничего не сломалось" "$(git rev-list --count HEAD..origin/master)" "0"
+
+# ---------------------------------------------------------------------------
+note "Отпечатки самих скриптов run-dev"
+# ---------------------------------------------------------------------------
+
+# A throwaway tree that only contains the executable run-dev files. The macOS and
+# Windows launchers are deliberately absent: on any single machine two of the
+# five files are missing, and that must not read as a change by itself.
+FPROOT="$SANDBOX/selffiles"
+mkdir -p "$FPROOT/tools/run-dev"
+printf 'core\n'     > "$FPROOT/tools/run-dev/run-dev.sh"
+printf 'windows\n'  > "$FPROOT/tools/run-dev/run-dev.ps1"
+printf 'launcher\n' > "$FPROOT/run-dev.Linux.sh"
+
+REPO_ROOT="$FPROOT"
+GIT="git"
+MS_OS="linux"
+RUN_DEV_ARGV=""
+
+FP1=$(capture_self_fingerprints)
+check "снимок покрывает все исполняемые файлы" \
+      "$(printf '%s\n' "$FP1" | wc -l | tr -d ' ')" "5"
+check "хэш совпадает с git hash-object" \
+      "$(fingerprint_of "$FP1" "run-dev.Linux.sh")" "$(git hash-object "$FPROOT/run-dev.Linux.sh")"
+check "отсутствующий файл помечен как -" \
+      "$(fingerprint_of "$FP1" "run-dev.Windows.bat")" "-"
+
+FP2=$(capture_self_fingerprints)
+check "повторный снимок идентичен"      "$(self_changed_files "$FP1" "$FP2")" ""
+self_updated "$FP1" "$FP2"; check "без изменений перезапуск не нужен" "$?" "1"
+
+# --no-filters: with core.autocrlf=true git would hash a CRLF and an LF copy of
+# the same file identically, and a line-ending-only rewrite of run-dev.Windows.bat
+# is exactly the corruption the block layout of that file guards against.
+printf 'launcher\r\n' > "$FPROOT/run-dev.Linux.sh"
+git config --file "$SANDBOX/gitconfig" core.autocrlf true
+FP_CRLF=$(capture_self_fingerprints)
+check "перевод строк CRLF<->LF виден в отпечатке" \
+      "$(self_changed_files "$FP1" "$FP_CRLF")" "run-dev.Linux.sh"
+git config --file "$SANDBOX/gitconfig" --unset core.autocrlf
+printf 'launcher\n' > "$FPROOT/run-dev.Linux.sh"
+
+# A git failure between the two snapshots must not fabricate a restart request.
+SAVED_GIT="$GIT"
+GIT="$SANDBOX/no-such-git"
+FP_BROKEN=$(capture_self_fingerprints)
+GIT="$SAVED_GIT"
+check "нехэшируемый файл помечен как ?" "$(fingerprint_of "$FP_BROKEN" "run-dev.Linux.sh")" "?"
+check "сбой git с одной стороны — не изменение" "$(self_changed_files "$FP1" "$FP_BROKEN")" ""
+check "сбой git с другой стороны — тоже не изменение" "$(self_changed_files "$FP_BROKEN" "$FP1")" ""
+
+printf 'core updated\n' > "$FPROOT/tools/run-dev/run-dev.sh"
+FP3=$(capture_self_fingerprints)
+self_updated "$FP1" "$FP3"; check "изменение скрипта замечено" "$?" "0"
+check "назван именно изменённый файл" \
+      "$(self_changed_files "$FP1" "$FP3")" "tools/run-dev/run-dev.sh"
+
+# A file that did not exist locally and arrives with the update is a change too.
+printf 'bat\n' > "$FPROOT/run-dev.Windows.bat"
+FP4=$(capture_self_fingerprints)
+check "появившийся файл другой платформы — тоже изменение" \
+      "$(self_changed_files "$FP3" "$FP4")" "run-dev.Windows.bat"
+
+# Runs check_self_update in a subshell so its `exit` cannot abort the test run.
+run_self_check() { ( check_self_update >/dev/null 2>&1 ); printf '%s\n' "$?"; }
+
+SELF_BEFORE="$FP1"
+check "скрипт обновился -> код 8" "$(run_self_check)" "8"
+
+SELF_BEFORE=$(capture_self_fingerprints)
+check "ничего не менялось -> продолжаем" "$(run_self_check)" "0"
+
+SELF_BEFORE=""
+check "снимок не снимался (--no-update) -> продолжаем" "$(run_self_check)" "0"
+
+check "команда перезапуска для Linux" "$(restart_command)" "./run-dev.Linux.sh"
+MS_OS="macos"; RUN_DEV_ARGV="--debug"
+check "команда перезапуска для macOS с аргументами" \
+      "$(restart_command)" "./run-dev.MacOS.command --debug"
+
+check "аргумент с пробелом цитируется" \
+      "$(quote_args -- --project "/tmp/a b/x")" "-- --project '/tmp/a b/x'"
+check "аргументы без пробелов не цитируются" "$(quote_args --debug --yes)" "--debug --yes"
+check "пустой аргумент не теряется"          "$(quote_args --name "")" "--name ''"
 
 # ---------------------------------------------------------------------------
 

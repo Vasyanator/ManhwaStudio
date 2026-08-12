@@ -496,6 +496,21 @@ fn load_single_catalog(dir: &Path, tag: &LocaleTag) -> Result<Catalog, LocaleSto
     })
 }
 
+/// Installs the EMBEDDED catalog for the user's UI language, without touching the
+/// on-disk `locale/` folder. Best-effort; never fails the caller.
+///
+/// For very early startup diagnostics (before `reconcile_disk_catalog` has had a
+/// chance to add newly shipped keys to the on-disk files): the embedded catalog is
+/// compiled into this binary, so it always matches this binary's key set, whereas a
+/// stale `locale/<tag>.json` would make a brand-new key render as its raw key text.
+/// Normal startup must keep using [`install_ui_locale`], which lets the user's
+/// on-disk edits win.
+pub fn install_embedded_ui_locale(user_settings: &Value) {
+    let tag = ui_locale_tag_from_user_settings(user_settings);
+    report_plural_rule_fallback(&tag);
+    install_embedded_fallback(&tag);
+}
+
 /// Installs the active UI locale: load it from disk, or fall back to the embedded
 /// catalog on any failure. Best-effort; never fails the caller.
 ///

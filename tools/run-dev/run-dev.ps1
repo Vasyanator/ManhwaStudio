@@ -9,14 +9,18 @@ run the app with `cargo run --bin manhwastudio_rs --release`.
 Main responsibilities:
 - Stage 1 (git): provision portable MinGit when git is absent, adopt a working
   copy unpacked from a source ZIP, fetch, and merge local changes automatically
-  when they do not truly conflict.
+  when they do not truly conflict; detect that the update rewrote run-dev itself
+  and ask for a restart instead of continuing.
 - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
   toolchain, provision an isolated one plus MinGW-w64 under installer_files/.
-- Stage 3: invoke cargo.
+- Stage 3: two sequential cargo runs — an environment check that only shows a
+  GUI when something is missing, then the application itself.
 
 Key functions:
 - Invoke-GitStage, Install-MinGit, Invoke-RepositoryAdoption, Update-WithLocalChanges
+- Get-SelfFingerprints, Get-ChangedSelfFiles, Assert-NoSelfUpdate
 - Invoke-RustStage, Install-ManagedRust, Install-Mingw, Assert-CToolchain
+- Invoke-CargoRun, Assert-AppEnvironment, Invoke-RunStage
 
 Notes:
 The algorithm, its rationale, and every failure path are specified in
@@ -25,6 +29,11 @@ The algorithm, its rationale, and every failure path are specified in
 Entered through run-dev.Windows.bat, which bypasses the execution policy.
 This file MUST stay UTF-8 with BOM: Windows PowerShell 5.1 reads a BOM-less
 script as the system ANSI code page and would mangle every Russian message.
+PowerShell parses a script file into an AST in full before executing any of it,
+so Stage 1 rewriting this file mid-run cannot corrupt the running program — the
+only consequence is that the running code is stale, which Assert-NoSelfUpdate
+catches. That property is relied upon; do not restructure the file around
+dynamic dot-sourcing.
 User-facing output is Russian by project convention; code comments are English.
 #>
 
@@ -60,13 +69,27 @@ $GitApiMinGit = 'https://api.github.com/repos/git-for-windows/git/releases/lates
 $GitApiMingw  = 'https://api.github.com/repos/brechtsanders/winlibs_mingw/releases/latest'
 $RustupUrlGnu = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe'
 
+# Files that are *executed* by a run-dev launch. When the git stage rewrites any
+# of them the running scripts no longer match what is on disk, so the run stops
+# and asks for a restart. Test/doc files of the module are deliberately absent:
+# changing them cannot affect an in-flight run. Kept in the same order as
+# SELF_FILES in run-dev.sh.
+$SelfFiles = @(
+    'tools\run-dev\run-dev.sh',
+    'tools\run-dev\run-dev.ps1',
+    'run-dev.Linux.sh',
+    'run-dev.MacOS.command',
+    'run-dev.Windows.bat')
+
 # Exit codes; see dev-docs/run_dev_plan.md.
-$ExitGeneric     = 1
-$ExitNoGit       = 2
-$ExitManualMerge = 3
-$ExitNoRust      = 4
-$ExitNoCc        = 5
-$ExitAborted     = 6
+$ExitGeneric         = 1
+$ExitNoGit           = 2
+$ExitManualMerge     = 3
+$ExitNoRust          = 4
+$ExitNoCc            = 5
+$ExitAborted         = 6
+$ExitVenvNotReady    = 7
+$ExitRestartRequired = 8
 
 # --- State -------------------------------------------------------------------
 
@@ -75,6 +98,11 @@ $script:Git         = $null
 $script:Cargo       = $null
 $script:Adopted     = $false
 $script:ManagedRust = $false
+# Fingerprints of $SelfFiles taken before the git stage touched the tree.
+$script:SelfBefore  = $null
+# Exit code of the most recent Invoke-CargoRun; see that function for why the
+# code is passed through state instead of being returned.
+$script:LastRunCode = 0
 
 # --- Output helpers ----------------------------------------------------------
 
@@ -86,19 +114,30 @@ function Info { param([string] $Text) Write-Host "    $Text" }
 
 <#
 .SYNOPSIS
+Prints a framed block with the given title and colour, then terminates the
+process with $Code. Waits for a key first unless -Yes, so a double-clicked window
+does not vanish before the message can be read. Never returns.
+#>
+function Exit-WithBanner {
+    param([int] $Code, [string] $Title, [System.ConsoleColor] $Color, [string[]] $Lines)
+    Write-Host ''
+    Write-Host '============================================================' -ForegroundColor $Color
+    Write-Host "  $Title" -ForegroundColor $Color
+    Write-Host '============================================================' -ForegroundColor $Color
+    foreach ($l in $Lines) { Write-Host "  $l" }
+    Write-Host ''
+    if (-not $Yes) { Wait-ForKey }
+    exit $Code
+}
+
+<#
+.SYNOPSIS
 Prints a framed error block and terminates the process with the given code.
 Never returns.
 #>
 function Die {
     param([int] $Code, [string[]] $Lines)
-    Write-Host ''
-    Write-Host '============================================================' -ForegroundColor Red
-    Write-Host '  ОШИБКА' -ForegroundColor Red
-    Write-Host '============================================================' -ForegroundColor Red
-    foreach ($l in $Lines) { Write-Host "  $l" }
-    Write-Host ''
-    if (-not $Yes) { Wait-ForKey }
-    exit $Code
+    Exit-WithBanner -Code $Code -Title 'ОШИБКА' -Color Red -Lines $Lines
 }
 
 function Wait-ForKey {
@@ -116,7 +155,7 @@ function Show-Usage {
 
 Опции:
   -NoUpdate       Не обновляться из git, сразу собрать и запустить.
-  -Offline        Не обращаться к сети вообще.
+  -Offline        Не обращаться к сети вообще (проверка окружения пропускается).
   -DiscardLocal   Убрать локальные изменения (в git stash) и обновиться.
   -KeepLocal      Никогда не трогать локальные изменения.
   -DebugBuild     Собрать без --release (быстрее сборка, медленнее работа).
@@ -525,9 +564,126 @@ function Update-WithLocalChanges {
     Ok 'Обновлено, локальные изменения сохранены.'
 }
 
+# --- Self-update detection ---------------------------------------------------
+#
+# Stage 1 updates the working copy, and run-dev is part of that working copy: a
+# run started with the old scripts can end up executing a mix of old and new
+# logic. The fix is not to be clever about reloading, it is to notice and ask for
+# a restart.
+
+<#
+.SYNOPSIS
+Returns a hashtable {relative path -> fingerprint} for every $SelfFiles entry.
+`git hash-object` is used because git is already located by the time this runs.
+
+`--no-filters` is mandatory, not a detail: without it git applies the path's
+clean/eol filter, so under core.autocrlf=true (the Git for Windows default) a
+CRLF and an LF copy of the same file hash identically. An update that rewrites
+run-dev.Windows.bat only in its line endings would then pass unnoticed — and that
+is exactly the byte-level change cmd.exe cannot survive mid-run. It also stops a
+change to .gitattributes from appearing as a change to every file at once.
+
+A file absent on this machine is recorded as '-' (it exists in the repository
+regardless of the OS, so its arrival is a real change); a hash that could not be
+computed is '?', which Get-ChangedSelfFiles treats as "unknown, not changed".
+#>
+function Get-SelfFingerprints {
+    $map = @{}
+    foreach ($rel in $SelfFiles) {
+        $full = Join-Path $script:RepoRoot $rel
+        if (Test-Path $full) {
+            $probe = Invoke-Git 'hash-object' '--no-filters' '--' $full
+            if ($probe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($probe.Output)) {
+                $map[$rel] = $probe.Output.Trim()
+            } else {
+                $map[$rel] = '?'
+            }
+        } else {
+            $map[$rel] = '-'
+        }
+    }
+    return $map
+}
+
+<#
+.SYNOPSIS
+Returns the $SelfFiles entries whose fingerprint differs between the snapshot
+taken before the update and the one taken after it. Always an array, possibly
+empty.
+
+A '?' on EITHER side means the hash was unknown at that moment, which is never
+evidence of a change: a git hiccup between the two snapshots must not fabricate a
+restart request for an update that touched nothing.
+#>
+function Get-ChangedSelfFiles {
+    param([hashtable] $Before, [hashtable] $After)
+    $changed = @()
+    foreach ($rel in $SelfFiles) {
+        $b = if ($Before.ContainsKey($rel)) { $Before[$rel] } else { '' }
+        $a = if ($After.ContainsKey($rel))  { $After[$rel]  } else { '' }
+        if ($a -eq '?' -or $b -eq '?') { continue }
+        if ($a -ne $b) { $changed += $rel }
+    }
+    # The unary comma stops PowerShell from unrolling a 0/1-element array.
+    return ,$changed
+}
+
+<#
+.SYNOPSIS
+The command that starts run-dev again with the same options, printed in the
+restart message.
+#>
+function Get-RestartCommand {
+    $parts = @('run-dev.Windows.bat')
+    if ($NoUpdate)     { $parts += '-NoUpdate' }
+    if ($Offline)      { $parts += '-Offline' }
+    if ($DiscardLocal) { $parts += '-DiscardLocal' }
+    if ($KeepLocal)    { $parts += '-KeepLocal' }
+    if ($DebugBuild)   { $parts += '-DebugBuild' }
+    if ($Yes)          { $parts += '-Yes' }
+    foreach ($a in $AppArgs) {
+        # Display only: an argument with spaces must still read as one argument.
+        if ([string]::IsNullOrWhiteSpace($a) -or $a -match '\s') {
+            $parts += """$a"""
+        } else {
+            $parts += $a
+        }
+    }
+    return ($parts -join ' ')
+}
+
+<#
+.SYNOPSIS
+Stops the run when Stage 1 rewrote run-dev itself. Nothing is rolled back: the
+update is applied and correct, only the running scripts are stale. Returns
+normally when nothing that this run executes has changed.
+#>
+function Assert-NoSelfUpdate {
+    if (-not $script:SelfBefore) { return }
+    $changed = @(Get-ChangedSelfFiles -Before $script:SelfBefore -After (Get-SelfFingerprints))
+    if ($changed.Count -eq 0) { return }
+
+    $lines = @(
+        'Обновление затронуло сам скрипт запуска run-dev.',
+        '',
+        'Обновлены файлы:')
+    foreach ($f in $changed) { $lines += "    $f" }
+    $lines += @(
+        '',
+        'Обновление уже применено, откатывать ничего не нужно.',
+        'Запустите run-dev ещё раз, чтобы дальше работала новая версия:',
+        '',
+        "    $(Get-RestartCommand)")
+    Exit-WithBanner -Code $ExitRestartRequired -Title 'НУЖЕН ПЕРЕЗАПУСК' `
+                    -Color Yellow -Lines $lines
+}
+
 function Invoke-GitStage {
     Step 'Проверка обновлений'
     Find-Git
+    # Taken before anything can modify the tree, so the comparison after the
+    # update sees exactly what this run started with.
+    $script:SelfBefore = Get-SelfFingerprints
 
     if (-not (Test-GitOk 'rev-parse' '--git-dir')) {
         if (-not (Invoke-RepositoryAdoption)) { return }
@@ -862,6 +1018,72 @@ function Invoke-RustStage {
 # Stage 3 — run
 # =============================================================================
 
+<#
+.SYNOPSIS
+Runs `cargo run --bin manhwastudio_rs [--release] -- <ApplicationArgs>` and
+records cargo's exit code in $script:LastRunCode.
+
+The exit code deliberately travels through script state rather than a return
+value: cargo's own output is this function's output stream, and returning a value
+would make the caller capture the build log along with it. Synchronous by
+contract — on Windows a running .exe cannot be relinked, so the two Stage 3
+phases must never overlap.
+#>
+function Invoke-CargoRun {
+    param([string[]] $ApplicationArgs)
+    $cargoArgs = @('run', '--bin', $AppBin)
+    if (-not $DebugBuild) { $cargoArgs += '--release' }
+    $cargoArgs += '--'
+    $cargoArgs += $ApplicationArgs
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & $script:Cargo @cargoArgs
+    $script:LastRunCode = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+}
+
+<#
+.SYNOPSIS
+Phase 1 of Stage 3: let the binary itself decide whether the Python environment
+is usable. `--check-venv` opens the installer *only* when something is missing
+and exits 0 without any GUI when everything is in place, so this is also what
+compiles the project — phase 2 then starts instantly. Never returns when the
+environment could not be prepared.
+#>
+function Assert-AppEnvironment {
+    if ($Offline) {
+        # -Offline is an explicit "do not touch the network" request, and this
+        # check may download uv, Python or Torch wheels. Skipping it is the only
+        # honest reading; the app reports a broken environment on its own later.
+        Warn 'Режим -Offline: проверка окружения Python пропущена.'
+        Info 'Если venv или пакетов не хватает, приложение сообщит об этом само.'
+        return
+    }
+
+    Step 'Проверка окружения приложения'
+    Info 'Сейчас проект собирается — на чистой машине это самая долгая часть.'
+    Info 'Окно установки откроется, только если чего-то не хватает.'
+
+    Say ''
+    Invoke-CargoRun -ApplicationArgs @('--check-venv', '--ignore-installed')
+    if ($script:LastRunCode -ne 0) {
+        Die $ExitVenvNotReady @(
+            "Окружение приложения не готово, запуск отменён (код $($script:LastRunCode)).",
+            '',
+            'Причина — одна из двух:',
+            '  1) проект не собрался. Тогда выше видны сообщения компилятора,',
+            '     и разбирать нужно именно их: другими флагами это не обходится.',
+            '  2) установка окружения была отменена или завершилась с ошибкой.',
+            '     Запустите run-dev снова и доведите установку до конца.',
+            '',
+            'Во втором случае проверку можно и пропустить: режим -Offline её не',
+            'выполняет. Но учтите, что он же отключает обновление из git и',
+            'установку Rust — при отсутствующем Rust запуск завершится ошибкой.')
+    }
+    Ok 'Окружение готово.'
+}
+
 function Invoke-RunStage {
     Step 'Сборка и запуск'
     if ($DebugBuild) {
@@ -877,16 +1099,16 @@ function Invoke-RunStage {
     # An explicitly set value is respected, so a signed dev build is still possible.
     if (-not $env:MS_DISABLE_BUILD_CODESIGN) { $env:MS_DISABLE_BUILD_CODESIGN = '1' }
 
-    $cargoArgs = @('run', '--bin', $AppBin)
-    if (-not $DebugBuild) { $cargoArgs += '--release' }
-    if ($AppArgs -and $AppArgs.Count -gt 0) { $cargoArgs += '--'; $cargoArgs += $AppArgs }
+    Assert-AppEnvironment
+
+    # Phase 2. `--ignore-installed` goes first: the environment was just checked,
+    # so the application must not repeat that check at startup.
+    $appArguments = @('--ignore-installed')
+    if ($AppArgs -and $AppArgs.Count -gt 0) { $appArguments += $AppArgs }
 
     Say ''
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $script:Cargo @cargoArgs
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prev
+    Invoke-CargoRun -ApplicationArgs $appArguments
+    $code = $script:LastRunCode
 
     if ($code -ne 0) {
         Warn "Приложение завершилось с кодом $code."
@@ -919,7 +1141,14 @@ function Invoke-Main {
     Write-Host 'ManhwaStudio — запуск dev-версии'
     Info "Каталог проекта: $script:RepoRoot"
 
-    if ($NoUpdate) { Info 'Обновление пропущено (-NoUpdate).' } else { Invoke-GitStage }
+    if ($NoUpdate) {
+        Info 'Обновление пропущено (-NoUpdate).'
+    } else {
+        Invoke-GitStage
+        # Must come before Stage 2/3: continuing with half-old scripts is exactly
+        # what this check exists to prevent.
+        Assert-NoSelfUpdate
+    }
     Invoke-RustStage
     Invoke-RunStage
 }

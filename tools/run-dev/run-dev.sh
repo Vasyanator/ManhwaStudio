@@ -9,20 +9,29 @@
 #
 # Main responsibilities:
 # - Stage 1 (git): locate git, adopt a non-repository ZIP copy, fetch, and merge
-#   local changes automatically when they do not truly conflict.
+#   local changes automatically when they do not truly conflict; detect that the
+#   update rewrote run-dev itself and ask for a restart instead of continuing.
 # - Stage 2 (rust): read the MSRV from Cargo.toml, pick a system or managed
 #   toolchain, provision an isolated one under installer_files/ when needed.
-# - Stage 3: exec cargo.
+# - Stage 3: two sequential cargo runs — an environment check that only shows a
+#   GUI when something is missing, then the application itself.
 #
 # Key functions:
 # - git_stage(), adopt_repository(), update_with_local_changes()
+# - capture_self_fingerprints(), self_changed_files(), self_updated()
+# - quote_args(), restart_command(), check_self_update()
 # - rust_stage(), required_msrv(), ensure_c_toolchain()
+# - cargo_run_app(), check_environment(), run_stage()
 #
 # Notes:
 # The algorithm, its rationale, and every failure path are specified in
 # `dev-docs/run_dev_plan.md`. Windows is a separate implementation (run-dev.ps1).
 # Written for bash 3.2 so it runs on the bash macOS still ships: no associative
 # arrays, no `mapfile`, no `${var^^}`.
+# INVARIANT: every executable statement lives inside a function, and the file
+# ends with `main "$@"; exit $?`. bash reads a script incrementally, and Stage 1
+# rewrites this very file when an update lands; parsing everything up front and
+# never returning to the reader is what makes that safe.
 # User-facing output is Russian by project convention; code comments are English.
 
 set -uo pipefail
@@ -37,6 +46,12 @@ APP_BIN="manhwastudio_rs"
 # `git stash push` (used by every rollback path) landed in git 2.13.
 GIT_MIN="2.13.0"
 
+# Files that are *executed* by a run-dev launch. When the git stage rewrites any
+# of them the running scripts no longer match what is on disk, so the run stops
+# and asks for a restart. Test/doc files of the module are deliberately absent:
+# changing them cannot affect an in-flight run.
+SELF_FILES="tools/run-dev/run-dev.sh tools/run-dev/run-dev.ps1 run-dev.Linux.sh run-dev.MacOS.command run-dev.Windows.bat"
+
 # Exit codes; see dev-docs/run_dev_plan.md.
 EXIT_GENERIC=1
 EXIT_NO_GIT=2
@@ -44,6 +59,8 @@ EXIT_MANUAL_MERGE=3
 EXIT_NO_RUST=4
 EXIT_NO_CC=5
 EXIT_ABORTED=6
+EXIT_VENV_NOT_READY=7
+EXIT_RESTART_REQUIRED=8
 
 # --- Options -----------------------------------------------------------------
 
@@ -63,6 +80,10 @@ CARGO=""
 MS_OS=""
 ADOPTED=0
 MANAGED_RUST=0
+# Fingerprints of SELF_FILES taken before the git stage touched the tree.
+SELF_BEFORE=""
+# The command line this run was started with, echoed back in the restart hint.
+RUN_DEV_ARGV=""
 
 # --- Output helpers ----------------------------------------------------------
 
@@ -79,17 +100,30 @@ ok()    { printf '%s  ok%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn()  { printf '%s  ! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
 info()  { printf '    %s\n' "$*"; }
 
-# Prints a framed error block and exits with `$1`.
-die() {
-    local code="$1"; shift
-    printf '\n%s' "$C_RED$C_BOLD"
+# Prints a framed block titled `$3` in colour `$2` and exits with `$1`.
+# Remaining arguments are the body lines.
+banner_exit() {
+    local code="$1" color="$2" title="$3"; shift 3
+    printf '\n%s' "$color$C_BOLD"
     printf '============================================================\n'
-    printf '  ОШИБКА\n'
+    printf '  %s\n' "$title"
     printf '============================================================%s\n' "$C_RESET"
     local line
     for line in "$@"; do printf '  %s\n' "$line"; done
     printf '\n'
     exit "$code"
+}
+
+# Prints a framed error block and exits with `$1`.
+die() {
+    local code="$1"; shift
+    banner_exit "$code" "$C_RED" "ОШИБКА" "$@"
+}
+
+# Prints a framed informational block (not a failure) and exits with `$1`.
+notice_exit() {
+    local code="$1" title="$2"; shift 2
+    banner_exit "$code" "$C_YELLOW" "$title" "$@"
 }
 
 usage() {
@@ -100,7 +134,7 @@ usage() {
 
 Опции:
   --no-update       Не обновляться из git, сразу собрать и запустить.
-  --offline         Не обращаться к сети вообще.
+  --offline         Не обращаться к сети вообще (проверка окружения пропускается).
   --discard-local   Убрать локальные изменения (в git stash) и обновиться.
   --keep-local      Никогда не трогать локальные изменения.
   --debug           Собрать без --release (быстрее сборка, медленнее работа).
@@ -399,9 +433,127 @@ update_with_local_changes() {
     ok "Обновлено, локальные изменения сохранены."
 }
 
+# --- Self-update detection ---------------------------------------------------
+#
+# Stage 1 updates the working copy, and run-dev is part of that working copy: a
+# run started with the old scripts can end up executing a mix of old and new
+# logic. The fix is not to be clever about reloading, it is to notice and ask for
+# a restart.
+
+# Prints "<path> <hash>" for every SELF_FILES entry. `git hash-object` is used
+# because git is already located by the time this runs and it works outside a
+# repository too.
+#
+# `--no-filters` is mandatory, not a detail: without it git applies the path's
+# clean/eol filter, so under `core.autocrlf=true` a CRLF and an LF copy of the
+# same file hash identically. An update that rewrites run-dev.Windows.bat only in
+# its line endings would then pass unnoticed — and that is exactly the byte-level
+# change cmd.exe cannot survive mid-run. It also stops a change to .gitattributes
+# from appearing as a change to every file at once.
+#
+# A file absent on this platform is recorded as "-" (it exists in the repository
+# regardless of the OS, so its appearance is a real change); a hash that could not
+# be computed is "?", which self_changed_files treats as "unknown, not changed".
+capture_self_fingerprints() {
+    local f h
+    for f in $SELF_FILES; do
+        if [ -f "$REPO_ROOT/$f" ]; then
+            h=$($GIT hash-object --no-filters -- "$REPO_ROOT/$f" 2>/dev/null)
+            [ -n "$h" ] || h="?"
+        else
+            h="-"
+        fi
+        printf '%s %s\n' "$f" "$h"
+    done
+}
+
+# Prints the fingerprint recorded for file `$2` inside snapshot `$1`, or nothing.
+fingerprint_of() {
+    printf '%s\n' "$1" | awk -v f="$2" '$1 == f { print $2; exit }'
+}
+
+# Prints, one per line, the SELF_FILES entries whose fingerprint differs between
+# snapshot `$1` (taken before the update) and snapshot `$2` (taken after it).
+# A "?" on EITHER side means the hash was unknown at that moment, which is never
+# evidence of a change: a git hiccup between the two snapshots must not fabricate
+# a restart request for an update that touched nothing.
+self_changed_files() {
+    local f a b
+    for f in $SELF_FILES; do
+        a=$(fingerprint_of "$1" "$f")
+        b=$(fingerprint_of "$2" "$f")
+        if [ "$a" = "?" ] || [ "$b" = "?" ]; then continue; fi
+        if [ "$a" != "$b" ]; then printf '%s\n' "$f"; fi
+    done
+}
+
+# True when the update rewrote at least one file this run is executing.
+self_updated() {
+    [ -n "$(self_changed_files "$1" "$2")" ]
+}
+
+# Renders the given arguments as one copy-pasteable command line, single-quoting
+# any argument that is empty or contains whitespace. Display only — the result is
+# never re-executed, so it does not try to be a general shell quoter.
+quote_args() {
+    local out="" a
+    for a in "$@"; do
+        case "$a" in
+            ""|*[[:space:]]*) a="'$a'" ;;
+        esac
+        if [ -z "$out" ]; then out="$a"; else out="$out $a"; fi
+    done
+    printf '%s\n' "$out"
+}
+
+# The command that starts run-dev again on this platform, with the same options.
+restart_command() {
+    # detect_os only ever yields linux or macos; the Linux launcher is the
+    # default so the variable can never end up unset under `set -u`.
+    local launcher="./run-dev.Linux.sh"
+    if [ "$MS_OS" = "macos" ]; then launcher="./run-dev.MacOS.command"; fi
+    if [ -n "$RUN_DEV_ARGV" ]; then
+        printf '%s %s\n' "$launcher" "$RUN_DEV_ARGV"
+    else
+        printf '%s\n' "$launcher"
+    fi
+}
+
+# Stops the run when Stage 1 rewrote run-dev itself. Nothing is rolled back: the
+# update is applied and correct, only the running scripts are stale.
+check_self_update() {
+    [ -n "$SELF_BEFORE" ] || return 0
+    local after
+    after=$(capture_self_fingerprints)
+    self_updated "$SELF_BEFORE" "$after" || return 0
+
+    # One positional argument per line: banner_exit indents each argument it is
+    # given, so passing the file list as a single multi-line string would indent
+    # only its first line. The here-document (not a pipe) keeps `set --` in this
+    # shell instead of a subshell.
+    set -- "Обновление затронуло сам скрипт запуска run-dev." "" "Обновлены файлы:"
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        set -- "$@" "    $f"
+    done <<EOF
+$(self_changed_files "$SELF_BEFORE" "$after")
+EOF
+
+    notice_exit "$EXIT_RESTART_REQUIRED" "НУЖЕН ПЕРЕЗАПУСК" "$@" \
+        "" \
+        "Обновление уже применено, откатывать ничего не нужно." \
+        "Запустите run-dev ещё раз, чтобы дальше работала новая версия:" \
+        "" \
+        "    $(restart_command)"
+}
+
 git_stage() {
     step "Проверка обновлений"
     locate_git
+    # Taken before anything can modify the tree, so the comparison after the
+    # update sees exactly what this run started with.
+    SELF_BEFORE=$(capture_self_fingerprints)
 
     if ! is_repository; then
         if ! adopt_repository; then return 0; fi
@@ -649,6 +801,60 @@ rust_stage() {
 # Stage 3 — run
 # =============================================================================
 
+# Runs `cargo run --bin <APP_BIN> [--release] -- <$1>` synchronously and returns
+# cargo's exit code. `$1` is a flat argument string for the application; it is
+# word-split on purpose. Synchronous by contract: on Windows a running .exe
+# cannot be relinked, so the two Stage 3 phases must never overlap.
+cargo_run_app() {
+    local extra="$1"
+    set -- run --bin "$APP_BIN"
+    [ "$RELEASE" = 1 ] && set -- "$@" --release
+    set -- "$@" --
+    if [ -n "$extra" ]; then
+        # shellcheck disable=SC2086
+        set -- "$@" $extra
+    fi
+    "$CARGO" "$@"
+}
+
+# Phase 1 of Stage 3: let the binary itself decide whether the Python
+# environment is usable. `--check-venv` opens the installer *only* when something
+# is missing and exits 0 without any GUI when everything is in place, so this is
+# also what compiles the project — phase 2 then starts instantly.
+check_environment() {
+    if [ "$OFFLINE" = 1 ]; then
+        # --offline is an explicit "do not touch the network" request, and this
+        # check may download uv, Python or Torch wheels. Skipping it is the only
+        # honest reading; the app reports a broken environment on its own later.
+        warn "Режим --offline: проверка окружения Python пропущена."
+        info "Если venv или пакетов не хватает, приложение сообщит об этом само."
+        return 0
+    fi
+
+    step "Проверка окружения приложения"
+    info "Сейчас проект собирается — на чистой машине это самая долгая часть."
+    info "Окно установки откроется, только если чего-то не хватает."
+
+    say ""
+    cargo_run_app "--check-venv --ignore-installed"
+    local rc=$?
+    if [ "$rc" != "0" ]; then
+        die "$EXIT_VENV_NOT_READY" \
+            "Окружение приложения не готово, запуск отменён (код $rc)." \
+            "" \
+            "Причина — одна из двух:" \
+            "  1) проект не собрался. Тогда выше видны сообщения компилятора," \
+            "     и разбирать нужно именно их: другими флагами это не обходится." \
+            "  2) установка окружения была отменена или завершилась с ошибкой." \
+            "     Запустите run-dev снова и доведите установку до конца." \
+            "" \
+            "Во втором случае проверку можно и пропустить: режим --offline её не" \
+            "выполняет. Но учтите, что он же отключает обновление из git и" \
+            "установку Rust — при отсутствующем Rust запуск завершится ошибкой."
+    fi
+    ok "Окружение готово."
+}
+
 run_stage() {
     step "Сборка и запуск"
     if [ "$RELEASE" = 1 ]; then
@@ -667,16 +873,15 @@ run_stage() {
         export MS_DISABLE_BUILD_CODESIGN=1
     fi
 
-    set -- run --bin "$APP_BIN"
-    [ "$RELEASE" = 1 ] && set -- "$@" --release
-    if [ -n "$APP_ARGS" ]; then
-        # APP_ARGS is a flat string; word-splitting it here is the intent.
-        # shellcheck disable=SC2086
-        set -- "$@" -- $APP_ARGS
-    fi
+    check_environment
+
+    # Phase 2. `--ignore-installed` goes first: the environment was just checked,
+    # so the application must not repeat that check at startup.
+    local extra="--ignore-installed"
+    if [ -n "$APP_ARGS" ]; then extra="$extra $APP_ARGS"; fi
 
     say ""
-    "$CARGO" "$@"
+    cargo_run_app "$extra"
     local rc=$?
     if [ "$rc" != "0" ]; then
         warn "Приложение завершилось с кодом $rc."
@@ -691,6 +896,7 @@ run_stage() {
 # =============================================================================
 
 main() {
+    RUN_DEV_ARGV=$(quote_args "$@")
     parse_args "$@"
     detect_os
 
@@ -709,13 +915,24 @@ main() {
     say "${C_BOLD}ManhwaStudio — запуск dev-версии${C_RESET}"
     info "Каталог проекта: $REPO_ROOT"
 
-    if [ "$DO_UPDATE" = 1 ]; then git_stage; else info "Обновление пропущено (--no-update)."; fi
+    if [ "$DO_UPDATE" = 1 ]; then
+        git_stage
+        # Must come before Stage 2/3: continuing with half-old scripts is exactly
+        # what this check exists to prevent.
+        check_self_update
+    else
+        info "Обновление пропущено (--no-update)."
+    fi
     rust_stage
     run_stage
 }
 
 # `test_run_dev.sh` sources this file to exercise the git stage in isolation
 # against a throwaway repository; sourcing must not run the app.
+# The trailing `exit` is load-bearing: bash reads a script incrementally, and
+# Stage 1 may have rewritten this file while it ran. Exiting here guarantees the
+# interpreter never returns to read a byte offset that no longer means anything.
 if [ -z "${MS_RUN_DEV_SOURCE_ONLY:-}" ]; then
     main "$@"
+    exit $?
 fi

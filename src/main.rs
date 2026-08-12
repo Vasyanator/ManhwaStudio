@@ -16,6 +16,10 @@ Main flow:
     continue into the Rust launcher;
 - starts a non-blocking GitHub release version check before the Rust launcher and lets the launcher
   return an update intent when the user clicks "Обновить";
+- supports `--check-venv`: checks the managed Python environment, exits 0 silently when it is
+  complete, otherwise opens the installer in environment-repair mode and exits 0/1;
+- supports `--ignore-installed` (run from a source checkout): no Linux desktop entry, no
+  existing-install discovery/prompt, per-root backend socket, self-update refused;
 - supports `--update` to open the Rust update window directly before normal startup routing;
 - supports hidden `--continue-update` to resume update work after the executable has been replaced;
 - can update an already installed copy found through Windows install discovery or a user-selected
@@ -98,6 +102,11 @@ mod storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod studio_bootstrap;
 mod tabs;
+// Non-interactive readiness check of the managed Python environment behind
+// `--check-venv`. Native-only: it drives the installer/python-manager layers, both
+// of which are compiled out on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+mod venv_check;
 // Single owner of the UI font stack (`fonts/ui`): every `run_native` context installs the
 // same chain through it, so no window is left on the bare egui defaults.
 mod ui_fonts;
@@ -212,11 +221,28 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main() -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    install_linux_desktop_integration_async();
-
     init_startup_logging_best_effort();
     let mut cli = Cli::parse();
+    // FIRST action after parsing: several service flags below (Start Menu shortcut,
+    // uninstall, update continuation) act on an installed copy immediately, so an
+    // impossible combination must be rejected before any of them can run.
+    reject_conflicting_startup_flags(&cli);
+    // Desktop integration writes into the user's shared `~/.local/share` tree, which is
+    // owned by whichever copy registered itself last. A copy launched from a source
+    // checkout must not steal it, so this runs only after the CLI is known.
+    #[cfg(target_os = "linux")]
+    if !cli.ignore_installed {
+        install_linux_desktop_integration_async();
+    }
+    // Give this copy its own backend socket so a dev build and an installed copy can run
+    // side by side without adopting each other's Python backend. Seeded before any
+    // backend client or supervisor exists; read-only afterwards.
+    if cli.ignore_installed {
+        let socket_name = backend_ipc::seed_isolated_backend_socket_name(&config::program_dir());
+        runtime_log::log_info(format!(
+            "[startup] --ignore-installed: isolated backend socket name '{socket_name}'"
+        ));
+    }
     if let Err(err) = trace::init_trace(&config::data_dir(), cli.trace) {
         eprintln!("failed to initialize tracing: {err}");
     }
@@ -280,6 +306,16 @@ fn run_main() -> anyhow::Result<()> {
     // studio opened afterwards and vice versa.
     general_settings_panel::seed_ui_scale_from_user_settings(&user_settings);
 
+    // Environment check mode terminates the process: it must never fall through into the
+    // launcher, the studio, or the AI backend supervisor. `process::exit` is used instead
+    // of returning, because callers (run-dev scripts) branch on an EXACT code and an
+    // `anyhow` error return would collapse every outcome into the generic failure exit
+    // plus a printed backtrace-style message.
+    if cli.check_venv {
+        init_runtime_logging();
+        std::process::exit(run_check_venv_flow(&config::program_dir()));
+    }
+
     if cli.continue_update {
         init_runtime_logging();
         if installer::update::run_continue_update_window().map_err(anyhow::Error::msg)?
@@ -289,6 +325,8 @@ fn run_main() -> anyhow::Result<()> {
         }
     }
 
+    // `--update` (like every other installed-copy flag) can no longer arrive together with
+    // `--ignore-installed`: `reject_conflicting_startup_flags` ended the process already.
     if cli.update {
         init_runtime_logging();
         if installer::update::run_update_window(cli.test_ver_check).map_err(anyhow::Error::msg)?
@@ -303,7 +341,7 @@ fn run_main() -> anyhow::Result<()> {
         let supervisor = ai_backend_supervisor::AiBackendSupervisor::start(!cli.no_ai);
         return launcher::run_test_launcher(
             &user_settings,
-            Some(spawn_startup_update_check(cli.test_ver_check)),
+            startup_update_check_receiver(&cli),
             &supervisor.handle(),
         );
     }
@@ -530,11 +568,29 @@ fn resolve_startup_project_dir(
     }
     resolve_project_dir_without_cli_arg(
         user_settings,
-        cli.test_ver_check,
-        cli.continue_install || cli.continue_install_target.is_some(),
+        StartupRoutingFlags {
+            force_update_available: cli.test_ver_check,
+            force_run_installer: cli.continue_install || cli.continue_install_target.is_some(),
+            ignore_installed: cli.ignore_installed,
+        },
         cli.continue_install_target.clone(),
         ai_backend,
     )
+}
+
+/// CLI-derived switches that steer the no-`--project` startup path.
+///
+/// Passed explicitly instead of threading the whole `Cli` (or a global) through the
+/// startup helpers, so every branch that changes behavior is visible at the call site.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+struct StartupRoutingFlags {
+    /// `--test-ver-check`: pretend an update is available.
+    force_update_available: bool,
+    /// Installer continuation after elevation: go straight into the installer window.
+    force_run_installer: bool,
+    /// `--ignore-installed`: never discover, modify, or replace an installed copy.
+    ignore_installed: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -553,17 +609,20 @@ fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_project_dir_without_cli_arg(
     user_settings: &serde_json::Value,
-    force_update_available: bool,
-    force_run_installer: bool,
+    flags: StartupRoutingFlags,
     auto_install_target: Option<PathBuf>,
     ai_backend: &ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<Option<PathBuf>> {
-    if should_enter_installer_flow(force_run_installer, auto_install_target.as_ref()) {
+    if should_enter_installer_flow(flags.force_run_installer, auto_install_target.as_ref()) {
         return run_startup_installer(config::program_dir(), auto_install_target);
     }
 
     let program_dir = config::program_dir();
-    let has_python_env = python_manager::has_supported_python_env(&program_dir);
+    // Under `--ignore-installed` the environment is the developer's business: neither the
+    // installed-copy discovery nor the "install the Python environment?" prompt may run,
+    // so startup goes straight to the launcher.
+    let has_python_env =
+        flags.ignore_installed || python_manager::has_supported_python_env(&program_dir);
 
     #[cfg(target_os = "windows")]
     if !has_python_env {
@@ -607,18 +666,192 @@ fn resolve_project_dir_without_cli_arg(
     }
 
     ensure_standard_launcher_startup_artifacts()?;
-    match launcher::run_launcher(
-        user_settings,
-        Some(spawn_startup_update_check(force_update_available)),
-        ai_backend,
-    )? {
+    // No update check under `--ignore-installed`: without a notification the launcher never
+    // shows its update button, which is why the outcome below is a guard, not the UI path.
+    let update_check_rx = if flags.ignore_installed {
+        None
+    } else {
+        Some(spawn_startup_update_check(flags.force_update_available))
+    };
+    match launcher::run_launcher(user_settings, update_check_rx, ai_backend)? {
         Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(selection.project_dir)),
         Some(LauncherOutcome::StartUpdate) => {
-            let _ = installer::update::run_update_window(force_update_available)
+            if flags.ignore_installed {
+                refuse_self_update_from_sources();
+                return Ok(None);
+            }
+            let _ = installer::update::run_update_window(flags.force_update_available)
                 .map_err(anyhow::Error::msg)?;
             Ok(None)
         }
         None => Ok(None),
+    }
+}
+
+/// Reports that self-update is unavailable when the program runs from a source checkout.
+///
+/// The updater replaces the running executable in place; under `--ignore-installed` that
+/// executable lives in `target/`, so replacing it would overwrite a build artifact with a
+/// release binary. Both the log and a modal dialog say what to do instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_self_update_from_sources() {
+    runtime_log::log_warn(
+        "[startup] self-update refused: running from sources (--ignore-installed)",
+    );
+    show_startup_error_dialog(t!("startup.ignore_installed.update_refused"));
+}
+
+/// Returns the startup update-check receiver, or `None` when self-update is disabled.
+///
+/// `--ignore-installed` suppresses the check entirely: the launcher then has no update
+/// notification to draw, so its update button never appears.
+#[cfg(not(target_arch = "wasm32"))]
+fn startup_update_check_receiver(cli: &Cli) -> Option<mpsc::Receiver<Option<UpdateNotification>>> {
+    if cli.ignore_installed {
+        return None;
+    }
+    Some(spawn_startup_update_check(cli.test_ver_check))
+}
+
+/// Process exit code for an impossible command line (a usage error, mirroring clap's
+/// own exit code for one). Distinct from [`CHECK_VENV_EXIT_NOT_READY`], which reports a
+/// well-formed run whose environment is unusable.
+#[cfg(not(target_arch = "wasm32"))]
+const CLI_USAGE_ERROR_EXIT: i32 = 2;
+
+/// Aborts startup when the command line combines `--ignore-installed` with a flag that
+/// manages an installed copy (see `args::conflicting_installed_copy_flags`).
+///
+/// Returns normally when the combination is valid. Otherwise it logs, prints a
+/// user-facing diagnostic to stderr and exits with [`CLI_USAGE_ERROR_EXIT`] — it must
+/// terminate rather than ignore the flag, because silently dropping, say, `--uninstall`
+/// would be as surprising as honoring it.
+#[cfg(not(target_arch = "wasm32"))]
+fn reject_conflicting_startup_flags(cli: &Cli) {
+    let conflicting = args::conflicting_installed_copy_flags(cli);
+    if conflicting.is_empty() {
+        return;
+    }
+    // The UI catalog is normally installed much later in startup (it needs the user
+    // config), and `t!` would return raw keys here. This path exits immediately, so
+    // bring the catalog up just for the diagnostic: both calls only READ, so the
+    // first-run language marker and the user config stay untouched. The EMBEDDED
+    // catalog is used on purpose — the on-disk `locale/` folder is only reconciled
+    // later in startup, so a freshly shipped key may not be in it yet.
+    let raw_settings =
+        config::load_raw_user_settings_for_startup().unwrap_or(serde_json::Value::Null);
+    locale_store::install_embedded_ui_locale(&raw_settings);
+    let message = tf!(
+        "startup.ignore_installed.conflicting_flags",
+        flags = conflicting.join(", ")
+    );
+    runtime_log::log_error(format!("[startup] {message}"));
+    eprintln!("{message}");
+    std::process::exit(CLI_USAGE_ERROR_EXIT);
+}
+
+/// Process exit code of `--check-venv` when the environment is usable.
+#[cfg(not(target_arch = "wasm32"))]
+const CHECK_VENV_EXIT_READY: i32 = 0;
+/// Process exit code of `--check-venv` when the environment is NOT usable: it was
+/// incomplete and the user cancelled the repair, a repair stage failed, or the check
+/// itself could not verify readiness. Scripts branch on exactly this value.
+#[cfg(not(target_arch = "wasm32"))]
+const CHECK_VENV_EXIT_NOT_READY: i32 = 1;
+
+/// Runs the `--check-venv` flow for `root_dir` and returns the process exit code.
+///
+/// Silent success path: when the environment already provides everything the recorded
+/// install type requires, this only logs and prints one line, opening no window. Otherwise
+/// the installer is opened in environment-repair mode, starting on the dependency-profile
+/// screen; the repair provisions the environment of `root_dir` and nothing else.
+///
+/// Returns [`CHECK_VENV_EXIT_READY`] when the environment is (or has just been made)
+/// usable and [`CHECK_VENV_EXIT_NOT_READY`] otherwise. Never opens the launcher or the
+/// studio, and never starts the AI backend.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_check_venv_flow(root_dir: &Path) -> i32 {
+    match venv_check::check_environment(root_dir) {
+        venv_check::EnvironmentReadiness::Ready => {
+            runtime_log::log_info(format!(
+                "[check-venv] environment at '{}' is complete",
+                root_dir.display()
+            ));
+            println!("{}", t!("venv_check.ready_message"));
+            CHECK_VENV_EXIT_READY
+        }
+        venv_check::EnvironmentReadiness::NotReady(reason) => {
+            let message = reason.user_message();
+            runtime_log::log_warn(format!(
+                "[check-venv] environment at '{}' is not ready: {reason:?}",
+                root_dir.display()
+            ));
+            println!("{}", tf!("venv_check.not_ready_message", reason = message));
+            run_environment_repair_and_report(root_dir)
+        }
+    }
+}
+
+/// Opens the environment-repair installer window and maps its outcome to an exit code.
+///
+/// A reported success is VERIFIED before returning [`CHECK_VENV_EXIT_READY`]: the same
+/// readiness check runs again, so a repair that finished without actually satisfying the
+/// contract (a stage that under-installed, a config the worker could not record) exits
+/// non-zero instead of handing a broken environment to the caller.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_environment_repair_and_report(root_dir: &Path) -> i32 {
+    let outcome = match launcher_install::run_environment_repair_window(root_dir) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            runtime_log::log_error(format!("[check-venv] repair window failed: {err}"));
+            eprintln!("{}", tf!("venv_check.repair_failed_message", err = err));
+            return CHECK_VENV_EXIT_NOT_READY;
+        }
+    };
+    match outcome {
+        launcher_install::InstallerOutcome::Completed => {
+            match venv_check::check_environment(root_dir) {
+                venv_check::EnvironmentReadiness::Ready => {
+                    runtime_log::log_info("[check-venv] environment repaired");
+                    println!("{}", t!("venv_check.repair_completed_message"));
+                    CHECK_VENV_EXIT_READY
+                }
+                venv_check::EnvironmentReadiness::NotReady(reason) => {
+                    runtime_log::log_error(format!(
+                        "[check-venv] repair reported success but the environment is still not ready: {reason:?}"
+                    ));
+                    eprintln!(
+                        "{}",
+                        tf!(
+                            "venv_check.repair_incomplete_message",
+                            reason = reason.user_message()
+                        )
+                    );
+                    CHECK_VENV_EXIT_NOT_READY
+                }
+            }
+        }
+        launcher_install::InstallerOutcome::Cancelled => {
+            runtime_log::log_warn("[check-venv] environment repair cancelled by the user");
+            eprintln!("{}", t!("venv_check.repair_cancelled_message"));
+            CHECK_VENV_EXIT_NOT_READY
+        }
+        launcher_install::InstallerOutcome::Failed(err) => {
+            runtime_log::log_error(format!("[check-venv] environment repair failed: {err}"));
+            eprintln!("{}", tf!("venv_check.repair_failed_message", err = err));
+            CHECK_VENV_EXIT_NOT_READY
+        }
+        // Neither outcome is reachable in repair mode (it never elevates and never
+        // deploys a copy to launch), but the enum is matched exhaustively on purpose:
+        // a future variant must be considered here rather than silently pass as ready.
+        launcher_install::InstallerOutcome::ElevatedRelaunchStarted
+        | launcher_install::InstallerOutcome::LaunchLauncher(_) => {
+            runtime_log::log_error(
+                "[check-venv] unexpected installer outcome in environment-repair mode",
+            );
+            eprintln!("{}", t!("venv_check.repair_unexpected_outcome_message"));
+            CHECK_VENV_EXIT_NOT_READY
+        }
     }
 }
 

@@ -11,6 +11,11 @@ starts background workers, and consumes progress events without blocking the GUI
 when startup receives `--update`, or when hidden `--continue-update` resumes after executable
 replacement.
 
+`install.rs` hosts two installer purposes (`InstallerPurpose`). `FullInstall` is the classic flow.
+`EnvironmentRepair` (`run_environment_repair_window`, used by `--check-venv`) reuses the same window
+and screens but fixes the target to the given root, starts on the dependency-profile screen, runs
+`utils::run_environment_repair_worker`, and finishes with a plain "environment is ready" screen.
+
 `utils.rs` owns the non-UI installer/update backend: release lookup, downloads, executable
 replacement handoff, archive extraction, managed Python/venv setup, static dependency
 installation, optional full PyTorch setup, elevation helpers, Windows shortcuts/registry
@@ -52,7 +57,36 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - Fast installation must install only the base dependency group.
 - Full installation must install PyTorch before torch-dependent extras.
 - Successful installation records `General.ai_install_type` in the installed `user_config.json`:
-  fast/base writes `Base`, full writes `Full`.
+  fast/base writes `Base`, full writes `Full`. This is done by the UI on a successful worker
+  result, for both installer purposes.
+- Environment repair provisions ONLY the Python environment of an existing root. It must NEVER:
+  download or extract `ManhwaStudio.zip`, copy the executable, write the app icon, create
+  shortcuts, touch the Windows registry, run `finalize_windows_post_install`, request elevation,
+  offer another install directory, or launch an installed copy. It must never delete an existing
+  working environment either: an interpreter found by `python_manager` (including a user `venv/`
+  in the root) is reused verbatim, and only a broken installer-owned `installer_files/venv` may be
+  removed before a fresh uv-managed venv is created.
+- Repair installs only the packages that `pip freeze` does not report (`missing_dependency_specs`),
+  and skips the Torch stage exactly when `utils::installed_torch_is_current` says so.
+- The required dependency set per install type is `utils::required_dependency_specs`: base group
+  for `Base`/`None`, plus the torch extras for `Full`. PyTorch is NOT in that list: its requirement
+  is a MINIMUM VERSION (`REQUIRED_TORCH_VERSION`), expressed by the single predicate
+  `installed_torch_is_current`, which the readiness check (`src/venv_check.rs`), the repair worker
+  and the update flow all share — a "ready" verdict must imply the worker has nothing left to do.
+- Two views of "missing" exist on purpose. Installation uses the strict
+  `missing_dependency_specs` (one concrete distribution per spec). Readiness uses
+  `missing_specs_for_readiness`, which additionally accepts any interchangeable distribution of the
+  same Python module (`ONNXRUNTIME_DISTRIBUTIONS`, mirroring `src/ai_install_probe.rs` plus the
+  WebGPU build), because a working environment built on `onnxruntime-gpu`/`-webgpu`/`-migraphx`
+  must not be offered a repair on every launch. Readiness may only ever be SOFTER than installation.
+- `dependency_marker_matches_current_platform` understands exactly the two
+  `platform_system == / != "Windows"` markers used by the embedded lists and treats anything else
+  as "applies here" (fail-open: an unnecessary install, never a false readiness). A dependency
+  with a different marker requires extending that function.
+- Environment repair must leave a READY environment behind: if it cannot record
+  `General.ai_install_type`, the outcome is `Failed`, not `Completed` (a silent failure there would
+  make the next `--check-venv` reopen the installer forever). A full install keeps the older
+  behavior, since startup re-detects the install type for a deployed app.
 - The update window uses the installer's native window sizing. Release checks and updater work must
   run on background workers; the GUI thread only polls worker results, asks for PyTorch choice when
   needed, and draws state. Existing-install and custom-folder update entry points first query the
@@ -78,6 +112,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.
+- To change what environment repair does (or must not do), edit
+  `utils.rs::run_environment_repair_worker` and keep the invariants above in sync.
 - To change the update window shell, edit `update.rs`.
 - To change install/update worker steps, release assets, command execution, or archive handling,
   edit `utils.rs`.
