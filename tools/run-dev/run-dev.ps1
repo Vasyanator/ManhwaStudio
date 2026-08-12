@@ -18,7 +18,9 @@ Main responsibilities:
 
 Key functions:
 - Invoke-GitStage, Install-MinGit, Invoke-RepositoryAdoption, Update-WithLocalChanges
-- Get-SelfFingerprints, Get-ChangedSelfFiles, Assert-NoSelfUpdate
+- Repair-SelfEol, Get-SelfFingerprints, Get-ChangedSelfFiles, Assert-NoSelfUpdate
+- Invoke-Git (stdout and stderr are never mixed)
+- Get-StashTop, Get-StashRefFor, Invoke-StashPop, Restore-StashEntry
 - Invoke-RustStage, Install-ManagedRust, Install-Mingw, Assert-CToolchain
 - Invoke-CargoRun, Assert-AppEnvironment, Invoke-RunStage
 
@@ -218,15 +220,32 @@ function Test-VersionAtLeast {
 
 <#
 .SYNOPSIS
-Parses a git `--count` output into an int, yielding 0 for empty or non-numeric
-text. Guards against `[int]''` throwing when a git command failed.
+Parses a git `--count` output into an int, yielding 0 for anything that is not a
+bare number. Guards against `[int]''` throwing when a git command failed.
+
+Strictly whole-string on purpose: fishing the first digit group out of arbitrary
+text would turn any stray message that happens to contain a number into a commit
+count, and "behind = 1" opens the update branch on a repository with nothing
+incoming. Only `rev-list --count` output — one line, digits only — is accepted.
 #>
 function Convert-ToCount {
     param([string] $Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return 0 }
-    $m = [regex]::Match($Text, '\d+')
-    if (-not $m.Success) { return 0 }
-    return [int]$m.Value
+    $t = $Text.Trim()
+    if ($t -notmatch '^\d+$') { return 0 }
+    return [int]$t
+}
+
+<#
+.SYNOPSIS
+True when $Text is a bare git object id: 40 hex characters (SHA-1) or 64
+(SHA-256 repositories). Anything else — empty output, a warning, a truncated
+line — is not a usable fingerprint.
+#>
+function Test-ObjectId {
+    param([string] $Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text.Trim() -match '^[0-9a-f]{40}$|^[0-9a-f]{64}$')
 }
 
 # --- Download / archive helpers ----------------------------------------------
@@ -295,19 +314,53 @@ function Expand-ZipTo {
 
 <#
 .SYNOPSIS
-Runs the resolved git with the given arguments, returning an object with
-ExitCode and Output. Never throws on a non-zero git exit.
+Runs the resolved git with the given arguments and returns an object with
+ExitCode, Output (stdout only) and Error (stderr only). Never throws on a
+non-zero git exit.
+
+.DESCRIPTION
+Keeping the two streams apart is a correctness requirement, not tidiness. git
+writes advisory text to stderr on perfectly successful commands — "warning: in
+the working copy of 'x', LF will be replaced by CRLF", ambiguous-refname notes,
+background-gc chatter — and every consumer here parses Output as data: a
+fingerprint, a commit count, a porcelain status. A warning merged into Output
+becomes a bogus hash, a bogus count, or a bogus "dirty tree". The POSIX
+implementation gets this for free by sending stderr to /dev/null (run-dev.sh);
+this is the same contract, with the text kept for diagnostics instead of dropped.
+
+Separation is by object type rather than by order: with `2>&1` a native command's
+stderr lines arrive as ErrorRecord objects and its stdout lines as strings, so the
+split does not depend on how the two streams interleave — which is exactly the
+thing that is not guaranteed between runs.
 #>
 function Invoke-Git {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $script:Git @Arguments 2>&1
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+        $captured = @(& $script:Git @Arguments 2>&1)
+        $code = $LASTEXITCODE
+        $out = @($captured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+        $err = @($captured | Where-Object { $_ -is  [System.Management.Automation.ErrorRecord] })
+        return [pscustomobject]@{
+            ExitCode = $code
+            Output   = (($out | ForEach-Object { [string]$_ }) -join "`n")
+            Error    = (($err | ForEach-Object { [string]$_ }) -join "`n")
+        }
     } finally {
         $ErrorActionPreference = $prev
     }
+}
+
+<#
+.SYNOPSIS
+Flattens the stderr of an Invoke-Git result into one line for a failure message.
+Callers keep the result object rather than re-running the command — a second
+`stash push` would not be free of consequences.
+#>
+function Format-GitError {
+    param([pscustomobject] $Result)
+    return ($Result.Error -replace "`r?`n", ' ').Trim()
 }
 
 function Test-GitOk {
@@ -465,7 +518,9 @@ function Resolve-AdoptedTree {
     Write-Host 'Ваш выбор [1]: ' -NoNewline
     switch (Read-Choice '1') {
         '1' {
-            Save-LocalChanges "run-dev: содержимое архива $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+            # [void]: Save-LocalChanges returns a flag, which would otherwise be
+            # printed to the console by this statement.
+            [void](Save-LocalChanges "run-dev: содержимое архива $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
             Ok "Файлы обновлены до origin/$Branch."
         }
         '2' { Warn 'Файлы оставлены без изменений.' }
@@ -475,15 +530,101 @@ function Resolve-AdoptedTree {
 
 <#
 .SYNOPSIS
+Returns the object id of the top stash entry, or '' when the stash is empty.
+Used to tell "push created an entry" from "push had nothing to save", which
+`git stash push` reports with the same exit code 0.
+#>
+function Get-StashTop {
+    $probe = Invoke-Git 'rev-parse' '-q' '--verify' 'refs/stash'
+    if ($probe.ExitCode -ne 0) { return '' }
+    if (-not (Test-ObjectId $probe.Output)) { return '' }
+    return $probe.Output.Trim()
+}
+
+<#
+.SYNOPSIS
+Returns the `stash@{N}` selector of the entry whose commit id is $Id, or '' when
+that entry is no longer in the stash.
+
+.DESCRIPTION
+The stash is a stack shared with everything else on the machine — an IDE,
+TortoiseGit, a second terminal. Between our push and our pop somebody else may
+have pushed (their entry is now on top) or dropped one (indices shifted), so an
+entry must always be addressed by identity, never by position.
+#>
+function Get-StashRefFor {
+    param([string] $Id)
+    if (-not (Test-ObjectId $Id)) { return '' }
+    $list = Invoke-Git 'stash' 'list' '--format=%H %gd'
+    if ($list.ExitCode -ne 0) { return '' }
+    foreach ($line in ($list.Output -split "`r?`n")) {
+        $parts = $line.Trim() -split '\s+', 2
+        if ($parts.Count -eq 2 -and $parts[0] -eq $Id.Trim()) { return $parts[1] }
+    }
+    return ''
+}
+
+<#
+.SYNOPSIS
+Pops exactly the stash entry with commit id $Id. Returns $false when that entry
+is gone or when the pop failed — a conflicting pop keeps the entry, so it stays
+addressable by the same id.
+#>
+function Invoke-StashPop {
+    param([string] $Id)
+    $ref = Get-StashRefFor $Id
+    if (-not $ref) { return $false }
+    return (Test-GitOk 'stash' 'pop' '-q' $ref)
+}
+
+<#
+.SYNOPSIS
+Restores the entry created by this run, warning instead of failing when it
+cannot. Used on rollback paths, where the caller is already on its way to Die
+with its own message: a lost entry must be reported, not hidden, and must not
+replace the primary error either.
+#>
+function Restore-StashEntry {
+    param([string] $Id)
+    if (-not $Id) { return }
+    if (Invoke-StashPop $Id) { return }
+    Warn 'Локальные изменения остались в git stash — посмотрите: git stash list'
+}
+
+<#
+.SYNOPSIS
 Saves tracked modifications into the stash. Untracked files are NEVER included:
-the working directory holds the user's projects, models and configs.
+the working directory holds the user's projects, models and configs. Returns
+$true when an entry was actually created.
+
+A push that saves nothing still exits 0, so the caller is told the difference:
+claiming "recoverable via git stash pop" when no entry exists would point the
+user at somebody else's older stash.
 #>
 function Save-LocalChanges {
     param([string] $Message)
-    if (-not (Test-GitOk 'stash' 'push' '-q' '-m' $Message)) {
-        Die $ExitGeneric @('Не удалось сохранить локальные изменения в git stash.')
+    $before = Get-StashTop
+    $push = Invoke-Git 'stash' 'push' '-q' '-m' $Message
+    if ($push.ExitCode -ne 0) {
+        $detail = Format-GitError $push
+        $lines = @('Не удалось сохранить локальные изменения в git stash.')
+        if ($detail) { $lines += "Git сообщает: $detail" }
+        Die $ExitGeneric $lines
     }
-    Info 'Прежнее содержимое сохранено. Вернуть: git stash pop'
+    $after = Get-StashTop
+    if ($after -eq $before) {
+        Warn 'Сохранять было нечего: git не нашёл изменений в отслеживаемых файлах.'
+        return $false
+    }
+    # Name the entry explicitly: a bare `git stash pop` takes whatever is on top,
+    # which may belong to another process by the time the user runs it.
+    $ref = Get-StashRefFor $after
+    if ($ref) {
+        Info "Прежнее содержимое сохранено. Вернуть: git stash pop $ref"
+    } else {
+        Info 'Прежнее содержимое сохранено. Найти: git stash list'
+    }
+    return $true
 }
 
 <#
@@ -527,13 +668,25 @@ function Update-WithLocalChanges {
         Info 'Локальные правки не пересекаются с новыми коммитами.'
     }
 
-    if (-not (Test-GitOk 'stash' 'push' '-q' '-m' 'run-dev: автосохранение перед обновлением')) {
-        Die $ExitGeneric @('Не удалось временно сохранить локальные изменения.')
+    # A stash push that saves nothing also exits 0, and the stash is shared with
+    # every other git client on the machine. So this records the identity of the
+    # entry it created and every restore below pops THAT entry: popping the
+    # current top instead would apply a stranger's work to the tree, or nothing
+    # at all — corruption, not a cosmetic bug.
+    $stashBefore = Get-StashTop
+    $push = Invoke-Git 'stash' 'push' '-q' '-m' 'run-dev: автосохранение перед обновлением'
+    if ($push.ExitCode -ne 0) {
+        $detail = Format-GitError $push
+        $lines = @('Не удалось временно сохранить локальные изменения.')
+        if ($detail) { $lines += "Git сообщает: $detail" }
+        Die $ExitGeneric $lines
     }
+    $ourStash = Get-StashTop
+    if ($ourStash -eq $stashBefore) { $ourStash = '' }
 
     if (-not (Invoke-Merge -Ahead $Ahead)) {
         [void](Invoke-Git 'reset' '--hard' '-q' $preHead)
-        [void](Invoke-Git 'stash' 'pop')
+        Restore-StashEntry $ourStash
         Die $ExitManualMerge @(
             'Не удалось объединить локальные коммиты с новой версией.',
             'Рабочая копия возвращена в исходное состояние, ничего не потеряно.',
@@ -541,13 +694,31 @@ function Update-WithLocalChanges {
             "Слейте вручную:  git merge origin/$Branch")
     }
 
-    if (-not (Test-GitOk 'stash' 'pop' '-q')) {
+    if (-not $ourStash) {
+        # Nothing was stashed, so nothing has to come back.
+        Ok 'Обновлено до актуальной версии.'
+        return
+    }
+
+    if (-not (Invoke-StashPop $ourStash)) {
+        if (-not (Get-StashRefFor $ourStash)) {
+            # The entry is not merely conflicting — it is gone, taken by another
+            # process. There is nothing safe left to apply, and guessing at the
+            # current top is exactly what must not happen here.
+            Die $ExitManualMerge @(
+                'Обновление применено, но вернуть локальные изменения не удалось:',
+                'созданная run-dev запись в git stash исчезла — её мог забрать',
+                'другой git-клиент (IDE, второй терминал).',
+                '',
+                'Посмотрите список сохранённого:  git stash list',
+                'Вернуть нужную запись:           git stash pop stash@{N}')
+        }
         # `stash pop` keeps the stash entry when it conflicts, so the work is
         # safe. `reset --hard` clears the conflicted index, the working tree and
         # the merge commit at once; the pop then replays onto the original base
         # and therefore applies cleanly.
         [void](Invoke-Git 'reset' '--hard' '-q' $preHead)
-        [void](Invoke-Git 'stash' 'pop')
+        Restore-StashEntry $ourStash
         Die $ExitManualMerge @(
             'Локальные изменения конфликтуют с новой версией — нужно ручное слияние.',
             'Рабочая копия возвращена в исходное состояние, ничего не потеряно.',
@@ -584,8 +755,12 @@ is exactly the byte-level change cmd.exe cannot survive mid-run. It also stops a
 change to .gitattributes from appearing as a change to every file at once.
 
 A file absent on this machine is recorded as '-' (it exists in the repository
-regardless of the OS, so its arrival is a real change); a hash that could not be
-computed is '?', which Get-ChangedSelfFiles treats as "unknown, not changed".
+regardless of the OS, so its arrival is a real change); anything that is not a
+well-formed object id — a failed command, empty output, a stray line — is
+recorded as '?', which Get-ChangedSelfFiles treats as "unknown, not changed".
+The shape is validated rather than trusted: a fingerprint is only useful if it
+can be compared, and text that merely happens to be non-empty compares unequal
+to itself on the next run.
 #>
 function Get-SelfFingerprints {
     $map = @{}
@@ -593,7 +768,7 @@ function Get-SelfFingerprints {
         $full = Join-Path $script:RepoRoot $rel
         if (Test-Path $full) {
             $probe = Invoke-Git 'hash-object' '--no-filters' '--' $full
-            if ($probe.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($probe.Output)) {
+            if ($probe.ExitCode -eq 0 -and (Test-ObjectId $probe.Output)) {
                 $map[$rel] = $probe.Output.Trim()
             } else {
                 $map[$rel] = '?'
@@ -603,6 +778,62 @@ function Get-SelfFingerprints {
         }
     }
     return $map
+}
+
+<#
+.SYNOPSIS
+Restores the $SelfFiles whose working copy differs from the index in line endings
+ONLY, before the "before" snapshot is taken. Silent no-op when there is nothing
+to settle.
+
+.DESCRIPTION
+Why such files exist: .gitattributes pins each of them to a specific `eol`, while
+a working copy created earlier (a different core.autocrlf — true is the Git for
+Windows default — a source ZIP, an editor) may hold the other convention. Git does
+not repair that by itself, but `git stash push` does, because it checks the file
+back out through the attribute. So a plain "update with local changes" silently
+rewrites the bytes of scripts that are executing right now, which the fingerprints
+then report as a self-update: a restart request for an update that changed
+nothing, repeated on every run because the state never settles. This is the
+Windows-only half of that bug; the POSIX side runs the same pass to keep one
+contract.
+
+Why it cannot lose work — three conditions, all required, because this function
+overwrites a file from the index and any doubt means "leave it alone":
+1. `git status` must SUCCEED. Its empty output is only meaningful when the
+   command actually ran.
+2. The porcelain state must be exactly one line of plain unstaged modification
+   (" M "). Merge conflicts and every other XY state are none of this function's
+   business.
+3. Emptiness of the diff is decided by the EXIT CODE of
+   `git diff --quiet --no-ext-diff`, never by captured output. A diff that fails
+   — a configured-and-broken GIT_EXTERNAL_DIFF, a broken diff driver — writes
+   nothing to stdout, and reading that as "no differences" would destroy the
+   user's unsaved edits. `--no-ext-diff` keeps an external differ out of the
+   decision in the first place.
+Exit code 0 then means: identical to the index once filters are applied, i.e. the
+difference is exactly the byte encoding.
+
+Rewriting a file that is being executed is safe here for the same structural
+reason the update itself is (see the file header): every interpreter has already
+read past the point it would need to re-read. It is also idempotent — after one
+pass the state matches the attribute and later runs find nothing to do.
+#>
+function Repair-SelfEol {
+    foreach ($rel in $SelfFiles) {
+        $full = Join-Path $script:RepoRoot $rel
+        if (-not (Test-Path $full)) { continue }
+
+        $status = Invoke-Git 'status' '--porcelain' '--untracked-files=no' '--' $full
+        if ($status.ExitCode -ne 0) { continue }
+        $lines = @($status.Output -split "`r?`n" | Where-Object { $_.Trim() })
+        if ($lines.Count -ne 1) { continue }
+        if ($lines[0] -notmatch '^ M ') { continue }
+
+        if ((Invoke-Git 'diff' '--quiet' '--no-ext-diff' '--' $full).ExitCode -ne 0) { continue }
+
+        [void](Invoke-Git 'checkout' '--' $full)
+    }
 }
 
 <#
@@ -681,8 +912,11 @@ function Assert-NoSelfUpdate {
 function Invoke-GitStage {
     Step 'Проверка обновлений'
     Find-Git
-    # Taken before anything can modify the tree, so the comparison after the
-    # update sees exactly what this run started with.
+    # Settle any line-ending-only mismatch first, otherwise `git stash push`
+    # would settle it mid-update and the fingerprints would read that as a
+    # self-update. Then snapshot: from here on, any change to these files really
+    # did come from the update.
+    Repair-SelfEol
     $script:SelfBefore = Get-SelfFingerprints
 
     if (-not (Test-GitOk 'rev-parse' '--git-dir')) {
@@ -743,7 +977,8 @@ function Invoke-GitStage {
     switch ($choice) {
         '1' { Update-WithLocalChanges -Ahead $ahead }
         '2' {
-            Save-LocalChanges "run-dev: отброшенные изменения $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+            # [void]: the returned flag must not reach the console.
+            [void](Save-LocalChanges "run-dev: отброшенные изменения $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
             if (Invoke-Merge -Ahead $ahead) {
                 Ok 'Обновлено. Локальные изменения лежат в git stash.'
             } else {

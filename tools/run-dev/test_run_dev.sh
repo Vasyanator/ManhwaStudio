@@ -18,6 +18,9 @@
 # - untracked files are never touched by any path
 # - self-fingerprints                     -> a rewritten run-dev script is detected
 #                                            and stops the run with exit code 8
+# - fingerprint/count parsing             -> only well-formed values are accepted
+# - EOL repair pass                       -> never touches a file with real edits
+# - stash guard                           -> a pop never restores somebody else's entry
 #
 # Run: bash tools/run-dev/test_run_dev.sh
 #
@@ -123,6 +126,24 @@ REPO_ROOT="$SELF_DIR/../.."
 check "required_msrv читает Cargo.toml проекта" "$(required_msrv)" "1.92"
 
 # ---------------------------------------------------------------------------
+note "Разбор значений git: принимаем только правильную форму"
+# ---------------------------------------------------------------------------
+
+is_object_id "0123456789abcdef0123456789abcdef01234567"; check "40 hex — объект" "$?" "0"
+is_object_id "$(printf '0%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)"
+check "64 hex (SHA-256) — объект" "$?" "0"
+is_object_id "0123456789abcdef0123456789abcdef0123456"; check "39 hex — не объект" "$?" "1"
+is_object_id ""; check "пусто — не объект" "$?" "1"
+is_object_id "warning: LF will be replaced by CRLF"; check "предупреждение — не объект" "$?" "1"
+is_object_id "0123456789ABCDEF0123456789abcdef01234567"; check "верхний регистр — не объект" "$?" "1"
+
+check "to_count число"        "$(to_count "3")" "3"
+check "to_count пусто"        "$(to_count "")" "0"
+check "to_count мусор"        "$(to_count "fatal: bad revision")" "0"
+check "to_count мусор с цифрой" "$(to_count "warning: 3 files")" "0"
+check "to_count строка с хвостом" "$(to_count "3 files")" "0"
+
+# ---------------------------------------------------------------------------
 note "Чистая рабочая копия, отставшая от origin"
 # ---------------------------------------------------------------------------
 
@@ -221,6 +242,115 @@ git merge -q --ff-only origin/master
 RC=$(run_git_stage)
 check "код возврата"        "$RC" "0"
 check "ничего не сломалось" "$(git rev-list --count HEAD..origin/master)" "0"
+
+# ---------------------------------------------------------------------------
+note "Чужой stash не всплывает при пустом сохранении"
+# ---------------------------------------------------------------------------
+
+# `git stash push` на чистом дереве завершается кодом 0, ничего не создав.
+# Если после этого выполнить pop, вернётся ЧУЖАЯ, более старая запись — то есть
+# рабочая копия будет перезаписана посторонним содержимым.
+WC=$(make_pair stashguard)
+use_repo "$WC" "$SANDBOX/stashguard.git"
+printf 'содержимое чужого stash\n' > local.txt
+git stash push -q -m "чужой stash"
+RC=$( ( update_with_local_changes 0 >/dev/null 2>&1 ); printf '%s\n' "$?" )
+check "код возврата"            "$RC" "0"
+check "обновление применено"    "$(cat upstream.txt)" "updated upstream"
+check "чужой stash не применён" "$(cat local.txt)" "mine"
+check "чужой stash остался на месте" "$(git stash list | wc -l | tr -d ' ')" "1"
+
+# stash_local сообщает вызывающему, что сохранять было нечего.
+stash_local "пустая попытка" >/dev/null 2>&1
+check "stash_local возвращает 1 при пустом дереве" "$?" "1"
+check "лишней записи не появилось" "$(git stash list | wc -l | tr -d ' ')" "1"
+
+# ---------------------------------------------------------------------------
+note "Возвращается ИМЕННО своя запись stash, а не верхушка стека"
+# ---------------------------------------------------------------------------
+
+# Стек stash общий со всей машиной: пока run-dev делает свою работу, IDE или
+# второй терминал может положить свою запись сверху. Восстанавливать нужно свою
+# запись по идентификатору, а не то, что оказалось наверху.
+WC=$(make_pair stashown)
+use_repo "$WC" "$SANDBOX/stashown.git"
+printf 'моя правка\n' > local.txt
+git stash push -q -m "наша запись"
+OUR_STASH=$(git rev-parse refs/stash)
+printf 'чужая правка\n' > local.txt
+git stash push -q -m "чужая запись"
+
+check "своя запись найдена по id, а не по позиции" "$(stash_ref_for "$OUR_STASH")" "stash@{1}"
+pop_stash_entry "$OUR_STASH"; check "поп своей записи удался" "$?" "0"
+check "применена именно своя правка" "$(cat local.txt)" "моя правка"
+check "чужая запись осталась в стеке" "$(git stash list | wc -l | tr -d ' ')" "1"
+check "и это именно чужая запись" \
+      "$(git stash list --format='%s' | grep -c 'чужая')" "1"
+
+pop_stash_entry "0123456789abcdef0123456789abcdef01234567"
+check "несуществующая запись не попается" "$?" "1"
+check "стек stash при этом не тронут" "$(git stash list | wc -l | tr -d ' ')" "1"
+restore_stash_entry "" ; check "пустой id — ничего не делаем" "$?" "0"
+check "стек stash по-прежнему цел" "$(git stash list | wc -l | tr -d ' ')" "1"
+
+# ---------------------------------------------------------------------------
+note "Починка концов строк не трогает настоящие правки"
+# ---------------------------------------------------------------------------
+
+# normalize_self_eol перезаписывает файл только когда git считает его изменённым,
+# а diff пуст (чистое несоответствие кодировки концов строк). Любая настоящая
+# правка обязана остаться нетронутой — иначе «починка» уничтожит работу.
+EOLWC="$SANDBOX/eolrepo"
+mkdir -p "$EOLWC/tools/run-dev"
+(
+    set -e
+    cd "$EOLWC"
+    git init -q
+    printf 'core\n'     > tools/run-dev/run-dev.sh
+    printf 'windows\n'  > tools/run-dev/run-dev.ps1
+    printf 'launcher\n' > run-dev.Linux.sh
+    printf 'bat\n'      > run-dev.Windows.bat
+    git add -A && git commit -qm "self files"
+)
+REPO_ROOT="$EOLWC"; GIT="git"
+cd "$EOLWC" || exit 1
+printf 'НАСТОЯЩАЯ ПРАВКА\n' > tools/run-dev/run-dev.sh
+printf 'bat\r\n'            > run-dev.Windows.bat
+normalize_self_eol
+check "файл с настоящей правкой не тронут" \
+      "$(cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
+check "нетронутый файл остался прежним" "$(cat run-dev.Linux.sh)" "launcher"
+check "проход идемпотентен (второй раз тоже ничего не ломает)" \
+      "$(normalize_self_eol; cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
+
+# Сломанный внешний diff: git пишет только в stderr и выходит ненулевым кодом.
+# Пустой stdout НЕ должен читаться как «diff пуст» — иначе checkout уничтожит
+# несохранённые правки пользователя.
+GIT_EXTERNAL_DIFF="$SANDBOX/no-such-diff-tool"; export GIT_EXTERNAL_DIFF
+normalize_self_eol
+check "сломанный GIT_EXTERNAL_DIFF не приводит к затиранию" \
+      "$(cat tools/run-dev/run-dev.sh)" "НАСТОЯЩАЯ ПРАВКА"
+unset GIT_EXTERNAL_DIFF
+git checkout -q -- tools/run-dev/run-dev.sh run-dev.Windows.bat
+
+# Конфликт слияния (XY = UU) — не «несоответствие концов строк», трогать нельзя.
+(
+    set -e
+    cd "$EOLWC"
+    git checkout -q -b other HEAD~0
+    printf 'ветка other\n' > run-dev.Linux.sh
+    git commit -q -am "other"
+    git checkout -q master
+    printf 'ветка master\n' > run-dev.Linux.sh
+    git commit -q -am "master"
+    git merge -q other >/dev/null 2>&1 || true
+)
+check "конфликт действительно создан" \
+      "$(git -C "$EOLWC" status --porcelain --untracked-files=no -- run-dev.Linux.sh | cut -c1-2)" "UU"
+normalize_self_eol
+check "конфликтующий файл не тронут" \
+      "$(grep -c '<<<<<<<' "$EOLWC/run-dev.Linux.sh")" "1"
+git -C "$EOLWC" merge --abort >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
 note "Отпечатки самих скриптов run-dev"

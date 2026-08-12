@@ -18,8 +18,9 @@
 #
 # Key functions:
 # - git_stage(), adopt_repository(), update_with_local_changes()
-# - capture_self_fingerprints(), self_changed_files(), self_updated()
-# - quote_args(), restart_command(), check_self_update()
+# - normalize_self_eol(), capture_self_fingerprints(), self_changed_files(),
+#   self_updated(), check_self_update()
+# - is_object_id(), to_count(), stash_top(), quote_args(), restart_command()
 # - rust_stage(), required_msrv(), ensure_c_toolchain()
 # - cargo_run_app(), check_environment(), run_stage()
 #
@@ -28,10 +29,13 @@
 # `dev-docs/run_dev_plan.md`. Windows is a separate implementation (run-dev.ps1).
 # Written for bash 3.2 so it runs on the bash macOS still ships: no associative
 # arrays, no `mapfile`, no `${var^^}`.
-# INVARIANT: every executable statement lives inside a function, and the file
-# ends with `main "$@"; exit $?`. bash reads a script incrementally, and Stage 1
-# rewrites this very file when an update lands; parsing everything up front and
-# never returning to the reader is what makes that safe.
+# INVARIANT: the single call `main "$@"` is the LAST statement in the file, after
+# every definition, and it is followed by `exit`. bash reads a script
+# incrementally and parses a function body only when it reaches that definition —
+# so what makes this file safe against Stage 1 rewriting it mid-run is the
+# placement, not the use of functions as such: by the time `main` starts, the
+# reader has consumed the file to EOF, and the trailing `exit` guarantees it
+# never comes back for more. Do not add executable statements after that call.
 # User-facing output is Russian by project convention; code comments are English.
 
 set -uo pipefail
@@ -199,6 +203,31 @@ extract_version() {
         | sed -E 's/[-+].*$//'
 }
 
+# True when `$1` is a bare git object id: 40 hex characters (SHA-1) or 64
+# (SHA-256 repositories). Anything else — empty output, a warning, a truncated
+# line — is not a usable fingerprint and must not be compared as one.
+is_object_id() {
+    case "${#1}" in
+        40|64) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Prints `$1` when it is a bare non-negative number, and 0 otherwise.
+# Strictly whole-string on purpose: fishing a digit group out of arbitrary text
+# would turn any stray message containing a number into a commit count, and
+# "behind = 1" opens the update branch on a repository with nothing incoming.
+to_count() {
+    case "$1" in
+        ""|*[!0-9]*) printf '0\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
 # True when version `$1` >= version `$2`. Missing components count as 0.
 version_ge() {
     local a b i av bv
@@ -352,13 +381,77 @@ handle_adopted_tree() {
     esac
 }
 
+# Prints the object id of the top stash entry, or nothing when the stash is
+# empty. Used to tell "push created an entry" from "push had nothing to save",
+# which `git stash push` reports with the same exit code 0.
+stash_top() {
+    local top
+    top=$($GIT rev-parse -q --verify refs/stash 2>/dev/null) || top=""
+    is_object_id "$top" || top=""
+    printf '%s\n' "$top"
+}
+
+# Prints the `stash@{N}` selector of the entry whose commit id is `$1`, or
+# nothing when that entry is not in the stash any more.
+#
+# The stash is a stack shared with everything else on the machine — an IDE, a
+# GUI client, a second terminal. Between our push and our pop somebody else may
+# have pushed (their entry is now on top) or dropped one (indices shifted), so an
+# entry must always be addressed by identity, never by position.
+stash_ref_for() {
+    local id="$1"
+    is_object_id "$id" || return 1
+    $GIT stash list --format='%H %gd' 2>/dev/null \
+        | awk -v id="$id" '$1 == id { print $2; exit }'
+}
+
+# Pops exactly the stash entry with commit id `$1`. Returns non-zero when that
+# entry is gone or when the pop failed (a conflicting pop keeps the entry, so it
+# stays addressable by the same id).
+pop_stash_entry() {
+    local ref
+    ref=$(stash_ref_for "$1") || return 1
+    [ -n "$ref" ] || return 1
+    $GIT stash pop -q "$ref"
+}
+
+# Restores the entry `$1` created by this run, warning instead of failing when it
+# cannot. Used on rollback paths, where the caller is already on its way to `die`
+# with its own message: losing the entry must be reported, not hidden, but it
+# must not replace the primary error either.
+restore_stash_entry() {
+    [ -n "$1" ] || return 0
+    if pop_stash_entry "$1"; then return 0; fi
+    warn "Локальные изменения остались в git stash — посмотрите: git stash list"
+    return 1
+}
+
 # Saves tracked modifications into the stash. Untracked files are NEVER included:
 # the working directory holds the user's projects, models and configs.
+# Returns 0 when an entry was actually created, 1 when there was nothing to save
+# (which `git stash push` also reports as success) — telling the user their work
+# is recoverable with `git stash pop` when no entry exists would point them at
+# somebody else's older stash.
 stash_local() {
+    local before after ref
+    before=$(stash_top)
     if ! $GIT stash push -q -m "$1"; then
         die "$EXIT_GENERIC" "Не удалось сохранить локальные изменения в git stash."
     fi
-    info "Прежнее содержимое сохранено. Вернуть: git stash pop"
+    after=$(stash_top)
+    if [ "$after" = "$before" ]; then
+        warn "Сохранять было нечего: git не нашёл изменений в отслеживаемых файлах."
+        return 1
+    fi
+    # Name the entry explicitly: a bare `git stash pop` takes whatever is on top,
+    # which may belong to another process by the time the user runs it.
+    ref=$(stash_ref_for "$after")
+    if [ -n "$ref" ]; then
+        info "Прежнее содержимое сохранено. Вернуть: git stash pop $ref"
+    else
+        info "Прежнее содержимое сохранено. Найти: git stash list"
+    fi
+    return 0
 }
 
 # Runs the merge appropriate for the ahead/behind relationship. Returns non-zero
@@ -396,13 +489,22 @@ update_with_local_changes() {
         info "Локальные правки не пересекаются с новыми коммитами."
     fi
 
+    # A stash push that saves nothing also exits 0, and the stash is shared with
+    # every other git client on the machine. So this records the identity of the
+    # entry it created and every restore below pops THAT entry: popping the
+    # current top instead would apply a stranger's work to the tree, or nothing
+    # at all — corruption, not a cosmetic bug.
+    local stash_before our_stash
+    stash_before=$(stash_top)
     if ! $GIT stash push -q -m "run-dev: автосохранение перед обновлением"; then
         die "$EXIT_GENERIC" "Не удалось временно сохранить локальные изменения."
     fi
+    our_stash=$(stash_top)
+    if [ "$our_stash" = "$stash_before" ]; then our_stash=""; fi
 
     if ! do_merge "$ahead"; then
         $GIT reset --hard -q "$pre_head"
-        git_q stash pop || true
+        restore_stash_entry "$our_stash" || true
         die "$EXIT_MANUAL_MERGE" \
             "Не удалось объединить локальные коммиты с новой версией." \
             "Рабочая копия возвращена в исходное состояние, ничего не потеряно." \
@@ -410,13 +512,31 @@ update_with_local_changes() {
             "Слейте вручную:  git merge origin/$BRANCH"
     fi
 
-    if ! $GIT stash pop -q; then
+    if [ -z "$our_stash" ]; then
+        # Nothing was stashed, so nothing has to come back.
+        ok "Обновлено до актуальной версии."
+        return 0
+    fi
+
+    if ! pop_stash_entry "$our_stash"; then
+        if [ -z "$(stash_ref_for "$our_stash")" ]; then
+            # The entry is not merely conflicting — it is gone, taken by another
+            # process. There is nothing safe left to apply, and guessing at the
+            # current top is exactly what must not happen here.
+            die "$EXIT_MANUAL_MERGE" \
+                "Обновление применено, но вернуть локальные изменения не удалось:" \
+                "созданная run-dev запись в git stash исчезла — её мог забрать" \
+                "другой git-клиент (IDE, второй терминал)." \
+                "" \
+                "Посмотрите список сохранённого:  git stash list" \
+                "Вернуть нужную запись:           git stash pop stash@{N}"
+        fi
         # `stash pop` keeps the stash entry when it conflicts, so the work is
         # safe. `reset --hard` clears the conflicted index, the working tree and
         # the merge commit at once; the pop then replays onto the original base
         # and therefore applies cleanly.
         $GIT reset --hard -q "$pre_head"
-        git_q stash pop || true
+        restore_stash_entry "$our_stash" || true
         die "$EXIT_MANUAL_MERGE" \
             "Локальные изменения конфликтуют с новой версией — нужно ручное слияние." \
             "Рабочая копия возвращена в исходное состояние, ничего не потеряно." \
@@ -452,18 +572,76 @@ update_with_local_changes() {
 # from appearing as a change to every file at once.
 #
 # A file absent on this platform is recorded as "-" (it exists in the repository
-# regardless of the OS, so its appearance is a real change); a hash that could not
-# be computed is "?", which self_changed_files treats as "unknown, not changed".
+# regardless of the OS, so its appearance is a real change); anything that is not
+# a well-formed object id — a failed command, empty output, a stray line — is
+# recorded as "?", which self_changed_files treats as "unknown, not changed".
+# The shape is validated rather than trusted: a fingerprint is only useful if it
+# can be compared, and text that merely happens to be non-empty compares unequal
+# to itself on the next run.
 capture_self_fingerprints() {
     local f h
     for f in $SELF_FILES; do
         if [ -f "$REPO_ROOT/$f" ]; then
             h=$($GIT hash-object --no-filters -- "$REPO_ROOT/$f" 2>/dev/null)
-            [ -n "$h" ] || h="?"
+            is_object_id "$h" || h="?"
         else
             h="-"
         fi
         printf '%s %s\n' "$f" "$h"
+    done
+}
+
+# Restores the self-files whose working copy differs from the index in line
+# endings ONLY, before the "before" snapshot is taken.
+#
+# Why such files exist: `.gitattributes` pins each of them to a specific `eol`,
+# while a working copy created earlier (a different `core.autocrlf`, a source ZIP,
+# an editor) may hold the other convention. Git does not repair that by itself —
+# but `git stash push` does, because it checks the file back out through the
+# attribute. So a plain "update with local changes" silently rewrites the bytes of
+# scripts that are executing right now, which the fingerprints then report as a
+# self-update: a restart request for an update that changed nothing, repeated on
+# every run because the state never settles.
+#
+# Why it cannot lose work — three conditions, all required, because this function
+# overwrites a file from the index and any doubt means "leave it alone":
+#   1. `git status` must SUCCEED. Its empty output is only meaningful when the
+#      command actually ran.
+#   2. The porcelain state must be exactly one line of plain unstaged
+#      modification (" M "). Merge conflicts and every other XY state are none of
+#      this function's business.
+#   3. Emptiness of the diff is decided by the EXIT CODE of
+#      `git diff --quiet --no-ext-diff`, never by captured output. A diff that
+#      fails — a configured-and-broken GIT_EXTERNAL_DIFF, a broken diff driver —
+#      writes nothing to stdout, and reading that as "no differences" would
+#      destroy the user's unsaved edits. `--no-ext-diff` keeps an external
+#      differ out of the decision in the first place.
+# Exit code 0 then means: identical to the index once filters are applied, i.e.
+# the difference is exactly the byte encoding.
+#
+# Rewriting a file that is being executed is safe here for the same structural
+# reason the update itself is (see the header): every interpreter has already
+# read past the point it would need to re-read. It is also idempotent — after one
+# pass the state matches the attribute and later runs find nothing to do.
+normalize_self_eol() {
+    local f path st rc
+    for f in $SELF_FILES; do
+        path="$REPO_ROOT/$f"
+        [ -f "$path" ] || continue
+
+        st=$($GIT status --porcelain --untracked-files=no -- "$path" 2>/dev/null)
+        rc=$?
+        [ "$rc" = 0 ] || continue
+        [ -n "$st" ] || continue
+        [ "$(printf '%s\n' "$st" | wc -l | tr -d ' ')" = "1" ] || continue
+        case "$st" in
+            " M "*) ;;
+            *) continue ;;
+        esac
+
+        $GIT diff --quiet --no-ext-diff -- "$path" 2>/dev/null || continue
+
+        git_q checkout -- "$path" || true
     done
 }
 
@@ -551,8 +729,11 @@ EOF
 git_stage() {
     step "Проверка обновлений"
     locate_git
-    # Taken before anything can modify the tree, so the comparison after the
-    # update sees exactly what this run started with.
+    # Settle any line-ending-only mismatch first, otherwise `git stash push`
+    # would settle it mid-update and the fingerprints would read that as a
+    # self-update. Then snapshot: from here on, any change to these files really
+    # did come from the update.
+    normalize_self_eol
     SELF_BEFORE=$(capture_self_fingerprints)
 
     if ! is_repository; then
@@ -578,8 +759,8 @@ git_stage() {
     fi
 
     local behind ahead
-    behind=$($GIT rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null || echo 0)
-    ahead=$($GIT rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)
+    behind=$(to_count "$($GIT rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null)")
+    ahead=$(to_count "$($GIT rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null)")
 
     if [ "$behind" = "0" ]; then
         ok "Установлена актуальная версия."
@@ -929,9 +1110,10 @@ main() {
 
 # `test_run_dev.sh` sources this file to exercise the git stage in isolation
 # against a throwaway repository; sourcing must not run the app.
-# The trailing `exit` is load-bearing: bash reads a script incrementally, and
-# Stage 1 may have rewritten this file while it ran. Exiting here guarantees the
-# interpreter never returns to read a byte offset that no longer means anything.
+# This call must stay the last statement in the file: bash reads a script
+# incrementally, so reaching it means the whole file has been read and parsed,
+# and the trailing `exit` guarantees bash never returns to a byte offset that
+# Stage 1 may have rewritten in the meantime.
 if [ -z "${MS_RUN_DEV_SOURCE_ONLY:-}" ]; then
     main "$@"
     exit $?

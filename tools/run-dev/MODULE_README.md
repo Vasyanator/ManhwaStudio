@@ -64,6 +64,10 @@ committed and never shows up as a local change during Stage 1:
   fingerprints. Sources `run-dev.sh` with `MS_RUN_DEV_SOURCE_ONLY=1` and drives its functions
   against throwaway repositories in a temp dir. No network, no cargo, no contact with the user's
   repository. Run: `bash tools/run-dev/test_run_dev.sh`.
+- `test_run_dev.ps1`: the same contract, asserted against `run-dev.ps1` so the two implementations
+  cannot silently diverge. Dot-sources with `MS_RUN_DEV_SOURCE_ONLY=1`; needs pwsh + git and nothing
+  else. Run: `pwsh -NoProfile -File tools/run-dev/test_run_dev.ps1`. A behavioural change to one
+  implementation belongs in both test files.
 
 ## Contracts and invariants
 
@@ -103,11 +107,35 @@ committed and never shows up as a local change during Stage 1:
 - **`--no-filters` on `git hash-object` is not optional.** With the filter applied, `core.autocrlf`
   (true by default on Git for Windows) makes a CRLF and an LF copy of the same file hash
   identically, so a line-ending-only rewrite of `run-dev.Windows.bat` — the one file where that is
-  fatal — would be invisible. A `?` fingerprint (hash could not be computed) means "unknown" on
-  either side of the comparison and never counts as a change, so a transient git failure cannot
-  fabricate a restart request.
-- **The scripts must survive being rewritten while they execute.** Structural, not incidental:
-  every statement in `run-dev.sh` lives in a function and the file ends with `main "$@"; exit $?`;
+  fatal — would be invisible. A `?` fingerprint means "unknown" on either side of the comparison and
+  never counts as a change, so a transient git failure cannot fabricate a restart request.
+- **git's stderr never reaches captured output, and every captured value is validated by shape.**
+  git writes advisory text to stderr on *successful* commands; merged into the output it becomes a
+  bogus fingerprint, a bogus `rev-list --count`, or a bogus dirty tree — the observed cause of
+  repeated false exit-8 restarts on Windows. `run-dev.sh` redirects stderr to `/dev/null`;
+  `Invoke-Git` in `run-dev.ps1` returns `Output` (stdout) and `Error` (stderr) separately, split by
+  object type so ordering cannot matter. On top of that, a fingerprint is accepted only if it is an
+  object id (`is_object_id` / `Test-ObjectId`) and a count only if it is a bare number (`to_count` /
+  `Convert-ToCount`); anything else degrades to `?` or `0` instead of becoming data.
+- **Line-ending mismatches of the self-files are settled before the first snapshot.**
+  `normalize_self_eol` / `Repair-SelfEol` re-checks-out a self-file **only** when all three hold:
+  `git status` exited 0, its porcelain state is exactly one line of plain unstaged modification
+  (`" M "`), and `git diff --quiet --no-ext-diff` exited 0. Otherwise `git stash push` would settle
+  the mismatch mid-update (it checks files out through the `eol` attribute) and the fingerprints
+  would report a self-update no commit caused, on every run. Never weaken those three tests, and in
+  particular never judge the diff by its captured output: a failing diff prints nothing to stdout,
+  and treating that as "no differences" makes this pass overwrite real local edits.
+- **A stash entry is restored by identity, never by position.** `push` exits 0 having saved nothing,
+  and the stash is shared with every other git client — an IDE can push or drop an entry between our
+  push and our pop. Both implementations record the commit id their push created and pop exactly
+  that `stash@{N}` (`stash_ref_for`/`pop_stash_entry`, `Get-StashRefFor`/`Invoke-StashPop`) on every
+  path. If the entry is gone, nothing is popped: the run stops and tells the user where their
+  changes are. The messages name the concrete `stash@{N}` too — a bare `git stash pop` is wrong
+  advice as soon as anything else touches the stash.
+- **The scripts must survive being rewritten while they execute.** Structural, not incidental: in
+  `run-dev.sh` the single call `main "$@"` is the **last** statement, after every definition, and is
+  followed by `exit $?` — bash parses a function body only when it reaches it, so the placement, not
+  the use of functions, is what guarantees the file has been read to EOF before any work starts;
   the root shell launchers end with `exec`; `run-dev.Windows.bat` wraps its whole tail in one
   `( … )` block (with `enabledelayedexpansion` + `!RC!`, because `%VAR%` inside a block is
   substituted at parse time — at the cost of `!` in paths and forwarded arguments) and keeps
@@ -131,8 +159,10 @@ committed and never shows up as a local change during Stage 1:
 ## Editing map
 
 - To change the update/merge algorithm, edit `update_with_local_changes` (sh) /
-  `Update-WithLocalChanges` (ps1) — and keep the two identical, `test_run_dev.sh` only covers the sh
-  side.
+  `Update-WithLocalChanges` (ps1) — and keep the two identical, extending both `test_run_dev.sh` and
+  `test_run_dev.ps1`.
+- To run a git command from `run-dev.ps1`, go through `Invoke-Git`/`Get-GitOut`/`Test-GitOk`. Never
+  call `& $script:Git … 2>&1` directly: that is how stderr gets into parsed data.
 - To change how a ZIP copy is adopted, see `adopt_repository` / `Invoke-RepositoryAdoption`.
 - To change toolchain selection or provisioning, see `rust_stage` / `Invoke-RustStage`.
 - To change which files force a restart after an update, edit `SELF_FILES` / `$SelfFiles` (keep the
@@ -151,10 +181,13 @@ committed and never shows up as a local change during Stage 1:
 ## Testing status
 
 `test_run_dev.sh` covers the git stage — the part that can destroy a user's work — including the
-restore-after-conflict path, and the self-update fingerprints down to `check_self_update` returning
-exit 8. It does **not** cover Stage 2 or 3, and does not cover `run-dev.ps1` at all: provisioning
-asserts against real downloads, running Stage 3 means a full cargo build plus a GUI, and there is
-no PowerShell test harness in this repository. Those paths are verified by hand.
+restore-after-conflict path, the stash guard, the EOL repair pass, the value parsers, and the
+self-update fingerprints down to `check_self_update` returning exit 8. `test_run_dev.ps1` asserts
+the same contract against `run-dev.ps1`, plus the stream separation in `Invoke-Git`; it needs pwsh,
+which is not available in every development environment here, so a change that only runs the sh
+suite is a change whose Windows half is unverified — say so rather than implying both were run.
+Neither suite covers Stage 2 or 3: provisioning asserts against real downloads and Stage 3 means a
+full cargo build plus a GUI. Those paths are verified by hand.
 
 Before trusting a change, on each platform: fresh ZIP without git, clean repo behind origin, dirty
 repo with non-overlapping edits, dirty repo with overlapping edits that merge, dirty repo with
