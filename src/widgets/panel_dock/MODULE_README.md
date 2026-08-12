@@ -10,7 +10,17 @@ Current state: **phases 0–6**. The pure layer (`model.rs`, `solver.rs`, `drag.
 `cross_window.rs`), the widget
 layer (`tab.rs`, `panel.rs`), the `PanelDock` driver in `mod.rs` including the reorganisation
 gestures, the persistence layer (`persist.rs`) and the detached OS windows (`window.rs`). The
-production consumer is the «Текст» tab, whose eight tabs live in six panels.
+production consumers are the three CANVAS program tabs: «Текст», whose eight tabs plus the canvas'
+own «Лента» live in seven default panels, and «Перевод» / «Клининг», which declare «Лента» alone.
+The dedicated canvas-controls anchor those panels used to hang off is gone with the panel it named;
+only its STORED tag survives, decode-only, so an arrangement written by an older build still loads
+(see «A retired stored tag must keep DECODING» below).
+
+Sizes measured for a tab are cached PER PROGRAM TAB (`PanelDockState::measured`, keyed by
+`AppTab::key()` and then by `TabId`), never by `TabId` alone: «Лента» is ONE tab id declared by
+three program tabs that share one state, and a global entry made the width the user dragged it to
+in «Текст» size the «Клининг» panel — which pins no `size_override` and therefore takes its size
+straight from that cache.
 
 ## Architecture
 Three layers, the lower two free of GUI state:
@@ -28,9 +38,9 @@ solve()  (solver.rs)       -> SolvedLayout: rect + body_max_height + shrunk per 
 ```
 
 A panel is a movable frame owning one or more tabs and showing one of them. A panel is either free
-(its own `pos` is authoritative) or anchored to another panel, to a side of the host area, or to
-the `CanvasView` controls rect. Anchors form a forest; connected components are called *chains* and
-are laid out and clamped as a unit.
+(its own `pos` is authoritative) or anchored to another panel or to a side of the host area.
+Anchors form a forest; connected components are called *chains* and are laid out and clamped as a
+unit.
 
 The solver applies, in order: chain grouping, `DOCK_GAP` placement, propagation from the anchor's
 resolved rect, shrinking of what sticks out of the host area, and whole-chain translation of what
@@ -71,9 +81,8 @@ declares TABS and the dock places them:
 state.ensure_default_layout(AppTab::Typing.key(), typing_default_dock_layout);
 let mut cx = TypingDockCx { top_panel, text_overlays, page_idx };   // one per frame
 let mut dock = PanelDock::begin(ctx, &mut self.panel_dock, DockArea {
-    rect: canvas_rect,
-    canvas_controls,                       // anchor + nothing else
-    layout_key: AppTab::Typing.key(),
+    rect: canvas_rect,                     // where panels may live
+    layout_key: AppTab::Typing.key(),      // never a localized title
 });
 dock.tab(TYPING_PREVIEW_TAB)
     .title(|| t!("typing.preview.panel_heading"))
@@ -241,8 +250,8 @@ the typing tab's hundred-field states) cannot satisfy. Parent and child therefor
 together; that is the accepted price and must not be "optimised" away.
 
 Inside a sub-window there is a `CentralPanel` for the neutral background and the same
-`draw_host` loop the main window runs — the same panels, the same gestures, no canvas and no
-canvas-controls anchor. `draw_host` reads `ctx` while that window's viewport is current, which
+`draw_host` loop the main window runs — the same panels, the same gestures, no canvas.
+`draw_host` reads `ctx` while that window's viewport is current, which
 is what makes the pointer, the drawn `Area`s and the drag session per-window without a single
 branch on the host.
 
@@ -427,6 +436,19 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
 * **Restore beats default.** `install_persisted_layouts` runs before the first frame, so
   `ensure_default_layout` finds the key taken and never builds over it. Restoring does not raise
   `dirty` — the config is not a user change.
+* **A retired stored tag must keep DECODING.** `StoredAnchor` is internally tagged
+  (`tag = "kind"`) and carries no `#[serde(other)]`, and the whole section is decoded by ONE
+  `serde_json::from_value`, so a tag this build does not know fails the ENTIRE section: every
+  program tab falls back to its default arrangement and the first dirty write makes that permanent
+  (`#[serde(default)]` does not help — it covers a MISSING field, not one that fails to parse, and
+  the section version does not change, so the `NewerVersion` refusal does not fire either). The
+  standing example is `StoredAnchor::CanvasControls`, written while the canvas' controls were an
+  anchor rather than the «Лента» panel: it is decoded to `Free` at the panel's stored `pos`, which
+  is where the panel was last DRAWN under that anchor, since the driver refreshes `pos` from the
+  solved rect every frame; it is never encoded again. That is the whole guarantee — a stored panel
+  carrying no `pos` (or a non-finite one) lands at the host area's ORIGIN, like any other
+  position-less stored panel. Retiring such a tag for real needs a section version bump and a
+  migration, never a plain deletion.
 * **Nothing wedges the layout.** A stored tab this build no longer declares is dropped; a declared
   tab the file does not mention is re-created by `ensure_declared_tabs`; a malformed section, an
   unusable stored layout (a tab in two panels, an anchor cycle) or a section from a NEWER schema
@@ -437,10 +459,18 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
 **Sub-windows in the file.** They live in the section's own `sub_windows` list (`index`, outer
 `pos` — absent where the platform does not report one — and inner `size`), and a panel addresses
 one through its `host`. The list is GLOBAL, not per program tab, so the writer REPLACES it while
-merging the layouts per key; phase 8 must therefore keep the windows in one dock state or teach
-`fold_save_message` how several feeders share them. A panel naming a window the list does not
-describe comes back to the main window, and a window no restored layout puts a panel in is not
-opened.
+merging the layouts per key. **That question is settled: there is exactly ONE dock state per studio
+window** (`MangaApp::panel_dock`), lent to whichever program tab draws, so the writer has a single
+feeder and the list has a single owner. A panel naming a window the list does not describe comes
+back to the main window, and a window no restored layout puts a panel in is not opened.
+
+**Constraint for phase 8** (not solved here — do not build machinery for it in advance): the writer
+merges layouts per key but REPLACES the global `sub_windows` list, while `layouts_from_user_settings`
+decodes only the keys present in the caller's defaults slice. A stored program-tab key the running
+build does not pass in that slice therefore keeps its layout in the file but loses its sub-window
+association on the next write. Unreachable today — all three canvas keys are in the slice, and a
+build that starts hosting the dock in another program tab has to add it there anyway. Phase 8 must
+either keep undecoded keys addressable or move the window list under the per-key merge.
 
 **Reset.** The header's context menu — below the «Переместить в окно →» submenu — restores the
 program tab's default layout. `PanelDockState`
@@ -452,9 +482,19 @@ plain `fn` and not a closure.
 - **Both widgets are mandatory.** Every floating panel of the studio is built from
   `CollapsiblePanel` + `PanelTab`. No new `Area + Frame::popup` with a hand-rolled collapse arrow,
   and no bare `egui::Window` used as a panel.
-- **The dock state must be its own field.** `PanelDock::begin` borrows `PanelDockState` mutably for
+- **One dock state per studio window, and it is the APPLICATION's.** `MangaApp` owns it and lends a
+  `&mut` to the program tab that draws; a tab may not keep one of its own. Three global concerns
+  forbid splitting it per tab: a sub-window's `ViewportId` is derived from an index minted by a
+  PER-STATE counter (two states would show two immediate viewports under one id in a single pass),
+  the persisted `sub_windows` list is one global list a second feeder would overwrite, and
+  `install_persisted_sub_windows` / `prune_sub_windows` judge a window against the layouts of THAT
+  state, so several states would each drop the others' windows. The layouts of all program tabs
+  coexist in one state anyway — they are keyed by `AppTab::key()`.
+- **The dock state must be its own borrow.** `PanelDock::begin` borrows `PanelDockState` mutably for
   the whole frame, so it may not be part of the per-frame context `C` either. Keep it disjoint from
-  every field the bodies touch — that is what makes the deferred API compile at the call site.
+  every field the bodies touch — that is what makes the deferred API compile at the call site. A
+  lent-in parameter (`TypingDrawParams::panel_dock`) satisfies this by construction, since it is
+  disjoint from the callee's `self`.
 - **Tab bodies reach caller state only through `C`.** A body is `FnOnce(&mut Ui, &mut C)`; `end`
   hands it the context and runs it, one body at a time. Bodies must not capture caller state
   directly — several tabs of one frame legitimately need the same `&mut`, which no set of captured
@@ -481,8 +521,10 @@ plain `fn` and not a closure.
 - **Positions are refreshed from the solve, and do not dirty the state.** `PanelNode::pos` is
   authoritative only while the anchor is `Free`, but it is what the model falls back to whenever an
   anchor stops resolving — which happens on ordinary frames: `frame_layout` drops a panel with
-  nothing to draw and hands its anchor down, and a `CanvasControls` anchor degrades to free while
-  the controls rect is unknown. `PanelDock::end` therefore writes every solved rect's origin back
+  nothing to draw and hands its OWN anchor down, so a dependant of a hidden FREE root becomes free
+  itself; a panel whose anchor target lives in another host is laid out free as well; and a panel
+  restored from a stored anchor this build no longer has (`persist::decode_anchor`) arrives free.
+  `PanelDock::end` therefore writes every solved rect's origin back
   (`write_back_positions`), so a panel falls back to where it was last drawn instead of jumping into
   the area's corner. It is a derived value, so it must never raise `dirty` — that flag is
   persistence's signal that the USER changed something.
@@ -511,8 +553,8 @@ plain `fn` and not a closure.
   reproduces it.
 - **Geometry contracts.** `pos` is stored relative to the host area's top-left. `align` / `along`
   are fractions in `0.0..=1.0` of the free travel along the shared side. `DockEdge` means "outside
-  the target, next to this side" for `Panel` / `CanvasControls` anchors and "inside the area, flush
-  with this side" for `ViewportEdge`. Attached panels always sit exactly `DOCK_GAP` away.
+  the target, next to this side" for a `Panel` anchor and "inside the area, flush with this side"
+  for `ViewportEdge`. Attached panels always sit exactly `DOCK_GAP` away.
 - **Sizes are outer sizes**, header and frame margins included. The header overhead is MEASURED,
   not assumed: `CollapsiblePanel` reports a `PanelChrome` (collapsed outer height, and the overhead
   an expanded panel spends before its body) on every drawn frame, the driver stores the latest one
@@ -569,11 +611,36 @@ plain `fn` and not a closure.
   step. The drawn rect now matches the solved rect exactly (the frame's border is charged to the
   content width and to the body's height budget), and the gesture is authoritative regardless.
 - **Declaration rules.**
-  - A tab declared for the first time (owned by no panel of the layout) gets its OWN new
-    free-floating panel, cascaded from the area origin. It is never appended to an existing panel:
-    merging unrelated tabs behind the caller's back is not undoable without a drag, while a lone
-    panel can always be docked onto another one. Callers that want a specific arrangement express
-    it in `PanelDockState::ensure_default_layout`.
+  - A tab declared for the first time (owned by no panel of the layout) gets its OWN new panel. It
+    is never appended to an existing panel: merging unrelated tabs behind the caller's back is not
+    undoable without a drag, while a lone panel can always be docked onto another one.
+  - **Where that panel goes is asked of the program tab's DEFAULT layout first**
+    (`PanelDockState::ensure_default_layout` keeps the builder). A user with a stored arrangement
+    never runs that builder — restore beats default — so a tab a new build adds reaches
+    `ensure_declared_tabs` for every existing user on the first launch after the update, and a
+    cascade from the area origin drops a brand-new panel into the middle of their canvas, on top of
+    what they arranged. The default already says where the tab belongs, so its anchor, position and
+    `size_override` are reused. A `Panel` anchor is re-addressed by the TAB the default's target
+    holds, because a `PanelId` of the default means nothing in a restored layout. Only when the
+    default does not know the tab, or its anchor cannot be resolved here (the target tab is absent,
+    or lives in another window), does the panel fall back to the free cascade by
+    `AUTO_PANEL_CASCADE_STEP` from the area origin.
+  - **A seeded panel never buries a live one.** The default answers for the whole default PANEL
+    while the seeded panel holds the new tab ALONE, so the natural way to add a tab — putting it
+    into an existing default panel — hands the newcomer that panel's anchor and pinned size, i.e.
+    exactly the rect the live panel holding the older tabs occupies. It has the highest id, is drawn
+    last, and covers it completely (the cascade this replaced always left a corner visible). So an
+    anchored placement QUEUES behind whoever already holds the slot (`free_anchor_slot`, on
+    `drag::queue_edge` so a queue grown here reads like one grown by a drag) and a free one steps off
+    what stands at its position (`step_off_occupied`). Occupancy is decided by comparing ANCHORS,
+    not rects: `drag::resolve_slot`'s geometric test needs the frame's solved rects and this runs
+    before the solve, on panels that have never been laid out. That answers the exact coincidence
+    seeding produces, which is the case that buries anything.
+  - **Seeding order is not declaration order.** A default anchor is resolved against the LIVE
+    layout, so a tab hanging off another newly declared tab must be created after it; walking the
+    declared tabs directly made an arrangement depend on the order two `dock.tab(..)` calls happen
+    to be written in. `seeding_order` walks each new tab's default anchor chain first and seeds
+    roots before dependants.
   - `visible(false)` keeps the tab's slot: its header is not shown, and a panel whose tabs are all
     hidden is not drawn — but neither is deleted. Deletion is a user action, never a visibility
     consequence.
@@ -590,10 +657,17 @@ plain `fn` and not a closure.
 - **Ids never come from a caption.** Every egui `Id` in `panel.rs` derives from the layout key plus
   `PanelId` / `TabId` literals (`egui-docs/05-ids-and-i18n.md` §2, `dev-docs/i18n_exclusions.md`).
   Captions and tooltips come from `t!` and are added to all five locale files at once.
-- **A `PanelDockOutput` rect belongs to the window its panel was drawn in.** A detached panel
-  reports a rect in that window's screen space, which says nothing about the main window, so a
-  caller anchoring other main-window UI to a dock panel must treat a detached one as "not on
-  screen" rather than trust the numbers.
+- **A `PanelDockOutput` answers for the MAIN window, and it is host-aware so it cannot answer for
+  anything else.** One output is filled by EVERY window of the dock — `PanelDock::end` hands the
+  same `&mut` to the main window's `draw_host` and to every sub-window's — and a sub-window's rect
+  is in THAT window's frame, whose dock area starts near the origin. Every rect is therefore
+  recorded together with its `HostId`, and `panel_rect` / `tab_rect` / `drawn_panels` / `is_empty`
+  report main-window panels ONLY: a detached panel reads as "not on screen", which is what a caller
+  anchoring other main-window UI to a dock panel (translation's detector edit boxes) or occluding
+  main-window pointer input with the rects (cleaning's `panel_rects`) has to do with it anyway.
+  Handing a sub-window rect out unlabelled put an invisible dead zone in the main window's top-left
+  corner and drew anchored UI in the wrong place. A sub-window's geometry is deliberately not
+  exposed: nothing needs it, and the day something does, it must ask for it by host.
 - **A window never claims a drop the shared frame gave to another one.** `accepts_drop(false)`,
   the suppressed tear-out preview and the forced `PendingTabDrop`/`PendingPanelDrop` are one rule
   in three places: while `cross_window::window_at` names a window other than this one, this window
@@ -624,8 +698,6 @@ plain `fn` and not a closure.
   them through `set_anchor` / `move_tab` / `detach_tab` / the targeted setters, all of which refuse
   an invariant breach. That is why a gesture can be tested without a window: the decision is a pure
   function and the application is a checked model call.
-- **The canvas-controls rect is an anchor, not an obstacle.** The solver never pushes anything away
-  from it; when it is not supplied, a `CanvasControls` anchor degrades to `Free`.
 - **The whole subsystem is cross-target.** The web port draws this same interface, so every file
   here must keep compiling for `wasm32-unknown-unknown` (`cargo +nightly wcheck`): no native-only
   dependency, no `std::fs`, no `cfg(not(wasm32))` gate on anything a caller needs. Config reads and
@@ -682,7 +754,12 @@ plain `fn` and not a closure.
   a gesture is SENSED (which pixels grab the panel, what the insertion marker looks like), edit
   `panel.rs`. To change when it is applied, edit `advance_panel_drag` / `begin_panel_drag` /
   `apply_panel_drop` / `apply_tab_drop` in `mod.rs`.
+- To change where a NEWLY DECLARED tab's panel lands — what the default is asked, how a slot that
+  is already taken is answered, in which order the new panels are created — edit
+  `default_placement` / `default_anchor_tab` / `free_anchor_slot` / `seeding_order` /
+  `ensure_declared_tabs` in `mod.rs`; all five are pure and unit-tested.
 - The solver still lays two panels with an identical `target` + `edge` + `align` on top of each
-  other — it is a total function of whatever layout it is given. What guarantees the user never
-  sees that is the sibling rule in `drag.rs`, which is the only thing that writes anchors from a
-  gesture, plus the default layouts, which give conditional panels distinct anchors by hand.
+  other — it is a total function of whatever layout it is given. Three things guarantee the user
+  never sees that, one per writer of anchors: the sibling rule in `drag.rs` for a gesture,
+  `free_anchor_slot` for a panel seeded from the default, and the default layouts themselves, which
+  give conditional panels distinct anchors by hand.

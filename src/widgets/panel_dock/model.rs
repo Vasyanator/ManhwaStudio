@@ -115,8 +115,8 @@ pub enum HostId {
 ///
 /// The meaning of the side depends on the anchor kind and is part of the
 /// anchor's contract:
-/// * `PanelAnchor::Panel` / `PanelAnchor::CanvasControls` — the panel sits
-///   *outside* the target, adjacent to this side of it (`Bottom` => below it);
+/// * `PanelAnchor::Panel` — the panel sits *outside* the target, adjacent to
+///   this side of it (`Bottom` => below it);
 /// * `PanelAnchor::ViewportEdge` — the panel sits *inside* the host area,
 ///   flush against this side of it (`Bottom` => at the area's bottom).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -189,17 +189,6 @@ pub enum PanelAnchor {
         /// Position along that side, `0.0..=1.0`.
         along: f32,
     },
-    /// Attached to the `CanvasView` controls panel, outside it.
-    ///
-    /// That panel is not part of this model: the solver receives its rect as an
-    /// input and never moves it. When no such rect is supplied, the anchor
-    /// degrades to `Free` (see `solver::solve`).
-    CanvasControls {
-        /// Which side of the controls rect the panel sits next to.
-        edge: DockEdge,
-        /// Position along that side, `0.0..=1.0`.
-        along: f32,
-    },
 }
 
 impl PanelAnchor {
@@ -208,7 +197,7 @@ impl PanelAnchor {
     pub const fn target_panel(self) -> Option<PanelId> {
         match self {
             Self::Panel { target, .. } => Some(target),
-            Self::Free | Self::ViewportEdge { .. } | Self::CanvasControls { .. } => None,
+            Self::Free | Self::ViewportEdge { .. } => None,
         }
     }
 
@@ -216,9 +205,7 @@ impl PanelAnchor {
     #[must_use]
     pub const fn edge(self) -> Option<DockEdge> {
         match self {
-            Self::Panel { edge, .. }
-            | Self::ViewportEdge { edge, .. }
-            | Self::CanvasControls { edge, .. } => Some(edge),
+            Self::Panel { edge, .. } | Self::ViewportEdge { edge, .. } => Some(edge),
             Self::Free => None,
         }
     }

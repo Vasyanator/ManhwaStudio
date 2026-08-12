@@ -3,13 +3,14 @@ File: src/canvas/scene.rs
 
 Purpose:
 Scene and viewport pipeline for `CanvasView`: page strip reservation/draw,
-per-page interactions, and floating canvas controls.
+per-page interactions, and the canvas' own viewport-space UI.
 
 Main responsibilities:
 - keep page-strip rendering orchestration outside the main canvas facade;
 - reserve page frames, draw ordered scene layers, and route page interactions;
 - lay out pages from source-page metadata so hit testing survives source GPU eviction;
-- render viewport-space controls without mixing them back into runtime modules;
+- render viewport-space UI (the «Лента» dock tab's body and the bottom hint)
+  without mixing it back into runtime modules;
 - preserve `CanvasHooks` compatibility while isolating scene-specific code.
 
 Key structures:
@@ -24,7 +25,7 @@ Key functions:
 - CanvasView::draw_canvas_page_on_top_layer()
 - CanvasView::handle_canvas_page_interactions()
 - CanvasView::draw_canvas_viewport_ui()
-- CanvasView::draw_canvas_controls()
+- CanvasView::draw_ribbon_tab_body()
 - CanvasView::draw_canvas_bottom_hint()
 - Canvas viewport controls here stay lightweight; advanced ribbon settings live in the
   Settings tab and are synchronized through shared canvas snapshots.
@@ -43,12 +44,13 @@ use super::types::{
 };
 use super::view_transform::DVec2;
 use super::{
-    BubbleCopyPasteTarget, CANVAS_LEFT_TOP_CONTROLS_AREA_ID, CanvasHintHelp, CanvasHintRow,
-    CanvasHooks, CanvasUiStatus, CanvasView, OnTopFocusMode, ViewTransform,
+    BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
+    OnTopFocusMode, ViewTransform,
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::project::ProjectData;
 use crate::runtime_log;
+use crate::widgets::panel_dock::PanelDockState;
 use crate::widgets::{HelpHint, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
@@ -92,14 +94,6 @@ pub(super) struct CanvasSceneState {
     /// `apply_viewport_snapshot` call replaces/drops it.
     pub(super) pending_focus: Option<PendingPageFocus>,
     pub(super) on_top_hit_rects: HashMap<i64, Rect>,
-    pub(super) canvas_left_top_controls_rect: Option<Rect>,
-    /// Natural content width (points) of the controls panel, measured last frame from the rows that
-    /// do NOT contain the shortcuts chip (header, checkbox, opacity slider). The chip row is
-    /// stretched to this width to right-align the chip, so it must be excluded from the measurement:
-    /// including it would feed the stretched width back in and inflate the panel by one item-spacing
-    /// every frame. Re-measured each frame, so the panel also shrinks again when a shorter locale
-    /// narrows those rows. `None` until the panel has been laid out expanded at least once.
-    pub(super) controls_content_width: Option<f32>,
     /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn last frame, or
     /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
     /// the hint. Reset each frame with the other per-frame scene rects.
@@ -181,8 +175,6 @@ impl Default for CanvasSceneState {
             pending_scroll_offset: None,
             pending_focus: None,
             on_top_hit_rects: HashMap::new(),
-            canvas_left_top_controls_rect: None,
-            controls_content_width: None,
             canvas_bottom_hint_rect: None,
             canvas_hangul_keyboard_rect: None,
             bottom_hint_body_size: None,
@@ -1317,112 +1309,68 @@ impl CanvasView {
         status: CanvasUiStatus,
         frame: CanvasFrameParams,
         hooks: &mut dyn CanvasHooks,
+        panel_dock: &mut PanelDockState,
     ) {
-        // Draws the controls panel; the canvas-shortcuts hover chip is rendered inline on its zoom
-        // row (see `draw_canvas_shortcuts_chip`), not as a separate floating box.
-        self.draw_canvas_controls(ctx, frame.canvas_rect, project.pages.len());
-        // Drawn right after the controls: the horizontal scrollbar rect is already cached (see
-        // `cache_scrollbar_rects`), so the hint can anchor its bottom just above the bar.
+        // The canvas' own controls are a DOCK tab now (`CANVAS_RIBBON_TAB`), declared by the owning
+        // program tab inside the hook below; the horizontal scrollbar rect is already cached (see
+        // `cache_scrollbar_rects`), so the bottom hint can anchor itself just above the bar.
         self.draw_canvas_bottom_hint(ctx, &frame);
-        hooks.draw_canvas_overlay_top_left(ctx, frame.canvas_rect, self, project, status);
+        hooks.draw_canvas_overlay_top_left(
+            ctx,
+            frame.canvas_rect,
+            self,
+            project,
+            status,
+            panel_dock,
+        );
     }
 
-    pub(super) fn draw_canvas_controls(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        total_pages: usize,
-    ) {
+    /// Draws the body of the «Лента» dock tab ([`crate::canvas::CANVAS_RIBBON_TAB`]): the page
+    /// counter, the zoom row with its right-aligned canvas-shortcuts hover chip, the
+    /// "show bubbles" checkbox and the bubble-opacity slider.
+    ///
+    /// `total_pages` is the project's page count; `0` renders as `0 / 1`, matching the pre-dock
+    /// panel. Called by all three canvas program tabs from
+    /// [`CanvasHooks::draw_canvas_overlay_top_left`], i.e. still inside `CanvasView::draw` and
+    /// therefore BEFORE `publish_canvas_settings` — an edit made here reaches the canvas settings
+    /// snapshot in the same frame, exactly as it did when the panel was an `Area`.
+    ///
+    /// Cheap: four rows of widgets, no I/O and no allocation beyond the two formatted labels.
+    pub fn draw_ribbon_tab_body(&mut self, ui: &mut egui::Ui, total_pages: usize) {
         let cur_page = if total_pages == 0 {
             0
         } else {
             self.scene.scroll_center_idx.min(total_pages - 1) + 1
         };
-        let page_text = format!("{} / {}", cur_page, total_pages.max(1));
-        let zoom_text = format!("{:.1}×", self.state.zoom);
-
-        // Width the shortcuts chip is right-aligned against: the panel's natural content width as
-        // measured last frame from the rows WITHOUT the chip. See `controls_content_width`.
-        let target_width = self.scene.controls_content_width;
-        // Max width of this frame's chip-free rows, accumulated below.
-        let mut natural_width: f32 = 0.0;
-        let controls_area = egui::Area::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID.into())
-            .movable(true)
-            .default_pos(canvas_rect.left_top() + egui::vec2(12.0, 12.0))
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    let toggle_hint = if self.state.controls_panel_collapsed {
-                        t!("canvas.controls.expand_panel_tooltip")
-                    } else {
-                        t!("canvas.controls.collapse_panel_tooltip")
-                    };
-                    let toggle_icon = if self.state.controls_panel_collapsed {
-                        "▶"
-                    } else {
-                        "▼"
-                    };
-                    let header = ui.horizontal(|ui| {
-                        if ui
-                            .small_button(toggle_icon)
-                            .on_hover_text(toggle_hint)
-                            .clicked()
-                        {
-                            self.state.controls_panel_collapsed =
-                                !self.state.controls_panel_collapsed;
-                        }
-                        ui.label(&page_text);
-                    });
-                    natural_width = natural_width.max(header.response.rect.width());
-                    if self.state.controls_panel_collapsed {
-                        return;
-                    }
-                    ui.add_space(2.0);
-                    Self::draw_zoom_and_shortcuts_row(ui, &zoom_text, target_width);
-                    ui.add_space(4.0);
-                    let show_bubbles = ui
-                        .checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
-                    natural_width = natural_width.max(show_bubbles.rect.width());
-                    let opacity = ui.add(
-                        WheelSlider::new(&mut self.state.bubble_opacity, 0.0..=1.0)
-                            .text(t!("canvas.controls.bubble_opacity")),
-                    );
-                    natural_width = natural_width.max(opacity.rect.width());
-                });
-            });
-        self.scene.canvas_left_top_controls_rect = Some(controls_area.response.rect);
-        // Collapsed, the width-defining rows are not laid out, so keep the last expanded value for
-        // when the panel opens again rather than collapsing the target to the header's width.
-        if !self.state.controls_panel_collapsed {
-            self.scene.controls_content_width = Some(natural_width);
-        }
+        ui.label(format!("{} / {}", cur_page, total_pages.max(1)));
+        ui.add_space(2.0);
+        Self::draw_zoom_and_shortcuts_row(ui, &format!("{:.1}×", self.state.zoom));
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
+        ui.add(
+            WheelSlider::new(&mut self.state.bubble_opacity, 0.0..=1.0)
+                .text(t!("canvas.controls.bubble_opacity")),
+        );
     }
 
     /// Draws the zoom label with the canvas-shortcuts hover chip right-aligned on the same row.
     ///
-    /// `target_width` is the panel's natural content width (measured from the chip-free rows). The
-    /// row is allocated exactly that wide so `Sides` right-aligns the chip to the panel's right
-    /// edge: `Sides` (like a bare `right_to_left` layout) otherwise expands to the parent's full
-    /// available width, which in the auto-sized `Area` is the whole screen and would stretch the
-    /// panel. `None` — the first expanded frame, before any measurement — falls back to the
-    /// natural, unstretched layout; the width captured that frame fixes the alignment on the next.
-    fn draw_zoom_and_shortcuts_row(ui: &mut egui::Ui, zoom_text: &str, target_width: Option<f32>) {
-        let sides = egui::containers::Sides::new();
-        let add_zoom = |ui: &mut egui::Ui| {
-            ui.label(zoom_text);
-        };
-        match target_width {
-            Some(width) => {
-                let height = ui.spacing().interact_size.y;
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, height),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| sides.show(ui, add_zoom, Self::draw_canvas_shortcuts_chip),
-                );
-            }
-            None => {
-                sides.show(ui, add_zoom, Self::draw_canvas_shortcuts_chip);
-            }
-        }
+    /// `Sides` stretches the row to the full available width, which is deliberate HERE and was a
+    /// defect in the pre-dock panel: an auto-sized `Area` reported "available" as the whole screen,
+    /// so the stretched row fed its own width back into the panel and grew it by one item-spacing
+    /// per frame — which is why the old code allocated the row at a separately measured
+    /// chip-free width. A dock body has a finite width, and the dock re-measures a tab's HEIGHT
+    /// only: `CollapsiblePanel` reports back the width it was GIVEN, never the drawn one
+    /// (`panel_dock/panel.rs::measured_size`). Stretching therefore cannot become a size request
+    /// and the panel stays shrinkable, so the chip can simply right-align against the body.
+    fn draw_zoom_and_shortcuts_row(ui: &mut egui::Ui, zoom_text: &str) {
+        egui::containers::Sides::new().show(
+            ui,
+            |ui| {
+                ui.label(zoom_text);
+            },
+            Self::draw_canvas_shortcuts_chip,
+        );
     }
 
     /// Draws the collapsible bottom-center keyboard-shortcut hint for the current frame.
@@ -1643,7 +1591,7 @@ impl CanvasView {
     /// Renders the canvas-shortcuts hover chip inline into `ui`: a subtle, non-interactive weak
     /// label (`canvas.shortcuts_hint.title`) that reveals the canvas's own navigation shortcuts
     /// (zoom, pan, scroll) as a tooltip on hover. Drawn on the zoom row of the controls panel
-    /// (see `draw_canvas_controls`); hover-only, so it takes no click and has no persisted state.
+    /// (see `draw_ribbon_tab_body`); hover-only, so it takes no click and has no persisted state.
     fn draw_canvas_shortcuts_chip(ui: &mut egui::Ui) {
         let rows = Self::canvas_shortcut_rows();
         let label = egui::Label::new(egui::RichText::new(t!("canvas.shortcuts_hint.title")).weak())

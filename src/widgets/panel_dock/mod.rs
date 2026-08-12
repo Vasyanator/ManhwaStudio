@@ -16,7 +16,8 @@ Key structures:
 - `PanelDockState`: per-program-tab layouts, last-frame measurements, dirty flag.
 - `DockArea`: where the dock may place panels this frame.
 - `PanelDock`: the frame driver (`begin` → `tab(..).show(..)` → `end`).
-- `PanelDockOutput`: rects of the panels drawn this frame.
+- `PanelDockOutput`: rects of the panels drawn this frame, each recorded with
+  the window it was drawn in and handed out for the MAIN window only.
 
 Key functions:
 - `PanelDock::begin` / `PanelDock::tab` / `PanelDock::end`.
@@ -93,6 +94,12 @@ pub use window::{
 /// landing exactly on top of the previous one.
 const AUTO_PANEL_CASCADE_STEP: f32 = 24.0;
 
+/// Difference between two anchor fractions (`PanelAnchor::Panel::align`,
+/// `PanelAnchor::ViewportEdge::along`) below which the two anchors name the SAME
+/// slot. A fraction spans the whole free travel along a side, so a thousandth of
+/// one is far below a point on any dock area a window can have.
+const SLOT_FRACTION_EPSILON: f32 = 1e-3;
+
 /// Difference, in points, between the size the drawn tab CONTRIBUTED to its
 /// panel's request and the size its content turned out to need, above which the
 /// dock asks for another frame. One point: below that the layout is visually
@@ -146,10 +153,6 @@ struct TabEntry<'frame, C> {
 pub struct DockArea<'a> {
     /// Region panels are laid out in and clamped to, in screen coordinates.
     pub rect: Rect,
-    /// Rect of the `CanvasView` controls panel, when it exists this frame. It is
-    /// an ANCHOR only: the dock never moves it and never pushes panels away from
-    /// it. `None` degrades a `PanelAnchor::CanvasControls` to free-floating.
-    pub canvas_controls: Option<Rect>,
     /// Stable key of the program tab whose layout is being drawn — use
     /// `AppTab::key()`, never a localised title.
     pub layout_key: &'a str,
@@ -172,9 +175,17 @@ pub struct PanelDockState {
     /// The panel move in flight, if any. At most one gesture at a time: it is
     /// driven by the single pointer.
     drag: Option<DragSession>,
-    /// Outer size each tab's content asked for when it was last drawn. This is
-    /// the "geometry lags content by one frame" cache.
-    measured: HashMap<TabId, Vec2>,
+    /// Outer size each tab's content asked for when it was last drawn — the
+    /// "geometry lags content by one frame" cache — scoped to the program tab it
+    /// was measured in and keyed by `AppTab::key()`.
+    ///
+    /// A `TabId` alone is NOT a key here: the canvas' «Лента» is declared by
+    /// three program tabs sharing one state, and one global entry made the width
+    /// the user dragged it to in «Текст» jump into «Клининг», whose own panel
+    /// carries no `size_override` and therefore takes its size straight from this
+    /// cache. A measurement belongs to the arrangement it was taken in, exactly
+    /// like the panel that holds the tab.
+    measured: BTreeMap<String, HashMap<TabId, Vec2>>,
     /// Header/frame overhead the widget measured the last time any panel was
     /// drawn. It is style-dependent, so it is measured rather than assumed; one
     /// value covers every panel because they all draw the same header widget.
@@ -494,10 +505,38 @@ impl PanelDockState {
         Some(layout)
     }
 
-    /// Outer size `tab`'s content asked for the last time it was drawn.
+    /// Outer size `tab`'s content asked for the last time it was drawn in the
+    /// program tab `layout_key`.
+    ///
+    /// The key is part of the question: a tab several program tabs declare is
+    /// measured once per arrangement, and the answer for one of them says
+    /// nothing about the others.
     #[must_use]
-    pub fn measured_size(&self, tab: TabId) -> Option<Vec2> {
-        self.measured.get(&tab).copied()
+    pub fn measured_size(&self, layout_key: &str, tab: TabId) -> Option<Vec2> {
+        self.measured.get(layout_key)?.get(&tab).copied()
+    }
+
+    /// Measurements taken in the program tab `layout_key`; `None` while nothing
+    /// has ever been drawn for it. Callers substitute an empty map.
+    fn measurements(&self, layout_key: &str) -> Option<&HashMap<TabId, Vec2>> {
+        self.measured.get(layout_key)
+    }
+
+    /// Remembers what one tab's content measured while the program tab
+    /// `layout_key` was drawing it.
+    fn remember_measurement(&mut self, layout_key: &str, tab: TabId, size: Vec2) {
+        // Looked up before `entry`, which would have to own the key: this runs
+        // once per DRAWN PANEL per frame, and every call after the program tab's
+        // first frame finds the entry already there. Allocating a `String` for a
+        // key that is present is the whole cost of the frame path here.
+        if let Some(sizes) = self.measured.get_mut(layout_key) {
+            sizes.insert(tab, size);
+            return;
+        }
+        self.measured
+            .entry(layout_key.to_owned())
+            .or_default()
+            .insert(tab, size);
     }
 
     /// Header/frame overhead measured on the last drawn frame, or the nominal
@@ -552,47 +591,85 @@ impl PanelDockState {
     }
 }
 
+/// One panel as it was drawn this frame: the window it was drawn in, and its
+/// outer rect in THAT window's own screen coordinates.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct DrawnPanel {
+    host: HostId,
+    rect: Rect,
+}
+
 /// Rects of everything the dock drew this frame.
 ///
 /// Only panels that were actually drawn appear here: a panel whose tabs are all
 /// hidden or undeclared has no rect, exactly as if it were not on screen.
 ///
-/// **Coordinate warning.** A rect belongs to the WINDOW its panel was drawn in.
-/// A panel the user detached into a sub-window reports a rect in that window's
-/// screen space, which says nothing about the main window — so a caller that
-/// anchors other main-window UI to a dock panel must treat a detached panel as
-/// "not on screen" rather than trust the numbers.
+/// **Every accessor answers for the MAIN window alone, and that is the type's
+/// whole point.** A panel the user detached into a sub-window is drawn in that
+/// window's own coordinate frame, whose dock area starts near the origin; the
+/// numbers are meaningless to the main window and dangerous there — compared
+/// against a main-window pointer position they carve an invisible dead zone out
+/// of its top-left corner, and used as an anchor they place UI at the wrong
+/// place. The host is therefore recorded with every rect and a sub-window's
+/// geometry is never handed out unlabelled: a detached panel reads as "not on
+/// screen", which is exactly what a caller anchoring main-window UI to a dock
+/// panel has to do with it anyway.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelDockOutput {
-    panels: BTreeMap<PanelId, Rect>,
+    panels: BTreeMap<PanelId, DrawnPanel>,
     tabs: BTreeMap<TabId, PanelId>,
 }
 
 impl PanelDockOutput {
-    /// Outer rect of one drawn panel.
-    #[must_use]
-    pub fn panel_rect(&self, id: PanelId) -> Option<Rect> {
-        self.panels.get(&id).copied()
+    /// Records one panel drawn in `host` and the tabs whose headers it showed.
+    ///
+    /// `rect` is in `host`'s own screen coordinates. Panel ids are unique across
+    /// the hosts of one layout, so two windows can never overwrite each other's
+    /// entry.
+    fn record(&mut self, host: HostId, panel: PanelId, rect: Rect, tabs: &[TabId]) {
+        self.panels.insert(panel, DrawnPanel { host, rect });
+        for tab in tabs {
+            self.tabs.insert(*tab, panel);
+        }
     }
 
-    /// Outer rect of the panel that showed `tab` this frame. `None` when the tab
-    /// was hidden, undeclared, or its panel had nothing to draw — which is what
-    /// a caller anchoring other UI to a dock panel must treat as "not on screen".
+    /// Rect of one panel drawn in the MAIN window. `None` when the panel was not
+    /// drawn at all, or was drawn in a detached sub-window.
+    #[must_use]
+    pub fn panel_rect(&self, id: PanelId) -> Option<Rect> {
+        self.panels
+            .get(&id)
+            .filter(|drawn| drawn.host == HostId::MainWindow)
+            .map(|drawn| drawn.rect)
+    }
+
+    /// Outer rect of the panel that showed `tab` this frame, in MAIN-window
+    /// coordinates.
+    ///
+    /// `None` when the tab was hidden, undeclared, its panel had nothing to
+    /// draw, or the user moved it into a detached sub-window — all four are "not
+    /// on screen in this window" to a caller anchoring other main-window UI to a
+    /// dock panel, and none of them may be approximated.
     #[must_use]
     pub fn tab_rect(&self, tab: TabId) -> Option<Rect> {
         let panel = self.tabs.get(&tab)?;
-        self.panels.get(panel).copied()
+        self.panel_rect(*panel)
     }
 
-    /// `true` when nothing was drawn.
+    /// `true` when nothing was drawn in the MAIN window.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.panels.is_empty()
+        self.drawn_panels().next().is_none()
     }
 
-    /// Every drawn panel with its rect, in ascending panel id order.
+    /// Every panel drawn in the MAIN window with its rect, in ascending panel id
+    /// order. Panels drawn in a sub-window are deliberately left out — see the
+    /// type's own documentation.
     pub fn drawn_panels(&self) -> impl Iterator<Item = (PanelId, Rect)> + '_ {
-        self.panels.iter().map(|(id, rect)| (*id, *rect))
+        self.panels
+            .iter()
+            .filter(|(_, drawn)| drawn.host == HostId::MainWindow)
+            .map(|(id, drawn)| (*id, drawn.rect))
     }
 }
 
@@ -607,7 +684,6 @@ impl PanelDockOutput {
 /// let mut cx = TypingDockCx { top_panel, text_overlays, page_idx };
 /// let mut dock = PanelDock::begin(ctx, &mut self.panel_dock, DockArea {
 ///     rect: canvas_rect,
-///     canvas_controls,
 ///     layout_key: AppTab::Typing.key(),
 /// });
 /// dock.tab(PREVIEW_TAB)
@@ -628,7 +704,6 @@ pub struct PanelDock<'ctx, 'frame, C> {
     ctx: &'ctx egui::Context,
     state: &'ctx mut PanelDockState,
     rect: Rect,
-    canvas_controls: Option<Rect>,
     layout_key: &'ctx str,
     /// Declaration order, which decides where auto-created panels cascade.
     order: Vec<TabId>,
@@ -650,7 +725,6 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             ctx,
             state,
             rect: area.rect,
-            canvas_controls: area.canvas_controls,
             layout_key: area.layout_key,
             order: Vec::new(),
             entries: BTreeMap::new(),
@@ -720,7 +794,6 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             ctx,
             state,
             rect,
-            canvas_controls,
             layout_key,
             order,
             mut entries,
@@ -734,10 +807,27 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             state.layouts.insert(layout_key.to_owned(), DockLayout::new());
         }
         {
+            // The default arrangement is rebuilt only on a frame where some
+            // declared tab still has no panel — the first frame of a key with no
+            // stored layout, or the first frame after a build added a tab. The
+            // insertion below then gives every declared tab a panel, so the
+            // following frames find nothing missing and never run the builder.
+            // The one case that keeps rebuilding it every frame is an insertion
+            // that cannot succeed (`PanelIdOverflow`, `DuplicatePanelId`): the
+            // tab stays unowned and `ensure_declared_tabs` logs the refusal each
+            // time. Nothing is built for that here — the model refuses both only
+            // for a layout that cannot arise from these helpers.
+            let missing = state.layouts.get(layout_key).is_some_and(|layout| {
+                order.iter().any(|tab| layout.panel_of_tab(*tab).is_none())
+            });
+            let default = missing
+                .then(|| state.defaults.get(layout_key).copied())
+                .flatten()
+                .map(|build| build());
             let Some(layout) = state.layouts.get_mut(layout_key) else {
                 return PanelDockOutput::default();
             };
-            if ensure_declared_tabs(layout, HostId::MainWindow, &order) {
+            if ensure_declared_tabs(layout, HostId::MainWindow, &order, default.as_ref()) {
                 state.dirty = true;
             }
         }
@@ -756,7 +846,6 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             HostFrame {
                 host: HostId::MainWindow,
                 area: rect,
-                canvas_controls,
                 layout_key,
                 gesture_in_flight,
             },
@@ -800,7 +889,6 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
 struct HostFrame<'a> {
     host: HostId,
     area: Rect,
-    canvas_controls: Option<Rect>,
     layout_key: &'a str,
     /// `true` while a tab or panel is being moved somewhere in this dock.
     ///
@@ -957,7 +1045,6 @@ fn draw_host<'frame, C>(
     let HostFrame {
         host,
         area,
-        canvas_controls,
         layout_key,
         gesture_in_flight,
     } = frame;
@@ -1049,7 +1136,11 @@ fn draw_host<'frame, C>(
         let Some(layout) = state.layouts.get(layout_key) else {
             return outcome;
         };
-        let plan = plan_frame(layout, host, decls, &state.measured);
+        // Only THIS program tab's measurements: the same `TabId` measured while
+        // another program tab was drawn describes another arrangement.
+        let no_measurements = HashMap::new();
+        let measured = state.measurements(layout_key).unwrap_or(&no_measurements);
+        let plan = plan_frame(layout, host, decls, measured);
         // Panels with nothing to draw are removed from the layout the SOLVER
         // sees, never from the stored one: a hidden panel must not reserve
         // its slot in the chain, or the panels below it would float over a
@@ -1061,7 +1152,6 @@ fn draw_host<'frame, C>(
             area,
             &plan.desired,
             &plan.mins,
-            canvas_controls,
             state.chrome,
         );
         (plan, solved)
@@ -1158,10 +1248,9 @@ fn draw_host<'frame, C>(
                 header_rects: drawn.header_rects.clone(),
             });
         }
-        output.panels.insert(panel_plan.id, drawn.rect);
-        for tab in &panel_plan.visible_tabs {
-            output.tabs.insert(*tab, panel_plan.id);
-        }
+        // Recorded WITH the host: the same output is filled by every window of the
+        // dock, and a sub-window's rect is in that window's own frame.
+        output.record(host, panel_plan.id, drawn.rect, &panel_plan.visible_tabs);
 
         if let Some(activated) = drawn.activated_tab
             && activated != active
@@ -1228,9 +1317,11 @@ fn draw_host<'frame, C>(
             // it), not a ratchet. It does mean a tab dragged out of a wide panel
             // carries that width with it, which is correct: it is the last width
             // that tab was actually drawn at.
-            state
-                .measured
-                .insert(active, Vec2::new(panel_plan.assumed_size.x, measured.y));
+            state.remember_measurement(
+                layout_key,
+                active,
+                Vec2::new(panel_plan.assumed_size.x, measured.y),
+            );
         }
     }
 
@@ -1381,7 +1472,7 @@ fn draw_host<'frame, C>(
                         );
                     }
                 } else if let Some(candidate) =
-                    snap_candidate(layout, panel, &solved, area, canvas_controls)
+                    snap_candidate(layout, panel, &solved, area)
                 {
                     drag::paint_snap_preview(ctx, &candidate);
                 }
@@ -1402,7 +1493,7 @@ fn draw_host<'frame, C>(
                         });
                     }
                     None => {
-                        if apply_panel_drop(layout, panel, &solved, area, canvas_controls) {
+                        if apply_panel_drop(layout, panel, &solved, area) {
                             state.dirty = true;
                         }
                     }
@@ -1682,9 +1773,6 @@ fn show_sub_windows<'frame, C>(
                         HostFrame {
                             host: node.host(),
                             area,
-                            // A sub-window has no canvas and therefore no canvas
-                            // controls to anchor to.
-                            canvas_controls: None,
                             layout_key,
                             gesture_in_flight: frame.gesture_in_flight,
                         },
@@ -1838,20 +1926,25 @@ fn move_into_existing_host(
     host: HostId,
 ) -> bool {
     let area_size = state.host_areas.get(&host).map(Rect::size);
+    // The subject is a tab of THIS program tab's arrangement, so its size comes
+    // from the measurements taken while this arrangement was drawn.
+    let no_measurements = HashMap::new();
     match subject {
         MenuMoveSubject::Tab(tab) => {
+            let measured = state.measurements(layout_key).unwrap_or(&no_measurements);
             let Some(layout) = state.layouts.get(layout_key) else {
                 return false;
             };
-            let panel_size = menu_subject_size(&state.measured, layout, subject);
+            let panel_size = menu_subject_size(measured, layout, subject);
             let landing = menu_tab_landing(layout, tab, host, area_size, panel_size);
             apply_tab_landing(state, layout_key, tab, host, landing)
         }
         MenuMoveSubject::Panel(panel) => {
+            let measured = state.measurements(layout_key).unwrap_or(&no_measurements);
             let Some(layout) = state.layouts.get(layout_key) else {
                 return false;
             };
-            let panel_size = menu_subject_size(&state.measured, layout, subject);
+            let panel_size = menu_subject_size(measured, layout, subject);
             let pos = menu_panel_slot(layout, host, area_size, panel_size);
             let Some(layout) = state.layouts.get_mut(layout_key) else {
                 return false;
@@ -2632,7 +2725,6 @@ fn snap_candidate(
     panel: PanelId,
     solved: &SolvedLayout,
     area: Rect,
-    canvas_controls: Option<Rect>,
 ) -> Option<SnapCandidate> {
     let dragged = solved.get(panel)?.rect;
     let candidates = drag::panel_snap_candidates(
@@ -2643,7 +2735,6 @@ fn snap_candidate(
     drag::find_snap(dragged, SnapTargets {
         area,
         panels: &candidates,
-        canvas_controls,
     })
 }
 
@@ -2657,12 +2748,11 @@ fn apply_panel_drop(
     panel: PanelId,
     solved: &SolvedLayout,
     area: Rect,
-    canvas_controls: Option<Rect>,
 ) -> bool {
     let Some(geometry) = solved.get(panel) else {
         return false;
     };
-    let Some(candidate) = snap_candidate(layout, panel, solved, area, canvas_controls) else {
+    let Some(candidate) = snap_candidate(layout, panel, solved, area) else {
         return true;
     };
     let rects: BTreeMap<PanelId, Rect> = solved
@@ -2676,7 +2766,6 @@ fn apply_panel_drop(
         candidate.anchor,
         &rects,
         area,
-        canvas_controls,
     );
     match layout.set_anchor(panel, anchor) {
         Ok(()) => true,
@@ -2715,11 +2804,13 @@ fn apply_tab_drop(layout: &mut DockLayout, target: PanelId, tab: TabId, index: u
 /// `pos` is authoritative only for a free panel, but an anchored one keeps it as
 /// the cache the model falls back to the moment its anchor stops resolving —
 /// which happens on ordinary frames, not only in corrupt layouts: `frame_layout`
-/// drops a panel with nothing to draw and hands its anchor to its dependants, and
-/// a `CanvasControls` anchor degrades to free while the controls rect is unknown.
-/// Without this refresh the fallback position is whatever the panel was created
-/// with (usually the area's origin), so a panel loses its place and jumps into
-/// the corner the frame its neighbour is hidden.
+/// drops a panel with nothing to draw and hands its OWN anchor to its dependants,
+/// so a dependant of a hidden FREE root becomes free itself and is placed by its
+/// `pos` alone. The same fallback carries a panel whose anchor target lives in
+/// another host and one restored from a stored anchor this build no longer has
+/// (`persist::decode_anchor`). Without this refresh the fallback position is
+/// whatever the panel was created with (usually the area's origin), so a panel
+/// loses its place and jumps into the corner the frame its neighbour is hidden.
 ///
 /// Deliberately does NOT dirty the dock state: a position derived from a solve
 /// the user did not ask for is not a change persistence has to store, and
@@ -2736,24 +2827,266 @@ fn write_back_positions(layout: &mut DockLayout, solved: &SolvedLayout, origin: 
     }
 }
 
+/// Where the DEFAULT arrangement wants a panel that the live layout has to
+/// create, expressed in the live layout's own ids.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct DefaultPlacement {
+    anchor: PanelAnchor,
+    pos: Pos2,
+    size_override: Option<Vec2>,
+}
+
+/// Tab naming the panel the DEFAULT hangs `tab`'s own panel off, or `None` when
+/// the default gives it no `Panel` anchor — or does not know the tab at all.
+///
+/// A `PanelId` of the default layout means nothing outside it, so a default
+/// anchor's target is named by the FIRST tab that panel holds. This is the single
+/// place that rule lives: [`default_placement`] resolves the anchor with it and
+/// [`seeding_order`] decides what has to exist first with it, and the two would
+/// disagree the moment they read the default differently.
+fn default_anchor_tab(default: &DockLayout, tab: TabId) -> Option<TabId> {
+    let source = default.panel_of_tab(tab).and_then(|id| default.panel(id))?;
+    match source.anchor {
+        PanelAnchor::Free | PanelAnchor::ViewportEdge { .. } => None,
+        PanelAnchor::Panel { target, .. } => default
+            .panel(target)
+            .and_then(|panel| panel.tabs.first().copied()),
+    }
+}
+
+/// `true` when two anchors name the same SLOT, i.e. would place two panels of one
+/// host on exactly the same rect.
+///
+/// `Free` is never a slot: a free panel is placed by its own `pos`, which two
+/// free panels do not share by being free. The fractions are compared with
+/// [`SLOT_FRACTION_EPSILON`] because they are derived values, not literals a
+/// caller typed.
+fn same_slot(left: PanelAnchor, right: PanelAnchor) -> bool {
+    match (left, right) {
+        (
+            PanelAnchor::Panel {
+                target: left_target,
+                edge: left_edge,
+                align: left_align,
+            },
+            PanelAnchor::Panel {
+                target: right_target,
+                edge: right_edge,
+                align: right_align,
+            },
+        ) => {
+            left_target == right_target
+                && left_edge == right_edge
+                && (left_align - right_align).abs() < SLOT_FRACTION_EPSILON
+        }
+        (
+            PanelAnchor::ViewportEdge {
+                edge: left_edge,
+                along: left_along,
+            },
+            PanelAnchor::ViewportEdge {
+                edge: right_edge,
+                along: right_along,
+            },
+        ) => left_edge == right_edge && (left_along - right_along).abs() < SLOT_FRACTION_EPSILON,
+        // Listed per LEFT variant rather than as a catch-all, so a new
+        // `PanelAnchor` variant fails to compile here instead of silently
+        // answering "different slot".
+        (PanelAnchor::Free, _)
+        | (PanelAnchor::Panel { .. }, _)
+        | (PanelAnchor::ViewportEdge { .. }, _) => false,
+    }
+}
+
+/// Anchor a panel being SEEDED into `layout` may actually take, given that the
+/// slot its default names may already be occupied.
+///
+/// This closes for the seeding path the defect [`drag::resolve_slot`] closes for
+/// the gestures: the solver is a total function and lays two panels sharing an
+/// anchor on exactly the same rect, the later one burying the earlier one — and a
+/// buried panel can no longer be reached, not even to drag it out again. The
+/// seeding path reaches that state by the most ordinary route there is: a new
+/// build adds its tab to an EXISTING default panel, the tab is new to the user's
+/// restored layout while the panel's older tabs are not, and the panel seeded for
+/// it inherits that panel's whole anchor and pinned size.
+///
+/// So the newcomer QUEUES, exactly as a dropped panel does: while a live panel of
+/// `host` already holds this anchor, the newcomer is re-anchored to THAT panel,
+/// on the side the queue grows along ([`drag::queue_edge`]), flush with it.
+///
+/// Occupancy is decided by comparing ANCHORS ([`same_slot`]) and not — as
+/// `resolve_slot` does — by comparing rects: the geometric test needs the frame's
+/// solved rects, and this runs before the solve, on panels that have never been
+/// laid out at all. Two anchors that merely happen to overlap are therefore left
+/// alone; the exact coincidence the seeding produces is what has to be caught.
+///
+/// A `Free` anchor is returned unchanged: a free panel is placed by its `pos`,
+/// and the positional rule for it is [`step_off_occupied`], applied by the caller.
+///
+/// The walk never revisits an occupant and is bounded by the panel count, so it
+/// terminates on every layout. The result is a proposal — `insert_panel` remains
+/// the authority that may refuse it.
+fn free_anchor_slot(layout: &DockLayout, host: HostId, anchor: PanelAnchor) -> PanelAnchor {
+    let mut anchor = anchor;
+    let mut visited: Vec<PanelId> = Vec::new();
+    for _ in 0..layout.panels().len() {
+        let occupant = layout
+            .panels_in_host(host)
+            .find(|node| !visited.contains(&node.id) && same_slot(node.anchor, anchor))
+            .map(|node| node.id);
+        let Some(occupant) = occupant else {
+            break;
+        };
+        visited.push(occupant);
+        anchor = PanelAnchor::Panel {
+            target: occupant,
+            edge: drag::queue_edge(anchor),
+            // Flush with the panel it queues behind, as the drag path does: a
+            // column of docked panels reads as a column only if its members share
+            // a side.
+            align: 0.0,
+        };
+    }
+    anchor
+}
+
+/// The declared tabs `layout` does not own yet, in the order they have to be
+/// seeded in: a tab whose default anchor targets another tab that is ALSO being
+/// created comes after that one.
+///
+/// Declaration order is the caller's business and says nothing about the shape of
+/// the default arrangement. Seeding in it directly made the result depend on it:
+/// [`default_placement`] resolves a default anchor against the LIVE layout, so a
+/// tab whose default hangs it off a panel whose first tab is created LATER finds
+/// no target yet and falls back to the cascade — the arrangement an existing user
+/// receives after an update would then hinge on the order two `dock.tab(..)` calls
+/// happen to be written in.
+///
+/// A dependency that is not created here — already in the layout, or not declared
+/// at all — ends the chain: it is resolvable, or unresolvable, right away. A cycle
+/// among the default's anchors cannot arise (`DockLayout` refuses one), and is
+/// broken here rather than trusted.
+fn seeding_order(layout: &DockLayout, order: &[TabId], default: Option<&DockLayout>) -> Vec<TabId> {
+    let mut missing: Vec<TabId> = Vec::new();
+    for tab in order {
+        if layout.panel_of_tab(*tab).is_none() && !missing.contains(tab) {
+            missing.push(*tab);
+        }
+    }
+    let Some(default) = default else {
+        return missing;
+    };
+    let mut seeded: Vec<TabId> = Vec::with_capacity(missing.len());
+    for tab in &missing {
+        // Collect what this tab has to wait for by walking UP the default's
+        // anchor chain, stopping at the first tab that is not created here.
+        let mut chain: Vec<TabId> = Vec::new();
+        let mut current = *tab;
+        while !seeded.contains(&current) && !chain.contains(&current) {
+            chain.push(current);
+            match default_anchor_tab(default, current) {
+                Some(next) if missing.contains(&next) => current = next,
+                Some(_) | None => break,
+            }
+        }
+        // The chain was collected leaf-first, and its root is what must exist
+        // before anything hanging off it can resolve.
+        seeded.extend(chain.iter().rev().copied());
+    }
+    seeded
+}
+
+/// Translates the place `default` gives `tab` into `layout`'s own ids, or `None`
+/// when the default cannot answer.
+///
+/// Two things must hold for the answer to be usable: the default has to hold the
+/// tab in `host` at all, and its anchor has to mean something HERE. A panel id of
+/// the default layout is meaningless in a restored one — the two were built
+/// independently — so a `Panel` anchor is re-addressed by the TAB its target
+/// holds: the live panel showing that tab is the live target. A default whose
+/// target tab is not in the restored layout (or lives in another window) has no
+/// resolvable anchor, and the caller falls back to the cascade rather than
+/// inventing one.
+fn default_placement(
+    default: &DockLayout,
+    layout: &DockLayout,
+    host: HostId,
+    tab: TabId,
+) -> Option<DefaultPlacement> {
+    let source = default
+        .panel_of_tab(tab)
+        .and_then(|id| default.panel(id))
+        .filter(|panel| panel.host == host)?;
+    let anchor = match source.anchor {
+        PanelAnchor::Free => PanelAnchor::Free,
+        PanelAnchor::ViewportEdge { edge, along } => PanelAnchor::ViewportEdge { edge, along },
+        PanelAnchor::Panel { edge, align, .. } => {
+            // The default's target panel is identified by the first tab it holds
+            // ([`default_anchor_tab`], the single place that rule lives): that is
+            // the stable name a layout keeps across rebuilds, while the `PanelId`
+            // is an index into the layout that produced it.
+            let target_tab = default_anchor_tab(default, tab)?;
+            let resolved = layout.panel_of_tab(target_tab)?;
+            if layout.panel(resolved).is_none_or(|panel| panel.host != host) {
+                return None;
+            }
+            PanelAnchor::Panel {
+                target: resolved,
+                edge,
+                align,
+            }
+        }
+    };
+    Some(DefaultPlacement {
+        anchor,
+        pos: source.pos,
+        size_override: source.size_override,
+    })
+}
+
 /// Adds a panel for every declared tab the layout does not own yet.
 ///
 /// **Rule:** a tab declared for the first time gets its OWN new free-floating
-/// panel, cascaded by [`AUTO_PANEL_CASCADE_STEP`] from the layout's origin so it
-/// does not land exactly on an existing one. It is deliberately never appended
-/// to an existing panel: merging unrelated tabs into one panel behind the
-/// caller's back is not recoverable by the user without dragging, while a panel
-/// that stands alone can always be docked onto another one. A caller that wants
-/// a specific arrangement expresses it in
-/// [`PanelDockState::ensure_default_layout`].
+/// panel. It is deliberately never appended to an existing panel: merging
+/// unrelated tabs into one panel behind the caller's back is not recoverable by
+/// the user without dragging, while a panel that stands alone can always be
+/// docked onto another one.
+///
+/// **Where that panel goes** is asked of the program tab's DEFAULT arrangement
+/// first (`default`, the layout [`PanelDockState::ensure_default_layout`] was
+/// given — pass `None` when the key has no builder). A user with a stored layout
+/// keeps it, so the default builder never runs for them, and a tab added by a new
+/// build reaches this function for every existing user at once: cascading it into
+/// the middle of the canvas puts a brand-new panel on top of the user's own
+/// arrangement, while the default builder already says where that tab belongs.
+/// The default's anchor, position and pinned size are reused when they can be
+/// expressed in this layout (see [`default_placement`]); otherwise — the default
+/// does not know the tab, or its anchor targets a panel that is not here — the
+/// panel falls back to a free position cascaded by [`AUTO_PANEL_CASCADE_STEP`]
+/// from the layout's origin, so it does not land exactly on an existing one.
+///
+/// **A seeded panel never buries a live one.** The default answers for the whole
+/// default panel while the seeded panel holds the new tab ALONE, so a tab added
+/// to an existing default panel would otherwise arrive on exactly the rect the
+/// live panel holding that panel's older tabs occupies. An anchored placement is
+/// therefore queued behind whoever already holds that slot
+/// ([`free_anchor_slot`]) and a free one steps off whatever stands at its
+/// position ([`step_off_occupied`]).
+///
+/// The tabs are seeded in [`seeding_order`], not in declaration order: a default
+/// anchor is resolved against the LIVE layout, so a tab it hangs off another
+/// newly declared tab has to be created after that one.
 ///
 /// Returns `true` when the layout changed.
-fn ensure_declared_tabs(layout: &mut DockLayout, host: HostId, order: &[TabId]) -> bool {
+fn ensure_declared_tabs(
+    layout: &mut DockLayout,
+    host: HostId,
+    order: &[TabId],
+    default: Option<&DockLayout>,
+) -> bool {
     let mut changed = false;
-    for tab in order {
-        if layout.panel_of_tab(*tab).is_some() {
-            continue;
-        }
+    // Every entry is a tab this layout does not own, listed once.
+    for tab in seeding_order(layout, order, default) {
         let id = match layout.next_panel_id() {
             Ok(id) => id,
             Err(error) => {
@@ -2764,7 +3097,7 @@ fn ensure_declared_tabs(layout: &mut DockLayout, host: HostId, order: &[TabId]) 
                 continue;
             }
         };
-        let mut node = match PanelNode::new(id, host, vec![*tab]) {
+        let mut node = match PanelNode::new(id, host, vec![tab]) {
             Ok(node) => node,
             Err(error) => {
                 runtime_log::log_warn(format!(
@@ -2774,9 +3107,31 @@ fn ensure_declared_tabs(layout: &mut DockLayout, host: HostId, order: &[TabId]) 
                 continue;
             }
         };
-        let step = f32::from(u16::try_from(layout.panels().len()).unwrap_or(u16::MAX));
-        let offset = DOCK_GAP + step * AUTO_PANEL_CASCADE_STEP;
-        node.pos = Pos2::new(offset, offset);
+        match default.and_then(|default| default_placement(default, layout, host, tab)) {
+            Some(placement) => {
+                match placement.anchor {
+                    // Placed by its own position, so the burial test is the
+                    // positional one a menu move already uses.
+                    PanelAnchor::Free => {
+                        node.anchor = PanelAnchor::Free;
+                        node.pos = step_off_occupied(layout, host, placement.pos);
+                    }
+                    anchor @ (PanelAnchor::Panel { .. } | PanelAnchor::ViewportEdge { .. }) => {
+                        node.anchor = free_anchor_slot(layout, host, anchor);
+                        // Kept as the cache the model falls back to whenever the
+                        // anchor stops resolving; the solve overwrites it with the
+                        // rect this panel is actually laid out at.
+                        node.pos = placement.pos;
+                    }
+                }
+                node.size_override = placement.size_override;
+            }
+            None => {
+                let step = f32::from(u16::try_from(layout.panels().len()).unwrap_or(u16::MAX));
+                let offset = DOCK_GAP + step * AUTO_PANEL_CASCADE_STEP;
+                node.pos = Pos2::new(offset, offset);
+            }
+        }
         match layout.insert_panel(node) {
             Ok(()) => changed = true,
             Err(error) => runtime_log::log_warn(format!(
@@ -2992,7 +3347,8 @@ mod tests {
         assert!(ensure_declared_tabs(
             &mut layout,
             HostId::MainWindow,
-            &[TAB_A, TAB_B]
+            &[TAB_A, TAB_B],
+            None
         ));
         assert_eq!(layout.panels().len(), 2);
         assert_eq!(layout.panel_of_tab(TAB_A), Some(PanelId::new(0)));
@@ -3013,16 +3369,339 @@ mod tests {
         assert!(!ensure_declared_tabs(
             &mut layout,
             HostId::MainWindow,
-            &[TAB_B, TAB_A]
+            &[TAB_B, TAB_A],
+            None
         ));
         assert_eq!(layout.panels().len(), 1);
         // A tab declared later still joins as its own panel.
         assert!(ensure_declared_tabs(
             &mut layout,
             HostId::MainWindow,
-            &[TAB_A, TAB_C]
+            &[TAB_A, TAB_C],
+            None
         ));
         assert_eq!(layout.panel_of_tab(TAB_C), Some(PanelId::new(1)));
+    }
+
+    /// A user with a stored layout never runs the default builder, so a tab a new
+    /// build adds reaches `ensure_declared_tabs` for EVERY existing user at once.
+    /// It must land where the default puts it, not in the middle of the canvas on
+    /// top of their own arrangement.
+    #[test]
+    fn a_newly_declared_tab_takes_the_place_its_default_layout_gives_it() {
+        // The default: TAB_A pinned to the area's left edge, TAB_B hanging off it.
+        let mut default = DockLayout::new();
+        let mut anchored = panel_with(0, &[TAB_A]);
+        anchored.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.25,
+        };
+        anchored.pos = Pos2::new(11.0, 12.0);
+        anchored.size_override = Some(Vec2::new(340.0, 160.0));
+        default.insert_panel(anchored).expect("default 0");
+        let mut hanging = panel_with(1, &[TAB_B]);
+        hanging.anchor = PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Bottom,
+            align: 0.5,
+        };
+        default.insert_panel(hanging).expect("default 1");
+
+        // The restored layout: only TAB_C, under a panel id the default never used.
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(7, &[TAB_C])).expect("restored");
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, TAB_B, TAB_C],
+            Some(&default)
+        ));
+        let created = layout
+            .panel_of_tab(TAB_A)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_A");
+        assert_eq!(
+            created.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.25,
+            }
+        );
+        assert_eq!(created.pos, Pos2::new(11.0, 12.0));
+        assert_eq!(created.size_override, Some(Vec2::new(340.0, 160.0)));
+
+        // The default's PANEL anchor is re-addressed by the tab its target holds:
+        // the default's `PanelId::new(0)` means nothing in this layout.
+        let dependant = layout
+            .panel_of_tab(TAB_B)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_B");
+        assert_eq!(
+            dependant.anchor,
+            PanelAnchor::Panel {
+                target: created.id,
+                edge: DockEdge::Bottom,
+                align: 0.5,
+            }
+        );
+        assert_eq!(layout.validate(), Ok(()));
+    }
+
+    /// The other branch: the default has an opinion the restored layout cannot
+    /// express, so the panel falls back to the cascade instead of being anchored
+    /// to a panel that is not there (or to a panel of the wrong window).
+    #[test]
+    fn a_default_anchor_that_does_not_resolve_falls_back_to_the_cascade() {
+        // The default anchors TAB_A to the panel holding TAB_C…
+        let mut default = DockLayout::new();
+        default.insert_panel(panel_with(0, &[TAB_C])).expect("default 0");
+        let mut anchored = panel_with(1, &[TAB_A]);
+        anchored.anchor = PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Right,
+            align: 0.0,
+        };
+        anchored.pos = Pos2::new(500.0, 400.0);
+        default.insert_panel(anchored).expect("default 1");
+
+        // …and the restored layout does not hold TAB_C at all.
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(0, &[TAB_B])).expect("restored");
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A],
+            Some(&default)
+        ));
+        let created = layout
+            .panel_of_tab(TAB_A)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_A");
+        assert_eq!(created.anchor, PanelAnchor::Free);
+        // The cascade, not the default's own position.
+        let offset = DOCK_GAP + AUTO_PANEL_CASCADE_STEP;
+        assert_eq!(created.pos, Pos2::new(offset, offset));
+        assert_eq!(created.size_override, None);
+
+        // A tab the default does not know at all takes the cascade too.
+        const TAB_D: TabId = TabId::new("test.d");
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_D],
+            Some(&default)
+        ));
+        let unknown = layout
+            .panel_of_tab(TAB_D)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_D");
+        assert_eq!(unknown.anchor, PanelAnchor::Free);
+        let offset = DOCK_GAP + 2.0 * AUTO_PANEL_CASCADE_STEP;
+        assert_eq!(unknown.pos, Pos2::new(offset, offset));
+    }
+
+    /// Every solved rect of `layout` is disjoint from every other one — the same
+    /// property `the_default_dock_layout_places_every_panel_clear_of_the_others`
+    /// pins for the pristine typing default, asserted here for a SEEDED panel.
+    fn assert_panels_stand_clear(layout: &DockLayout) -> SolvedLayout {
+        let solved = solve(
+            layout,
+            HostId::MainWindow,
+            AREA,
+            &PanelSizes::new(),
+            &PanelSizes::new(),
+            PanelChrome::default(),
+        );
+        let placed: Vec<(PanelId, Rect)> = solved.iter().map(|(id, panel)| (id, panel.rect)).collect();
+        for (index, (left_id, left)) in placed.iter().enumerate() {
+            for (right_id, right) in placed.iter().skip(index + 1) {
+                assert!(
+                    !left.intersect(*right).is_positive(),
+                    "panels {left_id} and {right_id} overlap: {left:?} vs {right:?}"
+                );
+            }
+        }
+        solved
+    }
+
+    /// The natural way a new build adds a tab is to put it into an EXISTING
+    /// default panel. The seeded panel then inherits that panel's whole anchor and
+    /// pinned size while holding the new tab ALONE, and the solver lays two panels
+    /// sharing target + edge + align on exactly the same rect: the newcomer has the
+    /// highest id, is drawn last, and buries the live panel completely — which
+    /// cannot even be dragged out again. So the seeded panel queues behind it.
+    #[test]
+    fn a_seeded_panel_queues_behind_the_live_panel_already_in_its_slot() {
+        let pinned = Some(Vec2::new(300.0, 200.0));
+        let edge_anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.0,
+        };
+        let under_root = PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        };
+
+        // The new build's default: the added TAB_C shares a panel with TAB_B,
+        // docked under the panel holding TAB_A.
+        let mut default = DockLayout::new();
+        let mut root = panel_with(0, &[TAB_A]);
+        root.anchor = edge_anchor;
+        root.size_override = pinned;
+        default.insert_panel(root).expect("default 0");
+        let mut hanging = panel_with(1, &[TAB_B, TAB_C]);
+        hanging.anchor = under_root;
+        hanging.size_override = pinned;
+        default.insert_panel(hanging).expect("default 1");
+
+        // The user's restored layout, written by the build that had no TAB_C.
+        let mut layout = DockLayout::new();
+        let mut live_root = panel_with(4, &[TAB_A]);
+        live_root.anchor = edge_anchor;
+        live_root.size_override = pinned;
+        layout.insert_panel(live_root).expect("restored root");
+        let mut live_hanging = panel_with(5, &[TAB_B]);
+        live_hanging.anchor = PanelAnchor::Panel {
+            target: PanelId::new(4),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        };
+        live_hanging.size_override = pinned;
+        layout.insert_panel(live_hanging).expect("restored hanging");
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_A, TAB_B, TAB_C],
+            Some(&default)
+        ));
+        assert_eq!(layout.validate(), Ok(()));
+        let created = layout
+            .panel_of_tab(TAB_C)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_C");
+        // Queued behind the live occupant of the slot, flush with it — not on it.
+        assert_eq!(
+            created.anchor,
+            PanelAnchor::Panel {
+                target: PanelId::new(5),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            }
+        );
+
+        // The contract is geometric, so it is checked on the solved rects.
+        let solved = assert_panels_stand_clear(&layout);
+        assert_eq!(solved.len(), 3, "every panel is placed");
+        let occupant = solved.get(PanelId::new(5)).expect("the live panel is placed");
+        let newcomer = solved.get(created.id).expect("the seeded panel is placed");
+        assert_ne!(newcomer.rect, occupant.rect);
+        // Reachable: the whole panel — its header strip included — is inside the
+        // dock area, so it can be grabbed and dragged elsewhere.
+        assert!(
+            AREA.contains_rect(newcomer.rect),
+            "the seeded panel {:?} left the dock area {AREA:?}",
+            newcomer.rect
+        );
+    }
+
+    /// The same rule for a FREE default placement: a seeded free panel is placed
+    /// by its own position, so it steps off a live panel standing there instead of
+    /// covering it.
+    #[test]
+    fn a_seeded_free_panel_steps_off_the_position_it_would_bury() {
+        let mut default = DockLayout::new();
+        let mut free = panel_with(0, &[TAB_C]);
+        free.pos = Pos2::new(120.0, 90.0);
+        default.insert_panel(free).expect("default 0");
+
+        let mut layout = DockLayout::new();
+        let mut live = panel_with(0, &[TAB_A]);
+        live.pos = Pos2::new(120.0, 90.0);
+        layout.insert_panel(live).expect("restored");
+
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_C],
+            Some(&default)
+        ));
+        let created = layout
+            .panel_of_tab(TAB_C)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_C");
+        assert_eq!(created.anchor, PanelAnchor::Free);
+        assert_eq!(
+            created.pos,
+            Pos2::new(120.0, 90.0) + Vec2::splat(AUTO_PANEL_CASCADE_STEP)
+        );
+    }
+
+    /// Seeding must not depend on the order the caller happens to declare its
+    /// tabs in. A default anchor is resolved against the LIVE layout, so a tab
+    /// hanging off another NEWLY declared one finds no target until that one has
+    /// been created — and declaration order is the caller's business.
+    #[test]
+    fn seeding_does_not_depend_on_the_declaration_order() {
+        // The default: TAB_B hangs off the panel holding TAB_A.
+        let mut default = DockLayout::new();
+        let mut root = panel_with(0, &[TAB_A]);
+        root.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.25,
+        };
+        root.size_override = Some(Vec2::new(340.0, 160.0));
+        default.insert_panel(root).expect("default 0");
+        let mut hanging = panel_with(1, &[TAB_B]);
+        hanging.anchor = PanelAnchor::Panel {
+            target: PanelId::new(0),
+            edge: DockEdge::Bottom,
+            align: 0.5,
+        };
+        default.insert_panel(hanging).expect("default 1");
+
+        // Both tabs are new, and the dependant is declared FIRST.
+        let mut layout = DockLayout::new();
+        layout.insert_panel(panel_with(7, &[TAB_C])).expect("restored");
+        assert!(ensure_declared_tabs(
+            &mut layout,
+            HostId::MainWindow,
+            &[TAB_B, TAB_A],
+            Some(&default)
+        ));
+        assert_eq!(layout.validate(), Ok(()));
+
+        let root = layout
+            .panel_of_tab(TAB_A)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_A");
+        assert_eq!(
+            root.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.25,
+            }
+        );
+        // The dependant found its target although it was declared before it: the
+        // anchor is the default's, not the cascade the missing target would give.
+        let dependant = layout
+            .panel_of_tab(TAB_B)
+            .and_then(|id| layout.panel(id))
+            .expect("a panel was created for TAB_B");
+        assert_eq!(
+            dependant.anchor,
+            PanelAnchor::Panel {
+                target: root.id,
+                edge: DockEdge::Bottom,
+                align: 0.5,
+            }
+        );
+        // Seeded root-first, whatever the declaration order says.
+        assert!(root.id < dependant.id);
+        assert_panels_stand_clear(&layout);
     }
 
     #[test]
@@ -3137,7 +3816,6 @@ mod tests {
             AREA,
             &plan.desired,
             &plan.mins,
-            None,
             PanelChrome::default(),
         );
         let root = solved.get(PanelId::new(0)).expect("root solved").rect;
@@ -3153,8 +3831,8 @@ mod tests {
         // used to end.
         let mut layout = DockLayout::new();
         let mut root = panel_with(0, &[TAB_A]);
-        root.anchor = PanelAnchor::CanvasControls {
-            edge: DockEdge::Bottom,
+        root.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
             along: 0.0,
         };
         layout.insert_panel(root).expect("insert 0");
@@ -3177,24 +3855,25 @@ mod tests {
                 .panel(PanelId::new(1))
                 .expect("survivor")
                 .anchor,
-            PanelAnchor::CanvasControls {
-                edge: DockEdge::Bottom,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
                 along: 0.0,
             }
         );
 
-        let controls = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(200.0, 40.0));
         let solved = solve(
             &effective,
             HostId::MainWindow,
             AREA,
             &plan.desired,
             &plan.mins,
-            Some(controls),
             PanelChrome::default(),
         );
+        // The survivor is laid out where the hidden ROOT would have been —
+        // flush with the area's left side — instead of one root-height lower.
         let rect = solved.get(PanelId::new(1)).expect("solved").rect;
-        assert!((rect.top() - controls.bottom() - DOCK_GAP).abs() < 0.01);
+        assert!((rect.left() - AREA.left() - DOCK_GAP).abs() < 0.01);
+        assert!((rect.top() - AREA.top()).abs() < 0.01);
     }
 
     #[test]
@@ -3390,26 +4069,27 @@ mod tests {
     fn the_plan_feeds_the_solver_and_keeps_the_declared_geometry() {
         let mut layout = DockLayout::new();
         let mut node = panel_with(0, &[TAB_A]);
-        node.anchor = PanelAnchor::CanvasControls {
-            edge: DockEdge::Bottom,
+        node.anchor = PanelAnchor::ViewportEdge {
+            edge: DockEdge::Top,
             along: 0.0,
         };
         layout.insert_panel(node).expect("insert 0");
         let decls = decls(&[(TAB_A, meta(true, None, Some(Vec2::new(300.0, 240.0))))]);
         let plan = plan_frame(&layout, HostId::MainWindow, &decls, &HashMap::new());
-        let controls = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(200.0, 40.0));
         let solved = solve(
             &layout,
             HostId::MainWindow,
             AREA,
             &plan.desired,
             &plan.mins,
-            Some(controls),
             PanelChrome::default(),
         );
         let panel = solved.get(PanelId::new(0)).expect("solved");
+        // The size the plan derived from the declaration reaches the solver, and
+        // the anchor the model carries decides where that size is placed.
         assert_eq!(panel.rect.size(), Vec2::new(300.0, 240.0));
-        assert!((panel.rect.top() - controls.bottom() - DOCK_GAP).abs() < 0.01);
+        assert!((panel.rect.top() - AREA.top() - DOCK_GAP).abs() < 0.01);
+        assert!((panel.rect.left() - AREA.left()).abs() < 0.01);
         assert!((panel.body_max_height - (240.0 - COLLAPSED_PANEL_HEIGHT)).abs() < 0.01);
     }
 
@@ -3537,7 +4217,6 @@ mod tests {
             area,
             &plan.desired,
             &plan.mins,
-            None,
             PanelChrome::default(),
         );
         write_back_positions(&mut layout, &solved, area.min);
@@ -3561,7 +4240,6 @@ mod tests {
             area,
             &plan.desired,
             &plan.mins,
-            None,
             PanelChrome::default(),
         );
         let rect = solved.get(PanelId::new(1)).expect("solved").rect;
@@ -3589,7 +4267,6 @@ mod tests {
                 AREA,
                 &plan.desired,
                 &plan.mins,
-                None,
                 PanelChrome::default(),
             );
             write_back_positions(layout, &solved, AREA.min);
@@ -3629,7 +4306,6 @@ mod tests {
             AREA,
             &plan.desired,
             &plan.mins,
-            None,
             PanelChrome::default(),
         );
         for panel in &plan.panels {
@@ -3756,16 +4432,9 @@ mod tests {
             AREA,
             &desired,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
-        assert!(apply_panel_drop(
-            &mut layout,
-            PanelId::new(1),
-            &solved,
-            AREA,
-            None
-        ));
+        assert!(apply_panel_drop(&mut layout, PanelId::new(1), &solved, AREA));
         assert_eq!(
             layout.panel(PanelId::new(1)).expect("dropped").anchor,
             PanelAnchor::Panel {
@@ -3790,10 +4459,9 @@ mod tests {
             AREA,
             &desired,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
-        apply_panel_drop(&mut layout, PanelId::new(0), &solved, AREA, None);
+        apply_panel_drop(&mut layout, PanelId::new(0), &solved, AREA);
         assert_eq!(
             layout.panel(PanelId::new(0)).expect("dropped").anchor,
             PanelAnchor::Free
@@ -3825,9 +4493,82 @@ mod tests {
     #[test]
     fn measurements_round_trip_through_the_state() {
         let mut state = PanelDockState::new();
-        assert_eq!(state.measured_size(TAB_A), None);
-        state.measured.insert(TAB_A, Vec2::new(300.0, 210.0));
-        assert_eq!(state.measured_size(TAB_A), Some(Vec2::new(300.0, 210.0)));
+        assert_eq!(state.measured_size("typing", TAB_A), None);
+        state.remember_measurement("typing", TAB_A, Vec2::new(300.0, 210.0));
+        assert_eq!(
+            state.measured_size("typing", TAB_A),
+            Some(Vec2::new(300.0, 210.0))
+        );
+        // The same tab drawn by ANOTHER program tab is a different measurement.
+        assert_eq!(state.measured_size("cleaning", TAB_A), None);
+    }
+
+    /// One `TabId` — the canvas' «Лента» — is declared by three program tabs that
+    /// share one dock state. A measurement taken while one of them was drawn must
+    /// not size the panel of another, or resizing the ribbon in «Текст» would make
+    /// «Клининг»' ribbon (which carries no `size_override`) jump to that width on
+    /// the next tab switch.
+    #[test]
+    fn a_measurement_does_not_leak_into_another_program_tabs_layout() {
+        let mut state = PanelDockState::new();
+        state.layouts.insert("typing".to_owned(), single_panel_default_layout());
+        state.layouts.insert("cleaning".to_owned(), single_panel_default_layout());
+        // The user dragged the shared tab wide while «Текст» was drawn.
+        state.remember_measurement("typing", TAB_A, Vec2::new(560.0, 480.0));
+
+        let declared = decls(&[(
+            TAB_A,
+            meta(true, None, Some(Vec2::new(340.0, 160.0))),
+        )]);
+        let no_measurements = HashMap::new();
+        let typing = plan_frame(
+            state.layout("typing").expect("typing layout"),
+            HostId::MainWindow,
+            &declared,
+            state.measurements("typing").unwrap_or(&no_measurements),
+        );
+        assert_eq!(typing.panels[0].assumed_size, Vec2::new(560.0, 480.0));
+
+        // «Клининг» has never drawn it: it starts from the DECLARED initial size.
+        let cleaning = plan_frame(
+            state.layout("cleaning").expect("cleaning layout"),
+            HostId::MainWindow,
+            &declared,
+            state.measurements("cleaning").unwrap_or(&no_measurements),
+        );
+        assert_eq!(cleaning.panels[0].assumed_size, Vec2::new(340.0, 160.0));
+    }
+
+    /// A `PanelDockOutput` is filled by EVERY window of the dock, and a
+    /// sub-window's rect is in that window's own frame — where the dock area
+    /// starts near the origin. Handing it to a caller that anchors main-window UI
+    /// (or occludes main-window pointer input) with it puts a dead zone in this
+    /// window's top-left corner, so a detached panel must read as "not on screen".
+    #[test]
+    fn the_output_answers_for_the_main_window_only() {
+        let main = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(300.0, 200.0));
+        // The very rect a detached panel reports: its window's own coordinates.
+        let detached = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::new(340.0, 160.0));
+        let mut output = PanelDockOutput::default();
+        output.record(HostId::MainWindow, PanelId::new(0), main, &[TAB_A]);
+        output.record(HostId::SubWindow(1), PanelId::new(3), detached, &[TAB_B]);
+
+        assert_eq!(output.panel_rect(PanelId::new(0)), Some(main));
+        assert_eq!(output.tab_rect(TAB_A), Some(main));
+        assert_eq!(output.panel_rect(PanelId::new(3)), None);
+        assert_eq!(output.tab_rect(TAB_B), None);
+        assert_eq!(output.drawn_panels().collect::<Vec<_>>(), vec![(
+            PanelId::new(0),
+            main
+        )]);
+        assert!(!output.is_empty());
+
+        // A dock whose every panel is detached has nothing to say about this window.
+        let mut detached_only = PanelDockOutput::default();
+        detached_only.record(HostId::SubWindow(1), PanelId::new(3), detached, &[TAB_B]);
+        assert!(detached_only.is_empty());
+        assert_eq!(detached_only.tab_rect(TAB_B), None);
+        assert_eq!(detached_only.drawn_panels().count(), 0);
     }
 
     #[test]
@@ -3864,7 +4605,8 @@ mod tests {
         assert!(ensure_declared_tabs(
             layout,
             HostId::MainWindow,
-            &[TAB_A, TAB_B]
+            &[TAB_A, TAB_B],
+            None
         ));
         assert_eq!(layout.panel_of_tab(TAB_A), Some(PanelId::new(0)));
         assert_eq!(layout.panel_of_tab(TAB_B), Some(PanelId::new(1)));
@@ -4180,7 +4922,7 @@ mod tests {
         let mut state = state_with_two_panels_in_a_sub_window();
         state.host_areas.insert(HostId::MainWindow, AREA);
         for tab in [TAB_A, TAB_B, TAB_C] {
-            state.measured.insert(tab, PANEL_SIZE);
+            state.remember_measurement("typing", tab, PANEL_SIZE);
         }
         state
     }

@@ -56,7 +56,12 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   override, and hidden installer/update continuation flags.
 - `app.rs`: root `eframe::App`, shared model construction, tab wiring, unified source-page +
   clean-overlay loader polling, source-page geometry metadata, incremental texture upload and
-  source GPU trimming, shared viewport sync, AI backend health wiring, and global hotkey dispatch.
+  source GPU trimming, shared viewport sync, AI backend health wiring, global hotkey dispatch, and
+  ownership of the window's single panel-dock state (restore before the first frame, lend to the
+  drawing tab, poll for persistence, keep the detached windows alive while no host tab draws). The
+  dock hosts are the three CANVAS tabs — translation, cleaning and typing — each of which runs the
+  dock inside `CanvasHooks::draw_canvas_overlay_top_left`; the state reaches them through
+  `CanvasDrawParams::panel_dock`, which the canvas only carries.
 - `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
   the background project load behind a loading screen (or an error screen with exit/return-to-
   launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it. It also owns
@@ -98,13 +103,16 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - Dockable-panel arrangement: `widgets/panel_dock/persist.rs` owns the self-versioned `PanelLayout`
   section of `user_config.json` (one entry per program tab, keyed by `AppTab::key()`). It is the
   only writer of that section and does all of its I/O on a `config_saver` thread
-  (`PanelLayoutWriter`, owned by `MangaApp`, flushed in `on_exit`); `app.rs` polls the tab's dock
-  state for a dirty layout once per frame. Loading happens once before the first frame, from the
-  startup `user_settings` snapshot, so a stored layout wins over the tab's default one. The section
-  also carries the dock's detached OS windows (`sub_windows`), which a panel addresses through its
-  `host`; `app.rs` additionally calls `TypingTabState::draw_idle_dock_sub_windows` on every frame
-  where the «Текст» tab is NOT active, because those windows are immediate viewports and exist only
-  while they are shown.
+  (`PanelLayoutWriter`, owned by `MangaApp`, flushed in `on_exit`). The dock STATE is app-owned too
+  — `MangaApp::panel_dock`, exactly one per studio window, lent to the drawing tab for the frame —
+  because sub-window indices, the persisted window list and the layouts of every program tab are one
+  shared thing; `app.rs` polls it for a dirty layout once per frame. Loading happens once before the
+  first frame, from the startup `user_settings` snapshot (`app.rs::restore_panel_dock`), so a stored
+  layout wins over a tab's default one. The section also carries the dock's detached OS windows
+  (`sub_windows`), which a panel addresses through its `host`; `app.rs` additionally calls
+  `PanelDockState::show_idle_sub_windows` on every frame whose active tab is not a dock host
+  (`tab_hosts_panel_dock`), because those windows are immediate viewports and exist only while they
+  are shown.
 - `window_geometry.rs`: native-only (`#[cfg(not(wasm32))]`) owner of the self-versioned `Window`
   section of `user_config.json` — the user's primary-monitor choice, the largest monitor seen
   last run, and the studio window's restored position/size/maximized state. Provides the pure

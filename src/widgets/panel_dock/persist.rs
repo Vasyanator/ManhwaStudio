@@ -54,6 +54,15 @@ declare is dropped (a removed tab must not wedge the layout); a tab this build
 declares but the file does not name is re-created by the dock's own
 `ensure_declared_tabs`. A section whose `version` is newer than
 `PANEL_LAYOUT_SECTION_VERSION` is neither read nor overwritten.
+
+A tag of `StoredAnchor` that the runtime model no longer has must stay
+DECODABLE for as long as the section version does not change. The enum is
+internally tagged and has no `#[serde(other)]`, and the whole section is decoded
+by ONE `from_value`, so an unknown tag is not a per-panel repair but a failure of
+the entire section: every program tab would silently fall back to its default
+arrangement and the first dirty write would make that permanent
+(`StoredAnchor::CanvasControls` is the standing example). Retiring such a tag for
+real means bumping the version and writing a migration, never a plain deletion.
 */
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -182,7 +191,19 @@ enum StoredAnchor {
     },
     /// Attached inside the host area, flush with one of its sides.
     ViewportEdge { edge: StoredEdge, along: f32 },
-    /// Attached outside the `CanvasView` controls rect.
+    /// LEGACY INPUT ONLY — never produced by [`encode_anchor`].
+    ///
+    /// Written by the builds in which the canvas' controls panel was not a dock
+    /// panel but a rect the solver received as an input
+    /// (`PanelAnchor::CanvasControls`, removed with the «Лента» tab). The variant
+    /// survives here because this enum is internally tagged and carries no
+    /// `#[serde(other)]`: the WHOLE section is decoded by one `from_value`, so a
+    /// tag serde does not know fails the entire section, and every layout of
+    /// every program tab would silently reset to its default.
+    ///
+    /// Scope: decoding only, mapped by [`decode_anchor`]. **Removable** once no
+    /// supported upgrade path can still carry a section written by such a build —
+    /// which needs a section version bump plus a migration, not a plain deletion.
     CanvasControls { edge: StoredEdge, along: f32 },
 }
 
@@ -466,6 +487,18 @@ fn decode_layout(
 /// A `Panel` anchor whose target was dropped, is out of range, or is the panel
 /// itself degrades to `Free`: the panel keeps its stored position and stays
 /// draggable, which is strictly better than dropping it.
+///
+/// [`StoredAnchor::CanvasControls`] — a build in which the canvas' controls were
+/// an anchor rather than a dock panel — degrades to `Free` for the same reason.
+/// The panel then keeps its STORED `pos`, which is the position it was last drawn
+/// at under that anchor: the driver refreshes every panel's `pos` from the solved
+/// rect on each frame (`mod.rs::write_back_positions`). That is as far as the
+/// guarantee goes — where the file carries no `pos` at all, or a non-finite one,
+/// `StoredPanel::pos` defaults to `[0.0, 0.0]` and `sane_coord` zeroes it, so the
+/// panel arrives at the host area's origin like any other position-less stored
+/// panel. Mapping the anchor onto the panel that now holds the «Лента» tab would
+/// need the same coordinates anyway and would make this module depend on a
+/// specific program tab's tab set, which the layer boundary forbids.
 fn decode_anchor(
     anchor: StoredAnchor,
     new_index: &[Option<u32>],
@@ -502,10 +535,14 @@ fn decode_anchor(
             edge: edge.into(),
             along,
         },
-        StoredAnchor::CanvasControls { edge, along } => PanelAnchor::CanvasControls {
-            edge: edge.into(),
-            along,
-        },
+        StoredAnchor::CanvasControls { .. } => {
+            runtime_log::log_info(format!(
+                "[panel_dock::persist] `{key}`: stored panel #{index} uses the legacy \
+                 canvas-controls anchor; it is restored free-floating at its stored position and \
+                 will be written back without that anchor"
+            ));
+            PanelAnchor::Free
+        }
     }
 }
 
@@ -673,6 +710,10 @@ fn encode_layout(layout: &DockLayout) -> StoredTabLayout {
 
 /// Converts one anchor into its stored form, mapping a panel target onto its
 /// list index.
+///
+/// Total over `PanelAnchor`, which is why the legacy-only
+/// [`StoredAnchor::CanvasControls`] can never be produced here: the runtime model
+/// has no variant that maps onto it.
 fn encode_anchor(anchor: PanelAnchor, positions: &BTreeMap<PanelId, u32>) -> StoredAnchor {
     match anchor {
         PanelAnchor::Free => StoredAnchor::Free,
@@ -689,10 +730,6 @@ fn encode_anchor(anchor: PanelAnchor, positions: &BTreeMap<PanelId, u32>) -> Sto
             None => StoredAnchor::Free,
         },
         PanelAnchor::ViewportEdge { edge, along } => StoredAnchor::ViewportEdge {
-            edge: edge.into(),
-            along,
-        },
-        PanelAnchor::CanvasControls { edge, along } => StoredAnchor::CanvasControls {
             edge: edge.into(),
             along,
         },
@@ -768,13 +805,15 @@ impl config_saver::SaverPayload for PanelLayoutSnapshot {
     /// Folds a newer snapshot over this one PER PROGRAM TAB: it overwrites the
     /// entry of every key it carries and leaves the others in place. Replacing
     /// the whole map would drop the pending layout of a program tab the newer
-    /// snapshot says nothing about — which is exactly what happens once more
-    /// than one dock state feeds this writer (phase 8).
+    /// snapshot says nothing about — and a snapshot legitimately carries only the
+    /// keys whose layouts changed.
     ///
     /// The sub-window list, by contrast, is REPLACED: it is one global list, so
-    /// the newest snapshot is the whole truth about it. (Phase 8 must therefore
-    /// keep the windows in ONE dock state, or teach this fold how several
-    /// feeders share them.)
+    /// the newest snapshot is the whole truth about it. That is sound because the
+    /// writer has exactly ONE feeder — the studio window's single
+    /// `PanelDockState`, owned by `MangaApp` — so every snapshot describes all
+    /// windows. A second feeder would have to teach this fold how they share the
+    /// list; the project deliberately does not have one.
     ///
     /// The same rule serves the debounce window and the retry queue, so "the
     /// last writer of a program tab wins" holds on both paths.
@@ -1468,6 +1507,389 @@ mod tests {
     fn only_a_transient_failure_is_worth_retrying() {
         assert!(!PanelLayoutError::NewerVersion { found: 99 }.is_retryable());
         assert!(transient_failure().is_retryable());
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy `canvas_controls` anchor: the section must still decode WHOLE
+    // -----------------------------------------------------------------------
+
+    /// The eight tab keys a pre-«Лента» build stored for the typing program tab.
+    const LEGACY_TYPING_TABS: [TabId; 8] = [
+        TabId::new("typing.preview"),
+        TabId::new("typing.params"),
+        TabId::new("typing.effects"),
+        TabId::new("typing.mask"),
+        TabId::new("typing.deform"),
+        TabId::new("typing.layout_editor"),
+        TabId::new("typing.actions"),
+        TabId::new("typing.layers"),
+    ];
+
+    /// The «Лента» tab, which the second program tab of the fixture declares.
+    const LEGACY_RIBBON_TAB: TabId = TabId::new("canvas.ribbon");
+
+    /// Builds a one-panel default layout naming `tabs`.
+    ///
+    /// A default layout is used by [`layouts_from_user_settings`] only as the
+    /// dictionary of tab keys a stored layout is resolved against, so its own
+    /// arrangement is irrelevant here.
+    fn dictionary_layout(tabs: &[TabId]) -> DockLayout {
+        let node = match PanelNode::new(PanelId::new(0), HostId::MainWindow, tabs.to_vec()) {
+            Ok(node) => node,
+            Err(error) => unreachable!("the fixture panel is valid: {error}"),
+        };
+        match DockLayout::from_panels(vec![node]) {
+            Ok(layout) => layout,
+            Err(error) => unreachable!("the fixture layout is valid: {error}"),
+        }
+    }
+
+    fn legacy_typing_dictionary() -> DockLayout {
+        dictionary_layout(&LEGACY_TYPING_TABS)
+    }
+
+    fn legacy_cleaning_dictionary() -> DockLayout {
+        dictionary_layout(&[LEGACY_RIBBON_TAB])
+    }
+
+    fn legacy_defaults() -> [LayoutDefault<'static>; 2] {
+        [
+            ("typing", legacy_typing_dictionary as fn() -> DockLayout),
+            ("cleaning", legacy_cleaning_dictionary as fn() -> DockLayout),
+        ]
+    }
+
+    /// A version-1 section exactly as a pre-«Лента» build wrote it: six typing
+    /// panels whose first one carries the retired `canvas_controls` anchor and is
+    /// the anchor TARGET of two others, plus a second program tab whose panel
+    /// lives in a detached window.
+    fn legacy_section() -> Value {
+        serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "sub_windows": [
+                { "index": 3, "pos": [240.0, 120.0], "size": [420.0, 560.0] }
+            ],
+            "tabs": {
+                "typing": { "panels": [
+                    {
+                        "tabs": ["typing.preview"],
+                        "active": "typing.preview",
+                        "anchor": {
+                            "kind": "canvas_controls",
+                            "edge": "bottom",
+                            "along": 0.017_609_848
+                        },
+                        "collapsed": false,
+                        "host": "main",
+                        "pos": [12.727_575, 122.187_5],
+                        "size": [276.652_34, 292.027_34]
+                    },
+                    {
+                        "tabs": ["typing.params", "typing.effects"],
+                        "active": "typing.params",
+                        "anchor": { "kind": "viewport_edge", "edge": "right", "along": 0.038_616_493 },
+                        "collapsed": false,
+                        "host": "main",
+                        "pos": [1_573.218_75, 19.582_031],
+                        "size": [434.781_25, 533.316_4]
+                    },
+                    {
+                        "tabs": ["typing.mask"],
+                        "active": "typing.mask",
+                        "anchor": { "kind": "panel", "target": 1, "edge": "bottom", "align": 0.0 },
+                        "collapsed": false,
+                        "host": "main",
+                        "pos": [0.0, 0.0]
+                    },
+                    {
+                        "tabs": ["typing.deform"],
+                        "active": "typing.deform",
+                        "anchor": { "kind": "panel", "target": 0, "edge": "bottom", "align": 0.008_073_221 },
+                        "collapsed": false,
+                        "host": "main",
+                        "pos": [0.0, 0.0]
+                    },
+                    {
+                        "tabs": ["typing.layout_editor"],
+                        "active": "typing.layout_editor",
+                        "anchor": { "kind": "panel", "target": 3, "edge": "bottom", "align": 0.0 },
+                        "collapsed": false,
+                        "host": "main",
+                        "pos": [0.0, 0.0]
+                    },
+                    {
+                        "tabs": ["typing.actions", "typing.layers"],
+                        "active": "typing.actions",
+                        "anchor": { "kind": "panel", "target": 0, "edge": "bottom", "align": 0.0 },
+                        "collapsed": true,
+                        "host": "main",
+                        "pos": [12.727_575, 422.214_84],
+                        "size": [277.511_72, 284.738_28]
+                    }
+                ] },
+                "cleaning": { "panels": [
+                    {
+                        "tabs": ["canvas.ribbon"],
+                        "active": "canvas.ribbon",
+                        "anchor": { "kind": "free" },
+                        "collapsed": false,
+                        "host": { "sub_window": 3 },
+                        "pos": [8.0, 8.0],
+                        "size": [320.0, 180.0]
+                    }
+                ] }
+            }
+        })
+    }
+
+    #[test]
+    fn a_legacy_canvas_controls_anchor_keeps_the_whole_stored_arrangement() {
+        // The regression this pins is total, not local: `StoredAnchor` is
+        // internally tagged with no `#[serde(other)]` and the whole section is
+        // decoded by ONE `from_value`, so dropping the retired tag would fail the
+        // section and reset EVERY program tab's layout — permanently, on the next
+        // dirty write. Every panel, tab, size, host and window is asserted.
+        let restored =
+            layouts_from_user_settings(&user_settings_with(legacy_section()), &legacy_defaults());
+
+        let typing = match restored.layouts.get("typing") {
+            Some(layout) => layout,
+            None => unreachable!("the legacy section must decode"),
+        };
+        assert_eq!(typing.panels().len(), 6);
+        assert_eq!(typing.validate(), Ok(()));
+
+        let tabs: Vec<Vec<TabId>> = typing
+            .panels()
+            .iter()
+            .map(|panel| panel.tabs.clone())
+            .collect();
+        assert_eq!(tabs, vec![
+            vec![TabId::new("typing.preview")],
+            vec![TabId::new("typing.params"), TabId::new("typing.effects")],
+            vec![TabId::new("typing.mask")],
+            vec![TabId::new("typing.deform")],
+            vec![TabId::new("typing.layout_editor")],
+            vec![TabId::new("typing.actions"), TabId::new("typing.layers")],
+        ]);
+        let active: Vec<TabId> = typing
+            .panels()
+            .iter()
+            .map(|panel| panel.active_tab)
+            .collect();
+        assert_eq!(active, vec![
+            TabId::new("typing.preview"),
+            TabId::new("typing.params"),
+            TabId::new("typing.mask"),
+            TabId::new("typing.deform"),
+            TabId::new("typing.layout_editor"),
+            TabId::new("typing.actions"),
+        ]);
+
+        // The retired anchor becomes `Free` at the position the panel was last
+        // drawn at, which is the geometry the old anchor produced.
+        assert_eq!(typing.panels()[0].anchor, PanelAnchor::Free);
+        assert_eq!(typing.panels()[0].pos, Pos2::new(12.727_575, 122.187_5));
+        assert_eq!(
+            typing.panels()[0].size_override,
+            Some(Vec2::new(276.652_34, 292.027_34))
+        );
+
+        // Every other anchor survives untouched — including the two panels that
+        // address the legacy-anchored one by index.
+        let anchors: Vec<PanelAnchor> = typing
+            .panels()
+            .iter()
+            .map(|panel| panel.anchor)
+            .collect();
+        assert_eq!(anchors, vec![
+            PanelAnchor::Free,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Right,
+                along: 0.038_616_493,
+            },
+            PanelAnchor::Panel {
+                target: PanelId::new(1),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Bottom,
+                align: 0.008_073_221,
+            },
+            PanelAnchor::Panel {
+                target: PanelId::new(3),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            PanelAnchor::Panel {
+                target: PanelId::new(0),
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+        ]);
+
+        let sizes: Vec<Option<Vec2>> = typing
+            .panels()
+            .iter()
+            .map(|panel| panel.size_override)
+            .collect();
+        assert_eq!(sizes, vec![
+            Some(Vec2::new(276.652_34, 292.027_34)),
+            Some(Vec2::new(434.781_25, 533.316_4)),
+            None,
+            None,
+            None,
+            Some(Vec2::new(277.511_72, 284.738_28)),
+        ]);
+        let collapsed: Vec<bool> = typing
+            .panels()
+            .iter()
+            .map(|panel| panel.collapsed)
+            .collect();
+        assert_eq!(collapsed, vec![false, false, false, false, false, true]);
+        assert!(
+            typing
+                .panels()
+                .iter()
+                .all(|panel| panel.host == HostId::MainWindow)
+        );
+
+        // The second program tab and the window it lives in are untouched too.
+        let cleaning = match restored.layouts.get("cleaning") {
+            Some(layout) => layout,
+            None => unreachable!("the second program tab must decode as well"),
+        };
+        assert_eq!(cleaning.panels().len(), 1);
+        assert_eq!(cleaning.panels()[0].tabs, vec![LEGACY_RIBBON_TAB]);
+        assert_eq!(cleaning.panels()[0].host, HostId::SubWindow(3));
+        assert_eq!(cleaning.panels()[0].pos, Pos2::new(8.0, 8.0));
+        assert_eq!(
+            restored.sub_windows,
+            vec![SubWindowNode::new(
+                3,
+                Some(Pos2::new(240.0, 120.0)),
+                Vec2::new(420.0, 560.0)
+            )]
+        );
+    }
+
+    /// The legacy anchor keeps the panel's stored position — and NOTHING more.
+    /// A file that carries no `pos` for such a panel leaves it at the host area's
+    /// ORIGIN, exactly like any other position-less stored panel: `StoredPanel::pos`
+    /// is `#[serde(default)]`. The compatibility path reproduces the old geometry
+    /// only as far as the file describes it, which is what `decode_anchor`'s
+    /// contract says.
+    #[test]
+    fn a_legacy_anchor_without_a_stored_position_lands_at_the_origin() {
+        let section = serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "tabs": {
+                "cleaning": { "panels": [
+                    {
+                        "tabs": ["canvas.ribbon"],
+                        "active": "canvas.ribbon",
+                        "anchor": { "kind": "canvas_controls", "edge": "bottom", "along": 0.5 },
+                        "host": "main"
+                    }
+                ] }
+            }
+        });
+        let restored = layouts_from_user_settings(&user_settings_with(section), &[(
+            "cleaning",
+            legacy_cleaning_dictionary as fn() -> DockLayout,
+        )]);
+        let cleaning = match restored.layouts.get("cleaning") {
+            Some(layout) => layout,
+            None => unreachable!("the section must decode"),
+        };
+        assert_eq!(cleaning.panels().len(), 1);
+        // No `pos` field at all: serde's default, not the old anchor's geometry.
+        assert_eq!(cleaning.panels()[0].anchor, PanelAnchor::Free);
+        assert_eq!(cleaning.panels()[0].pos, Pos2::new(0.0, 0.0));
+    }
+
+    /// The legacy anchor is orthogonal to the HOST: a panel a pre-«Лента» build
+    /// left in a detached window must come back into that window, free at its
+    /// stored position, with the window itself restored. The main-window fixture
+    /// above cannot show this — `decode_anchor` and `decode_host` are separate
+    /// steps and only a panel carrying both proves they compose.
+    #[test]
+    fn a_legacy_anchor_inside_a_sub_window_keeps_its_window() {
+        let section = serde_json::json!({
+            "version": PANEL_LAYOUT_SECTION_VERSION,
+            "sub_windows": [
+                { "index": 2, "pos": [640.0, 200.0], "size": [380.0, 500.0] }
+            ],
+            "tabs": {
+                "cleaning": { "panels": [
+                    {
+                        "tabs": ["canvas.ribbon"],
+                        "active": "canvas.ribbon",
+                        "anchor": { "kind": "canvas_controls", "edge": "bottom", "along": 0.75 },
+                        "collapsed": false,
+                        "host": { "sub_window": 2 },
+                        "pos": [16.0, 24.0],
+                        "size": [300.0, 170.0]
+                    }
+                ] }
+            }
+        });
+        let restored = layouts_from_user_settings(&user_settings_with(section), &[(
+            "cleaning",
+            legacy_cleaning_dictionary as fn() -> DockLayout,
+        )]);
+        let cleaning = match restored.layouts.get("cleaning") {
+            Some(layout) => layout,
+            None => unreachable!("the section must decode"),
+        };
+        assert_eq!(cleaning.panels().len(), 1);
+        let panel = &cleaning.panels()[0];
+        assert_eq!(panel.tabs, vec![LEGACY_RIBBON_TAB]);
+        assert_eq!(panel.anchor, PanelAnchor::Free);
+        assert_eq!(panel.host, HostId::SubWindow(2));
+        assert_eq!(panel.pos, Pos2::new(16.0, 24.0));
+        assert_eq!(panel.size_override, Some(Vec2::new(300.0, 170.0)));
+        assert_eq!(
+            restored.sub_windows,
+            vec![SubWindowNode::new(
+                2,
+                Some(Pos2::new(640.0, 200.0)),
+                Vec2::new(380.0, 500.0)
+            )]
+        );
+    }
+
+    #[test]
+    fn the_legacy_anchor_tag_is_never_written_back() {
+        // Decoding keeps the section readable; encoding must retire the tag, or
+        // the compatibility path would be self-perpetuating.
+        let restored =
+            layouts_from_user_settings(&user_settings_with(legacy_section()), &legacy_defaults());
+        let encoded = match serde_json::to_value(&StoredSection {
+            version: Some(PANEL_LAYOUT_SECTION_VERSION),
+            tabs: restored
+                .layouts
+                .iter()
+                .map(|(key, layout)| (key.clone(), encode_layout(layout)))
+                .collect(),
+            sub_windows: restored.sub_windows.iter().map(encode_sub_window).collect(),
+        }) {
+            Ok(value) => value,
+            Err(error) => unreachable!("the restored section serializes: {error}"),
+        };
+        assert!(!encoded.to_string().contains("canvas_controls"));
+
+        // …and what replaced it is the free anchor at the stored position.
+        let typing = match restored.layouts.get("typing") {
+            Some(layout) => layout,
+            None => unreachable!("the legacy section must decode"),
+        };
+        assert_eq!(
+            encode_anchor(typing.panels()[0].anchor, &BTreeMap::new()),
+            StoredAnchor::Free
+        );
     }
 
     #[test]

@@ -24,6 +24,26 @@ UI panels under `panels/` expose typed options/actions and avoid owning worker l
 converts panel actions into controller requests, canvas changes, persistent settings, or storage
 jobs.
 
+This tab also HOSTS the shared panel dock (`src/widgets/panel_dock`). It declares exactly one tab —
+the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`) —
+and its default arrangement is `canvas::ribbon_only_dock_layout` — one panel at the dock area's left
+edge, the same `fn` item «Клининг» registers, handed to the dock both by `app.rs::restore_panel_dock`
+and by `ensure_default_layout`. The tab itself is declared through `canvas::declare_ribbon_tab`, the
+canvas' one declaration of it. The dock state is app-owned (`MangaApp::panel_dock`, one per studio
+window) and reaches this tab through `CanvasDrawParams::panel_dock`, which the canvas passes into
+`draw_canvas_overlay_top_left`; the tab owns none of it. `draw_panel_dock` runs at the very END of
+that hook, and what that placement buys is ONE thing: running inside `CanvasView::draw` keeps a
+«Лента» edit ahead of `publish_canvas_settings`. It buys no z-order — within one `Order` egui's
+layer list is persistent and re-sorted stably each pass, so creation order inside the frame decides
+nothing (`egui-docs/06-overlays.md` §1.1). The standing consequence is that the OCR and image-crop
+capture surfaces, full-canvas `Order::Foreground` areas, rise above the dock's panels every time
+their selection mode is ENTERED (`Area::begin` raises an area that was not visible last frame) and
+take the clicks meant for a panel until the mode ends — as they did from the pre-dock controls
+panel on the lower `Order::Middle`. The panel's rect is stored in `ribbon_panel_rect` for the NEXT
+frame, because the two text-detector edit boxes that hang under it are drawn before the dock runs;
+it is `None` while the tab is hidden or detached, since `PanelDockOutput::tab_rect` answers for the
+main window alone.
+
 Text-detector mask GPU textures are a reconstructable display cache. The tab exposes memory
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
 text-mask data remain intact for redraw, editing, and disk persistence.
@@ -131,6 +151,13 @@ is an author note addressed to the translator, not a replica.
   the GUI thread.
 - Canvas integration must stay behind `CanvasHooks` or typed `CanvasView` APIs; do not duplicate
   canvas bubble/viewport state machines in translation code.
+- `draw_canvas_overlay_top_left` must reach its dock block on EVERY frame this tab is active: the
+  dock's detached OS windows are immediate viewports and exist only while `PanelDock::end` shows
+  them, so an early return above it would close the user's windows for that frame.
+- The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
+  `canvas::ribbon_only_dock_layout` is dropped from the user's stored arrangement on every load. A
+  tab this program tab alone would declare therefore needs a default layout builder of its own,
+  since that one is shared with «Клининг».
 - Text detector page results carry source size, block rectangles in source pixels, mask size, and
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
 - Text-detector mask GPU eviction must drop only tiled `TextureHandle` pages and preserve detector
@@ -187,6 +214,11 @@ is an author note addressed to the translator, not a replica.
 ## Editing map
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
   detector storage, footer sync, or settings persistence, edit `tab.rs`.
+- To change which dock tabs this program tab declares, where its panels start, or what the
+  text-detector edit boxes anchor to, edit `draw_panel_dock` / `text_detector_edit_panel_pos` in
+  `tab.rs`; the «Лента» tab's own content, sizes, title, declaration
+  (`canvas::declare_ribbon_tab`) and shared default arrangement
+  (`canvas::ribbon_only_dock_layout`) live in `src/canvas/`.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector

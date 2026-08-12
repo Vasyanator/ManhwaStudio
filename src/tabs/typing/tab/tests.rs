@@ -4750,17 +4750,36 @@ fn a_failed_raster_write_is_queued_and_retried_at_the_next_flush_point() {
 fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     let layout = typing_default_dock_layout();
     assert_eq!(layout.validate(), Ok(()));
-    assert_eq!(layout.panels().len(), 6);
+    assert_eq!(layout.panels().len(), 7);
+
+    // The canvas' own «Лента» tab heads the left column, where the canvas controls
+    // panel used to float. It is content-sized: four rows need no pinned height.
+    let ribbon = layout
+        .panel(PanelId::new(0))
+        .expect("the ribbon panel exists");
+    assert_eq!(ribbon.tabs, vec![CANVAS_RIBBON_TAB]);
+    assert_eq!(
+        ribbon.anchor,
+        PanelAnchor::ViewportEdge {
+            edge: DockEdge::Left,
+            along: 0.0,
+        }
+    );
+    assert_eq!(ribbon.size_override, None);
 
     let preview = layout
-        .panel(PanelId::new(0))
+        .panel(PanelId::new(1))
         .expect("the preview panel exists");
     assert_eq!(preview.tabs, vec![TYPING_PREVIEW_TAB]);
+    // Hanging off «Лента» reproduces the pre-migration arrangement, where the preview
+    // hung off the canvas controls panel that «Лента» replaced. The align is the
+    // hand-tuned offset, not zero — see `TYPING_DEFAULT_PREVIEW_ALIGN`.
     assert_eq!(
         preview.anchor,
-        PanelAnchor::CanvasControls {
+        PanelAnchor::Panel {
+            target: PanelId::new(0),
             edge: DockEdge::Bottom,
-            along: 0.0,
+            align: TYPING_DEFAULT_PREVIEW_ALIGN,
         }
     );
     assert_eq!(
@@ -4769,7 +4788,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     );
 
     let params = layout
-        .panel(PanelId::new(1))
+        .panel(PanelId::new(2))
         .expect("the parameters panel exists");
     assert_eq!(params.tabs, vec![TYPING_PARAMS_TAB, TYPING_EFFECTS_TAB]);
     assert_eq!(params.active_tab, TYPING_PARAMS_TAB);
@@ -4777,7 +4796,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
         params.anchor,
         PanelAnchor::ViewportEdge {
             edge: DockEdge::Right,
-            along: 0.0,
+            along: TYPING_DEFAULT_PARAMS_ALONG,
         }
     );
     assert_eq!(
@@ -4786,7 +4805,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     );
 
     let actions = layout
-        .panel(PanelId::new(2))
+        .panel(PanelId::new(3))
         .expect("the actions panel exists");
     assert_eq!(actions.tabs, vec![TYPING_ACTIONS_TAB, TYPING_LAYERS_TAB]);
     assert_eq!(actions.active_tab, TYPING_ACTIONS_TAB);
@@ -4795,7 +4814,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     assert_eq!(
         actions.anchor,
         PanelAnchor::Panel {
-            target: PanelId::new(0),
+            target: PanelId::new(1),
             edge: DockEdge::Bottom,
             align: 0.0,
         }
@@ -4813,36 +4832,36 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     // The three conditional panels continue the two columns instead of sharing an
     // anchor with an existing panel: identical target+edge+align would lay them out
     // on top of each other.
-    let mask = layout.panel(PanelId::new(3)).expect("the mask panel exists");
+    let mask = layout.panel(PanelId::new(4)).expect("the mask panel exists");
     assert_eq!(mask.tabs, vec![TYPING_MASK_TAB]);
     assert_eq!(
         mask.anchor,
-        PanelAnchor::Panel {
-            target: PanelId::new(1),
-            edge: DockEdge::Bottom,
-            align: 0.0,
-        }
-    );
-    let deform = layout
-        .panel(PanelId::new(4))
-        .expect("the deformation panel exists");
-    assert_eq!(deform.tabs, vec![TYPING_DEFORM_TAB]);
-    assert_eq!(
-        deform.anchor,
         PanelAnchor::Panel {
             target: PanelId::new(2),
             edge: DockEdge::Bottom,
             align: 0.0,
         }
     );
-    let layout_editor = layout
+    let deform = layout
         .panel(PanelId::new(5))
+        .expect("the deformation panel exists");
+    assert_eq!(deform.tabs, vec![TYPING_DEFORM_TAB]);
+    assert_eq!(
+        deform.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(3),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+    let layout_editor = layout
+        .panel(PanelId::new(6))
         .expect("the layout-editor panel exists");
     assert_eq!(layout_editor.tabs, vec![TYPING_LAYOUT_EDITOR_TAB]);
     assert_eq!(
         layout_editor.anchor,
         PanelAnchor::Panel {
-            target: PanelId::new(4),
+            target: PanelId::new(5),
             edge: DockEdge::Bottom,
             align: 0.0,
         }
@@ -4850,7 +4869,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
 
     // The conditional panels follow their content instead of a pinned size: they
     // are the ones that give way when the column does not fit the dock area.
-    for id in [PanelId::new(3), PanelId::new(4), PanelId::new(5)] {
+    for id in [PanelId::new(4), PanelId::new(5), PanelId::new(6)] {
         let panel = layout.panel(id).expect("a conditional panel exists");
         assert_eq!(panel.size_override, None, "{id} must stay content-sized");
     }
@@ -4879,8 +4898,11 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     }
 
     // Every declared tab has exactly one home, so the dock never has to invent a
-    // panel of its own for the typing tab.
+    // panel of its own for the typing tab — and the default layout doubles as the
+    // dictionary the persistence layer resolves stored tab keys against, so a tab
+    // missing here would be dropped from the user's arrangement on every load.
     for tab in [
+        CANVAS_RIBBON_TAB,
         TYPING_PREVIEW_TAB,
         TYPING_PARAMS_TAB,
         TYPING_EFFECTS_TAB,
@@ -4905,30 +4927,32 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
 /// (`panel_dock::frame_layout`, built on `DockLayout::remove_panel`).
 #[test]
 fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
+    use crate::canvas::{CANVAS_RIBBON_TAB_INITIAL_SIZE_PX, CANVAS_RIBBON_TAB_MIN_SIZE_PX};
     use crate::widgets::panel_dock::{DOCK_GAP, PanelChrome, PanelSizes, SolvedLayout, solve};
 
     let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
-    let controls = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::new(220.0, 36.0));
     // What each panel's tabs contribute. The three panels the default pins carry a
     // `size_override`, so the solver uses that instead; the conditional ones are
     // content-sized and these are the sizes they start at.
     let sizes: PanelSizes = [
-        (PanelId::new(0), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
-        (PanelId::new(1), TYPING_PARAMS_TAB_INITIAL_SIZE_PX),
-        (PanelId::new(2), TYPING_ACTIONS_TAB_INITIAL_SIZE_PX),
-        (PanelId::new(3), TYPING_MASK_TAB_INITIAL_SIZE_PX),
-        (PanelId::new(4), TYPING_DEFORM_TAB_INITIAL_SIZE_PX),
-        (PanelId::new(5), TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(0), CANVAS_RIBBON_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(1), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
+        (PanelId::new(2), TYPING_PARAMS_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(3), TYPING_ACTIONS_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(4), TYPING_MASK_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(5), TYPING_DEFORM_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(6), TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX),
     ]
     .into_iter()
     .collect();
     let mins: PanelSizes = [
-        (PanelId::new(0), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
-        (PanelId::new(1), TYPING_PARAMS_TAB_MIN_SIZE_PX),
-        (PanelId::new(2), TYPING_ACTIONS_TAB_MIN_SIZE_PX),
-        (PanelId::new(3), TYPING_MASK_TAB_MIN_SIZE_PX),
-        (PanelId::new(4), TYPING_DEFORM_TAB_MIN_SIZE_PX),
-        (PanelId::new(5), TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX),
+        (PanelId::new(0), CANVAS_RIBBON_TAB_MIN_SIZE_PX),
+        (PanelId::new(1), TYPING_PREVIEW_TAB_MIN_SIZE_PX),
+        (PanelId::new(2), TYPING_PARAMS_TAB_MIN_SIZE_PX),
+        (PanelId::new(3), TYPING_ACTIONS_TAB_MIN_SIZE_PX),
+        (PanelId::new(4), TYPING_MASK_TAB_MIN_SIZE_PX),
+        (PanelId::new(5), TYPING_DEFORM_TAB_MIN_SIZE_PX),
+        (PanelId::new(6), TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX),
     ]
     .into_iter()
     .collect();
@@ -4939,7 +4963,6 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
             area,
             &sizes,
             &mins,
-            Some(controls),
             PanelChrome::default(),
         )
     };
@@ -4957,7 +4980,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
 
     let layout = typing_default_dock_layout();
     let solved = solve_default(&layout);
-    assert_eq!(solved.len(), 6, "every panel of the layout is placed");
+    assert_eq!(solved.len(), 7, "every panel of the layout is placed");
     assert_pairwise_disjoint(&solved, "every tab visible");
     // On a dock area of a typical maximized window the whole arrangement — pinned
     // sizes included — still fits, so nothing is pushed off screen or shrunk on the
@@ -4976,43 +4999,62 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
             .expect("a panel of the default layout is solved")
             .rect
     };
-    // The left column, top to bottom: preview, actions/layers, deform, layout
-    // editor — exactly one `DOCK_GAP` apart, sharing their left edge.
-    for (upper, lower) in [(0, 2), (2, 4), (4, 5)] {
+    // The left column, top to bottom: ribbon, preview, actions/layers, deform, layout
+    // editor — every neighbour exactly one `DOCK_GAP` apart.
+    for (upper, lower) in [(0, 1), (1, 3), (3, 5), (5, 6)] {
         let (above, below) = (rect(upper), rect(lower));
         assert!(
             (below.top() - above.bottom() - DOCK_GAP).abs() <= 0.5,
             "panel {lower} must sit one gap under panel {upper}: {above:?} vs {below:?}"
         );
+    }
+    // Everything BELOW the preview shares the preview's left edge, so the column reads
+    // as one column from there down.
+    for (upper, lower) in [(1, 3), (3, 5), (5, 6)] {
+        let (above, below) = (rect(upper), rect(lower));
         assert!(
             (below.left() - above.left()).abs() <= 0.5,
             "panel {lower} must line up with panel {upper}: {above:?} vs {below:?}"
         );
     }
+    // The preview alone is NOT flush with «Лента» above it: the default transcribes the
+    // hand-tuned arrangement, where it sits a few points to the right
+    // (`TYPING_DEFAULT_PREVIEW_ALIGN`). Pinned as an inequality rather than an exact
+    // offset because the align is a FRACTION of the shared side, so the point value
+    // follows the ribbon's content width.
+    let (ribbon_rect, preview_rect) = (rect(0), rect(1));
+    let preview_offset = preview_rect.left() - ribbon_rect.left();
+    assert!(
+        preview_offset > 0.5 && preview_offset < DOCK_GAP,
+        "the preview must sit slightly right of «Лента», within a gap: offset {preview_offset}"
+    );
+    // The whole left column starts at the area's left edge, one `DOCK_GAP` in — the
+    // `ViewportEdge` anchor the ribbon carries.
+    assert!((rect(0).left() - (area.left() + DOCK_GAP)).abs() <= 0.5);
     // The right column: «Маска» one gap under «Параметры»/«Эффекты», which sits at
     // the area's right edge (a `ViewportEdge` anchor is inset by one `DOCK_GAP`).
-    let (params, mask) = (rect(1), rect(3));
+    let (params, mask) = (rect(2), rect(4));
     assert!((mask.top() - params.bottom() - DOCK_GAP).abs() <= 0.5);
     assert!((params.right() - (area.right() - DOCK_GAP)).abs() <= 0.5);
     // …and the two columns do not meet.
-    assert!(rect(2).right() < params.left());
+    assert!(rect(3).right() < params.left());
 
     // An ordinary frame: «Режим деформации» is not shown, so its panel leaves the
     // chain and «Редактирование раскладки» inherits its anchor — the column has to
     // close over the hole instead of stacking two panels under «Действия».
     let mut without_deform = typing_default_dock_layout();
     without_deform
-        .remove_panel(PanelId::new(4))
+        .remove_panel(PanelId::new(5))
         .expect("the deformation panel is part of the default layout");
     let solved = solve_default(&without_deform);
-    assert_eq!(solved.len(), 5);
+    assert_eq!(solved.len(), 6);
     assert_pairwise_disjoint(&solved, "deformation hidden");
     let actions = solved
-        .get(PanelId::new(2))
+        .get(PanelId::new(3))
         .expect("the actions panel is solved")
         .rect;
     let layout_editor = solved
-        .get(PanelId::new(5))
+        .get(PanelId::new(6))
         .expect("the layout-editor panel is solved")
         .rect;
     assert!(
@@ -5031,10 +5073,9 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
         cramped,
         &sizes,
         &mins,
-        Some(controls),
         PanelChrome::default(),
     );
-    assert_eq!(solved.len(), 6);
+    assert_eq!(solved.len(), 7);
     assert_pairwise_disjoint(&solved, "cramped dock area");
 }
 

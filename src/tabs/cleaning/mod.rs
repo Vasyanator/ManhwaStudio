@@ -2,4 +2,4 @@ mod autoclean;
 mod tab;
 mod tools;
 
-pub use tab::CleaningTabState;
+pub use tab::{CleaningDrawParams, CleaningTabState};

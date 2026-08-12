@@ -116,15 +116,15 @@ CanvasView method map:
   `scene_point_to_overlay_xy`, `scene_rect_to_overlay_rect`,
   `replace_overlay_region`, `replace_overlay_region_px`, `replace_overlay_region_local`,
   `replace_overlay_region_impl`,
-  `page_scene_rect`, `overlay_size`, `canvas_left_top_controls_rect`,
+  `page_scene_rect`, `overlay_size`,
   `rect_from_coords`, `uv_from_scene`,
   `default_rect_coords_for_page`, `default_rect_coords_for_page_idx`.
 - Main render pipeline:
   `draw` stays in the facade, while `begin_canvas_frame`, `draw_canvas_scene`,
   `reserve_canvas_page_frame`, `draw_canvas_page_layers`,
   `handle_canvas_page_interactions`, `draw_canvas_viewport_ui`,
-  `draw_canvas_controls`, and `draw_canvas_settings_section`
-  now live in `scene.rs`.
+  `draw_ribbon_tab_body` (the «Лента» dock tab, `CANVAS_RIBBON_TAB`), and
+  `draw_canvas_settings_section` now live in `scene.rs`.
   Bubble aside/on-top rendering, hit-tests, and drag/resize widgets live in
   `bubble_aside_ui` / `bubble_on_top_ui` and are called from the scene pass.
   Canvas context-menu on page image is shown only when `editable == true`.
@@ -210,6 +210,9 @@ use crate::models::bubbles_model::runtime_bubble_to_record;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{Bubble, ProjectData};
 use crate::runtime_log;
+use crate::widgets::panel_dock::{
+    DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId, PanelNode, TabId,
+};
 use crate::widgets::{
     BarGeometry, HangulKeyboardMode, HangulKeyboardOutcome, ScrollMark, paint_marks_on_bar,
     queue_word_to_global_exceptions, queue_word_to_project_exceptions, show_hangul_keyboard,
@@ -317,15 +320,156 @@ const IMAGE_BUBBLE_META_THROTTLE: Duration = Duration::from_secs(1);
 /// sampling is wanted to read individual source pixels.
 pub(crate) const PIXEL_INSPECTION_MIN_DEVICE_PX: f32 = 4.0;
 
-/// `Id` source of the canvas' own top-left controls panel (page counter, zoom,
-/// bubble toggles), drawn by `scene.rs`.
+/// Dock tab of the canvas' own controls («Лента»): page counter, zoom, the
+/// bubble toggles and the canvas-shortcuts chip. Its body is
+/// [`CanvasView::draw_ribbon_tab_body`].
 ///
-/// The panel belongs to `CanvasView`, so this is the ONE definition of its id:
-/// other tabs read its last-frame rect out of `egui::Memory` to place their own
-/// floating UI under it (the panel dock exposes it as
-/// `PanelAnchor::CanvasControls`), and a second literal would silently drift.
-/// Not localizable — an `Id` source, see `dev-docs/i18n_exclusions.md`.
-pub(crate) const CANVAS_LEFT_TOP_CONTROLS_AREA_ID: &str = "canvas_left_top_controls";
+/// The tab belongs to `CanvasView`, so this is the ONE definition of its id, and
+/// every canvas program tab (translation, cleaning, typing) declares exactly this
+/// literal. A stable, non-localised key: it addresses the tab in the persisted
+/// layout and derives egui ids, so a localised title must never reach it
+/// (`dev-docs/i18n_exclusions.md`, `egui-docs/05-ids-and-i18n.md` §2).
+pub(crate) const CANVAS_RIBBON_TAB: TabId = TabId::new("canvas.ribbon");
+
+/// Smallest outer size, in points, the dock may shrink the «Лента» panel to.
+///
+/// Derived from the widest row the body draws — the bubble-opacity
+/// `WheelSlider`, whose rail alone is `Spacing::slider_width` (100 pt) plus its
+/// value box and label: below this width the label is scrolled away and the
+/// panel stops being readable. The height leaves the header plus the four rows
+/// at their natural line height.
+pub(crate) const CANVAS_RIBBON_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 120.0);
+
+/// Outer size, in points, the «Лента» panel starts at before its content has
+/// been measured once.
+///
+/// Reconstructed from what the panel measured as an auto-sized `Area` before the
+/// migration — its widest row, the bubble-opacity `WheelSlider`, laid out by
+/// `egui::Slider` as rail + value + label:
+/// `Spacing::slider_width` (100) + `item_spacing.x` (8) + the value `DragValue`
+/// (its `min_size` is `interact_size`, so 40) + `item_spacing.x` (8) + the
+/// «Прозрачность пузырей» label (~150 pt at the 14 pt body font) ≈ 306 pt of
+/// content, plus the panel's own `Frame::popup` margins and border (~14 pt)
+/// ≈ 320 pt outer, rounded up for the slack the label estimate carries. The
+/// height is the header strip plus the four rows and their spacings.
+///
+/// The WIDTH matters more than the height and is deliberately not tight: the dock
+/// re-measures only a tab's content HEIGHT and reports back the width it was GIVEN
+/// (`panel.rs::measured_size`), so this number stays the panel's width until the
+/// user resizes it, while the height converges to the content on the second frame.
+/// Too narrow would mean permanently scrolling the slider's label out of view.
+pub(crate) const CANVAS_RIBBON_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(340.0, 160.0);
+
+/// Points kept free along the RIGHT edge of the canvas rect for the canvas'
+/// vertical scrollbar when a program tab hands the rect to the panel dock.
+///
+/// The dock lays panels out inside the area it is given and clamps them to it,
+/// so reserving the strip here is what keeps a right-anchored panel off the
+/// scrollbar. One definition for all three canvas tabs — see [`dock_area_rect`].
+pub(crate) const CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX: f32 = 24.0;
+
+/// Per-frame dock context of a canvas program tab whose only dock tab is the
+/// canvas' own «Лента» — «Перевод» and «Клининг».
+///
+/// Both hooks receive the canvas as a PARAMETER, so this borrow is disjoint from
+/// the tab state the hook was called on, which is what lets the dock frame hold
+/// it while the tab keeps using its own fields. «Текст» has its own context type:
+/// its eight further tabs need state this one knows nothing about.
+pub(crate) struct RibbonDockCx<'a> {
+    /// Owner of the «Лента» body.
+    pub canvas: &'a mut CanvasView,
+    /// Project page count, shown by the «Лента» tab's page counter.
+    pub total_pages: usize,
+}
+
+impl RibbonDockCx<'_> {
+    /// The accessor [`declare_ribbon_tab`] asks for, as a plain `fn` item both
+    /// callers can hand over instead of spelling a closure out twice.
+    pub(crate) fn ribbon_body(&mut self) -> (&mut CanvasView, usize) {
+        (&mut *self.canvas, self.total_pages)
+    }
+}
+
+/// Declares the canvas' «Лента» tab into a program tab's dock frame.
+///
+/// The ONE declaration of that tab: its title, both size bounds and its body are
+/// the canvas' own, and all three canvas program tabs go through here so the
+/// three call sites cannot drift apart. `access` is the only thing that differs
+/// between them — it picks the canvas and the page count out of the caller's
+/// per-frame dock context, which is the caller's own type and therefore cannot
+/// be named here.
+pub(crate) fn declare_ribbon_tab<'frame, C>(
+    dock: &mut PanelDock<'_, 'frame, C>,
+    access: impl for<'cx> Fn(&'cx mut C) -> (&'cx mut CanvasView, usize) + 'frame,
+) {
+    dock.tab(CANVAS_RIBBON_TAB)
+        .title(CanvasView::ribbon_tab_title)
+        .min_size(CANVAS_RIBBON_TAB_MIN_SIZE_PX)
+        .initial_size(CANVAS_RIBBON_TAB_INITIAL_SIZE_PX)
+        .show(move |ui, cx| {
+            let (canvas, total_pages) = access(cx);
+            canvas.draw_ribbon_tab_body(ui, total_pages);
+        });
+}
+
+/// Builds the one-panel default dock arrangement of a canvas program tab that
+/// declares nothing but [`CANVAS_RIBBON_TAB`]: the panel sits flush with the left
+/// edge of the dock area, where the canvas controls floated before the migration,
+/// and is content-sized — four rows have no reason to reserve a pinned height.
+///
+/// Registered as the default builder of both «Перевод» and «Клининг» — one `fn`
+/// item for both, since the arrangement is identical and two one-line wrappers
+/// could only ever drift. «Текст» builds its own, because the ribbon is only the
+/// head of its left column there.
+///
+/// A model refusal is logged and yields an EMPTY layout, which leaves the dock to
+/// create a panel for the orphaned tab on its own — a degraded arrangement rather
+/// than a lost tab.
+#[must_use]
+pub(crate) fn ribbon_only_dock_layout() -> DockLayout {
+    let mut layout = DockLayout::new();
+    let node = match PanelNode::new(PanelId::new(0), HostId::MainWindow, vec![CANVAS_RIBBON_TAB]) {
+        Ok(mut node) => {
+            node.anchor = PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            };
+            node
+        }
+        Err(error) => {
+            runtime_log::log_warn(format!(
+                "[canvas] ribbon-only default dock layout: could not build the ribbon panel \
+                 ({error}); the dock will create one for the orphaned tab on its own"
+            ));
+            return layout;
+        }
+    };
+    if let Err(error) = layout.insert_panel(node) {
+        runtime_log::log_warn(format!(
+            "[canvas] ribbon-only default dock layout: could not insert the ribbon panel \
+             ({error}); the dock will create one for the orphaned tab on its own"
+        ));
+    }
+    layout
+}
+
+/// Region a canvas program tab hands to `PanelDock::begin` as its dock area.
+///
+/// `canvas_rect` minus [`CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX`] on the right,
+/// never inverted: a canvas narrower than the reserve collapses onto its left
+/// edge instead of producing a negative width. All three canvas tabs use this
+/// one rule, so a panel docked to the right edge sits identically in each.
+#[must_use]
+pub(crate) fn dock_area_rect(canvas_rect: Rect) -> Rect {
+    Rect::from_min_max(
+        canvas_rect.min,
+        Pos2::new(
+            (canvas_rect.right() - CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX)
+                .max(canvas_rect.left()),
+            canvas_rect.bottom(),
+        ),
+    )
+}
 
 /// Device pixels rendered per source pixel for a given canvas zoom and DPI.
 ///
@@ -473,6 +617,28 @@ pub trait CanvasHooks {
     ) {
     }
 
+    /// Draws everything the owning program tab floats over the canvas, including
+    /// its PANEL DOCK.
+    ///
+    /// `panel_dock` is the studio window's single dock state
+    /// (`MangaApp::panel_dock`), lent through [`CanvasDrawParams::panel_dock`]
+    /// for this frame only — the canvas itself never reads or writes it. This is
+    /// where all three canvas tabs run `PanelDock::begin` … `end`, and the reason
+    /// it is HERE rather than after `CanvasView::draw` returns is one: the
+    /// «Лента» tab's edits must reach `publish_canvas_settings` in the same frame
+    /// they are made.
+    ///
+    /// Creation order inside the hook decides nothing about z-order. Within one
+    /// `Order`, egui keeps a persistent layer list and re-sorts it STABLY on
+    /// every pass (`egui-0.35.0/src/memory/mod.rs:1215-1221`, `:1350`), so a tab's
+    /// own full-canvas `Order::Foreground` capture surface and the dock's panels
+    /// keep whatever relative order they already had. What does move a layer up is
+    /// `Area::begin`'s `move_to_top` for an area that was not visible last frame
+    /// (`egui-0.35.0/src/containers/area.rs:548-552`) — so a capture surface rises
+    /// above the panels each time its selection mode is ENTERED and takes clicks
+    /// meant for a panel until the mode ends. That is unchanged from the pre-dock
+    /// controls panel, which sat on the lower `Order::Middle` anyway, and it is a
+    /// known behaviour, not something this ordering fixes.
     fn draw_canvas_overlay_top_left(
         &mut self,
         _ctx: &egui::Context,
@@ -480,6 +646,7 @@ pub trait CanvasHooks {
         _canvas: &mut CanvasView,
         _project: &ProjectData,
         _status: CanvasUiStatus,
+        _panel_dock: &mut PanelDockState,
     ) {
     }
 
@@ -561,6 +728,14 @@ pub struct CanvasDrawParams<'a> {
     pub status: CanvasUiStatus,
     pub source_upload_budget: &'a mut SourceTextureUploadBudget,
     pub hooks: &'a mut dyn CanvasHooks,
+    /// The studio window's panel-dock state, owned by `MangaApp` and lent for
+    /// this frame. The canvas only CARRIES it: it hands it to
+    /// [`CanvasHooks::draw_canvas_overlay_top_left`], the one place all three
+    /// canvas tabs run their dock, and touches nothing in it itself. The borrow
+    /// must be disjoint from `hooks` and from the `CanvasView` being drawn,
+    /// which it is by construction — all three are separate fields of `MangaApp`
+    /// or of the drawing tab.
+    pub panel_dock: &'a mut PanelDockState,
 }
 
 pub struct CanvasView {
@@ -1221,6 +1396,7 @@ impl CanvasView {
             status,
             source_upload_budget,
             hooks,
+            panel_dock,
         } = params;
         self.poll_overlay_prepare_results();
         self.sync_overlays_from_model();
@@ -1328,7 +1504,7 @@ impl CanvasView {
         self.promote_debounced_text_upserts(now_s);
         self.apply_deferred_remote_updates();
         self.flush_bubble_upserts_to_model(project);
-        self.draw_canvas_viewport_ui(ctx, project, status, frame, hooks);
+        self.draw_canvas_viewport_ui(ctx, project, status, frame, hooks, panel_dock);
         self.publish_canvas_settings(project);
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
@@ -2646,8 +2822,15 @@ impl CanvasView {
         Some(size)
     }
 
-    pub fn canvas_left_top_controls_rect(&self) -> Option<Rect> {
-        self.scene.canvas_left_top_controls_rect
+    /// Localised caption of the «Лента» dock tab.
+    ///
+    /// The ONE place `canvas.ribbon.tab_title` is looked up: all three canvas
+    /// program tabs pass this function to `PanelTab::title`, which evaluates it
+    /// once per drawn frame, so a runtime language switch is picked up and the
+    /// catalog key exists in exactly one place. Never used as an id source.
+    #[must_use]
+    pub fn ribbon_tab_title() -> &'static str {
+        t!("canvas.ribbon.tab_title")
     }
 
     // The three bottom-hint API methods below are the public surface used by the per-tab wiring:
@@ -2948,6 +3131,83 @@ fn image_bubble_crop_rect(bubble: &Bubble) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default arrangement of the two canvas program tabs that declare the
+    /// «Лента» and nothing else — «Перевод» and «Клининг» share this one builder.
+    ///
+    /// It is also the DICTIONARY of their dock tabs: a key it does not name is
+    /// dropped from the user's stored arrangement on every load
+    /// (`src/widgets/panel_dock/persist.rs`). And it must PLACE its panel inside
+    /// the dock area, not merely be well-formed.
+    #[test]
+    fn the_ribbon_only_default_layout_holds_the_tab_at_the_areas_left_edge() {
+        use crate::widgets::panel_dock::{DOCK_GAP, PanelChrome, PanelSizes, solve};
+
+        let layout = ribbon_only_dock_layout();
+        assert_eq!(layout.validate(), Ok(()));
+        assert_eq!(layout.panels().len(), 1);
+        let ribbon = layout
+            .panel(PanelId::new(0))
+            .expect("the ribbon panel exists");
+        assert_eq!(ribbon.tabs, vec![CANVAS_RIBBON_TAB]);
+        assert_eq!(
+            ribbon.anchor,
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            }
+        );
+        // Content-sized: four rows have no reason to reserve a pinned height.
+        assert_eq!(ribbon.size_override, None);
+        // Every tab these program tabs declare has a home here.
+        assert!(layout.panel_of_tab(CANVAS_RIBBON_TAB).is_some());
+
+        // A single-panel chain still has to be placed, and at the area's top-left
+        // corner — the `ViewportEdge` anchor is inset by one `DOCK_GAP`.
+        let area = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1600.0, 1000.0));
+        let sizes: PanelSizes = [(PanelId::new(0), CANVAS_RIBBON_TAB_INITIAL_SIZE_PX)]
+            .into_iter()
+            .collect();
+        let mins: PanelSizes = [(PanelId::new(0), CANVAS_RIBBON_TAB_MIN_SIZE_PX)]
+            .into_iter()
+            .collect();
+        let solved = solve(
+            &layout,
+            HostId::MainWindow,
+            area,
+            &sizes,
+            &mins,
+            PanelChrome::default(),
+        );
+        assert_eq!(solved.len(), 1);
+        let rect = solved
+            .get(PanelId::new(0))
+            .expect("the ribbon panel is solved")
+            .rect;
+        assert!((rect.left() - (area.left() + DOCK_GAP)).abs() <= 0.5);
+        assert!((rect.top() - area.top()).abs() <= 0.5);
+        assert!(area.contains_rect(rect));
+    }
+
+    /// The reserve keeps a right-anchored panel off the canvas' vertical
+    /// scrollbar, and the rule must stay total: a canvas narrower than the
+    /// reserve may not produce an inverted rect for the solver.
+    #[test]
+    fn the_dock_area_reserves_the_scrollbar_strip_without_inverting() {
+        let canvas = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(1010.0, 800.0));
+        let area = dock_area_rect(canvas);
+        assert_eq!(area.min, canvas.min);
+        assert!(
+            (area.right() - (canvas.right() - CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX)).abs()
+                <= f32::EPSILON
+        );
+        assert!((area.bottom() - canvas.bottom()).abs() <= f32::EPSILON);
+
+        let narrow = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(8.0, 100.0));
+        let area = dock_area_rect(narrow);
+        assert!(area.width() >= 0.0, "the reserve must not invert the area");
+        assert_eq!(area.right(), narrow.left());
+    }
 
     #[test]
     fn pixel_inspection_threshold_is_dpi_correct() {

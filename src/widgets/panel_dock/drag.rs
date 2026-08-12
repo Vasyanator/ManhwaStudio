@@ -148,8 +148,6 @@ pub struct DragSession {
 enum SnapKind {
     /// Another panel's edge.
     Panel,
-    /// An edge of the `CanvasView` controls rect.
-    CanvasControls,
     /// An edge of the dock area.
     ViewportEdge,
 }
@@ -176,8 +174,6 @@ pub struct SnapTargets<'a> {
     /// Other panels of the same host with their solved rects, already filtered
     /// by [`panel_snap_candidates`].
     pub panels: &'a [(PanelId, Rect)],
-    /// The `CanvasView` controls rect, when it exists this frame.
-    pub canvas_controls: Option<Rect>,
 }
 
 /// Panels a dragged panel may legally dock to, with the rects they were solved
@@ -201,10 +197,9 @@ pub fn panel_snap_candidates(
 /// Finds the nearest edge `dragged` could dock to, within [`SNAP_DISTANCE`].
 ///
 /// Candidates are, in priority order on an equal distance: another panel's edge,
-/// an edge of the canvas-controls rect, an edge of the dock area. A panel-to-
-/// panel or panel-to-controls candidate additionally requires the two rects to
-/// OVERLAP along the shared side — docking "below" a panel that stands far to
-/// the left is not what the user is doing.
+/// then an edge of the dock area. A panel-to-panel candidate additionally
+/// requires the two rects to OVERLAP along the shared side — docking "below" a
+/// panel that stands far to the left is not what the user is doing.
 ///
 /// Returns `None` when nothing is close enough, which the caller must treat as
 /// "the panel stays free-floating where it was dropped".
@@ -235,18 +230,6 @@ pub fn find_snap(dragged: Rect, targets: SnapTargets<'_>) -> Option<SnapCandidat
                         edge,
                         align,
                     },
-                    line,
-                    distance,
-                });
-            }
-        }
-    }
-
-    if let Some(controls) = targets.canvas_controls {
-        for edge in EDGES {
-            if let Some((distance, along, line)) = outside_candidate(dragged, controls, edge) {
-                consider(distance, SnapKind::CanvasControls, 0, SnapCandidate {
-                    anchor: PanelAnchor::CanvasControls { edge, along },
                     line,
                     distance,
                 });
@@ -401,13 +384,11 @@ pub fn resolve_slot(
     anchor: PanelAnchor,
     rects: &BTreeMap<PanelId, Rect>,
     area: Rect,
-    canvas_controls: Option<Rect>,
 ) -> PanelAnchor {
     let mut anchor = anchor;
     let mut visited: Vec<PanelId> = Vec::new();
     for _ in 0..layout.panels().len() {
-        let Some(rect) = prospective_rect(anchor, dragged_size, rects, area, canvas_controls)
-        else {
+        let Some(rect) = prospective_rect(anchor, dragged_size, rects, area) else {
             break;
         };
         let occupant = rects
@@ -449,9 +430,13 @@ pub fn resolve_slot(
 /// in the same direction (below a panel docked below). For a `ViewportEdge` the
 /// edge points at the area's side, so the queue has to grow along it instead:
 /// down a left/right column, right along a top/bottom row.
-fn queue_edge(anchor: PanelAnchor) -> DockEdge {
+///
+/// Shared with the seeding path (`mod.rs::free_anchor_slot`), which queues a
+/// newly declared tab's panel behind whoever already holds the slot its default
+/// names — a queue grown by two different rules would not read as one column.
+pub(super) fn queue_edge(anchor: PanelAnchor) -> DockEdge {
     match anchor {
-        PanelAnchor::Panel { edge, .. } | PanelAnchor::CanvasControls { edge, .. } => edge,
+        PanelAnchor::Panel { edge, .. } => edge,
         PanelAnchor::ViewportEdge { edge, .. } => {
             if edge.is_horizontal() {
                 DockEdge::Bottom
@@ -471,7 +456,6 @@ fn prospective_rect(
     size: Vec2,
     rects: &BTreeMap<PanelId, Rect>,
     area: Rect,
-    canvas_controls: Option<Rect>,
 ) -> Option<Rect> {
     match anchor {
         PanelAnchor::Free => None,
@@ -480,9 +464,6 @@ fn prospective_rect(
             edge,
             align,
         } => Some(place_outside(*rects.get(&target)?, edge, align, size)),
-        PanelAnchor::CanvasControls { edge, along } => {
-            Some(place_outside(canvas_controls?, edge, along, size))
-        }
         PanelAnchor::ViewportEdge { edge, along } => Some(place_inside(area, edge, along, size)),
     }
 }
@@ -632,7 +613,6 @@ mod tests {
         let candidate = find_snap(dragged, SnapTargets {
             area: AREA,
             panels: &panels,
-            canvas_controls: None,
         })
         .expect("a candidate within the snap distance");
         assert_eq!(candidate.anchor, PanelAnchor::Panel {
@@ -657,7 +637,6 @@ mod tests {
             find_snap(dragged, SnapTargets {
                 area: AREA,
                 panels: &panels,
-                canvas_controls: None,
             }),
             None
         );
@@ -673,7 +652,6 @@ mod tests {
         let candidate = find_snap(dragged, SnapTargets {
             area: AREA,
             panels: &panels,
-            canvas_controls: None,
         });
         assert!(candidate.is_none_or(|found| found.anchor.target_panel().is_none()));
     }
@@ -694,7 +672,6 @@ mod tests {
         let candidate = find_snap(dragged, SnapTargets {
             area: AREA,
             panels: &panels,
-            canvas_controls: None,
         })
         .expect("both candidates are exact");
         assert_eq!(candidate.anchor, PanelAnchor::Panel {
@@ -707,28 +684,11 @@ mod tests {
         let candidate = find_snap(dragged, SnapTargets {
             area: AREA,
             panels: &[],
-            canvas_controls: None,
         })
         .expect("the area edge is a candidate on its own");
         assert_eq!(candidate.anchor, PanelAnchor::ViewportEdge {
             edge: DockEdge::Right,
             along: fraction(200.0 - AREA.top(), AREA.height() - 150.0),
-        });
-    }
-
-    #[test]
-    fn the_canvas_controls_rect_is_a_target_and_outranks_the_area_edge() {
-        let controls = rect(20.0, 20.0, 200.0, 40.0);
-        let dragged = rect(20.0, 20.0 + 40.0 + DOCK_GAP, 200.0, 150.0);
-        let candidate = find_snap(dragged, SnapTargets {
-            area: AREA,
-            panels: &[],
-            canvas_controls: Some(controls),
-        })
-        .expect("the controls rect is a candidate");
-        assert_eq!(candidate.anchor, PanelAnchor::CanvasControls {
-            edge: DockEdge::Bottom,
-            along: 0.0,
         });
     }
 
@@ -741,7 +701,6 @@ mod tests {
         let candidate = find_snap(dragged, SnapTargets {
             area: AREA,
             panels: &panels,
-            canvas_controls: None,
         })
         .expect("a candidate");
         match candidate.anchor {
@@ -783,7 +742,6 @@ mod tests {
             },
             &rects,
             AREA,
-            None,
         );
         assert_eq!(resolved, PanelAnchor::Panel {
             target: PanelId::new(1),
@@ -812,7 +770,6 @@ mod tests {
                 anchor,
                 &rects,
                 AREA,
-                None,
             ),
             anchor
         );
@@ -843,7 +800,6 @@ mod tests {
             },
             &rects,
             AREA,
-            None,
         );
         assert_eq!(resolved, PanelAnchor::Panel {
             target: PanelId::new(0),
@@ -887,7 +843,6 @@ mod tests {
                 anchor,
                 &rects,
                 AREA,
-                None,
             ),
             anchor
         );

@@ -8,7 +8,7 @@ gap, keeping every chain inside the area, and charging the overflow to the
 panels whose size actually causes it.
 
 Main responsibilities:
-- resolve anchors into rects (panel-to-panel, host-area edges, canvas controls);
+- resolve anchors into rects (panel-to-panel, host-area edges);
 - keep exactly `DOCK_GAP` between a panel and whatever it is attached to;
 - translate a chain that hangs out of the area back inside it;
 - shrink, on BOTH axes, only the panels whose size actually pushes a member of
@@ -41,8 +41,8 @@ use super::model::{DockEdge, DockLayout, HostId, PanelAnchor, PanelId, PanelNode
 
 /// Distance, in points, kept between a panel and the thing it is docked to.
 ///
-/// The same constant is used for panel-to-panel gaps, the inset from a host
-/// area edge, and the distance from the canvas-controls rect.
+/// The same constant is used for panel-to-panel gaps and for the inset from a
+/// host area edge.
 pub const DOCK_GAP: f32 = 8.0;
 
 /// NOMINAL height, in points, of a panel's header strip.
@@ -400,11 +400,6 @@ impl SolvedLayout {
 /// * `mins` — the outer size below which a panel must not be *shrunk*. Missing
 ///   entries default to `(0.0, chrome.collapsed_height + PANEL_MIN_CONTENT_HEIGHT)`,
 ///   and every minimum is raised to what the widget can physically draw.
-/// * `canvas_controls` — rect of the `CanvasView` controls panel, in the same
-///   space as `area`. It is an *anchor only*: nothing is ever pushed away from
-///   it. When it is `None`, a `PanelAnchor::CanvasControls` resolves as
-///   `PanelAnchor::Free` at the panel's own `pos`, because the anchor target
-///   does not exist in this host.
 /// * `chrome` — the header/frame overhead the widget MEASURED on the previous
 ///   frame. Passing [`PanelChrome::default`] reproduces the nominal estimate,
 ///   which is only correct before a panel has ever been drawn.
@@ -422,11 +417,9 @@ pub fn solve(
     area: Rect,
     desired: &PanelSizes,
     mins: &PanelSizes,
-    canvas_controls: Option<Rect>,
     chrome: PanelChrome,
 ) -> SolvedLayout {
     let area = sanitize_rect(area);
-    let controls = canvas_controls.map(sanitize_rect);
 
     let nodes: BTreeMap<PanelId, &PanelNode> = layout
         .panels_in_host(host)
@@ -463,9 +456,8 @@ pub fn solve(
             nodes: &nodes,
             floor: &floor,
             area,
-            controls,
         };
-        let mut rects = propagate(&members, &nodes, &sizes, area, controls);
+        let mut rects = propagate(&members, &nodes, &sizes, area);
         // The axes are independent (see `Axis`), so each one is relieved on its
         // own; a chain too wide is shrunk exactly like a chain too tall, which
         // is what keeps every panel's resize grip inside the area.
@@ -477,7 +469,7 @@ pub fn solve(
                     // could give is already at its floor.
                     break;
                 }
-                rects = propagate(&members, &nodes, &sizes, area, controls);
+                rects = propagate(&members, &nodes, &sizes, area);
             }
         }
 
@@ -583,7 +575,6 @@ fn propagate(
     nodes: &BTreeMap<PanelId, &PanelNode>,
     sizes: &BTreeMap<PanelId, Vec2>,
     area: Rect,
-    controls: Option<Rect>,
 ) -> BTreeMap<PanelId, Rect> {
     // `BTreeSet` children keep the visiting order ascending by id without an
     // extra sort, which is what makes `propagate` deterministic.
@@ -609,7 +600,7 @@ fn propagate(
             continue;
         };
         let size = sizes.get(&id).copied().unwrap_or(DEFAULT_PANEL_SIZE);
-        rects.insert(id, place_root(node, size, area, controls));
+        rects.insert(id, place_root(node, size, area));
         queue.push_back(id);
     }
 
@@ -630,9 +621,7 @@ fn propagate(
             let size = sizes.get(&id).copied().unwrap_or(DEFAULT_PANEL_SIZE);
             let (edge, align) = match node.anchor {
                 PanelAnchor::Panel { edge, align, .. } => (edge, align),
-                PanelAnchor::Free
-                | PanelAnchor::ViewportEdge { .. }
-                | PanelAnchor::CanvasControls { .. } => (DockEdge::Bottom, 0.0),
+                PanelAnchor::Free | PanelAnchor::ViewportEdge { .. } => (DockEdge::Bottom, 0.0),
             };
             rects.insert(id, place_outside(parent_rect, edge, align, size));
             queue.push_back(id);
@@ -656,15 +645,9 @@ fn propagate(
 }
 
 /// Places a chain root from its own anchor.
-fn place_root(node: &PanelNode, size: Vec2, area: Rect, controls: Option<Rect>) -> Rect {
+fn place_root(node: &PanelNode, size: Vec2, area: Rect) -> Rect {
     match node.anchor {
         PanelAnchor::ViewportEdge { edge, along } => place_inside(area, edge, along, size),
-        PanelAnchor::CanvasControls { edge, along } => match controls {
-            Some(controls) => place_outside(controls, edge, along, size),
-            // Documented degradation: without the controls rect the anchor has
-            // no target in this host, so the panel keeps its own position.
-            None => Rect::from_min_size(free_pos(node, area), size),
-        },
         // A `Panel` anchor reaching this branch means the target is outside the
         // chain; treat it like `Free` rather than inventing a target.
         PanelAnchor::Free | PanelAnchor::Panel { .. } => {
@@ -789,8 +772,6 @@ struct ChainContext<'a> {
     floor: &'a BTreeMap<PanelId, Vec2>,
     /// Host area the chain has to fit into.
     area: Rect,
-    /// Canvas-controls rect, when this host has one.
-    controls: Option<Rect>,
 }
 
 impl ChainContext<'_> {
@@ -1039,11 +1020,10 @@ impl ChainContext<'_> {
                 // in this chain, which `propagate` lays out free — ends the walk.
                 PanelAnchor::Panel { .. }
                 | PanelAnchor::Free
-                | PanelAnchor::ViewportEdge { .. }
-                | PanelAnchor::CanvasControls { .. } => None,
+                | PanelAnchor::ViewportEdge { .. } => None,
             };
             let Some((target, edge, align)) = parent else {
-                let own = root_start_coefficient(node.anchor, axis, self.controls.is_some());
+                let own = root_start_coefficient(node.anchor, axis);
                 if own != 0.0 {
                     *coefficients.entry(current).or_insert(0.0) += own;
                 }
@@ -1068,11 +1048,9 @@ impl ChainContext<'_> {
 /// size, which is non-zero whenever the root is positioned by its far edge.
 ///
 /// Mirrors [`place_root`]: a `ViewportEdge` root flush with the trailing side of
-/// the area starts one own-size earlier, a `CanvasControls` root placed before
-/// the controls rect likewise, and an alignment fraction takes that share of it.
-/// A free root — and a `CanvasControls` root with no controls rect, which
-/// degrades to free — is positioned by its `pos` and contributes nothing.
-fn root_start_coefficient(anchor: PanelAnchor, axis: Axis, has_controls: bool) -> f32 {
+/// the area starts one own-size earlier, and an alignment fraction takes that
+/// share of it. A free root is positioned by its `pos` and contributes nothing.
+fn root_start_coefficient(anchor: PanelAnchor, axis: Axis) -> f32 {
     match anchor {
         PanelAnchor::Free | PanelAnchor::Panel { .. } => 0.0,
         PanelAnchor::ViewportEdge { edge, along } => match axis.role(edge) {
@@ -1080,16 +1058,6 @@ fn root_start_coefficient(anchor: PanelAnchor, axis: Axis, has_controls: bool) -
             EdgeRole::Trailing => -1.0,
             EdgeRole::Perpendicular => -sanitize_fraction(along),
         },
-        PanelAnchor::CanvasControls { edge, along } => {
-            if !has_controls {
-                return 0.0;
-            }
-            match axis.role(edge) {
-                EdgeRole::Leading => -1.0,
-                EdgeRole::Trailing => 0.0,
-                EdgeRole::Perpendicular => -sanitize_fraction(along),
-            }
-        }
     }
 }
 
@@ -1187,7 +1155,6 @@ mod tests {
             AREA,
             &PanelSizes::new(),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert!(solved.is_empty());
@@ -1210,7 +1177,6 @@ mod tests {
             AREA,
             &PanelSizes::new(),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(solved.len(), 1);
@@ -1230,7 +1196,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(
@@ -1254,7 +1219,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let rect = rect_of(&solved, 0);
@@ -1277,58 +1241,12 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let rect = rect_of(&solved, 0);
         // `along = 1.0` after clamping: flush with the area's right side.
         assert!((rect.right() - AREA.right()).abs() < FIT_EPSILON);
         assert!((rect.top() - AREA.top() - DOCK_GAP).abs() < FIT_EPSILON);
-    }
-
-    #[test]
-    fn canvas_controls_anchor_uses_the_supplied_rect() {
-        let mut layout = DockLayout::new();
-        let mut panel = free_at(0, TAB_A, 500.0, 500.0);
-        panel.anchor = PanelAnchor::CanvasControls {
-            edge: DockEdge::Bottom,
-            along: 0.0,
-        };
-        layout.insert_panel(panel).expect("insert 0");
-        let controls = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(200.0, 40.0));
-        let solved = solve(
-            &layout,
-            HostId::MainWindow,
-            AREA,
-            &sizes(&[(0, 300.0, 200.0)]),
-            &PanelSizes::new(),
-            Some(controls),
-            PanelChrome::default(),
-        );
-        let rect = rect_of(&solved, 0);
-        assert!((rect.top() - controls.bottom() - DOCK_GAP).abs() < FIT_EPSILON);
-        assert!((rect.left() - controls.left()).abs() < FIT_EPSILON);
-    }
-
-    #[test]
-    fn canvas_controls_anchor_without_a_rect_falls_back_to_the_free_position() {
-        let mut layout = DockLayout::new();
-        let mut panel = free_at(0, TAB_A, 500.0, 400.0);
-        panel.anchor = PanelAnchor::CanvasControls {
-            edge: DockEdge::Bottom,
-            along: 0.0,
-        };
-        layout.insert_panel(panel).expect("insert 0");
-        let solved = solve(
-            &layout,
-            HostId::MainWindow,
-            AREA,
-            &sizes(&[(0, 300.0, 200.0)]),
-            &PanelSizes::new(),
-            None,
-            PanelChrome::default(),
-        );
-        assert_eq!(rect_of(&solved, 0).min, Pos2::new(500.0, 400.0));
     }
 
     #[test]
@@ -1347,7 +1265,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0), (1, 260.0, 180.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let top = rect_of(&solved, 0);
@@ -1373,7 +1290,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0), (1, 260.0, 180.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert!((rect_of(&solved, 1).right() - rect_of(&solved, 0).right()).abs() < FIT_EPSILON);
@@ -1398,7 +1314,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 200.0, 200.0), (1, 150.0, 180.0), (2, 120.0, 160.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let center = rect_of(&solved, 0);
@@ -1429,7 +1344,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 200.0, 200.0), (1, 150.0, 150.0), (2, 180.0, 160.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let center = rect_of(&solved, 0);
@@ -1454,7 +1368,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let top = rect_of(&solved, 0);
@@ -1489,7 +1402,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
 
@@ -1537,7 +1449,6 @@ mod tests {
             area,
             &requested,
             &mins,
-            None,
             PanelChrome::default(),
         );
 
@@ -1577,7 +1488,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 400.0), (1, 300.0, 500.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let collapsed = solved.get(PanelId::new(0)).expect("solved 0");
@@ -1609,7 +1519,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 400.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             chrome,
         );
         let collapsed = rect_of(&solved, 0);
@@ -1645,7 +1554,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 400.0)]),
             &PanelSizes::new(),
-            None,
             chrome,
         );
         // Floor = measured header + PANEL_MIN_CONTENT_HEIGHT, not the nominal one.
@@ -1668,7 +1576,6 @@ mod tests {
             area,
             &sizes(&[(0, 400.0, 400.0), (1, 400.0, 400.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let first = solved.get(PanelId::new(0)).expect("solved 0");
@@ -1696,7 +1603,6 @@ mod tests {
             AREA,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let second = solve(
@@ -1705,7 +1611,6 @@ mod tests {
             AREA,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(first, second);
@@ -1732,7 +1637,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
 
@@ -1756,7 +1660,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         // Idempotence is a statement about geometry: `shrunk` legitimately
@@ -1798,9 +1701,8 @@ mod tests {
                 area,
                 &requested,
                 &mins,
-                Some(Rect::NOTHING),
-            PanelChrome::default(),
-        );
+                PanelChrome::default(),
+            );
             assert_eq!(solved.len(), 2);
             for (_, panel) in solved.iter() {
                 assert!(panel.rect.min.x.is_finite());
@@ -1836,7 +1738,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(rect_of(&solved, 0).size(), Vec2::new(420.0, 260.0));
@@ -1861,7 +1762,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 600.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert!((rect_of(&solved, 0).height() - 500.0).abs() < FIT_EPSILON);
@@ -1898,7 +1798,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         for id in [0_u32, 1, 2, 3] {
@@ -1926,7 +1825,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         for (id, panel) in first_pass.iter() {
@@ -1955,7 +1853,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 300.0, 60.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let small = rect_of(&solved, 0);
@@ -1980,7 +1877,6 @@ mod tests {
             AREA,
             &sizes(&[(0, 5.0, 12.0)]),
             &PanelSizes::new(),
-            None,
             chrome,
         );
         let rect = rect_of(&solved, 0);
@@ -2006,7 +1902,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let left = rect_of(&solved, 0);
@@ -2035,7 +1930,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 200.0)]),
             &sizes(&[(0, 280.0, 0.0), (1, 280.0, 0.0)]),
-            None,
             PanelChrome::default(),
         );
         for id in [0_u32, 1] {
@@ -2070,7 +1964,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 400.0), (2, 300.0, 400.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let root = rect_of(&solved, 0);
@@ -2111,7 +2004,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let root = rect_of(&solved, 0);
@@ -2152,7 +2044,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 200.0), (1, 300.0, 400.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         // 200 + gap + 400 = 608 pt of chain in 500 pt: 54 points each.
@@ -2177,7 +2068,6 @@ mod tests {
             AREA,
             &PanelSizes::new(),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(rect_of(&solved, 0).size(), DEFAULT_PANEL_SIZE);
@@ -2208,7 +2098,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 300.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
 
@@ -2245,7 +2134,6 @@ mod tests {
             area,
             &sizes(&[(0, 300.0, 300.0), (1, 300.0, 200.0)]),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
 
@@ -2282,7 +2170,6 @@ mod tests {
             area,
             &PanelSizes::new(),
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
 
@@ -2320,7 +2207,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         let second_pass = solve(
@@ -2329,7 +2215,6 @@ mod tests {
             area,
             &requested,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         assert_eq!(first_pass, second_pass);
@@ -2347,7 +2232,6 @@ mod tests {
             area,
             &settled,
             &PanelSizes::new(),
-            None,
             PanelChrome::default(),
         );
         for (id, panel) in first_pass.iter() {

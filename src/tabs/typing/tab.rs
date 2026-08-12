@@ -75,6 +75,9 @@ FILE HEADER (tabs/typing/tab.rs)
   - `set_overlays_model`: подключение shared-модели clean-overlay.
   - `viewport_snapshot/apply_viewport_snapshot`: bridge для общего viewport sync в `MangaApp`.
   - `draw`: кадр вкладки (poll загрузчика, upload текстур по бюджету, рендер `CanvasView`).
+    Все входы кадра приходят одним `TypingDrawParams`; среди них — `panel_dock`, состояние
+    панельного дока, которым владеет приложение (`MangaApp.panel_dock`, одно на окно студии)
+    и которое одалживается вкладке на кадр. Вкладка его НЕ хранит.
   - `draw_canvas_mask_overlay_on_page` / `draw_canvas_overlay_on_page` (в `TypingHooks`):
     yellow mask-preview/input живёт в canvas mask-layer, а текстовые/image оверлеи и
     debug авто-тайпа остаются в additional-elements layer.
@@ -106,7 +109,7 @@ use super::render_next::types::{
 use crate::app::{PageImageInfo, PageTexture};
 use crate::trace::cat;
 use crate::canvas::{
-    BubbleClass, CANVAS_LEFT_TOP_CONTROLS_AREA_ID, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
+    self, BubbleClass, CANVAS_RIBBON_TAB, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
     CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget,
     parse_image_text_areas,
 };
@@ -122,7 +125,6 @@ use crate::tabs::AppTab;
 use crate::tabs::typing::TypingTopPanelState;
 // Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use crate::widgets::WheelSlider;
-use crate::widgets::panel_dock::persist as panel_dock_persist;
 use crate::widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabId,
@@ -265,14 +267,18 @@ const TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX: egui::Vec2 = egui::Vec2::new(435.0, 5
 /// panel to. Same width as the preview above it, tall enough for the action rows
 /// plus a few layer rows.
 const TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX: egui::Vec2 = egui::Vec2::new(277.0, 285.0);
+/// `PanelAnchor::Panel::align` the DEFAULT arrangement gives «Превью текста» under
+/// «Лента»: the preview does NOT sit flush with the ribbon's left edge but ~3.7 pt
+/// to the right of it. Transcribed from the arrangement the user tuned by hand and
+/// deliberately not rounded to `0.0` — the offset is theirs, not drag noise to clean
+/// up. Everything below the preview stays flush with the preview (`align: 0.0`), so
+/// the left column still reads as one column.
+const TYPING_DEFAULT_PREVIEW_ALIGN: f32 = 0.0583;
+/// `PanelAnchor::ViewportEdge::along` the DEFAULT arrangement gives the
+/// «Параметры»/«Эффекты» column: ~11.6 pt below the dock area's top edge rather than
+/// flush with it. Transcribed from the same hand-tuned arrangement.
+const TYPING_DEFAULT_PARAMS_ALONG: f32 = 0.0386;
 
-/// Points kept free along the RIGHT edge of the dock area for the canvas'
-/// vertical scrollbar.
-///
-/// The dock lays panels out inside the area it is given, so reserving the strip
-/// here is what keeps a right-anchored panel from sitting on the scrollbar —
-/// exactly what the old parameters panel did by hand before the migration.
-const TYPING_DOCK_AREA_SCROLLBAR_RESERVE_PX: f32 = 24.0;
 const TEXT_OVERLAY_UPLOAD_TEXTURE_BUDGET_PER_FRAME: usize = 4;
 const TEXT_OVERLAY_UPLOAD_BYTES_BUDGET_PER_FRAME: usize = 8 * 1024 * 1024;
 const TEXT_OVERLAY_TRANSFORM_HANDLE_RADIUS_PX: f32 = 7.0;
@@ -504,16 +510,31 @@ impl TypingOverlayDeformMesh {
     }
 }
 
+/// Everything [`TypingTabState::draw`] needs for one frame.
+///
+/// Grouped into a struct rather than passed as separate arguments because the
+/// app-owned `panel_dock` borrow raised the call over the argument-count budget;
+/// the shape mirrors `CanvasDrawParams`, which this tab already builds from these
+/// same values.
+pub struct TypingDrawParams<'a> {
+    pub ctx: &'a egui::Context,
+    pub ui: &'a mut egui::Ui,
+    pub project: &'a ProjectData,
+    pub page_infos: &'a HashMap<usize, PageImageInfo>,
+    pub texture_cache: &'a mut HashMap<usize, PageTexture>,
+    pub status: CanvasUiStatus,
+    /// The studio window's dock state, owned by `MangaApp` and LENT for this frame.
+    ///
+    /// It is not a field of this tab because one studio window has exactly one dock
+    /// state: sub-window indices and the persisted `sub_windows` list are global, and
+    /// the layouts of every program tab live in one map keyed by `AppTab::key()`.
+    pub panel_dock: &'a mut PanelDockState,
+}
+
 pub struct TypingTabState {
     canvas: CanvasView,
     text_overlays: TypingTextOverlayLayer,
     top_panel: TypingTopPanelState,
-    /// Panel-dock state of this program tab (layouts + last-frame measurements).
-    /// Deliberately its OWN field, disjoint from `top_panel` and `text_overlays`:
-    /// `PanelDock::begin` borrows it for the whole frame while the tab bodies
-    /// borrow those two, and only disjoint fields let the borrow checker split
-    /// them (`dev-docs/dockable_panels_plan.md` §4.2).
-    panel_dock: PanelDockState,
     mask_layer: TypingMaskLayer,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
     /// shared with the PS tab. `None` until `set_layer_doc` is called by app.rs.
@@ -668,7 +689,6 @@ impl Default for TypingTabState {
             canvas,
             text_overlays: TypingTextOverlayLayer::default(),
             top_panel: TypingTopPanelState::default(),
-            panel_dock: PanelDockState::new(),
             mask_layer: TypingMaskLayer::default(),
             layer_doc: None,
             save_busy: false,
@@ -700,57 +720,6 @@ impl TypingTabState {
 
     pub fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
         self.top_panel.set_panel_layout(layout);
-    }
-
-    /// Restores this tab's dockable-panel arrangement from an already loaded
-    /// `user_config.json` snapshot. Performs no I/O.
-    ///
-    /// Call once, before the first frame: a restored layout wins over
-    /// [`typing_default_dock_layout`], while an absent, malformed, newer or
-    /// invalid stored layout silently degrades to it (every reason is logged by
-    /// `panel_dock::persist`). Tabs the stored layout does not mention are
-    /// re-created by the dock on the frame that declares them.
-    pub fn load_persisted_panel_layouts(&mut self, user_settings: &Value) {
-        let restored = panel_dock_persist::layouts_from_user_settings(
-            user_settings,
-            &[(
-                AppTab::Typing.key(),
-                typing_default_dock_layout as fn() -> DockLayout,
-            )],
-        );
-        // Layouts first: the sub-window install drops a window no restored layout
-        // puts a panel in, so it has to see them.
-        self.panel_dock.install_persisted_layouts(restored.layouts);
-        self.panel_dock
-            .install_persisted_sub_windows(restored.sub_windows);
-    }
-
-    /// Keeps this tab's detached panel windows on screen while ANOTHER program
-    /// tab is active (requirement 12 of `dev-docs/dockable_panels_plan.md` §1).
-    ///
-    /// An immediate viewport only exists while it is shown every pass, and
-    /// `PanelDock::end` — which shows them — runs only while the «Текст» tab
-    /// draws. Without this the user's detached windows would vanish on a tab
-    /// switch and come back somewhere else. The windows are shown EMPTY, which is
-    /// the behaviour the user chose for a program tab that has nothing to put in
-    /// them.
-    ///
-    /// Call it once per frame and ONLY on a frame where this tab did not draw.
-    pub fn draw_idle_dock_sub_windows(&mut self, ctx: &egui::Context) {
-        self.panel_dock.show_idle_sub_windows(ctx);
-    }
-
-    /// Hands out this tab's panel layouts when the user reorganised them since
-    /// the last call, for the app-owned writer to persist.
-    ///
-    /// Polled once per frame right after the tab draws (and once more from
-    /// `MangaApp::on_exit`), because the dock raises its dirty flag while the
-    /// gesture is still in flight — on every frame of a panel drag.
-    #[must_use]
-    pub fn take_dirty_panel_layouts(
-        &mut self,
-    ) -> Option<crate::widgets::panel_dock::PanelLayoutSnapshot> {
-        self.panel_dock.take_dirty_layouts()
     }
 
     /// Flushes the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
@@ -1026,15 +995,20 @@ impl TypingTabState {
         self.text_overlays.export_rx.is_some()
     }
 
-    pub fn draw(
-        &mut self,
-        ctx: &egui::Context,
-        ui: &mut egui::Ui,
-        project: &ProjectData,
-        page_infos: &HashMap<usize, PageImageInfo>,
-        texture_cache: &mut HashMap<usize, PageTexture>,
-        status: CanvasUiStatus,
-    ) {
+    /// Draws one frame of the «Текст» tab into `params.ui`.
+    ///
+    /// The dock state is LENT by the application for the frame (see
+    /// [`TypingDrawParams::panel_dock`]); this tab owns none of it.
+    pub fn draw(&mut self, params: TypingDrawParams<'_>) {
+        let TypingDrawParams {
+            ctx,
+            ui,
+            project,
+            page_infos,
+            texture_cache,
+            status,
+            panel_dock,
+        } = params;
         let save_busy = self.save_busy;
         let _frame_span = crate::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
         let canvas_rect = ui.max_rect();
@@ -1093,11 +1067,16 @@ impl TypingTabState {
             self.text_overlays.clear_selection();
         }
 
-        let (canvas, text_overlays, top_panel, panel_dock, mask_layer) = (
+        // Disjoint field split: `PanelDock::begin` borrows the dock state for the whole
+        // frame while the tab bodies borrow `top_panel` / `text_overlays` / `mask_layer`,
+        // and only borrows the compiler can see as disjoint may coexist
+        // (`dev-docs/dockable_panels_plan.md` §4.2). The dock state is no longer one of
+        // these fields: it is app-owned and lent in through `TypingDrawParams`, which is
+        // disjoint from `self` by construction.
+        let (canvas, text_overlays, top_panel, mask_layer) = (
             &mut self.canvas,
             &mut self.text_overlays,
             &mut self.top_panel,
-            &mut self.panel_dock,
             &mut self.mask_layer,
         );
         canvas.set_zoom_blocked(
@@ -1107,7 +1086,6 @@ impl TypingTabState {
         let mut hooks = TypingHooks {
             text_overlays,
             top_panel,
-            panel_dock,
             mask_layer,
             pending_create_text_from_bubble: None,
             page_overlay_occluders: HashMap::new(),
@@ -1124,6 +1102,10 @@ impl TypingTabState {
             status,
             source_upload_budget: &mut source_upload_budget,
             hooks: &mut hooks,
+            // Carried through the canvas to `draw_canvas_overlay_top_left`, the one place this
+            // tab runs the dock. The borrow is disjoint from `hooks` (which holds other fields
+            // of `self`) and from `canvas`, so all three can be live at once.
+            panel_dock,
         });
         if Self::should_clear_overlay_selection_from_canvas_click(
             ctx,
@@ -1376,22 +1358,30 @@ pub(in crate::tabs::typing) struct TypingPageInteractionPolicy {
 /// all of them within four percent of the free travel, i.e. a couple of points of
 /// drag residue — flushed to `0.0`, so both columns start exactly at their side.
 ///
-/// The LEFT column hangs off the `CanvasView` controls panel, the RIGHT one off the
-/// dock area's right edge; inside a column every panel is anchored to the one above
+/// The LEFT column is headed by the canvas' own «Лента» panel, which sits at the
+/// dock area's top-left corner; the RIGHT one hangs off the dock area's right edge.
+/// Inside a column every panel is anchored to the one above
 /// it, so a panel with nothing to draw drops out of the frame's chain and the ones
 /// below it move up into its place (`panel_dock::frame_layout`). Top to bottom, that
-/// is «Превью текста» → «Действия»/«Слои» → «Режим деформации» → «Редактирование
-/// раскладки» on the left and «Параметры»/«Эффекты» → «Маска» on the right:
-/// * `#0` — «Превью текста», under the `CanvasView` controls panel (create mode),
-///   pinned to [`TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX`];
-/// * `#1` — «Параметры» + «Эффекты», flush with the right edge of the dock area,
-///   pinned to [`TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX`];
-/// * `#2` — «Действия» + «Слои», under `#0`, pinned to
+/// is «Лента» → «Превью текста» → «Действия»/«Слои» → «Режим деформации» →
+/// «Редактирование раскладки» on the left and «Параметры»/«Эффекты» → «Маска» on
+/// the right:
+/// * `#0` — «Лента» ([`crate::canvas::CANVAS_RIBBON_TAB`]), flush with the left
+///   edge of the dock area. Content-sized: it is the canvas' own controls panel and
+///   has no reason to reserve more than its four rows;
+/// * `#1` — «Превью текста», under «Лента» (create mode) — where it hung off the
+///   canvas controls panel before that panel became a dock tab — offset along that
+///   side by [`TYPING_DEFAULT_PREVIEW_ALIGN`] and pinned to
+///   [`TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX`];
+/// * `#2` — «Параметры» + «Эффекты», on the right edge of the dock area,
+///   [`TYPING_DEFAULT_PARAMS_ALONG`] down from its top, pinned to
+///   [`TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX`];
+/// * `#3` — «Действия» + «Слои», under `#1`, pinned to
 ///   [`TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX`]. When the preview is hidden (edit
-///   mode) it inherits `#0`'s anchor and rises into the preview's place;
-/// * `#3` — «Маска», under `#1` (mask editor open);
-/// * `#4` — «Режим деформации», under `#2` (an overlay in transform mode);
-/// * `#5` — «Редактирование раскладки», under `#4`. The two never show together —
+///   mode) it inherits `#1`'s anchor and rises into the preview's place;
+/// * `#4` — «Маска», under `#2` (mask editor open);
+/// * `#5` — «Режим деформации», under `#3` (an overlay in transform mode);
+/// * `#6` — «Редактирование раскладки», under `#5`. The two never show together —
 ///   opening the layout editor leaves transform mode — so it normally sits directly
 ///   under «Действия», whose anchor it inherits for that frame.
 ///
@@ -1413,20 +1403,36 @@ pub(in crate::tabs::typing) struct TypingPageInteractionPolicy {
 /// hidden panel leaves the frame's chain and hands its own anchor down, so the
 /// column closes over the hole.
 ///
-/// Used only when no layout exists yet for this program tab.
-fn typing_default_dock_layout() -> DockLayout {
+/// Used only when no layout exists yet for this program tab. It stays here, next
+/// to the `TabId` literals it names, and is handed to the app-owned dock state as a
+/// plain `fn` pointer — both when the persisted layouts are restored before the
+/// first frame and by `ensure_default_layout` on every frame this tab draws.
+pub(crate) fn typing_default_dock_layout() -> DockLayout {
     let mut layout = DockLayout::new();
-    let preview = PanelId::new(0);
-    let params = PanelId::new(1);
-    let actions = PanelId::new(2);
-    let deform = PanelId::new(4);
+    let ribbon = PanelId::new(0);
+    let preview = PanelId::new(1);
+    let params = PanelId::new(2);
+    let actions = PanelId::new(3);
+    let deform = PanelId::new(5);
     let panels = [
+        // The ribbon is inserted FIRST because the preview anchors to it, and
+        // `insert_panel` rejects an anchor whose target does not exist yet.
+        (
+            ribbon,
+            vec![CANVAS_RIBBON_TAB],
+            PanelAnchor::ViewportEdge {
+                edge: DockEdge::Left,
+                along: 0.0,
+            },
+            None,
+        ),
         (
             preview,
             vec![TYPING_PREVIEW_TAB],
-            PanelAnchor::CanvasControls {
+            PanelAnchor::Panel {
+                target: ribbon,
                 edge: DockEdge::Bottom,
-                along: 0.0,
+                align: TYPING_DEFAULT_PREVIEW_ALIGN,
             },
             Some(TYPING_DEFAULT_PREVIEW_PANEL_SIZE_PX),
         ),
@@ -1435,7 +1441,7 @@ fn typing_default_dock_layout() -> DockLayout {
             vec![TYPING_PARAMS_TAB, TYPING_EFFECTS_TAB],
             PanelAnchor::ViewportEdge {
                 edge: DockEdge::Right,
-                along: 0.0,
+                along: TYPING_DEFAULT_PARAMS_ALONG,
             },
             Some(TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX),
         ),
@@ -1450,7 +1456,7 @@ fn typing_default_dock_layout() -> DockLayout {
             Some(TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX),
         ),
         (
-            PanelId::new(3),
+            PanelId::new(4),
             vec![TYPING_MASK_TAB],
             PanelAnchor::Panel {
                 target: params,
@@ -1470,7 +1476,7 @@ fn typing_default_dock_layout() -> DockLayout {
             None,
         ),
         (
-            PanelId::new(5),
+            PanelId::new(6),
             vec![TYPING_LAYOUT_EDITOR_TAB],
             PanelAnchor::Panel {
                 target: deform,
@@ -1571,15 +1577,20 @@ struct TypingDockCx<'a> {
     text_overlays: &'a mut TypingTextOverlayLayer,
     /// Owner of the «Маска» body.
     mask_layer: &'a mut TypingMaskLayer,
+    /// Owner of the «Лента» body. The hook's own `canvas` parameter, which is
+    /// borrow-independent of the three states above (they are fields of the tab,
+    /// it is the shared `CanvasView` the app hands to the canvas draw).
+    canvas: &'a mut CanvasView,
     /// Page whose layers the «Слои» tab lists and whose mask the «Маска» tab
     /// clears.
     page_idx: usize,
+    /// Project page count, shown by the «Лента» tab's page counter.
+    total_pages: usize,
 }
 
 struct TypingHooks<'a> {
     text_overlays: &'a mut TypingTextOverlayLayer,
     top_panel: &'a mut TypingTopPanelState,
-    panel_dock: &'a mut PanelDockState,
     mask_layer: &'a mut TypingMaskLayer,
     pending_create_text_from_bubble: Option<BubbleCreateTextRequest>,
     page_overlay_occluders: HashMap<usize, Vec<[Pos2; 4]>>,
@@ -1656,7 +1667,8 @@ impl CanvasHooks for TypingHooks<'_> {
         canvas_rect: Rect,
         canvas: &mut CanvasView,
         project: &ProjectData,
-        _status: CanvasUiStatus,
+        status: CanvasUiStatus,
+        panel_dock: &mut PanelDockState,
     ) {
         self.text_overlays
             .set_clean_overlays_model(canvas.clean_overlays_model_handle());
@@ -1788,38 +1800,32 @@ impl CanvasHooks for TypingHooks<'_> {
         // see THIS frame's polled render results, not the previous frame's.
         self.top_panel.begin_frame(ctx);
         {
-            let dock_state = &mut *self.panel_dock;
-            dock_state.ensure_default_layout(AppTab::Typing.key(), typing_default_dock_layout);
-            // Same rect the preview panel anchored to before the migration: the
-            // CanvasView controls panel, read from its last-frame area rect.
-            let canvas_controls =
-                ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
-            // The canvas' vertical scrollbar lives on the right edge of `canvas_rect`;
-            // keeping it out of the dock area is what stops a right-anchored panel from
-            // covering it.
-            let area_rect = Rect::from_min_max(
-                canvas_rect.min,
-                Pos2::new(
-                    (canvas_rect.right() - TYPING_DOCK_AREA_SCROLLBAR_RESERVE_PX)
-                        .max(canvas_rect.left()),
-                    canvas_rect.bottom(),
-                ),
-            );
+            panel_dock.ensure_default_layout(AppTab::Typing.key(), typing_default_dock_layout);
             let mut cx = TypingDockCx {
                 top_panel: &mut *self.top_panel,
                 text_overlays: &mut *self.text_overlays,
                 mask_layer: &mut *self.mask_layer,
+                // Reborrowed, not moved: the hook still uses `canvas` after the dock frame.
+                canvas: &mut *canvas,
                 page_idx,
+                total_pages: status.total_pages,
             };
             let mut dock = PanelDock::begin(
                 ctx,
-                dock_state,
+                panel_dock,
                 DockArea {
-                    rect: area_rect,
-                    canvas_controls,
+                    // The canvas' vertical scrollbar lives on the right edge of `canvas_rect`
+                    // and is kept out of the dock area by the shared rule all three canvas
+                    // tabs use, so a right-anchored panel cannot cover it.
+                    rect: canvas::dock_area_rect(canvas_rect),
                     layout_key: AppTab::Typing.key(),
                 },
             );
+            // The canvas owns this declaration; «Текст» only says where its context
+            // keeps the canvas and the page count.
+            canvas::declare_ribbon_tab(&mut dock, |cx: &mut TypingDockCx<'_>| {
+                (&mut *cx.canvas, cx.total_pages)
+            });
             dock.tab(TYPING_PREVIEW_TAB)
                 .title(|| t!("typing.preview.panel_heading"))
                 .visible(tabs_visible.preview)

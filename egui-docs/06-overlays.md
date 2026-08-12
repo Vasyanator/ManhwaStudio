@@ -26,6 +26,30 @@ Caveat: the doc comment on `Tooltip` says "You cannot interact with these", but
 allocated in a `Tooltip`-order `Area` *does* take input. What makes `Tooltip` safe for decoration is
 that we paint through a `Painter` and never allocate a widget there (§3).
 
+### 1.1 Within one `Order`: creation order does NOT decide who is on top
+
+A frequent (and wrong) assumption is "the `Area` created later in the frame wins the pointer".
+It does not. `Areas::order` is a **persistent** list that survives the frame: `set_state` appends a
+layer only the first time it is seen (memory/mod.rs:1215-1221), and `end_pass` re-sorts that list
+with a **stable** `sort_by_key(|layer| (layer.order, wants_to_be_on_top.contains(layer)))`
+(memory/mod.rs:1350). A stable sort keeps the relative order of two layers of the same `Order` as it
+already was — i.e. from when each was first created — so re-creating an `Area` in a different place
+in the frame changes nothing.
+
+What DOES move a layer up, within its `Order`:
+
+* `Area::begin` calls `move_to_top` when the area was **not visible last frame**, and also when it
+  is dragged, clicked, or the pointer was pressed on it (containers/area.rs:548-552). So an area
+  that appears fresh (a capture surface enabled by a mode, a popup) rises above the areas of the
+  same `Order` that were already there — and stays above them until *they* are re-created;
+* `Memory::areas_mut().move_to_top(layer_id)` explicitly (that is what the above calls);
+* `Area::order(..)` — a different `Order` beats everything inside one.
+
+Consequence for full-canvas capture surfaces: an `Order::Foreground` selection overlay entered by
+the user floats above `Order::Foreground` dock panels for as long as the mode lasts, and clicks over
+a panel go to the overlay. Fix such a case by giving the surface a LOWER `Order`, by excluding the
+panel rects from it, or by leaving it alone — never by reshuffling the creation order.
+
 ## 2. `Area` — the floating container
 
 `Area::new(Id)` (egui-0.35.0/src/containers/area.rs:133); `Area::show(ctx, …)` takes a **`&Context`**

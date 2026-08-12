@@ -71,7 +71,7 @@ use crate::page_ops::{PageOpKind, PageOpOutcome, execute_page_op};
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::tabs::characters::{CharactersTabAction, CharactersTabState};
-use crate::tabs::cleaning::CleaningTabState;
+use crate::tabs::cleaning::{CleaningDrawParams, CleaningTabState};
 use crate::tabs::notes::NotesTabState;
 use crate::tabs::page_manager::{PageManagerAction, PageManagerTabState};
 use crate::tabs::ps_editor::PsEditorTabState;
@@ -88,9 +88,13 @@ use crate::tabs::translation::{
     HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
     HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, TranslationHotkeyHints, TranslationTabState,
 };
-use crate::tabs::typing::{TypingSaveFlushReason, TypingTabState, TypingTextFlushError};
+use crate::tabs::typing::{
+    TypingDrawParams, TypingSaveFlushReason, TypingTabState, TypingTextFlushError,
+    typing_default_dock_layout,
+};
 use crate::tabs::wiki::WikiTabState;
-use crate::widgets::panel_dock::PanelLayoutWriter;
+use crate::widgets::panel_dock::persist as panel_dock_persist;
+use crate::widgets::panel_dock::{DockLayout, PanelDockState, PanelLayoutWriter};
 use eframe::egui;
 use egui::{Align2, ColorImage, TextureOptions};
 use ms_thread::{self as thread, JoinHandle};
@@ -221,12 +225,30 @@ pub struct MangaApp {
     typing_tab: TypingTabState,
     ps_editor_tab: PsEditorTabState,
     page_manager_tab: PageManagerTabState,
+    /// The dockable-panel arrangement of this studio window: every program tab's
+    /// `DockLayout` (keyed by `AppTab::key()`), the detached OS windows they place
+    /// panels in, and the dock's last-frame measurements.
+    ///
+    /// ONE state per studio window, owned here rather than by the tabs that draw it,
+    /// because three of its concerns are global and cannot be split per program tab:
+    /// * a sub-window's `ViewportId` is derived from its INDEX alone, and the index
+    ///   counter is per state — two states would mint two immediate viewports with
+    ///   the same id in one pass;
+    /// * the persisted `sub_windows` list is global (the writer merges `layouts` per
+    ///   key but REPLACES that list), so a second feeder would overwrite the first
+    ///   tab's windows on disk;
+    /// * installing and pruning sub-windows prunes them against the layouts of THIS
+    ///   state, so several states would each drop the other tabs' windows.
+    ///
+    /// Lent to the drawing tab for the frame (`TypingDrawParams::panel_dock`); the
+    /// tab borrows it disjointly from its own state.
+    panel_dock: PanelDockState,
     /// The single writer of the `PanelLayout` section of `user_config.json`
     /// (`src/widgets/panel_dock/persist.rs`). One per studio window, owned here
-    /// rather than by a tab's `PanelDockState`, because that state is also built
-    /// in tests and by every program tab that draws panels, and none of them may
-    /// spawn a thread or reach the disk. Tabs are polled for a dirty layout once
-    /// per frame; the writer coalesces the burst and writes off the GUI thread.
+    /// rather than by `panel_dock` itself, because that state is also built in
+    /// tests and may neither spawn a thread nor reach the disk. `panel_dock` is
+    /// polled for a dirty layout once per frame; the writer coalesces the burst
+    /// and writes off the GUI thread.
     panel_layout_writer: PanelLayoutWriter,
     /// Shared unified layer document: the source of truth for per-page layer MODEL state, held by
     /// both view tabs (`Arc<Mutex<…>>`). Each tab re-projects its current page whenever the doc's
@@ -684,10 +706,10 @@ impl MangaApp {
         cleaning_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut typing_tab = TypingTabState::default();
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
-        // Dockable-panel arrangement, restored from the snapshot already in hand. It must be
-        // installed BEFORE the first frame: the dock builds the default layout for any key that
-        // has none, and the default is what the restored layout has to win over.
-        typing_tab.load_persisted_panel_layouts(&user_settings);
+        // Dockable-panel arrangement of this studio window, restored from the snapshot already in
+        // hand. It must be installed BEFORE the first frame: the dock builds the default layout
+        // for any key that has none, and the default is what the restored layout has to win over.
+        let panel_dock = restore_panel_dock(&user_settings);
         typing_tab.set_hint_collapsed(typing_hint_collapsed);
         typing_tab.set_centering_assist_persisted_state(
             typing_centering_assist_enabled,
@@ -790,6 +812,7 @@ impl MangaApp {
             typing_tab,
             ps_editor_tab,
             page_manager_tab,
+            panel_dock,
             panel_layout_writer: PanelLayoutWriter::spawn(),
             layer_doc,
             characters_tab: CharactersTabState::default(),
@@ -3020,7 +3043,14 @@ impl eframe::App for MangaApp {
         // match closes the scope. `_active_tab_draw_scope` is a held RAII guard, not dead code.
         #[cfg(feature = "profiling")]
         let _active_tab_draw_scope = puffin::profile_scope_custom!("active_tab_draw");
-        match self.active_tab {
+        // The panel-dock verdict of this pass, taken BEFORE the arms run and used
+        // afterwards: two arms reassign `self.active_tab` while the pass is still
+        // going (`open_page_in_tab` from the page manager, and the typing tab's
+        // font-group deep link into the settings tab), so a verdict read after the
+        // match answers for the tab the frame ENDED on, not for the one that drew.
+        let drawn_tab = self.active_tab;
+        let dock_pass = PanelDockPass::begin(drawn_tab);
+        match drawn_tab {
             AppTab::PageManager => {
                 let op_in_progress = self.page_op_rx.is_some()
                     || self.page_op_error.is_some()
@@ -3067,6 +3097,10 @@ impl eframe::App for MangaApp {
                 let textures = &mut self.textures;
                 let canvas = &mut self.canvas;
                 let hooks = &mut self.translation_tab;
+                // Lent for the frame and disjoint from `hooks` and `canvas`, exactly as for
+                // «Текст»; the canvas only carries it through to the overlay hook, where this
+                // tab runs its dock.
+                let panel_dock = &mut self.panel_dock;
 
                 egui::CentralPanel::default().show(ui, |ui| {
                     let mut source_upload_budget =
@@ -3080,8 +3114,15 @@ impl eframe::App for MangaApp {
                         status,
                         source_upload_budget: &mut source_upload_budget,
                         hooks,
+                        panel_dock,
                     });
                 });
+                // Panel-layout persistence poll — same contract as under «Текст» below: the
+                // dock raises its dirty flag on every frame a gesture advances, so it must be
+                // drained in the frame it was raised.
+                if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
+                    self.panel_layout_writer.store(layouts);
+                }
             }
             AppTab::Cleaning => {
                 // The Cleaning tab has no bottom-hint: its canvas `bottom_hint` stays `None`, so
@@ -3095,9 +3136,22 @@ impl eframe::App for MangaApp {
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
                 let cleaning = &mut self.cleaning_tab;
+                let panel_dock = &mut self.panel_dock;
                 egui::CentralPanel::default().show(ui, |ui| {
-                    cleaning.draw(ctx, ui, project, page_infos, textures, status);
+                    cleaning.draw(CleaningDrawParams {
+                        ctx,
+                        ui,
+                        project,
+                        page_infos,
+                        texture_cache: textures,
+                        status,
+                        panel_dock,
+                    });
                 });
+                // Panel-layout persistence poll — same contract as under «Текст» below.
+                if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
+                    self.panel_layout_writer.store(layouts);
+                }
             }
             AppTab::Typing => {
                 self.typing_tab.set_bottom_hint(Some(CanvasBottomHint {
@@ -3120,15 +3174,27 @@ impl eframe::App for MangaApp {
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
                 let typing = &mut self.typing_tab;
+                // The dock state is app-owned and lent to the tab for the frame; the borrow is
+                // disjoint from `typing`, which is what lets the tab split it against its own
+                // fields (`dev-docs/dockable_panels_plan.md` §4.2).
+                let panel_dock = &mut self.panel_dock;
                 typing.set_save_busy(save_busy);
                 egui::CentralPanel::default().show(ui, |ui| {
-                    typing.draw(ctx, ui, project, page_infos, textures, status);
+                    typing.draw(TypingDrawParams {
+                        ctx,
+                        ui,
+                        project,
+                        page_infos,
+                        texture_cache: textures,
+                        status,
+                        panel_dock,
+                    });
                 });
                 // Panel-layout persistence poll. It sits right after the draw because the dock
                 // raises its dirty flag DURING the gesture — on every frame a panel drag advances
                 // — so the flag must be picked up in the same frame it was raised; the writer is
                 // what turns that per-frame stream into one debounced write.
-                if let Some(layouts) = typing.take_dirty_panel_layouts() {
+                if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
                     self.panel_layout_writer.store(layouts);
                 }
                 // In-app deep link from the typing panel's font-group "?" help icon:
@@ -3192,14 +3258,18 @@ impl eframe::App for MangaApp {
                 egui::CentralPanel::default().show(ui, |ui| self.wiki_tab.draw(ui));
             }
         }
-        // The typing tab's detached panel windows are immediate viewports: they
-        // exist only while they are shown every pass, and the tab that shows them
-        // stopped drawing the moment another program tab became active. Requirement
-        // 11 of `dev-docs/dockable_panels_plan.md` says they stay open and empty
-        // instead, so they are shown here — and ONLY here, because showing one
-        // viewport twice in a pass would render it twice.
-        if !matches!(self.active_tab, AppTab::Typing) {
-            self.typing_tab.draw_idle_dock_sub_windows(ctx);
+        // The dock's detached panel windows are immediate viewports: they exist only
+        // while they are shown every pass, and `PanelDock::end` — which shows them —
+        // ran above only if the tab that DREW this pass hosts the dock. Requirement 11
+        // of `dev-docs/dockable_panels_plan.md` says they stay open and empty
+        // otherwise, so they are shown here — and ONLY here, because showing one
+        // viewport twice in a pass would render it twice. The verdict comes from
+        // `dock_pass`, decided before the arms ran: `self.active_tab` may name another
+        // tab by now, and either mistake is visible (a window shown zero times is
+        // dropped by eframe and jumps when it is re-created a frame later; a window
+        // shown twice renders grey and consumes its input twice).
+        if dock_pass.needs_idle_sub_windows() {
+            self.panel_dock.show_idle_sub_windows(ctx);
         }
         // Close the active-tab draw scope before the post-draw GPU trim / memory phases.
         #[cfg(feature = "profiling")]
@@ -3355,7 +3425,7 @@ impl eframe::App for MangaApp {
         // the dirty flag may be the one the close arrived in and no further frame will poll it;
         // then the writer's own debounce window is drained synchronously and its thread joined.
         // Both steps are no-ops when nothing changed.
-        if let Some(layouts) = self.typing_tab.take_dirty_panel_layouts() {
+        if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
             self.panel_layout_writer.store(layouts);
         }
         self.panel_layout_writer.flush_and_join();
@@ -3489,6 +3559,104 @@ const fn pressure_target_free_bytes(pressure: MemoryPressure) -> u64 {
         MemoryPressure::Hard => HARD_PRESSURE_TARGET_FREE_BYTES,
         MemoryPressure::Critical => u64::MAX,
     }
+}
+
+/// What one `MangaApp::ui` pass did with the panel dock, decided BEFORE the active-tab arms run.
+///
+/// The dock's detached sub-windows are immediate viewports and must be shown exactly once per
+/// pass: `PanelDock::end` shows them while a dock host draws, and `show_idle_sub_windows` covers
+/// every other pass. Which of the two applies is a fact about the tab that DREW, and that tab is
+/// not `MangaApp::active_tab` at the end of the pass — the page-manager arm (`open_page_in_tab`)
+/// and the typing tab's settings deep link both switch tabs mid-pass. Capturing the verdict up
+/// front is what keeps the two mistakes out: a pass that shows a viewport zero times has it
+/// dropped by eframe and re-created without its stored position (the window jumps), and a pass
+/// that shows one twice renders it empty and feeds it its input twice.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PanelDockPass {
+    /// `true` when the arm that draws this pass runs `PanelDock::end`, which shows every
+    /// sub-window viewport of the dock itself.
+    dock_ran: bool,
+}
+
+impl PanelDockPass {
+    /// Opens the pass for the tab whose arm is about to draw. Call before the `match`.
+    #[must_use]
+    fn begin(drawn_tab: AppTab) -> Self {
+        Self {
+            dock_ran: tab_hosts_panel_dock(drawn_tab),
+        }
+    }
+
+    /// Whether `PanelDockState::show_idle_sub_windows` must run after the arms, i.e. whether the
+    /// pass has not already shown the sub-window viewports.
+    #[must_use]
+    fn needs_idle_sub_windows(self) -> bool {
+        !self.dock_ran
+    }
+}
+
+/// Whether `tab` draws the app-owned panel dock, i.e. whether `PanelDock::end` runs while it is
+/// the active program tab.
+///
+/// The single source of the "is this a dock host" question: it decides whether the dock's detached
+/// sub-windows still need the idle keep-alive pass (`PanelDockState::show_idle_sub_windows`), which
+/// must run on exactly the frames `PanelDock::end` does NOT. Adding a dock host means flipping its
+/// arm here. The `match` is exhaustive with no catch-all so a new `AppTab` variant has to answer it.
+#[must_use]
+fn tab_hosts_panel_dock(tab: AppTab) -> bool {
+    match tab {
+        // The three canvas tabs: each declares the canvas' own «Лента» tab, and «Текст»
+        // additionally declares its own eight.
+        AppTab::Translation | AppTab::Cleaning | AppTab::Typing => true,
+        AppTab::PageManager
+        | AppTab::PsEditor
+        | AppTab::Characters
+        | AppTab::Terms
+        | AppTab::Notes
+        | AppTab::Settings
+        | AppTab::Wiki => false,
+    }
+}
+
+/// Builds this studio window's panel-dock state and restores the persisted arrangement from an
+/// already loaded `user_config.json` snapshot. Performs no I/O.
+///
+/// Call once, before the first frame: a restored layout wins over a program tab's default layout,
+/// while an absent, malformed, newer or invalid stored layout silently degrades to it (every reason
+/// is logged by `panel_dock::persist`). Tabs the stored layout does not mention are re-created by
+/// the dock on the frame that declares them.
+///
+/// The defaults slice is the dock migration's extension point: ONE entry per dock host, mapping
+/// `AppTab::key()` to that tab's default-layout builder. A builder must name every `TabId` its tab
+/// can declare — `persist` uses the default's tab set as the dictionary of known tabs, and a tab
+/// missing from it would be dropped from the user's arrangement on every load.
+#[must_use]
+fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
+    let restored = panel_dock_persist::layouts_from_user_settings(
+        user_settings,
+        &[
+            // «Перевод» and «Клининг» declare the canvas' «Лента» and nothing else, so they
+            // share one builder — see `canvas::ribbon_only_dock_layout`.
+            (
+                AppTab::Translation.key(),
+                crate::canvas::ribbon_only_dock_layout as fn() -> DockLayout,
+            ),
+            (
+                AppTab::Cleaning.key(),
+                crate::canvas::ribbon_only_dock_layout as fn() -> DockLayout,
+            ),
+            (
+                AppTab::Typing.key(),
+                typing_default_dock_layout as fn() -> DockLayout,
+            ),
+        ],
+    );
+    let mut state = PanelDockState::new();
+    // Layouts first: the sub-window install drops a window no restored layout puts a panel in, so
+    // it has to see them.
+    state.install_persisted_layouts(restored.layouts);
+    state.install_persisted_sub_windows(restored.sub_windows);
+    state
 }
 
 /// Reads a per-tab canvas bottom-hint collapsed flag from the merged startup `user_settings`.
@@ -4481,10 +4649,54 @@ mod tests {
         apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
         decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
         page_op_text_quiesce, save_trigger_decision, should_seed_page_cache_on_initial_load,
-        text_tab_bool_from_user_settings,
+        PanelDockPass, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
     };
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
+    use crate::tabs::AppTab;
     use serde_json::{Value, json};
+
+    /// The dock hosts are the tabs `PanelDock::end` runs for, and the idle sub-window keep-alive
+    /// must run on exactly the complementary frames. The hosts are the three CANVAS tabs — each
+    /// declares the canvas' own «Лента» tab — and a tab that starts hosting the dock has to be
+    /// added here together with its default-layout entry in `restore_panel_dock`, while one that
+    /// is added by accident shows up as a double-shown viewport.
+    #[test]
+    fn only_the_canvas_tabs_host_the_panel_dock() {
+        let hosts: Vec<AppTab> = AppTab::ALL
+            .into_iter()
+            .filter(|tab| tab_hosts_panel_dock(*tab))
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![AppTab::Translation, AppTab::Cleaning, AppTab::Typing]
+        );
+    }
+
+    /// The idle sub-window pass must answer for the tab that DREW, and the two arms that
+    /// reassign `active_tab` mid-pass are exactly what makes the two answers differ:
+    /// «Менеджер страниц» opens a page in a canvas tab, and «Текст» deep-links into the
+    /// settings tab. Reading the tab AFTER the match therefore either skips the keep-alive
+    /// (eframe drops the viewport and the window jumps when it is re-created) or runs it on
+    /// top of `PanelDock::end` (one viewport shown twice in one pass).
+    #[test]
+    fn the_idle_sub_window_pass_answers_for_the_tab_that_drew() {
+        // Not a dock host -> the keep-alive is required, whatever the pass ends on.
+        let pass = PanelDockPass::begin(AppTab::PageManager);
+        assert!(tab_hosts_panel_dock(AppTab::Typing), "the fixture needs a host tab");
+        assert!(
+            pass.needs_idle_sub_windows(),
+            "the page-manager pass drew no dock, so the windows still need showing"
+        );
+
+        // A dock host -> `PanelDock::end` already showed the viewports; showing them again
+        // in the same pass renders each of them twice.
+        let pass = PanelDockPass::begin(AppTab::Typing);
+        assert!(
+            !tab_hosts_panel_dock(AppTab::Settings),
+            "the fixture needs a non-host tab"
+        );
+        assert!(!pass.needs_idle_sub_windows());
+    }
 
     #[test]
     fn page_op_quiesce_proceeds_when_the_flush_enqueued_every_resident_page() {

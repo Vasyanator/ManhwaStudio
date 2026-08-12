@@ -42,6 +42,12 @@ pub(crate) use panel::seed_effect_defaults_from_config;
 // Startup seeding of the runtime-global imported-system-fonts store from user config.
 pub(crate) use panel::seed_imported_system_fonts_from_config;
 pub use tab::TypingTabState;
+// Per-frame inputs of `TypingTabState::draw`, built by `app.rs` — it carries the
+// app-owned `PanelDockState` borrow the tab draws its panels from.
+pub use tab::TypingDrawParams;
+// This tab's default panel arrangement, handed to the app-owned dock state as a
+// `fn` pointer (restore before the first frame + `ensure_default_layout` per frame).
+pub(crate) use tab::typing_default_dock_layout;
 // Reason tag for `TypingTabState::flush_text_layers_if_dirty`; `app.rs` names it at the tab-leave and
 // exit flush points.
 pub use tab::TypingSaveFlushReason;

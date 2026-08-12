@@ -67,6 +67,16 @@ Panel/UI flow:
 - `draw_text_detector_additional_overlay_on_page`: draws detector boxes/line-edit overlay on additional-elements layer.
 - `draw_canvas_overlay_top_left` (CanvasHooks): frame orchestrator, buttons, polling, flushes.
 
+Panel dock:
+- `draw_panel_dock`: runs this tab's `PanelDock` frame (the canvas' «Лента» tab is its only
+  declaration) at the end of `draw_canvas_overlay_top_left`. It must run on every frame the tab is
+  active — `PanelDock::end` is what keeps the dock's detached sub-window viewports alive.
+- `ribbon_panel_rect`: last frame's MAIN-WINDOW rect of the panel holding «Лента», `None` when the
+  tab is hidden or detached; `text_detector_edit_panel_pos` places the two detector edit boxes
+  under it and falls back to a fixed canvas offset.
+- The default arrangement is canvas-owned (`canvas::ribbon_only_dock_layout`), shared with
+  «Клининг».
+
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.
 - `maybe_refresh_character_names_by_watch`: throttled mtime-watch `characters.json` with auto-refresh.
@@ -181,8 +191,8 @@ Key TranslationTabState field groups:
 
 use crate::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use crate::canvas::{
-    BubbleAction, BubbleClass, CanvasHooks, CanvasScrollbarContext, CanvasUiStatus, CanvasView,
-    TranslationStatusDisplay,
+    BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
+    CanvasUiStatus, CanvasView, RibbonDockCx, TranslationStatusDisplay,
 };
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
 use crate::memory_manager::{
@@ -234,6 +244,7 @@ use crate::tabs::translation::text_detector::{
     TranslationTextDetectorController,
 };
 use crate::tools::MaskBrush;
+use crate::widgets::panel_dock::{DockArea, PanelDock, PanelDockState};
 use crate::widgets::{
     AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider, WheelSpinBox,
 };
@@ -558,6 +569,17 @@ pub struct TranslationTabState {
     text_detector_progress: Option<(usize, usize)>,
     text_detector_edit_lines_mode: bool,
     text_detector_edit_mask_mode: bool,
+    /// Outer rect the dock panel holding the «Лента» tab was drawn at on the LAST
+    /// frame, in main-window coordinates; `None` when the tab was not on screen
+    /// (hidden, or the user moved it into a detached sub-window, whose rects say
+    /// nothing about this window).
+    ///
+    /// The two text-detector edit boxes hang under that panel — as they hung under
+    /// the canvas controls `Area` before it became a dock tab — and they are drawn
+    /// EARLIER in `draw_canvas_overlay_top_left` than the dock runs, so they can
+    /// only ever see the previous frame's rect. That is exactly what the old
+    /// `Memory::area_rect` read gave them.
+    ribbon_panel_rect: Option<Rect>,
     text_detector_line_selection: Option<TextDetectorLineSelection>,
     text_detector_line_drag_state: Option<TextDetectorLineDragState>,
     text_detector_mask_stroke_state: Option<TextDetectorMaskStrokeState>,
@@ -808,6 +830,7 @@ impl TranslationTabState {
             text_detector_progress: None,
             text_detector_edit_lines_mode: false,
             text_detector_edit_mask_mode: false,
+            ribbon_panel_rect: None,
             text_detector_line_selection: None,
             text_detector_line_drag_state: None,
             text_detector_mask_stroke_state: None,
@@ -5100,6 +5123,60 @@ impl TranslationTabState {
     }
 }
 
+impl TranslationTabState {
+    /// Top-left corner of the text-detector edit boxes: just under the dock panel
+    /// holding the «Лента» tab, as they sat under the canvas controls panel before
+    /// that panel became a dock tab.
+    ///
+    /// Uses the PREVIOUS frame's rect ([`TranslationTabState::ribbon_panel_rect`]) —
+    /// these boxes are drawn before the dock runs — and falls back to a fixed offset
+    /// inside `canvas_rect` whenever the panel is not on screen in this window
+    /// (hidden, or detached into a sub-window), which is the same fallback the
+    /// `Memory::area_rect` read had.
+    #[must_use]
+    fn text_detector_edit_panel_pos(&self, canvas_rect: Rect) -> Pos2 {
+        self.ribbon_panel_rect
+            .map(|rect| rect.left_bottom() + egui::vec2(0.0, 8.0))
+            .unwrap_or_else(|| canvas_rect.left_top() + egui::vec2(12.0, 112.0))
+    }
+
+    /// Runs the «Перевод» tab's panel dock — its only dock surface is the canvas'
+    /// own «Лента» tab — and records the drawn panel's rect for the next frame.
+    ///
+    /// Called at the very END of `draw_canvas_overlay_top_left`; see the call site
+    /// for why that position is load-bearing.
+    fn draw_panel_dock(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        canvas: &mut CanvasView,
+        total_pages: usize,
+        panel_dock: &mut PanelDockState,
+    ) {
+        panel_dock.ensure_default_layout(
+            AppTab::Translation.key(),
+            crate::canvas::ribbon_only_dock_layout,
+        );
+        let mut cx = RibbonDockCx {
+            canvas,
+            total_pages,
+        };
+        let mut dock = PanelDock::begin(
+            ctx,
+            panel_dock,
+            DockArea {
+                rect: crate::canvas::dock_area_rect(canvas_rect),
+                layout_key: AppTab::Translation.key(),
+            },
+        );
+        crate::canvas::declare_ribbon_tab(&mut dock, RibbonDockCx::ribbon_body);
+        // `tab_rect` answers for the MAIN window alone: it is `None` while the tab is
+        // hidden AND while the user keeps it in a detached sub-window, whose rect lives
+        // in that window's own coordinate frame. Both are "unknown" to the edit boxes.
+        self.ribbon_panel_rect = dock.end(&mut cx).tab_rect(CANVAS_RIBBON_TAB);
+    }
+}
+
 impl CanvasHooks for TranslationTabState {
     fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
         if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
@@ -5227,11 +5304,11 @@ impl CanvasHooks for TranslationTabState {
         canvas: &mut CanvasView,
         project: &ProjectData,
         status: CanvasUiStatus,
+        panel_dock: &mut PanelDockState,
     ) {
         let _ = (
             &project.image_dir,
             status.loaded_pages,
-            status.total_pages,
             status.load_errors_count,
         );
         let now_s = ctx.input(|i| i.time);
@@ -5314,10 +5391,7 @@ impl CanvasHooks for TranslationTabState {
         self.draw_startup_page_load_toast(ctx, canvas_rect, status);
         self.draw_toast(ctx, canvas_rect, toast_top_offset);
         if self.text_detector_edit_lines_mode {
-            let panel_pos = canvas
-                .canvas_left_top_controls_rect()
-                .map(|rect| rect.left_bottom() + egui::vec2(0.0, 8.0))
-                .unwrap_or_else(|| canvas_rect.left_top() + egui::vec2(12.0, 112.0));
+            let panel_pos = self.text_detector_edit_panel_pos(canvas_rect);
             egui::Area::new("translation_text_detector_line_edit_panel".into())
                 .fixed_pos(panel_pos)
                 .show(ctx, |ui| {
@@ -5337,10 +5411,7 @@ impl CanvasHooks for TranslationTabState {
                 });
         }
         if self.text_detector_edit_mask_mode {
-            let panel_pos = canvas
-                .canvas_left_top_controls_rect()
-                .map(|rect| rect.left_bottom() + egui::vec2(0.0, 8.0))
-                .unwrap_or_else(|| canvas_rect.left_top() + egui::vec2(12.0, 112.0));
+            let panel_pos = self.text_detector_edit_panel_pos(canvas_rect);
             egui::Area::new("translation_text_detector_mask_edit_panel".into())
                 .fixed_pos(panel_pos)
                 .show(ctx, |ui| {
@@ -5399,6 +5470,21 @@ impl CanvasHooks for TranslationTabState {
         {
             ctx.request_repaint();
         }
+        // The dock runs LAST in this hook, but NOT because that would win it the pointer: within
+        // one `Order`, egui's layer list is persistent and re-sorted stably every pass
+        // (`egui-0.35.0/src/memory/mod.rs:1215-1221`, `:1350`), so where in the frame an `Area` is
+        // created is irrelevant. What raises a layer is `Area::begin`'s `move_to_top` for an area
+        // that was not visible last frame (`egui-0.35.0/src/containers/area.rs:548-552`): the OCR
+        // and image-crop capture surfaces above are full-canvas `Order::Foreground` areas, so each
+        // time the user ENTERS one of those selection modes the surface rises above the dock's
+        // panels and swallows clicks on them until the mode ends. Known and unchanged by the dock
+        // migration — the old controls panel was on the lower `Order::Middle` and lost the same
+        // clicks (`egui-docs/06-overlays.md` §1.1).
+        //
+        // It must run on EVERY frame this tab is active — the dock's detached sub-windows are
+        // immediate viewports that only exist while `PanelDock::end` shows them
+        // (`app.rs::PanelDockPass`), so this hook has no early return before this point.
+        self.draw_panel_dock(ctx, canvas_rect, canvas, status.total_pages, panel_dock);
     }
 
     fn build_bubble_header(&mut self, _ui: &mut egui::Ui, _bubble: &Bubble, _editable: bool) {}
@@ -7841,7 +7927,31 @@ fn build_bubble_original_text(
 
 #[cfg(test)]
 mod tests {
-    use super::footer_tracking_should_recompute;
+    use super::{
+        Pos2, Rect, TranslationTabState, egui, footer_tracking_should_recompute,
+    };
+
+    /// The two text-detector edit boxes are drawn BEFORE the dock runs, so they position
+    /// themselves from the previous frame's ribbon-panel rect and must degrade to a fixed
+    /// offset inside the canvas whenever that panel was not on screen in this window.
+    #[test]
+    fn the_detector_edit_boxes_follow_the_ribbon_panel_and_have_a_fallback() {
+        let canvas = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(1100.0, 850.0));
+        let mut tab = TranslationTabState::default();
+        assert_eq!(
+            tab.text_detector_edit_panel_pos(canvas),
+            canvas.left_top() + egui::vec2(12.0, 112.0),
+            "an unknown panel rect falls back inside the canvas"
+        );
+
+        let panel = Rect::from_min_size(Pos2::new(120.0, 60.0), egui::vec2(330.0, 160.0));
+        tab.ribbon_panel_rect = Some(panel);
+        assert_eq!(
+            tab.text_detector_edit_panel_pos(canvas),
+            panel.left_bottom() + egui::vec2(0.0, 8.0),
+            "a known panel rect places the box one small gap under it"
+        );
+    }
 
     #[test]
     fn footer_tracking_not_bootstrapped_always_recomputes() {

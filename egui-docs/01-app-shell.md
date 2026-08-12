@@ -147,7 +147,6 @@ layout, not to your call site:
 // src/tabs/typing/tab.rs:1814 — the canonical call site
 let mut dock = PanelDock::begin(ctx, dock_state, DockArea {
     rect: area_rect,                  // where panels may live (the canvas area)
-    canvas_controls,                  // extra snap target, not a dock panel itself
     layout_key: AppTab::Typing.key(), // NEVER a localized tab title
 });
 dock.tab(TYPING_PREVIEW_TAB)

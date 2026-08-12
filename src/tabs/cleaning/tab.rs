@@ -6,7 +6,8 @@ FILE HEADER (tabs/cleaning/tab.rs)
     `bottom_hint` stays `None`, so the overlay is not drawn) and does not persist a collapsed flag.
   - `tools` / `active_tool_idx`: набор инструментов и выбранный инструмент.
   - `stroke_active` / `last_stroke_point`: состояние текущего штриха.
-  - `panel_rects`: прямоугольники плавающих панелей (`остров` + `панель инструмента`) для фильтрации ввода.
+  - `panel_rects`: прямоугольники плавающих панелей (`остров` + `панель инструмента` + панели ДОКА,
+    добавляемые в список после `canvas.draw`) для фильтрации ввода.
   - `text_mask_model`: shared-модель маски текста для mask-layer overlay в cleaning-canvas.
   - `quick_text_mask_panel_open`: состояние плавающей панели "Быстрый клин найденного текста".
   - `text_mask_textures`: tile-кэш текстовой маски для оверлея в cleaning-canvas with LRU metadata
@@ -16,7 +17,12 @@ FILE HEADER (tabs/cleaning/tab.rs)
 - `quick_clean_*`: состояние быстрого клина по маске текста (UI-параметры, фоновые job-события, прогресс).
 - `overlays_model`: shared clean-overlay model; committed edits land there and use its diff-based undo/redo history.
 - Ключевые методы:
-  - `draw`: кадр вкладки (гейты input, рендер canvas, UI панелей, overlay UI инструмента).
+  - `draw`: кадр вкладки (гейты input, рендер canvas, UI панелей, overlay UI инструмента);
+    все входы кадра приходят одним `CleaningDrawParams`, среди них `panel_dock` — состояние
+    панельного дока, которым владеет приложение и которое одалживается на кадр.
+  - `draw_canvas_overlay_top_left` (в `CleaningHooks`): единственное место, где эта вкладка
+    гоняет док; объявляет вкладку «Лента» через `canvas::declare_ribbon_tab`, раскладка по
+    умолчанию — общая с «Переводом» `canvas::ribbon_only_dock_layout`.
   - `draw_tool_panel`: отдельное плавающее окно инструмента (выбор инструмента + его UI) со сворачиванием.
   - `draw_quick_text_mask_panel`: плавающая сворачиваемая панель быстрого клина (параметры + запуск + прогресс).
   - `active_cursor_occluder`: вычисляет scene-область активного курсора кисти для скрытия on_top/aside пузырей.
@@ -42,8 +48,8 @@ use super::tools::{
 };
 use crate::app::{PageImageInfo, PageTexture};
 use crate::canvas::{
-    CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot,
-    SourceTextureUploadBudget,
+    self, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot,
+    RibbonDockCx, SourceTextureUploadBudget,
 };
 use crate::memory_manager::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -53,7 +59,9 @@ use crate::models::bubbles_model::BubblesModel;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::models::text_mask_model::TextMaskModel;
 use crate::project::ProjectData;
+use crate::tabs::AppTab;
 use crate::tabs::translation::backend_health::AiBackendHealthSnapshot;
+use crate::widgets::panel_dock::{DockArea, PanelDock, PanelDockState};
 use crate::widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Align, Color32, Layout, Pos2, Rect};
@@ -159,6 +167,27 @@ struct QuickTextCleanProgress {
     regions_partial: usize,
     failed_pages: usize,
     missing_masks: usize,
+}
+
+/// Everything one frame of [`CleaningTabState::draw`] needs.
+///
+/// A parameter struct rather than a parameter list: the app-owned `panel_dock`
+/// borrow raised the call over clippy's `too_many_arguments` budget, and the
+/// shape mirrors `CanvasDrawParams`, which this tab already builds from these
+/// very fields.
+pub struct CleaningDrawParams<'a> {
+    pub ctx: &'a egui::Context,
+    pub ui: &'a mut egui::Ui,
+    pub project: &'a ProjectData,
+    pub page_infos: &'a HashMap<usize, PageImageInfo>,
+    pub texture_cache: &'a mut HashMap<usize, PageTexture>,
+    pub status: CanvasUiStatus,
+    /// The studio window's dock state, owned by `MangaApp` and LENT for this
+    /// frame. It is not a field of this tab because one studio window has exactly
+    /// one dock state, shared by every program tab that hosts panels
+    /// (`src/widgets/panel_dock/MODULE_README.md`); the lent-in borrow is also
+    /// what keeps it disjoint from the fields the tab bodies touch.
+    pub panel_dock: &'a mut PanelDockState,
 }
 
 pub struct CleaningTabState {
@@ -362,15 +391,20 @@ impl CleaningTabState {
         self.canvas.reset_zoom_shortcut()
     }
 
-    pub fn draw(
-        &mut self,
-        ctx: &egui::Context,
-        ui: &mut egui::Ui,
-        project: &ProjectData,
-        page_infos: &HashMap<usize, PageImageInfo>,
-        texture_cache: &mut HashMap<usize, PageTexture>,
-        status: CanvasUiStatus,
-    ) {
+    /// Draws one frame of the «Клининг» tab into `params.ui`.
+    ///
+    /// The panel-dock state is LENT by the application for the frame (see
+    /// [`CleaningDrawParams::panel_dock`]); this tab owns none of it.
+    pub fn draw(&mut self, params: CleaningDrawParams<'_>) {
+        let CleaningDrawParams {
+            ctx,
+            ui,
+            project,
+            page_infos,
+            texture_cache,
+            status,
+            panel_dock,
+        } = params;
         if ctx.input(|i| i.pointer.primary_released()) {
             self.finish_stroke();
         }
@@ -440,6 +474,7 @@ impl CleaningTabState {
             text_mask_textures: &mut self.text_mask_textures,
             text_mask_synced_revision: &mut self.text_mask_synced_revision,
             cursor_occluder,
+            dock_panel_rects: Vec::new(),
         };
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
         self.canvas.draw(CanvasDrawParams {
@@ -451,9 +486,27 @@ impl CleaningTabState {
             status,
             source_upload_budget: &mut source_upload_budget,
             hooks: &mut hooks,
+            panel_dock,
         });
+        // Taken while `hooks` is still alive and BEFORE the `&mut self` calls below, which would
+        // otherwise conflict with the field borrows `hooks` holds.
+        let dock_panel_rects = std::mem::take(&mut hooks.dock_panel_rects);
         self.poll_save_job();
         self.panel_rects.clear();
+        // The dock drew its panels DURING `canvas.draw`, i.e. before this frame's `clear`, so its
+        // rects are re-added here: `canvas_pointer_occluded` gates the active tool on this
+        // same-frame list, exactly as it does for this tab's own island and tool panels.
+        //
+        // Its z-order term (`ctx.layer_id_at` == `Order::Foreground`) does cover a dock panel on
+        // its own, including the very first frame one appears — `Areas::set_state` records the
+        // panel's `Area` during `canvas.draw`, and `Areas::is_visible` accepts the CURRENT frame's
+        // set, so the lookup that runs later in the same frame already sees it. The explicit rects
+        // are kept anyway: they are this tab's uniform statement of "a floating surface of mine is
+        // here", and they do not depend on the panel widget staying an interactable `Area` on that
+        // order. They are MAIN-WINDOW rects by construction — `drawn_panels` never reports a panel
+        // the user detached into a sub-window, whose rect would otherwise blank out this window's
+        // top-left corner (`PanelDockOutput`).
+        self.panel_rects.extend(dock_panel_rects);
         self.draw_top_island_panel(ctx, canvas_rect, project);
         self.draw_tool_panel(ctx, canvas_rect);
         self.draw_quick_text_mask_panel(ctx, canvas_rect, project);
@@ -1510,6 +1563,16 @@ struct CleaningHooks<'a> {
     text_mask_textures: &'a mut HashMap<usize, TextMaskTexturePage>,
     text_mask_synced_revision: &'a mut u64,
     cursor_occluder: Option<CleaningCursorOccluder>,
+    /// Outer rects of the dock panels drawn this frame in THIS window, collected
+    /// by `draw_canvas_overlay_top_left` and drained by `CleaningTabState::draw`
+    /// into `panel_rects`. It cannot be written straight into that field: the
+    /// hook runs inside `canvas.draw`, and the tab clears `panel_rects` after
+    /// that call returns.
+    ///
+    /// Never holds a sub-window's rect: `PanelDockOutput::drawn_panels` reports
+    /// main-window panels only, and a detached panel's rect — taken in that
+    /// window's own frame — would occlude a corner of the canvas here.
+    dock_panel_rects: Vec<Rect>,
 }
 
 impl CleaningHooks<'_> {
@@ -1569,6 +1632,48 @@ impl CleaningHooks<'_> {
 }
 
 impl CanvasHooks for CleaningHooks<'_> {
+    /// Runs the «Клининг» tab's panel dock — its only floating dock surface is the
+    /// canvas' own «Лента» tab.
+    ///
+    /// Implemented here, rather than after `canvas.draw` returns, for two reasons:
+    /// the «Лента» body edits canvas settings and must land BEFORE
+    /// `publish_canvas_settings` (which runs at the end of `CanvasView::draw`), and
+    /// all three canvas tabs then run their dock at the same point of the frame with
+    /// the same dock-area rule. It must also run on EVERY frame this tab is active:
+    /// the dock's detached sub-windows are immediate viewports kept alive by
+    /// `PanelDock::end` (`app.rs::tab_hosts_panel_dock`).
+    fn draw_canvas_overlay_top_left(
+        &mut self,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+        canvas: &mut CanvasView,
+        _project: &ProjectData,
+        status: CanvasUiStatus,
+        panel_dock: &mut PanelDockState,
+    ) {
+        panel_dock.ensure_default_layout(AppTab::Cleaning.key(), canvas::ribbon_only_dock_layout);
+        let mut cx = RibbonDockCx {
+            canvas,
+            total_pages: status.total_pages,
+        };
+        let mut dock = PanelDock::begin(
+            ctx,
+            panel_dock,
+            DockArea {
+                rect: canvas::dock_area_rect(canvas_rect),
+                layout_key: AppTab::Cleaning.key(),
+            },
+        );
+        canvas::declare_ribbon_tab(&mut dock, RibbonDockCx::ribbon_body);
+        // MAIN-WINDOW panels only, by construction: `drawn_panels` never reports a
+        // panel the user detached into a sub-window, whose rect lives in that
+        // window's own frame and would carve a dead zone out of this window's
+        // top-left corner (`PanelDockOutput`).
+        let out = dock.end(&mut cx);
+        self.dock_panel_rects
+            .extend(out.drawn_panels().map(|(_, rect)| rect));
+    }
+
     fn draw_canvas_mask_overlay_on_page(
         &mut self,
         ui: &mut egui::Ui,

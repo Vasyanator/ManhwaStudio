@@ -169,19 +169,30 @@ per-frame `bubble_text_edit_ids` registry (unconditionally — a right-click doe
 cannot be reproduced outside its owning `Ui`. One captured id covers both derivations and cannot
 silently drift when a salt is renamed.
 
-The top-left canvas controls panel (`scene.rs::draw_canvas_controls`) is a movable, collapsible
-auto-sized `Area`. Its zoom row also carries the canvas-shortcuts hover chip
-(`canvas.shortcuts_hint.*`), right-aligned via `egui::containers::Sides` in
-`draw_zoom_and_shortcuts_row`; the chip lists the canvas-intrinsic navigation keys (zoom/pan/scroll)
-and is hover-only, so it has no click and no persisted state. Layout invariant: `Sides` (like a bare
-`right_to_left` layout) expands to the parent's full available width, which inside an auto-sized
-`Area` is the whole screen and would stretch the panel. So the chip row is allocated to exactly
-`scene.controls_content_width` — the panel's natural width, measured each frame from the rows that do
-NOT contain the chip (header, checkbox, opacity slider). That exclusion is required: measuring the
-stretched chip row would feed its width back in and grow the panel by one item-spacing per frame,
-and re-measuring the chip-free rows every frame is what lets the panel shrink again under a shorter
-locale. When adding a row to this panel, fold its width into `natural_width` unless it is
-chip-stretched.
+The canvas' own controls («Лента») are a DOCK TAB, not a panel of the canvas' own making. The
+canvas owns the tab's identity and body — `CANVAS_RIBBON_TAB` (the literal `"canvas.ribbon"`),
+`CanvasView::ribbon_tab_title` (the one lookup of `canvas.ribbon.tab_title`),
+`CANVAS_RIBBON_TAB_MIN_SIZE_PX` / `CANVAS_RIBBON_TAB_INITIAL_SIZE_PX`, and
+`scene.rs::draw_ribbon_tab_body` (page counter, zoom row, "show bubbles", bubble opacity) — while
+the panel it lives in, its position, size and collapsed state belong to the panel dock and are
+persisted per program tab. All three canvas tabs declare that one tab from
+`CanvasHooks::draw_canvas_overlay_top_left`, i.e. still inside `CanvasView::draw` and therefore
+BEFORE `publish_canvas_settings`, so an edit lands in the same frame it is made. `dock_area_rect`
+is the shared rule for the area they hand the dock: `canvas_rect` minus
+`CANVAS_DOCK_AREA_SCROLLBAR_RESERVE_PX` on the right, so no panel can sit on the vertical
+scrollbar.
+
+Its zoom row also carries the canvas-shortcuts hover chip (`canvas.shortcuts_hint.*`),
+right-aligned via `egui::containers::Sides` in `draw_zoom_and_shortcuts_row`; the chip lists the
+canvas-intrinsic navigation keys (zoom/pan/scroll) and is hover-only, so it has no click and no
+persisted state. `Sides` stretches the row to the full available width, which is exactly what the
+pre-dock `Area` could not afford (auto-sized, "available" was the whole screen, and the stretched
+row fed its own width back in and grew the panel by one item-spacing per frame — hence the old
+`controls_content_width` measurement). A dock body has a finite width, and the dock re-measures a
+tab's HEIGHT only: `CollapsiblePanel` reports back the width it was GIVEN, never the drawn one, so
+stretching cannot become a size request. When adding a row here, keep that asymmetry in mind — a
+row's height is a request, its width is not, which is why the initial width is derived from the
+widest row by hand (see the constant's own comment).
 
 Clean overlays enter through `CleanOverlaysModel`. Normal canvas visibility uses the
 model's shared visibility flag. A canvas may also set a local clean-overlay visibility
@@ -220,7 +231,8 @@ X range before the old overflow point.
 ## Files and submodules
 - `mod.rs`: public facade, hook trait, render orchestration, and synchronization with
   shared models.
-- `scene.rs`: page strip layout, viewport interaction, page hit-testing, and canvas UI.
+- `scene.rs`: page strip layout, viewport interaction, page hit-testing, and the canvas' own
+  viewport UI (`draw_ribbon_tab_body` — the «Лента» dock tab's body — and the bottom hint).
 - `overlay_runtime.rs`: clean overlay CPU/GPU runtime state, background preparation, and
   local/shared visibility state.
 - `bubble_runtime.rs`: runtime bubble state, model synchronization, undo/redo, and clipboard.
@@ -252,11 +264,28 @@ X range before the old overflow point.
   inside the specific `CanvasView`.
 - Canvas scroll areas need per-instance egui ids. Cross-tab viewport sync must go through
   `CanvasViewportSnapshot`, not shared egui `ScrollArea` memory.
-- `CANVAS_LEFT_TOP_CONTROLS_AREA_ID` (`mod.rs`) is the ONE definition of the top-left controls
-  panel's `Id`. Tabs place their own floating UI under that panel by reading its last-frame area
-  rect out of `egui::Memory`, so a second literal elsewhere would silently drift; import the
-  constant instead. Its rect is also exposed directly as
-  `CanvasView::canvas_left_top_controls_rect`.
+- `CANVAS_RIBBON_TAB` (`mod.rs`) is the ONE definition of the controls tab's identity, and the
+  canvas does NOT own the panel it is drawn in. The canvas also owns the tab's DECLARATION
+  (`declare_ribbon_tab`) and the default one-panel arrangement the two ribbon-only program tabs
+  share (`ribbon_only_dock_layout`), so the three call sites cannot drift. A tab that wants to
+  place other floating UI under that panel asks the DOCK for the rect
+  (`PanelDockOutput::tab_rect(CANVAS_RIBBON_TAB)`), which answers for the MAIN window alone: it is
+  `None` while the tab is hidden AND while the user keeps it in a detached sub-window, whose rect
+  lives in that window's own coordinate frame. Both are "not on screen" and must not be
+  approximated. The dock output only exists after the dock has run, so a surface drawn earlier in
+  the same hook necessarily uses the PREVIOUS frame's rect (translation's two text-detector edit
+  boxes do exactly that).
+- The canvas never touches `PanelDockState`. It only CARRIES the app-owned borrow from
+  `CanvasDrawParams::panel_dock` into `CanvasHooks::draw_canvas_overlay_top_left`, which is where
+  every canvas program tab runs `PanelDock::begin … end`. Running the dock there — rather than
+  after `CanvasView::draw` returns — is what keeps a «Лента» edit ahead of
+  `publish_canvas_settings`. It decides NOTHING about z-order: within one `Order` egui keeps a
+  persistent layer list and re-sorts it stably each pass, so creation order inside the frame is
+  irrelevant; a layer rises only when `Area::begin` finds it was not visible last frame
+  (`egui-docs/06-overlays.md` §1.1). The standing consequence is that a tab's full-canvas
+  `Order::Foreground` capture surface floats above the dock's panels for as long as its selection
+  mode lasts and takes the clicks meant for them — the same clicks the pre-dock controls panel lost
+  on the lower `Order::Middle`, i.e. known behaviour, not a regression to "fix" by reordering.
 - The canvas does NOT load fonts. Bubble text is drawn with the egui family named by
   `helpers::BUBBLE_TEXT_FONT_FAMILY_NAME`, which is an alias of
   `crate::ui_fonts::BUBBLE_TEXT_FAMILY_NAME`; the chain behind that family is installed once
@@ -354,6 +383,12 @@ X range before the old overflow point.
 - To change clean overlay visibility, upload, tiling, or editing runtime, edit
   `overlay_runtime.rs` and the facade methods in `mod.rs`.
 - To change page layout, scrolling, zooming, or context menus, edit `scene.rs`.
+- To change what the «Лента» tab SHOWS, edit `scene.rs::draw_ribbon_tab_body`; to change how big it
+  starts or how small it may get, edit the two `CANVAS_RIBBON_TAB_*_SIZE_PX` constants in `mod.rs`.
+  Where the panel holding it sits by default is a per-program-tab decision: «Текст» has its own
+  `typing_default_dock_layout`, while «Перевод» and «Клининг» share `mod.rs::ribbon_only_dock_layout`
+  — one `fn` item registered under both keys. To change how the tab is DECLARED (title, size
+  bounds, body), edit `mod.rs::declare_ribbon_tab`, which all three tabs call.
 - To change source page GPU residency or NEAREST inspection behavior, edit `scene.rs`,
   `mod.rs`, and the source-page texture owner in `app.rs`.
 - To change bubble editing behavior, start in `bubble_runtime.rs` and the relevant

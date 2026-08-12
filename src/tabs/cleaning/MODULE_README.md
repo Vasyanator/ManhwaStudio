@@ -23,6 +23,23 @@ workers, and applies prepared `ColorImage` patches into `CleanOverlaysModel` as 
 Save operations collect overlay snapshots from the shared model and write `clean_layers/` in a
 worker thread.
 
+This tab HOSTS the shared panel dock (`src/widgets/panel_dock`). It declares exactly one tab —
+the canvas' own «Лента» (`canvas::CANVAS_RIBBON_TAB`, body `CanvasView::draw_ribbon_tab_body`) —
+and its default arrangement is `canvas::ribbon_only_dock_layout` — one panel at the dock area's left
+edge, the same `fn` item «Перевод» registers, handed to the dock both by `app.rs::restore_panel_dock`
+and by `ensure_default_layout`. The tab itself is declared through `canvas::declare_ribbon_tab`, the
+canvas' one declaration of it. The dock state is NOT owned here: it is app-owned
+(`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
+`CleaningDrawParams::panel_dock`, which `tab.rs` passes on to `CanvasDrawParams`. The dock runs in
+`CleaningHooks::draw_canvas_overlay_top_left` — inside `CanvasView::draw`, so a «Лента» edit still
+lands before `publish_canvas_settings` — and it must run on EVERY frame this tab is active,
+because the dock's detached OS windows are immediate viewports that only exist while
+`PanelDock::end` shows them. The panels it drew are collected into `CleaningHooks::dock_panel_rects`
+and folded into `panel_rects` after `canvas.draw` returns (the tab clears that list there), or the
+active tool would paint under a panel. `PanelDockOutput::drawn_panels` reports MAIN-WINDOW panels
+only, so a panel the user detached into a sub-window cannot enter that list — its rect is in that
+window's own frame and would blank out this window's top-left corner.
+
 Long-running AI, image processing, mask loading, and save work runs on worker threads.
 The GUI thread polls job receivers and applies already prepared results.
 AI-backed tools receive backend health/Torch availability from the tab, then run model checks and
@@ -58,10 +75,21 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,
   or committed clean-overlay edits.
 - Canvas zoom, drag-scroll, and context menus must respect active tool capture/blocking signals.
+- `panel_rects` is a SAME-FRAME list, cleared once per frame after `canvas.draw`. Every floating
+  surface that may swallow a tool click has to be in it — the dock's panels included, which is why
+  their rects are carried out of the hook rather than pushed straight into the field.
+- The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
+  `canvas::ribbon_only_dock_layout` is dropped from the user's stored arrangement on every load. A
+  tab this program tab alone would declare therefore needs a default layout builder of its own,
+  since that one is shared with «Перевод».
 
 ## Editing map
 - To change top-level cleaning UI, save behavior, history, or quick-clean orchestration,
   edit `tab.rs`.
+- To change which dock tabs this program tab declares or where its panels start, edit
+  `CleaningHooks::draw_canvas_overlay_top_left` in `tab.rs`; the «Лента» tab's own content, sizes,
+  title, declaration (`canvas::declare_ribbon_tab`) and shared default arrangement
+  (`canvas::ribbon_only_dock_layout`) live in `src/canvas/`.
 - To change quick text-clean pixel classification, mask evolution (grow/shrink), candidate
   selection, bubble-interior clipping, or conditional padding, edit `autoclean.rs`; keep
   worker/job coordination, mask resize, and detector-box source->page scaling

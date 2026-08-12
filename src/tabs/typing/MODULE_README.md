@@ -34,23 +34,33 @@ extra page overlays, selection handles, deform tools, mask preview/input, and to
 floating UI.
 
 Every floating PANEL of this tab is a tab of the shared panel dock (`src/widgets/panel_dock`,
-`dev-docs/dockable_panels_plan.md`). `TypingTabState::panel_dock` (a `PanelDockState`, its own
-field so the borrow checker can split it from `top_panel` / `text_overlays` / `mask_layer`) holds
-the layout; `TypingHooks::draw_canvas_overlay_top_left` runs `top_panel.begin_frame` → the dock →
-`top_panel.end_frame`.
+`dev-docs/dockable_panels_plan.md`). This tab does NOT own the dock state: the `PanelDockState` is
+app-owned (`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
+`TypingDrawParams::panel_dock`, which the borrow checker sees as disjoint from `top_panel` /
+`text_overlays` / `mask_layer` — the split `PanelDock::begin` needs. `tab.rs` passes that borrow
+straight on to `CanvasDrawParams::panel_dock`, and the canvas hands it back as a parameter of
+`TypingHooks::draw_canvas_overlay_top_left`, which runs `top_panel.begin_frame` → the dock →
+`top_panel.end_frame`. One dock state per window is a hard constraint, not a preference:
+sub-window `ViewportId`s are derived from a per-state index counter, and the persisted window list
+is global (`src/widgets/panel_dock/MODULE_README.md`, «Sub-windows in the file»).
 
-Eight tabs in six default panels (`typing_default_dock_layout`), two columns:
+Nine tabs in seven default panels (`typing_default_dock_layout`), two columns. The first is not
+this tab's own: `canvas.ribbon` is the CANVAS' controls tab, declared by all three canvas program
+tabs through the one canvas-owned helper `canvas::declare_ribbon_tab` (this tab only tells it where
+its dock context keeps the canvas and the page count), and its body, sizes and title live in
+`src/canvas/`.
 
 | tab id | caption | body | default panel |
 |---|---|---|---|
-| `typing.preview` | «Превью текста» | `TypingTopPanelState::draw_preview_tab_body` | `#0`, under the `CanvasView` controls panel, pinned size |
-| `typing.params` | «Параметры» | `…::draw_params_tab_body` | `#1`, flush with the dock area's right edge, pinned size |
-| `typing.effects` | «Эффекты» | `…::draw_effects_tab_body` | `#1` |
-| `typing.actions` | «Действия» | `…::draw_actions_tab_body` | `#2`, under panel `#0`, pinned size |
-| `typing.layers` | «Слои» | `TypingTextOverlayLayer::draw_layers_tab_body` | `#2` |
-| `typing.mask` | «Маска обрезки» | `TypingMaskLayer::draw_mask_tab_body` | `#3`, under panel `#1` |
-| `typing.deform` | «Режим деформации» | `TypingTextOverlayLayer::draw_deformation_tab_body` | `#4`, under panel `#2` |
-| `typing.layout_editor` | «Редактирование раскладки» | `TypingTextOverlayLayer::draw_layout_editor_tab_body` | `#5`, under panel `#4` |
+| `canvas.ribbon` | «Лента» | `CanvasView::draw_ribbon_tab_body` | `#0`, at the dock area's left edge, content-sized |
+| `typing.preview` | «Превью текста» | `TypingTopPanelState::draw_preview_tab_body` | `#1`, under panel `#0` and slightly right of it, pinned size |
+| `typing.params` | «Параметры» | `…::draw_params_tab_body` | `#2`, on the dock area's right edge a little below its top, pinned size |
+| `typing.effects` | «Эффекты» | `…::draw_effects_tab_body` | `#2` |
+| `typing.actions` | «Действия» | `…::draw_actions_tab_body` | `#3`, under panel `#1`, pinned size |
+| `typing.layers` | «Слои» | `TypingTextOverlayLayer::draw_layers_tab_body` | `#3` |
+| `typing.mask` | «Маска обрезки» | `TypingMaskLayer::draw_mask_tab_body` | `#4`, under panel `#2` |
+| `typing.deform` | «Режим деформации» | `TypingTextOverlayLayer::draw_deformation_tab_body` | `#5`, under panel `#3` |
+| `typing.layout_editor` | «Редактирование раскладки» | `TypingTextOverlayLayer::draw_layout_editor_tab_body` | `#6`, under panel `#5` |
 
 Which tabs are drawn is ONE pure rule set, `TypingDockTabVisibility::resolve`: «Превью текста» in
 «Создание» mode, «Маска» while the mask editor is open, «Режим деформации» while an overlay is in
@@ -69,29 +79,31 @@ therefore the first to give when a column does not fit the dock area.
 
 Position, size, collapse and tab activation of every panel belong to the dock layout — no typing
 state owns them. Because several bodies need `&mut TypingTopPanelState`, three need
-`&mut TypingTextOverlayLayer` and one needs `&mut TypingMaskLayer`, they reach their state through
-`TypingDockCx`, the per-frame dock context, not through captured borrows.
+`&mut TypingTextOverlayLayer`, one needs `&mut TypingMaskLayer` and «Лента» needs the hook's own
+`&mut CanvasView`, they reach their state through `TypingDockCx`, the per-frame dock context, not
+through captured borrows.
 
-That layout is PERSISTED (`widgets::panel_dock::persist`). `load_persisted_panel_layouts` is called
-once by `MangaApp::new` with the startup `user_settings` snapshot and must stay ahead of the first
-frame, because a restored layout only wins over `typing_default_dock_layout` by being installed
-before `ensure_default_layout` runs; it installs the layouts first and the detached windows second,
-because a window no restored layout puts a panel in is not opened. `take_dirty_panel_layouts` is
-polled by `app.rs` right after this tab draws and again in `on_exit`; it hands the app-owned writer
-thread a snapshot of the layouts AND the windows. The default builder is also the DICTIONARY of
-this tab's tab keys, so a new `TabId` must be added to it or the stored arrangement will drop that
-tab on every load.
+That layout is PERSISTED (`widgets::panel_dock::persist`), and the whole persistence cycle is
+app-level now: `app.rs::restore_panel_dock` installs the stored arrangement before the first frame,
+polls `PanelDockState::take_dirty_layouts` right after this tab draws and again in `on_exit`. What
+this tab still owns is `typing_default_dock_layout`, handed to the app as a `fn` pointer: it is the
+DICTIONARY of this tab's tab keys, so a new `TabId` must be added to it or the stored arrangement
+will drop that tab on every load.
 
 Any of these tabs can be pulled out into a real OS window (`widgets::panel_dock::window`). Such a
 window is an immediate child viewport and therefore exists only while it is SHOWN every frame —
-which `PanelDock::end` does only while this tab draws. `draw_idle_dock_sub_windows` is the other
-half of that contract: `MangaApp::ui` calls it on every frame where another program tab is active,
-so the user's detached windows survive a tab switch (empty and grey, by the user's decision). It
-must never run on a frame where this tab drew, or the viewport would be shown twice in one pass.
+which `PanelDock::end` does only while a dock-hosting program tab draws. `MangaApp::ui` shows them
+on every other frame (`show_idle_sub_windows`, gated on `tab_hosts_panel_dock`), so the user's
+detached windows survive a tab switch (empty and grey, by the user's decision). Exactly one of the
+two per frame, or the viewport would be shown twice in one pass.
 
 Two deliberate behaviour changes came with the migration: the mask and deformation panels are now
 movable and collapsible (they were fixed and always expanded), and the layout editor keeps one
-user-controlled width instead of widening itself in Editing mode.
+user-controlled width instead of widening itself in Editing mode. A third came with the canvas'
+own panel: «Превью текста» now hangs off the «Лента» PANEL (`PanelAnchor::Panel`) instead of the
+dedicated canvas-controls anchor, which was removed with the panel it addressed. An arrangement
+stored by an older build keeps that panel where it was: the retired stored anchor decodes to
+`Free` at its stored position (`panel_dock/persist.rs`).
 
 **Panels go in the dock; scene-anchored overlays and toasts do NOT.** The create-editor's
 "идёт рендер" hint and its error/warning toasts (`tab/create_upload.rs`) stay plain
@@ -316,8 +328,9 @@ The module exposes memory snapshots and eviction methods for those textures only
 saving, and export.
 
 ## Files and submodules
-- `mod.rs`: module wiring and public re-exports for `TypingTabState`,
-  `TypingTopPanelState`, and `TypingPanelLayout`.
+- `mod.rs`: module wiring and public re-exports for `TypingTabState`, `TypingDrawParams`,
+  `TypingTopPanelState`, and `TypingPanelLayout`, plus the `pub(crate)`
+  `typing_default_dock_layout` the app hands to the shared dock state.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay
   `pub(in crate::tabs::typing)`) as a narrow facade — font loaders, imported-fonts add/remove +
