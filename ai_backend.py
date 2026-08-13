@@ -147,9 +147,15 @@ def _configure_logging() -> None:
 def main() -> int:
     _bootstrap_python_modules()
     _configure_logging()
+    # The package is imported under its TOP-LEVEL name (`ai_backend.*`) because
+    # `_bootstrap_python_modules` put `<repo>/modules` on sys.path. The test
+    # suite instead imports the same code as `modules.ai_backend.*` (pytest puts
+    # the repo root on sys.path). Both import roots are live, so never rely on
+    # module identity across them and always use package-relative imports inside
+    # the package itself.
     from config import VERSION
-    from ai_backend.torch_support import configure_torch_support
-    from ai_backend.rocm_runtime import configure_rocm_runtime
+    from ai_backend.runtime.torch_support import configure_torch_support
+    from ai_backend.runtime.rocm_runtime import configure_rocm_runtime
     from ai_backend.server import run_server
 
     args = _build_parser().parse_args()

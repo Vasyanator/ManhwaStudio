@@ -5,7 +5,7 @@ Purpose:
 PaddleOCR detection and recognition input preprocessing. Faithful port of
 `preprocess_det_image` / `resize_image_for_det` and
 `preprocess_rec_image_to_width` / `plan_rec_input_width` in
-`modules/ai_backend/paddle_onnx_runtime.py`.
+`modules/ai_backend/engines/paddle_onnx.py`.
 
 Key functions:
 - resize_dims_for_det : longest-side<=960, snapped to a stride-32 multiple, no upscale.

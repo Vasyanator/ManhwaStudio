@@ -5,7 +5,7 @@ Purpose:
 Native MangaOCR inference engine over ONNX Runtime: owns the encoder and decoder
 `ort` sessions plus the WordPiece vocabulary, and turns an input image into
 recognized (post-processed) Japanese text. Faithful port of the Python reference
-`_OnnxMangaOcrRuntime` in `modules/ai_backend/manga_ocr_service.py`.
+`_OnnxMangaOcrRuntime` in `modules/ai_backend/ocr/manga.py`.
 
 Key structures:
 - MangaOcrEngine : the public entry point (load + recognize).
@@ -50,7 +50,7 @@ use tokenizer::Vocab;
 
 // MangaOCR generation contract. Both the `base` and `2025` `generation_config.json`
 // exports carry identical values; they are fixed here as the crate's inference
-// contract (see manga_ocr_service.py generation config usage).
+// contract (see `modules/ai_backend/ocr/manga.py` generation config usage).
 /// Decoder start token id (`[CLS]`); seeds the generated sequence.
 const DECODER_START_TOKEN_ID: i64 = 2;
 /// End-of-sequence token id (`[SEP]`).

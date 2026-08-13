@@ -2,8 +2,16 @@
 File: modules/ai_backend/server.py
 
 Purpose:
-Runtime that builds all local AI services and serves them over the framed IPC
-protocol used by the Rust application.
+Composition root of the Python AI backend: it builds every local AI service and
+serves them over the framed IPC protocol used by the Rust application.
+
+This is the ONLY module that knows the full set of domain sub-packages
+(`runtime/`, `engines/`, `ocr/`, `detection/`, `inpaint/`, `reline/`,
+`translate/`, `browser/`) and wires their services into the shared `AppState`.
+Everything downstream (the IPC handlers in `ipc/handlers/`) reaches a service
+only through `HandlerContext.state.<attr>`, so the `AppState` field names are a
+cross-layer contract: renaming one silently breaks a handler and therefore an
+IPC method.
 
 Main responsibilities:
 - construct the shared `AppState` (OCR / text detector / inpaint / translation /
@@ -36,45 +44,56 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .device_service import AiDeviceService
-from .ctd_text_detector_service import CtdTextDetectorService
-from .paddle_text_detector_service import PaddleTextDetectorService
-from .easy_ocr_service import EasyOcrService
-from .aot_inpaint_service import AotInpaintService
-from .lama_mpe_inpaint_service import LamaMpeInpaintService
-from .lama_inpaint_service import LamaInpaintService
-from .manga_ocr_service import MangaOcrService
-from .machine_translation_service import MachineTranslationService
-from .model_manager import LoadedModelManager
-from .paddle_ocr_service import PaddleOcrService
-from .paddle_vl_ocr_service import PaddleVlOcrService
-from .paddle_onnx_runtime import RuntimeFactory
-from .reline_service import RelineService
-from .sdxl_inpaint_service import SdxlInpaintService
-from .flux_fill_inpaint_service import FluxFillInpaintService
-from .surya_ocr_service import SuryaOcrService
-from .surya_text_detector_service import SuryaTextDetectorService
-from .torch_support import is_torch_available
+# Domain sub-packages wired together here (see the module docstring): each import
+# names the package that owns the service, never a flat top-level module.
+from .runtime.device_service import AiDeviceService
+from .runtime.model_manager import LoadedModelManager
+from .runtime.torch_support import is_torch_available
+from .engines.paddle_onnx import RuntimeFactory
+from .detection.ctd import CtdTextDetectorService
+from .detection.paddle import PaddleTextDetectorService
+from .detection.surya import SuryaTextDetectorService
+from .ocr.easy import EasyOcrService
+from .ocr.manga import MangaOcrService
+from .ocr.paddle import PaddleOcrService
+from .ocr.paddle_vl import PaddleVlOcrService
+from .ocr.surya import SuryaOcrService
+from .inpaint.aot import AotInpaintService
+from .inpaint.lama import LamaInpaintService
+from .inpaint.lama_mpe import LamaMpeInpaintService
+from .inpaint.sdxl import SdxlInpaintService
+from .inpaint.flux_fill import FluxFillInpaintService
+from .reline.service import RelineService
+from .translate.machine_translation import MachineTranslationService
 from .browser.service import BrowserService
 from .ipc.protocol import TOPIC_HEALTH
 
 HEALTH_SNAPSHOT_REFRESH_SECS = 1.0
 
 # ============================================================================
-# AI BACKEND SERVER
+# AI BACKEND SERVER — composition root
 # ----------------------------------------------------------------------------
-# Что в файле:
-# - AppState: shared сервисы OCR/MT/Inpaint/textdetector/device.
-# - `_build_health_snapshot`/`_health_snapshot_worker`: фоновой health-snapshot,
-#   который также публикуется как `health` event на шину IPC, поэтому клиентам не
-#   нужно опрашивать health.
-# - `run_server`: строит сервисы и запускает framed IPC frame-server на базовом
-#   AF_UNIX-сокете (единственный транспорт). Маршрутизация запросов живёт в
-#   `ipc/handlers/`, а не здесь.
+# What lives here:
+# - `AppState`: the shared OCR / MT / inpaint / text-detector / device services.
+#   Its field names are the contract the IPC handlers depend on via
+#   `HandlerContext.state.<attr>`; do not rename them without updating
+#   `ipc/handlers/` and the Rust-side method expectations.
+# - `_build_health_snapshot` / `_health_snapshot_worker`: background health
+#   snapshot, also published as a `health` event on the IPC bus so clients never
+#   need to poll.
+# - `run_server`: constructs the services and starts the framed IPC server on
+#   the selected transport. Request routing lives in `ipc/handlers/`, not here.
 # ============================================================================
 
 @dataclass
 class AppState:
+    """Shared, process-wide service container handed to every IPC handler.
+
+    Built once by `run_server` and reached by handlers through
+    `HandlerContext.state`. Field names are part of the cross-layer contract
+    (see the module docstring): each one backs at least one IPC method.
+    """
+
     app_version: str
     model_manager: LoadedModelManager
     easy_ocr: EasyOcrService

@@ -616,23 +616,34 @@ original, and a bbox relative to the sent image) and the model returns
   WebSocket fallback on Windows. The `--socket` argument is optional and defaults to the same standard
   path; Settings process management passes it explicitly when starting the backend. All Rust clients
   reach the backend through `crate::backend_ipc`.
+- **Package layout** (`modules/ai_backend/`): `server.py` is the composition root — it constructs the
+  services and publishes them as named `AppState` fields, which `ipc/handlers/*` reach ONLY through
+  `HandlerContext.state.<field>`, so those field names are a cross-layer contract. Below it the code
+  is split into service domains (`ocr/`, `detection/`, `inpaint/`, `reline/`, `translate/`), the
+  cross-domain model-family runtime `engines/` (a module belongs there only when two or more domains
+  use it), and the process/hardware layer `runtime/`. Dependencies point one way only: domains →
+  `engines/` → `runtime/`. Two facts bite anyone editing it: the package is imported under TWO roots
+  (the running backend uses top-level `ai_backend.*`, the tests use `modules.ai_backend.*`), so
+  intra-package imports must always be package-relative; and the program root is owned by
+  `runtime/paths.py::program_root()` — counting `Path(__file__).parents[N]` anywhere else is a defect.
+  Details per sub-package are in the corresponding `MODULE_README.md`.
 - **Endpoints**: `/health`, `/device`, `/device/set`, `/device/cuda_diagnostics`, `/inpaint/lama_v2`, `/inpaint/aot`, `/inpaint/sdxl` (+ `/unload`), OCR endpoints, `/textdetector/ctd/detect`, `/textdetector/paddle/detect`.
 - **Health probe** (`backend_health.rs`): `spawn_ai_backend_probe()` — poll every 2s; `AiBackendHealthSnapshot` шарится между Translation и Settings.
 - `ensure_ai_backend_healthy()` — gate, возвращает unified error string.
 - Управление процессом — из Settings tab (не из Translation).
-- На ROCm-сборке Torch backend при старте (`ai_backend.py` → `rocm_runtime.configure_rocm_runtime()`)
+- На ROCm-сборке Torch backend при старте (`ai_backend.py` → `runtime.rocm_runtime.configure_rocm_runtime()`)
   переводит MIOpen в immediate-режим (`MIOPEN_FIND_MODE=FAST`), отключает cudnn benchmark и
   закрепляет MIOpen-кэш в `ManhwaStudio_AI_Models/.cache/miopen`, чтобы Torch-инференс (LaMa и др.)
   не платил повторную per-shape компиляцию/тюнинг ядер. На CUDA/CPU/MPS — no-op.
 - На ROCm-сборке Torch перенос весов чекпоинта на GPU обязан идти через
-  `modules/ai_backend/rocm_mmap_transfer.py`. Копия, источник которой лежит в writable private
+  `modules/ai_backend/runtime/rocm_mmap_transfer.py`. Копия, источник которой лежит в writable private
   file-mapping (`rw-p` — так safetensors/transformers/diffusers отдают веса после
   `from_pretrained`), залипает в драйвере amdkfd до ~2 с на каждый тензор ≥1 МиБ, потому что должна
   разорвать copy-on-write по всему отображённому диапазону; материализация в анонимную память это
   снимает (Surya OCR 269.7 с → 0.23 с, PaddleOCR-VL 519 с → 0.77 с). Обход self-gating (ROCm + posix
   + cuda-цель + CPU-источник + ≥1 МиБ + реально file-backed страницы) и на CUDA/CPU/MPS/Windows —
   строгий no-op; выключается через `MS_ROCM_MMAP_STAGING=0`. Контракт применения и выбор формы
-  (`move_module_to` против `patched_module_to`) — в `modules/ai_backend/MODULE_README.md`.
+  (`move_module_to` против `patched_module_to`) — в `modules/ai_backend/runtime/MODULE_README.md`.
 
 ---
 

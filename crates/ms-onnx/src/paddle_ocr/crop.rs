@@ -4,7 +4,7 @@ File: crates/ms-onnx/src/paddle_ocr/crop.rs
 Purpose:
 Perspective-cropping and reading-order sorting of detected text quads. Faithful
 port of `get_rotate_crop_image` and `sort_quad_indices` in
-`modules/ai_backend/paddle_onnx_runtime.py`.
+`modules/ai_backend/engines/paddle_onnx.py`.
 
 Key functions:
 - crop_dimensions   : axis-aligned crop (width, height) for a quad.

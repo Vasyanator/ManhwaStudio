@@ -4,7 +4,7 @@ File: crates/ms-onnx/src/paddle_ocr/db_postprocess.rs
 Purpose:
 Differentiable-Binarization (DB) post-processing: turns the detector probability
 map into a set of 4-point text quads in original-image coordinates. Faithful port
-of `DBPostProcess` in `modules/ai_backend/paddle_onnx_runtime.py`.
+of `DBPostProcess` in `modules/ai_backend/engines/paddle_onnx.py`.
 
 Key functions:
 - boxes_from_bitmap : full DB pipeline (binarize -> contours -> score -> unclip -> rescale).

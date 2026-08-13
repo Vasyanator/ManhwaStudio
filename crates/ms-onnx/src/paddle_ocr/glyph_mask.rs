@@ -5,7 +5,7 @@ Purpose:
 Builds a glyph-shaped binary mask (0/255) over the original image from detected
 text quads, for the `textdetector.paddle` op. Faithful port of
 `_extract_text_mask_in_roi` / `_build_glyph_mask` in
-`modules/ai_backend/paddle_text_detector_service.py`.
+`modules/ai_backend/detection/paddle.py`.
 
 Key functions:
 - otsu_threshold  : histogram-based Otsu threshold (self-contained).

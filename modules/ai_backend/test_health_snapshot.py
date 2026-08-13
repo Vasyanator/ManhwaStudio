@@ -10,7 +10,11 @@ the whole snapshot (and the periodic `health` event that depends on it).
 Notes:
 The snapshot only reads attributes and calls `.health()` on each service, so a
 lightweight `SimpleNamespace` of fakes stands in for the real `AppState` (no
-torch / model stack needed).
+torch / model stack needed). The fake MUST carry every attribute
+`_build_health_snapshot` touches: an attribute lookup happens outside
+`_safe_service_health`, so a missing one raises `AttributeError` instead of
+producing an error placeholder. Importing `server` still pulls the whole service
+stack, so this test needs the backend's Python environment (e.g. `jaconv`).
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ def _make_state(*, surya_raises: bool = False) -> SimpleNamespace:
         lama_inpaint=_OkService("lama_v2"),
         lama_mpe_inpaint=_OkService("lama_mpe"),
         aot_inpaint=_OkService("aot"),
+        flux_fill_inpaint=_OkService("flux_fill"),
         reline=_OkService("reline"),
         machine_translation=_OkService("mt"),
         model_manager=_OkService("mm"),
@@ -84,6 +89,7 @@ def test_one_raising_service_does_not_kill_snapshot() -> None:
     assert snap["ocr"]["mangaocr"] == {"status": "ok", "name": "mangaocr"}
     assert snap["text_detector"]["ctd"]["status"] == "ok"
     assert snap["inpaint"]["aot"]["status"] == "ok"
+    assert snap["inpaint"]["flux_fill"]["status"] == "ok"
     assert snap["image_processing"]["reline"]["status"] == "ok"
     assert snap["machine_translation"]["status"] == "ok"
     assert snap["model_manager"]["status"] == "ok"

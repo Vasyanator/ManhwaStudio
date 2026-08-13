@@ -4,7 +4,7 @@ File: crates/ms-onnx/src/paddle_ocr/dict.rs
 Purpose:
 Builds the PaddleOCR recognizer character table used to map CTC class indices to
 output characters. Faithful port of `CTCLabelDecoder.__init__` +
-`load_character_dict` in `modules/ai_backend/paddle_onnx_runtime.py`.
+`load_character_dict` in `modules/ai_backend/engines/paddle_onnx.py`.
 
 Key structures:
 - CharacterTable : ordered class-index -> character map (index 0 = blank).

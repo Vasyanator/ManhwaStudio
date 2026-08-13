@@ -130,7 +130,12 @@ def _handle_inpaint_sdxl(
         if preview_rgb is not None:
             try:
                 # Encode the preview as raw PNG bytes for the frame blob.
-                from ...sdxl_inpaint_service import _encode_png_bytes_rgb
+                # Documented exception to the "handlers reach services only via
+                # HandlerContext.state" rule (see ipc/MODULE_README.md): the
+                # preview encoder is a pure byte helper with no AppState
+                # counterpart, imported lazily so the handler module stays
+                # torch-free at import time.
+                from ...inpaint.sdxl import _encode_png_bytes_rgb
 
                 preview_blob = _encode_png_bytes_rgb(preview_rgb)
             except Exception:  # noqa: BLE001 - preview is best-effort

@@ -4,7 +4,7 @@ File: crates/ms-onnx/src/paddle_ocr/ctc.rs
 Purpose:
 CTC greedy decoding of the PaddleOCR recognizer output. Faithful port of
 `CTCLabelDecoder.decode_batch` / `_decode_logits` in
-`modules/ai_backend/paddle_onnx_runtime.py`.
+`modules/ai_backend/engines/paddle_onnx.py`.
 
 Key functions:
 - needs_softmax   : detect whether raw logits must be softmax-normalized first.

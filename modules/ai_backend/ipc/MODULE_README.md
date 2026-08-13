@@ -4,10 +4,11 @@
 Python implementation of the framed, multiplexed, bidirectional IPC protocol between the Rust
 frontend (client) and the Python AI backend (server). The default byte transport is a single
 AF_UNIX domain socket (`frame_server.py`); a token-authenticated WebSocket transport
-(`frame_ws_server.py`) is an interchangeable fallback for environments without AF_UNIX. The legacy
-HTTP server has been removed.
+(`frame_ws_server.py`) is an interchangeable fallback for environments without AF_UNIX. This is the
+only application-level protocol between the two processes; there is no HTTP server.
 
-The authoritative wire specification is `PROTOCOL.md` in this directory.
+The authoritative wire specification is `PROTOCOL.md` in this directory; the per-method surface is
+documented in `handlers/MODULE_README.md`.
 
 ## Architecture
 The package is layered: `framing` owns the wire codec, `events` owns server-push fan-out,
@@ -31,10 +32,19 @@ frame_ws_server.py       — WebSocket (TCP) listener; token-authed handshake, s
                 ├── textdetector.py— textdetector.ctd / .paddle / .surya
                 ├── inpaint.py     — inpaint.lama_v2 / .lama_mpe / .aot (+ unloads)
                 ├── sdxl.py        — inpaint.sdxl (+ unload); streaming via ProgressEmitter
+                ├── flux_fill.py   — inpaint.flux_fill (+ unload, + status); streaming
                 ├── reline.py      — reline.models / reline.process
                 ├── device.py      — device.get / .set / .cuda_diagnostics
-                └── translate.py   — translate.deep
+                ├── translate.py   — translate.deep
+                └── browser.py     — browser.command
 ```
+
+Tests live next to the code they cover: `test_framing.py`, `test_events.py`, `test_dispatcher.py`,
+`test_frame_server.py`, and `test_frame_ws_server.py` in this directory, and one
+`handlers/test_<group>.py` per handler module in `handlers/`. They import the package under its
+`modules.ai_backend.ipc...` dotted name (pytest puts the repo root on `sys.path`) and run without
+torch or any model: every test drives the handlers with a `SimpleNamespace`/`MagicMock` stand-in for
+`AppState`.
 
 ## Wire format (summary — `PROTOCOL.md` is authoritative)
 
@@ -49,26 +59,12 @@ Every message in either direction is a single frame:
 - `blob` carries raw binary data (PNG image bytes). Never base64. May be zero-length.
 - Size guards: header ≤ 1 MiB, blob ≤ 32 MiB.
 
-## Message kinds
+## Message kinds and event topics
 
-| Kind       | Direction        | Role                                                               |
-|------------|------------------|--------------------------------------------------------------------|
-| `hello`    | client→server, server→client | Handshake on connect; carries `v`=1 and (server reply) `backend_version`. |
-| `request`  | client→server    | One RPC call; `id` ≥ 1, `method` names the handler.              |
-| `progress` | server→client    | Zero or more intermediate frames before `response` (SDXL streaming). |
-| `response` | server→client    | Terminal frame for a `request`; `status`: `ok`/`error`/`interrupted`. |
-| `cancel`   | client→server    | Request cancellation by `id`; unknown/finished ids are a no-op.   |
-| `event`    | server→client    | Unsolicited push; `id`=0, `topic` identifies the payload type.    |
-| `error`    | server→client    | Protocol-level error (framing/version/unknown kind); not a request result. |
-
-## Event topics
-
-| Topic        | Trigger                             | Key payload fields                                          |
-|--------------|-------------------------------------|-------------------------------------------------------------|
-| `health`     | Periodic (~1 s) snapshot push       | `ok`, `service`, `backend_version`, `is_torch_available`, per-service objects |
-| `device`     | Device/provider selection changed   | Same shape as `device.get` response                         |
-| `model_load` | Model load/unload progress (opt-in) | `model`, `phase`, `loaded`, `total`, `message`              |
-| `log`        | Backend log line stream (opt-in)    | `level`, `message`, `ts_unix_s`                             |
+Seven kinds (`hello`, `request`, `progress`, `response`, `cancel`, `event`, `error`) and four event
+topics (`health`, `device`, `model_load`, `log`). Their exact directions, payload fields and
+lifecycles are specified in `PROTOCOL.md` §3 and §7 — deliberately NOT restated here, because two
+copies of a wire contract in one directory drift.
 
 `TOPIC_HEALTH` replaces health polling. Rust subscribes after the hello handshake via
 `BackendClient::subscribe(TOPIC_HEALTH)` and folds events into the shared health snapshot.
@@ -135,9 +131,26 @@ so a wedged peer can never stall the publisher for everyone else.
 ### `handlers/`
 One module per feature group; each calls `registry.register(METHOD_X, handler_fn)` at module level
 so the act of importing the package wires everything. The shared touch-point for adding a new group
-is a single import line in `handlers/__init__.py`.
+is a single import line in `handlers/__init__.py`. Handler-layer rules and the group-to-method map
+live in `handlers/MODULE_README.md`.
 
 ## Contracts and invariants
+- **Transport selection and endpoint rules** (`run_server(transport=...)`, driven by
+  `ai_backend.py --transport`, default `unix`):
+  - The default AF_UNIX socket path is per-platform — `/tmp/manhwastudio_backend_socket` on posix,
+    `tempfile.gettempdir()/manhwastudio_backend_socket` on Windows (`ai_backend.py
+    default_socket_path()`). It is a cross-process contract and must match the Rust side
+    (`backend_ipc::backend_socket_path()`) BYTE-FOR-BYTE. `--socket PATH` overrides it and is
+    optional; both sides must be given the same override.
+  - AF_UNIX is required for the `unix` transport: on a Python build without `socket.AF_UNIX`,
+    `server.run_server` raises a `RuntimeError` naming the missing support rather than falling back
+    to another transport.
+  - `--ws-token` (or the `WS_TOKEN` environment variable) is REQUIRED for the `ws` transport:
+    `run_server` raises `ValueError` rather than serve an unauthenticated WebSocket. `--ws-port 0`
+    binds an ephemeral port, and the bound port is printed once as `MS_BACKEND_WS_PORT=<port>` for
+    the Rust supervisor to parse. Each transport option also has an environment fallback
+    (`MS_BACKEND_TRANSPORT` / `WS_HOST` / `WS_PORT` / `WS_TOKEN`); the CLI flag wins.
+  - An unknown `transport` value is a `ValueError`, never a silent fall back to `unix`.
 - The frame protocol version is 1 (`PROTOCOL_VERSION`). A client with a different `v` is rejected
   at handshake with a `kind:"error"` frame before any request.
 - Image bytes are never base64-encoded on the wire. Request blobs carry raw PNG input; response
@@ -149,6 +162,11 @@ is a single import line in `handlers/__init__.py`.
 - Event fan-out is best-effort. A broken or slow sink is dropped silently; the publisher never
   raises. Slow-client isolation uses a 2 s per-write socket timeout (`_PUBLISH_WRITE_TIMEOUT_S`).
 - Handlers must not import `server.py` directly; they receive `AppState` via `HandlerContext.state`.
+  ONE documented exception: `handlers/sdxl.py` lazily imports `_encode_png_bytes_rgb` from
+  `../../inpaint/sdxl.py` inside the progress callback, because the preview PNG encoder is a pure
+  byte helper with no `AppState` counterpart. The import stays inside the function so the handler
+  module remains torch-free at import time. Do not grow this exception: any NEW service access goes
+  through `HandlerContext.state`.
 - Do not add imports directly to `registry.py`. Add one line to `handlers/__init__.py` only.
 
 ## Editing map

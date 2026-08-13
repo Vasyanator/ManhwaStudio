@@ -4,7 +4,7 @@
 Native MangaOCR inference engine: turns an input image into recognized,
 post-processed Japanese text using ONNX Runtime. This is a faithful, token-for-token
 port of the Python reference `_OnnxMangaOcrRuntime` in
-`modules/ai_backend/manga_ocr_service.py` (the source of truth). The module is pure
+`modules/ai_backend/ocr/manga.py` (the source of truth). The module is pure
 inference: the caller supplies model/vocabulary paths and an already-committed
 `OrtRuntime`; nothing here downloads, reads app config, or touches the GUI.
 

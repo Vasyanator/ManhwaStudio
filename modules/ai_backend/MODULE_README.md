@@ -2,179 +2,126 @@
 
 ## Purpose
 Python AI backend runtime called by the Rust application over a framed, multiplexed, bidirectional
-IPC protocol on a single AF_UNIX domain socket.
+IPC protocol (AF_UNIX socket by default, token-authenticated WebSocket as fallback). It hosts OCR,
+text detection, inpainting, line restoration, machine translation, device selection, shared
+resident-model management, and the in-process web-scraping browser session.
+
+This file is the **map and boundary document** for the package. Per-domain detail lives in the
+`MODULE_README.md` of each sub-package; do not duplicate it here.
 
 ## Architecture
-`server.py` wires OCR, text detection, inpainting, translation, device selection, version health
-metadata, shared loaded-model management, and the in-process web-scraping browser session. The
-server uses the `ipc/` framing layer (see `ipc/PROTOCOL.md`) — a length-prefixed frame protocol over
-an AF_UNIX stream socket — not HTTP.
 
-The advanced web-scraping downloaders (Selenium / CloakBrowser) used to run as separate stdio
-processes under `modules/new_project/`; they are now folded into this backend. `browser/service.py`
-(`BrowserService`, on `AppState.browser`) drives the existing daemon classes in-process and is
-exposed through the single IPC method `browser.command` (`ipc/handlers/browser.py`). Downloaded
-images are still handed to the launcher as an on-disk directory path + count — no image bytes travel
-over IPC for downloads. Selenium/Playwright are imported lazily on first browser use so AI-only
-startup never loads them.
-Torch-backed services load weights from `ManhwaStudio_AI_Models/Torch`; ONNX-backed services load
-weights from `ManhwaStudio_AI_Models/ONNX`. Library-managed model downloads and caches, such as
-EasyOCR and Surya, must remain under those libraries' default paths unless a service explicitly owns
-the download contract.
+The package is layered. Every arrow points downwards; there are no cycles.
+
+```
+ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules on sys.path
+        │
+        ▼
+   server.py                       — COMPOSITION ROOT: constructs services, fills AppState,
+        │                            starts the framed IPC server
+        ├── ipc/                   — transport, dispatcher, event bus, handlers (torch-free)
+        ├── browser/               — in-process Selenium / CloakBrowser scraping session
+        │
+        ├── ocr/  detection/  inpaint/  reline/  translate/   — service domains
+        │            │
+        │            ▼
+        ├── engines/               — model-family runtime shared by MORE THAN ONE domain
+        │            │
+        │            ▼
+        └── runtime/               — device selection, resident models, ROCm workarounds, paths
+```
+
+- **`server.py` is the only place that knows every domain.** It builds the services and publishes
+  them as named `AppState` fields. Handlers reach services exclusively through
+  `HandlerContext.state.<field>`, so those field names are a cross-layer contract: renaming one
+  silently breaks an IPC method.
+- **Dependency direction is one-way**: domains may import `engines/` and `runtime/`; `engines/` may
+  import `runtime/`; `runtime/` imports nothing from the layers above it. The single permitted
+  reverse edge is a lazy, `try`-guarded `from ..engines.paddle_onnx import resolve_compiled_cache_root`
+  inside `runtime/rocm_runtime.py` — it must stay lazy so a Torch-only install never loads
+  onnxruntime just to tune MIOpen.
+- **A module belongs in `engines/` only if two or more domains use it** (`paddle_onnx` serves
+  `ocr/paddle.py` and `detection/paddle.py`; `surya_checkpoints` serves `ocr/surya.py` and
+  `detection/surya.py`). A runtime used by exactly one domain belongs inside that domain.
 
 ## Files and submodules
-- `browser/service.py`: `BrowserService` — hosts the Selenium/CloakBrowser scraping session
-  in-process (driving the daemon classes from `modules/new_project/`), behind the `browser.command`
-  IPC method (`ipc/handlers/browser.py`). Because Playwright's sync API is greenlet-bound to its
-  creating thread while the dispatcher hands each request to an arbitrary pool worker, all daemon
-  browser work (`_handle_command`, `close`, and the daemon's background loop via the injected
-  `_run_on_browser_thread` hook) is marshalled onto one dedicated owner thread
-  (`_browser_executor`). `test_browser_service.py` covers this thread-affinity contract.
-- `server.py`: service construction, `AppState` wiring, and framed IPC server startup (delegates to
-  `ipc/frame_server.py`). The legacy HTTP server has been removed; all IPC goes through the `ipc/`
-  package. See `ipc/MODULE_README.md` and `ipc/PROTOCOL.md` for the transport contract.
-- `ipc/`: framed, multiplexed, bidirectional IPC layer. See `ipc/MODULE_README.md`.
-- `model_manager.py`: shared resident-model lease and unload manager.
-- `device_service.py`: selected Torch/ONNX device state, accelerated defaults, and manual
-  selection flags when backend devices need a user choice.
-- `test_device_service.py`: unit tests for backend device selection sentinel and fallback
-  contracts.
-- `test_reline_service.py`: unit tests for Reline catalog-name, archive-name, and direct-URL
-  model resolution.
-- `*_service.py`: backend service adapters for OCR, detectors, inpaint, and MT.
-- `paddle_onnx_runtime.py`: shared ONNX Runtime helpers for PaddleOCR.
-- `paddle_vl_ocr_service.py`: PaddleOCR-VL OCR backend (IPC method `ocr.paddle_vl`). PyTorch/Transformers-only
-  vision-language OCR loaded with `trust_remote_code=True`; needs no text detection and no language
-  selection (fixed `OCR:` prompt). Weights are fetched into the Hugging Face hub cache on first use,
-  not the app model tree. The model's remote code was saved with transformers 4.55; before
-  `from_pretrained` the service installs signature-guarded compat shims (`_ensure_transformers_compat`)
-  for the `create_causal_mask` keyword rename and the `check_model_inputs` factory change so it runs on
-  the app's transformers 4.57.x without a global downgrade (no-ops when the API already matches).
-  An optional `script` (`korean`/`chinese`/`japanese`) hard-restricts decoding to one writing system
-  via `script_constraint.py` to curb hallucination on messy/handwritten text; constrained mode caps
-  `max_new_tokens` to avoid non-terminating rambles. `test_paddle_vl_ocr_service.py` covers the text
-  post-processing contract.
-- `script_constraint.py`: stateful UTF-8 `prefix_allowed_tokens_fn` for PaddleOCR-VL. The SentencePiece
-  tokenizer uses byte_fallback (CJK comes out as script-agnostic `<0xNN>` byte tokens), so a plain
-  token allowlist cannot express "one script"; this reconstructs the decoded byte stream and only
-  allows byte continuations whose completed codepoints fall in the target Unicode ranges (plus
-  whitespace/digits/punctuation, and EOS only on a character boundary). `test_script_constraint.py`
-  covers it.
-- `rocm_runtime.py`: ROCm/HIP MIOpen runtime tuning. `configure_rocm_runtime()` runs once at
-  backend startup; on a ROCm Torch build (`torch.version.hip` set) it switches MIOpen to immediate
-  mode (`MIOPEN_FIND_MODE=FAST`) to avoid per-input-shape kernel auto-tuning/compilation, disables
-  cudnn/MIOpen benchmark, and pins the MIOpen user/kernel cache under
-  `ManhwaStudio_AI_Models/.cache/miopen`. No-op on CUDA/CPU/MPS/absent-Torch installs; env defaults
-  use `setdefault` so explicit user overrides win.
-- `test_rocm_runtime.py`: unit tests for `configure_rocm_runtime` no-op and ROCm-path behavior.
-- `rocm_mmap_transfer.py`: ROCm host->device weight-transfer workaround. On a ROCm Torch build a
-  copy whose source CPU tensor lives in a writable private file mapping (`rw-p`, exactly how
-  safetensors/transformers/diffusers hand out weights after `from_pretrained`) stalls inside the
-  amdkfd driver for up to ~2 s per tensor >=1 MiB, because the copy has to break copy-on-write over
-  the mapped range. Staging such tensors through anonymous memory removes the stall (Surya OCR:
-  269.7 s -> 0.23 s). Exposes `mmap_staging_required()`, `stage_cpu_tensor()`, `move_module_to()`,
-  `patched_module_to()` and `invalidate_maps_cache()`. See the staging contract below.
-- `test_rocm_mmap_transfer.py`: unit tests for the staging gates, `/proc/self/maps` classification,
-  snapshot session lifetime, patch thread-locality, and stock-`Module.to` equivalence. Runs without
-  a GPU (ROCm decisions are forced via monkeypatch).
-- `surya_checkpoints.py`: shared Surya checkpoint presence/download helper used by both Surya
-  services. It exists so that the (potentially minutes-long, network-bound) `s3://` checkpoint
-  download runs *before* `patched_module_to()` is entered and never inside it.
-- `reline_service.py`: Reline pipeline adapter, catalog-backed model downloader, and
-  `reline.process` IPC method handler backend.
-- `sdxl_inpaint_service.py`: SDXL inpaint backend (IPC method `inpaint.sdxl`). Lazily builds a
-  `StableDiffusionXLInpaintPipeline` from a local ckpt/safetensors or a HF repo id and caches it
-  through the shared model manager. `nine_channel` mode requires a 9-channel inpaint UNet (full
-  denoise); `four_channel` mode requires a 4-channel UNet and prefills the hole with the shared
-  `LamaInpaintService` before a moderate-denoise latent-blend pass. The mode/channel mismatch is an
-  explicit error. Normalizes generation params, maps sampler names to diffusers schedulers, dilates
-  and blurs the mask, and composites the output over the original outside the mask. When a
-  `progress_callback` is supplied, a diffusers `callback_on_step_end` emits a cheap linear
-  latent->RGB preview each step; the `inpaint.sdxl` IPC handler streams these as `progress` frames
-  (each with an optional latent preview PNG blob) followed by a terminal `response` instead of a
-  single JSON response. See `ipc/handlers/sdxl.py` and `ipc/PROTOCOL.md §5.4`.
-- `test_sdxl_inpaint_service.py`: pure-Python unit tests for SDXL param normalization and sampler
-  mapping (no torch/diffusers required).
-- `flux_fill_inpaint_service.py`: FLUX.1-Fill-dev inpaint/object-removal backend (IPC methods
-  `inpaint.flux_fill` streaming, `.unload`, `.status`). Downloads on demand into
-  `ManhwaStudio_AI_Models/side_models/FLUX.1-Fill-dev-GGUF/` (NOT the HF cache): the chosen GGUF
-  quant from `YarvixPA/FLUX.1-Fill-dev-GGUF` plus diffusers components (VAE/CLIP/T5/scheduler) from
-  the open `ostris/Flex.1-alpha` repo, with byte-level download progress. Builds a `FluxFillPipeline`
-  from the local GGUF transformer + components, pinned to the DISCRETE GPU (the Ryzen iGPU is
-  excluded) with MIOpen immediate mode. Mask dilation + Poisson (`cv2.seamlessClone`) tone matching
-  remove the dark-patch seam. `progress_callback(phase, step, total, label)` distinguishes the
-  `download` and `generate` phases; the `inpaint.flux_fill` handler streams these as `progress`
-  frames (header `phase`/`step`/`total`/`label`, no preview blob). See `ipc/handlers/flux_fill.py`.
-- `textdetector/`: ComicTextDetector implementation used by CTD service.
+- `server.py`: composition root — service construction, `AppState` wiring, framed IPC startup.
+- `__init__.py`: PEP 562 lazy re-export of `run_server`, so importing a light submodule (e.g.
+  `ipc.framing`) never drags in the AI stack.
+- `test_health_snapshot.py`: covers `server._build_health_snapshot`; lives here because `server.py`
+  does.
+- `runtime/`: program root (`paths.program_root()`), Torch availability, device/provider selection,
+  `LoadedModelManager`, and the two ROCm workarounds. See `runtime/MODULE_README.md`.
+- `engines/`: cross-domain model-family runtime (`paddle_onnx`, `surya_checkpoints`). See
+  `engines/MODULE_README.md`.
+- `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya`) and the
+  PaddleOCR-VL script constraint. See `ocr/MODULE_README.md`.
+- `detection/`: text detectors (`textdetector.ctd` / `.paddle` / `.surya`) plus the vendored
+  ComicTextDetector implementation in `detection/textdetector/`. See `detection/MODULE_README.md`.
+- `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
+  `.flux_fill`), the standalone LaMa V2 runtime module, and the vendored `lama_runtime_bundle/`.
+  See `inpaint/MODULE_README.md`.
+- `reline/`: Reline pipeline adapter and catalog-backed downloader (`reline.models`,
+  `reline.process`). See `reline/MODULE_README.md`.
+- `translate/`: machine translation (`translate.deep`). See `translate/MODULE_README.md`.
+- `ipc/`: framed transport, dispatcher, event bus, handlers. See `ipc/MODULE_README.md`, the method
+  surface in `ipc/handlers/MODULE_README.md`, and the authoritative wire spec `ipc/PROTOCOL.md`.
+- `browser/`: `BrowserService`, the in-process Selenium/CloakBrowser session behind the single
+  `browser.command` IPC method. All browser work is pinned to one owner thread (Playwright's sync
+  API is greenlet-bound); downloaded images are handed to the launcher as an on-disk directory path
+  + count. See `browser/MODULE_README.md`.
+
+Tests live next to the code they cover (`runtime/test_*.py`, `ipc/handlers/test_*.py`, …), matching
+the convention `browser/` already used.
 
 ## Contracts and invariants
-- Service initialization is lazy and must surface missing packages or weights as explicit errors.
-- Torch and ONNX model roots are separate; do not write ONNX weights under `Torch/` or Torch
-  checkpoints under `ONNX/`.
-- When no device config exists, CPU is only a temporary fallback. PyTorch should report an
-  unresolved device choice as soon as CUDA is available, and ONNX should prefer DirectML on Windows
-  when that provider exists. Unconfigured DirectML selection is reported via the `device.get` IPC
-  method as needing manual confirmation before it is persisted.
-- `General.ai_device`, `General.ai_onnx_provider`, and `General.ai_onnx_device_id` use
-  `not-selected` as the default config sentinel. Backend services must resolve it to a real runtime
-  default before constructing Torch devices or ONNX provider settings.
-- EasyOCR, Surya, and PaddleOCR-VL should use their own library/Hugging Face caches because those
-  packages own the download behavior.
-- SDXL inpaint requires `diffusers`/`transformers`; they are imported lazily and a missing package,
-  missing weights, or a mode/UNet channel mismatch surfaces as an explicit error. The service must
-  not silently fall back to the wrong channel mode. SDXL weights are user-supplied (arbitrary path
-  or HF repo), so the service owns no fixed model directory.
-- Reline checkpoints are Torch files kept under `ManhwaStudio_AI_Models/side_models/Reline`; the
-  `reline` package receives local model paths only, so catalog downloads are owned by
-  `reline_service.py`. Models missing from the remote catalog can be exposed via the built-in
-  `EXTRA_MODELS` list; entries without a direct `url` must be placed manually under that directory.
-- Long-running model inference runs outside the Rust GUI thread through backend requests.
-- On ROCm Torch builds, MIOpen runtime tuning is configured once at process startup by
-  `rocm_runtime.configure_rocm_runtime()` before any inference; Torch services must not depend on a
-  specific MIOpen Find mode and must not re-enable cudnn benchmark.
-- On ROCm Torch builds, a Torch service that moves checkpoint weights to the GPU must route the move
-  through `rocm_mmap_transfer`, or it pays a multi-minute amdkfd stall. Which form to use:
-  - the service owns the `nn.Module` and calls `.to()` itself -> `move_module_to(module, device)`;
-  - a third-party loader moves the model internally (surya predictors, `DiffusionPipeline.to`)
-    -> wrap that call in `with patched_module_to():`.
-  `patched_module_to()` replaces the `torch.nn.Module.to` class attribute, so the block must contain
-  the weight move and nothing else — never a download, a network wait, or inference. Only the
-  entering thread takes the staging path, but the attribute itself is process-global.
-  The workaround is self-gating (ROCm + posix + `cuda` target + CPU source + >=1 MiB + genuinely
-  file-backed pages) and is a strict no-op everywhere else, so wiring it in never changes
-  CPU/CUDA-NVIDIA/MPS/Windows behavior. `MS_ROCM_MMAP_STAGING=0` disables it entirely.
-  A transfer that also changes dtype is not affected by the pathology (Torch casts on the host into
-  anonymous memory first), which is why the fp32 detector path in `surya_text_detector_service.py`
-  needs no staging.
-  The `/proc/self/maps` snapshot lives for the duration of one load session (one `move_module_to`
-  call or one `patched_module_to` block) and is thread-local, so services carry no invalidation
-  obligation; `invalidate_maps_cache()` exists only as a manual reset.
-- The `health` IPC method and `TOPIC_HEALTH` event push must include `backend_version` from root
-  `config.VERSION`; Rust uses it to warn when the backend package and Studio binary versions do not
-  match.
-- The backend serves the framed IPC transport over one of two byte transports, selected by
-  `run_server(transport=...)` (`ai_backend.py --transport`, default `unix`); there is no HTTP
-  server:
-  - `unix` (default): a single AF_UNIX socket. The default path is per-platform
-    (`/tmp/manhwastudio_backend_socket` on posix, `tempfile.gettempdir()/manhwastudio_backend_socket`
-    on Windows) and must match the Rust side byte-for-byte; `--socket PATH` overrides it and is
-    optional. A single live instance is enforced by stale-socket detection: a live peer on the path
-    raises `FrameBackendInstanceError` (in `ipc/frame_server.py`), a stale socket file is unlinked
-    before bind. On posix the socket file is `chmod 0o600` and unlinked on shutdown. AF_UNIX is
-    required for this transport; a Python build without it fails with a clear error.
-  - `ws`: a token-authenticated WebSocket server (`ipc/frame_ws_server.py`) bound to
-    `--ws-host:--ws-port` (port 0 → ephemeral). The Rust client connects as
-    `ws://host:port/?token=<--ws-token>`; the server compares the token constant-time and rejects a
-    mismatch with HTTP 401. `--ws-token` is required for this transport. The actual bound port is
-    printed once as `MS_BACKEND_WS_PORT=<port>` for the Rust supervisor. Needs the `wsproto` package.
+- **Two import roots, both must keep working.** The running backend imports this package as
+  top-level `ai_backend.*` (repo-root `ai_backend.py` puts `<repo>/modules` on `sys.path`); the test
+  suite imports it as `modules.ai_backend.*`. Intra-package imports must therefore always be
+  package-relative — an absolute `import modules.ai_backend.x` breaks the runtime root, and an
+  absolute `import ai_backend.x` breaks the tests.
+- **Never re-derive the program root by counting `Path(__file__).resolve().parents[N]`.** Call
+  `runtime.paths.program_root()`. The depth constant exists in exactly one file; a module that
+  counts levels itself silently points at the wrong directory the next time it moves. The one
+  unavoidable exception is `inpaint/lama_v2_runtime_inpainter.py`, which is loaded standalone via
+  `spec_from_file_location` and therefore cannot use a relative import — it is documented in place.
+- **Service-domain `__init__.py` files are docstring-only.** `runtime/`, `engines/`, `ocr/`,
+  `detection/`, `inpaint/`, `reline/`, `translate/` and `ipc/` re-export nothing and import no
+  submodule: importing one engine must never pull another domain's heavy dependencies (torch,
+  diffusers, transformers, onnxruntime) into the process, and the `ipc/` layer must stay torch-free.
+  `browser/__init__.py` is the single exception — it re-exports `BrowserService`, which is safe only
+  because `browser/service.py` imports Selenium/Playwright lazily (see `browser/MODULE_README.md`).
+  The vendored subtrees (`detection/textdetector/`, `inpaint/lama_runtime_bundle/`) keep their
+  upstream `__init__.py` contents and are import-gated by their callers instead.
+- Service initialization is lazy and must surface missing packages or weights as explicit errors —
+  never a silent fallback to a different model, device, or channel mode.
+- Torch and ONNX model roots are separate: `ManhwaStudio_AI_Models/Torch` vs `.../ONNX`. Do not write
+  ONNX weights under `Torch/` or Torch checkpoints under `ONNX/`. Library-managed caches (EasyOCR,
+  Surya, PaddleOCR-VL via the Hugging Face hub) stay under those libraries' own default paths unless
+  a service explicitly owns the download contract.
+- `General.ai_device`, `General.ai_onnx_provider` and `General.ai_onnx_device_id` use `not-selected`
+  as the config sentinel; a service must resolve it to a real runtime default before constructing a
+  Torch device or ONNX provider settings, and must never persist that automatic resolution as an
+  explicit user choice. Which default is picked, and when the user is asked to confirm one, is
+  `runtime/MODULE_README.md`'s contract.
+- The `health` IPC method and the `TOPIC_HEALTH` event push must include `backend_version` from root
+  `config.VERSION`; Rust compares it with its own version and warns on a mismatch.
+- Long-running inference never runs on the Rust GUI thread — it is always a backend request.
+- On ROCm Torch builds, MIOpen tuning is configured once at startup by
+  `runtime.rocm_runtime.configure_rocm_runtime()`, and any service moving checkpoint weights to the
+  GPU must route the move through `runtime.rocm_mmap_transfer` or pay a multi-minute amdkfd stall.
+  The staging contract (`move_module_to` vs `patched_module_to`) is in `runtime/MODULE_README.md`.
+- The backend serves the framed IPC transport over one of two byte transports selected by
+  `run_server(transport=...)` (`ai_backend.py --transport`, default `unix`); there is no HTTP server.
+  Transport details, socket path rules, single-instance enforcement and the WS token handshake are
+  documented in `ipc/MODULE_README.md`.
 
 ## Editing map
-- To change model root resolution, edit `config.py` and the affected service resolver.
-- To change PaddleOCR ONNX layout, edit `paddle_onnx_runtime.py`.
-- To change inpaint checkpoint handling, edit the corresponding inpaint service.
-- To change Reline model catalog resolution, download/extract behavior, or pipeline JSON mapping,
-  edit `reline_service.py`.
-- To add a Torch service that loads weights onto a GPU, wire it into `rocm_mmap_transfer.py` (see
-  the staging contract above) and pick the `move_module_to` / `patched_module_to` form there.
-- To change how Surya checkpoints are located or fetched, edit `surya_checkpoints.py`; both Surya
-  services share it.
+- To add a whole new service domain: create the sub-package (docstring-only `__init__.py` +
+  `MODULE_README.md`), construct the service in `server.py`, add its `AppState` field, and add a
+  handler module under `ipc/handlers/` with one import line in `ipc/handlers/__init__.py`.
+- To add a service to an existing domain: edit that domain's package and its `MODULE_README.md`.
+- To add a runtime shared by two domains: put it in `engines/`, not in one of the domains.
+- To change device/provider selection, resident-model limits or the ROCm workarounds: `runtime/`.
+- To change where the program root or model roots resolve: `runtime/paths.py` and root `config.py`.
+- To change the wire protocol or a handler: `ipc/` (`PROTOCOL.md` first).

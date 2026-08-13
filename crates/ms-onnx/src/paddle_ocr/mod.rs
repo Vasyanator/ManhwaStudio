@@ -4,8 +4,8 @@ File: crates/ms-onnx/src/paddle_ocr/mod.rs
 Purpose:
 Native PaddleOCR (PP-OCRv5) text detection + recognition over ONNX Runtime, in
 pure Rust (no OpenCV/Clipper). Faithful port of the pipelines in
-`modules/ai_backend/paddle_onnx_runtime.py` (DBPostProcess, CTC decode,
-pre/post-processing) and `paddle_text_detector_service.py` (glyph mask).
+`modules/ai_backend/engines/paddle_onnx.py` (DBPostProcess, CTC decode,
+pre/post-processing) and `modules/ai_backend/detection/paddle.py` (glyph mask).
 
 Key structures:
 - PaddleDetection : detector output (quads, axis-aligned blocks, glyph mask).

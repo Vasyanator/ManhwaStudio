@@ -55,11 +55,11 @@ unsupported-CPU SIGILL would surface.
   and execution-provider registration.
 - `src/manga_ocr/`: the native MangaOCR engine (`MangaOcrEngine`) — preprocess,
   tokenizer, beam search, and post-process. See its `MODULE_README.md`. This is a
-  faithful port of `modules/ai_backend/manga_ocr_service.py`.
+  faithful port of `modules/ai_backend/ocr/manga.py`.
 - `src/paddle_ocr/`: the native PaddleOCR detection + recognition engines — DB
   post-process, perspective crop, CTC decode, character table, and glyph mask. See
-  its `MODULE_README.md`. Faithful port of `modules/ai_backend/paddle_onnx_runtime.py`
-  and `paddle_text_detector_service.py`.
+  its `MODULE_README.md`. Faithful port of `modules/ai_backend/engines/paddle_onnx.py`
+  and `modules/ai_backend/detection/paddle.py`.
 - `tests/manga_ocr_e2e.rs`: `#[ignore]` end-to-end parity test (needs real models +
   an onnxruntime dylib).
 

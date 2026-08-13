@@ -10,6 +10,8 @@ This package contains the complete framed IPC implementation:
 - `framing.py`: pure wire codec — `read_frame`/`write_frame`/`encode_frame`.
 - `dispatcher.py`: per-connection read loop, request routing, cancellation.
 - `frame_server.py`: AF_UNIX server binding/lifecycle (`run_frame_server`).
+- `frame_ws_server.py`: token-authenticated WebSocket fallback transport
+  (`run_frame_ws_server`); same dispatcher/handler stack, different carrier.
 - `events.py`: thread-safe event bus for server-initiated `event` frames.
 - `registry.py`: method handler registry (`register`/`get_handler`).
 - `handlers/`: one module per method group, each self-registering at import.

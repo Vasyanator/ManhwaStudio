@@ -15,7 +15,8 @@ Two-image blob convention (shared by all inpaint methods):
 The result image PNG goes in the response blob (raw bytes, NOT base64).
 
 The underlying ``AppState`` inpaint services return the result PNG as raw bytes
-in the ``image_png`` result key (see e.g. ``lama_inpaint_service.inpaint_image_bytes``);
+in the ``image_png`` result key (see e.g.
+``inpaint/lama.py``'s ``LamaInpaintService.inpaint_image_bytes``);
 these handlers put those bytes straight into the response blob.
 """
 
