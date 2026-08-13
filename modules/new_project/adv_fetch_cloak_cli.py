@@ -19,6 +19,19 @@ Main items:
   that index passes the authority gate (`_site_page_index_authority`) and otherwise by
   DOM/geometry/URL signals, and size-outlier pages are flagged as probable junk.
 
+Deep-capture diagnostics (all lines go to the runtime log through `_debug_log` /
+`_warn_log`, and every one of them is greppable by its `cloak deep <kind>:` prefix):
+- `cloak deep drain:`   one aggregated line per drain - wall time, per-stage time and
+  new-record contribution, running totals, and the slowest browser calls made;
+- `cloak deep shape:`   page URL and element/img/canvas/iframe counts, logged on the
+  first drain, at stop, and whenever the shape changes (so a static paged reader that
+  will never yield anything new is obvious without per-poll spam);
+- `cloak deep stall:`   one warning per idle episode once `DEEP_CAPTURE_STALL_SECONDS`
+  pass with no new capture, plus one line when captures resume;
+- `cloak deep call:`    a single browser call slower than `DEEP_CAPTURE_SLOW_CALL_SECONDS`;
+- `cloak deep start/stop/settle/screenshots:` phase timings of the capture lifecycle;
+- `cloak deep summary:` the stop block - pipeline counters and a per-source breakdown.
+
 Protocol:
 - `_handle_command({"command": ...})` runs one command and reports a single
   terminal event (plus interim `progress` events) through `self._emit`, the same
@@ -45,6 +58,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from enum import Enum
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -77,6 +91,17 @@ DEEP_CAPTURE_PHASH_MERGE_DISTANCE = 5
 # Captures whose smaller side is below this many pixels are flagged as probable
 # junk (icons, sprites, UI chrome) in the deep-intercept review.
 DEEP_CAPTURE_MIN_PAGE_DIM = 64
+# A single Playwright call inside the deep-capture path slower than this is named and
+# timed in its own log line, so a call that is merely slow (rather than hung) is
+# attributable from the log without re-running the capture.
+DEEP_CAPTURE_SLOW_CALL_SECONDS = 1.0
+# Wall time above which a whole drain is reported as a warning instead of info. A drain
+# is normally well under 0.1 s; anything near a second means the page is fighting back.
+DEEP_CAPTURE_SLOW_DRAIN_SECONDS = 2.0
+# Seconds without a single new captured payload before the stall warning is emitted.
+# Long enough to survive a slow page turn or a stretch of reading without scrolling,
+# short enough that a user who thinks the capture froze finds the reason in the log.
+DEEP_CAPTURE_STALL_SECONDS = 25.0
 
 
 class NonImagePayloadError(RuntimeError):
@@ -162,6 +187,46 @@ _UNKNOWN_DOM_POSITION = sys.maxsize
 
 
 @dataclass(frozen=True)
+class DeepCapturePageShape:
+    """Structural summary of the captured document, read with the DOM order walk.
+
+    Diagnostics only — nothing in the capture pipeline branches on it. It exists so the
+    log can distinguish "the reader is still loading pages" from "this is a paged reader
+    holding two images that will never change". Counts are aggregated over the main
+    document plus every open shadow root and same-origin iframe the walk reaches, which
+    is exactly the scope deep capture itself covers.
+
+    `complete_images` counts `<img>` elements that have actually decoded
+    (`complete && naturalWidth > 0`), so a page whose images are all still loading is
+    distinguishable from one that has finished rendering and simply has nothing more.
+    """
+    url: str = ""
+    elements: int = 0
+    images: int = 0
+    complete_images: int = 0
+    canvases: int = 0
+    iframes: int = 0
+
+    def describe(self) -> str:
+        """One-line human-readable form used in the drain / stall / stop log lines."""
+        return (
+            f"elements={self.elements} img={self.images}(complete={self.complete_images}) "
+            f"canvas={self.canvases} iframe={self.iframes} url={_short_link(self.url)}"
+        )
+
+    def signature(self) -> tuple[str, int, int, int, int, int]:
+        """Comparison key used to log the shape only when it actually changed."""
+        return (
+            self.url,
+            self.elements,
+            self.images,
+            self.complete_images,
+            self.canvases,
+            self.iframes,
+        )
+
+
+@dataclass(frozen=True)
 class DeepCaptureDomReading:
     """One raw read of the page's capturable elements in document order.
 
@@ -170,10 +235,130 @@ class DeepCaptureDomReading:
     whose element (or an ancestor) publishes one. `key_elements` maps every key to the
     representative key of its DOM element, so the several URL variants of one `<img>`
     can be counted as one element; keys absent from it are their own element.
+
+    `shape` is the diagnostic page-shape summary the same DOM walk produced, or None
+    when the read failed or came from a payload that carried no shape (legacy list
+    payloads and unit tests).
     """
     keys: list[tuple[str, str]] = field(default_factory=list)
     page_indices: dict[tuple[str, str], int] = field(default_factory=dict)
     key_elements: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    shape: Optional[DeepCapturePageShape] = None
+
+
+@dataclass
+class DeepCallStat:
+    """Aggregated wall time of one named browser call within a single drain.
+
+    Aggregating by label rather than logging per call is what keeps the diagnostics off
+    the hot path: the canvas screenshot pass makes one call per canvas, and only the
+    count, the total and the worst single call are ever reported.
+    """
+    calls: int = 0
+    total_seconds: float = 0.0
+    max_seconds: float = 0.0
+
+    def record(self, seconds: float) -> None:
+        """Fold one observed call duration into this label's totals."""
+        self.calls += 1
+        self.total_seconds += seconds
+        self.max_seconds = max(self.max_seconds, seconds)
+
+
+@dataclass(frozen=True)
+class DeepDrainStage:
+    """Wall time and new-record contribution of one stage inside a drain."""
+    name: str
+    seconds: float
+    added: int
+
+
+class DeepStallEvent(Enum):
+    """Transition reported by `DeepCaptureStallTracker.update`.
+
+    `NONE` means nothing worth logging changed; `STALLED` is emitted exactly once when
+    the idle threshold is first crossed; `RECOVERED` exactly once when a new capture
+    arrives after a stall episode.
+    """
+    NONE = "none"
+    STALLED = "stalled"
+    RECOVERED = "recovered"
+
+
+@dataclass
+class DeepCaptureStallTracker:
+    """Detects "nothing new is being captured" episodes without spamming the log.
+
+    Fed the running raw-payload total once per drain. A stall episode starts when
+    `threshold_seconds` elapse with no increase in that total and ends on the next
+    increase; each transition is reported once. `idle_seconds` is the observed idle
+    time at the moment of the transition, which the caller puts in the log line.
+    """
+    threshold_seconds: float = DEEP_CAPTURE_STALL_SECONDS
+    last_total: int = 0
+    last_progress_at: float = 0.0
+    stalled: bool = False
+    idle_seconds: float = 0.0
+
+    def start(self, now: float) -> None:
+        """Arm the tracker at capture start; `now` is a `time.monotonic()` reading."""
+        self.last_total = 0
+        self.last_progress_at = now
+        self.stalled = False
+        self.idle_seconds = 0.0
+
+    def update(self, total: int, now: float) -> DeepStallEvent:
+        """Record the current raw-payload `total` and report a stall transition."""
+        if total > self.last_total:
+            recovered = self.stalled
+            self.idle_seconds = now - self.last_progress_at
+            self.last_total = total
+            self.last_progress_at = now
+            self.stalled = False
+            return DeepStallEvent.RECOVERED if recovered else DeepStallEvent.NONE
+        idle = now - self.last_progress_at
+        if not self.stalled and idle >= self.threshold_seconds:
+            self.stalled = True
+            self.idle_seconds = idle
+            return DeepStallEvent.STALLED
+        return DeepStallEvent.NONE
+
+
+@dataclass
+class DeepDecodeStats:
+    """Outcome counters of the deep-capture decode pass.
+
+    `attempted` payloads were read; `decoded` became records; `exact_duplicates` decoded
+    to bytes already seen; `undecodable` failed to read or parse as an image. When the
+    user cancelled mid-pass, `attempted` is lower than the payload count and `cancelled`
+    is True.
+    """
+    attempted: int = 0
+    decoded: int = 0
+    exact_duplicates: int = 0
+    undecodable: int = 0
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class DeepCaptureSummary:
+    """Counts of one finished deep capture, from raw payloads to review pages.
+
+    `payloads` is what the interception layers stored; `decoded` how many of those
+    turned into images; `exact_duplicates` / `undecodable` explain the difference.
+    `blank_dropped`, `dom_collapsed` and `cluster_merged` are the three reductions the
+    finalization pipeline applies, in that order, and `pages` is what the review window
+    receives (`probable_junk` of them pre-unchecked).
+    """
+    payloads: int
+    decoded: int
+    exact_duplicates: int
+    undecodable: int
+    blank_dropped: int
+    dom_collapsed: int
+    cluster_merged: int
+    pages: int
+    probable_junk: int
 
 
 @dataclass
@@ -265,6 +450,18 @@ class CloakFetchDaemon:
         # tab can be resolved live, with no memory of past/first tabs. See
         # `_install_active_monitor_context` and `_resolve_active_page`.
         self._active_monitor_installed = False
+        # --- deep-capture diagnostics (see `_capture_deep_updates_once`) ---------------
+        # Browser-call timings of the drain currently in progress, keyed by call label
+        # and reset at the start of every drain. Only ever read for logging.
+        self._deep_call_stats: dict[str, DeepCallStat] = {}
+        # Drain counter (1-based in the log) and idle-time tracker, both reset by
+        # `start_deep_intercept`.
+        self._deep_drain_index = 0
+        self._deep_stall = DeepCaptureStallTracker()
+        # Last page shape read by the DOM-order walk, and the signature of the last one
+        # actually logged, so a static page is reported once instead of on every poll.
+        self._deep_page_shape: Optional[DeepCapturePageShape] = None
+        self._deep_shape_logged: Optional[tuple[str, int, int, int, int, int]] = None
         # Hook to run Playwright-touching work on the browser-owner thread. Default
         # passthrough keeps standalone behaviour; the in-process BrowserService
         # overrides it so the background link-collect loop's page calls run on the
@@ -622,6 +819,15 @@ class CloakFetchDaemon:
             raw_dir=raw_dir,
         )
         self._deep_capture_active = True
+        started = time.monotonic()
+        # Reset the diagnostics of the previous capture so drain numbering, the stall
+        # clock and the page-shape memory all belong to this run only.
+        self._deep_call_stats = {}
+        self._deep_drain_index = 0
+        self._deep_page_shape = None
+        self._deep_shape_logged = None
+        self._deep_stall = DeepCaptureStallTracker()
+        self._deep_stall.start(started)
 
         def prepare(page: Any) -> None:
             # Install the observe-only capture hooks before the reload so the reloaded
@@ -637,13 +843,25 @@ class CloakFetchDaemon:
         # not permanently rejected with "Глубокий перехват уже запущен."
         try:
             page = self._reload_capture_page(prepare)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - re-raised after logging the timing
+            _warn_log(
+                "cloak deep start: FAILED after %.2fs: %s: %s",
+                time.monotonic() - started,
+                type(exc).__name__,
+                exc,
+            )
             self._clear_deep_capture_runtime()
             raise
         page_url = str(page.url or "").strip()
         capture = self._deep_capture
         if capture is not None:
             capture.page_url = page_url
+        _debug_log(
+            "cloak deep start: took=%.2fs url=%s calls=[%s]",
+            time.monotonic() - started,
+            _short_link(page_url),
+            _format_deep_call_stats(self._deep_call_stats),
+        )
         self._emit_progress("collect", 0, 0)
         return page_url
 
@@ -665,10 +883,16 @@ class CloakFetchDaemon:
                     page_url = str(page.url or "").strip()
                     if not page_url or page_url in {"about:blank", "data:,"}:
                         raise RuntimeError("Сначала откройте страницу главы в CloakBrowser.")
-                    prepare(page)
-                    page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    self._timed_deep_call("prepare(init-scripts+cdp)", lambda: prepare(page))
+                    self._timed_deep_call(
+                        "page.reload(domcontentloaded)",
+                        lambda: page.reload(wait_until="domcontentloaded", timeout=60_000),
+                    )
                     try:
-                        page.wait_for_load_state("networkidle", timeout=10_000)
+                        self._timed_deep_call(
+                            "wait_for_load_state(networkidle)",
+                            lambda: page.wait_for_load_state("networkidle", timeout=10_000),
+                        )
                     except Exception:  # noqa: BLE001
                         LOG.debug("Deep capture page did not reach networkidle", exc_info=True)
                 return page
@@ -695,43 +919,67 @@ class CloakFetchDaemon:
         if capture is None or not self._deep_capture_active:
             return {"total": 0, "canvases": 0, "images": 0}
         self._capture_deep_updates_once()
-        with capture.lock:
-            canvases = 0
-            images = 0
-            for entry in capture.entries:
-                if _deep_capture_is_canvas_source(str(entry.get("source") or "")):
-                    canvases += 1
-                else:
-                    images += 1
-            return {"total": canvases + images, "canvases": canvases, "images": images}
+        canvases, images = self._deep_capture_kind_counts(capture)
+        return {"total": canvases + images, "canvases": canvases, "images": images}
 
     def stop_deep_intercept(self, cancel_file: Optional[Path] = None) -> dict[str, Any]:
+        """Finish deep capture and turn everything gathered into an auto-review result.
+
+        Emits a ``cloak deep stop:`` line with the wall time of every phase, so a slow
+        stop can be attributed to the final drain, the settle waits, the canvas
+        screenshot pass, the ordering finalization or the decode/finalize pipeline
+        without re-running the capture. The result contract is unchanged.
+        """
         capture = self._deep_capture
         if capture is None or not self._deep_capture_active:
             raise RuntimeError("Глубокий перехват ещё не запущен.")
 
+        stop_started = time.monotonic()
+        phases: list[tuple[str, float]] = []
+
+        def phase(name: str, step: Callable[[], Any]) -> Any:
+            started = time.monotonic()
+            try:
+                return step()
+            finally:
+                phases.append((name, time.monotonic() - started))
+
         self._emit_progress("collect", 0, 0)
         capture.stop_event.set()
-        self._capture_deep_updates_once()
-        self._settle_deep_image_reads()
+        phase("final-drain", lambda: self._capture_deep_updates_once(reason="stop"))
+        phase("settle", self._settle_deep_image_reads)
         # Accumulate on both sides of the screenshot pass: `ElementHandle.screenshot()`
         # scrolls each canvas into view, which on a virtual-scroll reader is exactly what
         # recycles the elements the merge depends on. The read before it keeps the
         # pre-scroll document order; the read after it picks up whatever the scrolling
         # attached (first-seen wins, so the earlier reading is never rewritten).
-        self._accumulate_deep_dom_order()
-        self._capture_visible_canvas_screenshots_if_needed(capture)
-        self._accumulate_deep_dom_order()
-        dom_order = self._finalize_dom_capture_order(capture)
+        phase("dom-order-pre", self._accumulate_deep_dom_order)
+        phase("canvas-screenshots", lambda: self._capture_visible_canvas_screenshots_if_needed(capture))
+        phase("dom-order-post", self._accumulate_deep_dom_order)
+        dom_order = phase("finalize-order", lambda: self._finalize_dom_capture_order(capture))
         with capture.lock:
             entries = list(capture.entries)
             page_url = self._current_url_or(capture.page_url)
             output_dir = capture.output_dir
+        # Force one last shape line so the log always shows what the page looked like
+        # when the user stopped, even if it never changed during the capture.
+        self._log_deep_page_shape(force=True)
 
         self._clear_deep_capture_runtime()
-        return self._build_auto_result_from_deep_entries(
-            entries, page_url, output_dir, cancel_file, dom_order
-        )
+        try:
+            return phase(
+                "build-result",
+                lambda: self._build_auto_result_from_deep_entries(
+                    entries, page_url, output_dir, cancel_file, dom_order
+                ),
+            )
+        finally:
+            _debug_log(
+                "cloak deep stop: took=%.2fs payloads=%d phases=[%s]",
+                time.monotonic() - stop_started,
+                len(entries),
+                ", ".join(f"{name} {seconds:.3f}s" for name, seconds in phases),
+            )
 
     def _read_dom_order_keys(self) -> DeepCaptureDomReading:
         """Read the current document order of page images/canvases.
@@ -739,14 +987,23 @@ class CloakFetchDaemon:
         Returns the `DeepCaptureDomReading` produced by `_deep_capture_dom_keys_from_raw`.
         A failed read is not fatal for deep capture (ordering just falls back to weaker
         signals), so it is logged and reported as an empty reading.
+
+        Side effect: the diagnostics page shape the same walk produced is stored in
+        `self._deep_page_shape`, so page-shape logging costs no extra DOM round-trip.
         """
         try:
             with self._page_lock:
-                raw = self._require_page().evaluate(COLLECT_DOM_IMAGE_ORDER_JS)
+                page = self._require_page()
+                raw = self._timed_deep_call(
+                    "evaluate(dom-order)", lambda: page.evaluate(COLLECT_DOM_IMAGE_ORDER_JS)
+                )
         except Exception:  # noqa: BLE001
             LOG.debug("Failed to read DOM image order during deep capture", exc_info=True)
             return DeepCaptureDomReading()
-        return _deep_capture_dom_keys_from_raw(raw)
+        reading = _deep_capture_dom_keys_from_raw(raw)
+        if reading.shape is not None:
+            self._deep_page_shape = reading.shape
+        return reading
 
     def _accumulate_deep_dom_order(self) -> None:
         """Record the page's current document order, in first-seen (chronological) order.
@@ -1073,7 +1330,12 @@ class CloakFetchDaemon:
             if not is_image_candidate:
                 continue
             try:
-                result = session.send("Network.getResponseBody", {"requestId": request_id})
+                result = self._timed_deep_call(
+                    "cdp(getResponseBody)",
+                    lambda request_id=request_id: session.send(
+                        "Network.getResponseBody", {"requestId": request_id}
+                    ),
+                )
             except Exception:  # noqa: BLE001
                 continue
             body_value = result.get("body") if isinstance(result, dict) else None
@@ -1111,7 +1373,7 @@ class CloakFetchDaemon:
             )
             if not is_image_candidate:
                 return
-            body = response.body()
+            body = self._timed_deep_call("response.body()", response.body)
             if not body:
                 return
             self._remember_deep_capture_bytes(
@@ -1181,7 +1443,10 @@ class CloakFetchDaemon:
             return
         with self._page_lock:
             try:
-                raw_events = self._require_page().evaluate(DRAIN_DEEP_CAPTURE_JS)
+                page = self._require_page()
+                raw_events = self._timed_deep_call(
+                    "evaluate(page-events)", lambda: page.evaluate(DRAIN_DEEP_CAPTURE_JS)
+                )
             except Exception:  # noqa: BLE001
                 LOG.debug("Failed to drain deep capture page events", exc_info=True)
                 return
@@ -1212,7 +1477,11 @@ class CloakFetchDaemon:
             return
         with self._page_lock:
             try:
-                raw_events = self._require_page().evaluate(COLLECT_DEEP_ELEMENT_SNAPSHOTS_JS)
+                page = self._require_page()
+                raw_events = self._timed_deep_call(
+                    "evaluate(canvas-snapshots)",
+                    lambda: page.evaluate(COLLECT_DEEP_ELEMENT_SNAPSHOTS_JS),
+                )
             except Exception:  # noqa: BLE001
                 LOG.debug("Failed to collect deep capture element snapshots", exc_info=True)
                 return
@@ -1237,11 +1506,181 @@ class CloakFetchDaemon:
                 metadata=_deep_capture_item_metadata(item),
             )
 
-    def _capture_deep_updates_once(self) -> None:
-        self._drain_pending_response_bodies()
-        self._drain_deep_capture_page_events()
-        self._capture_deep_element_snapshots()
-        self._accumulate_deep_dom_order()
+    def _timed_deep_call(self, label: str, call: Callable[[], Any]) -> Any:
+        """Run one browser call from the deep-capture path and record its wall time.
+
+        ``label`` names the call in the diagnostics (for example ``evaluate(dom-order)``
+        or ``screenshot(canvas)``); repeated calls with the same label are aggregated
+        into one `DeepCallStat` so a per-canvas loop contributes one table entry rather
+        than one line per element. A call slower than `DEEP_CAPTURE_SLOW_CALL_SECONDS`
+        additionally gets its own warning line, which is what names the offending call
+        when a capture looks frozen. Exceptions propagate unchanged and are still timed.
+        """
+        started = time.monotonic()
+        try:
+            return call()
+        finally:
+            elapsed = time.monotonic() - started
+            self._deep_call_stats.setdefault(label, DeepCallStat()).record(elapsed)
+            if elapsed >= DEEP_CAPTURE_SLOW_CALL_SECONDS:
+                _warn_log("cloak deep call: SLOW %s took %.2fs", label, elapsed)
+
+    def _run_deep_drain_stage(
+        self,
+        stages: list[DeepDrainStage],
+        capture: Optional[DeepCaptureState],
+        name: str,
+        stage: Callable[[], None],
+    ) -> None:
+        """Run one drain stage, appending its wall time and new-record count to `stages`.
+
+        The new-record count is the growth of ``capture.entries`` across the stage, which
+        is how each interception layer's contribution becomes attributable. `capture` may
+        be None (capture already stopped); the stage still runs — every stage is a no-op
+        in that state — and is recorded with a zero contribution.
+        """
+        started = time.monotonic()
+        before = self._deep_entry_count(capture)
+        try:
+            stage()
+        finally:
+            elapsed = time.monotonic() - started
+            added = self._deep_entry_count(capture) - before
+            stages.append(DeepDrainStage(name=name, seconds=elapsed, added=added))
+
+    @staticmethod
+    def _deep_entry_count(capture: Optional[DeepCaptureState]) -> int:
+        """Current number of raw captured payloads, or 0 when capture is not running."""
+        if capture is None:
+            return 0
+        with capture.lock:
+            return len(capture.entries)
+
+    @staticmethod
+    def _deep_capture_kind_counts(capture: DeepCaptureState) -> tuple[int, int]:
+        """Split the raw captured payloads into ``(canvases, images)``.
+
+        Classification is `_deep_capture_is_canvas_source`: canvas-element captures
+        (native readback and screenshots) versus everything else (plain ``<img>`` reads,
+        network/CDP bytes, blob/descramble exports). These are raw capture counts, not
+        the deduped/clustered page count produced at stop.
+        """
+        with capture.lock:
+            sources = [str(entry.get("source") or "") for entry in capture.entries]
+        canvases = sum(1 for source in sources if _deep_capture_is_canvas_source(source))
+        return canvases, len(sources) - canvases
+
+    def _capture_deep_updates_once(self, reason: str = "poll") -> None:
+        """Run one full drain of every deep-capture layer and log one diagnostic line.
+
+        `reason` labels the drain in the log (``poll`` for a status poll, ``stop`` for
+        the final drain). Exactly one aggregated ``cloak deep drain:`` line is emitted
+        per call — never one per captured image — carrying the whole-drain wall time, the
+        per-stage time/new-record split, the running totals and the slowest browser calls
+        made. Page-shape and stall lines are emitted from here only when they change.
+        """
+        capture = self._deep_capture
+        self._deep_call_stats = {}
+        stages: list[DeepDrainStage] = []
+        started = time.monotonic()
+        self._run_deep_drain_stage(stages, capture, "network", self._drain_pending_response_bodies)
+        self._run_deep_drain_stage(stages, capture, "page-events", self._drain_deep_capture_page_events)
+        self._run_deep_drain_stage(stages, capture, "canvas-native", self._capture_deep_element_snapshots)
+        self._run_deep_drain_stage(stages, capture, "dom-order", self._accumulate_deep_dom_order)
+        if capture is None:
+            return
+        self._report_deep_drain(capture, reason, time.monotonic() - started, stages)
+
+    def _report_deep_drain(
+        self,
+        capture: DeepCaptureState,
+        reason: str,
+        elapsed: float,
+        stages: list[DeepDrainStage],
+    ) -> None:
+        """Emit the aggregated diagnostics for one finished drain.
+
+        Emits the ``cloak deep drain:`` line (as a warning when the drain took longer
+        than `DEEP_CAPTURE_SLOW_DRAIN_SECONDS`), the ``cloak deep shape:`` line whenever
+        the observed page shape changed since it was last logged, and at most one stall
+        or recovery line per episode.
+        """
+        canvases, images = self._deep_capture_kind_counts(capture)
+        total = canvases + images
+        added = sum(stage.added for stage in stages)
+        self._deep_drain_index += 1
+        line = (
+            "cloak deep drain: #%d reason=%s took=%.3fs new=%d total=%d (canvas=%d img=%d) "
+            "stages=[%s] calls=[%s]"
+        )
+        args: tuple[object, ...] = (
+            self._deep_drain_index,
+            reason,
+            elapsed,
+            added,
+            total,
+            canvases,
+            total - canvases,
+            _format_deep_drain_stages(stages),
+            _format_deep_call_stats(self._deep_call_stats),
+        )
+        if elapsed >= DEEP_CAPTURE_SLOW_DRAIN_SECONDS:
+            _warn_log(line, *args)
+        else:
+            _debug_log(line, *args)
+        # First drain always logs the shape; later drains only when it actually moved,
+        # so a static paged reader shows one shape line instead of one per poll.
+        self._log_deep_page_shape(force=self._deep_drain_index == 1)
+        self._report_deep_capture_stall(total, canvases)
+
+    def _log_deep_page_shape(self, *, force: bool) -> None:
+        """Log the page shape when it changed since the last logged one (or if forced).
+
+        The shape itself is read for free inside the DOM-order walk; this only decides
+        whether it is worth a line. `force` is used for the first drain and at stop so
+        the log always contains a shape at both ends of a capture.
+        """
+        shape = self._deep_page_shape
+        if shape is None:
+            return
+        signature = shape.signature()
+        if not force and signature == self._deep_shape_logged:
+            return
+        self._deep_shape_logged = signature
+        _debug_log("cloak deep shape: %s", shape.describe())
+
+    def _report_deep_capture_stall(self, total: int, canvases: int) -> None:
+        """Emit at most one stall warning per idle episode, and one recovery line after.
+
+        `total` is the running raw-payload count the tracker watches. The warning names
+        the observed page shape, because a page that holds a fixed handful of images and
+        never changes is the usual cause: the capture is healthy, the page simply has
+        nothing new to give.
+        """
+        event = self._deep_stall.update(total, time.monotonic())
+        if event is DeepStallEvent.NONE:
+            return
+        shape = self._deep_page_shape
+        shape_text = shape.describe() if shape is not None else "unknown"
+        if event is DeepStallEvent.STALLED:
+            _warn_log(
+                (
+                    "cloak deep stall: no new images captured for %.0fs — the page is not "
+                    "producing anything new (total=%d canvas=%d img=%d); page shape: %s"
+                ),
+                self._deep_stall.idle_seconds,
+                total,
+                canvases,
+                total - canvases,
+                shape_text,
+            )
+            return
+        if event is DeepStallEvent.RECOVERED:
+            _debug_log(
+                "cloak deep stall: recovered — new captures resumed after %.0fs idle (total=%d)",
+                self._deep_stall.idle_seconds,
+                total,
+            )
 
     def _settle_deep_image_reads(self) -> None:
         """Give in-flight `<img>` reads kicked off by the page scan time to resolve.
@@ -1250,27 +1689,69 @@ class CloakFetchDaemon:
         scan (and any reads still pending when the user stops) only land in the page
         buffer a moment later. Drain a few more times with short waits so a fast
         start -> stop still captures every plain <img> on the page.
+
+        Reports one aggregated ``cloak deep settle:`` line rather than one per round.
         """
+        capture = self._deep_capture
+        self._deep_call_stats = {}
+        started = time.monotonic()
+        before = self._deep_entry_count(capture)
+        rounds = 0
         for _ in range(6):
             if not self._deep_capture_active:
                 break
             time.sleep(0.15)
+            rounds += 1
             self._drain_deep_capture_page_events()
+        _debug_log(
+            "cloak deep settle: took=%.3fs rounds=%d new=%d total=%d calls=[%s]",
+            time.monotonic() - started,
+            rounds,
+            self._deep_entry_count(capture) - before,
+            self._deep_entry_count(capture),
+            _format_deep_call_stats(self._deep_call_stats),
+        )
 
     def _capture_visible_canvas_screenshots_if_needed(self, capture: DeepCaptureState) -> None:
+        """Add a compositor screenshot of every visible canvas as a last-resort layer.
+
+        Reports one aggregated ``cloak deep screenshots:`` line: how many canvases were
+        found, how many were skipped as too small or failed, how many new payloads the
+        pass added, and the timing of the underlying browser calls. Each canvas costs a
+        `bounding_box` plus a `screenshot`, and `screenshot` scrolls the element into
+        view, so this pass is the usual suspect when stop takes a long time.
+        """
+        self._deep_call_stats = {}
+        started = time.monotonic()
+        before = self._deep_entry_count(capture)
+        skipped = 0
+        failed = 0
         with self._page_lock:
             try:
-                handles = self._require_page().query_selector_all("canvas")
+                page = self._require_page()
+                handles = self._timed_deep_call(
+                    "query_selector_all(canvas)", lambda: page.query_selector_all("canvas")
+                )
             except Exception:  # noqa: BLE001
                 LOG.debug("Failed to query canvas elements for deep capture screenshots", exc_info=True)
+                _warn_log(
+                    "cloak deep screenshots: canvas query failed after %.3fs; screenshot pass skipped",
+                    time.monotonic() - started,
+                )
                 return
             for index, handle in enumerate(handles):
                 try:
-                    box = handle.bounding_box()
+                    box = self._timed_deep_call(
+                        "bounding_box(canvas)", lambda handle=handle: handle.bounding_box()
+                    )
                     if not box or box.get("width", 0) <= 1 or box.get("height", 0) <= 1:
+                        skipped += 1
                         continue
-                    body = handle.screenshot(type="png")
+                    body = self._timed_deep_call(
+                        "screenshot(canvas)", lambda handle=handle: handle.screenshot(type="png")
+                    )
                 except Exception:  # noqa: BLE001
+                    failed += 1
                     LOG.debug("Failed to screenshot canvas %d during deep capture", index, exc_info=True)
                     continue
                 self._remember_deep_capture_bytes(
@@ -1280,36 +1761,54 @@ class CloakFetchDaemon:
                     content_type="image/png",
                     metadata={"dom_order": index, "element": "canvas"},
                 )
+        _debug_log(
+            "cloak deep screenshots: took=%.3fs canvases=%d skipped=%d failed=%d new=%d calls=[%s]",
+            time.monotonic() - started,
+            len(handles),
+            skipped,
+            failed,
+            self._deep_entry_count(capture) - before,
+            _format_deep_call_stats(self._deep_call_stats),
+        )
 
     def _decode_deep_capture_records(
         self,
         entries: list[dict[str, Any]],
         cancel_file: Optional[Path],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], DeepDecodeStats]:
         """Decode captured payloads into scored records, dropping exact duplicates.
 
         Each record keeps the original entry, decoded RGB image, capture order, a
         blank-frame flag, and a perceptual hash used later for content clustering.
         Cancellation via `cancel_file` stops decoding early but keeps what was decoded.
+
+        Returns the records together with the pass's `DeepDecodeStats`, which the stop
+        summary uses to explain the gap between payloads captured and images decoded.
         """
         records: list[dict[str, Any]] = []
         image_hashes: set[str] = set()
+        stats_counters = DeepDecodeStats()
         total = len(entries)
         for index, entry in enumerate(entries):
             if _cancel_requested(cancel_file):
+                stats_counters.cancelled = True
                 break
+            stats_counters.attempted += 1
             self._emit_progress("download", index + 1, total)
             raw_path_value = entry.get("raw_path")
             if not isinstance(raw_path_value, str):
+                stats_counters.undecodable += 1
                 continue
             raw_path = Path(raw_path_value)
             try:
                 body = raw_path.read_bytes()
                 image = _decode_image_bytes(body, str(entry.get("url") or raw_path))
             except Exception:  # noqa: BLE001
+                stats_counters.undecodable += 1
                 continue
             image_digest = _image_exact_digest(image)
             if image_digest in image_hashes:
+                stats_counters.exact_duplicates += 1
                 _debug_log(
                     "cloak deep decode: [%d/%d] exact-duplicate dropped source=%s %dx%d url=%s",
                     index + 1,
@@ -1350,7 +1849,8 @@ class CloakFetchDaemon:
                     "phash": _image_dhash(image),
                 }
             )
-        return records
+        stats_counters.decoded = len(records)
+        return records, stats_counters
 
     def _build_auto_result_from_deep_entries(
         self,
@@ -1370,10 +1870,24 @@ class CloakFetchDaemon:
         per cluster, order pages by DOM/geometry/URL signals, and flag size-outlier
         pages as probable junk for the review UI.
 
+        Emits the greppable ``cloak deep summary:`` block (pipeline counters plus a
+        per-source breakdown) once the pipeline has run.
+
         Raises RuntimeError if nothing decodable or only blank frames were captured.
         """
-        records = self._decode_deep_capture_records(entries, cancel_file)
+        records, decode_stats = self._decode_deep_capture_records(entries, cancel_file)
         if not records:
+            _warn_log(
+                (
+                    "cloak deep summary: NOTHING DECODED — payloads=%d attempted=%d "
+                    "exact-dupes=%d undecodable=%d cancelled=%s"
+                ),
+                len(entries),
+                decode_stats.attempted,
+                decode_stats.exact_duplicates,
+                decode_stats.undecodable,
+                decode_stats.cancelled,
+            )
             shutil.rmtree(output_dir, ignore_errors=True)
             raise RuntimeError("Глубокий перехват не нашёл декодируемых изображений.")
 
@@ -1383,11 +1897,19 @@ class CloakFetchDaemon:
         if dropped_blank > 0:
             _debug_log("cloak deep capture: dropped %d blank (near-uniform) frame(s)", dropped_blank)
         if not records:
+            _warn_log(
+                "cloak deep summary: ONLY BLANK FRAMES — payloads=%d decoded=%d blank-dropped=%d",
+                len(entries),
+                decoded_count,
+                dropped_blank,
+            )
             shutil.rmtree(output_dir, ignore_errors=True)
             raise RuntimeError("Глубокий перехват нашёл только пустые (одноцветные) кадры.")
 
         collapsed = _collapse_deep_capture_dom_updates(records)
+        dom_collapsed = len(records) - len(collapsed)
         clusters = _cluster_deep_records_by_content(collapsed)
+        cluster_merged = len(collapsed) - len(clusters)
         representatives = [_select_cluster_representative(cluster) for cluster in clusters]
         representatives.sort(
             key=lambda record: _deep_capture_sort_key(
@@ -1395,14 +1917,41 @@ class CloakFetchDaemon:
             )
         )
         _assign_deep_capture_confidence(representatives)
+        probable_junk = sum(1 for record in representatives if record.get("probable_junk"))
         _debug_log(
-            "cloak deep capture: %d payload(s) -> %d decoded -> %d blank dropped -> %d page(s) (%d flagged as probable junk)",
+            (
+                "cloak deep capture: %d payload(s) -> %d decoded -> %d blank dropped -> "
+                "%d dom-collapsed -> %d cluster-merged -> %d page(s) (%d flagged as probable junk)"
+            ),
             len(entries),
             decoded_count,
             dropped_blank,
+            dom_collapsed,
+            cluster_merged,
             len(representatives),
-            sum(1 for record in representatives if record.get("probable_junk")),
+            probable_junk,
         )
+        summary = DeepCaptureSummary(
+            payloads=len(entries),
+            decoded=decoded_count,
+            exact_duplicates=decode_stats.exact_duplicates,
+            undecodable=decode_stats.undecodable,
+            blank_dropped=dropped_blank,
+            dom_collapsed=dom_collapsed,
+            cluster_merged=cluster_merged,
+            pages=len(representatives),
+            probable_junk=probable_junk,
+        )
+        for line in _format_deep_capture_summary(
+            summary, _deep_capture_source_breakdown(entries, representatives)
+        ):
+            _debug_log("%s", line)
+        if decode_stats.cancelled:
+            _debug_log(
+                "cloak deep summary: cancelled by the user after %d of %d payload(s)",
+                decode_stats.attempted,
+                len(entries),
+            )
         for page_index, record in enumerate(representatives):
             image = record["image"]
             stats = _blank_stats(image)
@@ -2684,6 +3233,11 @@ COLLECT_DEEP_ELEMENT_SNAPSHOTS_JS = """
 # containers usually all exist from first paint, so a single read yields the whole
 # mapping. The walk is strictly observe-only - it only reads attributes - and memoized
 # per ancestor, because this collector runs on every status poll.
+#
+# Returns `{items, shape}`: `items` is the ordering payload described above and `shape`
+# is the diagnostics-only page summary (URL, element/img/canvas/iframe counts, decoded
+# image count) counted inside the same traversal, so page-shape logging costs no extra
+# DOM round-trip. A bare list is still accepted by the Python parser for older payloads.
 COLLECT_DOM_IMAGE_ORDER_JS = """
 () => {
   const state = window.__mfDeepCapture;
@@ -2745,11 +3299,19 @@ COLLECT_DOM_IMAGE_ORDER_JS = """
     seenUrls.add(url);
     out.push({ order: slot, kind: "image", url, page_index: pageIndex });
   };
+  // Diagnostics-only page shape, counted inside the walk this collector already makes so
+  // no extra DOM round-trip or extra traversal is paid for it. Scope is the same as the
+  // walk itself (document + open shadow roots + same-origin iframes).
+  const shape = { url: "", elements: 0, images: 0, complete_images: 0, canvases: 0, iframes: 0 };
+  try { shape.url = String(location.href || ""); } catch (_) {}
   const walk = (root) => {
     if (!root || !root.querySelectorAll) return;
     for (const node of root.querySelectorAll("*")) {
+      shape.elements += 1;
       const tag = String(node.tagName || "").toLowerCase();
       if (tag === "img") {
+        shape.images += 1;
+        try { if (node.complete && node.naturalWidth > 0) shape.complete_images += 1; } catch (_) {}
         const slot = order++;
         const pageIndex = pageIndexOf(node);
         addUrl(slot, pageIndex, node.currentSrc || "");
@@ -2762,12 +3324,15 @@ COLLECT_DOM_IMAGE_ORDER_JS = """
         addUrl(slot, pageIndex, node.src || "");
         addUrl(slot, pageIndex, node.getAttribute("src") || "");
       } else if (tag === "canvas") {
+        shape.canvases += 1;
         out.push({
           order: order++,
           kind: "canvas",
           element_id: (state && state.elementId ? state.elementId(node) : 0),
           page_index: pageIndexOf(node),
         });
+      } else if (tag === "iframe") {
+        shape.iframes += 1;
       }
       if (node.shadowRoot) walk(node.shadowRoot);
     }
@@ -2776,7 +3341,7 @@ COLLECT_DOM_IMAGE_ORDER_JS = """
     }
   };
   walk(document);
-  return out;
+  return { items: out, shape };
 }
 """
 
@@ -3287,6 +3852,118 @@ def _debug_log(message: str, *args: object) -> None:
         sys.stdout.flush()
 
 
+def _warn_log(message: str, *args: object) -> None:
+    """Emit a warning-level diagnostic to both the Python log and the Rust runtime log.
+
+    Same transport as `_debug_log` (a JSON ``log`` event on stdout, which the Rust side
+    forwards into the runtime log) but at ``warn`` level and **not** gated by
+    `VERBOSE_DOWNLOAD_LOG`: the lines routed through here mark conditions the user needs
+    to see, such as a capture that has stopped finding anything.
+    """
+    LOG.warning(message, *args)
+    try:
+        formatted = message % args if args else message
+    except Exception:  # noqa: BLE001 - never lose a warning to a bad format string
+        formatted = f"{message} | args={args!r}"
+    with EMIT_LOCK:
+        sys.stdout.write(json.dumps({"event": "log", "level": "warn", "message": formatted}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def _format_deep_call_stats(stats: dict[str, DeepCallStat], limit: int = 4) -> str:
+    """Render the per-drain browser-call table, slowest total first.
+
+    Produces ``label=Nx/0.42s(max 0.30s)`` entries joined by ", ", capped at `limit`
+    entries so one canvas-heavy drain cannot flood the line. Returns "-" when no browser
+    call was made (every stage early-returned).
+    """
+    if not stats:
+        return "-"
+    ordered = sorted(stats.items(), key=lambda item: (-item[1].total_seconds, item[0]))
+    return ", ".join(
+        f"{label}={stat.calls}x/{stat.total_seconds:.3f}s(max {stat.max_seconds:.3f}s)"
+        for label, stat in ordered[:limit]
+    )
+
+
+def _format_deep_drain_stages(stages: list[DeepDrainStage]) -> str:
+    """Render the per-stage table of one drain as ``name 0.061s +2`` entries."""
+    if not stages:
+        return "-"
+    return ", ".join(f"{stage.name} {stage.seconds:.3f}s +{stage.added}" for stage in stages)
+
+
+def _deep_capture_source_breakdown(
+    entries: list[dict[str, Any]],
+    representatives: list[dict[str, Any]],
+) -> list[tuple[str, int, int, int]]:
+    """Per-source deep-capture breakdown for the stop summary.
+
+    Returns ``(source, raw_payloads, final_pages, probable_junk_pages)`` for every source
+    that produced at least one raw payload or one final page, ordered by final pages
+    descending, then raw payloads descending, then source name. `entries` are the raw
+    captured payloads, `representatives` the finalized per-page records (each holding its
+    originating payload under ``"entry"`` and its `probable_junk` flag). A source that
+    captured plenty and yielded no page is exactly the signal this table exists for.
+    """
+    raw_counts: dict[str, int] = {}
+    for entry in entries:
+        source = str(entry.get("source") or "unknown")
+        raw_counts[source] = raw_counts.get(source, 0) + 1
+    page_counts: dict[str, int] = {}
+    junk_counts: dict[str, int] = {}
+    for record in representatives:
+        entry = record.get("entry")
+        source = str(entry.get("source") or "unknown") if isinstance(entry, dict) else "unknown"
+        page_counts[source] = page_counts.get(source, 0) + 1
+        if bool(record.get("probable_junk")):
+            junk_counts[source] = junk_counts.get(source, 0) + 1
+    sources = set(raw_counts) | set(page_counts)
+    rows = [
+        (source, raw_counts.get(source, 0), page_counts.get(source, 0), junk_counts.get(source, 0))
+        for source in sources
+    ]
+    rows.sort(key=lambda row: (-row[2], -row[1], row[0]))
+    return rows
+
+
+def _format_deep_capture_summary(
+    summary: DeepCaptureSummary,
+    breakdown: list[tuple[str, int, int, int]],
+) -> list[str]:
+    """Render the greppable stop-summary block as one list of log lines.
+
+    The first line carries every pipeline counter; the following lines are the
+    per-source breakdown from `_deep_capture_source_breakdown`, one per source, so the
+    whole block can be pulled out of a runtime log with ``grep 'cloak deep summary:'``.
+    """
+    lines = [
+        (
+            "cloak deep summary: payloads=%d decoded=%d exact-dupes=%d undecodable=%d "
+            "blank-dropped=%d dom-collapsed=%d cluster-merged=%d pages=%d probable_junk=%d"
+        )
+        % (
+            summary.payloads,
+            summary.decoded,
+            summary.exact_duplicates,
+            summary.undecodable,
+            summary.blank_dropped,
+            summary.dom_collapsed,
+            summary.cluster_merged,
+            summary.pages,
+            summary.probable_junk,
+        )
+    ]
+    if not breakdown:
+        lines.append("cloak deep summary: source (none)")
+        return lines
+    lines.extend(
+        f"cloak deep summary: source {source} raw={raw} pages={pages} probable_junk={junk}"
+        for source, raw, pages, junk in breakdown
+    )
+    return lines
+
+
 def _format_console_location(location: Any) -> str:
     if not isinstance(location, dict):
         return ""
@@ -3655,14 +4332,22 @@ def _deep_capture_dom_keys_from_raw(raw: Any) -> DeepCaptureDomReading:
     `DOM_PAGE_INDEX_ATTRIBUTES`) when the payload carried one; keys whose element
     published no index are simply absent, so the mapping is empty on sites that use no
     such attributes.
+
+    Accepts both payload shapes: the current `{"items": [...], "shape": {...}}` object
+    (the diagnostics page shape rides along with the ordering read) and a bare list of
+    items, which carries no shape.
     """
     keys: list[tuple[str, str]] = []
     page_indices: dict[tuple[str, str], int] = {}
     key_elements: dict[tuple[str, str], tuple[str, str]] = {}
     slot_elements: dict[int, tuple[str, str]] = {}
     seen: set[tuple[str, str]] = set()
+    shape: Optional[DeepCapturePageShape] = None
+    if isinstance(raw, dict):
+        shape = _deep_capture_page_shape_from_raw(raw.get("shape"))
+        raw = raw.get("items")
     if not isinstance(raw, list):
-        return DeepCaptureDomReading(keys, page_indices, key_elements)
+        return DeepCaptureDomReading(keys, page_indices, key_elements, shape)
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -3694,7 +4379,32 @@ def _deep_capture_dom_keys_from_raw(raw: Any) -> DeepCaptureDomReading:
             key_elements[key] = slot_elements.setdefault(slot, key)
         else:
             key_elements[key] = key
-    return DeepCaptureDomReading(keys, page_indices, key_elements)
+    return DeepCaptureDomReading(keys, page_indices, key_elements, shape)
+
+
+def _deep_capture_page_shape_from_raw(raw: Any) -> Optional[DeepCapturePageShape]:
+    """Parse the diagnostics `shape` object emitted by COLLECT_DOM_IMAGE_ORDER_JS.
+
+    Returns None when the payload carried no usable shape. Non-integer counters are
+    read as 0 rather than rejecting the whole shape: this is diagnostics, and a partly
+    readable shape is still more informative than none.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def count(name: str) -> int:
+        value = raw.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    url = raw.get("url")
+    return DeepCapturePageShape(
+        url=url if isinstance(url, str) else "",
+        elements=count("elements"),
+        images=count("images"),
+        complete_images=count("complete_images"),
+        canvases=count("canvases"),
+        iframes=count("iframes"),
+    )
 
 
 def _group_dom_keys_by_element(

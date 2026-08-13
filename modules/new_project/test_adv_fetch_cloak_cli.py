@@ -24,7 +24,13 @@ Main responsibilities:
   and agreeing with document order — and once accepted its gaps are filled so untagged
   records keep their document position;
 - `stop_deep_intercept` accumulates the DOM order on both sides of the canvas screenshot
-  pass, which scrolls (and therefore recycles) elements.
+  pass, which scrolls (and therefore recycles) elements;
+- the pure deep-capture diagnostics helpers: `DeepCaptureStallTracker` reports a stall
+  and a recovery exactly once per episode and never while captures keep arriving,
+  `DeepCapturePageShape` parsing tolerates junk counters and its signature changes only
+  with content, the DOM-order parser accepts both the `{items, shape}` payload and a bare
+  list, and the stop summary / per-source breakdown / call and stage tables format as
+  documented.
 
 Notes:
 Fake pages record `evaluate`/`bring_to_front` and never touch a real browser. `_valid_pages`
@@ -44,12 +50,23 @@ from PIL import Image
 
 from modules.new_project.adv_fetch_cloak_cli import (
     CloakFetchDaemon,
+    DeepCallStat,
     DeepCaptureDomOrder,
+    DeepCapturePageShape,
+    DeepCaptureStallTracker,
     DeepCaptureState,
+    DeepCaptureSummary,
+    DeepDrainStage,
+    DeepStallEvent,
     _append_first_seen_keys,
     _combine_dom_order,
     _deep_capture_dom_keys_from_raw,
+    _deep_capture_page_shape_from_raw,
     _deep_capture_sort_key,
+    _deep_capture_source_breakdown,
+    _format_deep_call_stats,
+    _format_deep_capture_summary,
+    _format_deep_drain_stages,
     _site_page_index_authority,
 )
 
@@ -679,7 +696,7 @@ def test_stop_accumulates_dom_order_around_the_screenshot_pass() -> None:
 
     daemon._read_dom_order_keys = lambda: _deep_capture_dom_keys_from_raw(state["raw"])  # type: ignore[assignment]
     daemon._emit_progress = lambda *_args, **_kwargs: None  # type: ignore[assignment]
-    daemon._capture_deep_updates_once = lambda: None  # type: ignore[assignment]
+    daemon._capture_deep_updates_once = lambda **_kwargs: None  # type: ignore[assignment]
     daemon._settle_deep_image_reads = lambda: None  # type: ignore[assignment]
     daemon._current_url_or = lambda default: default  # type: ignore[assignment]
     daemon._clear_deep_capture_runtime = lambda: None  # type: ignore[assignment]
@@ -703,6 +720,199 @@ def test_stop_accumulates_dom_order_around_the_screenshot_pass() -> None:
     assert dom_order.url_to_index[_img_url(9)] == 0
     assert dom_order.element_to_index[10] == 1
     assert dom_order.url_to_index[_img_url(11)] == 2
+
+
+# --- deep-capture diagnostics -------------------------------------------------------
+
+
+def test_stall_tracker_reports_one_warning_per_episode() -> None:
+    tracker = DeepCaptureStallTracker(threshold_seconds=10.0)
+    tracker.start(now=0.0)
+
+    # Progress keeps resetting the idle clock.
+    assert tracker.update(total=1, now=1.0) is DeepStallEvent.NONE
+    assert tracker.update(total=2, now=5.0) is DeepStallEvent.NONE
+    # Idle, but below the threshold.
+    assert tracker.update(total=2, now=10.0) is DeepStallEvent.NONE
+    # Threshold crossed -> exactly one STALLED, then silence.
+    assert tracker.update(total=2, now=15.5) is DeepStallEvent.STALLED
+    assert round(tracker.idle_seconds, 3) == 10.5
+    assert tracker.update(total=2, now=40.0) is DeepStallEvent.NONE
+    assert tracker.update(total=2, now=90.0) is DeepStallEvent.NONE
+
+
+def test_stall_tracker_reports_recovery_once() -> None:
+    tracker = DeepCaptureStallTracker(threshold_seconds=10.0)
+    tracker.start(now=0.0)
+
+    assert tracker.update(total=0, now=20.0) is DeepStallEvent.STALLED
+    assert tracker.update(total=3, now=25.0) is DeepStallEvent.RECOVERED
+    assert round(tracker.idle_seconds, 3) == 25.0
+    # Recovery is reported once; the next progress is unremarkable again.
+    assert tracker.update(total=4, now=26.0) is DeepStallEvent.NONE
+
+
+def test_stall_tracker_never_stalls_while_captures_keep_arriving() -> None:
+    tracker = DeepCaptureStallTracker(threshold_seconds=5.0)
+    tracker.start(now=0.0)
+
+    events = [tracker.update(total=step, now=float(step) * 4.0) for step in range(1, 20)]
+
+    assert set(events) == {DeepStallEvent.NONE}
+
+
+def test_page_shape_from_raw_parses_and_rejects_junk() -> None:
+    shape = _deep_capture_page_shape_from_raw(
+        {
+            "url": "https://reader.example/ch1",
+            "elements": 242,
+            "images": 7,
+            "complete_images": 7,
+            "canvases": 0,
+            "iframes": 1,
+        }
+    )
+
+    assert shape == DeepCapturePageShape(
+        url="https://reader.example/ch1",
+        elements=242,
+        images=7,
+        complete_images=7,
+        canvases=0,
+        iframes=1,
+    )
+    assert "elements=242" in shape.describe()
+    assert "canvas=0" in shape.describe()
+    assert _deep_capture_page_shape_from_raw(None) is None
+    assert _deep_capture_page_shape_from_raw(["not", "a", "shape"]) is None
+    # Unusable counters degrade to 0 instead of discarding the whole shape.
+    degraded = _deep_capture_page_shape_from_raw({"elements": "many", "images": -3, "canvases": True})
+    assert degraded == DeepCapturePageShape()
+
+
+def test_page_shape_signature_changes_only_with_content() -> None:
+    first = DeepCapturePageShape(url="u", elements=10, images=2, complete_images=2)
+    same = DeepCapturePageShape(url="u", elements=10, images=2, complete_images=2)
+    grown = DeepCapturePageShape(url="u", elements=10, images=3, complete_images=2)
+
+    assert first.signature() == same.signature()
+    assert first.signature() != grown.signature()
+
+
+def test_dom_keys_from_raw_accepts_the_shape_carrying_payload() -> None:
+    # The collector now returns {items, shape}; ordering must be identical to the bare
+    # list form and the shape must ride along.
+    items = _raw_payload([9, 10, 11])
+    bare = _deep_capture_dom_keys_from_raw(items)
+    wrapped = _deep_capture_dom_keys_from_raw(
+        {"items": items, "shape": {"url": "https://r/1", "elements": 5, "images": 2, "canvases": 1}}
+    )
+
+    assert wrapped.keys == bare.keys
+    assert wrapped.page_indices == bare.page_indices
+    assert bare.shape is None
+    assert wrapped.shape is not None
+    assert wrapped.shape.canvases == 1
+    # A malformed object must not take the ordering read down with it.
+    assert _deep_capture_dom_keys_from_raw({"shape": {"elements": 3}}).keys == []
+
+
+def test_source_breakdown_counts_raw_pages_and_junk() -> None:
+    entries = [
+        {"source": "canvas-native"},
+        {"source": "canvas-native"},
+        {"source": "canvas-native"},
+        {"source": "network"},
+        {"source": "img-element"},
+        {"source": "img-element"},
+        {},  # missing source -> "unknown"
+    ]
+    representatives = [
+        {"entry": {"source": "canvas-native"}, "probable_junk": False},
+        {"entry": {"source": "canvas-native"}, "probable_junk": False},
+        {"entry": {"source": "img-element"}, "probable_junk": True},
+    ]
+
+    breakdown = _deep_capture_source_breakdown(entries, representatives)
+
+    assert breakdown == [
+        ("canvas-native", 3, 2, 0),
+        ("img-element", 2, 1, 1),
+        ("network", 1, 0, 0),
+        ("unknown", 1, 0, 0),
+    ]
+
+
+def test_source_breakdown_handles_empty_inputs() -> None:
+    assert _deep_capture_source_breakdown([], []) == []
+
+
+def test_summary_block_is_greppable_and_complete() -> None:
+    summary = DeepCaptureSummary(
+        payloads=17,
+        decoded=15,
+        exact_duplicates=1,
+        undecodable=1,
+        blank_dropped=2,
+        dom_collapsed=3,
+        cluster_merged=4,
+        pages=6,
+        probable_junk=1,
+    )
+
+    lines = _format_deep_capture_summary(
+        summary, [("canvas-native", 9, 5, 0), ("network", 6, 1, 1)]
+    )
+
+    assert all(line.startswith("cloak deep summary:") for line in lines)
+    assert "payloads=17" in lines[0] and "pages=6" in lines[0] and "probable_junk=1" in lines[0]
+    assert "cluster-merged=4" in lines[0] and "dom-collapsed=3" in lines[0]
+    assert lines[1] == "cloak deep summary: source canvas-native raw=9 pages=5 probable_junk=0"
+    assert lines[2] == "cloak deep summary: source network raw=6 pages=1 probable_junk=1"
+
+
+def test_summary_block_marks_an_empty_breakdown() -> None:
+    summary = DeepCaptureSummary(0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    lines = _format_deep_capture_summary(summary, [])
+
+    assert lines[-1] == "cloak deep summary: source (none)"
+
+
+def test_call_stats_are_rendered_slowest_first_and_capped() -> None:
+    stats = {
+        "evaluate(dom-order)": DeepCallStat(calls=1, total_seconds=0.002, max_seconds=0.002),
+        "evaluate(page-events)": DeepCallStat(calls=1, total_seconds=0.900, max_seconds=0.900),
+        "screenshot(canvas)": DeepCallStat(calls=6, total_seconds=0.400, max_seconds=0.120),
+        "bounding_box(canvas)": DeepCallStat(calls=6, total_seconds=0.060, max_seconds=0.020),
+        "cdp(getResponseBody)": DeepCallStat(calls=2, total_seconds=0.030, max_seconds=0.020),
+    }
+
+    rendered = _format_deep_call_stats(stats, limit=2)
+
+    assert rendered == "evaluate(page-events)=1x/0.900s(max 0.900s), screenshot(canvas)=6x/0.400s(max 0.120s)"
+    assert _format_deep_call_stats({}) == "-"
+
+
+def test_call_stat_record_aggregates() -> None:
+    stat = DeepCallStat()
+    stat.record(0.10)
+    stat.record(0.25)
+    stat.record(0.05)
+
+    assert stat.calls == 3
+    assert round(stat.total_seconds, 3) == 0.4
+    assert stat.max_seconds == 0.25
+
+
+def test_drain_stage_table_shows_time_and_contribution() -> None:
+    stages = [
+        DeepDrainStage(name="network", seconds=0.001, added=0),
+        DeepDrainStage(name="page-events", seconds=0.0612, added=2),
+    ]
+
+    assert _format_deep_drain_stages(stages) == "network 0.001s +0, page-events 0.061s +2"
+    assert _format_deep_drain_stages([]) == "-"
 
 
 if __name__ == "__main__":
@@ -739,4 +949,17 @@ if __name__ == "__main__":
     test_sort_key_without_dom_order_uses_weaker_tiers()
     test_page_index_minority_is_not_authoritative()
     test_stop_accumulates_dom_order_around_the_screenshot_pass()
-    print("all active-tab resolution and deep-capture ordering tests passed")
+    test_stall_tracker_reports_one_warning_per_episode()
+    test_stall_tracker_reports_recovery_once()
+    test_stall_tracker_never_stalls_while_captures_keep_arriving()
+    test_page_shape_from_raw_parses_and_rejects_junk()
+    test_page_shape_signature_changes_only_with_content()
+    test_dom_keys_from_raw_accepts_the_shape_carrying_payload()
+    test_source_breakdown_counts_raw_pages_and_junk()
+    test_source_breakdown_handles_empty_inputs()
+    test_summary_block_is_greppable_and_complete()
+    test_summary_block_marks_an_empty_breakdown()
+    test_call_stats_are_rendered_slowest_first_and_capped()
+    test_call_stat_record_aggregates()
+    test_drain_stage_table_shows_time_and_contribution()
+    print("all active-tab resolution, deep-capture ordering and diagnostics tests passed")

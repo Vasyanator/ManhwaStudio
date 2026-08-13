@@ -16,6 +16,8 @@ CloakBrowser also owns a deep capture mode that is not implemented for Selenium.
 
 CloakBrowser canvas fetch/intercept emits detailed JSON `log` events while inspecting and saving canvases. Those logs include DOM backing size, CSS box size, viewport visibility, export errors, data URL shape, decoded PNG size, byte size, and simple black/transparent pixel diagnostics; Rust forwards them to the runtime log for troubleshooting pages that export blank or low-quality canvases.
 
+**Deep-capture diagnostics.** The deep-capture path is instrumented so a runtime log alone answers "where is the time going" and "what did the interception actually find", without re-running the capture. Every line is prefixed `cloak deep <kind>:` and is greppable; `_debug_log` carries the routine ones and `_warn_log` (same transport, `warn` level, not gated by `VERBOSE_DOWNLOAD_LOG`) the ones the user must see. The line families are: `drain` — exactly one aggregated line per drain (never per image) with whole-drain wall time, the per-stage time/new-record split (`network`, `page-events`, `canvas-native`, `dom-order`), running totals split canvas/image, and the slowest browser calls; `shape` — page URL plus element/`<img>`/complete-`<img>`/`<canvas>`/`<iframe>` counts, logged on the first drain, at stop, and only when the shape actually changes, so a static paged reader reads as one line instead of one per poll; `stall` — one warning per idle episode once `DEEP_CAPTURE_STALL_SECONDS` pass with no new payload (naming the observed shape), plus one line when captures resume; `call` — a single browser call over `DEEP_CAPTURE_SLOW_CALL_SECONDS`; `start` / `stop` / `settle` / `screenshots` — lifecycle phase timings; `summary` — the stop block, one counter line (payloads, decoded, exact dupes, undecodable, blank-dropped, dom-collapsed, cluster-merged, pages, probable junk) followed by one line per capture source with its raw/page/junk counts. Constraints this must keep satisfying: browser calls are timed through the one `_timed_deep_call` helper (per-label aggregation, so the per-canvas screenshot loop is one table entry); the page shape is counted **inside** the DOM-order walk `COLLECT_DOM_IMAGE_ORDER_JS` already performs and returned alongside it as `{items, shape}`, so diagnostics add no DOM round-trip; and the collector stays observe-only.
+
 ## Files and submodules
 
 This package is now headless-only: the legacy PyQt6 "New project" UI (`window.py`,
@@ -33,7 +35,10 @@ with the browser-free `test_adv_fetch_cloak_cli.py` unit tests listed below.
 - `test_adv_fetch_cloak_cli.py`: browser-free unit tests for `adv_fetch_cloak_cli.py` — active-tab
   resolution and the deep-capture page-ordering pipeline (`_combine_dom_order`,
   `_append_first_seen_keys`, the site page-index path and its authority gate,
-  `_deep_capture_sort_key` tiers, and the stop-time call order around the screenshot pass). It
+  `_deep_capture_sort_key` tiers, and the stop-time call order around the screenshot pass), plus
+  the pure deep-capture diagnostics helpers (`DeepCaptureStallTracker` episode/recovery edges,
+  `DeepCapturePageShape` parsing and change signature, `_deep_capture_source_breakdown`,
+  `_format_deep_capture_summary`, `_format_deep_call_stats`, `_format_deep_drain_stages`). It
   exposes a `__main__` runner as well, because the project venv has no pytest; run it with
   `PYTHONPATH=<repo> ./venv/bin/python modules/new_project/test_adv_fetch_cloak_cli.py`.
 
