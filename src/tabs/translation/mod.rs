@@ -8,6 +8,7 @@ Submodules:
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.
+- `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
 - `panels`: UI subpanels for Translation tab.
 - `tab`: top-level Translation tab state implementing `CanvasHooks`.
@@ -18,6 +19,7 @@ pub(crate) mod backend_health;
 mod machine_translation;
 mod machine_translators;
 mod ocr;
+mod ocr_case_fix;
 pub mod panels;
 mod tab;
 pub(crate) mod text_detector;

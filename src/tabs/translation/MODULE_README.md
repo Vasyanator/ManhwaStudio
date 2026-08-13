@@ -130,6 +130,8 @@ is an author note addressed to the translator, not a replica.
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR via `genai`,
   credential-store API key commands, crop encoding, page image LRU cache, and
   model-download/load-state events.
+- `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
+  character state machine) used by `ocr.rs`'s post-processing helper.
 - `text_detector.rs`: `TranslationTextDetectorController`, local classic detector, backend
   PaddleOCR/CTD/Surya detector calls, mask decoding/building, detector batch progress, and helper
   routes reused by cleaning tools for region masks.
@@ -187,6 +189,27 @@ is an author note addressed to the translator, not a replica.
   character, so the incomplete-replica rules would border every hint. `canvas_scrollbar_marks`
   carries the same exemption for the same reason — a hint's single line lives in `text`, so a
   translation-status stripe for it would always read "translated".
+- Post-OCR processing is ONE helper, `ocr.rs::apply_post_ocr_processing`, and all three
+  recognize routes (AI API, native ONNX, backend IPC) must call it — engine parity of the
+  published text is a contract of this module. The caps-lock decision and the caps-lock
+  rewrite straddle the user's `CharReplacementRule`s: `ocr_case_fix::looks_like_caps_lock`
+  runs on the RAW engine output (a repair rule such as `"0" -> "o"` must not be able to
+  introduce a lowercase letter and veto the fix), the substitutions run next, and
+  `ocr_case_fix::apply_caps_lock_fix` — which is unconditional and trusts the caller's
+  gate — runs last so it sees the final punctuation (the default `…` -> `...` rule creates
+  real sentence terminators). The detector accepts a result only when the whole of it (both
+  `text` and `lines`) holds at least one uppercase Latin/Cyrillic letter and no lowercase
+  one. Characters outside those two scripts never take part in the decision and are copied
+  through unchanged, so byte-identity is guaranteed only for a result with no
+  Latin/Cyrillic letters at all or one the detector rejected — `"HELLO 日本"` becomes
+  `"Hello 日本"`. The rewrite keeps only the first letter of a stream and the first letter
+  after `.`/`!`/`?`/`…` uppercase, with ONE exception: the English pronoun `I` and its
+  contractions (`I'm`, `I'll`, `I've`, `I'd`, either apostrophe) stay capitalized anywhere.
+  That exception is a whole-word match applied as a second pass per fragment, so `is`, `in`
+  and `i18n` are untouched and it re-cases exactly one ASCII character. The rewrite threads
+  one sentence state across the elements of `lines` so a sentence continues over a line
+  break, but rewrites each element in place: `lines.len()` is preserved structurally, and an
+  element that already contains a `\n` is never split.
 - App-managed OCR/detector model downloads must go through `src/ai_models.rs`. Missing models,
   backend failures, unavailable credential stores, AI API request failures, and unsupported engines
   must surface clear errors.

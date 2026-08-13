@@ -67,6 +67,8 @@ pub struct OcrPanelOptions {
     pub ai_api_system_instruction: String,
     pub join_newlines: bool,
     pub reflect_strings: bool,
+    /// Lower an entirely uppercase Latin/Cyrillic OCR result to sentence case.
+    pub fix_caps_lock: bool,
     pub copy_to_clipboard: bool,
     pub create_bubble: bool,
     pub replace_chars_enabled: bool,
@@ -134,6 +136,7 @@ impl Default for OcrPanelOptions {
             ai_api_system_instruction: "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /".to_string(),
             join_newlines: true,
             reflect_strings: false,
+            fix_caps_lock: true,
             copy_to_clipboard: true,
             create_bubble: true,
             replace_chars_enabled: true,
@@ -547,6 +550,13 @@ pub fn draw_ocr_panel(
             &mut options.reflect_strings,
             t!("translation.ocr_panel.rtl_columns_label"),
         )
+        .changed();
+    actions.options_changed |= ui
+        .checkbox(
+            &mut options.fix_caps_lock,
+            t!("translation.ocr_panel.fix_caps_lock_label"),
+        )
+        .on_hover_text(t!("translation.ocr_panel.fix_caps_lock_hint"))
         .changed();
     actions.options_changed |= ui
         .checkbox(

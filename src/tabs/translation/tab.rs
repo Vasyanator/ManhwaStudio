@@ -3100,6 +3100,7 @@ impl TranslationTabState {
                 join_newlines: self.ocr_panel_options.join_newlines,
                 reflect_strings: self.ocr_panel_options.reflect_strings,
                 char_replacements: self.ocr_panel_options.runtime_char_replacements(),
+                fix_caps_lock: self.ocr_panel_options.fix_caps_lock,
             };
             if self.ocr_panel_options.create_bubble {
                 self.pending_bubble_inserts.insert(
@@ -5662,6 +5663,11 @@ impl TranslationTabState {
             if let Some(reflect) = ocr_obj.get("reflect").and_then(Value::as_bool) {
                 self.ocr_panel_options.reflect_strings = reflect;
             }
+            // Absent in projects saved before the option existed; the `true`
+            // default from `OcrPanelOptions::default` then stays in force.
+            if let Some(fix_caps) = ocr_obj.get("fix_caps_lock").and_then(Value::as_bool) {
+                self.ocr_panel_options.fix_caps_lock = fix_caps;
+            }
             if let Some(copy) = ocr_obj.get("copy").and_then(Value::as_bool) {
                 self.ocr_panel_options.copy_to_clipboard = copy;
             }
@@ -7244,6 +7250,10 @@ fn save_translation_settings_to_project_file(
         Value::Bool(ocr_options.reflect_strings),
     );
     ocr_obj.insert(
+        "fix_caps_lock".to_string(),
+        Value::Bool(ocr_options.fix_caps_lock),
+    );
+    ocr_obj.insert(
         "copy".to_string(),
         Value::Bool(ocr_options.copy_to_clipboard),
     );
@@ -7878,6 +7888,7 @@ fn build_ocr_request(
             join_newlines: ocr_options.join_newlines,
             reflect_strings: ocr_options.reflect_strings,
             char_replacements: ocr_options.runtime_char_replacements(),
+            fix_caps_lock: ocr_options.fix_caps_lock,
         },
         page_idx: page.idx,
     })

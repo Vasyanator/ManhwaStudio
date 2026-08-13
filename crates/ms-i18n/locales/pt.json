@@ -3113,6 +3113,8 @@
   "translation.ocr_panel.enable_replace_row_label": "Ativar esta linha de substituição",
   "translation.ocr_panel.engine_label": "Motor:",
   "translation.ocr_panel.error_detail": "Erro: {err}",
+  "translation.ocr_panel.fix_caps_lock_hint": "Se o texto reconhecido estiver todo em maiúsculas (latim ou cirílico), manter em maiúscula apenas a primeira letra de cada frase.",
+  "translation.ocr_panel.fix_caps_lock_label": "Corrigir MAIÚSCULAS",
   "translation.ocr_panel.keep_line_breaks_label": "Manter as quebras de linha",
   "translation.ocr_panel.language_label": "Idioma:",
   "translation.ocr_panel.last_ocr_lines_status": "Último OCR: {lines} linhas",

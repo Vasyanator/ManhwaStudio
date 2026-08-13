@@ -3200,6 +3200,8 @@
   "translation.ocr_panel.enable_replace_row_label": "Включить эту строку замены",
   "translation.ocr_panel.engine_label": "Движок:",
   "translation.ocr_panel.error_detail": "Ошибка: {err}",
+  "translation.ocr_panel.fix_caps_lock_hint": "Если распознанный текст целиком в верхнем регистре (латиница или кириллица), оставить заглавной только первую букву предложения.",
+  "translation.ocr_panel.fix_caps_lock_label": "Исправление КАПСЛОКА",
   "translation.ocr_panel.keep_line_breaks_label": "Сохранять переносы строк",
   "translation.ocr_panel.language_label": "Язык:",
   "translation.ocr_panel.last_ocr_lines_status": "Последний OCR: {lines} строк",

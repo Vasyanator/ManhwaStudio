@@ -3200,6 +3200,8 @@
   "translation.ocr_panel.enable_replace_row_label": "Enable this replacement row",
   "translation.ocr_panel.engine_label": "Engine:",
   "translation.ocr_panel.error_detail": "Error: {err}",
+  "translation.ocr_panel.fix_caps_lock_hint": "If the recognized text is entirely uppercase (Latin or Cyrillic), keep only the first letter of each sentence capitalized.",
+  "translation.ocr_panel.fix_caps_lock_label": "Fix ALL CAPS",
   "translation.ocr_panel.keep_line_breaks_label": "Keep line breaks",
   "translation.ocr_panel.language_label": "Language:",
   "translation.ocr_panel.last_ocr_lines_status": "Last OCR: {lines} lines",

@@ -3363,6 +3363,7 @@ dependencies = [
  "ttf-parser 0.25.1",
  "tungstenite",
  "uds_windows",
+ "unicode-script",
  "ureq",
  "uuid",
  "wasm-bindgen",

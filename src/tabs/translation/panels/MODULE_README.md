@@ -29,7 +29,10 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
   quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
   enabled rows into `CharReplacementRule`s carried by `OcrRecognizeRequest`, and the OCR worker
-  applies them to the recognized result. Wider engines
+  applies them to the recognized result. The "Исправление КАПСЛОКА" toggle
+  (`fix_caps_lock`, ON by default) sits with the other behavior toggles and asks the OCR
+  worker to lower an entirely uppercase Latin/Cyrillic result to sentence case
+  (`translation::ocr_case_fix`); it carries no UI logic of its own. Wider engines
   (PaddleOCR-VL) live on a second engine row to keep the side panel from widening; PaddleOCR-VL
   shows no language/model controls (only an optional writing-system restriction: auto / korean /
   chinese / japanese). The five runtime engine-selection buttons are `AiButton`s gated on a

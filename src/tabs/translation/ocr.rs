@@ -16,14 +16,16 @@
 //      пользовательским оверлеем, который worker использует вместо crop страницы.
 // - AI API OCR uses `genai` multimodal chat calls from the worker thread and
 //   stores provider API keys only through the OS credential store.
-// - Post-OCR character substitution (`CharReplacementRule`) is applied to the
-//   recognized result in the worker before it is published, so every engine
-//   path and the stored last result share the same substituted text.
+// - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
+//   the result is published, so every engine path and the stored last result
+//   share the same text: character substitution (`CharReplacementRule`) first,
+//   then the optional ALL-CAPS -> sentence-case fix (`ocr_case_fix`).
 // - Вспомогательные функции: crop по UV, PNG-кодирование, сборка/разбор
 //   framed-заголовков `BackendClient`/`CallHandle` и JSON.
 // ============================================================================
 use crate::backend_ipc::{self, CallError, CallHandle};
 use crate::tabs::translation::backend_health::ai_backend_offline_error;
+use crate::tabs::translation::ocr_case_fix;
 use crate::{ai_models, config};
 // Native ONNX Runtime OCR path (Phase 1: MangaOCR only). Desktop-only: the native
 // runtime + ORT loader depend on `ms-onnx`/`ort`, which are not part of the web build.
@@ -263,6 +265,27 @@ fn apply_char_replacements(result: &mut OcrRecognizeResult, rules: &[CharReplace
     }
 }
 
+/// Applies every post-OCR transformation the request asks for, in the one order
+/// all engines must share.
+///
+/// The caps-lock DECISION and the caps-lock REWRITE straddle the substitutions on
+/// purpose. Every recognize route (AI API, native ONNX, backend IPC) must call this
+/// helper — engine parity of post-processing is a module contract.
+fn apply_post_ocr_processing(result: &mut OcrRecognizeResult, request: &OcrRecognizeRequest) {
+    // Decide on the RAW engine output, before any substitution. A rule that repairs
+    // a misread character with a lowercase letter (`"0" -> "o"`, a common fix) would
+    // otherwise make an all-caps result look mixed-case and silently veto the fix,
+    // publishing "HELLo WORLD" instead of "Hello world".
+    let fix_caps_lock = request.fix_caps_lock && ocr_case_fix::looks_like_caps_lock(result);
+    // Substitutions run next, so the rewrite below sees the FINAL punctuation: a
+    // rule may turn an engine artifact into a real sentence terminator (the default
+    // `…` -> `...` rule does exactly that) and thereby open a new sentence.
+    apply_char_replacements(result, &request.char_replacements);
+    if fix_caps_lock {
+        ocr_case_fix::apply_caps_lock_fix(result);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OcrRecognizeRequest {
     pub request_id: u64,
@@ -276,6 +299,18 @@ pub struct OcrRecognizeRequest {
     /// Post-OCR character substitutions applied to the recognized result before
     /// it is published. Empty means no substitution.
     pub char_replacements: Vec<CharReplacementRule>,
+    /// When `true`, a recognized result that is entirely uppercase Latin/Cyrillic
+    /// text is lowered to sentence case (see `ocr_case_fix`): only the first letter
+    /// of the text and the first letter after `.`/`!`/`?`/`…` stay uppercase, with
+    /// the sole exception of the English pronoun `I` and its contractions
+    /// (`I'm`, `I'll`, `I've`, `I'd`), which stay capitalized anywhere.
+    ///
+    /// The decision is taken on the raw engine output; a result holding any
+    /// lowercase Latin/Cyrillic letter is left alone. Characters outside those two
+    /// scripts never take part in the decision and are copied through unchanged, so
+    /// a result is byte-identical only when it has no Latin/Cyrillic letters at all
+    /// (or the detector rejected it) — `"HELLO 日本"` still becomes `"Hello 日本"`.
+    pub fix_caps_lock: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1132,7 +1167,7 @@ fn run_recognize_command(
         // no IPC cancel; run it synchronously like before.
         if request.engine == OcrEngine::AiApi {
             let result = run_ai_api_ocr_request(&request, page_cache).map(|mut result| {
-                apply_char_replacements(&mut result, &request.char_replacements);
+                apply_post_ocr_processing(&mut result, &request);
                 result
             });
             return publish_recognize(request_id, result, evt_tx);
@@ -1147,7 +1182,7 @@ fn run_recognize_command(
         #[cfg(not(target_arch = "wasm32"))]
         match try_native_ocr(&request, page_cache, evt_tx) {
             NativeOcrOutcome::Ok(mut result) => {
-                apply_char_replacements(&mut result, &request.char_replacements);
+                apply_post_ocr_processing(&mut result, &request);
                 return publish_recognize(request_id, Ok(result), evt_tx);
             }
             NativeOcrOutcome::Failed(native_error) => {
@@ -1165,7 +1200,7 @@ fn run_recognize_command(
         match run_backend_recognize(&request, page_cache, cmd_rx) {
             BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(result)) => {
                 let result = result.map(|mut result| {
-                    apply_char_replacements(&mut result, &request.char_replacements);
+                    apply_post_ocr_processing(&mut result, &request);
                     result
                 });
                 return publish_recognize(request_id, result, evt_tx);
@@ -1898,8 +1933,9 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::{
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
-        OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
-        assemble_native_ocr_result, interpret_call_result, is_likely_multimodal_model,
+        OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
+        apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
+        is_likely_multimodal_model,
         model_iden_for_ai_api_service, native_failure_should_surface, ocr_header_fields,
         ocr_requires_backend, ocr_route, ocr_route_needs_backend_warmup, parse_ocr_response,
     };
@@ -1925,6 +1961,77 @@ mod tests {
             ai_api_model: "gpt-4o-mini".to_string(),
             ai_api_system_instruction: String::new(),
         }
+    }
+
+    /// Builds a minimal post-processing request: only the two post-OCR fields
+    /// matter, the transport fields are never read by the helper under test.
+    fn sample_post_processing_request(
+        char_replacements: Vec<CharReplacementRule>,
+        fix_caps_lock: bool,
+    ) -> OcrRecognizeRequest {
+        OcrRecognizeRequest {
+            request_id: 1,
+            engine: OcrEngine::MangaOcr,
+            options: sample_options(),
+            page_path: std::path::PathBuf::from("page.png"),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            image_override_png: None,
+            join_newlines: true,
+            reflect_strings: false,
+            char_replacements,
+            fix_caps_lock,
+        }
+    }
+
+    #[test]
+    fn caps_lock_decision_ignores_lowercase_introduced_by_substitution() {
+        // A common OCR repair rule turns a misread zero into a letter. Deciding
+        // on the SUBSTITUTED text would see that lowercase `o` and abandon the
+        // caps fix, publishing "HELLo WORLD".
+        let mut result = OcrRecognizeResult {
+            lines: vec!["HELL0 WORLD".to_string()],
+            text: "HELL0 WORLD".to_string(),
+        };
+        let request = sample_post_processing_request(
+            vec![CharReplacementRule {
+                targets: vec!["0".to_string()],
+                replacement: "o".to_string(),
+            }],
+            true,
+        );
+        apply_post_ocr_processing(&mut result, &request);
+        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.lines, vec!["Hello world".to_string()]);
+    }
+
+    #[test]
+    fn post_processing_lets_substitutions_create_sentence_boundaries() {
+        // The rewrite must run AFTER substitutions so a rule that produces real
+        // punctuation (the default `…` -> `...`) opens a new sentence.
+        let mut result = OcrRecognizeResult {
+            lines: vec!["ONE… TWO".to_string()],
+            text: "ONE… TWO".to_string(),
+        };
+        let request = sample_post_processing_request(
+            vec![CharReplacementRule {
+                targets: vec!["…".to_string()],
+                replacement: "...".to_string(),
+            }],
+            true,
+        );
+        apply_post_ocr_processing(&mut result, &request);
+        assert_eq!(result.text, "One... Two");
+    }
+
+    #[test]
+    fn post_processing_skips_caps_fix_when_disabled() {
+        let mut result = OcrRecognizeResult {
+            lines: vec!["HELLO WORLD".to_string()],
+            text: "HELLO WORLD".to_string(),
+        };
+        let request = sample_post_processing_request(Vec::new(), false);
+        apply_post_ocr_processing(&mut result, &request);
+        assert_eq!(result.text, "HELLO WORLD");
     }
 
     #[test]
