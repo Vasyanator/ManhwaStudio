@@ -25,6 +25,11 @@ Notes:
   transformers 4.57.x without a global downgrade. The shims are no-ops when the
   installed transformers already matches the remote code; remove them once
   PaddleOCR-VL ships remote code compatible with current transformers.
+- The checkpoint is stored in BF16 and is requested as BF16 on a bf16-capable
+  GPU, so `from_pretrained` performs no host-side cast and hands out weights
+  that still live in the safetensors file mapping. The host->device transfer
+  therefore goes through `rocm_mmap_transfer.move_module_to`, which is a strict
+  no-op off ROCm; see that module for the amdkfd stall it works around.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ except Exception:
     UserConfig = None
 
 from .model_manager import LoadedModelManager
+from .rocm_mmap_transfer import move_module_to
 from .script_constraint import ScriptConstraint, TokenByteIndex, normalize_script
 
 # Hugging Face repository that ships PaddleOCR-VL weights plus the custom model
@@ -265,7 +271,13 @@ class PaddleVlOcrService:
                 trust_remote_code=True,
                 dtype=dtype,
             )
-            model = model.to(device)
+            # `dtype=dtype` above matches the checkpoint's own BF16 storage, so
+            # transformers skips the host-side cast and the parameters are still
+            # views into the mmapped safetensors file. On ROCm such a source
+            # makes every >=1 MiB host->device copy stall for seconds inside
+            # amdkfd, so the move is routed through the staging helper (a plain
+            # `model.to(device)` everywhere else).
+            model = move_module_to(model, device)
             model.eval()
         except Exception as exc:
             self._model = None
@@ -307,6 +319,7 @@ class PaddleVlOcrService:
             return rgb.resize(target_size, resample=resampling)
 
     def _unload_model_key(self, model_key: str) -> bool:
+        """Drop the model for `model_key`; `False` when another key is resident."""
         with self._lock:
             current_device = self._device
             if current_device is None or model_key != self._model_key(current_device):

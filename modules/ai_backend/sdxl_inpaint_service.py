@@ -21,6 +21,9 @@ Main responsibilities:
 Notes:
 The Python `diffusers`/`transformers` packages are imported lazily. Missing
 packages, weights, or an SDXL/mode channel mismatch surface as explicit errors.
+The host->device move of the built pipeline is wrapped in
+`rocm_mmap_transfer.patched_module_to`, which is a strict no-op off ROCm; see
+`_build_sdxl_inpaint_pipeline` for why.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ except Exception:
 
 from .lama_inpaint_service import LamaInpaintService
 from .model_manager import LoadedModelManager
+from .rocm_mmap_transfer import patched_module_to
 
 MODEL_SUFFIXES = (".safetensors", ".ckpt")
 
@@ -476,6 +480,20 @@ def _validate_mode_channels(mode: str, in_channels: int) -> None:
 
 
 def _build_sdxl_inpaint_pipeline(model_path: str, device: str) -> Any:
+    """Build a `StableDiffusionXLInpaintPipeline` and move it onto `device`.
+
+    `model_path` is a local ckpt/safetensors file, a local diffusers folder, or a
+    Hugging Face repo id. Weights are loaded in fp16 for a `cuda` device and fp32
+    otherwise. The returned pipeline has progress bars disabled, attention
+    slicing enabled and, in fp16, the VAE `force_upcast` flag set.
+
+    The host->device move runs inside `patched_module_to()` (ROCm mmap staging);
+    it is a strict no-op on every other build.
+
+    # Raises
+    `RuntimeError` if `diffusers` is missing and `FileNotFoundError` if the path
+    is neither a ckpt/safetensors file nor a diffusers repo folder.
+    """
     torch = _torch()
     try:
         from diffusers import StableDiffusionXLInpaintPipeline
@@ -509,7 +527,24 @@ def _build_sdxl_inpaint_pipeline(model_path: str, device: str) -> Any:
         # Not a local path: treat as a remote Hugging Face repo id.
         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(model_path, torch_dtype=dtype)
 
-    pipe = pipe.to(device)
+    # On a ROCm build a host->device copy whose source is the writable private
+    # file mapping that safetensors hands out stalls ~1-2 s per tensor of >=1 MiB
+    # inside amdkfd, and a typical SDXL checkpoint is ~2500 tensors / ~6.9 GB.
+    # The stall only exists when the checkpoint dtype already matches `dtype`
+    # (an fp16 checkpoint on CUDA here); an fp32 checkpoint is cast on the host
+    # first, which allocates anonymous memory and sidesteps it. That condition is
+    # detected per tensor by the helper, so this wrapper is unconditional.
+    # The patch wraps the stock `DiffusionPipeline.to` instead of replacing it:
+    # `to` first does its own bnb / offload / device-map bookkeeping and only
+    # then calls `module.to(device, dtype)` per component, and that inner call
+    # reaches the patch because `ModelMixin.to` / `PreTrainedModel.to` both end
+    # in `super().to(...)`, which resolves the patched `nn.Module.to` class
+    # attribute at call time. Staging is per tensor with immediate release, so
+    # peak host RSS grows by one tensor, not by the model. Deliberately NOT the
+    # diffusers `disable_mmap=True` flag: that reads the whole checkpoint into
+    # `bytes` (~2x file size, ~14 GB for SDXL).
+    with patched_module_to():
+        pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
     try:
         pipe.enable_attention_slicing()

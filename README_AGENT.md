@@ -624,6 +624,15 @@ original, and a bbox relative to the sent image) and the model returns
   переводит MIOpen в immediate-режим (`MIOPEN_FIND_MODE=FAST`), отключает cudnn benchmark и
   закрепляет MIOpen-кэш в `ManhwaStudio_AI_Models/.cache/miopen`, чтобы Torch-инференс (LaMa и др.)
   не платил повторную per-shape компиляцию/тюнинг ядер. На CUDA/CPU/MPS — no-op.
+- На ROCm-сборке Torch перенос весов чекпоинта на GPU обязан идти через
+  `modules/ai_backend/rocm_mmap_transfer.py`. Копия, источник которой лежит в writable private
+  file-mapping (`rw-p` — так safetensors/transformers/diffusers отдают веса после
+  `from_pretrained`), залипает в драйвере amdkfd до ~2 с на каждый тензор ≥1 МиБ, потому что должна
+  разорвать copy-on-write по всему отображённому диапазону; материализация в анонимную память это
+  снимает (Surya OCR 269.7 с → 0.23 с, PaddleOCR-VL 519 с → 0.77 с). Обход self-gating (ROCm + posix
+  + cuda-цель + CPU-источник + ≥1 МиБ + реально file-backed страницы) и на CUDA/CPU/MPS/Windows —
+  строгий no-op; выключается через `MS_ROCM_MMAP_STAGING=0`. Контракт применения и выбор формы
+  (`move_module_to` против `patched_module_to`) — в `modules/ai_backend/MODULE_README.md`.
 
 ---
 

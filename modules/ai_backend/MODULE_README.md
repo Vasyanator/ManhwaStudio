@@ -67,6 +67,19 @@ the download contract.
   `ManhwaStudio_AI_Models/.cache/miopen`. No-op on CUDA/CPU/MPS/absent-Torch installs; env defaults
   use `setdefault` so explicit user overrides win.
 - `test_rocm_runtime.py`: unit tests for `configure_rocm_runtime` no-op and ROCm-path behavior.
+- `rocm_mmap_transfer.py`: ROCm host->device weight-transfer workaround. On a ROCm Torch build a
+  copy whose source CPU tensor lives in a writable private file mapping (`rw-p`, exactly how
+  safetensors/transformers/diffusers hand out weights after `from_pretrained`) stalls inside the
+  amdkfd driver for up to ~2 s per tensor >=1 MiB, because the copy has to break copy-on-write over
+  the mapped range. Staging such tensors through anonymous memory removes the stall (Surya OCR:
+  269.7 s -> 0.23 s). Exposes `mmap_staging_required()`, `stage_cpu_tensor()`, `move_module_to()`,
+  `patched_module_to()` and `invalidate_maps_cache()`. See the staging contract below.
+- `test_rocm_mmap_transfer.py`: unit tests for the staging gates, `/proc/self/maps` classification,
+  snapshot session lifetime, patch thread-locality, and stock-`Module.to` equivalence. Runs without
+  a GPU (ROCm decisions are forced via monkeypatch).
+- `surya_checkpoints.py`: shared Surya checkpoint presence/download helper used by both Surya
+  services. It exists so that the (potentially minutes-long, network-bound) `s3://` checkpoint
+  download runs *before* `patched_module_to()` is entered and never inside it.
 - `reline_service.py`: Reline pipeline adapter, catalog-backed model downloader, and
   `reline.process` IPC method handler backend.
 - `sdxl_inpaint_service.py`: SDXL inpaint backend (IPC method `inpaint.sdxl`). Lazily builds a
@@ -119,6 +132,23 @@ the download contract.
 - On ROCm Torch builds, MIOpen runtime tuning is configured once at process startup by
   `rocm_runtime.configure_rocm_runtime()` before any inference; Torch services must not depend on a
   specific MIOpen Find mode and must not re-enable cudnn benchmark.
+- On ROCm Torch builds, a Torch service that moves checkpoint weights to the GPU must route the move
+  through `rocm_mmap_transfer`, or it pays a multi-minute amdkfd stall. Which form to use:
+  - the service owns the `nn.Module` and calls `.to()` itself -> `move_module_to(module, device)`;
+  - a third-party loader moves the model internally (surya predictors, `DiffusionPipeline.to`)
+    -> wrap that call in `with patched_module_to():`.
+  `patched_module_to()` replaces the `torch.nn.Module.to` class attribute, so the block must contain
+  the weight move and nothing else — never a download, a network wait, or inference. Only the
+  entering thread takes the staging path, but the attribute itself is process-global.
+  The workaround is self-gating (ROCm + posix + `cuda` target + CPU source + >=1 MiB + genuinely
+  file-backed pages) and is a strict no-op everywhere else, so wiring it in never changes
+  CPU/CUDA-NVIDIA/MPS/Windows behavior. `MS_ROCM_MMAP_STAGING=0` disables it entirely.
+  A transfer that also changes dtype is not affected by the pathology (Torch casts on the host into
+  anonymous memory first), which is why the fp32 detector path in `surya_text_detector_service.py`
+  needs no staging.
+  The `/proc/self/maps` snapshot lives for the duration of one load session (one `move_module_to`
+  call or one `patched_module_to` block) and is thread-local, so services carry no invalidation
+  obligation; `invalidate_maps_cache()` exists only as a manual reset.
 - The `health` IPC method and `TOPIC_HEALTH` event push must include `backend_version` from root
   `config.VERSION`; Rust uses it to warn when the backend package and Studio binary versions do not
   match.
@@ -144,3 +174,7 @@ the download contract.
 - To change inpaint checkpoint handling, edit the corresponding inpaint service.
 - To change Reline model catalog resolution, download/extract behavior, or pipeline JSON mapping,
   edit `reline_service.py`.
+- To add a Torch service that loads weights onto a GPU, wire it into `rocm_mmap_transfer.py` (see
+  the staging contract above) and pick the `move_module_to` / `patched_module_to` form there.
+- To change how Surya checkpoints are located or fetched, edit `surya_checkpoints.py`; both Surya
+  services share it.

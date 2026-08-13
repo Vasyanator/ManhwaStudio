@@ -18,6 +18,11 @@ Key structures:
 Notes:
 - ONNX weights are loaded exclusively through `onnxruntime`.
 - Absence of `manga_ocr` must not break ONNX variants.
+- `MangaOcrModel.from_pretrained` is called without a `dtype`, so transformers
+  performs no host-side cast and the weights stay views into the mmapped
+  checkpoint. The PyTorch runtime therefore moves the model to the GPU through
+  `rocm_mmap_transfer.move_module_to`, which is a strict no-op off ROCm; see
+  that module for the amdkfd stall it works around.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from .paddle_onnx_runtime import (
     provider_attempts,
     resolve_compiled_cache_root,
 )
+from .rocm_mmap_transfer import move_module_to
 
 try:
     import onnxruntime as ort  # type: ignore
@@ -301,6 +307,13 @@ class _OnnxMangaOcrRuntime:
 
 
 class _TorchMangaOcrRuntime:
+    """MangaOCR inference backed by the original `manga_ocr` PyTorch package.
+
+    Weights come from the locally cached `kha-white/manga-ocr-base` repository;
+    the runtime never downloads. `force_cpu=True` keeps the model on the CPU even
+    when an accelerator is present; otherwise CUDA/ROCm is preferred over MPS.
+    """
+
     def __init__(self, force_cpu: bool) -> None:
         try:
             import torch  # type: ignore
@@ -331,8 +344,18 @@ class _TorchMangaOcrRuntime:
             ) from exc
 
         if not force_cpu and torch.cuda.is_available():
-            self._model.cuda()
+            # `from_pretrained` above requests no dtype, so transformers performs
+            # no host-side cast and the parameters remain views into the mmapped
+            # checkpoint. On ROCm that source makes every >=1 MiB host->device
+            # copy stall for seconds inside amdkfd, so the move goes through the
+            # staging helper instead of `Module.cuda()` (which is a plain
+            # `.to("cuda")` everywhere else). The device is named explicitly
+            # because the helper takes a device, not a `cuda()` shorthand;
+            # index-less `cuda` keeps `Module.cuda()`'s "current device" meaning.
+            move_module_to(self._model, torch.device("cuda"))
         elif not force_cpu and torch.backends.mps.is_available():
+            # Not routed through the helper on purpose: the workaround targets
+            # `cuda` destinations only and would be a no-op here anyway.
             self._model.to("mps")
         self._torch = torch
 
@@ -351,6 +374,7 @@ class _TorchMangaOcrRuntime:
             raise RuntimeError(f"MangaOCR PyTorch inference failed: {exc}") from exc
 
     def close(self) -> None:
+        """Release the model, processor and tokenizer; the runtime is unusable after."""
         self._processor = None
         self._tokenizer = None
         self._model = None

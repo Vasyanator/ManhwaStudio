@@ -15,13 +15,24 @@ Key runtime options:
 - `sort_lines`: request Surya line sorting;
 - `drop_repeated_text`: suppress repeated decoded text;
 - `max_sliding_window` / `max_tokens`: optional decoder limits.
+
+Notes:
+Surya owns the host->device transfer of its own weights, so every predictor
+construction here is wrapped in `rocm_mmap_transfer.patched_module_to()`; see
+`_ensure_recognition_loaded_locked` for why. The checkpoint is downloaded before
+that block through `surya_checkpoints.ensure_checkpoint_downloaded`, because the
+patch is process-global and must never be held around network waits. Predictor
+loads are logged with their duration so a slow start can be attributed to weight
+loading rather than package import.
 """
 
 from __future__ import annotations
 
 import gc
 import io
+import logging
 import threading
+import time
 from typing import Any
 
 try:
@@ -35,6 +46,14 @@ except Exception:
     UserConfig = None
 
 from .model_manager import LoadedModelManager
+from .rocm_mmap_transfer import patched_module_to
+from .surya_checkpoints import ensure_checkpoint_downloaded
+
+log = logging.getLogger(__name__)
+
+# Name the recognition and detection models carry in checkpoint download errors.
+FOUNDATION_CHECKPOINT_LABEL = "Surya OCR foundation"
+DETECTION_CHECKPOINT_LABEL = "Surya OCR detection"
 
 SURYA_TASK_OCR_WITH_BOXES = "ocr_with_boxes"
 SURYA_TASK_OCR_WITHOUT_BOXES = "ocr_without_boxes"
@@ -198,6 +217,15 @@ class SuryaOcrService:
         }
 
     def _ensure_recognition_loaded_locked(self, device: str):
+        """Return the recognition predictor for `device`, loading it if needed.
+
+        Caller must hold `self._lock`. Reloads from scratch when the previously
+        loaded predictors live on another device.
+
+        # Raises
+        `RuntimeError` if the Surya package is missing or the load fails; in
+        that case the service is left with no predictors and `_last_error` set.
+        """
         if (
             self._foundation_predictor is not None
             and self._recognition_predictor is not None
@@ -215,16 +243,55 @@ class SuryaOcrService:
             self._last_error = f"Surya OCR package is not available: {exc}"
             raise RuntimeError(self._last_error) from exc
 
+        log.info("Surya OCR recognition predictor load start device=%s", device)
+        started_at = time.perf_counter()
         try:
-            foundation_predictor = FoundationPredictor(device=device)
-            recognition_predictor = RecognitionPredictor(foundation_predictor)
+            # Download first, load second. `FoundationPredictor` resolves its
+            # `s3://` checkpoint lazily inside `from_pretrained` (3 attempts with
+            # a 5 s sleep between them), which on a clean install is minutes of
+            # network wait for ~1.4 GiB. The staging patch below is
+            # process-global and its contract covers weight transfers only, so
+            # the download must not happen while it is installed.
+            ensure_checkpoint_downloaded(
+                self._foundation_checkpoint_name(), label=FOUNDATION_CHECKPOINT_LABEL
+            )
+            # Surya loads the checkpoint and moves it to the GPU inside its own
+            # loader (`surya/foundation/loader.py`: `from_pretrained(...).to(dev)`),
+            # so there is no CPU-resident module we could hand to
+            # `move_module_to` — the only seam is the temporary `nn.Module.to`
+            # patch. It also covers `PreTrainedModel.to`, because that override
+            # ends in `super().to(...)` and `super()` resolves the (already
+            # patched) `nn.Module.to` class attribute at call time.
+            # Why it is needed: on a ROCm build a host->device copy whose source
+            # is the writable private file mapping handed out by safetensors
+            # stalls ~1-2 s per tensor of >=1 MiB (measured here: 271.06 s ->
+            # 0.28 s for the 1372 MiB foundation checkpoint).
+            # Constructing on CPU and moving the module ourselves is not an
+            # option: the loader makes device-dependent decisions while still on
+            # CPU (attention implementation) and keeps private device-resident
+            # token tensors that a later move would leave behind.
+            # The patch is process-global, so it is held around loading only.
+            with patched_module_to():
+                foundation_predictor = FoundationPredictor(device=device)
+                recognition_predictor = RecognitionPredictor(foundation_predictor)
         except Exception as exc:
             self._foundation_predictor = None
             self._recognition_predictor = None
             self._device = None
             self._last_error = f"Surya OCR init failed: {exc}"
+            log.error(
+                "Surya OCR recognition predictor load failed device=%s duration_s=%.2f error=%s",
+                device,
+                time.perf_counter() - started_at,
+                exc,
+            )
             raise RuntimeError(self._last_error) from exc
 
+        log.info(
+            "Surya OCR recognition predictor load done device=%s duration_s=%.2f",
+            device,
+            time.perf_counter() - started_at,
+        )
         self._foundation_predictor = foundation_predictor
         self._recognition_predictor = recognition_predictor
         self._device = device
@@ -232,6 +299,15 @@ class SuryaOcrService:
         return recognition_predictor
 
     def _ensure_detection_loaded_locked(self, device: str):
+        """Return the `ocr_with_boxes` line detector, loading it if needed.
+
+        Caller must hold `self._lock`. The detector shares `self._device` with
+        the recognition predictors, so it is only reused when both agree.
+
+        # Raises
+        `RuntimeError` if the Surya detection package is missing or the load
+        fails; `_last_error` is set and no detector is retained.
+        """
         if self._detection_predictor is not None and self._device == device:
             return self._detection_predictor
 
@@ -241,13 +317,36 @@ class SuryaOcrService:
             self._last_error = f"Surya detection package is not available: {exc}"
             raise RuntimeError(self._last_error) from exc
 
+        log.info("Surya OCR detection predictor load start device=%s", device)
+        started_at = time.perf_counter()
         try:
-            self._detection_predictor = DetectionPredictor(device=device)
+            # Same ordering rule as in `_ensure_recognition_loaded_locked`: the
+            # `s3://` checkpoint is fetched before the patch is installed, so the
+            # process-global patch never wraps a network wait.
+            ensure_checkpoint_downloaded(
+                self._detection_checkpoint_name(), label=DETECTION_CHECKPOINT_LABEL
+            )
+            # Same ROCm mmap->GPU stall as in `_ensure_recognition_loaded_locked`:
+            # `surya/detection/loader.py` also moves the checkpoint to the device
+            # itself, so the transfer is only reachable through the patch.
+            with patched_module_to():
+                self._detection_predictor = DetectionPredictor(device=device)
         except Exception as exc:
             self._detection_predictor = None
             self._last_error = f"Surya detection init failed: {exc}"
+            log.error(
+                "Surya OCR detection predictor load failed device=%s duration_s=%.2f error=%s",
+                device,
+                time.perf_counter() - started_at,
+                exc,
+            )
             raise RuntimeError(self._last_error) from exc
 
+        log.info(
+            "Surya OCR detection predictor load done device=%s duration_s=%.2f",
+            device,
+            time.perf_counter() - started_at,
+        )
         self._last_error = None
         return self._detection_predictor
 
@@ -299,6 +398,11 @@ class SuryaOcrService:
             return rgb.resize(target_size, resample=resampling)
 
     def _unload_foundation_key(self, model_key: str) -> bool:
+        """Drop every predictor when `model_key` names the resident foundation.
+
+        Returns `False` when another key is resident, which is what tells
+        `LoadedModelManager` the eviction did not happen.
+        """
         with self._lock:
             current_device = self._device
             if current_device is None or model_key != self._foundation_model_key(current_device):
@@ -311,6 +415,7 @@ class SuryaOcrService:
             return True
 
     def _unload_detector_key(self, model_key: str) -> bool:
+        """Drop only the `ocr_with_boxes` detector; `False` if it is not resident."""
         with self._lock:
             current_device = self._device
             if current_device is None or model_key != self._detector_model_key(current_device):
@@ -327,6 +432,20 @@ class SuryaOcrService:
         self._recognition_predictor = None
         self._detection_predictor = None
         self._device = None
+
+    @staticmethod
+    def _foundation_checkpoint_name() -> str:
+        """Checkpoint `FoundationPredictor()` resolves when given no explicit one."""
+        from surya.settings import settings  # type: ignore
+
+        return str(settings.FOUNDATION_MODEL_CHECKPOINT)
+
+    @staticmethod
+    def _detection_checkpoint_name() -> str:
+        """Checkpoint `DetectionPredictor()` resolves when given no explicit one."""
+        from surya.settings import settings  # type: ignore
+
+        return str(settings.DETECTOR_MODEL_CHECKPOINT)
 
     @classmethod
     def _foundation_model_key(cls, device: str) -> str:

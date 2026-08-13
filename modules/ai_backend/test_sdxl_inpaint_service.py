@@ -8,17 +8,28 @@ Main responsibilities:
 - verify mode/model_path/sampler validation raises clear errors;
 - verify numeric clamping of steps/cfg/denoise/mask parameters;
 - verify the four-channel denoise cap keeps the LaMa prefill meaningful;
-- verify sampler names map to the expected diffusers scheduler config.
+- verify sampler names map to the expected diffusers scheduler config;
+- verify the pipeline's host->device move happens inside the ROCm mmap->GPU
+  staging patch, and that unloading drops the pipeline and reports it to the
+  shared model manager.
 
 These tests cover the pure-Python contract only; they do not load torch,
-diffusers, or any model weights.
+diffusers, or any model weights. The staging-patch test injects fake `torch` /
+`diffusers` modules into `sys.modules` instead, so it needs neither package nor
+a GPU. Whether the patch is a no-op on the current host is `rocm_mmap_transfer`'s
+own contract (covered by `test_rocm_mmap_transfer.py`); what is pinned here is
+only that the service wraps the move in it.
 """
 
 from __future__ import annotations
 
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from modules.ai_backend import sdxl_inpaint_service as svc
+from modules.ai_backend.model_manager import LoadedModelManager
 
 
 class NormalizeSdxlParamsTests(unittest.TestCase):
@@ -145,6 +156,132 @@ class MatchVaeRoundtripTests(unittest.TestCase):
         corrected = svc._match_vae_roundtrip(generated, original, alpha)
         # No reliable context -> generated returned unchanged.
         self.assertTrue(np.allclose(corrected, generated))
+
+
+class _PatchRecorder:
+    """Recording stand-in for `rocm_mmap_transfer.patched_module_to`.
+
+    The instance is both the factory and the context manager, so `depth` can be
+    sampled from inside the faked `pipe.to()` to prove the move happened while
+    the staging patch was installed.
+    """
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self.enters = 0
+        self.exits = 0
+
+    def __call__(self) -> "_PatchRecorder":
+        return self
+
+    def __enter__(self) -> "_PatchRecorder":
+        self.depth += 1
+        self.enters += 1
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.depth -= 1
+        self.exits += 1
+        return False
+
+
+class _FakePipe:
+    """Minimal stand-in for `StableDiffusionXLInpaintPipeline`."""
+
+    def __init__(self, recorder: _PatchRecorder) -> None:
+        self._recorder = recorder
+        # (device, staging patch depth at the time of the move).
+        self.moves: list[tuple[object, int]] = []
+        self.vae = types.SimpleNamespace(config=types.SimpleNamespace(force_upcast=False))
+
+    def to(self, device: object) -> "_FakePipe":
+        self.moves.append((device, self._recorder.depth))
+        return self
+
+    def set_progress_bar_config(self, **_kwargs: object) -> None:
+        pass
+
+    def enable_attention_slicing(self) -> None:
+        pass
+
+
+class SdxlPipelinePlacementTests(unittest.TestCase):
+    """Pin the ROCm mmap staging seam of the SDXL pipeline build."""
+
+    def setUp(self) -> None:
+        self.recorder = _PatchRecorder()
+        recorder = self.recorder
+        pipes: list[_FakePipe] = []
+        self.pipes = pipes
+
+        class StableDiffusionXLInpaintPipeline:
+            @staticmethod
+            def from_pretrained(_path: str, **_kwargs: object) -> _FakePipe:
+                pipe = _FakePipe(recorder)
+                pipes.append(pipe)
+                return pipe
+
+        diffusers = types.ModuleType("diffusers")
+        diffusers.StableDiffusionXLInpaintPipeline = StableDiffusionXLInpaintPipeline
+
+        # `float16` only needs identity, and the absence of `cuda` keeps
+        # `_clear_torch_cache` from initializing a real accelerator context.
+        fake_torch = types.ModuleType("torch")
+        fake_torch.float16 = object()
+        fake_torch.float32 = object()
+
+        modules_patch = patch.dict(
+            sys.modules, {"diffusers": diffusers, "torch": fake_torch}
+        )
+        modules_patch.start()
+        self.addCleanup(modules_patch.stop)
+
+        staging_patch = patch.object(svc, "patched_module_to", self.recorder)
+        staging_patch.start()
+        self.addCleanup(staging_patch.stop)
+
+    def test_move_to_gpu_runs_inside_staging_patch(self) -> None:
+        # A path that is neither a file nor a directory is treated as a HF repo
+        # id, which keeps the test off the filesystem.
+        pipe = svc._build_sdxl_inpaint_pipeline("org/sdxl-inpaint", "cuda:0")
+
+        self.assertIs(pipe, self.pipes[0])
+        self.assertEqual(pipe.moves, [("cuda:0", 1)])
+        self.assertEqual((self.recorder.enters, self.recorder.exits), (1, 1))
+        self.assertEqual(self.recorder.depth, 0)
+
+    def test_fp16_pipeline_keeps_vae_force_upcast(self) -> None:
+        # The staging wrapper must not disturb the fp16 VAE contract.
+        pipe = svc._build_sdxl_inpaint_pipeline("org/sdxl-inpaint", "cuda:0")
+        self.assertTrue(pipe.vae.config.force_upcast)
+
+
+class SdxlUnloadTests(unittest.TestCase):
+    """Pin the unload bookkeeping; no torch, diffusers or weights involved."""
+
+    def test_unload_drops_the_pipeline_and_reports_it(self) -> None:
+        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        service._pipe = object()
+        service._active_model_key = "sdxl:nine_channel:cuda:0:/models/a.safetensors"
+
+        with patch.object(service._model_manager, "mark_unloaded") as unloaded:
+            self.assertTrue(service.unload())
+
+        unloaded.assert_called_once_with("sdxl:nine_channel:cuda:0:/models/a.safetensors")
+        self.assertIsNone(service._pipe)
+        self.assertIsNone(service._active_model_key)
+
+    def test_unload_without_a_pipeline_is_a_noop(self) -> None:
+        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        self.assertFalse(service.unload())
+
+    def test_unload_key_refuses_a_foreign_key(self) -> None:
+        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        service._pipe = object()
+        service._active_model_key = "sdxl:a"
+
+        self.assertFalse(service._unload_key("sdxl:b"))
+        self.assertIsNotNone(service._pipe)
 
 
 if __name__ == "__main__":

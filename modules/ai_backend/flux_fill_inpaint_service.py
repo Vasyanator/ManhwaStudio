@@ -28,11 +28,22 @@ Main responsibilities:
 Notes:
 The heavy packages (torch/diffusers/transformers) are imported lazily. Missing
 packages, weights, or download failures surface as explicit errors.
+At the default `dtype: "bf16"` the safetensors components (VAE / CLIP / T5) are
+requested at the dtype they are already stored in, so no host-side cast
+materializes them in anonymous memory and every host->device copy of theirs hits
+the ROCm amdkfd stall. Both placement paths therefore go through
+`rocm_mmap_transfer`: the plain path wraps `pipe.to(device)` in
+`patched_module_to()`, the CPU-offload path re-homes the components up front
+(see `_materialize_components_for_offload`). Both are strict no-ops off ROCm.
+Neither the GGUF transformer nor a `dtype: "fp16"` run is affected: the GGUF
+reader and the fp16 host-side cast both already copy into anonymous memory, and
+the per-tensor file-backing checks keep those cases out of the workaround.
 """
 
 from __future__ import annotations
 
 import io
+import logging
 import os
 import threading
 import time
@@ -47,6 +58,13 @@ except Exception:  # pragma: no cover - config is always importable in-app
     _config = None
 
 from .model_manager import LoadedModelManager
+from .rocm_mmap_transfer import (
+    mmap_staging_required,
+    patched_module_to,
+    tensor_needs_staging,
+)
+
+log = logging.getLogger(__name__)
 
 # --- Repos / quants -------------------------------------------------------
 GGUF_REPO = "YarvixPA/FLUX.1-Fill-dev-GGUF"
@@ -192,6 +210,7 @@ class FluxFillInpaintService:
             }
 
     def unload(self) -> bool:
+        """Drop the resident pipeline; `False` when nothing was loaded."""
         with self._lock:
             if self._pipe is None:
                 return False
@@ -293,6 +312,19 @@ class FluxFillInpaintService:
 
     # ---- pipeline ----
     def _ensure_pipeline_locked(self, normalized: dict[str, Any], model_key: str) -> Any:
+        """Return the cached pipeline for `model_key`, building it if needed.
+
+        Caller must hold `self._lock`. A pipeline built for another key is
+        dropped and reported to the model manager first. Placement depends on
+        `normalized["cpu_offload"]`: either accelerate model CPU offload (weights
+        stay in RAM, one component on the GPU at a time) or a full move onto the
+        selected discrete GPU. Both placements route through `rocm_mmap_transfer`
+        and are unchanged off ROCm.
+
+        # Raises
+        `FileNotFoundError` if the selected GGUF quant or the diffusers
+        components are missing from `side_models`.
+        """
         if self._pipe is not None and self._active_key == model_key:
             return self._pipe
 
@@ -349,9 +381,20 @@ class FluxFillInpaintService:
             except Exception:
                 pass
         if normalized["cpu_offload"] and getattr(device, "type", "cpu") != "cpu":
+            _materialize_components_for_offload(pipe, device)
             pipe.enable_model_cpu_offload(device=str(device))
         else:
-            pipe.to(device)
+            # ROCm mmap->GPU staging (see the file header). The patch wraps the
+            # stock `DiffusionPipeline.to` rather than replacing it, because that
+            # method first does its own sequential/model-offload, bnb,
+            # group-offload, `hf_device_map` and HPU bookkeeping and only then
+            # calls `module.to(device, dtype)` per component. The patch reaches
+            # that inner call because `ModelMixin.to` and `PreTrainedModel.to`
+            # both end in `super().to(...)`, and `super()` resolves the patched
+            # `nn.Module.to` class attribute at call time. Staging is per tensor
+            # with immediate release, so peak host RSS grows by one tensor.
+            with patched_module_to():
+                pipe.to(device)
 
         self._pipe = pipe
         self._device = device
@@ -565,6 +608,137 @@ def _select_discrete_device() -> Any:
         return torch.device("cpu")
     torch.cuda.set_device(best[0])
     return torch.device(f"cuda:{best[0]}")
+
+
+# Pipeline components loaded from safetensors, i.e. the ones diffusers hands out
+# backed by a writable private file mapping. `transformer` is deliberately
+# absent: it comes from GGUF, whose reader copies every tensor through
+# `torch.from_numpy(tensor.data.copy())` into anonymous memory, so it never hits
+# the amdkfd stall and must not be round-tripped through the GPU for nothing.
+_MMAP_BACKED_COMPONENTS = ("vae", "text_encoder", "text_encoder_2")
+
+
+def _largest_cpu_tensor(module: Any) -> Any:
+    """Largest CPU-resident parameter or buffer of `module`, or `None`.
+
+    Used as the probe for `_component_is_file_backed`. Only CPU tensors qualify:
+    a component that already sits on the GPU has nothing left to re-home. Ties
+    and empty modules are irrelevant to the caller, which only needs one
+    representative tensor.
+    """
+    largest = None
+    largest_bytes = -1
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        if getattr(getattr(tensor, "device", None), "type", None) != "cpu":
+            continue
+        nbytes = int(tensor.numel()) * int(tensor.element_size())
+        if nbytes > largest_bytes:
+            largest = tensor
+            largest_bytes = nbytes
+    return largest
+
+
+def _component_is_file_backed(module: Any) -> bool:
+    """Whether `module`'s weights still live in the safetensors file mapping.
+
+    Only such weights hit the amdkfd stall, so only they are worth the round
+    trip in `_materialize_components_for_offload`. The check is not redundant
+    with `mmap_staging_required()`: at `dtype: "fp16"` the loaders cast the BF16
+    checkpoint on the host, which already materializes every tensor in anonymous
+    memory, and round-tripping ~9.5 GiB of it through the GPU would cost seconds
+    and a ~9.2 GiB VRAM peak for nothing.
+
+    The largest CPU tensor is representative: a component is loaded in one pass
+    from its own file, so its weights are either all mapped or all copied.
+    Returns `False` when the module has no CPU tensors left (nothing to re-home)
+    or when the file-backing detection is unavailable.
+    """
+    probe = _largest_cpu_tensor(module)
+    if probe is None:
+        return False
+    return tensor_needs_staging(probe)
+
+
+def _materialize_components_for_offload(pipe: Any, device: Any) -> None:
+    """Re-home the safetensors components in anonymous host memory before offload.
+
+    `enable_model_cpu_offload` never moves a component to the GPU itself: it
+    leaves every module on the CPU and installs an accelerate `CpuOffload` hook
+    that does `module.to(<gpu>)` lazily from inside the forward pass. On ROCm
+    that first lazy move copies straight out of the safetensors mapping and hits
+    the amdkfd copy-on-write stall (~1-2 s per tensor of >=1 MiB; at the default
+    BF16 dtype these three components carry 284 such tensors, ~9.5 GiB), only it
+    happens during generation instead of during load. `patched_module_to` cannot
+    be held there: it is process-global and its contract forbids wrapping
+    inference.
+
+    So the weights are re-homed up front: one staged CPU->GPU copy per component
+    immediately followed by a move back, which leaves the resident CPU copy in
+    freshly allocated anonymous memory. Every later lazy move is then a plain
+    fast transfer. Peak VRAM is one component, exactly what model CPU offload
+    peaks at during generation anyway, and the anonymous host copy is what
+    accelerate would end up with after the first offload cycle regardless.
+
+    Skipped entirely unless `mmap_staging_required()` holds (ROCm/HIP build on
+    posix), and per component unless its weights are actually file-backed (see
+    `_component_is_file_backed`).
+
+    A failed re-homing is a lost optimization, not a lost model: it is logged
+    with context and the load continues, so the first generation merely pays the
+    stall. Components left on the GPU by a partial failure are pulled back by
+    `enable_model_cpu_offload`, which starts with its own `to("cpu")`.
+    """
+    if not mmap_staging_required():
+        return
+
+    import torch
+
+    started_at = time.perf_counter()
+    rehomed: list[str] = []
+    skipped: list[str] = []
+    for name in _MMAP_BACKED_COMPONENTS:
+        module = getattr(pipe, name, None)
+        if not isinstance(module, torch.nn.Module):
+            continue
+        if not _component_is_file_backed(module):
+            skipped.append(name)
+            continue
+        try:
+            with patched_module_to():
+                module.to(device)
+            # The way back allocates fresh anonymous host memory for every
+            # tensor — that copy is the whole point of the round trip.
+            module.to("cpu")
+        except (RuntimeError, MemoryError) as exc:
+            log.warning(
+                "Flux Fill: could not re-home component %r in anonymous host memory "
+                "before CPU offload (%s). The model still works, but on ROCm the "
+                "first generation may stall in the mmap->GPU weight copy.",
+                name,
+                exc,
+            )
+            break
+        # Release the component's device blocks before the next, larger one is
+        # staged: the allocator does not serve a ~9 GiB T5 request out of the
+        # small blocks left behind by the VAE and would reserve on top of them,
+        # which turns a fitting model into an OOM on a 12 GiB card.
+        _clear_torch_cache()
+        rehomed.append(name)
+
+    _clear_torch_cache()
+    if rehomed:
+        log.info(
+            "Flux Fill: re-homed %s in anonymous host memory in %.2f s before enabling "
+            "model CPU offload (ROCm mmap->GPU stall workaround).",
+            ", ".join(rehomed),
+            time.perf_counter() - started_at,
+        )
+    if skipped:
+        log.debug(
+            "Flux Fill: %s already live in anonymous host memory (no file mapping); "
+            "skipped the pre-offload round trip.",
+            ", ".join(skipped),
+        )
 
 
 def _apply_miopen_fast() -> None:

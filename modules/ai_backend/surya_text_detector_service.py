@@ -9,6 +9,12 @@ Main responsibilities:
 - return line blocks and a binary mask derived from Surya detector heatmaps;
 - synchronize model device with backend `General.ai_device`;
 - cooperate with `LoadedModelManager` for bounded resident model count.
+
+Notes:
+Checkpoint presence and download are delegated to `surya_checkpoints`, shared
+with `surya_ocr_service`. This service needs no ROCm mmap staging: it loads the
+float16 detector checkpoint as float32, and that host-side cast already
+materializes the weights in anonymous memory (see `_preferred_detector_dtype`).
 """
 
 from __future__ import annotations
@@ -33,8 +39,16 @@ except Exception:
     UserConfig = None
 
 from .model_manager import LoadedModelManager
+from .surya_checkpoints import (
+    checkpoint_local_dir,
+    checkpoint_ready,
+    ensure_checkpoint_downloaded,
+)
 
 log = logging.getLogger(__name__)
+
+# Names this service in checkpoint download errors.
+CHECKPOINT_LABEL = "Surya detector"
 
 
 def _clear_torch_cache() -> None:
@@ -71,8 +85,8 @@ class SuryaTextDetectorService:
     def health(self) -> dict[str, Any]:
         with self._lock:
             checkpoint = self._checkpoint_name()
-            model_dir = _resolve_checkpoint_local_dir(checkpoint)
-            model_exists = bool(model_dir) and _check_checkpoint_ready(model_dir)
+            model_dir = checkpoint_local_dir(checkpoint)
+            model_exists = bool(model_dir) and checkpoint_ready(model_dir)
             return {
                 "ready": self._predictor is not None,
                 "device": self._device,
@@ -92,7 +106,7 @@ class SuryaTextDetectorService:
         selected_device = _resolve_selected_backend_device(self._device or "cpu")
         model_key = self._model_key(selected_device)
         checkpoint = self._checkpoint_name()
-        model_dir = _resolve_checkpoint_local_dir(checkpoint)
+        model_dir = checkpoint_local_dir(checkpoint)
         log.info(
             "Surya detect_image_bytes start bytes=%s device=%s model_key=%s checkpoint=%s model_dir=%s",
             len(image_bytes),
@@ -167,30 +181,17 @@ class SuryaTextDetectorService:
         return self._predictor
 
     def _ensure_checkpoint_downloaded_locked(self) -> None:
-        checkpoint = self._checkpoint_name()
-        local_dir = _resolve_checkpoint_local_dir(checkpoint)
-        if local_dir and _check_checkpoint_ready(local_dir):
-            return
-        if not checkpoint.startswith("s3://"):
-            raise FileNotFoundError(f"Surya detector checkpoint not found: {checkpoint}")
+        """Fetch the detector checkpoint if it is not complete on disk.
 
-        try:
-            from surya.common.s3 import download_directory  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                f"Surya detector download helpers are not available: {exc}"
-            ) from exc
+        Caller must hold `self._lock`. Delegates to `surya_checkpoints`, which
+        the Surya OCR service shares; see that module for why the download must
+        finish before the predictor is constructed.
 
-        remote_dir = checkpoint.removeprefix("s3://")
-        if not local_dir:
-            raise RuntimeError(
-                f"Surya detector checkpoint path is invalid for download: {checkpoint}"
-            )
-        download_directory(remote_dir, local_dir)
-        if not _check_checkpoint_ready(local_dir):
-            raise RuntimeError(
-                f"Surya detector checkpoint download finished but manifest is incomplete: {local_dir}"
-            )
+        # Raises
+        `FileNotFoundError` / `RuntimeError` as documented on
+        `surya_checkpoints.ensure_checkpoint_downloaded`.
+        """
+        ensure_checkpoint_downloaded(self._checkpoint_name(), label=CHECKPOINT_LABEL)
 
     def _detect_with_predictor(self, image_bytes: bytes, predictor) -> dict[str, Any]:
         from surya.common.util import clean_boxes  # type: ignore
@@ -488,28 +489,6 @@ def _encode_mask_png_bytes(cv2, mask: np.ndarray) -> bytes:
     return encoded.tobytes()
 
 
-def _resolve_checkpoint_local_dir(checkpoint: str) -> str:
-    normalized = str(checkpoint or "").strip()
-    if not normalized.startswith("s3://"):
-        return normalized
-    try:
-        from surya.common.s3 import S3DownloaderMixin  # type: ignore
-    except Exception:
-        return ""
-    return str(S3DownloaderMixin.get_local_path(normalized))
-
-
-def _check_checkpoint_ready(local_dir: str) -> bool:
-    normalized = str(local_dir or "").strip()
-    if not normalized:
-        return False
-    try:
-        from surya.common.s3 import check_manifest  # type: ignore
-    except Exception:
-        return False
-    return bool(check_manifest(normalized))
-
-
 def _read_configured_device() -> str | None:
     config_root = getattr(UserConfig, "config", None)
     if not isinstance(config_root, dict):
@@ -563,6 +542,12 @@ def _resolve_selected_backend_device(fallback: str) -> str:
 
 
 def _preferred_detector_dtype(device: str):
+    """Dtype to load the Surya detector with, or `None` for Surya's default.
+
+    `device` is a backend device string (`cpu`, `cuda`, `cuda:N`, `mps`).
+    Returns `torch.float32` for CUDA/ROCm targets and `None` when Torch is
+    unavailable or the target is not CUDA.
+    """
     normalized = str(device or "").strip().lower()
     if normalized.startswith("cuda"):
         try:
@@ -571,5 +556,16 @@ def _preferred_detector_dtype(device: str):
             return None
         # Surya detection on some CUDA setups emits NaN heatmaps in float16.
         # Prefer float32 here to preserve correctness.
+        #
+        # As a side effect this keeps the service clear of the ROCm mmap->GPU
+        # stall handled by `rocm_mmap_transfer` (see `surya_ocr_service`): the
+        # detector checkpoint is stored in float16, so requesting float32 makes
+        # transformers cast on the host into freshly allocated anonymous memory
+        # and the host->device copy no longer reads from the safetensors file
+        # mapping. Measured with `rocm_mmap_transfer._is_file_backed` on the CPU
+        # copy of this checkpoint: 29 of 29 parameters >=1 MiB are file-backed
+        # at float16, 0 of 43 at float32. Changing this back to float16 would
+        # reintroduce the stall, and the load would then have to be wrapped in
+        # `rocm_mmap_transfer.patched_module_to()`.
         return torch.float32
     return None
