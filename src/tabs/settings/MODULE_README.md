@@ -62,6 +62,15 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `save_ai_runtime` is wired to the
   "Рантайм ИИ" selector in `ai_backend_panel`; the guard writers are wired to `native_runtime`'s ORT
   load path and the "Повторить попытку ORT" reset control.
+  It also hosts `save_advanced_form_search_params` (`TextTab.advanced_form_search`, ONE JSON
+  object). Unlike its `TextTab` siblings this one is NOT driven from a settings pane: the knobs live
+  in the typing tab's advanced-form window, which spawns the write on its own named thread. Only the
+  placement of the object lives here; its SHAPE belongs to `tabs::typing::advanced_form_params`.
+  It is also the ONE saver here that does NOT hand-roll the read-modify-write: it delegates to
+  `config::update_user_config_file`, which takes `config::lock_user_config_write()` itself (so this
+  saver must not — the lock is not reentrant), REPORTS a malformed `user_config.json` instead of
+  degrading it to an empty object, and goes through `storage()` rather than raw `fs::`. Its siblings
+  still carry the degrade-and-clobber recipe; migrating them is a separate task (README_AGENT.md).
 - `general.rs`: thin studio wrapper for the general section. Enforces the studio-only vertical
   typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then renders the shared
   General section through `SettingsTabState.shared.draw(General, ..)` (projects-directory editor,

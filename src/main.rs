@@ -286,6 +286,7 @@ fn run_main() -> anyhow::Result<()> {
     seed_hanging_punctuation_from_config();
     seed_text_language_from_config();
     seed_rotation_ctrl_wheel_from_config();
+    seed_advanced_form_search_from_config();
     // Seed the typing tab's per-effect-kind default overrides so newly added effect
     // cards pick up the user's stored defaults from the first frame.
     tabs::typing::seed_effect_defaults_from_config();
@@ -503,6 +504,27 @@ fn seed_rotation_ctrl_wheel_from_config() {
         .and_then(rotation_ctrl_wheel::RotationCtrlWheelMode::from_config_str)
     {
         rotation_ctrl_wheel::set_rotation_ctrl_wheel_mode(mode);
+    }
+}
+
+/// Seeds the runtime-global advanced text-form search knobs from user config at
+/// startup. The module defaults every knob; here the app overrides the fields
+/// `TextTab.advanced_form_search` actually names.
+///
+/// Best-effort and PARTIAL-TOLERANT: a config error, a non-object value or a
+/// missing/invalid field keeps that field's compiled-in default (the decoding rule
+/// belongs to `AdvancedFormParams::from_config_value`, which also clamps the result
+/// into the supported ranges).
+#[cfg(not(target_arch = "wasm32"))]
+fn seed_advanced_form_search_from_config() {
+    let Ok(cfg) = config::load_user_config() else {
+        return;
+    };
+    use tabs::typing::advanced_form_params;
+    if let Some(stored) = cfg.get_path(&["TextTab", config::TEXT_TAB_ADVANCED_FORM_SEARCH_KEY]) {
+        advanced_form_params::set_advanced_form_params(
+            advanced_form_params::AdvancedFormParams::from_config_value(stored),
+        );
     }
 }
 

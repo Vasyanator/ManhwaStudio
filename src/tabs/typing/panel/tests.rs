@@ -4043,6 +4043,70 @@ paths change.
         );
     }
 
+    /// Высота строки, которую окно форм отдаёт движку, — это ЕДИНИЦЫ ТОЙ ЖЕ
+    /// МЕТРИКИ, что и ширины: множитель в долях em, помноженный на `units_per_em`
+    /// построенной метрики. Значения посчитаны на бумаге по формуле
+    /// `FormSearchParams::line_height_units` (зеркало `pipeline.rs:432-437`).
+    ///
+    /// Ошибка здесь ничего не ломает громко — она молча расстраивает потолок
+    /// пропорции формы, поэтому число зафиксировано тестом.
+    #[test]
+    fn advanced_form_line_height_folds_spacing_and_glyph_width_into_metric_units() {
+        use super::create_advanced::advanced_form_line_height_em;
+
+        // Кегль 40 px, межстрочный +10 %, высота глифа 120 %, ширина глифа 80 %:
+        //   spacing %       = 10 + (120 − 100)      = 30
+        //   line_height_px  = 40 + 0 + 40 · 0.30    = 52
+        //   em              = 52 / 40 / 0.80        = 1.625
+        let em = advanced_form_line_height_em(40.0, 0.0, 10.0, 120.0, 80.0);
+        assert!(
+            (em - 1.625).abs() < 1e-5,
+            "line height must be 1.625 em, got {em}"
+        );
+        // `GlyphWidths` меряет в 1/1000 em; `CharWidthMetric` — ~2 символа на em.
+        assert!(
+            (em * 1000.0 - 1625.0).abs() < 1e-2,
+            "glyph-width units must be 1625, got {}",
+            em * 1000.0
+        );
+        assert!(
+            (em * 2.0 - 3.25).abs() < 1e-5,
+            "character-width units must be 3.25, got {}",
+            em * 2.0
+        );
+
+        // Нейтральные параметры: строка ровно в кегль, масштаб натуральный.
+        let neutral = advanced_form_line_height_em(40.0, 0.0, 0.0, 100.0, 100.0);
+        assert!(
+            (neutral - 1.0).abs() < 1e-6,
+            "neutral parameters must give exactly 1 em, got {neutral}"
+        );
+
+        // Пиксельный межстрочный складывается с процентным, а не заменяет его:
+        //   spacing %       = 0 + (100 − 100)       = 0
+        //   line_height_px  = 40 + 8                = 48
+        //   em              = 48 / 40 / 1.0         = 1.2
+        let px_spacing = advanced_form_line_height_em(40.0, 8.0, 0.0, 100.0, 100.0);
+        assert!(
+            (px_spacing - 1.2).abs() < 1e-6,
+            "8 px of leading on a 40 px body must give 1.2 em, got {px_spacing}"
+        );
+
+        // Вырожденный горизонтальный масштаб не имеет права обнулить делитель.
+        let degenerate = advanced_form_line_height_em(40.0, 0.0, 0.0, 100.0, 0.0);
+        assert!(
+            (degenerate - 1.0).abs() < 1e-6,
+            "a zero glyph width must fall back to the natural scale, got {degenerate}"
+        );
+        // Нечисловой вход не должен просачиваться в ключ поиска (там `NaN` сделал
+        // бы ключ не равным самому себе и зациклил перезапуск перебора).
+        assert!(
+            advanced_form_line_height_em(f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN)
+                .is_finite(),
+            "a non-numeric input must degrade to the compiled-in default"
+        );
+    }
+
     #[test]
     fn advanced_form_glyph_widths_keep_selected_face_under_faux_bold() {
         use forms::LineWidthMetric;
@@ -4882,4 +4946,700 @@ paths change.
             "the arrival of the bytes must change the signature, which is what rebuilds \
              the form cache with real glyph widths"
         );
+    }
+
+    // --- Advanced form search: knobs + presentation order (layer C) -----------
+
+    // The range/default constants are the numbers the UI binds; the assertions
+    // below check the mapping against them rather than repeating the literals.
+    use super::advanced_form_params::{
+        ASPECT_MAX_DEFAULT, ASPECT_MAX_MIN, EVENNESS_MAX, EVENNESS_MIN, HYPHEN_RATIO_DEFAULT,
+        HYPHEN_RELAX_SLACK_DEFAULT, HYPHEN_RELAX_SLACK_MIN, NARROW_SLOTS_MAX, NARROW_SLOTS_MIN,
+        PER_BUCKET_DEFAULT, PER_BUCKET_MAX, PER_BUCKET_MIN, QUALITY_FLOOR_MAX,
+    };
+
+    /// Serializes every test that WRITES the process-global advanced-form knobs.
+    ///
+    /// `advanced_form_params` is one `RwLock` shared by the whole test binary, so two
+    /// tests setting it in parallel would read each other's values (and a panel test
+    /// would see its search base change under it mid-assertion). Take this lock for the
+    /// WHOLE test and restore `AdvancedFormParams::default()` before releasing it.
+    static ADVANCED_FORM_PARAMS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquires [`ADVANCED_FORM_PARAMS_TEST_LOCK`], recovering from poisoning (a failed
+    /// assertion in another test leaves the `()` payload usable, and blocking the whole
+    /// suite on it would hide the real failure).
+    fn lock_advanced_form_params() -> std::sync::MutexGuard<'static, ()> {
+        ADVANCED_FORM_PARAMS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Builds a legal `TextForm` for the ordering tests.
+    ///
+    /// Only the three fields layer C reads carry meaning here — the line COUNT
+    /// (which bucket the form lands in), `quality_milli` and `aspect_milli`; the
+    /// widths are derived from the generated lines so the value stays coherent.
+    fn ordering_test_form(line_count: usize, quality_milli: u32, aspect_milli: u32) -> TextForm {
+        let lines: Vec<String> = (0..line_count.max(1))
+            .map(|index| format!("line {index}"))
+            .collect();
+        let line_widths: Vec<u32> = lines
+            .iter()
+            .map(|line| u32::try_from(line.chars().count()).unwrap_or(0))
+            .collect();
+        let max_width = line_widths.iter().copied().max().unwrap_or(0);
+        let min_width = line_widths.iter().copied().min().unwrap_or(0);
+        TextForm {
+            lines,
+            word_break_count: 0,
+            max_width,
+            min_width,
+            median_width: max_width,
+            unevenness_pct: 0,
+            break_cost: 0,
+            conservatism: Conservatism::Safe,
+            line_widths,
+            quality_milli,
+            roughness_pct: 0,
+            aspect_milli,
+        }
+    }
+
+    /// Line count of every ordered card, in order — the identity the ordering
+    /// assertions are written against.
+    fn ordered_line_counts(forms: &[TextForm]) -> Vec<usize> {
+        forms.iter().map(TextForm::line_count).collect()
+    }
+
+    #[test]
+    fn advanced_form_order_puts_the_global_quality_best_first() {
+        let params = AdvancedFormParams::default();
+        // Deliberately shuffled across buckets: the best form is neither the first
+        // input nor a member of the first (smallest) bucket.
+        let forms = vec![
+            ordering_test_form(2, 500, 3_000),
+            ordering_test_form(2, 900, 3_000),
+            ordering_test_form(3, 200, 1_000),
+            ordering_test_form(3, 600, 1_000),
+            ordering_test_form(4, 400, 500),
+        ];
+
+        let ordered = order_advanced_forms(forms, &params);
+
+        assert_eq!(
+            ordered.first().map(|form| form.quality_milli),
+            Some(200),
+            "card #1 must be the global quality minimum"
+        );
+    }
+
+    /// Asserts plan §2.3's first ordering guarantee: no line count repeats before
+    /// every line count has appeared once. Returns the position of the first repeat
+    /// (`None` when there is none) so a caller can pin what comes right after it.
+    fn assert_no_height_repeats_before_all_appear(
+        line_counts: &[usize],
+        heights: usize,
+    ) -> Option<usize> {
+        let mut seen: Vec<usize> = Vec::new();
+        let mut first_repeat: Option<usize> = None;
+        for (position, count) in line_counts.iter().enumerate() {
+            if seen.contains(count) {
+                assert_eq!(
+                    seen.len(),
+                    heights,
+                    "height {count} repeated at card {position} while only {} of {heights} \
+                     heights had been shown ({line_counts:?})",
+                    seen.len()
+                );
+                first_repeat.get_or_insert(position);
+            } else {
+                seen.push(*count);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            heights,
+            "every height must appear ({line_counts:?})"
+        );
+        first_repeat
+    }
+
+    /// The two ordering guarantees of plan §2.3 hold TOGETHER at the DEFAULT
+    /// `narrow_slots`, which is what the sub-round split buys: sub-round 0 of round 0
+    /// carries exactly one card per height, so nothing repeats before every height has
+    /// appeared, and sub-round 1 — the narrow buckets' second cards — follows
+    /// IMMEDIATELY, so the narrow lean is still early.
+    ///
+    /// Without sub-rounds the two properties contradict each other at the default
+    /// (`narrow_slots = 2`): a narrow bucket emitting both of its round-0 cards repeats
+    /// its own height inside round 0. This test used to dodge that by setting
+    /// `narrow_slots = 1`.
+    #[test]
+    fn advanced_form_order_shows_every_height_before_repeating_one() {
+        let params = AdvancedFormParams::default();
+        assert_eq!(
+            params.narrow_slots, 2,
+            "the guarantee is asserted at the SHIPPED narrow lean, not with it disabled"
+        );
+        // Bucket bests by aspect: 400 (5 lines), 1000 (3 lines), 3000 (2 lines) — the
+        // lower median is 1000, so the 3- and 5-line buckets are the narrow ones.
+        let forms = vec![
+            ordering_test_form(2, 100, 3_000),
+            ordering_test_form(2, 150, 3_000),
+            ordering_test_form(3, 300, 1_000),
+            ordering_test_form(3, 350, 1_000),
+            ordering_test_form(5, 500, 400),
+        ];
+
+        let ordered = order_advanced_forms(forms, &params);
+        let line_counts = ordered_line_counts(&ordered);
+
+        assert_eq!(line_counts.len(), 5, "nothing may be dropped ({line_counts:?})");
+        let first_repeat = assert_no_height_repeats_before_all_appear(&line_counts, 3);
+        assert_eq!(
+            first_repeat,
+            Some(3),
+            "the narrow lean must arrive in the very next sub-round, i.e. right after \
+             the one-card-per-height sub-round ({line_counts:?})"
+        );
+        assert_eq!(
+            line_counts[3], 3,
+            "card #4 is the narrow 3-line bucket's second card ({line_counts:?})"
+        );
+    }
+
+    /// The narrow lean at the DEFAULT `narrow_slots`, asserted together with the
+    /// no-repeat guarantee: the narrow bucket still gets `narrow_slots` cards per
+    /// round, but its second card lands in sub-round 1, i.e. AFTER every height has
+    /// been shown once.
+    #[test]
+    fn advanced_form_order_gives_a_narrow_bucket_more_slots_per_round() {
+        let params = AdvancedFormParams::default();
+        assert_eq!(params.narrow_slots, 2, "two slots per round is the shipped default");
+        // Two buckets, four forms each; the 2-line bucket is the NARROW one (its
+        // best form's aspect is at the median of the bucket bests), the 5-line one
+        // is wide. Qualities interleave so the round content, not a global sort,
+        // is what the assertion measures.
+        let forms = vec![
+            ordering_test_form(2, 100, 500),
+            ordering_test_form(2, 200, 500),
+            ordering_test_form(2, 300, 500),
+            ordering_test_form(2, 400, 500),
+            ordering_test_form(5, 150, 3_000),
+            ordering_test_form(5, 250, 3_000),
+            ordering_test_form(5, 350, 3_000),
+            ordering_test_form(5, 450, 3_000),
+        ];
+
+        let ordered = order_advanced_forms(forms, &params);
+        let line_counts = ordered_line_counts(&ordered);
+
+        assert_eq!(line_counts.len(), 8, "nothing may be dropped ({line_counts:?})");
+        let first_round = &line_counts[..3];
+        assert_eq!(
+            first_round.iter().filter(|count| **count == 2).count(),
+            2,
+            "the narrow bucket must emit `narrow_slots` cards per round ({line_counts:?})"
+        );
+        assert_eq!(
+            first_round.iter().filter(|count| **count == 5).count(),
+            1,
+            "a wide bucket must emit one card per round ({line_counts:?})"
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .take(3)
+                .map(|form| form.quality_milli)
+                .collect::<Vec<_>>(),
+            vec![100, 150, 200],
+            "inside one round the cards are ordered by quality"
+        );
+        // BOTH properties at once: the extra narrow card is the FIRST repeat and it
+        // comes only after both heights have been shown (sub-round 1, not round 0
+        // wholesale).
+        assert_eq!(
+            assert_no_height_repeats_before_all_appear(&line_counts, 2),
+            Some(2),
+            "the narrow bucket's second card must follow the full sub-round, not \
+             precede a height ({line_counts:?})"
+        );
+    }
+
+    #[test]
+    fn advanced_form_order_quality_floor_drops_a_whole_junk_bucket() {
+        let forms = || {
+            vec![
+                ordering_test_form(2, 100, 1_000),
+                ordering_test_form(2, 200, 1_000),
+                ordering_test_form(7, 900, 200),
+            ]
+        };
+        let tight = AdvancedFormParams {
+            quality_floor: 0.2,
+            ..AdvancedFormParams::default()
+        };
+        let loose = AdvancedFormParams {
+            quality_floor: 1.0,
+            ..AdvancedFormParams::default()
+        };
+
+        let dropped = order_advanced_forms(forms(), &tight);
+        assert_eq!(
+            ordered_line_counts(&dropped),
+            vec![2, 2],
+            "a bucket whose best is beyond `best + floor` must be dropped whole"
+        );
+
+        let kept = order_advanced_forms(forms(), &loose);
+        assert!(
+            ordered_line_counts(&kept).contains(&7),
+            "raising the floor above the gap must readmit that bucket"
+        );
+    }
+
+    #[test]
+    fn advanced_form_order_puts_unscored_forms_last() {
+        let params = AdvancedFormParams::default();
+        // The legacy `enumerate_forms` path reports UNSCORED_QUALITY_MILLI (the
+        // worst possible value) and a zero aspect. Such forms must neither be
+        // dropped by the quality floor nor sort in front of real cards.
+        let forms = vec![
+            ordering_test_form(4, forms::UNSCORED_QUALITY_MILLI, 0),
+            ordering_test_form(2, 100, 1_000),
+            ordering_test_form(6, forms::UNSCORED_QUALITY_MILLI, 0),
+            ordering_test_form(3, 300, 800),
+        ];
+
+        let ordered = order_advanced_forms(forms, &params);
+        let qualities: Vec<u32> = ordered.iter().map(|form| form.quality_milli).collect();
+
+        assert_eq!(qualities.len(), 4, "unscored forms must not be dropped");
+        assert_eq!(
+            qualities,
+            vec![
+                100,
+                300,
+                forms::UNSCORED_QUALITY_MILLI,
+                forms::UNSCORED_QUALITY_MILLI
+            ],
+            "scored cards first, unscored ones in the tail"
+        );
+    }
+
+    #[test]
+    fn form_search_params_at_default_evenness_reproduce_the_corridor_ladder() {
+        let params = AdvancedFormParams::default();
+
+        let search = params.to_search_params(1_200.0, None, None);
+
+        assert_eq!(
+            search.corridor_levels,
+            forms::default_corridor_ladder(),
+            "evenness 1.0 must reproduce the engine ladder exactly"
+        );
+        assert!((search.aspect_max - ASPECT_MAX_DEFAULT).abs() < f32::EPSILON);
+        assert!((search.line_height_units - 1_200.0).abs() < f32::EPSILON);
+        assert_eq!(search.per_bucket, PER_BUCKET_DEFAULT);
+        assert!((search.hyphen.ratio_strict - HYPHEN_RATIO_DEFAULT).abs() < f32::EPSILON);
+        assert!(
+            (search.hyphen.slack_hi - HYPHEN_RELAX_SLACK_DEFAULT).abs() < f32::EPSILON,
+            "the relaxation knob is the `slack_hi` end of the hyphen budget"
+        );
+    }
+
+    #[test]
+    fn evenness_tightens_the_corridor_below_one_and_widens_it_above() {
+        let tight = AdvancedFormParams {
+            evenness: 0.5,
+            ..AdvancedFormParams::default()
+        }
+        .to_search_params(1_200.0, None, None);
+        let wide = AdvancedFormParams {
+            evenness: 1.5,
+            ..AdvancedFormParams::default()
+        }
+        .to_search_params(1_200.0, None, None);
+        let ladder = forms::default_corridor_ladder();
+
+        assert_eq!(tight.corridor_levels.len(), ladder.len());
+        assert_eq!(wide.corridor_levels.len(), ladder.len());
+        for (index, base) in ladder.iter().enumerate() {
+            let tight_level = tight.corridor_levels[index];
+            let wide_level = wide.corridor_levels[index];
+            let base_span = base.interior_hi - base.interior_lo;
+            assert!(
+                tight_level.interior_hi - tight_level.interior_lo < base_span,
+                "level {index}: the interior corridor must be strictly narrower at k = 0.5"
+            );
+            assert!(
+                wide_level.interior_hi - wide_level.interior_lo > base_span,
+                "level {index}: the interior corridor must be strictly wider at k = 1.5"
+            );
+            assert!(tight_level.interior_lo > base.interior_lo);
+            assert!(tight_level.interior_hi < base.interior_hi);
+            assert!(wide_level.interior_lo < base.interior_lo);
+            assert!(wide_level.interior_hi > base.interior_hi);
+            // All four bounds obey ONE law: they contract towards the ideal width at
+            // k < 1 and spread at k > 1. A tighter corridor must therefore also RAISE
+            // the edge floors — the multiplicative variant loosened them exactly when
+            // the user asked for more evenness, which made the knob non-monotone.
+            assert!(
+                tight_level.head_lo > base.head_lo && tight_level.tail_lo > base.tail_lo,
+                "level {index}: the edge floors must rise at k = 0.5"
+            );
+            assert!(
+                wide_level.head_lo < base.head_lo && wide_level.tail_lo < base.tail_lo,
+                "level {index}: the edge floors must fall at k = 1.5"
+            );
+            assert!((tight_level.head_lo - (1.0 - (1.0 - base.head_lo) * 0.5)).abs() < f32::EPSILON);
+            assert!((tight_level.tail_lo - (1.0 - (1.0 - base.tail_lo) * 0.5)).abs() < f32::EPSILON);
+            assert!((wide_level.head_lo - (1.0 - (1.0 - base.head_lo) * 1.5)).abs() < f32::EPSILON);
+            assert!((wide_level.tail_lo - (1.0 - (1.0 - base.tail_lo) * 1.5)).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn filters_prune_decides_whether_the_ranges_reach_the_search() {
+        let pruning = AdvancedFormParams::default();
+        assert!(pruning.filters_prune, "pruning is the default");
+        let pruned = pruning.to_search_params(1_200.0, Some((2, 5)), Some((10, 90)));
+        assert_eq!(pruned.line_range, Some((2, 5)));
+        assert_eq!(pruned.width_range, Some((10, 90)));
+
+        let filtering = AdvancedFormParams {
+            filters_prune: false,
+            ..AdvancedFormParams::default()
+        };
+        let unpruned = filtering.to_search_params(1_200.0, Some((2, 5)), Some((10, 90)));
+        assert_eq!(
+            (unpruned.line_range, unpruned.width_range),
+            (None, None),
+            "with pruning off the window's ranges must not constrain the search"
+        );
+    }
+
+    #[test]
+    fn hyphen_relaxation_never_falls_below_the_budget_floor() {
+        let params = AdvancedFormParams {
+            hyphen_relax_slack: HYPHEN_RELAX_SLACK_MIN,
+            hyphen_ratio: 0.25,
+            ..AdvancedFormParams::default()
+        };
+
+        let search = params.to_search_params(1_200.0, None, None);
+
+        assert!((search.hyphen.ratio_strict - 0.25).abs() < f32::EPSILON);
+        assert!(
+            search.hyphen.slack_hi >= search.hyphen.slack_lo,
+            "a `slack_hi` below `slack_lo` is the degenerate setting the engine \
+             answers with the strict ratio, i.e. no relaxation at all"
+        );
+    }
+
+    #[test]
+    fn clamp_to_supported_range_fixes_out_of_range_values() {
+        let mut params = AdvancedFormParams {
+            evenness: 9.0,
+            aspect_max: 0.1,
+            hyphen_ratio: f32::NAN,
+            hyphen_relax_slack: -5.0,
+            quality_floor: 100.0,
+            per_bucket: 0,
+            narrow_slots: 99,
+            filters_prune: false,
+        };
+
+        params.clamp_to_supported_range();
+
+        assert!((params.evenness - EVENNESS_MAX).abs() < f32::EPSILON);
+        assert!((params.aspect_max - ASPECT_MAX_MIN).abs() < f32::EPSILON);
+        assert!(
+            (params.hyphen_ratio - HYPHEN_RATIO_DEFAULT).abs() < f32::EPSILON,
+            "NaN has no side to clamp to and must fall back to the field default"
+        );
+        assert!((params.hyphen_relax_slack - HYPHEN_RELAX_SLACK_MIN).abs() < f32::EPSILON);
+        assert!((params.quality_floor - QUALITY_FLOOR_MAX).abs() < f32::EPSILON);
+        assert_eq!(params.per_bucket, PER_BUCKET_MIN);
+        assert_eq!(params.narrow_slots, NARROW_SLOTS_MAX);
+        assert!(!params.filters_prune, "a bool has no range to clamp");
+    }
+
+    #[test]
+    fn a_partial_stored_object_seeds_only_the_fields_it_names() {
+        let stored = json!({ "per_bucket": 3, "filters_prune": false, "evenness": 0.75 });
+
+        let params = AdvancedFormParams::from_config_value(&stored);
+
+        assert_eq!(params.per_bucket, 3);
+        assert!(!params.filters_prune);
+        assert!((params.evenness - 0.75).abs() < f32::EPSILON);
+        let defaults = AdvancedFormParams::default();
+        assert!((params.aspect_max - defaults.aspect_max).abs() < f32::EPSILON);
+        assert!((params.hyphen_ratio - defaults.hyphen_ratio).abs() < f32::EPSILON);
+        assert!(
+            (params.hyphen_relax_slack - defaults.hyphen_relax_slack).abs() < f32::EPSILON
+        );
+        assert!((params.quality_floor - defaults.quality_floor).abs() < f32::EPSILON);
+        assert_eq!(params.narrow_slots, defaults.narrow_slots);
+    }
+
+    #[test]
+    fn a_stored_object_round_trips_and_a_poisoned_one_degrades_to_defaults() {
+        let saved = AdvancedFormParams {
+            evenness: 0.8,
+            aspect_max: 3.5,
+            hyphen_ratio: 0.4,
+            hyphen_relax_slack: 1.5,
+            quality_floor: 1.25,
+            per_bucket: 7,
+            narrow_slots: 3,
+            filters_prune: false,
+        };
+
+        assert_eq!(
+            AdvancedFormParams::from_config_value(&saved.to_config_value()),
+            saved,
+            "the persisted object must round-trip exactly"
+        );
+
+        let defaults = AdvancedFormParams::default();
+        assert_eq!(
+            AdvancedFormParams::from_config_value(&Value::String("nonsense".to_string())),
+            defaults,
+            "a non-object value must degrade to the defaults, never poison the search"
+        );
+        let hand_edited = json!({ "per_bucket": 9_000, "evenness": -3.0, "narrow_slots": 0 });
+        let clamped = AdvancedFormParams::from_config_value(&hand_edited);
+        assert_eq!(clamped.per_bucket, PER_BUCKET_MAX);
+        assert_eq!(clamped.narrow_slots, NARROW_SLOTS_MIN);
+        assert!((clamped.evenness - EVENNESS_MIN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn setting_the_runtime_params_clamps_and_round_trips() {
+        let _params_guard = lock_advanced_form_params();
+        let stored = AdvancedFormParams {
+            per_bucket: 9_000,
+            ..AdvancedFormParams::default()
+        };
+
+        advanced_form_params::set_advanced_form_params(stored);
+        assert_eq!(
+            advanced_form_params::advanced_form_params().per_bucket,
+            PER_BUCKET_MAX,
+            "the setter must clamp, so no caller can hand the search a poisoned value"
+        );
+
+        // Restore the default so any other test observing the process-global sees it.
+        advanced_form_params::set_advanced_form_params(AdvancedFormParams::default());
+        assert_eq!(
+            advanced_form_params::advanced_form_params(),
+            AdvancedFormParams::default()
+        );
+    }
+
+    /// Installs a form cache whose key is the panel's CURRENT search input under
+    /// `knobs` — i.e. the state the window is in right after a search finished.
+    ///
+    /// The single form only has to be legal; the ranges/knobs are what the toggle test
+    /// measures.
+    fn install_current_advanced_form_cache(
+        state: &mut TypingCreatePanelState,
+        knobs: &AdvancedFormParams,
+    ) {
+        let key = AdvancedFormSearchKey {
+            base: state.advanced_form_search_base(knobs),
+            line_range: knobs
+                .filters_prune
+                .then_some(state.advanced_form_line_range)
+                .flatten(),
+            width_range: knobs
+                .filters_prune
+                .then_some(state.advanced_form_width_range)
+                .flatten(),
+        };
+        let result = AdvancedFormSearchResult {
+            forms: vec![ordering_test_form(3, 200, 1_000)],
+            truncated: false,
+        };
+        state.advanced_form_cache = Some(create_advanced::build_advanced_form_cache(
+            key, result, knobs, None,
+        ));
+    }
+
+    /// Flipping «Фильтры ограничивают перебор» must PRESERVE both range filters, in
+    /// BOTH directions — the checkbox only decides whether the ranges CONSTRAIN the
+    /// search or merely filter its output, so neither reading invalidates the numbers
+    /// the user dialled in.
+    ///
+    /// `filters_prune` used to be a field of `AdvancedFormSearchBase`, so a toggle
+    /// counted as "another text/font/preset" and `schedule_advanced_form_search` wiped
+    /// both spin boxes: a display-only range could not be promoted to a search
+    /// constraint, and a search constraint could not be demoted back.
+    #[test]
+    fn toggling_filters_prune_keeps_both_range_filters() {
+        let _params_guard = lock_advanced_form_params();
+        let ctx = egui::Context::default();
+        let mut state = TypingCreatePanelState::new(false);
+        state.text = "Проверка сохранения диапазонов при переключении".to_string();
+
+        let pruning = AdvancedFormParams::default();
+        assert!(pruning.filters_prune, "pruning is the shipped default");
+        let filtering = AdvancedFormParams {
+            filters_prune: false,
+            ..AdvancedFormParams::default()
+        };
+
+        // A set shown under PRUNING knobs, narrowed by both ranges (search inputs).
+        advanced_form_params::set_advanced_form_params(pruning);
+        state.advanced_form_line_range = Some((2, 4));
+        state.advanced_form_width_range = Some((10, 20));
+        install_current_advanced_form_cache(&mut state, &pruning);
+
+        // Direction 1: search constraint -> display filter.
+        advanced_form_params::set_advanced_form_params(filtering);
+        state.schedule_advanced_form_search(&ctx);
+        assert_eq!(
+            (state.advanced_form_line_range, state.advanced_form_width_range),
+            (Some((2, 4)), Some((10, 20))),
+            "turning pruning OFF must keep both ranges as display filters"
+        );
+        assert_eq!(
+            state
+                .advanced_form_search_debounce
+                .as_ref()
+                .map(|(key, _)| (key.line_range, key.width_range)),
+            Some((None, None)),
+            "with pruning off the ranges must leave the SEARCH key, not the window"
+        );
+
+        // The set the window now shows was produced under the unpruned key.
+        install_current_advanced_form_cache(&mut state, &filtering);
+        state.advanced_form_search_debounce = None;
+
+        // Direction 2: display filter -> search constraint.
+        advanced_form_params::set_advanced_form_params(pruning);
+        state.schedule_advanced_form_search(&ctx);
+        assert_eq!(
+            (state.advanced_form_line_range, state.advanced_form_width_range),
+            (Some((2, 4)), Some((10, 20))),
+            "turning pruning ON must promote the very same ranges, not clear them"
+        );
+        assert_eq!(
+            state
+                .advanced_form_search_debounce
+                .as_ref()
+                .map(|(key, _)| (key.line_range, key.width_range)),
+            Some((Some((2, 4)), Some((10, 20)))),
+            "with pruning on the ranges must enter the search key"
+        );
+
+        advanced_form_params::set_advanced_form_params(AdvancedFormParams::default());
+    }
+
+    /// A CONSTRAINED run must not let the spin-box bounds collapse onto the narrowed
+    /// range: the cache carries the previous bounds forward, unioned with what it
+    /// observed. The toggle fix above must not disturb that, since the carry is keyed
+    /// on the KEY's ranges (which still follow `filters_prune`).
+    #[test]
+    fn a_constrained_run_carries_the_previous_range_bounds_forward() {
+        let _params_guard = lock_advanced_form_params();
+        let knobs = AdvancedFormParams::default();
+        let state = TypingCreatePanelState::new(false);
+        advanced_form_params::set_advanced_form_params(knobs);
+
+        // An UNCONSTRAINED run observing 2..=5 lines.
+        let unconstrained_key = AdvancedFormSearchKey {
+            base: state.advanced_form_search_base(&knobs),
+            line_range: None,
+            width_range: None,
+        };
+        let wide = AdvancedFormSearchResult {
+            forms: vec![
+                ordering_test_form(2, 100, 1_000),
+                ordering_test_form(5, 200, 1_000),
+            ],
+            truncated: false,
+        };
+        let wide_cache =
+            create_advanced::build_advanced_form_cache(unconstrained_key.clone(), wide, &knobs, None);
+        assert_eq!(wide_cache.line_bounds, (2, 5), "an unconstrained run reports what it saw");
+
+        // The user narrows to 2..=2; the next run only ever sees 2-line forms.
+        let narrowed_key = AdvancedFormSearchKey {
+            line_range: Some((2, 2)),
+            ..unconstrained_key
+        };
+        let narrow = AdvancedFormSearchResult {
+            forms: vec![ordering_test_form(2, 100, 1_000)],
+            truncated: false,
+        };
+        let narrow_cache = create_advanced::build_advanced_form_cache(
+            narrowed_key,
+            narrow,
+            &knobs,
+            Some((wide_cache.line_bounds, wide_cache.width_bounds)),
+        );
+
+        assert_eq!(
+            narrow_cache.line_bounds,
+            (2, 5),
+            "a constrained run must keep the previous bounds, or the filter could \
+             never be widened again"
+        );
+
+        advanced_form_params::set_advanced_form_params(AdvancedFormParams::default());
+    }
+
+    /// Two debounced knob saves must not land out of order. The global config write
+    /// lock serializes the WRITES but not the SPAWNS, so an older snapshot could
+    /// overwrite a newer one and the knob would silently revert after a restart.
+    ///
+    /// The gate is what forbids it: only the newest claimed generation may write, and
+    /// the check happens under the gate's own lock, so an older writer cannot slip
+    /// between a newer one's check and its write. Asserted without threads — the
+    /// property is about the ORDER of `claim` versus `write_if_current`, which a
+    /// single thread can reproduce exactly.
+    #[test]
+    fn only_the_newest_advanced_form_params_save_reaches_the_disk() {
+        let gate = create_advanced::AdvancedFormParamsSaveGate::new();
+        let older = gate.claim();
+        let newer = gate.claim();
+        assert_ne!(older, newer, "every save must get its own generation");
+
+        let mut written: Vec<&str> = Vec::new();
+        assert!(
+            gate.write_if_current(newer, || written.push("newer")),
+            "the newest generation must write"
+        );
+        assert!(
+            !gate.write_if_current(older, || written.push("older")),
+            "a superseded generation must abandon its write"
+        );
+        assert_eq!(
+            written,
+            vec!["newer"],
+            "the older snapshot must never overwrite the newer one"
+        );
+
+        // A save claimed AFTER the last write is the newest again and does write.
+        let newest = gate.claim();
+        assert!(
+            gate.write_if_current(newest, || written.push("newest")),
+            "the next edit must still reach the disk"
+        );
+        assert_eq!(written, vec!["newer", "newest"]);
+
+        // A claim whose THREAD never started must be released, or it would block the
+        // save that is already in flight and nothing would ever be written.
+        let live = gate.claim();
+        let never_spawned = gate.claim();
+        gate.release(never_spawned);
+        assert!(
+            gate.write_if_current(live, || written.push("live")),
+            "releasing a stillborn save must hand the newest generation back"
+        );
+        assert_eq!(written, vec!["newer", "newest", "live"]);
     }

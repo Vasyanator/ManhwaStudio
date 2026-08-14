@@ -41,6 +41,11 @@ pub(crate) use panel::EffectDefaultsEditorState;
 pub(crate) use panel::seed_effect_defaults_from_config;
 // Startup seeding of the runtime-global imported-system-fonts store from user config.
 pub(crate) use panel::seed_imported_system_fonts_from_config;
+// The advanced text-form search knobs (`TextTab.advanced_form_search`). Re-exported
+// because the two config-owning sites live outside typing: the startup seed
+// (`main.rs::seed_advanced_form_search_from_config`) and the writer
+// (`tabs::settings::save_advanced_form_search_params`).
+pub(crate) use panel::advanced_form_params;
 pub use tab::TypingTabState;
 // Per-frame inputs of `TypingTabState::draw`, built by `app.rs` — it carries the
 // app-owned `PanelDockState` borrow the tab draws its panels from.

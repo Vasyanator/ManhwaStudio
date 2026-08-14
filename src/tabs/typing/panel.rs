@@ -46,18 +46,34 @@ FILE HEADER (tabs/typing/panel.rs)
   `unevenness_pct` = среднее |ширина−медиана| / медиана — общий разброс строк,
   устойчивый к одиночным выбросам). Ширина строк
   меряется попиксельно: панель строит `forms::GlyphWidths` выбранным шрифтом
-  (cosmic-text, кернинг пар) и передаёт как `LineWidthMetric` в `enumerate_forms`;
+  (cosmic-text, кернинг пар) и передаёт как `LineWidthMetric` в `forms::search_forms`;
   при недоступном шрифте — `CharWidthMetric` (счёт символов); байты шрифта берутся
-  из `FontProvider` ФОНОВЫМ потоком (`poll_advanced_form_font`), поэтому первые кадры
-  после открытия окна метрика посимвольная. Висящая пунктуация
+  из `FontProvider` ФОНОВЫМ потоком (`poll_advanced_form_font`), и ПЕРВЫЙ поиск ждёт
+  их прихода — иначе один и тот же кэш строился бы дважды (сначала посимвольно,
+  потом попиксельно). Висящая пунктуация
   оверлея учитывается (при включённой края не идут в ширину). Метрика
   перестраивается при смене текста/шрифта/начертания/висячести
-  (`AdvancedFormMetricSignature`). Границы берутся из фактических данных
-  (`AdvancedFormCache`) и сбрасываются при пересборке кэша; смена базы пиковости
-  раскрывает порог на максимум для новой базы. Сортировка — по ширине
-  (узкие → широкие), в пределах допуска по ширине сначала по ровности (меньшая
-  неравномерность раньше), затем по цене разрывов, пиковости и числу переносов
-  (`sort_advanced_forms`). Само окно стартует
+  (`AdvancedFormMetricSignature`).
+  ПЕРЕБОР НЕ ИДЁТ НА GUI-ПОТОКЕ. Весь вход поиска описан ключом
+  `AdvancedFormSearchKey` (текст, пресет, `AdvancedFormMetricSignature`, ручки
+  перебора из `AdvancedFormParams`, высота строки в em и диапазоны фильтров);
+  его смена взводит ~200 мс debounce, после которого запускается именованный
+  воркер `typing-form-search`, а замена задачи взводит её `Arc<AtomicBool>`
+  через `Drop` — то есть отменяет предыдущую без явного вызова на каждой
+  площадке мутации. Пока поиск в полёте, окно продолжает рисовать ПРЕЖНИЙ
+  результат и строку «пересчёт», а не пустую сетку. Диапазоны числа строк и
+  ширины — ВХОД поиска, пока включён `filters_prune` (тогда их границы берутся
+  из последнего НЕограниченного прогона, иначе сузивший себя фильтр было бы не
+  расширить); пиковость, неравномерность и консервативность остаются фильтрами
+  показа. Сама галочка `filters_prune` в БАЗУ ключа не входит, поэтому её
+  переключение в любую сторону диапазоны СОХРАНЯЕТ и лишь меняет, попадают ли
+  они в перебор. Порядок карточек — `text_forms::order_advanced_forms` (слой C плана
+  `dev-docs/text_forms_ranking_plan.md`): порог качества, корзины по числу строк,
+  уклон в узкие, круговой показ. Порог качества и приоритет узких форм
+  (`AdvancedFormOrderKey`) НЕ перезапускают перебор — только пересортировку.
+  Ручки перебора живут в сворачиваемой секции «Параметры поиска» самого окна
+  (`advanced_form_params`, персист `TextTab.advanced_form_search`).
+  Само окно стартует
   размером 80%×80% вьюпорта, поднято на `Order::Tooltip` (над панелями
   параметров/действий) и при открытии центрируется по вьюпорту: первый кадр
   скрыт (`set_opacity(0)`), пока не измерен итоговый размер, после чего
@@ -154,8 +170,12 @@ use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread as thread;
+// The panel compiles for wasm too, where `std::time::Instant` panics; `web_time`
+// is the workspace-wide shim (same API, browser clock under wasm).
+use web_time::{Duration, Instant};
 
 const CREATE_PREVIEW_HEIGHT_PX: f32 = 200.0;
 const EDIT_TEXT_FIELD_HEIGHT_PX: f32 = 170.0;
@@ -199,6 +219,13 @@ mod create_apply;
 // defaults, write/read). `pub(in crate::tabs::typing)` because the tab-side codec and
 // the PSD export read stored payloads through it too.
 pub(in crate::tabs::typing) mod text_params_schema;
+// The eight user knobs of the advanced text-form search: their supported ranges and
+// defaults, the process-global runtime value, the persisted JSON shape and the mapping
+// onto the engine's `FormSearchParams`. `pub(crate)` (re-exported by `tabs::typing`)
+// because the startup seed (`main.rs`) and the config writer (`tabs::settings`) live
+// outside the typing subtree.
+pub(crate) mod advanced_form_params;
+use advanced_form_params::AdvancedFormParams;
 mod text_forms;
 use text_forms::*;
 mod inline_tags;
@@ -1791,6 +1818,19 @@ struct TypingCreatePanelState {
     /// Выбранная группа по числу переносов слов; `None` — «Все».
     advanced_form_group: Option<usize>,
     advanced_form_cache: Option<AdvancedFormCache>,
+    /// Поиск форм, выполняющийся ПРЯМО СЕЙЧАС в фоновом потоке; не более одного.
+    /// Замена значения отменяет прежнюю задачу (`Drop` взводит её флаг отмены).
+    advanced_form_search: Option<AdvancedFormSearchJob>,
+    /// Debounce запуска поиска: ключ, ради которого «тикает» таймер, и момент
+    /// последней смены этого ключа. Пока пользователь печатает, ключ меняется
+    /// каждый кадр и таймер взводится заново, поэтому серия нажатий запускает
+    /// ОДИН перебор, а не по одному на кадр.
+    advanced_form_search_debounce: Option<(AdvancedFormSearchKey, Instant)>,
+    /// Ручки поиска правились и ещё не записаны в `user_config.json`; значение —
+    /// момент последней правки. Значение УЖЕ применено к процесс-глобальному
+    /// состоянию, ждёт только диск: слайдер отдаёт новое число на каждом кадре
+    /// перетаскивания, и запись на кадр была бы чистой амплификацией.
+    advanced_form_params_save_pending: Option<Instant>,
     /// Font bytes for the advanced-form width metric, resolved OFF the GUI thread; see
     /// [`AdvancedFormFont`]. `None` until the window has asked for a font at all.
     advanced_form_font: Option<AdvancedFormFont>,
@@ -1803,10 +1843,14 @@ struct TypingCreatePanelState {
     /// Какой из двух текстов развёрнут в панели (конкурирующий аккордеон):
     /// `true` — сформированный, `false` — исходный.
     advanced_text_show_formed: bool,
-    /// Фильтр по числу строк `(min, max)`; задаётся границами кэша.
-    advanced_form_line_range: (usize, usize),
-    /// Фильтр по ширине самой длинной строки `(min, max)`, в единицах метрики.
-    advanced_form_width_range: (u32, u32),
+    /// Фильтр по числу строк `(min, max)`. `None` — «весь диапазон»: фильтр не
+    /// сужен пользователем, поэтому в поиск он не передаётся и его границы
+    /// берутся из полученного набора форм. При включённом
+    /// [`AdvancedFormParams::filters_prune`] это ВХОД перебора, а не фильтр показа.
+    advanced_form_line_range: Option<(usize, usize)>,
+    /// Фильтр по ширине самой длинной строки `(min, max)` в единицах метрики;
+    /// `None` — «весь диапазон» (см. [`Self::advanced_form_line_range`]).
+    advanced_form_width_range: Option<(u32, u32)>,
     /// Верхний порог пиковости в % (показываем формы не «пиковее» него).
     advanced_form_peak_max: u32,
     /// База отсчёта пиковости (минимум/медиана).
@@ -1832,21 +1876,116 @@ struct TypingCreatePanelState {
 /// из прошедших фильтр.
 const ADVANCED_FORM_DISPLAY_LIMIT: usize = 600;
 
-/// Кэш перечисленных форм для окна «Продвинутая форма текста».
-struct AdvancedFormCache {
+/// Всё, от чего зависит НАБОР найденных форм, кроме диапазонов фильтров окна.
+///
+/// Смена базы означает другой текст/шрифт/пресет/ручку перебора, то есть другой
+/// набор форм: сужённые под прошлый набор диапазоны фильтров и пороги показа
+/// теряют смысл и сбрасываются, чего смена одних лишь диапазонов не делает.
+///
+/// [`AdvancedFormParams::filters_prune`] сюда НЕ входит намеренно: он не меняет
+/// набор сам по себе, а лишь решает, попадают ли диапазоны окна в
+/// [`AdvancedFormSearchKey`]. Будь он полем базы, переключение галочки считалось
+/// бы сменой базы и стирало бы оба диапазона — то есть ни превратить фильтр
+/// показа в ограничение перебора, ни вернуть его обратно было бы нельзя.
+///
+/// Все вещественные поля КОНЕЧНЫ по построению
+/// (`AdvancedFormParams::clamp_to_supported_range` для ручек и
+/// `advanced_form_line_height_em` для высоты строки), поэтому производное
+/// `PartialEq` рефлексивно и сравнение ключа не может зациклить перезапуск.
+#[derive(Debug, Clone, PartialEq)]
+struct AdvancedFormSearchBase {
+    /// Подготовленный исходный текст (`advanced_form_source_text`).
     source_text: String,
     preset: TextFormPreset,
-    /// Формы, отсортированные по ширине (узкие → широкие), а в пределах ±1
-    /// символа — по накопленной цене разрывов.
+    /// Шрифт/начертание/висячая пунктуация — от них зависят ширины строк.
+    metric: AdvancedFormMetricSignature,
+    /// Ручки, влияющие на ПЕРЕБОР. Порог качества и приоритет узких форм сюда не
+    /// входят: они меняют только порядок показа ([`AdvancedFormOrderKey`]).
+    evenness: f32,
+    aspect_max: f32,
+    hyphen_ratio: f32,
+    hyphen_relax_slack: f32,
+    per_bucket: usize,
+    /// Высота строки в долях em — вторая половина потолка пропорции формы
+    /// (первая — ширины метрики). Строго положительна и конечна.
+    line_height_em: f32,
+}
+
+/// Полный вход поиска форм: база плюс диапазоны фильтров окна, которые при
+/// включённом `filters_prune` СОКРАЩАЮТ перебор (и потому попадают в ключ), а
+/// иначе передаются как `None` и остаются фильтром показа.
+#[derive(Debug, Clone, PartialEq)]
+struct AdvancedFormSearchKey {
+    base: AdvancedFormSearchBase,
+    line_range: Option<(usize, usize)>,
+    width_range: Option<(u32, u32)>,
+}
+
+/// Ручки, влияющие ТОЛЬКО на порядок показа карточек
+/// (`text_forms::order_advanced_forms`). Их смена пересортировывает уже
+/// найденный набор и НИКОГДА не перезапускает перебор: пересортировка дешёвая,
+/// перебор — нет.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AdvancedFormOrderKey {
+    /// Порог качества в единицах `TextForm::quality_milli`
+    /// (`AdvancedFormParams::quality_floor_milli`).
+    quality_floor_milli: u32,
+    narrow_slots: usize,
+}
+
+/// Результат фонового поиска форм — ровно то, что вернул `forms::search_forms`.
+struct AdvancedFormSearchResult {
     forms: Vec<TextForm>,
+    truncated: bool,
+}
+
+/// Выполняющийся в фоне поиск форм для окна «Продвинутая форма текста».
+///
+/// Отмена устроена как у `TypingShapeVariantPreviewState`: воркер держит копию
+/// `cancel`, а `Drop` этой структуры взводит флаг — поэтому ПРИСВОЕНИЕ нового
+/// значения полю панели отменяет предыдущую задачу, и ни одна площадка мутации
+/// не обязана помнить про явный вызов отмены.
+struct AdvancedFormSearchJob {
+    /// Вход, ради которого задача запущена; он же становится ключом кэша.
+    key: AdvancedFormSearchKey,
+    /// Взводится `Drop`'ом; воркер проверяет его до и после перебора.
+    cancel: Arc<AtomicBool>,
+    /// Отдаёт результат ровно один раз.
+    rx: Receiver<AdvancedFormSearchResult>,
+    /// Сбросить пороги показа (пиковость, неравномерность, консервативность,
+    /// группа переносов) при приёме результата: взводится, только когда сменилась
+    /// БАЗА ключа, иначе правка одного диапазона обнуляла бы чужие фильтры.
+    reset_display_filters: bool,
+}
+
+impl Drop for AdvancedFormSearchJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Кэш найденных форм для окна «Продвинутая форма текста».
+struct AdvancedFormCache {
+    /// Вход, которым получен этот результат. Несовпадение с текущим входом — и
+    /// есть повод запустить новый поиск.
+    key: AdvancedFormSearchKey,
+    /// Формы КАК ИХ ВЕРНУЛ `forms::search_forms` (по корзинам высот, внутри
+    /// корзины — по возрастанию `quality_milli`). Хранятся отдельно от показа,
+    /// потому что порог качества ВЫБРАСЫВАЕТ формы, а его ослабление обязано
+    /// вернуть их без нового перебора.
+    searched_forms: Vec<TextForm>,
+    /// Порядок показа (`order_advanced_forms`) при [`Self::order_key`].
+    forms: Vec<TextForm>,
+    /// Ручки показа, при которых собран [`Self::forms`].
+    order_key: AdvancedFormOrderKey,
     /// Встретившиеся значения числа переносов слов (для динамических кнопок).
     group_counts: Vec<usize>,
-    /// Границы фильтров по фактическим данным: число строк, ширина, пиковость %.
+    /// Границы диапазонных фильтров. Обновляются по фактическим данным только
+    /// после НЕограниченного прогона; после прогона, СУЖЕННОГО этими же
+    /// фильтрами, переносятся с прошлого кэша (объединённые с наблюдёнными),
+    /// иначе сузивший себя фильтр было бы уже не расширить.
     line_bounds: (usize, usize),
     width_bounds: (u32, u32),
-    /// Сигнатура шрифта/режима, при которой построена метрика ширины. Смена —
-    /// повод пересобрать кэш (ширины меняются).
-    metric_signature: AdvancedFormMetricSignature,
     /// Максимальная пиковость в % для каждой базы (минимум/медиана).
     peak_max_bound_min: u32,
     peak_max_bound_median: u32,
@@ -1855,8 +1994,8 @@ struct AdvancedFormCache {
     /// Самая вольная консервативность среди форм (верхняя граница фильтра). Если
     /// `Safe` — отрывов служебных слов нет, селектор консервативности не нужен.
     conservatism_bound: Conservatism,
-    /// Перебор форм оказался неполным: выбит бюджет узлов рекурсии (не лимит
-    /// отрисовки). Означает, что в кэше лежат не все возможные формы.
+    /// Перебор форм оказался неполным: выбит бюджет узлов (не лимит отрисовки).
+    /// Означает, что в кэше лежат не все возможные формы.
     truncated: bool,
 }
 
@@ -1872,6 +2011,35 @@ struct AdvancedFormFont {
     /// Remembered rather than retried, so a missing font does not spawn a resolver per
     /// frame for as long as the window stays open.
     content: Option<FontContent>,
+}
+
+/// Снимок всего, что нужно для ПОСТРОЕНИЯ метрики ширины окна форм, — чтобы её
+/// строил фоновый воркер, а не GUI-поток.
+///
+/// Байты уже разрешены (`AdvancedFormFont`), поэтому чтения файла здесь нет; но
+/// разбор фейса, регистрация в `fontdb` и шейпинг алфавита — работа, которой на
+/// GUI-потоке делать нечего (`CLAUDE.md` §5). Путь и подпись шрифта нужны только
+/// для диагностики и для пропуска уже зарегистрированного файла в бандловой
+/// цепочке; ключом ничто из них не является.
+#[derive(Clone)]
+struct AdvancedFormMetricSpec {
+    /// Разрешённые байты выбранного шрифта; `None` — метрика будет посимвольной.
+    content: Option<FontContent>,
+    /// Индекс фейса ВЫБРАННОГО пользователем начертания внутри файла.
+    face_index: usize,
+    /// Выбран синтетический «Встроенный шрифт интерфейса»: в базу метрики
+    /// доливается остаток бандловой цепочки `core`.
+    bundled_stack: bool,
+    /// Файл выбранного фейса — источник байт и то, что пропускается при доливке
+    /// цепочки, чтобы фейс не задвоился.
+    path: PathBuf,
+    /// Подпись шрифта для сообщений в лог.
+    display_label: String,
+    force_bold: bool,
+    faux_bold: bool,
+    force_italic: bool,
+    faux_italic: bool,
+    hanging_punctuation: bool,
 }
 
 /// An in-flight background resolve of [`AdvancedFormFont`].

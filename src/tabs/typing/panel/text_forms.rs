@@ -4,8 +4,14 @@ File: panel/text_forms.rs
 Purpose:
 Free-function helpers extracted verbatim from panel.rs for text-form editing:
 char/byte range conversions, inclusive bounds over an iterator, and the
-advanced-form window support (range-row filter UI, form sorting, and form-card
-drawing).
+advanced-form window support (range-row filter UI, the presentation order of the
+ranked search, and form-card drawing).
+
+Key functions:
+- `order_advanced_forms`: presentation order of the ranked search (layer C of
+  `dev-docs/text_forms_ranking_plan.md` §2.3) — quality floor, line-count
+  buckets, narrow lean, round-robin split into SUB-ROUNDS (which is what lets the
+  narrow lean coexist with "every height appears before any height repeats").
 
 Notes:
 Extracted verbatim from `panel.rs`. Free fns are `pub(super)` and the parent
@@ -150,32 +156,119 @@ where
     true
 }
 
-/// Сортировка форм для окна: узкие → широкие; в пределах допуска по ширине —
-/// по ровности (меньшая неравномерность раньше), затем по цене разрывов,
-/// пиковости и числу переносов.
-pub(super) fn sort_advanced_forms(forms: &mut [TextForm]) {
-    forms.sort_by_key(|a| a.max_width);
-    let mut i = 0;
-    while i < forms.len() {
-        let run_min = forms[i].max_width;
-        let mut j = i + 1;
-        while j < forms.len() && forms[j].max_width <= run_min + forms::DEFAULT_WIDTH_TOLERANCE {
-            j += 1;
-        }
-        forms[i..j].sort_by(|a, b| {
-            a.conservatism
-                .cmp(&b.conservatism)
-                .then(a.unevenness_pct.cmp(&b.unevenness_pct))
-                .then(a.break_cost.cmp(&b.break_cost))
-                .then(a.max_width.cmp(&b.max_width))
-                .then(
-                    a.peakiness_pct(PeakBase::Min)
-                        .cmp(&b.peakiness_pct(PeakBase::Min)),
-                )
-                .then(a.word_break_count.cmp(&b.word_break_count))
-        });
-        i = j;
+/// Порядок ПОКАЗА форм в окне «Продвинутая форма текста» — слой C плана
+/// (`dev-docs/text_forms_ranking_plan.md` §2.3) поверх выхода
+/// `forms::search_forms`.
+///
+/// Вход: формы, уже сгруппированные по числу строк и отсортированные по
+/// `quality_milli` внутри группы (гарантия `search_forms`; порядок внутри корзины
+/// здесь дополнительно закрепляется УСТОЙЧИВОЙ сортировкой по `quality_milli`,
+/// поэтому контракт не зависит от того, кто собрал вектор).
+///
+/// Что делает порядок:
+/// 1. **Порог качества** — форма, чей `quality_milli` хуже лучшего в наборе более
+///    чем на `params.quality_floor_milli()`, отбрасывается (выбывают целые
+///    «мусорные» корзины, а не хвосты хороших).
+/// 2. **Корзины по числу строк** — естественное семейство альтернатив одной высоты.
+/// 3. **Уклон в узкие** — корзина, чья ЛУЧШАЯ форма не шире МЕДИАНЫ лучших форм
+///    всех корзин (нижняя медиана), получает `params.narrow_slots` мест за круг,
+///    остальные — одно. Мера ОТНОСИТЕЛЬНАЯ: у большого текста все формы высокие,
+///    и абсолютный порог пропорции не разделил бы их.
+/// 4. **Круговой показ ПОДКРУГАМИ** — карточка ранга `i` корзины с `мест` мест за
+///    круг встаёт в `круг = i / мест`, `подкруг = i % мест`; итоговый порядок —
+///    по `(круг, подкруг, quality_milli)`. Подкруг 0 любого круга содержит РОВНО
+///    по одной карточке каждой непустой корзины, поэтому держатся ОБА свойства
+///    плана §2.3 сразу: карточка №1 — глобально лучшая форма, ни одна высота не
+///    повторяется, пока не показаны все высоты, — и при этом вторая карточка
+///    узкой корзины приходит сразу следующим подкругом, то есть уклон в узкие
+///    остаётся ранним. Без подкругов (все места одного круга вперемешку) эти
+///    свойства противоречили бы друг другу: корзина с двумя местами повторяла бы
+///    свою высоту ВНУТРИ круга 0.
+///
+/// Формы с `forms::UNSCORED_QUALITY_MILLI` (выход легаси-перебора
+/// `enumerate_forms`, качество не считалось) ранжируются ОТДЕЛЬНО и уходят в
+/// ХВОСТ: их «худшее возможное» качество иначе либо целиком выбило бы их порогом,
+/// либо, вперемешку с оценёнными, подняло бы неоценённую форму выше настоящих
+/// карточек следующего круга.
+#[must_use]
+pub(super) fn order_advanced_forms(
+    forms: Vec<TextForm>,
+    params: &AdvancedFormParams,
+) -> Vec<TextForm> {
+    let (scored, unscored): (Vec<TextForm>, Vec<TextForm>) = forms
+        .into_iter()
+        .partition(|form| form.quality_milli != forms::UNSCORED_QUALITY_MILLI);
+    let mut ordered = order_form_group(scored, params);
+    // Порог качества неоценённой группы вырожден (лучшее = `u32::MAX`, сумма
+    // насыщается) и не отбрасывает ничего — группа лишь раскладывается по кругам.
+    ordered.extend(order_form_group(unscored, params));
+    ordered
+}
+
+/// Слой C для ОДНОЙ группы форм с сопоставимым качеством (см.
+/// [`order_advanced_forms`]): порог качества, корзины по высоте, уклон в узкие и
+/// круговой показ подкругами. Пустой вход даёт пустой выход.
+#[must_use]
+fn order_form_group(forms: Vec<TextForm>, params: &AdvancedFormParams) -> Vec<TextForm> {
+    let Some(best_quality) = forms.iter().map(|form| form.quality_milli).min() else {
+        return Vec::new();
+    };
+    let quality_ceiling = best_quality.saturating_add(params.quality_floor_milli());
+
+    let mut buckets: BTreeMap<usize, Vec<TextForm>> = BTreeMap::new();
+    for form in forms
+        .into_iter()
+        .filter(|form| form.quality_milli <= quality_ceiling)
+    {
+        buckets.entry(form.line_count()).or_default().push(form);
     }
+    for bucket in buckets.values_mut() {
+        // Устойчивая сортировка: на выходе `search_forms` это no-op, а для любого
+        // другого источника она восстанавливает «лучшее в корзине — первым».
+        bucket.sort_by_key(|form| form.quality_milli);
+    }
+
+    // Нижняя медиана: при чётном числе корзин лишние места достаются более узкой
+    // половине, а не обеим сразу.
+    let mut best_aspects: Vec<u32> = buckets
+        .values()
+        .filter_map(|bucket| bucket.first().map(|form| form.aspect_milli))
+        .collect();
+    best_aspects.sort_unstable();
+    let median_aspect = best_aspects
+        .get(best_aspects.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
+    let narrow_slots = params.narrow_slots.max(1);
+
+    let queues: Vec<(usize, Vec<TextForm>)> = buckets
+        .into_values()
+        .map(|bucket| {
+            let slots = match bucket.first() {
+                Some(best) if best.aspect_milli <= median_aspect => narrow_slots,
+                _ => 1,
+            };
+            (slots, bucket)
+        })
+        .collect();
+
+    // Место карточки — `(круг, подкруг, качество)`. Подкруг существует ровно ради
+    // того, чтобы «уклон в узкие» не ломал «ни одна высота не повторяется, пока не
+    // показаны все»: вторая карточка узкой корзины уходит в подкруг 1, то есть за
+    // ПОЛНЫЙ подкруг 0, где каждая высота представлена ровно один раз.
+    let mut slotted: Vec<(usize, usize, u32, TextForm)> = Vec::new();
+    for (slots, bucket) in queues {
+        for (rank, form) in bucket.into_iter().enumerate() {
+            let quality = form.quality_milli;
+            // `slots >= 1` по построению: либо `narrow_slots.max(1)`, либо единица.
+            slotted.push((rank / slots, rank % slots, quality, form));
+        }
+    }
+    // Устойчиво: при равных круге, подкруге и качестве порядок остаётся «по
+    // возрастанию высоты» — корзины пришли из `BTreeMap`, то есть по возрастанию
+    // числа строк.
+    slotted.sort_by_key(|(round, sub_round, quality, _)| (*round, *sub_round, *quality));
+    slotted.into_iter().map(|(_, _, _, form)| form).collect()
 }
 
 /// Рисует одну карточку формы: чёрный текст на белом, строки центрированы по

@@ -6,10 +6,20 @@ Purpose:
 чтобы последовательность ширин строк удовлетворяла выбранной форме.
 
 Used by:
-- панель typing (`panel.rs`) — окно «Продвинутая форма текста» перечисляет все
-  валидные формы (`enumerate_forms`) и отображает их обычным egui-текстом;
+- панель typing (`panel.rs`) — окно «Продвинутая форма текста» получает
+  ранжированный набор форм (`search_forms`) и отображает их обычным egui-текстом;
 - новый рендер (`render_next`) — `choose_form` подбирает одну форму поверх
   существующего scored-wrap, не переписывая его.
+
+Две точки входа в перебор:
+- `enumerate_forms` — исчерпывающий перебор без ранжирования (порядок обхода
+  дерева, ограничители: `max_forms`, свободная память, потолок узлов). Путь
+  `choose_form`; на больших текстах комбинаторно взрывается.
+- `search_forms` — ранжированный поиск (`dev-docs/text_forms_ranking_plan.md`).
+  Отдельный ограниченный перебор НА КАЖДУЮ ВЫСОТУ формы внутри коридора ширин,
+  с потолком пропорции, бюджетом переносов и оценкой качества `Q`. Все числовые
+  решения вынесены в `FormSearchParams`; дедлайна по часам нет (крейт собирается
+  и под wasm) — только детерминированные бюджеты по числу узлов.
 
 Дерево перебора:
 Текст заранее делится на блоки сегментатором (`segmentation::Segmenter::segment`
@@ -46,6 +56,21 @@ Width metric:
 дефис переноса) не идёт в ширину; при выключенной — считается. Сравнение ширин в
 предикатах формы идёт с допуском (`tolerance`), чтобы суб-глифовый джиттер не
 создавал ложных подъёмов/спусков.
+
+Notes:
+- пропорция формы считается в единицах метрики: `line_height_units` приходит от
+  вызывающего (см. док-комментарий поля), потому что перевод пикселей в единицы
+  знает только он — `GlyphWidths` меряет в 1/1000 em, `CharWidthMetric` в символах;
+- `search_forms` держит memo ширин `(start, end) → ширина` (`WidthMemo`): плотная
+  таблица на `n²` ячеек по 8 байт, пока `n²` укладывается в
+  `DENSE_WIDTH_MEMO_MAX_CELLS`, дальше — разрежённая хеш-таблица с потолком
+  записей. Текст строки в memo не хранится: он нужен только при выдаче формы и
+  собирается там заново;
+- вещественные поля `FormSearchParams` санируются на входе `search_forms`
+  (`NaN`/бесконечность/вне области → значение по умолчанию): крейт GUI-free,
+  логировать и падать здесь нечему, а `NaN` молча снимал бы гарантии слоя A;
+- бюджет узлов `node_budget_total` — один на весь вызов `search_forms`, включая
+  аварийный прогон со снятым потолком пропорции.
 */
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -69,14 +94,14 @@ const MIN_AVAILABLE_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Как часто (в узлах DFS) проверять свободную память. Чтение `/proc/meminfo`
 /// на каждом узле было бы дорого, поэтому проверяем раз в N узлов.
-const MEMORY_CHECK_INTERVAL_NODES: usize = 8192;
+const MEMORY_CHECK_INTERVAL_NODES: u64 = 8192;
 
 /// Аварийный потолок числа узлов DFS — гарантия завершения для случая, когда
 /// свободную память наблюдать нельзя (`available_memory_bytes()` вернул `None`,
 /// напр. не-Linux) ИЛИ память просто никогда не падает ниже порога. На Linux с
 /// читаемым `MemAvailable` практический ограничитель — память, а не этот потолок
 /// (то есть фактически «без лимита по количеству, только по памяти»).
-const SAFETY_NODE_CEILING: usize = 50_000_000;
+const SAFETY_NODE_CEILING: u64 = 50_000_000;
 
 /// Доступная («OOM-релевантная») память процесса в байтах. На Linux читает
 /// `MemAvailable:` из `/proc/meminfo` (значение в кБ → ×1024); эта метрика
@@ -311,7 +336,29 @@ pub struct TextForm {
     /// `Safe` — все переносы безопасны; выше — есть отрыв предлога/частицы и т.п.
     /// По этому полю формы фильтруются (см. окно «Продвинутая форма текста»).
     pub conservatism: Conservatism,
+    /// Ширина каждой строки формы (в единицах метрики), в порядке строк. Заполняют
+    /// оба пути перебора; потребителям не нужно перемерять строки заново.
+    pub line_widths: Vec<u32>,
+    /// Оценка качества `Q` × 1000 (плановый слой B, §2.2): МЕНЬШЕ — ЛУЧШЕ.
+    /// Заполняет только [`search_forms`]; [`enumerate_forms`] проставляет
+    /// [`UNSCORED_QUALITY_MILLI`] («не оценивалось»), чтобы «неоценённое» никогда
+    /// не выглядело идеальным при сортировке по возрастанию.
+    pub quality_milli: u32,
+    /// «Шероховатость» профиля ширин в % (терм `rough` из §2.2 × 100): смесь
+    /// максимального и среднего скачка ширины между соседними строками,
+    /// нормированная на медианную ширину, с уценкой краевых переходов.
+    /// `0%` — все строки одной ширины. Заполняют оба пути перебора.
+    pub roughness_pct: u32,
+    /// Пропорция формы `max_width / (число строк × line_height_units)` × 1000
+    /// (1000 = квадрат, больше = шире). Заполняет только [`search_forms`]:
+    /// [`enumerate_forms`] не знает высоту строки и оставляет `0` («неизвестно»).
+    pub aspect_milli: u32,
 }
+
+/// Значение [`TextForm::quality_milli`] для форм, которые не проходили оценку
+/// качества (выход [`enumerate_forms`]). Намеренно «худшее возможное»: сортировка
+/// по возрастанию `quality_milli` не поднимет неоценённую форму наверх.
+pub const UNSCORED_QUALITY_MILLI: u32 = u32::MAX;
 
 /// База отсчёта пиковости: с чем сравнивать самую длинную строку.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,20 +414,28 @@ fn median_of_widths(widths: &[u32]) -> u32 {
     }
 }
 
-/// «Неравномерность» в %: среднее абсолютное отклонение ширин от медианы,
-/// делённое на медиану. Устойчива к одиночным выбросам (короткая последняя
-/// строка почти не влияет), но штрафует общий разброс («лесенку»/«воронку»).
+/// «Неравномерность» в долях медианы: среднее абсолютное отклонение ширин от
+/// медианы, делённое на медиану. Устойчива к одиночным выбросам (короткая
+/// последняя строка почти не влияет), но штрафует общий разброс
+/// («лесенку»/«воронку»). `0.0` для пустого набора и нулевой медианы.
 #[must_use]
-fn unevenness_pct_of_widths(widths: &[u32], median: u32) -> u32 {
+fn unevenness_of_widths(widths: &[u32], median: u32) -> f64 {
     if widths.is_empty() || median == 0 {
-        return 0;
+        return 0.0;
     }
     let mean_abs_dev = widths
         .iter()
         .map(|&w| (f64::from(w) - f64::from(median)).abs())
         .sum::<f64>()
-        / widths.len() as f64;
-    ((mean_abs_dev / f64::from(median)) * 100.0).round() as u32
+        / count_as_f64(widths.len());
+    mean_abs_dev / f64::from(median)
+}
+
+/// «Неравномерность» в % — то же, что [`unevenness_of_widths`], округлённое до
+/// целых процентов (поле [`TextForm::unevenness_pct`]).
+#[must_use]
+fn unevenness_pct_of_widths(widths: &[u32], median: u32) -> u32 {
+    round_to_u32(unevenness_of_widths(widths, median) * 100.0)
 }
 
 // --- Метрика ширины строки -------------------------------------------------
@@ -394,6 +449,16 @@ const WIDTH_METRIC_EM: f32 = 1000.0;
 pub const DEFAULT_WIDTH_TOLERANCE: u32 = 35;
 
 /// Источник ширины строки для перебора форм.
+///
+/// # Контракт для реализаций
+/// Ранжированный поиск ([`search_forms`]) обрывает просмотр всё более длинных
+/// строк, опираясь на ОДНО свойство метрики (монотонность ширины по длине строки
+/// НЕ требуется — её нарушает уже хвостовой дефис переноса, становящийся
+/// внутренним): удлинение строки ещё одним блоком не может уменьшить её ширину
+/// больше, чем на сумму «ширина самого широкого одиночного блока» +
+/// `line_width("-")`. Обе штатные метрики ([`CharWidthMetric`], [`GlyphWidths`])
+/// этому удовлетворяют с большим запасом: ширина строки у них — сумма вкладов
+/// символов, а единственный исчезающий при удлинении вклад — дефис переноса.
 pub trait LineWidthMetric {
     /// Ширина строки в единицах метрики, с учётом висящей пунктуации по краям.
     fn line_width(&self, line: &str) -> u32;
@@ -544,10 +609,17 @@ fn measure_units(font_system: &mut FontSystem, attrs: &Attrs<'_>, text: &str) ->
 #[derive(Debug, Clone)]
 pub struct FormEnumeration {
     pub forms: Vec<TextForm>,
-    /// Список форм усечён: достигнут лимит `max_forms`, сработала защита по
-    /// свободной памяти (`MIN_AVAILABLE_MEMORY_BYTES`) или аварийный потолок
-    /// узлов (`SAFETY_NODE_CEILING`).
+    /// Список форм усечён: достигнут лимит `max_forms`, бюджет узлов/форм
+    /// [`FormSearchParams`], сработала защита по свободной памяти
+    /// (`MIN_AVAILABLE_MEMORY_BYTES`) или аварийный потолок узлов
+    /// (`SAFETY_NODE_CEILING`). Отбор `per_bucket` лучших форм в корзине
+    /// усечением НЕ считается — это курирование, а не исчерпание бюджета.
     pub truncated: bool,
+    /// Сколько узлов дерева перебора было посещено (суммарно по всем корзинам и,
+    /// для [`search_forms`], включая аварийный повторный прогон). Диагностика и
+    /// проверка того, что жёсткие ограничения поиска действительно СОКРАЩАЮТ
+    /// перебор, а не фильтруют его результат.
+    pub nodes_visited: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -863,13 +935,49 @@ struct EnumContext<'a> {
     tol: u32,
     out: Vec<TextForm>,
     seen: HashSet<String>,
-    nodes: usize,
+    nodes: u64,
+    memory: MemoryProbe,
     truncated: bool,
+}
+
+/// Делит подготовленный `text` на блоки перебора форм.
+///
+/// Инлайновые `<no-break>`/`<m j>`-диапазоны уже не рвутся (их пробелы стали
+/// NBSP), остальной текст размечается мягкими переносами, после чего сегментатор
+/// строит блоки в режиме [`BindingMode::Annotate`] — граф строится один раз, а
+/// служебные связи помечаются категорией консервативности на стыке.
+#[must_use]
+fn segment_form_blocks(seg: &dyn ms_text_util::segmentation::Segmenter, text: &str) -> Vec<Block> {
+    let hyphenated = inline_no_break_runs(text)
+        .into_iter()
+        .map(|run| {
+            if run.no_break {
+                run.text
+            } else {
+                seg.soft_hyphenate_overlong(run.text.as_str())
+            }
+        })
+        .collect::<String>();
+    seg.segment(
+        &hyphenated,
+        SegmentOptions {
+            hanging_punctuation: false,
+            preserve_edge_spaces: false,
+            allow_hard_hyphen_breaks: true,
+            // Строим граф один раз: служебные слова не склеиваем, а помечаем
+            // стык категорией консервативности — фильтрация форм потом.
+            binding: BindingMode::Annotate,
+        },
+    )
 }
 
 /// Перечисляет за один прогон все формы `text`, удовлетворяющие `preset`.
 /// Повторов нет: каждая комбинация разрывов даёт уникальный текст. Ширины строк
 /// берутся из `metric`.
+///
+/// Это ИСХОДНЫЙ исчерпывающий путь (без ранжирования): порядок форм — порядок
+/// обхода дерева, `quality_milli` не считается ([`UNSCORED_QUALITY_MILLI`]),
+/// `aspect_milli` неизвестен (`0`). Ранжированный поиск — [`search_forms`].
 #[must_use]
 pub fn enumerate_forms(
     text: &str,
@@ -881,35 +989,17 @@ pub fn enumerate_forms(
         return FormEnumeration {
             forms: Vec::new(),
             truncated: false,
+            nodes_visited: 0,
         };
     }
 
     with_default_segmenter(|seg| {
-        let hyphenated = inline_no_break_runs(text)
-            .into_iter()
-            .map(|run| {
-                if run.no_break {
-                    run.text
-                } else {
-                    seg.soft_hyphenate_overlong(run.text.as_str())
-                }
-            })
-            .collect::<String>();
-        let blocks = seg.segment(
-            &hyphenated,
-            SegmentOptions {
-                hanging_punctuation: false,
-                preserve_edge_spaces: false,
-                allow_hard_hyphen_breaks: true,
-                // Строим граф один раз: служебные слова не склеиваем, а помечаем
-                // стык категорией консервативности — фильтрация форм потом.
-                binding: BindingMode::Annotate,
-            },
-        );
+        let blocks = segment_form_blocks(seg, text);
         if blocks.is_empty() {
             return FormEnumeration {
                 forms: Vec::new(),
                 truncated: false,
+                nodes_visited: 0,
             };
         }
         let mut ctx = EnumContext {
@@ -921,9 +1011,10 @@ pub fn enumerate_forms(
             out: Vec::new(),
             seen: HashSet::new(),
             nodes: 0,
+            memory: MemoryProbe::new(),
             truncated: false,
         };
-        let mut lines: Vec<String> = Vec::new();
+        let mut trail = LineTrail::new();
         enumerate_dfs(
             &mut ctx,
             0,
@@ -933,33 +1024,96 @@ pub fn enumerate_forms(
             Conservatism::Safe,
             0,
             u32::MAX,
-            &mut lines,
+            &mut trail,
         );
         FormEnumeration {
             forms: ctx.out,
             truncated: ctx.truncated,
+            nodes_visited: ctx.nodes,
         }
     })
 }
 
-/// Решает, нужно ли досрочно прервать перечисление (помимо лимита `max_forms`).
+/// Ограничитель перебора: свободная память плюс аварийный потолок узлов.
 ///
 /// Два независимых условия:
-/// - **Память**: раз в `MEMORY_CHECK_INTERVAL_NODES` узлов запрашиваем свободную
-///   память; если её удалось измерить и она ниже `MIN_AVAILABLE_MEMORY_BYTES` —
-///   останавливаемся (на Linux это и есть практический ограничитель: «перечисляем,
-///   пока есть память»).
+/// - **Память**: не чаще одного раза на `MEMORY_CHECK_INTERVAL_NODES` узлов
+///   запрашиваем свободную память; если её удалось измерить и она ниже
+///   `MIN_AVAILABLE_MEMORY_BYTES` — останавливаемся (на Linux это и есть
+///   практический ограничитель: «перечисляем, пока есть память»).
 /// - **Аварийный потолок узлов** (`SAFETY_NODE_CEILING`): гарантия завершения,
 ///   когда память измерить нельзя (`None`, напр. не-Linux) или она никогда не
 ///   падает ниже порога.
-fn should_stop_enumeration(ctx: &EnumContext<'_>) -> bool {
-    if ctx.nodes.is_multiple_of(MEMORY_CHECK_INTERVAL_NODES)
-        && let Some(bytes) = current_available_memory()
-        && bytes < MIN_AVAILABLE_MEMORY_BYTES
-    {
-        return true;
+///
+/// Отдельный счётчик `next_check_at` (а не `nodes % N == 0`) нужен потому, что
+/// проверку вызывают после каждого возврата из ребёнка, а счётчик узлов внутри
+/// цикла `for end` не растёт: с проверкой по остатку один «узел из 8192» заново
+/// читал и парсил `/proc/meminfo` до `n` раз подряд.
+///
+/// Сработавшая защита по памяти «залипает» (`exhausted`): раскрутка стека обязана
+/// продолжать останавливаться, а не возобновлять перебор до следующей проверки.
+#[derive(Debug)]
+struct MemoryProbe {
+    /// Номер узла, начиная с которого разрешён следующий замер памяти.
+    next_check_at: u64,
+    /// Замер уже показал нехватку памяти — все дальнейшие ответы `true`.
+    exhausted: bool,
+}
+
+impl MemoryProbe {
+    /// Свежий ограничитель: первый замер — на узле `MEMORY_CHECK_INTERVAL_NODES`.
+    const fn new() -> Self {
+        Self {
+            next_check_at: MEMORY_CHECK_INTERVAL_NODES,
+            exhausted: false,
+        }
     }
-    ctx.nodes > SAFETY_NODE_CEILING
+
+    /// Нужно ли прервать перебор, находясь на узле номер `nodes`.
+    fn should_stop(&mut self, nodes: u64) -> bool {
+        if self.exhausted {
+            return true;
+        }
+        if nodes >= self.next_check_at {
+            self.next_check_at = nodes.saturating_add(MEMORY_CHECK_INTERVAL_NODES);
+            if let Some(bytes) = current_available_memory()
+                && bytes < MIN_AVAILABLE_MEMORY_BYTES
+            {
+                self.exhausted = true;
+                return true;
+            }
+        }
+        nodes > SAFETY_NODE_CEILING
+    }
+}
+
+/// Накопитель текущей ветки перебора: строки формы и их ширины, в одном порядке
+/// и всегда одной длины. Ширина строки уже посчитана на узле DFS, поэтому
+/// `finalize` не меряет строки заново.
+struct LineTrail {
+    lines: Vec<String>,
+    widths: Vec<u32>,
+}
+
+impl LineTrail {
+    const fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            widths: Vec::new(),
+        }
+    }
+
+    /// Добавляет строку с уже известной шириной.
+    fn push(&mut self, line: String, width: u32) {
+        self.lines.push(line);
+        self.widths.push(width);
+    }
+
+    /// Снимает последнюю строку вместе с её шириной.
+    fn pop(&mut self) {
+        self.lines.pop();
+        self.widths.pop();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -972,14 +1126,14 @@ fn enumerate_dfs(
     cons_acc: Conservatism,
     max_width: u32,
     min_width: u32,
-    lines: &mut Vec<String>,
+    trail: &mut LineTrail,
 ) {
     if ctx.out.len() >= ctx.max_forms {
         ctx.truncated = true;
         return;
     }
     ctx.nodes += 1;
-    if should_stop_enumeration(ctx) {
+    if ctx.memory.should_stop(ctx.nodes) {
         ctx.truncated = true;
         return;
     }
@@ -995,10 +1149,10 @@ fn enumerate_dfs(
             Step::Ok(next_phase) => {
                 let new_max = max_width.max(width);
                 let new_min = min_width.min(width);
-                lines.push(line_text);
+                trail.push(line_text, width);
                 if end == n {
                     finalize(
-                        ctx, next_phase, cost_acc, break_count, cons_acc, new_max, new_min, lines,
+                        ctx, next_phase, cost_acc, break_count, cons_acc, new_max, new_min, trail,
                     );
                 } else {
                     let joint = &ctx.blocks[end - 1].joint;
@@ -1011,11 +1165,11 @@ fn enumerate_dfs(
                         cons_acc.max(joint.conservatism),
                         new_max,
                         new_min,
-                        lines,
+                        trail,
                     );
                 }
-                lines.pop();
-                if ctx.out.len() >= ctx.max_forms || should_stop_enumeration(ctx) {
+                trail.pop();
+                if ctx.out.len() >= ctx.max_forms || ctx.memory.should_stop(ctx.nodes) {
                     ctx.truncated = true;
                     return;
                 }
@@ -1033,26 +1187,1230 @@ fn finalize(
     cons_acc: Conservatism,
     max_width: u32,
     min_width: u32,
-    lines: &[String],
+    trail: &LineTrail,
 ) {
     if ctx.preset == TextFormPreset::Lens && !(phase.ascended && phase.descended) {
         return;
     }
-    let key = lines.join("\n");
+    let key = trail.lines.join("\n");
     if ctx.seen.insert(key) {
-        let widths: Vec<u32> = lines.iter().map(|line| ctx.metric.line_width(line)).collect();
-        let median_width = median_of_widths(&widths);
+        // Ширины уже посчитаны на узлах DFS — строки не меряются второй раз.
+        let widths = trail.widths.as_slice();
+        let median_width = median_of_widths(widths);
         ctx.out.push(TextForm {
-            lines: lines.to_vec(),
+            lines: trail.lines.clone(),
             word_break_count: break_count,
             max_width,
             min_width: if min_width == u32::MAX { 0 } else { min_width },
             median_width,
-            unevenness_pct: unevenness_pct_of_widths(&widths, median_width),
+            unevenness_pct: unevenness_pct_of_widths(widths, median_width),
             break_cost: cost_acc,
             conservatism: cons_acc,
+            line_widths: widths.to_vec(),
+            // Исчерпывающий путь не ранжирует формы: качество не считается, а
+            // пропорция неизвестна без высоты строки (см. `search_forms`).
+            quality_milli: UNSCORED_QUALITY_MILLI,
+            roughness_pct: roughness_pct_of_widths(widths, &QualityWeights::DEFAULT),
+            aspect_milli: 0,
         });
     }
+}
+
+// --- Ранжированный поиск форм (слои A/B, план §2.1/§2.2/§2.4) ---------------
+
+/// Одна ступень «лестницы» коридора ширин (план §2.4, шаг 5).
+///
+/// Все границы — доли идеальной ширины строки корзины
+/// `T_L = ширина_всего_текста_в_одну_строку / L`: `1.0` — ровно идеальная ширина.
+/// Ступень применяется целиком; лестница проходится ТОЛЬКО для корзины, которая
+/// оказалась ПУСТОЙ, и никогда глобально — иначе богатая корзина была бы
+/// разбавлена послаблением, которое понадобилось совсем другой высоте.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CorridorLevel {
+    /// Нижняя граница внутренних строк (не первой и не последней), доля `T_L`.
+    /// Разумный диапазон `0.0..=1.0`.
+    pub interior_lo: f32,
+    /// Верхняя граница ЛЮБОЙ строки корзины, доля `T_L`. Разумный диапазон `>= 1.0`.
+    pub interior_hi: f32,
+    /// Нижняя граница первой строки, доля `T_L`. Намеренно слабее `interior_lo`:
+    /// короткая первая строка — нормальный типографский приём.
+    pub head_lo: f32,
+    /// Нижняя граница последней строки, доля `T_L`. Слабее всех: хвост абзаца —
+    /// единственная строка, которой позволено быть огрызком.
+    pub tail_lo: f32,
+}
+
+impl CorridorLevel {
+    /// Строгая (первая) ступень лестницы: `[0.72, 1.32]`, голова `0.34`, хвост `0.30`.
+    pub const STRICT: Self = Self {
+        interior_lo: 0.72,
+        interior_hi: 1.32,
+        head_lo: 0.34,
+        tail_lo: 0.30,
+    };
+    /// Первое послабление: `[0.60, 1.45]`, голова `0.24`, хвост `0.20`.
+    pub const RELAXED: Self = Self {
+        interior_lo: 0.60,
+        interior_hi: 1.45,
+        head_lo: 0.24,
+        tail_lo: 0.20,
+    };
+    /// Последнее послабление: `[0.45, 1.60]`, голова `0.12`, хвост `0.10`.
+    pub const LOOSE: Self = Self {
+        interior_lo: 0.45,
+        interior_hi: 1.60,
+        head_lo: 0.12,
+        tail_lo: 0.10,
+    };
+}
+
+impl Default for CorridorLevel {
+    fn default() -> Self {
+        Self::STRICT
+    }
+}
+
+/// Лестница коридоров по умолчанию: строгая ступень, затем два послабления
+/// (план §2.4, шаг 5). Порядок значим — берётся первая ступень, давшая формы.
+#[must_use]
+pub fn default_corridor_ladder() -> Vec<CorridorLevel> {
+    vec![
+        CorridorLevel::STRICT,
+        CorridorLevel::RELAXED,
+        CorridorLevel::LOOSE,
+    ]
+}
+
+/// Бюджет переносов формы (план §2.1): какая доля строк вправе нести дефис.
+///
+/// Послабление привязано к «люфту» `slack = max_width / min_possible_width`, а НЕ к
+/// пропорции формы. Для маленького текста «вертикальная» и «узкая» формы совпадают,
+/// для большого — нет: 24 строки по 13 символов очень высоки (пропорция ≈ 0.33), но
+/// 13 символов — это масса места, где переносы вовсе не вынуждены. Привязка к
+/// пропорции выдала бы большому тексту право переносить 20 строк из 24; привязка к
+/// люфту послабляет ровно те формы, где перенос неизбежен, при любом размере текста.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HyphenBudget {
+    /// Доля строк с переносом при комфортной ширине (`slack >= slack_hi`).
+    pub ratio_strict: f32,
+    /// Доля строк с переносом, когда переносы вынуждены (`slack <= slack_lo`).
+    pub ratio_relaxed: f32,
+    /// Люфт, при котором и ниже действует `ratio_relaxed`.
+    pub slack_lo: f32,
+    /// Люфт, при котором и выше действует `ratio_strict`. Между `slack_lo` и
+    /// `slack_hi` доля интерполируется линейно.
+    pub slack_hi: f32,
+}
+
+impl HyphenBudget {
+    /// Значения плана §2.1: 100 % при люфте ≤ 1.25, 50 % при люфте ≥ 2.0.
+    pub const DEFAULT: Self = Self {
+        ratio_strict: 0.50,
+        ratio_relaxed: 1.00,
+        slack_lo: 1.25,
+        slack_hi: 2.00,
+    };
+
+    /// Допустимая доля строк с переносом при люфте `slack`
+    /// (`max_width / min_possible_width`).
+    ///
+    /// Ниже `slack_lo` — `ratio_relaxed`, выше `slack_hi` — `ratio_strict`, между
+    /// ними линейная интерполяция. Нечисловой (`NaN`/бесконечный) люфт трактуется
+    /// как «места вдоволь» → `ratio_strict`. Вырожденная настройка
+    /// `slack_hi <= slack_lo` также даёт `ratio_strict`.
+    #[must_use]
+    pub fn allowed_ratio(self, slack: f64) -> f64 {
+        let lo = f64::from(self.slack_lo);
+        let hi = f64::from(self.slack_hi);
+        let strict = f64::from(self.ratio_strict);
+        let relaxed = f64::from(self.ratio_relaxed);
+        if !slack.is_finite() || slack >= hi || hi <= lo {
+            return strict;
+        }
+        if slack <= lo {
+            return relaxed;
+        }
+        relaxed + (strict - relaxed) * (slack - lo) / (hi - lo)
+    }
+}
+
+impl Default for HyphenBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Веса и внутренние константы оценки качества `Q` (план §2.2). `Q` намеренно НЕ
+/// содержит предпочтения по ширине: ширина — дело порядка показа, а не качества.
+/// Все нормированы на медианную ширину самой формы, поэтому `Q` сравним между
+/// разными высотами. МЕНЬШЕ — ЛУЧШЕ.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QualityWeights {
+    /// Вес «шероховатости» — скачков ширины между соседними строками.
+    pub rough: f32,
+    /// Вес «неравномерности» — среднего отклонения ширин от медианы (ловит
+    /// «лесенку», которую мелкие пошаговые скачки прячут).
+    pub uneven: f32,
+    /// Вес заполненности бюджета переносов (`переносов / разрешено`).
+    pub hyphen: f32,
+    /// Вес средней цены разрыва (типографское качество каждого переноса).
+    pub break_cost: f32,
+    /// Вес короткой первой строки.
+    pub head: f32,
+    /// Вес короткой последней строки.
+    pub tail: f32,
+    /// Вес доли строк внутри серии подряд идущих переносов.
+    pub hyphen_runs: f32,
+    /// Множитель ПЕРВОГО и ПОСЛЕДНЕГО перехода в терме `rough`. Уценка не
+    /// косметическая: у обеих эталонных панелей плана §2.2 краевая строка
+    /// намеренно короткая, и без уценки она оценивалась бы как худший из
+    /// возможных скачков.
+    pub edge_transition: f32,
+    /// Доля МАКСИМАЛЬНОГО скачка в терме `rough`.
+    pub rough_max_mix: f32,
+    /// Доля СРЕДНЕГО скачка в терме `rough`.
+    pub rough_mean_mix: f32,
+    /// Порог «короткой первой строки» в долях медианы: штраф растёт от нуля на
+    /// пороге до единицы при нулевой ширине.
+    pub head_threshold: f32,
+    /// Порог «короткой последней строки» в долях медианы.
+    pub tail_threshold: f32,
+    /// Длина серии подряд идущих строк с переносом, начиная с которой серия
+    /// штрафуется термом `runs`.
+    pub hyphen_run_len: usize,
+    /// Нормировка средней цены разрыва (`Joint::break_cost` максимум 4).
+    pub break_cost_norm: f32,
+}
+
+impl QualityWeights {
+    /// Веса плана §2.2 (настроены на реальном корпусе реплик).
+    pub const DEFAULT: Self = Self {
+        rough: 1.00,
+        uneven: 0.70,
+        hyphen: 0.55,
+        break_cost: 0.25,
+        head: 0.45,
+        tail: 0.35,
+        hyphen_runs: 0.30,
+        edge_transition: 0.45,
+        rough_max_mix: 0.6,
+        rough_mean_mix: 0.4,
+        head_threshold: 0.55,
+        tail_threshold: 0.45,
+        hyphen_run_len: 3,
+        break_cost_norm: 4.0,
+    };
+}
+
+impl Default for QualityWeights {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Высота строки в единицах метрики по умолчанию: `GlyphWidths` меряет в 1/1000 em,
+/// типичный интерлиньяж — 120 % кегля. См. [`FormSearchParams::line_height_units`].
+const DEFAULT_LINE_HEIGHT_UNITS: f32 = 1200.0;
+
+/// Настройки ранжированного поиска форм [`search_forms`]. Все числовые решения
+/// плана вынесены сюда: в теле алгоритма «магических» констант нет.
+///
+/// # Санация входа
+/// [`search_forms`] прогоняет настройки через [`FormSearchParams::sanitized`] и
+/// работает с результатом: каждое ВЕЩЕСТВЕННОЕ поле (включая вложенные
+/// [`CorridorLevel`], [`HyphenBudget`], [`QualityWeights`]), оказавшееся `NaN`,
+/// бесконечным там, где бесконечность не определена, или вне своей области
+/// (отрицательным; для высоты строки — ещё и нулевым), молча заменяется значением
+/// по умолчанию. Замена именно молчаливая и детерминированная: крейт GUI-free и
+/// вызывается на каждое изображение текста, сообщать об этом некому, а без замены
+/// одно `NaN` бесшумно снимает жёсткую гарантию (любое сравнение с `NaN` ложно,
+/// поэтому `NaN` в потолке пропорции = «потолка нет», `NaN` в доле переносов =
+/// «бюджет не ограничивает»). Целочисленные поля не санируются: они не создают
+/// неупорядоченных сравнений, а их вырожденные значения (например `per_bucket: 0`)
+/// означают ровно то, что написано в их док-комментариях.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormSearchParams {
+    /// Потолок пропорции формы `max_width / (число строк × line_height_units)`.
+    /// По умолчанию `21/9` — формы шире отбрасываются ещё на этапе перебора.
+    /// `f32::INFINITY` снимает потолок.
+    pub aspect_max: f32,
+    /// Высота одной строки В ЕДИНИЦАХ ТОЙ ЖЕ МЕТРИКИ, что и ширины. Перевод из
+    /// пикселей — забота вызывающего, потому что единицы метрики знает только он:
+    ///
+    /// ```text
+    /// spacing%      = effective_spacing_percent(line_spacing_percent, glyph_height_percent)
+    /// line_height_px= font_size_px + line_spacing_px + font_size_px * spacing% / 100
+    /// units         = units_per_em * line_height_px / font_size_px
+    ///                 / (glyph_width_percent / 100)
+    /// ```
+    ///
+    /// (зеркало `pipeline.rs:433-436`). `units_per_em` — 1000 для [`GlyphWidths`] и
+    /// ≈2 символа на em для [`CharWidthMetric`]. Горизонтальный масштаб глифов
+    /// (`glyph_width_percent`) обязан входить в делитель: ширины меряются без него,
+    /// и иначе потолок пропорции молча разъедется с тем, что видит пользователь.
+    /// Значение по умолчанию — [`GlyphWidths`] при интерлиньяже 120 %.
+    pub line_height_units: f32,
+    /// Лестница коридоров ширин, от строгой ступени к слабой (план §2.4, шаг 5).
+    /// Пустой список означает «форм нет»: коридор — не фильтр, а условие допуска.
+    pub corridor_levels: Vec<CorridorLevel>,
+    /// Бюджет переносов (план §2.1).
+    pub hyphen: HyphenBudget,
+    /// Веса оценки качества (план §2.2).
+    pub quality: QualityWeights,
+    /// Сколько лучших (по `quality_milli`) форм оставлять в корзине одной высоты.
+    /// По умолчанию 14.
+    pub per_bucket: usize,
+    /// Потолок узлов дерева перебора на ОДНУ попытку корзины. Лестница коридоров
+    /// взводит его заново на каждой ступени. По умолчанию 300 000.
+    pub node_budget_per_bucket: u64,
+    /// Потолок числа форм, накапливаемых в одной корзине до отбора `per_bucket`.
+    /// По умолчанию 3000.
+    pub form_cap_per_bucket: usize,
+    /// Потолок узлов на ВЕСЬ вызов [`search_forms`], включая аварийный прогон
+    /// §2.1: тот тратит остаток этого же бюджета, а не получает второй такой же.
+    /// По умолчанию 5 000 000. Дедлайна по часам сознательно нет: крейт собирается
+    /// в том числе под wasm, где `std::time::Instant` небезопасен, а бюджет по узлам
+    /// вдобавок детерминирован и проверяем тестом.
+    pub node_budget_total: u64,
+    /// Жёсткий диапазон числа строк `[min, max]` включительно. Задан — высоты вне
+    /// диапазона НЕ перебираются вовсе (это сокращение перебора, а не фильтр).
+    pub line_range: Option<(usize, usize)>,
+    /// Жёсткий диапазон `max_width` формы `[min, max]` включительно. Верхняя
+    /// граница зажимает верх коридора (перебор обрывается раньше), нижняя
+    /// отбрасывает корзины, которые физически не могут её достичь.
+    pub width_range: Option<(u32, u32)>,
+}
+
+impl Default for FormSearchParams {
+    fn default() -> Self {
+        Self {
+            aspect_max: 21.0 / 9.0,
+            line_height_units: DEFAULT_LINE_HEIGHT_UNITS,
+            corridor_levels: default_corridor_ladder(),
+            hyphen: HyphenBudget::DEFAULT,
+            quality: QualityWeights::DEFAULT,
+            per_bucket: 14,
+            node_budget_per_bucket: 300_000,
+            form_cap_per_bucket: 3_000,
+            node_budget_total: 5_000_000,
+            line_range: None,
+            width_range: None,
+        }
+    }
+}
+
+/// Конечное неотрицательное значение или `fallback` (`NaN`, бесконечность и
+/// отрицательные — вне области для долей коридора, весов и порогов).
+#[must_use]
+fn sane_non_negative(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+/// Конечное СТРОГО положительное значение или `fallback` (там, где ноль обнулил
+/// бы знаменатель — например высота строки в пропорции формы).
+#[must_use]
+fn sane_positive(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+impl FormSearchParams {
+    /// Копия настроек, пригодная для арифметики поиска: каждое вещественное поле
+    /// вне своей области значений заменено значением по умолчанию (см. раздел
+    /// «Санация входа» в описании типа).
+    ///
+    /// Область значений по полям: `aspect_max` — строго положительное, при этом
+    /// `f32::INFINITY` разрешена и означает «потолка нет»; `line_height_units` —
+    /// конечное строго положительное; доли коридора, доли/люфты бюджета переносов
+    /// и все веса качества — конечные неотрицательные. Целочисленные поля,
+    /// `line_range` и `width_range` копируются как есть.
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        let defaults = Self::default();
+        // Потолок пропорции: бесконечность осмысленна («без потолка»), а `NaN` и
+        // неположительное — нет.
+        let aspect_max = if self.aspect_max.is_nan() || self.aspect_max <= 0.0 {
+            defaults.aspect_max
+        } else {
+            self.aspect_max
+        };
+        let strict = CorridorLevel::STRICT;
+        let corridor_levels = self
+            .corridor_levels
+            .iter()
+            .map(|level| CorridorLevel {
+                interior_lo: sane_non_negative(level.interior_lo, strict.interior_lo),
+                interior_hi: sane_non_negative(level.interior_hi, strict.interior_hi),
+                head_lo: sane_non_negative(level.head_lo, strict.head_lo),
+                tail_lo: sane_non_negative(level.tail_lo, strict.tail_lo),
+            })
+            .collect();
+        let hyphen_default = HyphenBudget::DEFAULT;
+        let hyphen = HyphenBudget {
+            ratio_strict: sane_non_negative(self.hyphen.ratio_strict, hyphen_default.ratio_strict),
+            ratio_relaxed: sane_non_negative(
+                self.hyphen.ratio_relaxed,
+                hyphen_default.ratio_relaxed,
+            ),
+            slack_lo: sane_non_negative(self.hyphen.slack_lo, hyphen_default.slack_lo),
+            slack_hi: sane_non_negative(self.hyphen.slack_hi, hyphen_default.slack_hi),
+        };
+        let weights_default = QualityWeights::DEFAULT;
+        let quality = QualityWeights {
+            rough: sane_non_negative(self.quality.rough, weights_default.rough),
+            uneven: sane_non_negative(self.quality.uneven, weights_default.uneven),
+            hyphen: sane_non_negative(self.quality.hyphen, weights_default.hyphen),
+            break_cost: sane_non_negative(self.quality.break_cost, weights_default.break_cost),
+            head: sane_non_negative(self.quality.head, weights_default.head),
+            tail: sane_non_negative(self.quality.tail, weights_default.tail),
+            hyphen_runs: sane_non_negative(self.quality.hyphen_runs, weights_default.hyphen_runs),
+            edge_transition: sane_non_negative(
+                self.quality.edge_transition,
+                weights_default.edge_transition,
+            ),
+            rough_max_mix: sane_non_negative(
+                self.quality.rough_max_mix,
+                weights_default.rough_max_mix,
+            ),
+            rough_mean_mix: sane_non_negative(
+                self.quality.rough_mean_mix,
+                weights_default.rough_mean_mix,
+            ),
+            head_threshold: sane_non_negative(
+                self.quality.head_threshold,
+                weights_default.head_threshold,
+            ),
+            tail_threshold: sane_non_negative(
+                self.quality.tail_threshold,
+                weights_default.tail_threshold,
+            ),
+            hyphen_run_len: self.quality.hyphen_run_len,
+            break_cost_norm: sane_non_negative(
+                self.quality.break_cost_norm,
+                weights_default.break_cost_norm,
+            ),
+        };
+        Self {
+            aspect_max,
+            line_height_units: sane_positive(self.line_height_units, defaults.line_height_units),
+            corridor_levels,
+            hyphen,
+            quality,
+            per_bucket: self.per_bucket,
+            node_budget_per_bucket: self.node_budget_per_bucket,
+            form_cap_per_bucket: self.form_cap_per_bucket,
+            node_budget_total: self.node_budget_total,
+            line_range: self.line_range,
+            width_range: self.width_range,
+        }
+    }
+}
+
+/// Приводит счётчик к `f64` без потери точности на реальных размерах текста
+/// (счётчики форм/строк/узлов заведомо меньше `u32::MAX`; больше — насыщение).
+#[must_use]
+fn count_as_f64(count: usize) -> f64 {
+    f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// Округляет неотрицательное вещественное к `u32` с насыщением. `NaN`,
+/// бесконечность и отрицательные значения дают `0`/`u32::MAX` соответственно.
+#[must_use]
+fn round_to_u32(value: f64) -> u32 {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    let rounded = value.round();
+    if rounded >= f64::from(u32::MAX) {
+        return u32::MAX;
+    }
+    // Проверки выше доказывают `0.0 < rounded < u32::MAX` — приведение точное.
+    rounded as u32
+}
+
+/// «Шероховатость» профиля ширин (терм `rough` плана §2.2), в долях медианы.
+///
+/// Для каждого перехода между соседними строками берётся `|Δw| / медиана`;
+/// первый и последний переходы умножаются на `weights.edge_transition`. Результат —
+/// смесь `rough_max_mix × максимум + rough_mean_mix × среднее`. Одна строка (нет
+/// переходов) и нулевая медиана дают `0.0`.
+#[must_use]
+fn roughness_of_widths(widths: &[u32], weights: &QualityWeights) -> f64 {
+    let median = f64::from(median_of_widths(widths));
+    if widths.len() < 2 || median <= 0.0 {
+        return 0.0;
+    }
+    let transitions = widths.len() - 1;
+    let edge = f64::from(weights.edge_transition);
+    let mut max_jump = 0.0f64;
+    let mut sum = 0.0f64;
+    for (index, pair) in widths.windows(2).enumerate() {
+        let jump = f64::from(pair[0].abs_diff(pair[1])) / median;
+        // Краевые переходы уценены: короткая первая/последняя строка — приём
+        // наборщика, а не «резкий скачок ширины» (план §2.2).
+        let weighted = if index == 0 || index + 1 == transitions {
+            jump * edge
+        } else {
+            jump
+        };
+        max_jump = max_jump.max(weighted);
+        sum += weighted;
+    }
+    let mean = sum / count_as_f64(transitions);
+    f64::from(weights.rough_max_mix) * max_jump + f64::from(weights.rough_mean_mix) * mean
+}
+
+/// «Шероховатость» в процентах для поля [`TextForm::roughness_pct`].
+#[must_use]
+fn roughness_pct_of_widths(widths: &[u32], weights: &QualityWeights) -> u32 {
+    round_to_u32(roughness_of_widths(widths, weights) * 100.0)
+}
+
+/// Доля строк, попавших в серию из `run_len` и более подряд идущих строк с
+/// переносом (терм `runs` плана §2.2). `run_len == 0` трактуется как «серий нет».
+#[must_use]
+fn hyphen_run_share(hyphen_flags: &[bool], run_len: usize) -> f64 {
+    if hyphen_flags.is_empty() || run_len == 0 {
+        return 0.0;
+    }
+    let mut in_runs = 0usize;
+    let mut current = 0usize;
+    for &flag in hyphen_flags {
+        if flag {
+            current += 1;
+        } else {
+            if current >= run_len {
+                in_runs += current;
+            }
+            current = 0;
+        }
+    }
+    if current >= run_len {
+        in_runs += current;
+    }
+    count_as_f64(in_runs) / count_as_f64(hyphen_flags.len())
+}
+
+/// Разложенная оценка формы: итоговое `Q` и отдельно шероховатость (её панель
+/// показывает как самостоятельную характеристику).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QualityBreakdown {
+    /// Итоговое `Q` — МЕНЬШЕ ЛУЧШЕ, `0.0` — идеально ровная форма без переносов.
+    quality: f64,
+    /// Терм `rough` в долях медианы.
+    roughness: f64,
+}
+
+/// Считает оценку качества `Q` формы (план §2.2, слой B).
+///
+/// `hyphen_flags[i]` — несёт ли строка `i` дефис переноса (у последней строки это
+/// всегда `false`); длина совпадает с `widths`. `break_cost_total` — сумма
+/// `Joint::break_cost` по фактическим разрывам, `allowed_hyphens` — бюджет
+/// переносов слоя A в строках (может быть дробным). Оценка width-agnostic: все
+/// термы нормированы медианной шириной самой формы.
+#[must_use]
+fn form_quality(
+    widths: &[u32],
+    hyphen_flags: &[bool],
+    break_cost_total: u32,
+    allowed_hyphens: f64,
+    weights: &QualityWeights,
+) -> QualityBreakdown {
+    let roughness = roughness_of_widths(widths, weights);
+    let median = f64::from(median_of_widths(widths));
+    let line_count = widths.len();
+    if line_count == 0 {
+        return QualityBreakdown {
+            quality: 0.0,
+            roughness,
+        };
+    }
+
+    let uneven = unevenness_of_widths(widths, median_of_widths(widths));
+
+    let hyphen_lines = count_as_f64(hyphen_flags.iter().filter(|&&flag| flag).count());
+    // Бюджет исчерпан «в ноль» только у одностроч­ных форм, где переносов и быть
+    // не может; ненулевой перенос при нулевом бюджете — максимальный штраф.
+    let hyphen_term = if allowed_hyphens > 0.0 {
+        hyphen_lines / allowed_hyphens
+    } else if hyphen_lines > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+
+    let breaks = line_count - 1;
+    let norm = f64::from(weights.break_cost_norm);
+    let break_term = if breaks == 0 || norm <= 0.0 {
+        0.0
+    } else {
+        f64::from(break_cost_total) / count_as_f64(breaks) / norm
+    };
+
+    let edge_term = |width: u32, threshold: f32| -> f64 {
+        let threshold = f64::from(threshold);
+        if threshold <= 0.0 || median <= 0.0 {
+            return 0.0;
+        }
+        let ratio = f64::from(width) / median;
+        (threshold - ratio).max(0.0) / threshold
+    };
+    let head_term = edge_term(widths[0], weights.head_threshold);
+    let tail_term = edge_term(widths[line_count - 1], weights.tail_threshold);
+    let runs_term = hyphen_run_share(hyphen_flags, weights.hyphen_run_len);
+
+    let quality = f64::from(weights.rough) * roughness
+        + f64::from(weights.uneven) * uneven
+        + f64::from(weights.hyphen) * hyphen_term
+        + f64::from(weights.break_cost) * break_term
+        + f64::from(weights.head) * head_term
+        + f64::from(weights.tail) * tail_term
+        + f64::from(weights.hyphen_runs) * runs_term;
+
+    QualityBreakdown { quality, roughness }
+}
+
+/// Потолок числа ячеек ПЛОТНОЙ memo-таблицы ширин (`n²`, где `n` — число блоков).
+/// Ячейка — `Option<u32>` (8 байт), то есть потолок ≈ 8 МБ. С запасом покрывает
+/// любой осмысленный текст реплики (самая длинная реплика корпуса — n ≈ 120, то
+/// есть 14 400 ячеек) и не даёт вставке на сотню тысяч символов (n ≈ 20 000,
+/// `n²` = 4·10⁸ ячеек ≈ 3 ГБ) выделить память ЕЩЁ ДО того, как сработает хоть
+/// один бюджет перебора.
+const DENSE_WIDTH_MEMO_MAX_CELLS: usize = 1_000_000;
+
+/// Потолок числа записей РАЗРЕЖЁННОЙ memo-таблицы. Достигнут — новые ширины
+/// просто не запоминаются: перебор продолжается, лишь снова меряя строки. Memo —
+/// чистая оптимизация, поэтому от её отключения результат не меняется, зато
+/// расход памяти ограничен сверху при любом размере текста.
+const SPARSE_WIDTH_MEMO_MAX_ENTRIES: usize = 1_000_000;
+
+/// Memo ширин строк перебора: `(start, end) → ширина по активной метрике`.
+///
+/// Текст строки НЕ хранится — он нужен только при выдаче готовой формы
+/// (`emit_form`), где собирается заново; хранение строк делало memo главным
+/// потребителем памяти. Плотная таблица используется, пока `n²` ячеек
+/// укладывается в [`DENSE_WIDTH_MEMO_MAX_CELLS`]; иначе таблица разрежённая, с
+/// потолком записей [`SPARSE_WIDTH_MEMO_MAX_ENTRIES`]. Размер считается
+/// checked-арифметикой: `n * n` для огромного `n` переполнило бы `usize` (на
+/// wasm32 он 32-битный).
+#[derive(Debug)]
+enum WidthMemo {
+    /// Плотная таблица `n × n`: индекс `start * stride + (end - 1)`.
+    Dense { widths: Vec<Option<u32>>, stride: usize },
+    /// Разрежённая таблица для текстов, которым плотная не по карману.
+    Sparse(HashMap<(usize, usize), u32>),
+}
+
+impl WidthMemo {
+    /// Таблица для текста из `n` блоков (см. описание типа: плотная или
+    /// разрежённая — решает [`DENSE_WIDTH_MEMO_MAX_CELLS`]).
+    #[must_use]
+    fn new(n: usize) -> Self {
+        match n.checked_mul(n) {
+            Some(cells) if cells <= DENSE_WIDTH_MEMO_MAX_CELLS => Self::Dense {
+                widths: vec![None; cells],
+                stride: n,
+            },
+            _ => Self::Sparse(HashMap::new()),
+        }
+    }
+
+    /// Запомненная ширина строки `[start, end)`; `None` — ещё не мерили (или
+    /// запись не поместилась в разрежённую таблицу). `end > start`.
+    #[must_use]
+    fn get(&self, start: usize, end: usize) -> Option<u32> {
+        match self {
+            Self::Dense { widths, stride } => widths.get(start * stride + (end - 1)).copied()?,
+            Self::Sparse(map) => map.get(&(start, end)).copied(),
+        }
+    }
+
+    /// Запоминает ширину строки `[start, end)`. Разрежённая таблица, дойдя до
+    /// потолка записей, перестаёт запоминать (см. [`SPARSE_WIDTH_MEMO_MAX_ENTRIES`]).
+    fn insert(&mut self, start: usize, end: usize, width: u32) {
+        match self {
+            Self::Dense { widths, stride } => {
+                if let Some(cell) = widths.get_mut(start * *stride + (end - 1)) {
+                    *cell = Some(width);
+                }
+            }
+            Self::Sparse(map) => {
+                if map.len() < SPARSE_WIDTH_MEMO_MAX_ENTRIES {
+                    map.insert((start, end), width);
+                }
+            }
+        }
+    }
+}
+
+/// План перебора одной корзины (одной высоты формы).
+#[derive(Debug)]
+struct BucketPlan {
+    /// Ровно столько строк должно быть у каждой формы корзины.
+    target_lines: usize,
+    /// Нижняя граница ширины первой строки, в единицах метрики.
+    head_lo: f64,
+    /// Нижняя граница ширины внутренних строк.
+    interior_lo: f64,
+    /// Нижняя граница ширины последней строки.
+    tail_lo: f64,
+    /// Верхняя граница ширины ЛЮБОЙ строки: минимум из верха коридора, потолка
+    /// пропорции для этой высоты и верха `width_range`.
+    upper: f64,
+    /// Запас, за которым превышение `upper` уже необратимо и просмотр всё более
+    /// длинных строк можно оборвать: «ширина самого широкого одиночного блока» +
+    /// «ширина дефиса переноса» (контракт [`LineWidthMetric`]). Одинаков для всех
+    /// корзин поиска; лежит здесь, потому что применяется рядом с `upper`.
+    break_slop: f64,
+    /// Ширина самого широкого одиночного блока, измеренного как переносимая
+    /// строка (знаменатель люфта бюджета переносов).
+    min_possible_width: f64,
+    /// Высота строки в единицах метрики (для поля `aspect_milli`).
+    line_height_units: f64,
+}
+
+impl BucketPlan {
+    /// Сколько строк корзины вправе нести перенос при текущей максимальной ширине
+    /// формы `max_width`. Дробное значение (бюджет слоя A) — целочисленный предел
+    /// берётся отбрасыванием дробной части.
+    fn allowed_hyphens(&self, budget: HyphenBudget, max_width: u32) -> f64 {
+        // Нулевая `min_possible_width` (текст без измеримых блоков) → люфта нет,
+        // трактуем как «переносы вынуждены».
+        let slack = if self.min_possible_width > 0.0 {
+            f64::from(max_width) / self.min_possible_width
+        } else {
+            0.0
+        };
+        budget.allowed_ratio(slack) * count_as_f64(self.target_lines)
+    }
+}
+
+/// Накопленное состояние текущей ветки перебора корзины.
+#[derive(Debug)]
+struct PartialForm {
+    /// Индексы блоков, на которых закрывается каждая уже поставленная строка.
+    cuts: Vec<usize>,
+    /// Ширины уже поставленных строк, в том же порядке.
+    widths: Vec<u32>,
+    /// Несёт ли каждая поставленная строка дефис переноса.
+    hyphen_flags: Vec<bool>,
+    /// Сумма `Joint::break_cost` по уже сделанным разрывам.
+    break_cost: u32,
+    /// Максимум категорий консервативности по уже сделанным разрывам.
+    conservatism: Conservatism,
+    max_width: u32,
+    /// `u32::MAX`, пока не поставлено ни одной строки.
+    min_width: u32,
+    /// Сколько поставленных строк несут перенос.
+    hyphen_lines: usize,
+}
+
+impl PartialForm {
+    /// Пустая ветка: строк нет, ширины ещё не наблюдались.
+    const fn new() -> Self {
+        Self {
+            cuts: Vec::new(),
+            widths: Vec::new(),
+            hyphen_flags: Vec::new(),
+            break_cost: 0,
+            conservatism: Conservatism::Safe,
+            max_width: 0,
+            min_width: u32::MAX,
+            hyphen_lines: 0,
+        }
+    }
+}
+
+/// Снимок полей `PartialForm`, которые меняются при спуске и должны быть
+/// восстановлены при откате ветки.
+#[derive(Debug, Clone, Copy)]
+struct PartialSnapshot {
+    break_cost: u32,
+    conservatism: Conservatism,
+    max_width: u32,
+    min_width: u32,
+    hyphen_lines: usize,
+}
+
+/// Контекст ранжированного поиска: неизменные входы, memo ширин, счётчики
+/// бюджетов и накопитель текущей корзины.
+///
+/// Контекст живёт на ВЕСЬ вызов [`search_forms`], включая аварийный прогон со
+/// снятым потолком пропорции: и бюджет узлов, и защита по памяти, и memo — одни
+/// на оба прогона (`node_budget_total` — потолок всего вызова, а не одного
+/// прогона).
+struct SearchContext<'a> {
+    blocks: &'a [Block],
+    preset: TextFormPreset,
+    metric: &'a dyn LineWidthMetric,
+    tol: u32,
+    params: &'a FormSearchParams,
+    /// Memo ширин строк (см. [`WidthMemo`]). Заполняется лениво: строка не
+    /// меряется дважды ни внутри прогона, ни между прогонами.
+    widths: WidthMemo,
+    nodes_total: u64,
+    nodes_bucket: u64,
+    memory: MemoryProbe,
+    truncated: bool,
+    /// Формы текущей корзины до отбора `per_bucket` лучших.
+    bucket: Vec<TextForm>,
+}
+
+impl<'a> SearchContext<'a> {
+    /// Свежий контекст поиска по блокам `blocks`. Счётчики бюджетов обнулены —
+    /// на весь вызов [`search_forms`] контекст создаётся ровно один раз.
+    fn new(
+        blocks: &'a [Block],
+        preset: TextFormPreset,
+        metric: &'a dyn LineWidthMetric,
+        params: &'a FormSearchParams,
+    ) -> Self {
+        Self {
+            blocks,
+            preset,
+            metric,
+            tol: metric.tolerance(),
+            params,
+            widths: WidthMemo::new(blocks.len()),
+            nodes_total: 0,
+            nodes_bucket: 0,
+            memory: MemoryProbe::new(),
+            truncated: false,
+            bucket: Vec::new(),
+        }
+    }
+
+    /// Текст строки `[start, end)` ровно в том виде, в каком её меряет метрика.
+    /// Перенос (а с ним и хвостовой дефис) есть у любой строки, кроме доходящей
+    /// до конца текста. `end > start` и `end <= blocks.len()`.
+    #[must_use]
+    fn line_text(&self, start: usize, end: usize) -> String {
+        let n = self.blocks.len();
+        build_line_text_and_units(&self.blocks[start..end], end < n).0
+    }
+
+    /// Ширина строки `[start, end)` по активной метрике (через memo).
+    fn ensure_width(&mut self, start: usize, end: usize) -> u32 {
+        if let Some(width) = self.widths.get(start, end) {
+            return width;
+        }
+        let width = self.metric.line_width(&self.line_text(start, end));
+        self.widths.insert(start, end, width);
+        width
+    }
+
+    /// Исчерпан ли бюджет текущей корзины или всего поиска. Побочный эффект:
+    /// помечает результат `truncated`.
+    fn bucket_exhausted(&mut self) -> bool {
+        if self.bucket.len() >= self.params.form_cap_per_bucket
+            || self.nodes_bucket >= self.params.node_budget_per_bucket
+        {
+            self.truncated = true;
+            return true;
+        }
+        self.search_exhausted()
+    }
+
+    /// Исчерпан ли бюджет всего поиска (узлы или свободная память). Побочный
+    /// эффект: помечает результат `truncated`.
+    fn search_exhausted(&mut self) -> bool {
+        if self.nodes_total >= self.params.node_budget_total {
+            self.truncated = true;
+            return true;
+        }
+        if self.memory.should_stop(self.nodes_total) {
+            self.truncated = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Перебор одной корзины: формы ровно из `plan.target_lines` строк, каждая строка
+/// внутри коридора ширин, с инкрементальной отсечкой по форме пресета и бюджету
+/// переносов. Найденные формы складываются в `ctx.bucket`.
+///
+/// Дедупликации нет и она не нужна: тождество формы — её вектор разрезов, а
+/// каждый допустимый вектор перебирается РОВНО один раз. Доказательство: путь от
+/// корня к листу — это и есть вектор разрезов (на каждом узле выбирается очередной
+/// `end`, строго больший предыдущего, и цикл `for end` посещает каждое значение
+/// не более одного раза), поэтому разные пути дают разные векторы; лист (`end == n`)
+/// достижим только когда `remaining_lines == 1`, значит длина вектора всегда равна
+/// `plan.target_lines` и векторы разных корзин не совпадают; повторный проход по
+/// ступени лестницы коридора делается ТОЛЬКО для пустой корзины, то есть после
+/// нуля выданных форм.
+fn search_dfs(
+    ctx: &mut SearchContext<'_>,
+    plan: &BucketPlan,
+    start: usize,
+    phase: PhaseState,
+    state: &mut PartialForm,
+) {
+    ctx.nodes_total += 1;
+    ctx.nodes_bucket += 1;
+    if ctx.bucket_exhausted() {
+        return;
+    }
+
+    let n = ctx.blocks.len();
+    let placed = state.cuts.len();
+    let remaining_lines = plan.target_lines - placed;
+    // Последняя строка обязана дойти ровно до конца текста; остальным нужно
+    // оставить хотя бы по одному блоку на каждую ещё не поставленную строку.
+    let (first_end, last_end) = if remaining_lines == 1 {
+        (n, n)
+    } else {
+        // Блоков может не хватить на оставшиеся строки — тогда ветка мертва.
+        let Some(last_end) = n.checked_sub(remaining_lines - 1) else {
+            return;
+        };
+        (start + 1, last_end)
+    };
+    if first_end > last_end {
+        return;
+    }
+
+    for end in first_end..=last_end {
+        let width = ctx.ensure_width(start, end);
+        let width_f = f64::from(width);
+        if width_f > plan.upper {
+            // Верх коридора нарушен (план §2.4, шаг 3). Оборвать ОСТАТОК ветки
+            // можно только тогда, когда ни один следующий шаг не вернёт ширину
+            // обратно под потолок. Монотонности ширины по `end` метрика не
+            // обещает: присоединение следующего блока делает уже посчитанный
+            // хвостовой дефис переноса внутренним, и новый блок может оказаться
+            // уже этого дефиса.
+            //
+            // Доказательство границы. Пусть `B(start, end)` — ширина строки без
+            // хвостового дефиса переноса; по контракту `LineWidthMetric` она не
+            // убывает с ростом `end`. Тогда для любого `end' > end`
+            // `width(start, end') >= B(start, end') >= B(start, end) >=
+            // width(start, end) - hyphen`, то есть один шаг может вернуть не
+            // больше ширины дефиса переноса. `plan.break_slop` берёт этот запас
+            // с добавкой ширины самого широкого одиночного блока — оценка
+            // заведомо не меньше необходимой, поэтому обрыв за ней допустим
+            // (admissible): ни одна форма, которую примет финальная проверка, не
+            // теряется.
+            if width_f > plan.upper + plan.break_slop {
+                break;
+            }
+            continue;
+        }
+        let lower = if placed == 0 {
+            plan.head_lo
+        } else if end == n {
+            plan.tail_lo
+        } else {
+            plan.interior_lo
+        };
+        if width_f < lower {
+            continue;
+        }
+
+        // Форма пресета — та же инкрементальная отсечка, что и в исчерпывающем
+        // переборе: `PruneRest` убивает остаток ветки, `SkipEnd` пробует шире.
+        let next_phase = match advance_step(ctx.preset, phase, width, ctx.tol) {
+            Step::PruneRest => break,
+            Step::SkipEnd => continue,
+            Step::Ok(next_phase) => next_phase,
+        };
+
+        let carries_hyphen = end < n && ctx.blocks[end - 1].joint.word_break;
+        let new_hyphens = state.hyphen_lines + usize::from(carries_hyphen);
+        let new_max = state.max_width.max(width);
+        // Отсечка по бюджету переносов точна: вдоль ветки число переносов только
+        // растёт, максимальная ширина только растёт, а бюджет с ростом ширины
+        // только падает — значит превышение здесь превышением и останется.
+        if count_as_f64(new_hyphens) > plan.allowed_hyphens(ctx.params.hyphen, new_max) {
+            continue;
+        }
+
+        let snapshot = PartialSnapshot {
+            break_cost: state.break_cost,
+            conservatism: state.conservatism,
+            max_width: state.max_width,
+            min_width: state.min_width,
+            hyphen_lines: state.hyphen_lines,
+        };
+        state.cuts.push(end);
+        state.widths.push(width);
+        state.hyphen_flags.push(carries_hyphen);
+        state.max_width = new_max;
+        state.min_width = state.min_width.min(width);
+        state.hyphen_lines = new_hyphens;
+
+        if end == n {
+            emit_form(ctx, plan, next_phase, state);
+        } else {
+            let joint = &ctx.blocks[end - 1].joint;
+            state.break_cost = state.break_cost.saturating_add(joint.break_cost);
+            state.conservatism = state.conservatism.max(joint.conservatism);
+            search_dfs(ctx, plan, end, next_phase, state);
+        }
+
+        state.cuts.pop();
+        state.widths.pop();
+        state.hyphen_flags.pop();
+        state.break_cost = snapshot.break_cost;
+        state.conservatism = snapshot.conservatism;
+        state.max_width = snapshot.max_width;
+        state.min_width = snapshot.min_width;
+        state.hyphen_lines = snapshot.hyphen_lines;
+
+        if ctx.bucket_exhausted() {
+            return;
+        }
+    }
+}
+
+/// Достраивает завершённую ветку до [`TextForm`] и кладёт её в текущую корзину.
+/// Отбрасывает формы, нарушающие остаточные жёсткие условия (линза без пика,
+/// нижняя граница `width_range`). Повторов на входе не бывает — см. доказательство
+/// в [`search_dfs`].
+fn emit_form(
+    ctx: &mut SearchContext<'_>,
+    plan: &BucketPlan,
+    phase: PhaseState,
+    state: &PartialForm,
+) {
+    if ctx.preset == TextFormPreset::Lens && !(phase.ascended && phase.descended) {
+        return;
+    }
+    // Нижняя граница `width_range` — свойство всей формы, а не отдельной строки,
+    // поэтому проверяется здесь; корзины, которым она недостижима, отсекаются
+    // целиком ещё до перебора.
+    if let Some((min_width, _)) = ctx.params.width_range
+        && state.max_width < min_width
+    {
+        return;
+    }
+    // Текст строк собирается только здесь, на готовой форме: memo хранит одни
+    // ширины, а число выданных форм ограничено `form_cap_per_bucket`.
+    let mut lines = Vec::with_capacity(state.cuts.len());
+    let mut start = 0usize;
+    for &end in &state.cuts {
+        lines.push(ctx.line_text(start, end));
+        start = end;
+    }
+
+    let widths = state.widths.as_slice();
+    let median_width = median_of_widths(widths);
+    let allowed = plan.allowed_hyphens(ctx.params.hyphen, state.max_width);
+    let scored = form_quality(
+        widths,
+        &state.hyphen_flags,
+        state.break_cost,
+        allowed,
+        &ctx.params.quality,
+    );
+    let height = count_as_f64(plan.target_lines) * plan.line_height_units;
+    let aspect = if height > 0.0 {
+        f64::from(state.max_width) / height
+    } else {
+        0.0
+    };
+
+    ctx.bucket.push(TextForm {
+        lines,
+        word_break_count: state.hyphen_lines,
+        max_width: state.max_width,
+        min_width: if state.min_width == u32::MAX {
+            0
+        } else {
+            state.min_width
+        },
+        median_width,
+        unevenness_pct: unevenness_pct_of_widths(widths, median_width),
+        break_cost: state.break_cost,
+        conservatism: state.conservatism,
+        line_widths: widths.to_vec(),
+        quality_milli: round_to_u32(scored.quality * 1000.0),
+        roughness_pct: round_to_u32(scored.roughness * 100.0),
+        aspect_milli: round_to_u32(aspect * 1000.0),
+    });
+}
+
+/// Один полный прогон поиска по всем высотам при заданном потолке пропорции.
+/// `aspect_max` передаётся отдельно от `ctx.params`, потому что аварийный прогон
+/// §2.1 повторяет поиск ровно с этим одним снятым ограничением.
+///
+/// Контекст общий на оба прогона: бюджеты узлов/памяти и memo ширин НЕ
+/// сбрасываются между вызовами (`node_budget_total` — потолок всего поиска).
+/// Ожидает уже санированные `params` (см. [`FormSearchParams::sanitized`]): в
+/// частности `line_height_units > 0` и отсутствие `NaN` в границах.
+fn run_search(ctx: &mut SearchContext<'_>, aspect_max: f64) -> Vec<TextForm> {
+    let n = ctx.blocks.len();
+    let params = ctx.params;
+
+    // Идеальная ширина строки корзины считается от ширины всего текста в одну
+    // строку; знаменатель люфта переносов — самый широкий одиночный блок.
+    let total_width = f64::from(ctx.ensure_width(0, n));
+    let min_possible_width = f64::from(
+        (0..n)
+            .map(|index| ctx.ensure_width(index, index + 1))
+            .max()
+            .unwrap_or(0),
+    );
+    // Запас, за которым превышение верха коридора необратимо (см. `search_dfs`):
+    // самый широкий одиночный блок плюс ширина дефиса переноса в единицах этой же
+    // метрики (у метрики с висящей пунктуацией дефис не считается вовсе — там
+    // ширина дефиса честный ноль).
+    let break_slop = min_possible_width + f64::from(ctx.metric.line_width("-"));
+    let line_height_units = f64::from(params.line_height_units);
+    let width_cap = params
+        .width_range
+        .map_or(f64::INFINITY, |(_, max_width)| f64::from(max_width));
+
+    let mut forms: Vec<TextForm> = Vec::new();
+    for target_lines in 1..=n {
+        if let Some((min_lines, max_lines)) = params.line_range
+            && (target_lines < min_lines || target_lines > max_lines)
+        {
+            continue;
+        }
+        if ctx.search_exhausted() {
+            break;
+        }
+
+        let ideal = total_width / count_as_f64(target_lines);
+        let aspect_cap = aspect_max * count_as_f64(target_lines) * line_height_units;
+        // Предварительного отсева корзины по `ideal` здесь НЕТ, и это не упущение
+        // (план §2.4, шаг 2 предлагал его, но он неадмиссибелен):
+        // `T_L = ширина_в_одну_строку / L` НЕ является нижней оценкой максимальной
+        // ширины L-строчной формы — разрыв строки съедает межсловный пробел,
+        // поэтому сумма ширин строк, вообще говоря, МЕНЬШЕ ширины того же текста
+        // в одну строку. Контрпример: «a b» посимвольной метрикой без висящей
+        // пунктуации, L = 2: одна строка = 3, `ideal` = 1.5, а реальная форма
+        // ["a", "b"] имеет максимум 1 и проходит все финальные проверки — отсев
+        // по `ideal` выбросил бы её при потолке между 1 и 1.5. Корзина, чьи
+        // строки в потолок не лезут, и так умирает на глубине 1: верх коридора
+        // зажат `aspect_cap`.
+        for level in &params.corridor_levels {
+            let upper = (f64::from(level.interior_hi) * ideal)
+                .min(aspect_cap)
+                .min(width_cap);
+            if let Some((min_width, _)) = params.width_range
+                && upper < f64::from(min_width)
+            {
+                // Ни одна строка этой корзины не дотянет до нижней границы ширины:
+                // послабления коридора верх не поднимают, лестницу можно не идти.
+                break;
+            }
+            let plan = BucketPlan {
+                target_lines,
+                head_lo: f64::from(level.head_lo) * ideal,
+                interior_lo: f64::from(level.interior_lo) * ideal,
+                tail_lo: f64::from(level.tail_lo) * ideal,
+                upper,
+                break_slop,
+                min_possible_width,
+                line_height_units,
+            };
+            ctx.nodes_bucket = 0;
+            let mut state = PartialForm::new();
+            search_dfs(ctx, &plan, 0, PhaseState::START, &mut state);
+            if !ctx.bucket.is_empty() {
+                break;
+            }
+        }
+
+        // Слой C начинается здесь: корзина отдаётся отсортированной по качеству и
+        // обрезанной до `per_bucket`; порядок ПОКАЗА корзин — дело вызывающего.
+        ctx.bucket
+            .sort_by_key(|form| (form.quality_milli, form.max_width, form.break_cost));
+        ctx.bucket.truncate(params.per_bucket);
+        forms.append(&mut ctx.bucket);
+    }
+
+    forms
+}
+
+/// Ранжированный поиск форм текста (план §2.1/§2.2/§2.4).
+///
+/// В отличие от исчерпывающего [`enumerate_forms`], перебор ведётся ОТДЕЛЬНО для
+/// каждой высоты формы внутри коридора ширин, а результат ранжируется:
+///
+/// * **слой A (допуск)** — потолок пропорции `aspect_max`, бюджет переносов по
+///   люфту, коридор ширин, предикат пресета и жёсткие диапазоны
+///   `line_range`/`width_range`; всё это СОКРАЩАЕТ перебор, а не фильтрует его
+///   результат;
+/// * **слой B (качество)** — оценка `Q` (`quality_milli`, меньше лучше), не
+///   содержащая предпочтения по ширине;
+/// * **слой C (порядок)** — здесь только группировка: формы идут корзинами по
+///   возрастанию числа строк, внутри корзины — по возрастанию `quality_milli`, не
+///   более `params.per_bucket` штук. Порядок показа (round-robin по корзинам,
+///   уклон в узкие, порог качества) строит вызывающий.
+///
+/// Гарантии: ни одна возвращённая форма не шире `aspect_max` (кроме аварийного
+/// прогона ниже), не нарушает бюджет переносов и заданные диапазоны, и каждая
+/// форма встречается ровно один раз. Если при действующем потолке пропорции не
+/// нашлось НИЧЕГО (текст из одного длинного неразрывного слова), поиск
+/// повторяется один раз без потолка — окно не должно быть пустым. Пустой ответ
+/// остаётся возможным, когда форм не существует в принципе (например `Lens` на
+/// одном блоке).
+///
+/// Входные `params` санируются (см. [`FormSearchParams::sanitized`]): гарантии
+/// выше держатся при любых, в том числе враждебных, значениях полей.
+///
+/// Бюджет узлов `params.node_budget_total` — потолок ВСЕГО вызова: аварийный
+/// прогон тратит то, что осталось от первого. Если первый прогон бюджет уже
+/// исчерпал, аварийный не запускается вовсе, а результат помечен `truncated` —
+/// исчерпанный жёсткий бюджет сильнее правила «окно не должно быть пустым»,
+/// иначе `node_budget_total` перестаёт быть потолком.
+///
+/// `truncated` означает исчерпание бюджета (узлы/формы/память), но не отбор
+/// `per_bucket` лучших. `nodes_visited` — суммарное число посещённых узлов.
+#[must_use]
+pub fn search_forms(
+    text: &str,
+    preset: TextFormPreset,
+    metric: &dyn LineWidthMetric,
+    params: &FormSearchParams,
+) -> FormEnumeration {
+    if text.split_whitespace().next().is_none() {
+        return FormEnumeration {
+            forms: Vec::new(),
+            truncated: false,
+            nodes_visited: 0,
+        };
+    }
+    // Санация до начала работы: `NaN` в любом сравнении даёт `false` и молча
+    // снимает то ограничение, которое им задано (потолок пропорции, коридор,
+    // бюджет переносов), а нулевая высота строки обнуляет знаменатель пропорции.
+    let params = params.sanitized();
+
+    with_default_segmenter(|seg| {
+        let blocks = segment_form_blocks(seg, text);
+        if blocks.is_empty() {
+            return FormEnumeration {
+                forms: Vec::new(),
+                truncated: false,
+                nodes_visited: 0,
+            };
+        }
+
+        let mut ctx = SearchContext::new(&blocks, preset, metric, &params);
+        let mut forms = run_search(&mut ctx, f64::from(params.aspect_max));
+        if forms.is_empty() && params.aspect_max.is_finite() {
+            // План §2.1 (обязательный аварийный прогон): потолок пропорции снят,
+            // остальные ограничения в силе. Измерено: 57 реплик из 2089 без этого
+            // прогона не дали бы ни одной формы. Бюджет узлов общий с первым
+            // прогоном — если он исчерпан, прогон завершится, ничего не посетив.
+            forms = run_search(&mut ctx, f64::INFINITY);
+        }
+        FormEnumeration {
+            forms,
+            truncated: ctx.truncated,
+            nodes_visited: ctx.nodes_total,
+        }
+    })
 }
 
 /// Подбирает одну форму поверх scored-wrap рендера: предпочитает форму, где
@@ -1483,4 +2841,639 @@ Pages wired down:                        333333.\n";
             None
         );
     }
+
+    // --- Ранжированный поиск форм (`search_forms`) --------------------------
+
+    /// Высота строки для `CHAR_METRIC` в единицах ЭТОЙ метрики: ~2 символа на em
+    /// (плана §3, п.1) при интерлиньяже 120 % → `2 * 1.2`.
+    const CHAR_METRIC_LINE_HEIGHT: f32 = 2.4;
+
+    /// Настройки поиска по умолчанию, переведённые в единицы посимвольной метрики.
+    fn char_search_params() -> FormSearchParams {
+        FormSearchParams {
+            line_height_units: CHAR_METRIC_LINE_HEIGHT,
+            ..FormSearchParams::default()
+        }
+    }
+
+    /// Ширина самого широкого одиночного блока текста, измеренного как
+    /// переносимая строка — знаменатель люфта бюджета переносов (план §2.1).
+    fn min_possible_width_of(text: &str) -> u32 {
+        with_default_segmenter(|seg| {
+            let blocks = segment_form_blocks(seg, text);
+            let last = blocks.len();
+            (0..last)
+                .map(|index| {
+                    let (line, _) =
+                        build_line_text_and_units(&blocks[index..=index], index + 1 < last);
+                    CHAR_METRIC.line_width(&line)
+                })
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Пропорция формы в тех же единицах, что и потолок `aspect_max`.
+    fn aspect_of(form: &TextForm, line_height_units: f32) -> f64 {
+        f64::from(form.max_width) / (count_as_f64(form.line_count()) * f64::from(line_height_units))
+    }
+
+    /// Формы, сгруппированные по числу строк, в порядке появления в выдаче.
+    fn buckets_of(forms: &[TextForm]) -> Vec<(usize, Vec<u32>)> {
+        let mut buckets: Vec<(usize, Vec<u32>)> = Vec::new();
+        for form in forms {
+            match buckets.last_mut() {
+                Some((lines, qualities)) if *lines == form.line_count() => {
+                    qualities.push(form.quality_milli);
+                }
+                _ => buckets.push((form.line_count(), vec![form.quality_milli])),
+            }
+        }
+        buckets
+    }
+
+    /// Реплика на 209 символов из реального корпуса (`dev-docs/text_forms_ranking_plan.md`
+    /// §1, между p99 и максимумом): достаточно велика, чтобы дать полтора десятка
+    /// корзин, и достаточно мала, чтобы прогоняться в тестах несколько раз.
+    const MEDIUM_REPLICA: &str = "Кста, народ, может создать тг канал и чат вокруг моего \
+перевода? Буду делиться новостями перевода, показывать процесс, отвечать на вопросы. \
+Могу так же научить кого-то, или взять ещё какой-то заброшенный тайтл";
+
+    /// Самая длинная реплика корпуса — 382 символа, 67 слов (план §1). На ней
+    /// исчерпывающий перебор упирался в 4-секундный потолок и возвращал смещённую
+    /// выборку; ранжированный поиск обязан завершиться в пределах бюджета узлов.
+    const BIG_REPLICA: &str = "Всем привет, это ashen! МНе было очень весело делать эту \
+мангу! (и больно, лол) Это моя первая манга, и это не самая лучшая работа, много ошибок \
+в рисовке Я надеюсь, вы простите меня, так как работа создавалась для конкурса и у меня \
+был всего месяц. Плюс коллеги вымещают свою злобу на мне но, я надеюсь, вам понравилось! \
+я надеюсь в будущем создать больше историй, так что увидимся";
+
+    /// Текст, у которого под потолком пропорции формы заведомо есть: аварийный
+    /// прогон §2.1 на нём не срабатывает, поэтому потолок обязан соблюдаться.
+    const MEDIUM_TEXT: &str = "один два три четыре пять шесть семь восемь";
+
+    #[test]
+    fn quality_prefers_a_flat_block_over_a_staircase_of_equal_median() {
+        let weights = QualityWeights::DEFAULT;
+        let no_hyphens = [false; 5];
+        // Одинаковая медиана (10), разный профиль: ровный блок против «лесенки».
+        let flat = form_quality(&[10, 10, 10, 10, 10], &no_hyphens, 0, 2.5, &weights);
+        let staircase = form_quality(&[6, 8, 10, 12, 14], &no_hyphens, 0, 2.5, &weights);
+        assert!(
+            flat.quality < staircase.quality,
+            "flat {} must beat staircase {}",
+            flat.quality,
+            staircase.quality
+        );
+        // Ровный блок без переносов — идеал: все термы нулевые.
+        assert!(flat.quality.abs() < 1e-12, "flat block must score 0");
+        assert!(staircase.roughness > 0.0);
+    }
+
+    /// Потолок `Q`, под который обязаны попадать обе эталонные панели плана §2.2.
+    /// Значение выбрано между их фактическими оценками (0.766 и 1.040) и оценкой
+    /// второй панели без уценки краевого перехода (1.353).
+    const REFERENCE_QUALITY_CEILING: f64 = 1.10;
+
+    #[test]
+    fn reference_panels_score_under_the_ceiling_and_need_the_edge_discount() {
+        let weights = QualityWeights::DEFAULT;
+        // Панель p95 «ТЫ ПОСЛЕДНИЙ ЧЕЛОВЕК…»: 3 переноса на 8 строк, бюджет 0.5×8.
+        let wide = form_quality(
+            &[9, 11, 11, 13, 12, 12, 9, 7],
+            &[true, false, true, false, true, false, false, false],
+            6,
+            4.0,
+            &weights,
+        );
+        // Малая панель «ЭТО ЧТО-ТО ТИПА ТЕСТИРОВАНИЯ ЛОКАЦИИ.»: 2 переноса на 5
+        // строк, намеренно короткая первая строка (3 при медиане 7).
+        let small_widths = [3, 9, 8, 7, 7];
+        let small_hyphens = [false, true, false, true, false];
+        let small = form_quality(&small_widths, &small_hyphens, 4, 2.5, &weights);
+
+        assert!(
+            wide.quality < REFERENCE_QUALITY_CEILING,
+            "wide panel scored {}",
+            wide.quality
+        );
+        assert!(
+            small.quality < REFERENCE_QUALITY_CEILING,
+            "small panel scored {}",
+            small.quality
+        );
+
+        // Уценка краевого перехода несущая: без неё короткая первая строка малой
+        // панели читается как худший из возможных скачков и вердикт переворачивается.
+        let no_discount = QualityWeights {
+            edge_transition: 1.0,
+            ..weights
+        };
+        let small_without_discount =
+            form_quality(&small_widths, &small_hyphens, 4, 2.5, &no_discount);
+        assert!(
+            small_without_discount.quality > REFERENCE_QUALITY_CEILING,
+            "without the edge discount the small panel must fail the ceiling, got {}",
+            small_without_discount.quality
+        );
+        assert!(small.roughness < small_without_discount.roughness);
+    }
+
+    #[test]
+    fn search_returns_nothing_wider_than_the_aspect_cap() {
+        let params = char_search_params();
+        let result = search_forms(MEDIUM_TEXT, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        assert!(!result.forms.is_empty(), "text must admit forms under the cap");
+        let cap = f64::from(params.aspect_max);
+        for form in &result.forms {
+            let aspect = aspect_of(form, params.line_height_units);
+            assert!(
+                aspect <= cap + 1e-9,
+                "aspect {aspect} over cap {cap} for {:?}",
+                form.line_widths
+            );
+            // Поле `aspect_milli` обязано соответствовать посчитанной пропорции.
+            assert_eq!(form.aspect_milli, round_to_u32(aspect * 1000.0));
+        }
+    }
+
+    #[test]
+    fn hyphen_budget_is_strict_with_slack_and_relaxed_without_it() {
+        let text = "тестирование локации территории";
+        let min_possible = min_possible_width_of(text);
+        assert!(min_possible > 0);
+        let params = char_search_params();
+        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        assert!(!result.forms.is_empty());
+
+        let mut saw_strict_slack = false;
+        for form in &result.forms {
+            let slack = f64::from(form.max_width) / f64::from(min_possible);
+            let allowed = params.hyphen.allowed_ratio(slack) * count_as_f64(form.line_count());
+            assert!(
+                count_as_f64(form.word_break_count) <= allowed + 1e-9,
+                "{} hyphens over budget {allowed} at slack {slack}",
+                form.word_break_count
+            );
+            if slack >= f64::from(params.hyphen.slack_hi) {
+                saw_strict_slack = true;
+                assert!(
+                    count_as_f64(form.word_break_count)
+                        <= f64::from(params.hyphen.ratio_strict)
+                            * count_as_f64(form.line_count())
+                            + 1e-9,
+                    "comfortable width must keep hyphens under the strict share"
+                );
+            }
+        }
+        assert!(saw_strict_slack, "expected forms with slack >= slack_hi");
+
+        // Текст из равносложных слов, прижатый по ширине к самому широкому блоку:
+        // люфта нет (slack = 1.0 ≤ slack_lo), переносы вынуждены — правило обязано
+        // разрешить их сверх строгой доли.
+        let forced_text = "молоко молоко";
+        let forced_width = min_possible_width_of(forced_text);
+        let forced = FormSearchParams {
+            width_range: Some((0, forced_width)),
+            ..char_search_params()
+        };
+        let forced_result =
+            search_forms(forced_text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &forced);
+        assert!(!forced_result.forms.is_empty(), "narrow forms must exist");
+        assert!(
+            forced_result.forms.iter().any(|form| {
+                f64::from(form.max_width) / f64::from(forced_width)
+                    <= f64::from(params.hyphen.slack_lo)
+                    && count_as_f64(form.word_break_count)
+                        > f64::from(params.hyphen.ratio_strict) * count_as_f64(form.line_count())
+            }),
+            "at zero slack the hyphen share must be allowed above `ratio_strict`"
+        );
+    }
+
+    #[test]
+    fn empty_result_falls_back_to_a_lifted_aspect_cap() {
+        // Одно длинное неразрывное слово: под потолком пропорции нет ни одной
+        // формы, но окно не должно оставаться пустым (план §2.1).
+        let text = "ааааааааааааааааааааааааааааа";
+        let params = char_search_params();
+        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        assert_eq!(result.forms.len(), 1, "fallback must yield the single form");
+        let only = &result.forms[0];
+        assert_eq!(only.line_count(), 1);
+        assert!(
+            aspect_of(only, params.line_height_units) > f64::from(params.aspect_max),
+            "the fallback form is exactly the one the cap rejected"
+        );
+
+        // Формы может не существовать в принципе — тогда пустой ответ законен.
+        assert!(
+            search_forms(text, TextFormPreset::Lens, &CHAR_METRIC, &params)
+                .forms
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn buckets_are_capped_and_ordered_by_quality() {
+        let params = FormSearchParams {
+            per_bucket: 4,
+            ..char_search_params()
+        };
+        let result = search_forms(MEDIUM_REPLICA, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        assert!(!result.forms.is_empty());
+
+        let buckets = buckets_of(&result.forms);
+        let mut seen_line_counts: Vec<usize> = Vec::new();
+        for (line_count, qualities) in &buckets {
+            assert!(
+                qualities.len() <= params.per_bucket,
+                "bucket L={line_count} kept {} forms",
+                qualities.len()
+            );
+            assert!(
+                qualities.windows(2).all(|pair| pair[0] <= pair[1]),
+                "bucket L={line_count} is not sorted by quality: {qualities:?}"
+            );
+            assert!(
+                !seen_line_counts.contains(line_count),
+                "line count {line_count} appears in two separate runs"
+            );
+            seen_line_counts.push(*line_count);
+        }
+        // Корзины идут по возрастанию высоты формы.
+        assert!(seen_line_counts.windows(2).all(|pair| pair[0] < pair[1]));
+        // Все формы корзины действительно имеют её высоту, а ширины строк
+        // сохранены (потребителю не нужно перемерять).
+        for form in &result.forms {
+            assert_eq!(form.line_widths.len(), form.line_count());
+            assert_eq!(
+                form.line_widths,
+                form.lines
+                    .iter()
+                    .map(|line| CHAR_METRIC.line_width(line))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn big_replica_completes_within_the_node_budget() {
+        assert!(BIG_REPLICA.chars().count() >= 350);
+        let params = char_search_params();
+        let result = search_forms(BIG_REPLICA, TextFormPreset::FreeNoTree, &CHAR_METRIC, &params);
+        assert!(!result.forms.is_empty(), "a long replica must still get a window");
+        assert!(
+            result.nodes_visited <= params.node_budget_total,
+            "node budget overrun: {}",
+            result.nodes_visited
+        );
+        // Бюджет корзины тоже держится: ни одна не набрала больше `form_cap`.
+        for (line_count, qualities) in buckets_of(&result.forms) {
+            assert!(
+                qualities.len() <= params.per_bucket,
+                "bucket L={line_count} kept {} forms",
+                qualities.len()
+            );
+        }
+    }
+
+    #[test]
+    fn line_and_width_ranges_prune_the_search_instead_of_filtering_it() {
+        let baseline = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &char_search_params(),
+        );
+        assert!(!baseline.forms.is_empty());
+
+        let line_limited = FormSearchParams {
+            line_range: Some((9, 10)),
+            ..char_search_params()
+        };
+        let by_lines = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &line_limited,
+        );
+        assert!(!by_lines.forms.is_empty());
+        assert!(
+            by_lines
+                .forms
+                .iter()
+                .all(|form| (9..=10).contains(&form.line_count())),
+            "line_range must be a hard constraint"
+        );
+        // Сокращение перебора, а не фильтрация результата: две высоты из двух
+        // десятков обязаны стоить кратно меньше узлов.
+        assert!(
+            by_lines.nodes_visited * 4 < baseline.nodes_visited,
+            "line_range visited {} nodes vs baseline {}",
+            by_lines.nodes_visited,
+            baseline.nodes_visited
+        );
+
+        let widest = baseline
+            .forms
+            .iter()
+            .map(|form| form.max_width)
+            .max()
+            .unwrap_or(0);
+        let narrow_cap = widest / 2;
+        let width_limited = FormSearchParams {
+            width_range: Some((0, narrow_cap)),
+            ..char_search_params()
+        };
+        let by_width = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &width_limited,
+        );
+        assert!(!by_width.forms.is_empty());
+        assert!(
+            by_width
+                .forms
+                .iter()
+                .all(|form| form.max_width <= narrow_cap),
+            "width_range must clamp the corridor, not filter afterwards"
+        );
+        assert!(
+            by_width.nodes_visited < baseline.nodes_visited,
+            "width_range visited {} nodes vs baseline {}",
+            by_width.nodes_visited,
+            baseline.nodes_visited
+        );
+    }
+
+    #[test]
+    fn the_aspect_pre_skip_never_discards_an_admissible_form() {
+        // Контрпример: «a b» посимвольной метрикой БЕЗ висящей пунктуации. Текст в
+        // одну строку — 3 символа, значит `T_2` = 1.5, но разрыв съедает пробел:
+        // реальная форма ["a", "b"] имеет максимум 1 и проходит потолок пропорции
+        // (1 / (2 строки × 1.0) = 0.5 ≤ 0.6). Отсев корзины по `T_L > aspect_cap`
+        // (1.5 > 1.2) выбрасывал её — то есть был неадмиссибелен.
+        let metric = CharWidthMetric::new(false);
+        assert_eq!(metric.line_width("a b"), 3);
+        let params = FormSearchParams {
+            aspect_max: 0.6,
+            line_height_units: 1.0,
+            ..FormSearchParams::default()
+        };
+        let result = search_forms("a b", TextFormPreset::FreeNoTree, &metric, &params);
+        assert!(
+            result.forms.iter().any(|form| form.lines == ["a", "b"]),
+            "the two-line form must survive, got {:?}",
+            result
+                .forms
+                .iter()
+                .map(|form| form.lines.clone())
+                .collect::<Vec<_>>()
+        );
+        // Аварийный прогон при этом не понадобился: потолок соблюдён всеми формами.
+        for form in &result.forms {
+            let aspect = aspect_of(form, params.line_height_units);
+            assert!(
+                aspect <= f64::from(params.aspect_max) + 1e-9,
+                "aspect {aspect} over cap for {:?}",
+                form.lines
+            );
+        }
+    }
+
+    /// Метрика, у которой ширина строки НЕ растёт монотонно с индексом разрыва:
+    /// строка, КОНЧАЮЩАЯСЯ на `z`, получает +10, а присоединение следующего блока
+    /// делает эту `z` внутренней, и ширина падает. Это огрублённая модель
+    /// реального механизма — хвостового дефиса переноса, который при удлинении
+    /// строки исчезает.
+    struct TrailingPenaltyMetric;
+
+    impl LineWidthMetric for TrailingPenaltyMetric {
+        fn line_width(&self, line: &str) -> u32 {
+            let core = line.trim();
+            let penalty = u32::from(core.ends_with('z')) * 10;
+            u32::try_from(core.chars().count()).unwrap_or(u32::MAX) + penalty
+        }
+
+        fn tolerance(&self) -> u32 {
+            0
+        }
+    }
+
+    #[test]
+    fn the_corridor_break_survives_a_non_monotone_metric() {
+        let metric = TrailingPenaltyMetric;
+        // Ширины префиксов первой строки: 2, 16, 9, 12 — второй выше верха
+        // коридора (12), а следующий за ним снова под ним.
+        assert_eq!(metric.line_width("aa"), 2);
+        assert_eq!(metric.line_width("aa bbz"), 16);
+        assert_eq!(metric.line_width("aa bbz cc"), 9);
+        assert_eq!(metric.line_width("aa bbz cc dd"), 12);
+
+        // Одна ступень коридора с широким верхом: `upper` = 2.0 × T_2 = 12.
+        let params = FormSearchParams {
+            aspect_max: 4.0,
+            line_height_units: 3.0,
+            corridor_levels: vec![CorridorLevel {
+                interior_lo: 0.30,
+                interior_hi: 2.0,
+                head_lo: 0.30,
+                tail_lo: 0.30,
+            }],
+            line_range: Some((2, 2)),
+            ..FormSearchParams::default()
+        };
+        let result = search_forms("aa bbz cc dd", TextFormPreset::FreeNoTree, &metric, &params);
+        assert!(
+            result
+                .forms
+                .iter()
+                .any(|form| form.lines == ["aa bbz cc", "dd"]),
+            "the break past a non-monotone bump lost the form, got {:?}",
+            result
+                .forms
+                .iter()
+                .map(|form| form.lines.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_node_budget_is_one_total_for_both_runs() {
+        // Одно длинное неразрывное слово: под потолком пропорции форм нет, значит
+        // аварийный прогон §2.1 обязателен — и обязан тратить ТОТ ЖЕ бюджет узлов.
+        let text = "ааааааааааааааааааааааааааааа";
+        let generous = char_search_params();
+        let full = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &generous);
+        assert_eq!(full.forms.len(), 1, "a full budget must reach the fallback");
+        assert!(!full.truncated);
+
+        // Бюджет меньше того, что тратит ПЕРВЫЙ прогон: аварийный прогон не
+        // запускается вовсе, а результат помечен `truncated` — документированный
+        // выбор `search_forms` (жёсткий потолок сильнее «окно не должно пустовать»).
+        let starved = FormSearchParams {
+            node_budget_total: full.nodes_visited / 2,
+            ..char_search_params()
+        };
+        assert!(starved.node_budget_total >= 1, "the test needs a real budget");
+        let result = search_forms(text, TextFormPreset::FreeNoTree, &CHAR_METRIC, &starved);
+        assert!(result.truncated, "an exhausted budget must be reported");
+        assert!(
+            result.forms.is_empty(),
+            "the fallback must not get a second budget"
+        );
+        // Счётчик узлов проверяется ПОСЛЕ инкремента, поэтому вызов DFS, начатый на
+        // последнем узле, успевает посчитать себя: перерасход ограничен числом
+        // ступеней лестницы коридора, а не вторым таким же бюджетом.
+        let slack = u64::try_from(starved.corridor_levels.len()).unwrap_or(0);
+        assert!(
+            result.nodes_visited <= starved.node_budget_total + slack,
+            "spent {} nodes on a budget of {}",
+            result.nodes_visited,
+            starved.node_budget_total
+        );
+    }
+
+    #[test]
+    fn the_width_memo_degrades_instead_of_allocating_n_squared() {
+        // Маленький текст — плотная таблица.
+        assert!(matches!(WidthMemo::new(64), WidthMemo::Dense { .. }));
+        // Вставка на сотню тысяч символов: `n²` — сотни миллионов ячеек. Таблица
+        // обязана деградировать, а не выделять гигабайты.
+        assert!(matches!(WidthMemo::new(100_000), WidthMemo::Sparse(_)));
+        // Порог: `n²` ровно на потолке — ещё плотная, на один блок больше — уже нет.
+        assert!(matches!(WidthMemo::new(1_001), WidthMemo::Sparse(_)));
+        // `n * n` для абсурдного `n` не должно переполнять `usize` (checked-арифметика).
+        assert!(matches!(WidthMemo::new(usize::MAX), WidthMemo::Sparse(_)));
+
+        // Обе ветки одинаково отдают записанное и молчат про незаписанное.
+        let mut memos = [WidthMemo::new(8), WidthMemo::new(100_000)];
+        for memo in &mut memos {
+            assert_eq!(memo.get(3, 5), None);
+            memo.insert(3, 5, 42);
+            assert_eq!(memo.get(3, 5), Some(42));
+            assert_eq!(memo.get(3, 4), None);
+            assert_eq!(memo.get(2, 5), None);
+        }
+    }
+
+    #[test]
+    fn hostile_params_are_sanitized_before_the_search() {
+        let nan = f32::NAN;
+        // Каждое вещественное поле — вне области значений: `NaN` в потолке
+        // пропорции, нулевая высота строки, `NaN` в границах коридора, в долях
+        // бюджета переносов и в весах качества.
+        let hostile = FormSearchParams {
+            aspect_max: nan,
+            line_height_units: 0.0,
+            corridor_levels: vec![CorridorLevel {
+                interior_lo: nan,
+                interior_hi: nan,
+                head_lo: nan,
+                tail_lo: nan,
+            }],
+            hyphen: HyphenBudget {
+                ratio_strict: nan,
+                ratio_relaxed: nan,
+                slack_lo: nan,
+                slack_hi: nan,
+            },
+            quality: QualityWeights {
+                rough: nan,
+                uneven: nan,
+                head: nan,
+                edge_transition: nan,
+                ..QualityWeights::DEFAULT
+            },
+            ..FormSearchParams::default()
+        };
+        let defaults = FormSearchParams::default();
+        // Санация точечная: заменяется каждое отдельное поле, а не структура
+        // целиком — ступень коридора остаётся одна, но со строгими границами.
+        assert_eq!(
+            hostile.sanitized(),
+            FormSearchParams {
+                corridor_levels: vec![CorridorLevel::STRICT],
+                ..FormSearchParams::default()
+            },
+            "every out-of-domain real must fall back to its default"
+        );
+
+        let result = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &hostile,
+        );
+        assert!(!result.forms.is_empty(), "sanitised params must still search");
+
+        // Потолок пропорции действует (значением по умолчанию, а не «нет потолка»).
+        for form in &result.forms {
+            let aspect = aspect_of(form, defaults.line_height_units);
+            assert!(
+                aspect <= f64::from(defaults.aspect_max) + 1e-9,
+                "aspect {aspect} over the default cap"
+            );
+        }
+        // Бюджет переносов действует: `NaN` в доле пропускал абсолютно всё.
+        let min_possible = f64::from(min_possible_width_of(MEDIUM_REPLICA));
+        assert!(min_possible > 0.0);
+        for form in &result.forms {
+            let slack = f64::from(form.max_width) / min_possible;
+            let allowed = defaults.hyphen.allowed_ratio(slack) * count_as_f64(form.line_count());
+            assert!(
+                count_as_f64(form.word_break_count) <= allowed + 1e-9,
+                "{} hyphens over budget {allowed} at slack {slack}",
+                form.word_break_count
+            );
+        }
+        // Оценка качества посчитана, а не превращена `NaN`-весами в «идеал» (0).
+        assert!(
+            result.forms.iter().any(|form| form.quality_milli > 0),
+            "NaN weights would have scored every form as perfect"
+        );
+    }
+
+    #[test]
+    fn the_search_emits_each_form_exactly_once() {
+        // Тождество формы — её вектор разрезов, и каждый перебирается ровно раз
+        // (доказательство — в `search_dfs`); дедупликации по хешу, способной
+        // потерять форму на коллизии, в поиске нет.
+        let result = search_forms(
+            MEDIUM_REPLICA,
+            TextFormPreset::FreeNoTree,
+            &CHAR_METRIC,
+            &char_search_params(),
+        );
+        assert!(result.forms.len() > 10, "expected a rich sample");
+        let mut seen: HashSet<Vec<String>> = HashSet::new();
+        for form in &result.forms {
+            assert!(
+                seen.insert(form.lines.clone()),
+                "duplicate form: {:?}",
+                form.lines
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_enumeration_keeps_widths_but_stays_unscored() {
+        let result = enumerate_forms("aa bb ccccc", TextFormPreset::FreeNoTree, 1000, &CHAR_METRIC);
+        assert!(!result.forms.is_empty());
+        for form in &result.forms {
+            assert_eq!(form.line_widths, widths_of(form));
+            assert_eq!(form.quality_milli, UNSCORED_QUALITY_MILLI);
+            // Пропорция без известной высоты строки не определена.
+            assert_eq!(form.aspect_milli, 0);
+            assert_eq!(
+                form.roughness_pct,
+                roughness_pct_of_widths(&form.line_widths, &QualityWeights::DEFAULT)
+            );
+        }
+    }
 }
+
+
+

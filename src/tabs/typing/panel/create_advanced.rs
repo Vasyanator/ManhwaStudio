@@ -9,8 +9,9 @@ competing text accordion, and the "advanced form" enumeration window.
 Main responsibilities:
 - draw the advanced text-params section and its formula/shape layout controls;
 - draw formula spacing controls and the competing text accordion;
-- drive the advanced-form window: buttons, preview font, source text, metric
-  signature and glyph-width cache rebuild, and applying a chosen form.
+- drive the advanced-form window: buttons, preview font, source text, the metric
+  signature, the BACKGROUND form search and its «Параметры поиска» section, the
+  presentation order, and applying a chosen form.
 
 Notes:
 Extracted verbatim from `panel.rs`; methods are `pub(super)` so the module root
@@ -27,15 +28,63 @@ match at all and panic). See `panel/MODULE_README.md` for the fidelity trade-off
 
 THE METRIC'S FONT BYTES ARE OBTAINED OFF THE GUI THREAD. `poll_advanced_form_font`
 dispatches a `FontProvider::resolve` (a cache miss is an `fs::read`, forbidden here —
-`CLAUDE.md` §5) and caches the result in `AdvancedFormFont`; the window enumerates
-with the coarse per-CHARACTER metric until it lands, and the arrival changes
-`AdvancedFormMetricSignature::font_content_id`, which is what rebuilds the form cache
-with real glyph widths. The same two-step shape as the on-canvas editor font
-(`tab/create_upload.rs`). The own-typeface PREVIEW of the form cards goes through
-`widgets::request_font_family`, which reads its file off-thread for the same reason.
+`CLAUDE.md` §5) and caches the result in `AdvancedFormFont`. The FIRST search WAITS for
+them (`schedule_advanced_form_search` returns while a resolve is in flight): their
+arrival changes `AdvancedFormMetricSignature::font_content_id`, so enumerating before
+they land means enumerating the very same text twice. The same two-step shape as the
+on-canvas editor font (`tab/create_upload.rs`). The own-typeface PREVIEW of the form
+cards goes through `widgets::request_font_family`, which reads its file off-thread for
+the same reason.
+
+NEITHER IS THE SEARCH ITSELF ON THE GUI THREAD. `AdvancedFormSearchKey` describes the
+whole input; a change to it arms a ~200 ms debounce and then a named
+`typing-form-search` worker that builds the width metric AND runs
+`forms::search_forms`. Replacing the job cancels the previous one through its `Drop`
+(`AdvancedFormSearchJob`), the same cancel-on-supersede shape as
+`tab::TypingShapeVariantPreviewState`. While a search is in flight the window keeps
+drawing the PREVIOUS result plus a "recomputing" line — never an empty grid.
+The presentation order (`text_forms::order_advanced_forms`) is applied on the GUI
+thread, because it is a sort over a few hundred cards and its two knobs (quality
+floor, narrow lean) must NOT re-run the search.
 */
 
 use super::*;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use super::advanced_form_params::{
+    ASPECT_MAX_MAX, ASPECT_MAX_MIN, EVENNESS_MAX, EVENNESS_MIN, HYPHEN_RATIO_MAX,
+    HYPHEN_RATIO_MIN, HYPHEN_RELAX_SLACK_MAX, HYPHEN_RELAX_SLACK_MIN, NARROW_SLOTS_MAX,
+    NARROW_SLOTS_MIN, PER_BUCKET_MAX, PER_BUCKET_MIN, QUALITY_FLOOR_MAX, QUALITY_FLOOR_MIN,
+    advanced_form_params, set_advanced_form_params,
+};
+
+/// Пауза без изменений входа, после которой запускается перебор форм.
+///
+/// Ключ поиска меняется на КАЖДОМ нажатии клавиши и на каждом шаге слайдера;
+/// без этой паузы серия нажатий запускала бы (и тут же отменяла) по перебору на
+/// кадр. 200 мс — порядок величины самого перебора на худшей реплике корпуса
+/// (~50 мс, план §2.5), то есть цена ожидания ощутимо ниже цены рестарта.
+const ADVANCED_FORM_SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// Пауза без изменений ручек поиска, после которой они пишутся в
+/// `user_config.json`. Слайдер отдаёт новое значение каждый кадр перетаскивания,
+/// поэтому запись «на каждое изменение» была бы чистой амплификацией; значение
+/// применяется к процесс-глобальному состоянию СРАЗУ, ждёт только диск.
+const ADVANCED_FORM_PARAMS_SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// Единиц метрики на em у [`forms::GlyphWidths`] — она меряет глифы в 1/1000 em.
+const GLYPH_METRIC_UNITS_PER_EM: f32 = 1000.0;
+
+/// Единиц метрики на em у [`forms::CharWidthMetric`]: она считает СИМВОЛЫ, а
+/// строчный латинско-кириллический символ занимает примерно пол-em, то есть ~2
+/// символа на em. Число приблизительное по своей природе — приблизительна и сама
+/// метрика; оно нужно лишь для того, чтобы потолок пропорции формы имел
+/// осмысленный масштаб, пока байты шрифта не пришли.
+const CHAR_METRIC_UNITS_PER_EM: f32 = 2.0;
+
+/// Высота строки в долях em при вырожденных параметрах текста (интерлиньяж
+/// 120 %) — то же значение, что `forms::FormSearchParams::default()`.
+const DEFAULT_LINE_HEIGHT_EM: f32 = 1.2;
 
 impl TypingCreatePanelState {
 
@@ -862,7 +911,9 @@ impl TypingCreatePanelState {
         ui.horizontal_wrapped(|ui| {
             if ui.button(t!("typing.advanced.advanced_form_button")).clicked() {
                 self.advanced_form_open = true;
-                self.advanced_form_cache = None;
+                // Кэш НЕ выбрасывается: если вход не изменился, окно откроется с
+                // готовой сеткой, а если изменился — ключ поиска это заметит сам,
+                // и прежний результат подержится ровно до прихода нового.
                 self.advanced_form_centered = false;
             }
             // «Вернуть исходный» просто очищает сформированный текст и
@@ -1042,183 +1093,895 @@ impl TypingCreatePanelState {
         }
     }
 
+    /// Снимок всего, что нужно для ПОСТРОЕНИЯ метрики ширины, — чтобы её строил
+    /// фоновый воркер поиска, а не GUI-поток (см. [`AdvancedFormMetricSpec`]).
+    ///
+    /// Байты берутся из уже разрешённого кэша (`poll_advanced_form_font`); `None`
+    /// в них означает «мерить посимвольно».
+    pub(super) fn advanced_form_metric_spec(&self) -> AdvancedFormMetricSpec {
+        let font = self.fonts.get(self.selected_font_idx);
+        AdvancedFormMetricSpec {
+            content: self.advanced_form_font_content().cloned(),
+            // The FACE index is the panel's selection, not the content's representative
+            // face: one file can hold several faces and the user picked one of them.
+            face_index: font
+                .and_then(|font| font.faces.get(self.selected_face_idx))
+                .map_or(0, |face| face.face_index),
+            bundled_stack: font.is_some_and(|font| font.bundled_stack_font().is_some()),
+            path: font.map(|font| font.path.clone()).unwrap_or_default(),
+            display_label: font
+                .map(|font| font.display_label().to_string())
+                .unwrap_or_default(),
+            force_bold: self.force_bold,
+            faux_bold: self.faux_bold,
+            force_italic: self.force_italic,
+            faux_italic: self.faux_italic,
+            hanging_punctuation: self.hanging_punctuation,
+        }
+    }
+
     /// Строит попиксельную метрику ширины (`GlyphWidths`) выбранным шрифтом для
     /// символов `source_text`. `None`, если шрифт не выбран или его байты ещё не
     /// пришли/не читаются — тогда падаем на посимвольную метрику.
     ///
-    /// БАЙТЫ БЕРУТСЯ ИЗ УЖЕ РАЗРЕШЁННОГО КЭША (`poll_advanced_form_font`), а не из файла:
-    /// эта функция вызывается на GUI-потоке из `rebuild_advanced_form_cache_if_needed`,
-    /// где чтение файла запрещено (`CLAUDE.md` §5).
-    pub(super) fn build_advanced_form_glyph_widths(&self, source_text: &str) -> Option<forms::GlyphWidths> {
-        // Единицы на em для замеров (должно совпадать с метрикой внутри forms).
-        const METRIC_EM: f32 = 1000.0;
-        let font = self.fonts.get(self.selected_font_idx)?;
-        let content = self.advanced_form_font_content()?;
-        let face_index = font
-            .faces
-            .get(self.selected_face_idx)
-            .map_or(0, |face| face.face_index);
-        let path = font.path.clone();
-        // Лёгкая система шрифтов: пустая БД + только нужный файл (без системных шрифтов).
-        let mut font_system =
-            FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new());
-        // One-shot throwaway system: use a fresh, empty cache. This path is not
-        // pooled (it deliberately avoids the system-font scan for metric-only
-        // measurement), so the cache only satisfies the load API.
-        let mut font_cache = FontFaceCache::new();
-        // The FACE index is the panel's selection, not the content's representative face:
-        // one file can hold several faces and the user picked one of them.
-        let selected_face =
-            load_font_content(&mut font_system, &mut font_cache, content, face_index).ok()?;
-        let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
-        attrs = selected_face.apply_to_attrs(attrs);
-        // The metric must measure the SAME face the renderer draws, so the
-        // real-face request is gated exactly like the renderer's
-        // `ms_text_render::pipeline::base_attrs_real_bold_italic`, AND by what this
-        // database can actually provide: it holds only the selected font FILE, and
-        // cosmic-text treats style as a hard `Attrs::matches` filter, so requesting a
-        // face the file does not contain would leave the fallback iterator empty and
-        // panic on the GUI thread (`shape.rs`: `expect("no default font found")`).
-        let wants_real_bold = wants_metric_real_face(self.force_bold, self.faux_bold);
-        let wants_real_italic = wants_metric_real_face(self.force_italic, self.faux_italic);
-        let available = metric_real_face_availability(
-            font_system.db(),
-            attrs.style,
-            attrs.stretch,
-            wants_real_italic,
-        );
-        if wants_real_italic && !available.italic {
-            crate::runtime_log::log_warn(format!(
-                "typing advanced forms: real Italic face requested for font '{}', but the font \
-                 file provides no Italic face; measuring the selected face instead (the \
-                 enumerated forms use upright widths). Path: {} Face index: {face_index}",
-                font.display_label(),
-                path.display()
-            ));
+    /// Тонкая обёртка над [`build_advanced_form_glyph_widths_from_spec`]. Продовый
+    /// путь строит метрику в фоновом воркере поиска прямо из снимка
+    /// [`AdvancedFormMetricSpec`], поэтому обёртка существует ТОЛЬКО ради тестов
+    /// метрики, которые формулируют условие через состояние панели.
+    #[cfg(test)]
+    pub(super) fn build_advanced_form_glyph_widths(
+        &self,
+        source_text: &str,
+    ) -> Option<forms::GlyphWidths> {
+        build_advanced_form_glyph_widths_from_spec(&self.advanced_form_metric_spec(), source_text)
+    }
+}
+
+/// Строит попиксельную метрику ширины по снимку [`AdvancedFormMetricSpec`].
+///
+/// `None`, если байт шрифта нет или фейс не загрузился — вызывающий тогда мерит
+/// посимвольно. Чтения файла здесь НЕТ (байты уже разрешены), но разбор фейса,
+/// сборка `fontdb` и шейпинг алфавита — работа для фонового потока; вызывать её
+/// на GUI-потоке нельзя нигде, кроме тестов.
+fn build_advanced_form_glyph_widths_from_spec(
+    spec: &AdvancedFormMetricSpec,
+    source_text: &str,
+) -> Option<forms::GlyphWidths> {
+    // Единицы на em для замеров (должно совпадать с метрикой внутри forms).
+    const METRIC_EM: f32 = 1000.0;
+    let content = spec.content.as_ref()?;
+    let face_index = spec.face_index;
+    let path = spec.path.as_path();
+    // Лёгкая система шрифтов: пустая БД + только нужный файл (без системных шрифтов).
+    let mut font_system =
+        FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new());
+    // One-shot throwaway system: use a fresh, empty cache. This path is not
+    // pooled (it deliberately avoids the system-font scan for metric-only
+    // measurement), so the cache only satisfies the load API.
+    let mut font_cache = FontFaceCache::new();
+    let selected_face =
+        load_font_content(&mut font_system, &mut font_cache, content, face_index).ok()?;
+    let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
+    attrs = selected_face.apply_to_attrs(attrs);
+    // The metric must measure the SAME face the renderer draws, so the
+    // real-face request is gated exactly like the renderer's
+    // `ms_text_render::pipeline::base_attrs_real_bold_italic`, AND by what this
+    // database can actually provide: it holds only the selected font FILE, and
+    // cosmic-text treats style as a hard `Attrs::matches` filter, so requesting a
+    // face the file does not contain would leave the fallback iterator empty and
+    // panic (`shape.rs`: `expect("no default font found")`).
+    let wants_real_bold = wants_metric_real_face(spec.force_bold, spec.faux_bold);
+    let wants_real_italic = wants_metric_real_face(spec.force_italic, spec.faux_italic);
+    let available = metric_real_face_availability(
+        font_system.db(),
+        attrs.style,
+        attrs.stretch,
+        wants_real_italic,
+    );
+    if wants_real_italic && !available.italic {
+        crate::runtime_log::log_warn(format!(
+            "typing advanced forms: real Italic face requested for font '{}', but the font \
+             file provides no Italic face; measuring the selected face instead (the \
+             enumerated forms use upright widths). Path: {} Face index: {face_index}",
+            spec.display_label,
+            path.display()
+        ));
+    }
+    if wants_real_bold && !available.bold {
+        crate::runtime_log::log_warn(format!(
+            "typing advanced forms: real Bold face requested for font '{}', but the font \
+             file provides no Bold face at the requested style; measuring the selected face \
+             instead. Path: {} Face index: {face_index}",
+            spec.display_label,
+            path.display()
+        ));
+    }
+    // The built-in entry stands for the WHOLE bundled chain, not for the one `core`
+    // file it points at, so measuring only that file would size CJK / Arabic forms
+    // against `.notdef` boxes of Noto Sans while the renderer draws them with real
+    // advances. Registered AFTER `metric_real_face_availability`, which must keep
+    // seeing ONLY the selected file: it decides whether a real Bold/Italic face may be
+    // requested, and a chain face must never make an unsatisfiable request look
+    // satisfiable.
+    if spec.bundled_stack {
+        register_bundled_core_fallback(font_system.db_mut(), path);
+    }
+    attrs = apply_metric_real_bold_italic(
+        attrs,
+        spec.force_bold,
+        spec.faux_bold,
+        spec.force_italic,
+        spec.faux_italic,
+        available,
+    );
+    Some(forms::GlyphWidths::build(
+        &mut font_system,
+        &attrs,
+        source_text,
+        spec.hanging_punctuation,
+        forms::DEFAULT_WIDTH_TOLERANCE,
+    ))
+}
+
+/// Высота строки текста В ДОЛЯХ EM — множитель, которым окно форм переводит
+/// высоту строки в единицы ЛЮБОЙ метрики ширин
+/// (`forms::FormSearchParams::line_height_units` = `units_per_em × это`).
+///
+/// Зеркало `ms_text_render::pipeline` (`pipeline.rs:432-437`) вместе с его
+/// `effective_spacing_percent` (`pipeline.rs:2628-2630`), которая внутри крейта
+/// `pub(crate)` и потому воспроизведена здесь дословно:
+///
+/// ```text
+/// spacing%       = clamp(line_spacing_percent + (glyph_height_percent − 100), −300, 300)
+/// line_height_px = max(font_size_px + line_spacing_px + font_size_px·spacing%/100, 1)
+/// em             = line_height_px / font_size_px / (glyph_width_percent / 100)
+/// ```
+///
+/// ГОРИЗОНТАЛЬНЫЙ масштаб глифов обязан входить в делитель: ширины метрики
+/// меряются БЕЗ него, поэтому иначе потолок пропорции формы молча разъехался бы
+/// с тем, что видит пользователь.
+///
+/// Все проценты — в тех же единицах, что одноимённые поля `TextRenderParams`
+/// (`create_apply::build_render_params_for`): `100` = натуральный масштаб.
+/// Результат ВСЕГДА конечен и строго положителен ([`DEFAULT_LINE_HEIGHT_EM`] при
+/// вырожденном входе) — он попадает в ключ поиска, а `NaN` там сделал бы ключ
+/// не равным самому себе и зациклил перезапуск перебора.
+#[must_use]
+pub(super) fn advanced_form_line_height_em(
+    font_size_px: f32,
+    line_spacing_px: f32,
+    line_spacing_percent: f32,
+    glyph_height_percent: f32,
+    glyph_width_percent: f32,
+) -> f32 {
+    let font_size_px = if font_size_px.is_finite() {
+        font_size_px.max(1.0)
+    } else {
+        1.0
+    };
+    let line_spacing_px = if line_spacing_px.is_finite() {
+        line_spacing_px
+    } else {
+        0.0
+    };
+    // `f32::clamp` пропускает `NaN` насквозь, поэтому нечисловая сумма снимается
+    // сразу после него, а не до (порядок важен: до клампа она ещё не сложена).
+    let spacing_percent =
+        (line_spacing_percent + (glyph_height_percent - 100.0)).clamp(-300.0, 300.0);
+    let spacing_percent = if spacing_percent.is_finite() {
+        spacing_percent
+    } else {
+        0.0
+    };
+    let line_height_px =
+        (font_size_px + line_spacing_px + font_size_px * (spacing_percent / 100.0)).max(1.0);
+    let width_scale = glyph_width_percent / 100.0;
+    // Нулевой, отрицательный или нечисловой горизонтальный масштаб обнулил бы
+    // делитель; при нём вырождены и сами ширины, так что берём натуральный.
+    let width_scale = if width_scale.is_finite() && width_scale > 0.0 {
+        width_scale
+    } else {
+        1.0
+    };
+    let em = line_height_px / font_size_px / width_scale;
+    if em.is_finite() && em > 0.0 {
+        em
+    } else {
+        DEFAULT_LINE_HEIGHT_EM
+    }
+}
+
+/// Снимок процесс-глобальных ручок поиска, прижатый к поддерживаемым диапазонам.
+///
+/// Прижатие здесь — не дубль `to_search_params`: ключ поиска сравнивается по
+/// ЭТИМ значениям, и неприжатое (в пределе — `NaN` из руками правленого конфига)
+/// значение сделало бы ключ не равным самому себе.
+#[must_use]
+fn advanced_form_knobs() -> AdvancedFormParams {
+    let mut knobs = advanced_form_params();
+    knobs.clamp_to_supported_range();
+    knobs
+}
+
+/// Ручки, влияющие только на порядок показа карточек.
+#[must_use]
+fn advanced_form_order_key(knobs: &AdvancedFormParams) -> AdvancedFormOrderKey {
+    AdvancedFormOrderKey {
+        quality_floor_milli: knobs.quality_floor_milli(),
+        narrow_slots: knobs.narrow_slots,
+    }
+}
+
+/// Выполняет поиск форм целиком: строит метрику ширины и запускает
+/// `forms::search_forms`. Вызывается ТОЛЬКО из фонового воркера.
+///
+/// Единицы высоты строки собираются здесь, а не у вызывающего, потому что
+/// масштаб задаёт та метрика, которую удалось построить: 1/1000 em у
+/// `GlyphWidths` и ~2 символа на em у запасной `CharWidthMetric`.
+#[must_use]
+fn run_advanced_form_search(
+    key: &AdvancedFormSearchKey,
+    spec: &AdvancedFormMetricSpec,
+    knobs: AdvancedFormParams,
+) -> AdvancedFormSearchResult {
+    let glyph_widths = build_advanced_form_glyph_widths_from_spec(spec, &key.base.source_text);
+    let char_metric = forms::CharWidthMetric::new(spec.hanging_punctuation);
+    let (metric, units_per_em): (&dyn forms::LineWidthMetric, f32) = match glyph_widths.as_ref() {
+        Some(glyph_widths) => (glyph_widths, GLYPH_METRIC_UNITS_PER_EM),
+        None => (&char_metric, CHAR_METRIC_UNITS_PER_EM),
+    };
+    let params = knobs.to_search_params(
+        key.base.line_height_em * units_per_em,
+        key.line_range,
+        key.width_range,
+    );
+    let enumeration = forms::search_forms(
+        &key.base.source_text,
+        key.base.preset,
+        metric,
+        &params,
+    );
+    AdvancedFormSearchResult {
+        forms: enumeration.forms,
+        truncated: enumeration.truncated,
+    }
+}
+
+/// Собирает кэш окна из результата поиска и текущих ручек показа.
+///
+/// `carried_bounds` — границы диапазонных фильтров предыдущего кэша. Они
+/// переносятся, когда прогон был СУЖЕН этими же фильтрами (`key.line_range` /
+/// `key.width_range` заданы): наблюдения такого прогона описывают лишь
+/// запрошенное окно, и взять их за границы значило бы запереть пользователя в
+/// им же выбранном сужении без возможности расширить его обратно.
+#[must_use]
+pub(super) fn build_advanced_form_cache(
+    key: AdvancedFormSearchKey,
+    result: AdvancedFormSearchResult,
+    knobs: &AdvancedFormParams,
+    carried_bounds: Option<((usize, usize), (u32, u32))>,
+) -> AdvancedFormCache {
+    let forms = order_advanced_forms(result.forms.clone(), knobs);
+
+    let mut group_counts: Vec<usize> = forms.iter().map(|form| form.word_break_count).collect();
+    group_counts.sort_unstable();
+    group_counts.dedup();
+
+    // Пустой набор ничего не наблюдает: `inclusive_bounds` отдал бы `(0, 0)`, а
+    // это не «границы данных», а «данных нет».
+    let observed = (!forms.is_empty()).then(|| {
+        (
+            inclusive_bounds(forms.iter().map(TextForm::line_count)),
+            inclusive_bounds(forms.iter().map(|form| form.max_width)),
+        )
+    });
+    let carried_lines = key.line_range.and(carried_bounds).map(|bounds| bounds.0);
+    let carried_widths = key.width_range.and(carried_bounds).map(|bounds| bounds.1);
+    let line_bounds = merge_advanced_form_bounds(carried_lines, observed.map(|bounds| bounds.0));
+    let width_bounds = merge_advanced_form_bounds(carried_widths, observed.map(|bounds| bounds.1));
+
+    let peak_max_bound_min = forms
+        .iter()
+        .map(|form| form.peakiness_pct(PeakBase::Min))
+        .max()
+        .unwrap_or(0);
+    let peak_max_bound_median = forms
+        .iter()
+        .map(|form| form.peakiness_pct(PeakBase::Median))
+        .max()
+        .unwrap_or(0);
+    let uneven_max_bound = forms
+        .iter()
+        .map(|form| form.unevenness_pct)
+        .max()
+        .unwrap_or(0);
+    let conservatism_bound = forms
+        .iter()
+        .map(|form| form.conservatism)
+        .max()
+        .unwrap_or(Conservatism::Safe);
+
+    AdvancedFormCache {
+        key,
+        searched_forms: result.forms,
+        forms,
+        order_key: advanced_form_order_key(knobs),
+        group_counts,
+        line_bounds,
+        width_bounds,
+        peak_max_bound_min,
+        peak_max_bound_median,
+        uneven_max_bound,
+        conservatism_bound,
+        truncated: result.truncated,
+    }
+}
+
+/// Границы диапазонного фильтра: перенесённые расширяются наблюдёнными, а при
+/// отсутствии тех и других остаются схлопнутыми (`advanced_form_range_row` тогда
+/// строку фильтра не рисует).
+#[must_use]
+fn merge_advanced_form_bounds<T: Ord + Copy + Default>(
+    carried: Option<(T, T)>,
+    observed: Option<(T, T)>,
+) -> (T, T) {
+    match (carried, observed) {
+        (Some(carried), Some(observed)) => (
+            carried.0.min(observed.0),
+            carried.1.max(observed.1),
+        ),
+        (Some(bounds), None) | (None, Some(bounds)) => bounds,
+        (None, None) => (T::default(), T::default()),
+    }
+}
+
+/// Порядковый барьер отложенных записей ручек поиска форм.
+///
+/// Каждая правка ручек порождает СВОЙ поток записи, а общий замок
+/// `config::lock_user_config_write()` упорядочивает записи, но не спасает от
+/// ИНВЕРСИИ: два потока, стартовавшие в порядке «старое, новое», вправе взять
+/// замок в порядке «новое, старое», и на диск ляжет устаревший снимок — ручка
+/// молча откатилась бы при следующем запуске.
+///
+/// Барьер выдаёт монотонный номер поколения на КАЖДЫЙ старт записи
+/// ([`AdvancedFormParamsSaveGate::claim`]) и пропускает к диску только поток с
+/// НАИБОЛЬШИМ выданным номером ([`AdvancedFormParamsSaveGate::write_if_current`]),
+/// причём проверка и сама запись идут под ОДНИМ замком барьера — иначе устаревший
+/// поток мог бы проскочить между проверкой и записью более свежего.
+pub(super) struct AdvancedFormParamsSaveGate {
+    /// Последнее выданное поколение; `0` — не выдано ни одного.
+    latest: AtomicU64,
+    /// Держится на всё время «проверка + запись». Внутри него берётся
+    /// `config::lock_user_config_write()`, и НИКОГДА наоборот — обратного порядка
+    /// в проекте нет, поэтому пара замков не образует цикла.
+    write_lock: Mutex<()>,
+}
+
+impl AdvancedFormParamsSaveGate {
+    pub(super) const fn new() -> Self {
+        Self {
+            latest: AtomicU64::new(0),
+            write_lock: Mutex::new(()),
         }
-        if wants_real_bold && !available.bold {
-            crate::runtime_log::log_warn(format!(
-                "typing advanced forms: real Bold face requested for font '{}', but the font \
-                 file provides no Bold face at the requested style; measuring the selected face \
-                 instead. Path: {} Face index: {face_index}",
-                font.display_label(),
-                path.display()
-            ));
-        }
-        // The built-in entry stands for the WHOLE bundled chain, not for the one `core`
-        // file it points at, so measuring only that file would size CJK / Arabic forms
-        // against `.notdef` boxes of Noto Sans while the renderer draws them with real
-        // advances. Registered AFTER `metric_real_face_availability`, which must keep
-        // seeing ONLY the selected file: it decides whether a real Bold/Italic face may be
-        // requested, and a chain face must never make an unsatisfiable request look
-        // satisfiable.
-        if font.bundled_stack_font().is_some() {
-            register_bundled_core_fallback(font_system.db_mut(), &path);
-        }
-        attrs = apply_metric_real_bold_italic(
-            attrs,
-            self.force_bold,
-            self.faux_bold,
-            self.force_italic,
-            self.faux_italic,
-            available,
-        );
-        Some(forms::GlyphWidths::build(
-            &mut font_system,
-            &attrs,
-            source_text,
-            self.hanging_punctuation,
-            forms::DEFAULT_WIDTH_TOLERANCE,
-        ))
     }
 
-    pub(super) fn rebuild_advanced_form_cache_if_needed(&mut self) {
-        let source_text = self.advanced_form_source_text();
-        let signature = self.advanced_form_metric_signature();
-        let stale = match &self.advanced_form_cache {
-            Some(cache) => {
-                cache.source_text != source_text
-                    || cache.preset != self.advanced_form_preset
-                    || cache.metric_signature != signature
-            }
-            None => true,
-        };
-        if !stale {
-            return;
-        }
-        // Попиксельная метрика выбранным шрифтом; при отсутствии шрифта —
-        // посимвольная (с учётом висящей пунктуации).
-        let glyph_widths = self.build_advanced_form_glyph_widths(&source_text);
-        let char_metric = forms::CharWidthMetric::new(self.hanging_punctuation);
-        let metric: &dyn forms::LineWidthMetric = match &glyph_widths {
-            Some(glyph_widths) => glyph_widths,
-            None => &char_metric,
-        };
-        // Храним ВСЕ удачные формы (перебор ограничен лишь бюджетом узлов
-        // рекурсии). Фильтры применяются ко всему набору; ограничение на 600 —
-        // только в отрисовке (`ADVANCED_FORM_DISPLAY_LIMIT`).
-        let enumeration = forms::enumerate_forms(
-            &source_text,
-            self.advanced_form_preset,
-            usize::MAX,
-            metric,
+    /// Регистрирует новую запись и отдаёт её поколение (строго новее всех ранее
+    /// выданных).
+    pub(super) fn claim(&self) -> u64 {
+        self.latest.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+    }
+
+    /// Отзывает поколение записи, которая так и НЕ стартовала (поток не создался).
+    ///
+    /// Без отзыва несостоявшаяся запись навсегда объявила бы себя «самой свежей», и
+    /// уже запущенная ПРЕДЫДУЩАЯ запись отказалась бы писать — на диск не легло бы
+    /// вообще ничего. Если поколение уже перекрыто ещё более свежим, отзывать
+    /// нечего, и вызов ничего не делает.
+    pub(super) fn release(&self, generation: u64) {
+        // `Err` = нас уже перекрыли; победитель новее, и он же и запишет.
+        let _ = self.latest.compare_exchange(
+            generation,
+            generation.wrapping_sub(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
         );
-        let mut forms = enumeration.forms;
-        sort_advanced_forms(&mut forms);
-        let mut group_counts: Vec<usize> =
-            forms.iter().map(|form| form.word_break_count).collect();
-        group_counts.sort_unstable();
-        group_counts.dedup();
-        // Сбрасываем выбор группы, если такого числа переносов больше нет.
+    }
+
+    /// Выполняет `write`, только если `generation` всё ещё самое новое; иначе
+    /// запись отменяется (её уже перекрыла более свежая) и возвращается `false`.
+    ///
+    /// Отравленный замок восстанавливается: полезной нагрузки у него нет, а
+    /// потеря сохранения хуже, чем работа после чужой паники.
+    pub(super) fn write_if_current(&self, generation: u64, write: impl FnOnce()) -> bool {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.latest.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        write();
+        true
+    }
+}
+
+/// Процесс-глобальный барьер записи ручек поиска форм.
+static ADVANCED_FORM_PARAMS_SAVE_GATE: AdvancedFormParamsSaveGate =
+    AdvancedFormParamsSaveGate::new();
+
+/// Пишет ручки поиска форм в `user_config.json` на именованном фоновом потоке —
+/// той же схемой, что `settings::draw_rotation_ctrl_wheel_setting`.
+///
+/// Путь конфига вычисляется ВНУТРИ воркера: `config::user_config_path` щупает
+/// файловую систему, а вызывающий — GUI-поток. Ошибка записи только логируется:
+/// значение уже применено к процесс-глобальному состоянию, поэтому сессия
+/// работает как ни в чём не бывало и терять кадр на всплывающее сообщение не за что.
+///
+/// Запись ПОРЯДКОВО БЕЗОПАСНА: поколение выдаётся здесь, в момент старта, а поток
+/// сверяется с ним под замком [`ADVANCED_FORM_PARAMS_SAVE_GATE`] — перекрытый
+/// снимок на диск не попадает (см. [`AdvancedFormParamsSaveGate`]).
+fn persist_advanced_form_search_params(params: AdvancedFormParams) {
+    let generation = ADVANCED_FORM_PARAMS_SAVE_GATE.claim();
+    if let Err(error) = thread::Builder::new()
+        .name("typing-form-search-params-save".to_string())
+        .spawn(move || {
+            let path = config::user_config_path();
+            // Возвращённый `false` — не ошибка: этот снимок перекрыт более
+            // свежим, который и лежит (или ляжет) на диске.
+            ADVANCED_FORM_PARAMS_SAVE_GATE.write_if_current(generation, || {
+                if let Err(error) =
+                    crate::tabs::settings::save_advanced_form_search_params(&path, params)
+                {
+                    crate::runtime_log::log_error(format!(
+                        "typing advanced forms: failed to persist the search parameters. \
+                         Path: {} Error: {error}",
+                        path.display()
+                    ));
+                }
+            });
+        })
+    {
+        // Поток не стартовал — снимаем своё поколение, иначе уже запущенная
+        // предыдущая запись сочла бы себя перекрытой и не записала бы ничего.
+        ADVANCED_FORM_PARAMS_SAVE_GATE.release(generation);
+        crate::runtime_log::log_error(format!(
+            "typing advanced forms: failed to start the search-parameters save thread; the \
+             values stay in effect for this session only. Error: {error}"
+        ));
+    }
+}
+
+impl TypingCreatePanelState {
+    /// Всё, от чего зависит НАБОР найденных форм, кроме диапазонов фильтров окна.
+    ///
+    /// `knobs` передаются, а не читаются здесь: вызывающий берёт снимок
+    /// процесс-глобальных ручек ОДИН раз за кадр и строит по нему и базу, и ключ,
+    /// иначе два чтения могли бы разойтись правкой из другого потока.
+    /// [`AdvancedFormParams::filters_prune`] в базу не входит намеренно — см.
+    /// [`AdvancedFormSearchBase`].
+    pub(super) fn advanced_form_search_base(
+        &self,
+        knobs: &AdvancedFormParams,
+    ) -> AdvancedFormSearchBase {
+        // Те же величины и в тех же единицах, что уходят в рендер
+        // (`create_apply::build_render_params_for`) — иначе потолок пропорции
+        // формы описывал бы не тот текст, который увидит пользователь.
+        let font_size_px = self.font_size_px.max(1.0);
+        let (line_spacing_px, line_spacing_percent) = self.line_spacing.as_px_percent();
+        AdvancedFormSearchBase {
+            source_text: self.advanced_form_source_text(),
+            preset: self.advanced_form_preset,
+            metric: self.advanced_form_metric_signature(),
+            evenness: knobs.evenness,
+            aspect_max: knobs.aspect_max,
+            hyphen_ratio: knobs.hyphen_ratio,
+            hyphen_relax_slack: knobs.hyphen_relax_slack,
+            per_bucket: knobs.per_bucket,
+            line_height_em: advanced_form_line_height_em(
+                font_size_px,
+                line_spacing_px,
+                line_spacing_percent,
+                self.glyph_height.as_percent_of(font_size_px),
+                self.glyph_width.as_percent_of(font_size_px),
+            ),
+        }
+    }
+
+    /// База набора форм, который окно ПОКАЗЫВАЕТ прямо сейчас; `None`, пока не
+    /// показан ни один.
+    ///
+    /// Именно с ней сравнивается текущая база, а не с той, что уже считается или
+    /// ждёт debounce: диапазонные фильтры описывают ПОКАЗАННЫЙ набор, и пока он
+    /// не относится к текущему входу, их полагается держать раскрытыми. Сброс от
+    /// этого идемпотентен и повторяется каждый кадр набора текста — это и есть
+    /// правильное поведение, а не издержка.
+    fn advanced_form_shown_search_base(&self) -> Option<&AdvancedFormSearchBase> {
+        self.advanced_form_cache.as_ref().map(|cache| &cache.key.base)
+    }
+
+    /// Идёт ли прямо сейчас пересчёт форм (ожидание байт метрики, debounce или
+    /// сам перебор). Пока он идёт, окно рисует ПРЕЖНИЙ результат и сообщает, что
+    /// он устарел.
+    fn advanced_form_search_in_progress(&self) -> bool {
+        self.advanced_form_font_request.is_some()
+            || self.advanced_form_search_debounce.is_some()
+            || self.advanced_form_search.is_some()
+    }
+
+    /// Принимает готовый результат фонового поиска. Раз за кадр, ДО планирования
+    /// нового: только что пришедший результат может оказаться ровно тем, что
+    /// нужно, и тогда планировать нечего.
+    fn poll_advanced_form_search(&mut self, ctx: &egui::Context) {
+        let outcome = match self.advanced_form_search.as_ref() {
+            Some(job) => job.rx.try_recv(),
+            None => return,
+        };
+        match outcome {
+            Ok(result) => {
+                let Some(job) = self.advanced_form_search.take() else {
+                    return;
+                };
+                // Клон, а не перемещение: у задачи есть `Drop` (он и отменяет
+                // предыдущую), поэтому её поля частично не вынимаются. Копия
+                // ключа стоит одну строку текста и делается раз на поиск.
+                self.install_advanced_form_search_result(
+                    job.key.clone(),
+                    job.reset_display_filters,
+                    result,
+                );
+            }
+            Err(TryRecvError::Empty) => {
+                // Воркер не планирует кадров сам.
+                ctx.request_repaint();
+            }
+            Err(TryRecvError::Disconnected) => {
+                let Some(job) = self.advanced_form_search.take() else {
+                    return;
+                };
+                crate::runtime_log::log_error(
+                    "typing advanced forms: the background form search ended without a result; \
+                     the window shows an empty set until the input changes",
+                );
+                // Пустой результат ПОД ЭТИМ ЖЕ ключом: иначе следующий кадр
+                // запустил бы ту же задачу заново и окно закольцевалось бы на
+                // падающем воркере.
+                self.install_advanced_form_search_result(
+                    job.key.clone(),
+                    job.reset_display_filters,
+                    AdvancedFormSearchResult {
+                        forms: Vec::new(),
+                        truncated: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Ставит результат поиска в кэш и приводит к нему фильтры показа.
+    fn install_advanced_form_search_result(
+        &mut self,
+        key: AdvancedFormSearchKey,
+        reset_display_filters: bool,
+        result: AdvancedFormSearchResult,
+    ) {
+        let knobs = advanced_form_knobs();
+        let carried_bounds = self
+            .advanced_form_cache
+            .as_ref()
+            .map(|cache| (cache.line_bounds, cache.width_bounds));
+        let cache = build_advanced_form_cache(key, result, &knobs, carried_bounds);
+        if reset_display_filters {
+            // Пороги пиковости и неравномерности — на максимум (показываем всё).
+            self.advanced_form_peak_max = match self.advanced_form_peak_base {
+                PeakBase::Min => cache.peak_max_bound_min,
+                PeakBase::Median => cache.peak_max_bound_median,
+            };
+            self.advanced_form_uneven_max = cache.uneven_max_bound;
+            // Консервативность по умолчанию строгая (`Safe`): показываем только
+            // формы без отрыва служебных слов. Пользователь ослабляет вручную.
+            self.advanced_form_conservatism_max = Conservatism::Safe;
+            self.advanced_form_group = None;
+        }
+        // Выбранного числа переносов может не быть в новом наборе — и тогда
+        // фильтр показывал бы пустую сетку без единой подсказки почему.
         if let Some(selected) = self.advanced_form_group
-            && !group_counts.contains(&selected)
+            && !cache.group_counts.contains(&selected)
         {
             self.advanced_form_group = None;
         }
-        let line_bounds = inclusive_bounds(forms.iter().map(|form| form.line_count()));
-        let width_bounds = inclusive_bounds(forms.iter().map(|form| form.max_width));
-        let peak_max_bound_min = forms
-            .iter()
-            .map(|form| form.peakiness_pct(PeakBase::Min))
-            .max()
-            .unwrap_or(0);
-        let peak_max_bound_median = forms
-            .iter()
-            .map(|form| form.peakiness_pct(PeakBase::Median))
-            .max()
-            .unwrap_or(0);
-        let uneven_max_bound = forms.iter().map(|form| form.unevenness_pct).max().unwrap_or(0);
-        let conservatism_bound = forms
-            .iter()
-            .map(|form| form.conservatism)
-            .max()
-            .unwrap_or(Conservatism::Safe);
-        // Диапазоны фильтров заново раскрываются на всю ширину данных; пороги
-        // пиковости и неравномерности — на максимум (показываем всё).
-        self.advanced_form_line_range = line_bounds;
-        self.advanced_form_width_range = width_bounds;
-        self.advanced_form_peak_max = match self.advanced_form_peak_base {
-            PeakBase::Min => peak_max_bound_min,
-            PeakBase::Median => peak_max_bound_median,
+        self.advanced_form_cache = Some(cache);
+    }
+
+    /// Планирует перебор, когда вход изменился: сбрасывает диапазоны при смене
+    /// базы, выдерживает debounce и запускает воркер, отменяя предыдущий.
+    ///
+    /// Переключение `filters_prune` базой НЕ является: оба диапазона переживают
+    /// его в любую сторону, меняется лишь то, попадают ли они в ключ (то есть в
+    /// перебор) или остаются фильтром показа.
+    pub(super) fn schedule_advanced_form_search(&mut self, ctx: &egui::Context) {
+        // Один снимок ручек на кадр: база и ключ обязаны быть согласованы.
+        let knobs = advanced_form_knobs();
+        let base = self.advanced_form_search_base(&knobs);
+        // Смена базы — это другой набор форм: сужённые под прошлый набор
+        // диапазоны не должны ни сужать первый прогон нового текста, ни держать
+        // фильтр в пустом окне.
+        if self.advanced_form_shown_search_base() != Some(&base) {
+            self.advanced_form_line_range = None;
+            self.advanced_form_width_range = None;
+        }
+        let key = AdvancedFormSearchKey {
+            line_range: knobs
+                .filters_prune
+                .then_some(self.advanced_form_line_range)
+                .flatten(),
+            width_range: knobs
+                .filters_prune
+                .then_some(self.advanced_form_width_range)
+                .flatten(),
+            base,
         };
-        self.advanced_form_uneven_max = uneven_max_bound;
-        // Консервативность по умолчанию строгая (`Safe`): показываем только формы
-        // без отрыва служебных слов, как раньше. Пользователь ослабляет вручную.
-        self.advanced_form_conservatism_max = Conservatism::Safe;
-        self.advanced_form_cache = Some(AdvancedFormCache {
-            source_text,
-            preset: self.advanced_form_preset,
-            forms,
-            group_counts,
-            line_bounds,
-            width_bounds,
-            metric_signature: signature,
-            peak_max_bound_min,
-            peak_max_bound_median,
-            uneven_max_bound,
-            conservatism_bound,
-            truncated: enumeration.truncated,
-        });
+        if self
+            .advanced_form_cache
+            .as_ref()
+            .is_some_and(|cache| cache.key == key)
+        {
+            self.advanced_form_search_debounce = None;
+            // Показанное уже отвечает текущему входу. Задача, запущенная ради
+            // входа, от которого пользователь успел откатиться, теперь только
+            // перезаписала бы кэш устаревшим набором — роняем её (`Drop` взводит
+            // отмену).
+            self.advanced_form_search = None;
+            return;
+        }
+        if self
+            .advanced_form_search
+            .as_ref()
+            .is_some_and(|job| job.key == key)
+        {
+            self.advanced_form_search_debounce = None;
+            return;
+        }
+        // Ждём байты метрики: их приход меняет `font_content_id`, то есть базу
+        // ключа, и перебор пришлось бы повторить целиком — два полных прохода на
+        // каждое открытие окна.
+        if self.advanced_form_font_request.is_some() {
+            ctx.request_repaint();
+            return;
+        }
+        let now = Instant::now();
+        let restart = self
+            .advanced_form_search_debounce
+            .as_ref()
+            .is_none_or(|(pending, _)| *pending != key);
+        if restart {
+            self.advanced_form_search_debounce = Some((key.clone(), now));
+        }
+        let Some((_, since)) = self.advanced_form_search_debounce.as_ref() else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(*since);
+        if elapsed < ADVANCED_FORM_SEARCH_DEBOUNCE {
+            // Ни одно другое событие не разбудит окно: ввод уже обработан.
+            ctx.request_repaint_after(ADVANCED_FORM_SEARCH_DEBOUNCE - elapsed);
+            return;
+        }
+        self.advanced_form_search_debounce = None;
+        let reset_display_filters = self
+            .advanced_form_cache
+            .as_ref()
+            .is_none_or(|cache| cache.key.base != key.base);
+        self.spawn_advanced_form_search(ctx, key, knobs, reset_display_filters);
+    }
+
+    /// Запускает фоновый поиск форм, отменяя предыдущий.
+    ///
+    /// `knobs` — ТОТ ЖЕ снимок ручек, по которому собран `key`: воркер решает по
+    /// `filters_prune`, пускать ли диапазоны ключа в перебор, и второе чтение
+    /// процесс-глобального значения могло бы разойтись с ключом.
+    ///
+    /// Отмена не требует явного вызова: присвоение поля роняет прежнюю задачу, а
+    /// её `Drop` взводит общий с воркером флаг.
+    fn spawn_advanced_form_search(
+        &mut self,
+        ctx: &egui::Context,
+        key: AdvancedFormSearchKey,
+        knobs: AdvancedFormParams,
+        reset_display_filters: bool,
+    ) {
+        let spec = self.advanced_form_metric_spec();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_key = key.clone();
+        let (tx, rx) = mpsc::channel::<AdvancedFormSearchResult>();
+        match thread::Builder::new()
+            .name("typing-form-search".to_string())
+            .spawn(move || {
+                // Задачу могли заменить, пока поток стартовал.
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = run_advanced_form_search(&worker_key, &spec, knobs);
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Неудачная отправка значит лишь, что окно закрыли или вход
+                // сменился, пока шёл перебор.
+                let _ = tx.send(result);
+            }) {
+            Ok(_handle) => {
+                self.advanced_form_search = Some(AdvancedFormSearchJob {
+                    key,
+                    cancel,
+                    rx,
+                    reset_display_filters,
+                });
+                ctx.request_repaint();
+            }
+            Err(error) => {
+                crate::runtime_log::log_error(format!(
+                    "typing advanced forms: failed to spawn the form search worker; the window \
+                     shows no variants for this input. Error: {error}"
+                ));
+                // Пустой результат под этим ключом — иначе окно пыталось бы
+                // стартовать поток каждый кадр.
+                self.advanced_form_search = None;
+                self.install_advanced_form_search_result(
+                    key,
+                    reset_display_filters,
+                    AdvancedFormSearchResult {
+                        forms: Vec::new(),
+                        truncated: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Пересобирает ПОРЯДОК показа, когда изменились только его ручки (порог
+    /// качества, приоритет узких форм). Перебор при этом не повторяется:
+    /// пересортировка нескольких сотен карточек стоит доли миллисекунды, а
+    /// перебор — десятки.
+    fn reorder_advanced_form_cache_if_needed(&mut self) {
+        let knobs = advanced_form_knobs();
+        let order_key = advanced_form_order_key(&knobs);
+        if self
+            .advanced_form_cache
+            .as_ref()
+            .is_none_or(|cache| cache.order_key == order_key)
+        {
+            return;
+        }
+        let Some(cache) = self.advanced_form_cache.take() else {
+            return;
+        };
+        let carried_bounds = Some((cache.line_bounds, cache.width_bounds));
+        let result = AdvancedFormSearchResult {
+            forms: cache.searched_forms,
+            truncated: cache.truncated,
+        };
+        self.advanced_form_cache = Some(build_advanced_form_cache(
+            cache.key,
+            result,
+            &knobs,
+            carried_bounds,
+        ));
+    }
+
+    /// Дописывает ручки поиска на диск, когда пользователь перестал их крутить.
+    fn poll_advanced_form_params_save(&mut self, ctx: &egui::Context) {
+        let Some(since) = self.advanced_form_params_save_pending else {
+            return;
+        };
+        let elapsed = Instant::now().saturating_duration_since(since);
+        if elapsed < ADVANCED_FORM_PARAMS_SAVE_DEBOUNCE {
+            ctx.request_repaint_after(ADVANCED_FORM_PARAMS_SAVE_DEBOUNCE - elapsed);
+            return;
+        }
+        self.flush_advanced_form_params_save();
+    }
+
+    /// Немедленно дописывает отложенную правку ручек поиска, если она есть.
+    /// Зовётся при закрытии окна, чтобы правка «за секунду до закрытия» не
+    /// пропала вместе с окном.
+    fn flush_advanced_form_params_save(&mut self) {
+        if self.advanced_form_params_save_pending.take().is_some() {
+            persist_advanced_form_search_params(advanced_form_knobs());
+        }
+    }
+
+    /// Секция «Параметры поиска» окна форм (план §3c) — свёрнута по умолчанию.
+    ///
+    /// Каждый контрол привязан к константам `*_MIN`/`*_MAX` модуля
+    /// `advanced_form_params`, поэтому предложить значение, которое поиск
+    /// откажется принять, физически нельзя. Правка применяется к
+    /// процесс-глобальному значению СРАЗУ (следующий кадр запланирует перебор
+    /// через общий debounce), а запись на диск откладывается
+    /// [`ADVANCED_FORM_PARAMS_SAVE_DEBOUNCE`].
+    fn draw_advanced_form_search_params_section(&mut self, ui: &mut egui::Ui) {
+        let preview_enabled = self.preview_enabled;
+        let mut edited: Option<AdvancedFormParams> = None;
+        collapsing_param_section(
+            ui,
+            "typing.advanced.form_search_section",
+            preview_enabled,
+            t!("typing.advanced.form_search_section"),
+            false,
+            None,
+            |ui| {
+                let before = advanced_form_knobs();
+                let mut knobs = before;
+                ui.add(
+                    WheelSlider::new(&mut knobs.evenness, EVENNESS_MIN..=EVENNESS_MAX)
+                        .text(t!("typing.advanced.form_search_evenness_label"))
+                        .fixed_decimals(2)
+                        .wheel_step(0.05),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_evenness_tooltip"));
+                ui.add(
+                    WheelSlider::new(&mut knobs.aspect_max, ASPECT_MAX_MIN..=ASPECT_MAX_MAX)
+                        .text(t!("typing.advanced.form_search_aspect_label"))
+                        .fixed_decimals(2)
+                        .wheel_step(0.05),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_aspect_tooltip"));
+                ui.add(
+                    WheelSlider::new(&mut knobs.hyphen_ratio, HYPHEN_RATIO_MIN..=HYPHEN_RATIO_MAX)
+                        .text(t!("typing.advanced.form_search_hyphen_ratio_label"))
+                        // Хранится долей, показывается процентом — как и всё
+                        // остальное «сколько строк» в панели.
+                        .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                        .wheel_step(0.05),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_hyphen_ratio_tooltip"));
+                ui.add(
+                    WheelSlider::new(
+                        &mut knobs.hyphen_relax_slack,
+                        HYPHEN_RELAX_SLACK_MIN..=HYPHEN_RELAX_SLACK_MAX,
+                    )
+                    .text(t!("typing.advanced.form_search_hyphen_relax_label"))
+                    .fixed_decimals(2)
+                    .wheel_step(0.05),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_hyphen_relax_tooltip"));
+                ui.add(
+                    WheelSlider::new(&mut knobs.quality_floor, QUALITY_FLOOR_MIN..=QUALITY_FLOOR_MAX)
+                        .text(t!("typing.advanced.form_search_quality_floor_label"))
+                        .fixed_decimals(2)
+                        .wheel_step(0.05),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_quality_floor_tooltip"));
+                ui.add(
+                    WheelSlider::new(&mut knobs.per_bucket, PER_BUCKET_MIN..=PER_BUCKET_MAX)
+                        .text(t!("typing.advanced.form_search_per_bucket_label")),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_per_bucket_tooltip"));
+                ui.add(
+                    WheelSlider::new(&mut knobs.narrow_slots, NARROW_SLOTS_MIN..=NARROW_SLOTS_MAX)
+                        .text(t!("typing.advanced.form_search_narrow_bias_label")),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_narrow_bias_tooltip"));
+                ui.checkbox(
+                    &mut knobs.filters_prune,
+                    t!("typing.advanced.form_search_filters_prune_checkbox"),
+                )
+                .on_hover_text(t!("typing.advanced.form_search_filters_prune_tooltip"));
+                if ui
+                    .small_button(t!("typing.advanced.form_search_reset_button"))
+                    .clicked()
+                {
+                    knobs = AdvancedFormParams::default();
+                }
+                if knobs != before {
+                    edited = Some(knobs);
+                }
+            },
+        );
+        if let Some(knobs) = edited {
+            // Применяем сразу: следующий кадр увидит новый ключ поиска. Диск ждёт
+            // паузы — слайдер отдаёт новое значение на каждом кадре перетаскивания.
+            set_advanced_form_params(knobs);
+            self.advanced_form_params_save_pending = Some(Instant::now());
+        }
     }
 
     /// Применяет выбранную форму: записывает её как сформированный текст (исходный
@@ -1229,15 +1992,27 @@ impl TypingCreatePanelState {
         self.queue_preview_render();
     }
 
-    /// Плавающее окно перебора форм текста.
+    /// Плавающее окно поиска форм текста.
+    ///
+    /// Состояние КАЖДОГО кадра, ровно в этом порядке:
+    /// 1. `poll_advanced_form_font` — фоновый резолв байт метрики;
+    /// 2. `poll_advanced_form_search` — приём готового результата перебора;
+    /// 3. `schedule_advanced_form_search` — сравнение входа с ключом кэша,
+    ///    debounce и запуск воркера (с отменой предыдущего);
+    /// 4. `reorder_advanced_form_cache_if_needed` — только порядок показа;
+    /// 5. `poll_advanced_form_params_save` — отложенная запись ручек на диск;
+    /// 6. отрисовка ПОСЛЕДНЕГО известного результата (плюс строка «пересчёт»,
+    ///    пока идут шаги 1–3) — пустая сетка не показывается никогда.
     pub(super) fn draw_advanced_form_window(&mut self, ctx: &egui::Context) -> bool {
         if !self.advanced_form_open {
             return false;
         }
-        // Before the cache check: the arrival of the bytes changes the metric signature,
-        // which is what makes the rebuild below switch to real glyph widths.
         self.poll_advanced_form_font(ctx);
-        self.rebuild_advanced_form_cache_if_needed();
+        self.poll_advanced_form_search(ctx);
+        self.schedule_advanced_form_search(ctx);
+        self.reorder_advanced_form_cache_if_needed();
+        self.poll_advanced_form_params_save(ctx);
+        let recomputing = self.advanced_form_search_in_progress();
         let font_id = self.advanced_form_preview_font(ctx);
         let current_preset = self.advanced_form_preset;
         let current_group = self.advanced_form_group;
@@ -1299,7 +2074,13 @@ impl TypingCreatePanelState {
                     }
                 }
             });
+            // Ручки перебора живут ЗДЕСЬ, а не в панели настроек: они бессмысленны
+            // без сетки результатов перед глазами (план §3c).
+            self.draw_advanced_form_search_params_section(ui);
             ui.separator();
+            if recomputing {
+                ui.small(t!("typing.advanced.form_recomputing_status"));
+            }
             match cache.as_ref() {
                 Some(cache) if !cache.forms.is_empty() => {
                     if cache.group_counts.len() > 1 {
@@ -1324,21 +2105,28 @@ impl TypingCreatePanelState {
                             }
                         });
                     }
-                    // Диапазонные фильтры: число строк и ширина строки.
+                    // Диапазонные фильтры: число строк и ширина строки. `None` —
+                    // «весь диапазон»; сужение записывается обратно только когда
+                    // оно действительно уже границ, иначе полный диапазон снова и
+                    // снова сужал бы перебор до им же наблюдённых границ.
+                    let mut line_value = line_range.unwrap_or(cache.line_bounds);
                     let has_line = advanced_form_range_row(
                         ui,
                         t!("typing.advanced.form_lines_label"),
                         "",
-                        &mut line_range,
+                        &mut line_value,
                         cache.line_bounds,
                     );
+                    line_range = (line_value != cache.line_bounds).then_some(line_value);
+                    let mut width_value = width_range.unwrap_or(cache.width_bounds);
                     let has_width = advanced_form_range_row(
                         ui,
                         t!("typing.advanced.form_width_label"),
                         "",
-                        &mut width_range,
+                        &mut width_value,
                         cache.width_bounds,
                     );
+                    width_range = (width_value != cache.width_bounds).then_some(width_value);
                     // Порог пиковости: насколько % самая длинная строка длиннее
                     // базовой (минимальной/медианной). Один верхний предел.
                     let peak_bound = match peak_base {
@@ -1408,18 +2196,20 @@ impl TypingCreatePanelState {
                     if (has_line || has_width || has_peak || has_uneven || has_conservatism)
                         && ui.small_button(t!("typing.advanced.form_reset_filters_button")).clicked()
                     {
-                        line_range = cache.line_bounds;
-                        width_range = cache.width_bounds;
+                        line_range = None;
+                        width_range = None;
                         peak_max = peak_bound;
                         uneven_max = uneven_bound;
                         conservatism_max = Conservatism::Safe;
                         new_group = None;
                     }
 
+                    let line_filter = line_range.unwrap_or(cache.line_bounds);
+                    let width_filter = width_range.unwrap_or(cache.width_bounds);
                     let passes = |form: &TextForm| {
                         new_group.is_none_or(|c| form.word_break_count == c)
-                            && (line_range.0..=line_range.1).contains(&form.line_count())
-                            && (width_range.0..=width_range.1).contains(&form.max_width)
+                            && (line_filter.0..=line_filter.1).contains(&form.line_count())
+                            && (width_filter.0..=width_filter.1).contains(&form.max_width)
                             && form.peakiness_pct(peak_base) <= peak_max
                             && form.unevenness_pct <= uneven_max
                             && form.conservatism <= conservatism_max
@@ -1459,6 +2249,9 @@ impl TypingCreatePanelState {
                             });
                         });
                 }
+                // Первый перебор ещё идёт: строка «пересчёт» выше уже всё сказала,
+                // а «введите текст» здесь было бы ложью.
+                _ if recomputing => {}
                 Some(_) => {
                     ui.label(t!("typing.advanced.form_no_variants_status"));
                 }
@@ -1506,12 +2299,17 @@ impl TypingCreatePanelState {
             open = false;
             changed = true;
         }
+        // Кэш возвращается на место ВСЕГДА: смена пресета его не выбрасывает —
+        // пресет входит в ключ поиска, и прежний результат продолжает рисоваться,
+        // пока новый не приедет.
         self.advanced_form_cache = cache;
-        if new_preset != self.advanced_form_preset {
-            self.advanced_form_preset = new_preset;
-            self.advanced_form_cache = None;
-        }
+        self.advanced_form_preset = new_preset;
         self.advanced_form_group = new_group;
+        if !open {
+            // Правку ручек, сделанную за мгновение до закрытия, дописываем сразу:
+            // следующего кадра окна уже не будет.
+            self.flush_advanced_form_params_save();
+        }
         self.advanced_form_open = open;
         changed
     }
@@ -1532,9 +2330,10 @@ impl TypingCreatePanelState {
 /// no face is duplicated.
 ///
 /// Deliberately `core` ONLY. The `ext` tier is ~80 MB across ~44 files, and this database
-/// is rebuilt from scratch on every metric-cache rebuild (a font, style or text change
-/// with the advanced-form window open), on the GUI thread: registering `ext` would open
-/// and memory-map every one of those files each time, just to read a `name` table. The
+/// is rebuilt from scratch on every form search (a font, style, text or knob change with
+/// the advanced-form window open): registering `ext` would open and memory-map every one
+/// of those files each time, just to read a `name` table. That the rebuild now happens on
+/// a worker thread rather than on the GUI thread lowers the stakes but not the waste. The
 /// `core` files, by contrast, cost no I/O at all here — their bytes are the process-
 /// resident `'static` buffers `ms_fonts::bytes` already handed to the egui UI, so this is
 /// four in-memory face parses. Residual, accepted divergence: a script only `ext` covers

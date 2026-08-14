@@ -447,10 +447,19 @@ saving, and export.
     the unchanged advanced-params header. Also inline offset + alignment controls. The former
     left/right column split is gone; the non-stacked ("wide") path is dead (both call sites pass
     `stacked_columns = true`).
-  - `create_advanced.rs`: advanced params — formula/shape layout, spacing, text accordion, advanced-form window.
+  - `create_advanced.rs`: advanced params — formula/shape layout, spacing, text accordion, and the
+    advanced-form window (its BACKGROUND `forms::search_forms` job, the debounce/cancel state
+    machine and the «Параметры поиска» knob section).
   - `create_edit.rs`: edit-mode params section + inline text-selection / inline-tag styling.
   - `create_apply.rs`: apply selected-overlay data, font selection, preview render queue/poll, render-param builders.
-  - `text_forms.rs`: char/byte range conversions, advanced-form range-row + sort + card (free fns).
+  - `text_forms.rs`: char/byte range conversions, advanced-form range-row + order + card (free fns).
+    `order_advanced_forms` is the ranked search's presentation order (layer C: quality floor,
+    line-count buckets, narrow lean, round-robin) and the window's ONLY ordering path — the
+    legacy width-run comparator `sort_advanced_forms` is gone with the exhaustive enumeration.
+  - `advanced_form_params.rs`: the eight user knobs of the advanced form search — ranges,
+    defaults, the process-global runtime value, the `TextTab.advanced_form_search` JSON shape
+    and the mapping onto `forms::FormSearchParams`. `pub(crate)` (re-exported by
+    `tabs::typing`) because the startup seed and the config writer live outside typing.
   - `inline_tags.rs`: inline-tag machine/opening/closing build + parse, offset/stretch/color/align tokens (free fns).
   - `effect_cards.rs`: effect-card title, per-card control UI, preview-render worker spawner (free fns).
   - `fonts.rs`: font discovery/loading — folder fonts PLUS the imported system fonts

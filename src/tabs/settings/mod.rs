@@ -49,6 +49,9 @@ use crate::widgets::{
 // The font-settings block's per-list name switch: the UI type lives with the widget, its
 // `user_config.json` load/save with the other settings-tab config IO in this file.
 use typesetting::{FontListKind, FontNameDisplayMode, FontNameDisplayModes};
+// `Context` is what turns the `Option` of `as_object_mut` into a typed anyhow error
+// inside `config::update_user_config_file`'s mutator.
+use anyhow::Context as _;
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -683,6 +686,52 @@ pub(super) fn save_rotation_ctrl_wheel_mode(
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
     fs::write(user_settings_file, payload).map_err(|err| err.to_string())
+}
+
+/// Persists the advanced text-form search knobs under
+/// `TextTab.advanced_form_search` as ONE JSON object.
+///
+/// The object's shape belongs to `advanced_form_params::to_config_value`; this
+/// function only places it, preserving every unrelated key. File I/O — meant to
+/// run OFF the GUI thread (the advanced-form window spawns it on a named thread,
+/// like its `save_rotation_ctrl_wheel_mode` sibling). Returns a user-facing error
+/// string.
+///
+/// UNLIKE its siblings above, this saver goes through
+/// `config::update_user_config_file`, which takes `config::lock_user_config_write()`
+/// itself (so this function must NOT take it — the lock is not reentrant), REPORTS a
+/// malformed `user_config.json` instead of replacing it with an empty object, and
+/// reads/writes through the `storage()` abstraction, which the raw `fs::` calls of the
+/// siblings bypass. Rewriting THEM the same way is a separate decision, deliberately not
+/// taken here.
+///
+/// # Errors
+/// Returns the failure of reading, parsing, serializing or writing
+/// `user_settings_file`. A parse failure means the file is malformed and NOTHING was
+/// written — the caller's knobs stay in effect for the session, and the user's other
+/// settings survive.
+pub(crate) fn save_advanced_form_search_params(
+    user_settings_file: &Path,
+    params: crate::tabs::typing::advanced_form_params::AdvancedFormParams,
+) -> Result<(), String> {
+    config::update_user_config_file(user_settings_file, |root| {
+        let root_obj = root
+            .as_object_mut()
+            .context("the user config root is not a JSON object")?;
+        let mut text_tab_obj = root_obj
+            .get("TextTab")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        text_tab_obj.insert(
+            config::TEXT_TAB_ADVANCED_FORM_SEARCH_KEY.to_string(),
+            params.to_config_value(),
+        );
+        root_obj.insert("TextTab".to_string(), Value::Object(text_tab_obj));
+        Ok(())
+    })
+    // `{:#}` spells out the anyhow context chain (which file, which step).
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// Persists the selected typesetting language tag under `TextTab.text_language`.
@@ -1442,6 +1491,92 @@ mod font_name_mode_tests {
                 .get(FontListKind::Folder.config_key())
                 .and_then(Value::as_str),
             Some(FontNameDisplayMode::Identity.as_config_str())
+        );
+    }
+}
+
+#[cfg(test)]
+mod advanced_form_search_save_tests {
+    use super::*;
+    use crate::tabs::typing::advanced_form_params::AdvancedFormParams;
+
+    /// Reads back a written config file as JSON.
+    fn read_root(path: &Path) -> Value {
+        let raw = fs::read_to_string(path).expect("config file written");
+        serde_json::from_str::<Value>(&raw).expect("config file is valid json")
+    }
+
+    /// The knobs of a hand-picked, non-default setting, so the assertions cannot pass
+    /// on the defaults by accident.
+    fn tuned_params() -> AdvancedFormParams {
+        AdvancedFormParams {
+            per_bucket: 7,
+            narrow_slots: 3,
+            filters_prune: false,
+            ..AdvancedFormParams::default()
+        }
+    }
+
+    #[test]
+    fn saving_the_knobs_preserves_every_unrelated_key() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+        fs::write(
+            &path,
+            r#"{"General":{"ui_language":"ru"},"TextTab":{"hanging_punctuation":",."}}"#,
+        )
+        .expect("write seed config");
+
+        save_advanced_form_search_params(&path, tuned_params()).expect("save the knobs");
+
+        let root = read_root(&path);
+        assert_eq!(
+            root.get("General")
+                .and_then(Value::as_object)
+                .and_then(|general| general.get("ui_language"))
+                .and_then(Value::as_str),
+            Some("ru")
+        );
+        let text_tab = root
+            .get("TextTab")
+            .and_then(Value::as_object)
+            .expect("TextTab object");
+        assert_eq!(
+            text_tab.get("hanging_punctuation").and_then(Value::as_str),
+            Some(",."),
+            "a sibling TextTab key must survive the write"
+        );
+        let stored = text_tab
+            .get(config::TEXT_TAB_ADVANCED_FORM_SEARCH_KEY)
+            .expect("the knobs object");
+        assert_eq!(
+            AdvancedFormParams::from_config_value(stored),
+            tuned_params(),
+            "the object must round-trip through the file"
+        );
+    }
+
+    /// A malformed `user_config.json` must be REPORTED, never replaced: the previous
+    /// recipe degraded an unparsable root to an empty object and then wrote it back,
+    /// destroying every unrelated setting (and the ORT load-guard marker) because one
+    /// knob moved.
+    #[test]
+    fn a_malformed_config_is_reported_and_left_untouched() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("user_config.json");
+        let malformed = r#"{"General":{"ui_language":"ru"},"TextTab":{"#;
+        fs::write(&path, malformed).expect("write malformed config");
+
+        let error = save_advanced_form_search_params(&path, tuned_params())
+            .expect_err("a malformed config must not be overwritten");
+        assert!(
+            error.contains("parse"),
+            "the error must name the parse failure, got: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file must still be there"),
+            malformed,
+            "not one byte of the user's file may change"
         );
     }
 }

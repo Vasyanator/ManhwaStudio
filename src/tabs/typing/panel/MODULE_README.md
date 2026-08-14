@@ -608,10 +608,14 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   keeps serving the last known good bytes and is reported once. Bundled entries hold `'static`
   bytes and are never revalidated.
 - THE FORMS METRIC TAKES BYTES FROM THE PROVIDER, never from a path on the GUI thread:
-  `create_advanced::poll_advanced_form_font` resolves in the background and
-  `build_advanced_form_glyph_widths` reads that cache, returning `None` until the bytes land —
-  the window enumerates with `CharWidthMetric` meanwhile. `AdvancedFormMetricSignature::font_content_id`
-  is what rebuilds the cache when they arrive; the cache is dropped whenever the provider is.
+  `create_advanced::poll_advanced_form_font` resolves in the background and caches the bytes in
+  `AdvancedFormFont`; `AdvancedFormMetricSpec` is the snapshot the search worker builds the
+  metric from, so nothing but tests ever measures on the GUI thread. THE FIRST SEARCH WAITS
+  FOR THE BYTES (`schedule_advanced_form_search` returns while a resolve is in flight): their
+  arrival changes `AdvancedFormMetricSignature::font_content_id`, i.e. the search key, so
+  enumerating before they land means enumerating the same text twice — once per character and
+  once per glyph. `CharWidthMetric` therefore remains the fallback for a font that resolves to
+  NOTHING, not a transient first state.
 - THE ON-CANVAS EDITOR FONT IS RESOLVED OFF-THREAD. `create_upload::request_editor_font`
   spawns the `FontProvider::resolve` (a cache miss is an `fs::read`, forbidden on the GUI
   thread) and `poll_editor_font_request` — called once per frame, BEFORE the "no editor
@@ -821,7 +825,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     cannot call it). It must build `FauxBoldParams` by spreading `..FauxBoldParams::default()`
     so an omitted token can never mean a different value here than in the renderer; pinned
     by `panel_faux_bold_mirror_matches_the_renderer_defaults`.
-- The advanced-form width metric (`create_advanced::build_advanced_form_glyph_widths`)
+- The advanced-form width metric (`create_advanced::build_advanced_form_glyph_widths_from_spec`)
   must measure the SAME face the renderer draws, so its real-Bold/Italic face request
   (`apply_metric_real_bold_italic`) MIRRORS `ms_text_render::pipeline::
   base_attrs_real_bold_italic`: real face only when `force_*` is set WITHOUT its faux
@@ -861,6 +865,171 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   is correct for any typesetting language, not hardcoded to Russian.
 - No catch-all `match` arms over `TextLanguage`/`ScriptGroup` in `font_coverage.rs`.
 
+## Advanced-form search: the knobs and the presentation order
+(`advanced_form_params.rs` + `text_forms::order_advanced_forms`; spec:
+`dev-docs/text_forms_ranking_plan.md` §2.3/§3b/§3c)
+- **ONE OWNER OF THE EIGHT KNOBS.** `AdvancedFormParams` (`Copy`) holds `evenness`,
+  `aspect_max`, `hyphen_ratio`, `hyphen_relax_slack`, `quality_floor`, `per_bucket`,
+  `narrow_slots`, `filters_prune`, and the module exports every knob's `*_MIN` / `*_MAX` /
+  `*_DEFAULT` next to its field doc. **The window's controls bind THOSE constants** — a
+  control must never be able to offer a value the search refuses. `clamp_to_supported_range`
+  is applied at every entry (setter, config decode) and once more inside `to_search_params`,
+  so a hand-edited `user_config.json` cannot poison the search; `NaN` falls back to the
+  field's default, since it has no side to clamp to.
+- **RUNTIME VALUE**: a process-global `advanced_form_params()` / `set_advanced_form_params()`
+  pair, mirroring `tabs::typing::rotation_ctrl_wheel`. Eight fields do not fit an atomic, so
+  the store is `OnceLock<RwLock<AdvancedFormParams>>` (the `aspect_max` default is a division,
+  not a `const` expression); read once per frame while the window is open, written only by the
+  parameter section and the startup seed. A POISONED lock degrades to the compiled-in defaults
+  and logs once — the form window may not abort the GUI thread.
+- **PERSISTENCE** is `user_config.json` → `TextTab.advanced_form_search`, ONE JSON object
+  (`config::TEXT_TAB_ADVANCED_FORM_SEARCH_KEY`), following the `rotation_ctrl_wheel_mode`
+  recipe: seeded at startup by `main.rs::seed_advanced_form_search_from_config`, written by
+  `tabs::settings::save_advanced_form_search_params` on a named thread. The
+  GUI thread never reads the config file. The write goes through
+  `config::update_user_config_file`, NOT the raw `fs::` read-modify-write its settings-tab
+  siblings still use: that helper takes `config::lock_user_config_write()` itself (so the
+  saver must not), REPORTS a malformed `user_config.json` instead of replacing it with an
+  empty object — the sibling recipe silently destroys every unrelated setting when the file
+  fails to parse — and goes through the `storage()` abstraction, so it is wasm-portable.
+  Rewriting the siblings the same way is a separate decision. **The field NAMES belong to
+  this module**
+  (`to_config_value` / `from_config_value`) so the writer and the reader cannot drift, and a
+  PARTIAL object is a supported input: every missing or invalid field keeps its compiled-in
+  default. The key is deliberately absent from `config::user_config_defaults()` for the same
+  reason — materializing it would add eight keys to every config for nothing.
+- **`to_search_params(line_height_units, line_range, width_range)`** maps the knobs onto the
+  engine's `forms::FormSearchParams` (layers A/B). `evenness` (`k`) rescales EVERY level of
+  `forms::default_corridor_ladder()` by ONE law — all four bounds contract towards the ideal
+  width `T_L` at `k < 1` and spread at `k > 1`: `interior_lo → 1 − (1 − lo)·k`,
+  `interior_hi → 1 + (hi − 1)·k`, `head_lo → 1 − (1 − head_lo)·k`, `tail_lo` likewise — the
+  measured mapping of plan §3b, reproduced BIT-EXACTLY at `k = 1.0` (`1.0 - (1.0 - x)` is not
+  the identity in f32, so the default short-circuits instead of round-tripping). The
+  multiplicative edge mapping (`head_lo·k`) was measured and REJECTED: it loosened the edge
+  floors exactly when the user asked for more evenness, and the card count stopped responding
+  monotonically. `hyphen_ratio` is `HyphenBudget::ratio_strict`; `hyphen_relax_slack` is its
+  `slack_hi` end, raised to `slack_lo` when it would fall below it (the engine answers
+  `slack_hi <= slack_lo` with "no relaxation at all"). The window's line/width ranges are
+  passed as SEARCH ranges only while `filters_prune` is on — otherwise they stay a display
+  filter. Everything else (quality weights, node budgets) comes from
+  `FormSearchParams::default()` and is not user-visible.
+- **`line_height_units` IS THE CALLER'S JOB, and the panel computes it in two halves.**
+  `create_advanced::advanced_form_line_height_em` mirrors `ms_text_render::pipeline`
+  (`pipeline.rs:432-437`) plus its `pub(crate)` `effective_spacing_percent`
+  (`pipeline.rs:2628-2630`), reproduced here because the crate does not export it:
+  `spacing% = clamp(line_spacing_percent + (glyph_height_percent − 100), ±300)`,
+  `line_height_px = max(font_size_px + line_spacing_px + font_size_px·spacing%/100, 1)`,
+  `em = line_height_px / font_size_px / (glyph_width_percent/100)`. The HORIZONTAL glyph
+  scale must be in the divisor — widths are measured without it, so leaving it out silently
+  detunes the aspect cap. The second half is the metric's own em scale, which only the WORKER
+  knows because it depends on which metric it managed to build: `GLYPH_METRIC_UNITS_PER_EM`
+  (1000, `GlyphWidths` measures in 1/1000 em) or `CHAR_METRIC_UNITS_PER_EM` (~2 characters
+  per em, `CharWidthMetric`). The em figure is guaranteed finite and positive because it
+  enters the search key, where a `NaN` would make the key unequal to itself and loop the
+  restart forever. Pinned by
+  `advanced_form_line_height_folds_spacing_and_glyph_width_into_metric_units`.
+- **LAYER C — `text_forms::order_advanced_forms(forms, params)`** turns the engine's
+  bucketed output into the card order and guarantees:
+  1. **quality floor** — a form worse than `best + params.quality_floor_milli()` is dropped,
+     which removes whole junk buckets rather than trimming good ones;
+  2. **card #1 is the global `quality_milli` minimum**;
+  3. **round-robin over line-count buckets, SPLIT INTO SUB-ROUNDS** — a bucket with `slots`
+     cards per round places its card of rank `i` at `round = i / slots`, `sub = i % slots`,
+     and the output is sorted by `(round, sub, quality_milli)`. Sub-round 0 of a round
+     therefore holds EXACTLY ONE card per non-empty bucket, so no height repeats before
+     every height has appeared;
+  4. **narrow lean** — a bucket whose best form's `aspect_milli` is at or below the LOWER
+     MEDIAN of all buckets' best aspects gets `params.narrow_slots` slots per round, every
+     other bucket gets one. Relative to this text, never an absolute aspect threshold: for a
+     large text every form is tall.
+  **THE SUB-ROUND IS WHAT MAKES 3 AND 4 COMPATIBLE.** Emitted as one flat batch per round,
+  a narrow bucket's two round-0 cards repeat its own height INSIDE round 0, i.e. guarantee 4
+  breaks guarantee 3 at the shipped default `narrow_slots = 2` — the contradiction the
+  ordering tests used to dodge by disabling the lean. With sub-rounds the second narrow card
+  lands in sub-round 1, immediately after the complete one-card-per-height sub-round: the
+  lean stays EARLY and nothing repeats too soon. Both are asserted at the DEFAULT
+  `narrow_slots`.
+  Forms carrying `forms::UNSCORED_QUALITY_MILLI` (a path that does not score, i.e.
+  `forms::enumerate_forms`, which the window no longer uses) are ranked as a SEPARATE group
+  appended at the END — mixed in, their "worst possible" score would either be dropped whole
+  by the floor or would push an unscored form ahead of real cards in the next round.
+
+## The advanced-form window: what it does per frame
+(`create_advanced.rs`; window state lives in `panel.rs`)
+- **THE SEARCH IS NOT ON THE GUI THREAD.** It used to be: `rebuild_advanced_form_cache_if_needed`
+  ran `forms::enumerate_forms(..., usize::MAX, ..)` synchronously inside
+  `draw_advanced_form_window`, on every frame the window was open, re-triggered by every
+  keystroke — the plain violation of CLAUDE.md §5 the plan's work item B exists to remove.
+- **THE INPUT IS A KEY, AND THE KEY IS THE INVALIDATION.** `AdvancedFormSearchKey` = an
+  `AdvancedFormSearchBase` (prepared source text, preset, `AdvancedFormMetricSignature`, the
+  five knobs that change WHICH forms exist — `filters_prune` is not one of them, see below —
+  and the line height in em) plus the two range filters. A cache whose key
+  differs from the current key is stale; nothing else invalidates it, which is why changing
+  the preset or reopening the window no longer throws the previous result away.
+- **Frame order, exactly:** `poll_advanced_form_font` → `poll_advanced_form_search` (accept a
+  finished result) → `schedule_advanced_form_search` (reset ranges on a base change, debounce,
+  spawn) → `reorder_advanced_form_cache_if_needed` → `poll_advanced_form_params_save` → draw
+  the LAST known result. The window never draws an empty grid while it is recomputing; it
+  draws the previous cards plus `typing.advanced.form_recomputing_status`.
+- **DEBOUNCE `ADVANCED_FORM_SEARCH_DEBOUNCE` (200 ms).** The key changes on every keystroke
+  and on every slider step, so without it a burst starts (and cancels) one search per frame.
+  While the timer runs the window asks for `request_repaint_after`, since no input event will
+  wake it otherwise.
+- **CANCEL-ON-SUPERSEDE, WITHOUT A CALL SITE.** `AdvancedFormSearchJob` owns an
+  `Arc<AtomicBool>` shared with the worker and sets it in `Drop`, so ASSIGNING the field
+  cancels the previous job — the same shape as `tab::TypingShapeVariantPreviewState`. The
+  worker checks the flag before starting and before sending. `forms::search_forms` itself
+  takes no cancel token (it is bounded by node budgets instead), so cancellation stops the
+  DELIVERY and the wasted metric build, not a running enumeration.
+- **THE WORKER BUILDS THE METRIC TOO.** `AdvancedFormMetricSpec` is the whole snapshot
+  (resolved bytes, face index, bundled-chain flag, the four bold/italic flags, hanging
+  punctuation); `build_advanced_form_glyph_widths_from_spec` runs on the worker. Bytes are
+  never read from disk there — they were resolved by `poll_advanced_form_font` — but the
+  fontdb build and the alphabet shaping are still worker work.
+- **RANGE FILTERS ARE SEARCH INPUTS while `filters_prune` is on**, which is what makes a
+  deliberately narrow request cheap. Consequences that are contract:
+  - the panel fields are `Option`: `None` means "not narrowed", and only a value strictly
+    different from the bounds is written back, so a full range can never re-enter the search
+    as a self-imposed constraint;
+  - a cache built from a CONSTRAINED run CARRIES the previous bounds forward (unioned with
+    what it observed) instead of adopting its own observations — otherwise the first
+    narrowing would collapse the spin-box bounds onto itself and the user could never widen
+    back;
+  - a BASE change (text, font, preset, SEARCH knob) resets both ranges to `None` before the
+    key is built. The comparison is against the base of the SHOWN cache, so the reset simply
+    repeats every frame while a new set is being computed, which is the wanted state;
+  - **`filters_prune` IS NOT PART OF THE BASE**, deliberately. It changes no form by itself —
+    it only decides whether the ranges enter `AdvancedFormSearchKey` — so as a base field it
+    made every toggle a "base change" that wiped BOTH ranges: a display-only range could not
+    be promoted to a search constraint, and a search constraint could not be demoted back.
+    The ranges now survive the toggle in both directions (`toggling_filters_prune_keeps_both_range_filters`),
+    and the carry rule above is unaffected because it keys on the KEY's ranges, not on the knob.
+- **THE QUALITY FLOOR AND THE NARROW LEAN NEVER RE-SEARCH.** They form `AdvancedFormOrderKey`;
+  `reorder_advanced_form_cache_if_needed` re-runs `order_advanced_forms` over the retained
+  `AdvancedFormCache::searched_forms`. The raw set is kept precisely because the floor DROPS
+  forms and loosening it must bring them back without a new enumeration.
+- **THE «Параметры поиска» SECTION LIVES IN THE WINDOW**, not in the settings pane: the knobs
+  are meaningless without the result grid in view, and the window has no launcher counterpart,
+  so the double-interface pattern of `egui-docs/04-widgets.md` §7 does not apply. It is a
+  `collapsing_param_section`, closed by default, and every control binds the `*_MIN`/`*_MAX`
+  constants of `advanced_form_params.rs`. An edit is applied to the process-global value
+  IMMEDIATELY (the next frame's key change schedules the search) and written to
+  `user_config.json` after `ADVANCED_FORM_PARAMS_SAVE_DEBOUNCE` (600 ms) on the named thread
+  `typing-form-search-params-save`, which computes `config::user_config_path()` itself so the
+  GUI thread touches no filesystem. Closing the window flushes a pending write; the accepted
+  loss window is a crash (or an app exit that does not close the window) inside those 600 ms,
+  with the value still in effect for the session.
+- **THE WRITES ARE ORDER-SAFE, NOT ONLY SERIALIZED.** Each save is its own detached thread;
+  `config::lock_user_config_write()` orders the WRITES but not the SPAWNS, so two saves could
+  take the lock in the reverse order and leave the OLDER snapshot on disk — the knob would
+  silently revert at the next launch. `create_advanced::AdvancedFormParamsSaveGate` stamps a
+  monotonic generation at spawn time and admits only the newest one, checking it under the
+  gate's own mutex so a stale writer cannot slip between a newer writer's check and its write
+  (the config lock is taken INSIDE the gate, never the other way round). A superseded save
+  abandons its write silently — it is not an error. A save whose THREAD failed to start
+  RELEASES its generation, or a stillborn claim would declare itself newest forever and the
+  save already in flight would write nothing at all.
+
 ## Editing map
 - To change the create-preset FILE (a key, the version, the save guard), see
   `presets_store.rs`; to change the WRITE RECIPE or the concurrency vocabulary of EITHER panel
@@ -874,6 +1043,17 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   `create_render_data::build_render_data_json_with_font`, the reader is
   `create_apply::apply_render_data_json_with_options`, and the legacy conversion is
   `tab/codec.rs::upgrade_text_params_to_v2`.
+- To change an advanced-form search KNOB (its range, default, persisted name or how it maps
+  onto the engine), see `advanced_form_params.rs` — and only there; to change its CONTROL, see
+  `create_advanced::draw_advanced_form_search_params_section`; to change the CARD ORDER, see
+  `text_forms::order_advanced_forms`; to change where the values are written, see
+  `tabs::settings::save_advanced_form_search_params` and
+  `main.rs::seed_advanced_form_search_from_config`.
+- To change WHEN the form search re-runs, see `panel::AdvancedFormSearchBase` (the struct) /
+  `create_advanced::advanced_form_search_base` (what fills it) /
+  `schedule_advanced_form_search`; to change what it measures with, see
+  `advanced_form_metric_spec` + `build_advanced_form_glyph_widths_from_spec`; to change the
+  aspect-cap unit conversion, see `advanced_form_line_height_em`.
 - To change what a language requires, see `font_coverage.rs`
   (`script_chars_for_group`, `extra_chars_for_language`, the `*_EXTRA_CHARS` sets).
 - To change when coverage is recomputed, see `facade.rs::begin_frame` (language-change

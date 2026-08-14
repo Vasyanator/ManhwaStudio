@@ -43,7 +43,7 @@ output images, or apply effects.
   pixel widths via cosmic-text shaping with a precomputed per-glyph advance + adjacent-pair
   kerning table, `CharWidthMetric` is the no-font fallback; both honor the hanging-punctuation
   edge rule — tolerance-aware form predicates, single-pass deduplicated `enumerate_forms`,
-  and `choose_form`). The
+  the ranked `search_forms` (see "Form search" below), and `choose_form`). The
   enumerator reuses the shared text segmenter (`segmentation::Segmenter::segment` after
   `soft_hyphenate_overlong`) so it splits on the same orthographic boundaries as the
   renderer — keep-together particles, dictionary hyphenation points, and existing hard
@@ -58,6 +58,98 @@ output images, or apply effects.
   those ranges as non-breaking blocks. Used by the typing panel's "Продвинутая
   форма текста" window and re-exported as `render_next::forms` so the renderer subsystem
   shares the same definitions.
+
+## Form search (`forms.rs::search_forms`)
+
+`forms.rs` has two entry points into the break tree and they answer different
+questions. `enumerate_forms` is the original exhaustive walk: every form that
+matches the preset, in tree order, bounded only by `max_forms`, free memory and a
+node ceiling. It is what `choose_form` (the renderer's single-pick path) uses, and
+on a p99 text it is both too slow and meaningless — the set it returns is the DFS
+prefix, not a sample of good forms.
+
+`search_forms` is the ranked search designed in `dev-docs/text_forms_ranking_plan.md`.
+Three layers, deliberately kept separate — admissibility decides what may exist,
+quality decides what is good, ordering decides what is shown first:
+
+- **Layer A — admissibility, inside the search.** Aspect cap
+  `max_width / (lines × line_height_units) <= aspect_max` (default 21:9); the width
+  **corridor**; the hyphen budget; the preset predicate; and the optional hard
+  `line_range` / `width_range`. All of them *prune*: a line count outside
+  `line_range` is never walked and `width_range`'s upper bound clamps the corridor.
+  Every prune must be **admissible** — it may never discard a form the final
+  acceptance test would admit. Two consequences that look like missing
+  optimisations and are not: there is no per-bucket pre-skip on the ideal width
+  `T_L` (`T_L` is not a lower bound on a form's max width — a break eats the
+  inter-word space), and the corridor's upper bound stops the scan only past a
+  proven slop (see the `LineWidthMetric` contract below), because line width is
+  not monotone in the break index.
+- **Layer B — quality `Q`** (`TextForm::quality_milli`, ×1000, **lower is better**):
+  roughness, unevenness, hyphen-budget fill, mean break cost, short head, short
+  tail, hyphen runs. Deliberately width-agnostic and normalised by the form's own
+  median, so `Q` is comparable across line counts.
+- **Layer C — order.** `search_forms` only *groups*: forms come out bucketed by
+  line count ascending, each bucket sorted by `quality_milli` ascending and cut to
+  `per_bucket`. Round-robin emission, narrow lean and the quality floor belong to
+  the caller (the typing panel).
+
+Why the corridor exists: exhaustive enumeration is not merely slow at p99, it is
+useless — the mass of forms sits at middle line counts and differs by shuffling
+one short line. Searching per line count `L` inside `[interior_lo, interior_hi] × T_L`
+(where `T_L = total_single_line_width / L`) is at once the performance fix and the
+formal statement of "smooth form without abrupt width jumps". A bucket that comes
+out EMPTY — and only such a bucket — is retried down a relaxation ladder, so a rich
+bucket is never polluted by a rung a different height needed.
+
+Why the hyphen relaxation keys on slack, not on aspect: for a small text "vertical"
+and "narrow" coincide, for a large one they do not — 24 lines × 13 chars is very
+tall yet has plenty of room to avoid hyphens. Keying on the aspect would hand a
+large text a free pass to hyphenate most of its lines. `slack = max_width /
+min_possible_width` (the widest single block measured as a wrapping line, hyphen
+included) relaxes exactly the forms where hyphenation is unavoidable, at any text
+size.
+
+Contracts:
+
+- every numeric decision of the plan is a field of `FormSearchParams` (or of the
+  nested `CorridorLevel` / `HyphenBudget` / `QualityWeights`); the algorithm body
+  carries no tuning constants;
+- `search_forms` **sanitises** those params first (`FormSearchParams::sanitized`):
+  a non-finite or out-of-domain real is silently replaced by its default. Without
+  it a single `NaN` voids a hard guarantee, because every comparison against `NaN`
+  is false (`NaN` aspect cap = no cap, `NaN` hyphen ratio = no budget). The crate is
+  GUI-free and runs per text image, so the replacement is silent, deterministic and
+  unlogged;
+- `LineWidthMetric` implementations owe the search one property (documented on the
+  trait): appending a block to a line may not shrink its width by more than
+  "widest single block" + `line_width("-")`. Full monotonicity is *not* assumed —
+  the wrap hyphen already breaks it;
+- `line_height_units` is supplied by the caller in the units of the active metric —
+  only the caller knows the px→units conversion (see the field's doc comment);
+- no form wider than `aspect_max` is returned, EXCEPT after the mandatory
+  empty-result fallback: when the cap admits nothing (one long unbreakable word),
+  the search is re-run once with the cap lifted so the window is never empty;
+- `node_budget_total` is the ceiling of the **whole call**: both runs share one
+  `SearchContext`, so the fallback spends what the first run left. If the first
+  run exhausted it, the fallback does not run at all and the result is `truncated`
+  — an exhausted hard budget outranks "the window is never empty";
+- each form is emitted exactly once **by construction** (a root-to-leaf path *is*
+  the cut vector, the ladder only retries an empty bucket), not by a dedup set: a
+  64-bit-hash dedup silently dropped a valid form on a collision;
+- the line memo (`WidthMemo`) stores widths only — never line text — and switches
+  from a dense `n²` table to a capped hash map above `DENSE_WIDTH_MEMO_MAX_CELLS`,
+  so a pasted 100 000-character text cannot allocate gigabytes before any budget
+  is consulted;
+- `truncated` means a budget was hit (nodes, per-bucket form cap, memory), never
+  the `per_bucket` curation; `nodes_visited` reports the work done;
+- bounded by node counts only. There is **no wall-clock deadline**: this crate
+  builds for wasm, where `std::time::Instant` is not universally safe, and node
+  budgets are deterministic and testable;
+- `TextForm` derives `Eq`, so every derived real is stored as an integer
+  (`quality_milli`, `roughness_pct`, `aspect_milli`, `unevenness_pct`) — never add
+  an `f32` field to it. `line_widths` is filled by both entry points so consumers
+  never re-measure; `quality_milli`/`aspect_milli` are filled only by
+  `search_forms` (`enumerate_forms` leaves `UNSCORED_QUALITY_MILLI` / `0`).
 
 ## Contracts and invariants
 - Wrapping uses normalized text from `pipeline.rs`; inline style byte-offset remapping
@@ -88,3 +180,8 @@ output images, or apply effects.
 - To change rectangle/oval/hexagon shaping or shape fallback warnings, edit `shape.rs`.
 - To change vertical column preparation, edit `vertical.rs`; edit `../layout/vertical.rs`
   only for glyph placement after wrapping.
+- To retune the ranked form search (corridor tightness, aspect cap, hyphen
+  relaxation, quality weights, budgets), change the defaults in
+  `forms.rs::FormSearchParams::default()` and the associated `DEFAULT` consts — not
+  the algorithm bodies. To change *what is shown first*, edit the panel: the crate
+  only groups and sorts within a bucket.

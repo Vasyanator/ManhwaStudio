@@ -145,6 +145,16 @@ pub const UI_SCALE_PERCENT_DEFAULT: u32 = 100;
 pub const GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY: &str = "first_run_languages_confirmed";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
+/// `TextTab` key holding the advanced text-form search knobs as ONE JSON object
+/// (`evenness`, `aspect_max`, `hyphen_ratio`, …). The shape is owned by
+/// `tabs::typing::advanced_form_params` (`to_config_value` / `from_config_value`);
+/// nothing else may spell its field names.
+///
+/// Deliberately ABSENT from [`user_config_defaults`]: every field already has a
+/// compiled-in default and a partial object is a supported input, so materializing
+/// the whole object would only add eight keys to every user's config for nothing.
+/// It is written once the user actually changes a knob.
+pub const TEXT_TAB_ADVANCED_FORM_SEARCH_KEY: &str = "advanced_form_search";
 /// `TextTab` key holding the selected typesetting language as a BCP-47-style tag
 /// (e.g. `"ru"`). Selects the hyphenation/segmentation engine; seeds
 /// `ms_text_util::language` at startup. Default `"ru"` preserves prior behavior.
