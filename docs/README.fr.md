@@ -32,10 +32,10 @@ Un programme spécialisé pour traduire des bandes dessinées, y compris les man
 - Assemblage/découpage pour les webtoons. Un algorithme intelligent qui ne coupe pas au milieu du dessin
 - Passage par Reline ou Waifu2x pour l'upscaling et la suppression du bruit
 
-# Fenêtre d'import depuis PSD
+# Fenêtre d'import depuis PSD/PSB
 <img width="2560" height="1356" alt="Image" src="https://github.com/user-attachments/assets/47602f13-1320-4d9e-ba71-b923c6d8b78f" />
 
-- Ouverture d'un dossier ou d'une archive de fichiers PSD après le nettoyage
+- Ouverture d'un dossier ou d'une archive ZIP/RAR de fichiers PSD et PSB après le nettoyage
 - Détection automatique de l'ordre des pages et séparation de l'original du calque nettoyé
 - Import du nettoyage dans le chapitre
 

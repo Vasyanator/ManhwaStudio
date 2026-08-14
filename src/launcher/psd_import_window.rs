@@ -2,19 +2,28 @@
 File: src/launcher/psd_import_window.rs
 
 Purpose:
-Detached egui window for importing simple PSD layers into launcher projects.
+Detached egui window for importing simple Photoshop layers into launcher projects.
 
 Main responsibilities:
-- render a dark-themed PSD import UI with layer mapping and preview;
-- load PSD/ZIP/RAR sources on background threads using the in-tree `ag-psd` crate;
-- warn when unsupported complexity is detected (for example groups or PSB files);
+- render a dark-themed import UI with layer mapping and preview;
+- load PSD/PSB/ZIP/RAR sources on background threads using the `ag-psd` crate;
+- warn when unsupported complexity is detected (for example layer groups);
 - save selected raster layers into project `src/` and `clean_layers/` without blocking the GUI.
 
 Notes:
-This implementation targets simple flat PSD files. `ag-psd` decodes 8/16/32-bit documents
+Both `.psd` and `.psb` (Large Document Format) are accepted and share one code path:
+`ag_psd::read_psd` picks the layout from the file header (version 2 = PSB, 8-byte section
+and channel lengths), so nothing downstream needs to know which one it got. The extension
+rule lives in `is_supported_document_ext` and is used by all four scanners (picked files,
+folder walk, ZIP, RAR).
+This implementation targets simple flat documents. `ag-psd` decodes 8/16/32-bit documents
 (down-converting to 8-bit RGBA), so 16-bit "клин" exports load fine; it exposes the nested
 group hierarchy via `Layer::children`, which we flatten to leaf raster layers and flag with a
-warning when groups are present.
+warning when groups are present. 16/32-bit documents keep their layer records in the
+`Lr16`/`Lr32` sections, and `ag-psd` reads those, so such a file lists its real layers here
+rather than collapsing to the single composite row.
+The read path deliberately disables `ReadOptions::total_memory_limit` — see the comment in
+`load_document_from_bytes`.
 */
 
 use crate::launcher::new_project::project_io::{
@@ -1502,9 +1511,8 @@ fn scan_selected_files(
     let mut unsupported = Vec::new();
     for path in paths {
         match lowercase_ext(&path).as_deref() {
-            Some("psd") => psd_files.push(path),
+            Some(ext) if is_supported_document_ext(ext) => psd_files.push(path),
             Some("zip" | "rar") => archive_files.push(path),
-            Some("psb") => warnings.push(tf!("launcher.psd_import.psb_unsupported_path", path = path.display())),
             _ => unsupported.push(path),
         }
     }
@@ -1552,7 +1560,7 @@ fn scan_selected_files(
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("unknown.psd")
+            .unwrap_or("unknown")
             .to_string();
         documents.push(load_document_from_bytes(
             &file_name,
@@ -1568,19 +1576,15 @@ fn scan_folder(
     path: PathBuf,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<LoadedPsdDocument>, WorkerError> {
-    let mut found = Vec::new();
-    for entry in walk_dir(&path)? {
-        match lowercase_ext(&entry).as_deref() {
-            Some("psd") => found.push(entry),
-            Some("psb") => warnings.push(tf!("launcher.psd_import.psb_unsupported_entry", entry = entry.display())),
-            _ => {}
-        }
-    }
+    let mut found = walk_dir(&path)?
+        .into_iter()
+        .filter(|entry| is_supported_document_path(entry))
+        .collect::<Vec<_>>();
 
     if found.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_folder").to_string(),
-            log_message: format!("no psd files in '{}'", path.display()),
+            log_message: format!("no psd/psb files in '{}'", path.display()),
         });
     }
 
@@ -1594,7 +1598,7 @@ fn scan_folder(
         let file_name = entry
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("unknown.psd")
+            .unwrap_or("unknown")
             .to_string();
         documents.push(load_document_from_bytes(
             &file_name,
@@ -1629,11 +1633,9 @@ fn scan_zip_archive(
             continue;
         }
         let name = entry.name().replace('\\', "/");
-        if name.to_ascii_lowercase().ends_with(".psb") {
-            warnings.push(tf!("launcher.psd_import.zip_psb_skipped", zip_path = zip_path.display(), name = name));
-            continue;
-        }
-        if !name.to_ascii_lowercase().ends_with(".psd") {
+        // Archive members are plain strings; reuse the same extension rule as the
+        // filesystem paths so ZIP does not drift from the other three scanners.
+        if !is_supported_document_path(Path::new(&name)) {
             continue;
         }
         let mut bytes = Vec::new();
@@ -1647,7 +1649,7 @@ fn scan_zip_archive(
     if entries.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_zip").to_string(),
-            log_message: format!("no psd entries found in '{}'", zip_path.display()),
+            log_message: format!("no psd/psb entries found in '{}'", zip_path.display()),
         });
     }
 
@@ -1657,7 +1659,7 @@ fn scan_zip_archive(
         let file_name = Path::new(&name)
             .file_name()
             .and_then(|item| item.to_str())
-            .unwrap_or("unknown.psd")
+            .unwrap_or("unknown")
             .to_string();
         documents.push(load_document_from_bytes(
             &file_name,
@@ -1695,19 +1697,15 @@ fn scan_rar_archive_from_temp_dir(
         &["rar", "unrar", "unar", "7z", "7za"],
     )?;
 
-    let mut found = Vec::new();
-    for entry in walk_dir(extract_dir)? {
-        match lowercase_ext(&entry).as_deref() {
-            Some("psd") => found.push(entry),
-            Some("psb") => warnings.push(tf!("launcher.psd_import.rar_psb_skipped", rar_path = rar_path.display(), entry = entry.display())),
-            _ => {}
-        }
-    }
+    let mut found = walk_dir(extract_dir)?
+        .into_iter()
+        .filter(|entry| is_supported_document_path(entry))
+        .collect::<Vec<_>>();
 
     if found.is_empty() {
         return Err(WorkerError {
             user_message: t!("launcher.psd_import.no_psd_in_rar").to_string(),
-            log_message: format!("no psd entries found in rar '{}'", rar_path.display()),
+            log_message: format!("no psd/psb entries found in rar '{}'", rar_path.display()),
         });
     }
 
@@ -1730,7 +1728,7 @@ fn scan_rar_archive_from_temp_dir(
         let file_name = Path::new(&relative_name)
             .file_name()
             .and_then(|item| item.to_str())
-            .unwrap_or("unknown.psd")
+            .unwrap_or("unknown")
             .to_string();
         documents.push(load_document_from_bytes(
             &file_name,
@@ -1860,11 +1858,25 @@ fn load_document_from_bytes(
     // together with ag-psd's gating means the merged composite is only decoded for
     // flattened PSDs (documents without a layer section), so layered documents never
     // pay for a composite we would immediately drop.
+    // The memory budget is opted OUT of deliberately. `ReadOptions::default()` carries a
+    // cumulative 2 GiB `total_memory_limit`, and every decoded layer is charged against it
+    // without ever being refunded, so at 8-bit RGBA the whole document may hold at most
+    // ~537 million pixels. This importer decodes ALL layers of a page, and a long webtoon
+    // strip with a handful of layers passes that ceiling easily — a file that imported
+    // before would start failing with `ReadError::ExceededMemoryLimit`, a pure regression
+    // against the behaviour every existing chapter was imported with, so `None` keeps the
+    // previous unlimited reads. The cost is accepted rather than overlooked: a malformed or
+    // deliberately crafted document — including a member of a picked ZIP/RAR, which the user
+    // has not necessarily inspected — can still drive this worker into memory exhaustion,
+    // exactly as it could before the 0.2.0 bump. A ceiling that does not regress legitimate
+    // imports has to be derived from the app's memory profile and reported with its own
+    // message, which this constant cannot express.
     let options = ReadOptions {
         use_image_data: Some(true),
         skip_composite_image_data: Some(true),
         skip_thumbnail: Some(true),
         skip_linked_files_data: Some(true),
+        total_memory_limit: None,
         ..Default::default()
     };
     let psd = read_psd(&bytes, &options).map_err(|err| WorkerError {
@@ -2291,6 +2303,26 @@ fn lowercase_ext(path: &Path) -> Option<String> {
         .map(|item| item.to_ascii_lowercase())
 }
 
+/// Reports whether `ext` names a Photoshop document this importer can read.
+///
+/// `ext` is a bare extension without the dot; the comparison is ASCII
+/// case-insensitive, so callers may pass it raw or already lowercased. `psb`
+/// (Large Document Format) needs no separate code path — `ag_psd::read_psd`
+/// switches to 8-byte section and channel lengths from the file header alone.
+/// This is the single place that decides which documents the picker, the folder
+/// walk and both archive scanners accept.
+fn is_supported_document_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("psd") || ext.eq_ignore_ascii_case("psb")
+}
+
+/// Reports whether `path` points at a document this importer can read, based on
+/// its extension only. Paths without an extension are rejected.
+fn is_supported_document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|item| item.to_str())
+        .is_some_and(is_supported_document_ext)
+}
+
 fn extract_page_from_name(name: &str) -> Option<u32> {
     let path = name.replace('\\', "/");
     let stem = Path::new(&path).file_stem()?.to_str()?;
@@ -2376,6 +2408,55 @@ mod tests {
     }
 
     #[test]
+    fn table_rows_sort_mixed_psd_and_psb_by_page_number() {
+        // A chapter may mix both container formats; the natural sort must order by the
+        // numeric stem first and only then by the extension characters.
+        let mut rows = vec![
+            test_row("10.psb", "clean"),
+            test_row("2.psd", "clean"),
+            test_row("1.psd", "clean"),
+            test_row("1.psb", "clean"),
+        ];
+
+        super::sort_rows_for_table(&mut rows);
+
+        let names = rows
+            .iter()
+            .map(|row| row.file_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["1.psb", "1.psd", "2.psd", "10.psb"]);
+    }
+
+    #[test]
+    fn supported_document_ext_accepts_psd_and_psb_in_any_case() {
+        assert!(super::is_supported_document_ext("psd"));
+        assert!(super::is_supported_document_ext("psb"));
+        assert!(super::is_supported_document_ext("PSB"));
+        assert!(super::is_supported_document_ext("PsB"));
+        assert!(super::is_supported_document_ext("PSD"));
+
+        assert!(!super::is_supported_document_ext("png"));
+        assert!(!super::is_supported_document_ext("zip"));
+        assert!(!super::is_supported_document_ext("rar"));
+        assert!(!super::is_supported_document_ext("ps"));
+        assert!(!super::is_supported_document_ext(""));
+    }
+
+    #[test]
+    fn supported_document_path_matches_extension_only() {
+        use std::path::Path;
+
+        assert!(super::is_supported_document_path(Path::new(
+            "chapter/001.PSB"
+        )));
+        assert!(super::is_supported_document_path(Path::new("001.psd")));
+        assert!(!super::is_supported_document_path(Path::new("001.png")));
+        // No extension at all: a bare name and a dotfile are both rejected.
+        assert!(!super::is_supported_document_path(Path::new("psd")));
+        assert!(!super::is_supported_document_path(Path::new(".psd")));
+    }
+
+    #[test]
     fn fully_skipped_document_warning_detects_unassigned_psd() {
         let rows = vec![
             test_row_with_document("assigned.psd", "source", 0, LayerImportType::Source),
@@ -2418,34 +2499,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn flattened_psd_yields_single_source_composite_row() {
+    const FIXTURE_WIDTH: u32 = 3;
+    const FIXTURE_HEIGHT: u32 = 2;
+
+    /// Fills a `FIXTURE_WIDTH` x `FIXTURE_HEIGHT` opaque RGBA8 buffer with `rgb`.
+    fn fixture_pixels(rgb: [u8; 3]) -> Vec<u8> {
+        let pixel_count = FIXTURE_WIDTH as usize * FIXTURE_HEIGHT as usize;
+        let mut data = Vec::with_capacity(pixel_count * 4);
+        for _ in 0..pixel_count {
+            data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        data
+    }
+
+    /// Serializes a flattened (layer-less) opaque red document; `psb` selects the
+    /// Large Document Format container instead of PSD.
+    fn flattened_fixture_bytes(psb: bool) -> Vec<u8> {
         use ag_psd::psd::{ColorMode, PixelData, Psd as AgPsd, WriteOptions};
         use ag_psd::write_psd;
 
-        let width = 3u32;
-        let height = 2u32;
-        // Opaque red composite, RGBA8.
-        let mut data = Vec::with_capacity((width * height * 4) as usize);
-        for _ in 0..(width * height) {
-            data.extend_from_slice(&[255, 0, 0, 255]);
-        }
-
         let psd = AgPsd {
-            width: width as f64,
-            height: height as f64,
+            width: f64::from(FIXTURE_WIDTH),
+            height: f64::from(FIXTURE_HEIGHT),
             color_mode: Some(ColorMode::Rgb),
             bits_per_channel: Some(8.0),
             // Flattened: no layer section, only the merged composite.
             children: None,
             image_data: Some(PixelData {
-                width,
-                height,
-                data,
+                width: FIXTURE_WIDTH,
+                height: FIXTURE_HEIGHT,
+                data: fixture_pixels([255, 0, 0]),
             }),
             ..Default::default()
         };
-        let bytes = write_psd(&psd, &WriteOptions::default());
+        write_psd(
+            &psd,
+            &WriteOptions {
+                psb: Some(psb),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Returns the container version stored in a serialized Photoshop file:
+    /// the `8BPS` signature followed by a big-endian `u16` (1 = PSD, 2 = PSB).
+    /// Panics if the buffer is not a Photoshop file, which for a fixture is a bug.
+    fn document_version(bytes: &[u8]) -> u16 {
+        assert_eq!(
+            bytes.get(..4),
+            Some(b"8BPS".as_slice()),
+            "fixture is not a Photoshop file"
+        );
+        let version: [u8; 2] = bytes
+            .get(4..6)
+            .and_then(|slice| slice.try_into().ok())
+            .expect("fixture header is truncated");
+        u16::from_be_bytes(version)
+    }
+
+    #[test]
+    fn flattened_psd_yields_single_source_composite_row() {
+        let bytes = flattened_fixture_bytes(false);
+        assert_eq!(document_version(&bytes), 1, "fixture must be a PSD");
 
         let mut warnings = Vec::new();
         let document = super::load_document_from_bytes("001.psd", 1, bytes, &mut warnings)
@@ -2465,13 +2580,141 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.import_type, LayerImportType::Source);
         assert_eq!(row.source, super::LayerSource::Composite);
-        assert_eq!(row.size, (width, height));
+        assert_eq!(row.size, (FIXTURE_WIDTH, FIXTURE_HEIGHT));
         assert!(warnings.is_empty(), "no warnings for a valid flattened psd");
 
         // The composite pixels must flow through the shared render path.
         let documents = std::sync::Arc::new(vec![document]);
         let image = super::render_layer_rgba(&documents, 0, super::LayerSource::Composite)
             .expect("composite renders");
-        assert_eq!(image.dimensions(), (width, height));
+        assert_eq!(image.dimensions(), (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+    }
+
+    #[test]
+    fn flattened_psb_yields_single_source_composite_row() {
+        let bytes = flattened_fixture_bytes(true);
+        // Without this the test would prove nothing: `read_psd` accepts both
+        // containers, so a PSD-shaped fixture would pass every assertion below.
+        assert_eq!(
+            document_version(&bytes),
+            2,
+            "fixture must really be a PSB (header version 2)"
+        );
+
+        let mut warnings = Vec::new();
+        let document = super::load_document_from_bytes("001.psb", 1, bytes, &mut warnings)
+            .expect("flattened psb loads");
+        assert!(
+            document.layers.is_empty(),
+            "fixture is flattened (no layers)"
+        );
+
+        let rows = super::build_document_rows(&document, 0, &mut warnings);
+
+        assert_eq!(rows.len(), 1, "flattened psb yields exactly one row");
+        let row = &rows[0];
+        assert_eq!(row.file_name, "001.psb");
+        assert_eq!(row.page, 1);
+        assert_eq!(row.import_type, LayerImportType::Source);
+        assert_eq!(row.source, super::LayerSource::Composite);
+        assert_eq!(row.size, (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+        assert!(warnings.is_empty(), "no warnings for a valid flattened psb");
+
+        let documents = std::sync::Arc::new(vec![document]);
+        let image = super::render_layer_rgba(&documents, 0, super::LayerSource::Composite)
+            .expect("composite renders");
+        assert_eq!(image.dimensions(), (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "psb composite pixels survive the round trip"
+        );
+    }
+
+    #[test]
+    fn layered_psb_yields_one_row_per_layer_with_intact_pixels() {
+        use ag_psd::psd::{
+            ColorMode, Layer, LayerAdditionalInfo, PixelData, Psd as AgPsd, WriteOptions,
+        };
+        use ag_psd::write_psd;
+
+        // Layer channel lengths are the PSB-specific part of the format (8 bytes each
+        // instead of 4), so a layered fixture exercises what the flattened one cannot.
+        let layer = |name: &str, rgb: [u8; 3]| Layer {
+            additional_info: LayerAdditionalInfo {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            top: Some(0.0),
+            left: Some(0.0),
+            bottom: Some(f64::from(FIXTURE_HEIGHT)),
+            right: Some(f64::from(FIXTURE_WIDTH)),
+            image_data: Some(PixelData {
+                width: FIXTURE_WIDTH,
+                height: FIXTURE_HEIGHT,
+                data: fixture_pixels(rgb),
+            }),
+            ..Default::default()
+        };
+
+        let psd = AgPsd {
+            width: f64::from(FIXTURE_WIDTH),
+            height: f64::from(FIXTURE_HEIGHT),
+            color_mode: Some(ColorMode::Rgb),
+            bits_per_channel: Some(8.0),
+            // Top-to-bottom order, as `collect_leaf_layers` expects.
+            children: Some(vec![
+                layer("source", [255, 0, 0]),
+                layer("clean", [0, 0, 255]),
+            ]),
+            ..Default::default()
+        };
+        let bytes = write_psd(
+            &psd,
+            &WriteOptions {
+                psb: Some(true),
+                // Keep the bottom layer a layer instead of a background so both
+                // fixtures round-trip through the same channel layout.
+                no_background: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            document_version(&bytes),
+            2,
+            "fixture must really be a PSB (header version 2)"
+        );
+
+        let mut warnings = Vec::new();
+        let document = super::load_document_from_bytes("002.psb", 2, bytes, &mut warnings)
+            .expect("layered psb loads");
+        assert_eq!(document.layers.len(), 2, "both layers decode");
+        assert_eq!(document.layers[0].name, "source");
+        assert_eq!(document.layers[1].name, "clean");
+        assert!(
+            document.composite.is_none(),
+            "layered documents drop the composite"
+        );
+
+        let rows = super::build_document_rows(&document, 0, &mut warnings);
+        assert_eq!(rows.len(), 2, "one row per layer");
+        assert_eq!(rows[0].page, 2, "page comes from the file stem, not the ext");
+        // A single same-size pair on one page is auto-assigned top=source, bottom=clean.
+        assert_eq!(rows[0].import_type, LayerImportType::Source);
+        assert_eq!(rows[1].import_type, LayerImportType::Clean);
+        assert!(warnings.is_empty(), "no warnings for a flat layer stack");
+
+        let documents = std::sync::Arc::new(vec![document]);
+        for (layer_index, expected) in [(0usize, [255, 0, 0, 255]), (1, [0, 0, 255, 255])] {
+            let image =
+                super::render_layer_rgba(&documents, 0, super::LayerSource::Layer(layer_index))
+                    .expect("psb layer renders");
+            assert_eq!(image.dimensions(), (FIXTURE_WIDTH, FIXTURE_HEIGHT));
+            assert_eq!(
+                image.get_pixel(FIXTURE_WIDTH - 1, FIXTURE_HEIGHT - 1).0,
+                expected,
+                "psb layer {layer_index} pixels survive the 8-byte channel lengths"
+            );
+        }
     }
 }

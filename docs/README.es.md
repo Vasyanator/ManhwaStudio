@@ -32,10 +32,10 @@ Un programa especializado para traducir cómics, incluidos manga y webtoons. Una
 - Costura/corte para webtoons. Un algoritmo inteligente que no corta donde hay dibujo
 - Procesamiento con Reline o Waifu2x para escalar y eliminar ruido
 
-# Ventana de importación desde PSD
+# Ventana de importación desde PSD/PSB
 <img width="2560" height="1356" alt="Image" src="https://github.com/user-attachments/assets/47602f13-1320-4d9e-ba71-b923c6d8b78f" />
 
-- Abrir una carpeta o un archivo comprimido con archivos PSD tras la limpieza
+- Abrir una carpeta o un archivo comprimido ZIP/RAR con archivos PSD y PSB tras la limpieza
 - Detección automática del orden de las páginas y separación del original de la capa limpiada
 - Importación de la limpieza al capítulo
 

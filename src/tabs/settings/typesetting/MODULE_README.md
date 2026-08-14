@@ -143,8 +143,8 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   come back as `FontCardError { user_message, log_message }` — localized message for the UI,
   path + underlying error for `runtime_log`. One unparsable case is worth naming because it
   surprises: `ag-psd` accepts only Bitmap/Grayscale/Indexed/RGB and rejects the colour mode
-  while reading the FILE HEADER, before any `ReadOptions` flag applies (`ag-psd-0.1.0`
-  `src/reader.rs:678` → `:566`), so a CMYK / Lab / duotone / multichannel card fails even
+  while reading the FILE HEADER, before any `ReadOptions` flag applies (`ag-psd-0.2.0`
+  `src/reader.rs:927` → `:724`), so a CMYK / Lab / duotone / multichannel card fails even
   though we decode no pixels at all. Unit-tested end-to-end against a PSD built in
   memory with `ag_psd::write_psd` (no disk fixtures).
 - `font_properties_window.rs`: the per-font PROPERTIES window (`FontPropertiesState`, one open

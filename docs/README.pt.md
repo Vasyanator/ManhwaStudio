@@ -32,10 +32,10 @@ Um programa especializado para traduzir quadrinhos, incluindo mangás e webtoons
 - Costura/fatiamento para webtoons. Um algoritmo inteligente que não corta onde há desenho
 - Processamento com Reline ou Waifu2x para upscale e remoção de ruído
 
-# Janela de importação de PSD
+# Janela de importação de PSD/PSB
 <img width="2560" height="1356" alt="Image" src="https://github.com/user-attachments/assets/47602f13-1320-4d9e-ba71-b923c6d8b78f" />
 
-- Abrir uma pasta ou um arquivo compactado com arquivos PSD após a limpeza
+- Abrir uma pasta ou um arquivo compactado ZIP/RAR com arquivos PSD e PSB após a limpeza
 - Detecção automática da ordem das páginas e separação do original da camada limpa
 - Importação da limpeza para o capítulo
 

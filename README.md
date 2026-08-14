@@ -32,10 +32,10 @@ A specialized program for translating comics, including manga and webtoons. An a
 - Stitching/slicing for webtoons. A smart algorithm that won't cut through artwork
 - Running through Reline or Waifu2x for upscaling and noise removal
 
-# PSD import window
+# PSD/PSB import window
 <img width="2560" height="1356" alt="Image" src="https://github.com/user-attachments/assets/47602f13-1320-4d9e-ba71-b923c6d8b78f" />
 
-- Open a folder or an archive with PSD files after cleaning
+- Open a folder or a ZIP/RAR archive with PSD and PSB files after cleaning
 - Automatic detection of the page order and separation of the original from the cleaned layer
 - Import the cleaned pages into the chapter
 

@@ -245,8 +245,8 @@ fn oversized_card_error(path: &Path, size: u64) -> Option<FontCardError> {
 ///
 /// The COLOR MODE is part of "supported", and the raster skip flags do not exempt it: `ag-psd`
 /// rejects anything but Bitmap/Grayscale/Indexed/RGB while reading the FILE HEADER, before any
-/// option is consulted (`ag-psd-0.1.0/src/reader.rs:678`, testing `is_supported_color_mode` at
-/// `:566`). A CMYK, Lab, duotone or multichannel card therefore fails here even though we
+/// option is consulted (`ag-psd-0.2.0/src/reader.rs:927`, testing `is_supported_color_mode` at
+/// `:724`). A CMYK, Lab, duotone or multichannel card therefore fails here even though we
 /// decode none of its pixels — which is what the user message says, and what
 /// `cmyk_color_mode_is_rejected_despite_raster_skips` pins down.
 fn parse_font_card_bytes(bytes: &[u8], path: &Path) -> Result<Vec<FontCardEntry>, FontCardError> {
@@ -798,10 +798,11 @@ mod tests {
             .expect_err("a CMYK document must be refused");
         // ag-psd checks the color mode while reading the HEADER, before any ReadOptions flag is
         // consulted, so our raster skips do not let a CMYK card through
-        // (ag-psd-0.1.0/src/reader.rs:678, `is_supported_color_mode` at :566). This is what the
-        // localized parse-error message promises.
+        // (ag-psd-0.2.0/src/reader.rs:927, `is_supported_color_mode` at :724). This is what the
+        // localized parse-error message promises. The mode NAME is asserted too, so a failure
+        // for some other unsupported mode cannot pass as this one.
         assert!(
-            err.log_message.contains("Color mode not supported"),
+            err.log_message.contains("Color mode not supported: CMYK"),
             "unexpected failure reason: {}",
             err.log_message
         );

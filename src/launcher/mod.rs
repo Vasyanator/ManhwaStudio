@@ -16,7 +16,7 @@ Key modules:
 - `main_page`: rendering of the current main page
 - `new_project`: detached "New Project" window runtime and UI
 - `pages`: animated fullscreen launcher subpages
-- `psd_import_window`: detached PSD import window backed by a Python worker
+- `psd_import_window`: detached PSD/PSB import window, parsed in-process by `ag-psd`
 - `state`: shared launcher UI state and page enum
 - `theme`: dark theme styling helpers
 - `tutorial`: launcher main-menu tutorial step script

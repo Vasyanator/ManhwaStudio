@@ -25,7 +25,9 @@ notification.
   overlay pattern. Edit here to change the modal's detection, preselection, or layout.
 - `pages/`: fullscreen launcher pages for open/import/export/settings flows.
 - `new_project/`: detached new-project workflow.
-- `psd_import_window.rs`: detached PSD import workflow.
+- `psd_import_window.rs`: detached PSD/PSB import workflow. Both formats take the same path:
+  `ag-psd` tells them apart by the version field in the file header, and the accepted
+  extensions live in one place (`is_supported_document_ext`).
 - `theme.rs`: launcher visual style helpers.
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
